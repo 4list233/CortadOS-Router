@@ -20,6 +20,12 @@ def load(name, filename):
 
 plugin = load('review_test_plugin', ROOT / 'integrations/hermes/__init__.py')
 reviews, core = plugin.reviews, plugin.core
+# Pinned benchmark catalog. tables/model-scores.generated.json is rewritten by the nightly tier build (bin/refresh-tiers.sh →
+# tables/benchmarks/build_tiers.py), so reading it made these policy tests follow the benchmarks: by 2026-10-13 claude-opus-5-5 had become a
+# ceiling model at general 99.8 (it was non-ceiling at 84.3 on 2026-09-29, Fable ceiling at 94.6), so it, not Fable, became Astra's closest
+# frontier Anthropic peer and also the eligible Samantha when Fable's pool or the native Claude lane is spent. This fixture is CortadOS
+# router/model-scores.generated.json at commit 1b54a924 (nightly 2026-09-29), the catalog these tests were written and passed (23/23) against.
+SCORES = json.loads((ROOT / 'tests/fixtures/model-scores.2026-09-29.generated.json').read_text())
 
 # test_mail_read_guard_covers_review_dispatch and test_profile_instructions_are_opt_in_and_dynamic need the private
 # CortadOS tree (plugins/cortados-pty/mailguard.py, faces.json): they live in tests/integration/test_router_reviews_cortados.py.
@@ -30,6 +36,7 @@ class ReviewTests(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.stack = []
         for owner, name, value in [(core, 'STATE', self.state), (core, 'lane_health', lambda: {}),
+                                    (core, 'model_scores', lambda: SCORES),
                                     (plugin, '_profile_name', lambda: 'samantha')]:
             p = patch.object(owner, name, value); p.start(); self.addCleanup(p.stop)
         plugin._pending.clear(); plugin._review_pending.clear(); plugin._session_ctx.clear()
@@ -181,7 +188,13 @@ class ReviewTests(unittest.TestCase):
         conv = SimpleNamespace(model_override=None)
         gw = SimpleNamespace(_session_key_for_source=lambda s:'key', _claim_one_turn_restore=Mock(),
                              _session_state=lambda k:SimpleNamespace(conversation=conv), _evict_cached_agent=Mock())
-        with patch.object(plugin, '_live_enabled', return_value=True), patch.object(plugin, '_override_for', side_effect=lambda p,m:{'model':m,'provider':p}), patch.object(core, 'decide_s1') as score:
+        # Since CortadOS 18ff46a0 ("fix(router): account for exact session input and contain AGY truncation") the review branch measures
+        # the session through _dispatch_fit (Hermes session store + hermes_constants) before choosing the reviewer. The fake gateway has
+        # neither, so the measurement is supplied here, as GatewayPreservation in test_router_transport.py does: a small, known fit.
+        fit = {'session_id': 'review-session', 'known': True, 'reason': None, 'history_bytes': 0,
+               'current_and_recall_bytes': len(e.text.encode()), 'input_bytes': 124000 + len(e.text.encode()), 'input_tokens': 37500}
+        with patch.object(plugin, '_live_enabled', return_value=True), patch.object(plugin, '_override_for', side_effect=lambda p,m:{'model':m,'provider':p}), \
+             patch.object(plugin, '_dispatch_fit', return_value=fit), patch.object(core, 'decide_s1') as score:
             plugin._pre_gateway_dispatch(e, gw)
             self.assertEqual(conv.model_override['model'], 'claude-fable-5-1')
             plugin._pre_llm_call(session_id='review-session', turn_id='rev1', user_message=e.text, platform='discord', model='claude-fable-5-1')

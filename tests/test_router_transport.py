@@ -101,10 +101,17 @@ class TransportGates(unittest.TestCase):
         # Use tiny deterministic table candidates; model availability/scarcity
         # never launches a probe in these tests.
         self.table=core.table();self.table=json.loads(json.dumps(self.table))
+        tiny=[{'lane':'antigravity','provider':'agy-cli','model':'gemini-test'},
+              {'lane':'claude','provider':'claude-cli','model':'claude-test'}]
         for band in self.table['candidates']:
-            self.table['candidates'][band]=[
-                {'lane':'antigravity','provider':'agy-cli','model':'gemini-test'},
-                {'lane':'claude','provider':'claude-cli','model':'claude-test'}]
+            self.table['candidates'][band]=[dict(c) for c in tiny]
+        # A degraded decision no longer reaches the band candidates: since the configured scorer-unavailable fallback
+        # (tables/routing-table.json fallback.routes = codex gpt-5.6-terra; CortadOS contracts CTX-ADM-103 AC-01 and CTX-ADM-001
+        # "scorer-unavailable fallback remains configured GPT Terra family constrained by capability, availability, permissions
+        # and fit", pinned by tests/test_router_terra_fallback.py) it selects among fallback.routes. Copying the live table carried
+        # that Terra route in, so these gates were never applied to the tiny candidates. The deterministic table therefore also
+        # configures the tiny pair as its fallback routes: the same transport gates, on the path degraded turns really take.
+        self.table['fallback']['routes']=[dict(c) for c in tiny]
         p=patch.object(core,'table',return_value=self.table);p.start();self.addCleanup(p.stop)
 
     def test_oversized_current_request_excludes_agy_even_with_zero_history(self):
@@ -129,6 +136,9 @@ class TransportGates(unittest.TestCase):
         self.assertEqual('claude',core.resolve(self.degraded)['chosen']['lane'])
 
     def test_scored_unfitting_stronger_model_cannot_hide_fitting_same_pool_model(self):
+        # This one pins the SCORED path. With configured fallback routes a degraded decision never reaches scored candidates (see
+        # setUp), so this table configures none: core.resolve then scores a degraded decision in the fallback band, as before.
+        self.table['fallback'].pop('routes')
         candidates=[{'lane':'claude','provider':'claude-cli','model':model,
                      'family':model,'index':index,'general':index,'price':1,
                      'tokens_per_s':10,'ceiling':False,'use_case':'conversation'}

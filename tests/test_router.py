@@ -151,12 +151,21 @@ class ScoredSelection(unittest.TestCase):
             m["index"]["planning"] = m["index"]["general"]
         ms["reference_index"] = {b: {**v, "planning": v["general"]} for b, v in ms["reference_index"].items()}
         core.model_scores = lambda: ms
-        self.assertEqual(core.resolve(dec(steps=2, ambiguity=2, novelty=1, work_kind="planning"))["chosen"]["model"], "top")    # D=5 planning → frontier
+        # Trigger is selection.ceiling_work.min_D in tables/routing-table.json. It was D>=5 (Forest 2026-09-25, CortadOS 2fbf4ff9) and is
+        # D>=7 since CortadOS 634c97bb (Forest 2026-09-29: "ceiling_work min_D 5→7 (outward floor made ordinary planning-tagged replies
+        # frontier work)"); ROUTER-DESIGN §9 records that this test still asserted D=5. Same intent, at the documented boundary.
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="planning"))["chosen"]["model"], "top")    # D=7 planning → frontier
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="planning"))["chosen"]["model"], "top")  # D=6 planning → not (below min_D 7)
         self.assertNotEqual(core.resolve(dec(steps=1, ambiguity=1, work_kind="planning"))["chosen"]["model"], "top")            # D=2 planning → not
-        self.assertNotEqual(core.resolve(dec(steps=2, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "top")     # D=5 code → price ladder
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="code"))["chosen"]["model"], "top")     # D=7 code → price ladder
     def test_underused_frontier_pool_takes_hard_work(self):
+        # Trigger is selection.ceiling_underuse.min_D in tables/routing-table.json. It was D>=6 (Forest 2026-09-25, CortadOS 2fbf4ff9) and is
+        # D>=9 since CortadOS dc029601 ("router: Astra only for D>=9 when Codex is underused (was 6) ... simple turns were staying on Astra");
+        # ROUTER-DESIGN §9 records that this test still asserted D=6. Same intent, at the documented boundary.
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="code"))["chosen"]["model"], "top")    # D=9 code, no underuse → price ladder
         core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.6, "expiring_pct": 0, "tightest": {}, "pools": {}}}
-        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "top")       # D=6 code, claude pool underused → top
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="code"))["chosen"]["model"], "top")       # D=9 code, claude pool underused → top
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=2, work_kind="code"))["chosen"]["model"], "top")    # D=8, underused → not (below min_D 9)
 
     def test_face_turns_have_a_floor_but_background_does_not(self):
         r = core.resolve(dec(), "interactive")                                    # R0 face turn: "small" (12) is below the floor → not chosen
