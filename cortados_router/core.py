@@ -393,7 +393,12 @@ def turn_tokens(history_chars: int) -> int:
     return int((int(cx.get("harness_tokens", 31000)) + history_chars // 4) * float(cx.get("headroom", 1.2)))
 
 
-def lane_ceiling(lane: str, model: str = "") -> int:
+def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> int:
+    # A transport-keyed ceiling applies only to the transport that measured it (the Donna
+    # model gateway's calibrated fit); unknown or absent transports keep the lane ceiling.
+    by_transport = (_context_cfg().get("ceiling_tokens_by_transport") or {}).get(lane) or {}
+    if transport is not None and transport in by_transport:
+        return int(by_transport[transport])
     cx = _context_cfg().get("ceiling_tokens") or {}
     if lane == "claude" and "[1m]" in (model or ""):
         return int(cx.get("claude[1m]", 1000000))
@@ -487,7 +492,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     byte_caps = {'antigravity': 180000, **(cx.get('ceiling_bytes') or {})}
     transport_rejected = set()
     for c in cands:
-        cap = lane_ceiling(c['lane'], c['model'])
+        cap = lane_ceiling(c['lane'], c['model'], fit.get('transport'))
         if execution and c['provider'] == 'codex-cli':
             cap = int(cx.get('provider_ceiling_tokens', {}).get('codex-cli', 200000))
         why = None

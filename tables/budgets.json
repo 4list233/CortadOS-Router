@@ -64,10 +64,16 @@
    "antigravity": 0,
    "local": 65536
   },
+  "ceiling_tokens_by_transport": {
+   "codex": {
+    "model_gateway": 240000
+   }
+  },
   "ceiling_notes": {
    "codex": "272k window but the native route fails on ~400 KB request bodies: treat as 100k per call and never swap onto it mid-session",
    "local": "qwen3-8b-nothink-64k at 65,536 (the only model allowed resident on this Mac, Forest 2026-09-26); ~35k usable after the harness \u2192 fresh-context work only",
-   "antigravity": "TEMPORARY CONTAINMENT 2026-10-04: automatic selection disabled (ceiling 0) until exact-session fit accounting and the 180,000 UTF-8 byte guard are activated and verified. Previous policy ceiling 40,000 tokens. AGY USER_INPUT truncates around 192,000 bytes; never clip protected exchanges or the current tool loop to fit."
+   "antigravity": "TEMPORARY CONTAINMENT 2026-10-04: automatic selection disabled (ceiling 0) until exact-session fit accounting and the 180,000 UTF-8 byte guard are activated and verified. Previous policy ceiling 40,000 tokens. AGY USER_INPUT truncates around 192,000 bytes; never clip protected exchanges or the current tool loop to fit.",
+   "codex.model_gateway": "240k only on the Donna model gateway transport (calibrated provider fit, Forest 2026-10-14): fit-calibration-2026-10-14/tokenizer S8 succeeded at 224,715 tokens and production-options L2 at 1,847,347 logical / 768,092 transport bytes; the gateway also enforces 1,800,000 / 750,000 byte caps. Hermes keeps ceiling_tokens.codex 100000."
   },
   "local_fresh_only_history_tokens": 8000
  },

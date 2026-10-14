@@ -145,11 +145,29 @@ class TransportGates(unittest.TestCase):
                     for model,index in [('large-small-window',90),('small-large-window',80)]]
         with patch.object(core,'scored_candidates',return_value=candidates), \
              patch.object(core,'required_index',return_value=50), \
-             patch.object(core,'lane_ceiling',side_effect=lambda lane,model:30000 if model=='large-small-window' else 200000), \
+             patch.object(core,'lane_ceiling',side_effect=lambda lane,model,transport=None:30000 if model=='large-small-window' else 200000), \
              patch.object(core,'_pool_tokens_per_pct',return_value=None), \
              patch.object(core,'_tokens_left_for',return_value=None):
             r=core.resolve(self.degraded,input_fit={'known':True,'input_tokens':80000,'input_bytes':280000})
         self.assertEqual('small-large-window',r['chosen']['model'])
+
+    def test_transport_ceiling_applies_only_to_its_own_transport(self):
+        # Forest 2026-10-14: 240k is calibrated for the Donna model gateway transport only; Hermes keeps codex at 100k.
+        self.assertEqual(240000,core.lane_ceiling('codex','gpt-6-sol','model_gateway'))
+        self.assertEqual(100000,core.lane_ceiling('codex','gpt-6-sol'))
+        self.assertEqual(100000,core.lane_ceiling('codex','gpt-6-sol','hermes'))
+        self.assertEqual(200000,core.lane_ceiling('claude','claude-test','model_gateway'))
+
+    def test_gateway_transport_admits_large_codex_request_that_hermes_refuses(self):
+        codex=[{'lane':'codex','provider':'openai-codex','model':'gpt-6-sol'}]
+        for band in self.table['candidates']:
+            self.table['candidates'][band]=[dict(c) for c in codex]
+        self.table['fallback']['routes']=[dict(c) for c in codex]
+        fit={'known':True,'assembled':True,'input_tokens':200000,'input_bytes':800000}
+        gateway=core.resolve(self.degraded,input_fit={**fit,'transport':'model_gateway'})
+        self.assertEqual('gpt-6-sol',gateway['chosen']['model'])
+        hermes=core.resolve(self.degraded,input_fit=fit)
+        self.assertIsNone(hermes['chosen']);self.assertTrue(hermes['fit_blocked'])
 
 
 class GatewayPreservation(unittest.TestCase):

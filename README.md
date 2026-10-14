@@ -172,7 +172,7 @@ This is the code CortadOS runs today, extracted from its private repo without re
 - Mandatory routing for agent, cron, delegation and auxiliary calls, when a profile sets `agent.model_router`.
 - Shadow logging of every decision.
 
-**Tests.** `python3 -B -m unittest discover -s tests -t .` runs 153 tests: 146 pass, 6 are skipped and 1 fails.
+**Tests.** `python3 -B -m unittest discover -s tests -t .` runs 155 tests: 148 pass, 6 are skipped and 1 fails.
 - **Skipped:** the six Hermes integration modules in `tests/integration`, which need pytest and an importable Hermes.
 - **Failing:** `test_profile_instructions_are_opt_in_and_dynamic`. It reads CortadOS's live `faces.json` and fails until the
   opt-in dual-review rules are applied there; that deployment is still pending.
