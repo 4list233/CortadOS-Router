@@ -123,7 +123,7 @@ conversations. `.gitignore` keeps `s1/data`, `s1/runs` and `s1/current.json` out
 
 ```
 cortados_router/      the router: core (scoring client, rules, resolve, logging), scarcity, probe_reaper, unitcost,
-                      transport (input-size estimate), images (vision conversion before scoring), reviews (opt-in
+                      transport (input-size estimate), images (local OCR first, vision model only for photos), reviews (opt-in
                       dual review), execution_routing / cron_routing (mandatory per-call selection), task_context
                       (scorer wire contract), compat (env + optional host modules), paths
 integrations/hermes/  the Hermes plugin (hooks, tools, /router command) and patches/ that install mandatory routing
@@ -172,22 +172,12 @@ This is the code CortadOS runs today, extracted from its private repo without re
 - Mandatory routing for agent, cron, delegation and auxiliary calls, when a profile sets `agent.model_router`.
 - Shadow logging of every decision.
 
-**Tests.** `tests/` holds 137 tests. 123 pass and 14 fail. The 14 are the same tests that fail, with the same
-messages, in the CortadOS tree today:
+**Tests.** `python3 -B -m unittest discover -s tests -t .` runs 153 tests: 146 pass, 6 are skipped and 1 fails.
+- **Skipped:** the six Hermes integration modules in `tests/integration`, which need pytest and an importable Hermes.
+- **Failing:** `test_profile_instructions_are_opt_in_and_dynamic`. It reads CortadOS's live `faces.json` and fails until the
+  opt-in dual-review rules are applied there; that deployment is still pending.
 
-| test group | failing |
-|---|---|
-| `test_router` ScoredSelection | 2 |
-| `test_router_reviews` | 5 |
-| `test_router_transport` | 5 |
-| `test_router_images` | 2 |
-
-For the two frontier-selection tests, the design log notes that they still assert the old D = 5 / D = 6 triggers.
-
-`tests/integration` holds:
-
-- **Six Hermes modules.** They are skipped without pytest and an importable Hermes.
-- **One CortadOS-tree module.** It has 2 tests, one of which is the sixth review failure.
+The tests use a pinned benchmark catalog (`tests/fixtures/`), so the nightly table refresh can't break them.
 
 ## License
 

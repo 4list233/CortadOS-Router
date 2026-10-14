@@ -773,11 +773,12 @@ def _pre_gateway_dispatch(event=None, gateway=None, **_):
         authorize = getattr(gateway, "_is_user_authorized_for_source", None)
         if images and callable(authorize) and not authorize(src):
             return None
-        image_token, converted = None, []
+        image_token, converted, scored_text, image_context = None, [], None, ""
         if images:
             import uuid
             image_token = uuid.uuid4().hex
             converted = image_conversion.convert(images, _vision_config(), _TRANSCRIPTS_DIR, request_text=raw)
+            scored_text, image_context = image_conversion.routing_text(raw, converted)  # image-only: content; typed+image: text
             raw = image_conversion.apply_conversion(event, converted, image_token)
             logger.info("router live: converted %d/%d image(s) before scoring; vision models=%s; outcomes=%s",
                         sum(r["complete"] for r in converted), len(images),
@@ -814,7 +815,7 @@ def _pre_gateway_dispatch(event=None, gateway=None, **_):
             return None
         if not raw.strip() or raw.lstrip().startswith("/") or raw.startswith("[IMPORTANT: Background process"):
             return None
-        text = core.clean_request(raw)
+        text = core.clean_request(scored_text if scored_text is not None else raw)
         if not text:
             return None
         # Conversion is complete before this separate task-routing pass, irrespective of
@@ -853,7 +854,7 @@ def _pre_gateway_dispatch(event=None, gateway=None, **_):
                     or selected.get('task_id')!=current.get('task_id') or selected.get('version')!=current.get('version')
                     or not native_input):
                 return {'action':'skip','reason':'Current task selection changed before scoring; the retained input requires preparation retry.'}
-        ctx_slice = _recall_for_router(key, text_raw, face, images)
+        ctx_slice = image_conversion.with_image_context(_recall_for_router(key, text_raw, face, images), image_context)
         if _required_routing_enabled():
             # Select usable initialization credentials; exact fit is decided
             # again after Context assembly, before the first provider request.

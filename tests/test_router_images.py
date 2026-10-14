@@ -15,6 +15,8 @@ spec = importlib.util.spec_from_file_location('router_images_test_plugin', ROOT/
 plugin = importlib.util.module_from_spec(spec); spec.loader.exec_module(plugin)
 images, core = plugin.image_conversion, plugin.core
 CONFIG = {'provider': 'openai-codex', 'model': 'gpt-5.6-luna'}
+FIT = {'session_id': 'image-session', 'known': True, 'reason': None, 'history_bytes': 0, 'current_and_recall_bytes': 0,
+       'input_bytes': 1000, 'input_tokens': 300}
 
 
 def response(text='Chicken salad, $13.50', complexity='simple', status='complete'):
@@ -30,6 +32,8 @@ class Images(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
+        # These cases exercise the vision conversion; local OCR reading nothing is the path a photo takes (OCR-first, 2026-10-14).
+        p = patch.object(images, 'ocr', return_value=None); p.start(); self.addCleanup(p.stop)
 
     def test_all_attachments_even_with_long_caption(self):
         e = event('caption ' * 600, [f'/tmp/{i}.png' for i in range(5)], ['image/png'] * 5)
@@ -77,7 +81,7 @@ class Images(unittest.TestCase):
             return result
         original_join = images.threading.Thread.join
         def tracked_join(thread, timeout):
-            self.assertEqual(timeout, 185)
+            self.assertEqual(timeout, 185 + images.OCR_TIMEOUT_S)  # + the OCR step that now runs first (Forest 2026-10-14)
             original_join(thread, timeout)
         with patch.object(images.asyncio, 'wait_for', side_effect=wait_for), \
                 patch.object(images.threading.Thread, 'join', tracked_join):
@@ -149,7 +153,8 @@ class Images(unittest.TestCase):
             return response('Primary text cannot be read', status='unreadable')
         result = images.convert(['/tmp/a'], CONFIG, self.path, call=call)[0]
         self.assertFalse(result['complete'])
-        self.assertEqual([o['status'] for o in result['outcomes']], ['unreadable', 'unreadable'])
+        # OCR runs first and reads nothing usable (Forest 2026-10-14), then both vision passes report the image unreadable.
+        self.assertEqual([o['status'] for o in result['outcomes']], ['insufficient', 'unreadable', 'unreadable'])
         self.assertFalse(list(self.path.glob('*.txt')))
 
     def test_answerer_gets_all_text_and_no_duplicate_vision(self):
@@ -160,6 +165,75 @@ class Images(unittest.TestCase):
         self.assertEqual(e.media_urls, ['/tmp/audio']); self.assertEqual(e.media_types, ['audio/ogg'])
         self.assertEqual(e.media_text_inlined, [False])
         self.assertNotIn('cortados-image-route', core.clean_request(out))
+
+
+class OcrFirst(unittest.TestCase):
+    """Forest 2026-10-14: local OCR before routing; a vision model only for images OCR can't read (photos)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+
+    def test_readable_text_needs_no_vision_call(self):
+        call = Mock()
+        read = {'engine': 'apple-vision', 'text': 'Question 3: Solve for x\n2x + 5 = 17', 'confidence': 1.0}
+        r = images.convert(['/tmp/quiz.png'], CONFIG, self.path, call=call, ocr_fn=lambda p: read)[0]
+        call.assert_not_called()
+        self.assertTrue(r['complete'], 'images.convert: confident OCR text must complete the conversion')
+        self.assertIn('2x + 5 = 17', r['content']); self.assertEqual(r['model'], 'ocr:apple-vision')
+
+    def test_photo_with_little_text_falls_back_to_vision(self):
+        calls = []
+        async def call(path, prompt, model):
+            calls.append(model); return response('a green salad on a white plate')
+        read = {'engine': 'apple-vision', 'text': 'MENU', 'confidence': 0.9}
+        r = images.convert(['/tmp/salad.jpg'], CONFIG, self.path, call=call, ocr_fn=lambda p: read)[0]
+        self.assertEqual(calls, ['gpt-5.6-luna'], 'images.convert: a photo OCR cannot read must go to the vision model')
+        self.assertIn('green salad', r['content'])
+        self.assertEqual(r['outcomes'][0], {'model': 'ocr:apple-vision', 'status': 'insufficient'})
+
+    def test_sufficiency_boundaries(self):
+        ok = lambda text, conf: images.ocr_sufficient({'text': text, 'confidence': conf})
+        self.assertFalse(ok('x' * (images.OCR_MIN_CHARS - 1), 1.0))
+        self.assertTrue(ok('x' * images.OCR_MIN_CHARS, 1.0))
+        self.assertTrue(ok('x' * images.OCR_MIN_CHARS, images.OCR_MIN_CONFIDENCE))
+        self.assertFalse(ok('x' * images.OCR_MIN_CHARS, images.OCR_MIN_CONFIDENCE - 0.01))
+        self.assertFalse(images.ocr_sufficient(None))
+
+    def test_image_only_routes_on_content_and_typed_request_routes_on_text(self):
+        results = [{'content': 'Question 3: Solve for x'}]
+        self.assertEqual(images.routing_text('(The user sent a message with no text content)', results),
+                         ('Question 3: Solve for x', ''), 'image-only: the extracted content is the request')
+        self.assertEqual(images.routing_text('[Image attached at: /tmp/q.png]', results), ('Question 3: Solve for x', ''))
+        typed, context = images.routing_text('Can you check my answer?', results)
+        self.assertEqual((typed, context), ('Can you check my answer?', 'Question 3: Solve for x'),
+                         'typed request plus image: route on the text, the image is supporting context')
+        long = images.routing_text('check this', [{'content': 'y' * 9000}])[1]
+        self.assertEqual(len(long), images.SUPPORT_MAX_CHARS)
+
+    def test_engine_outputs_are_parsed(self):
+        vision = NS(returncode=0, stdout=json.dumps({'engine': 'apple-vision', 'lines': [
+            {'text': 'Total', 'confidence': 1.0}, {'text': '$13.50', 'confidence': 0.5}]}))
+        with patch.object(images.subprocess, 'run', return_value=vision):
+            self.assertEqual(images._run_vision('ocr_vision', '/tmp/a'), {'engine': 'apple-vision', 'text': 'Total\n$13.50', 'confidence': 0.75})
+        header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext'
+        rows = [header, '5\t1\t1\t1\t1\t1\t0\t0\t9\t9\t90\tSolve', '5\t1\t1\t1\t1\t2\t0\t0\t9\t9\t70\tfor',
+                '5\t1\t1\t1\t2\t1\t0\t0\t9\t9\t80\tx', '4\t1\t1\t1\t2\t0\t0\t0\t9\t9\t-1\t']
+        with patch.object(images.subprocess, 'run', return_value=NS(returncode=0, stdout='\n'.join(rows))):
+            r = images._run_tesseract('tesseract', '/tmp/a')
+        self.assertEqual(r['text'], 'Solve for\nx'); self.assertAlmostEqual(r['confidence'], 0.8)
+
+    def test_vision_warm_up_runs_once_per_binary_in_the_background(self):
+        # A fresh Vision binary needs ~55 s for its first call, longer than OCR_TIMEOUT_S; without a background warm-up
+        # every call would time out to tesseract forever.
+        started = []
+        with patch.object(images, '_warmed', set()), patch.object(images.threading, 'Thread', side_effect=lambda **kw: NS(start=lambda: started.append(kw['name']))):
+            images._warm('/bin/ocr_vision'); images._warm('/bin/ocr_vision'); images._warm('/other/ocr_vision')
+        self.assertEqual(started, ['router-ocr-warmup', 'router-ocr-warmup'], 'images._warm: one background warm-up per binary per process')
+
+    def test_unreadable_image_with_no_engine_falls_back(self):
+        with patch.object(images, '_vision_binary', return_value=None), patch.object(images.shutil, 'which', return_value=None):
+            self.assertIsNone(images.ocr('/tmp/a'))
 
 
 class Gateway(unittest.TestCase):
@@ -178,7 +252,11 @@ class Gateway(unittest.TestCase):
                                   (plugin, '_profile_name', lambda:'donna'), (plugin, '_TRANSCRIPTS_DIR', self.path),
                                   (plugin, '_task_for_router', lambda *a, **kw:None),
                                   (plugin, '_recall_for_router', lambda *a:'context'), (plugin, '_esc_for', lambda k:None),
-                                  (plugin, '_override_for', lambda p,m:{'provider':p, 'model':m})]:
+                                  (plugin, '_override_for', lambda p,m:{'provider':p, 'model':m}),
+                                  # Since CortadOS 18ff46a0 the dispatch measures the session through _dispatch_fit (Hermes session
+                                  # store + hermes_constants); the fake gateway has neither, so a small known fit is supplied, as in
+                                  # test_router_transport.GatewayPreservation and test_router_reviews.
+                                  (plugin, '_dispatch_fit', Mock(return_value=FIT))]:
             p = patch.object(obj, name, value); p.start(); self.addCleanup(p.stop)
 
     def conversion(self, paths, config, directory, **kwargs):
@@ -210,6 +288,18 @@ class Gateway(unittest.TestCase):
         with patch.object(images, 'convert', return_value=failed), patch.object(core, 'decide_s1', return_value=self.decision), patch.object(core, 'resolve', return_value=self.route) as resolve:
             plugin._pre_gateway_dispatch(e, self.gw)
         self.assertIn('INCOMPLETE', e.text); self.assertEqual(resolve.call_args.kwargs['escalate']['D_floor'], 9)
+
+    def test_typed_request_scores_the_text_with_the_image_as_context(self):
+        e = event('Can you check my working on this?')
+        with patch.object(images, 'convert', side_effect=self.conversion), patch.object(core, 'decide_s1', return_value=self.decision) as score, \
+                patch.object(core, 'resolve', return_value=self.route):
+            plugin._pre_gateway_dispatch(e, self.gw)
+        scored = score.call_args.args[0]
+        self.assertIn('check my working', scored)
+        self.assertNotIn('salad 0', scored, 'gateway: a typed request is scored on its text, not on the image content')
+        context = plugin._dispatch_fit.call_args.args[3]
+        self.assertIn('salad 0', context, 'gateway: the image content reaches routing as supporting context')
+        self.assertIn('salad 0', e.text, 'gateway: the answering model still receives the full conversion')
 
     def test_unauthorized_image_never_calls_vision(self):
         self.gw._is_user_authorized_for_source = lambda s:False
