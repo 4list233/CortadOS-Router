@@ -1,0 +1,3177 @@
+{
+ "generated": "2026-10-13 17:53",
+ "method": "per-benchmark min-max \u2192 logit \u2192 additive ability/difficulty fit over all published models, ridge-shrunk; floors = midpoints between band reference abilities",
+ "benchmarks_used": 93,
+ "families_fitted": 937,
+ "band_references": {
+  "R1": [
+   "claude-haiku-4-5"
+  ],
+  "R2": [
+   "claude-sonnet-5",
+   "gpt-5.6-terra"
+  ],
+  "R3": [
+   "claude-opus-5",
+   "gpt-5.6-sol"
+  ],
+  "R4": [
+   "claude-fable-5-1",
+   "gpt-6-astra"
+  ]
+ },
+ "reference_abilities": {
+  "R1": 0.571,
+  "R2": 2.278,
+  "R3": 3.432,
+  "R4": 3.934
+ },
+ "floors": {
+  "R1": -1000000000.0,
+  "R2": 1.425,
+  "R3": 2.855,
+  "R4": 3.683
+ },
+ "families": [
+  {
+   "family": "gpt-6-astra",
+   "theta": 4.312,
+   "by_skill": {
+    "code": 1.85,
+    "agentic": 3.69,
+    "reasoning": 4.441,
+    "chat": 1.327
+   },
+   "benchmarks": 52,
+   "band": "R4",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-5-5",
+   "theta": 4.304,
+   "by_skill": {
+    "code": 3.467,
+    "agentic": 2.696,
+    "reasoning": 4.237,
+    "chat": 1.101
+   },
+   "benchmarks": 45,
+   "band": "R4",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-fable-5-1",
+   "theta": 3.934,
+   "by_skill": {
+    "code": 2.47,
+    "agentic": 2.256,
+    "reasoning": 3.938,
+    "chat": 1.775
+   },
+   "benchmarks": 49,
+   "band": "R4",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-1-sol",
+   "theta": 3.886,
+   "by_skill": {
+    "code": 1.466,
+    "agentic": 2.697,
+    "reasoning": 4.152,
+    "chat": 1.185
+   },
+   "benchmarks": 42,
+   "band": "R4",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-5-5",
+   "theta": 3.597,
+   "by_skill": {
+    "code": 2.5,
+    "agentic": 1.655,
+    "reasoning": 3.666,
+    "chat": 0.98
+   },
+   "benchmarks": 39,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-5",
+   "theta": 3.514,
+   "by_skill": {
+    "code": 1.96,
+    "agentic": 2.26,
+    "reasoning": 3.6,
+    "chat": 0.976
+   },
+   "benchmarks": 52,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-sol",
+   "theta": 3.432,
+   "by_skill": {
+    "code": 1.728,
+    "agentic": 2.559,
+    "reasoning": 3.468,
+    "chat": 1.14
+   },
+   "benchmarks": 55,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-sol",
+   "theta": 3.175,
+   "by_skill": {
+    "code": 1.217,
+    "agentic": 2.295,
+    "reasoning": 3.289,
+    "chat": 0.546
+   },
+   "benchmarks": 43,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-sol"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-5",
+   "theta": 3.147,
+   "by_skill": {
+    "code": 1.262,
+    "agentic": 2.483,
+    "reasoning": 3.067,
+    "chat": 1.251
+   },
+   "benchmarks": 60,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "muse-spark-1-3",
+   "theta": 3.048,
+   "by_skill": {
+    "code": 1.715,
+    "agentic": 1.715,
+    "reasoning": 2.679,
+    "chat": 1.798
+   },
+   "benchmarks": 37,
+   "band": "R3",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-7-flash",
+   "theta": 2.849,
+   "by_skill": {
+    "code": 1.24,
+    "agentic": 1.232,
+    "reasoning": 2.634,
+    "chat": 2.204
+   },
+   "benchmarks": 47,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.7-flash-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-terra",
+   "theta": 2.832,
+   "by_skill": {
+    "code": 1.252,
+    "agentic": 1.961,
+    "reasoning": 2.867,
+    "chat": 0.734
+   },
+   "benchmarks": 51,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-8-flash",
+   "theta": 2.831,
+   "by_skill": {
+    "code": 1.018,
+    "agentic": 0.942,
+    "reasoning": 2.656,
+    "chat": 2.661
+   },
+   "benchmarks": 46,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    }
+   ]
+  },
+  {
+   "family": "kimi-k3",
+   "theta": 2.807,
+   "by_skill": {
+    "code": 1.815,
+    "agentic": 1.414,
+    "reasoning": 2.561,
+    "chat": 1.166
+   },
+   "benchmarks": 50,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k3-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-8",
+   "theta": 2.806,
+   "by_skill": {
+    "code": 1.73,
+    "agentic": 1.436,
+    "reasoning": 2.768,
+    "chat": 1.166
+   },
+   "benchmarks": 56,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-4-8-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-6",
+   "theta": 2.7,
+   "by_skill": {
+    "code": 1.279,
+    "agentic": 1.625,
+    "reasoning": 2.531,
+    "chat": 0.984
+   },
+   "benchmarks": 49,
+   "band": "R2",
+   "proxy": true,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4",
+   "theta": 2.624,
+   "by_skill": {
+    "code": 0.947,
+    "agentic": 1.311,
+    "reasoning": 2.803,
+    "chat": 1.069
+   },
+   "benchmarks": 58,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-7",
+   "theta": 2.596,
+   "by_skill": {
+    "code": 1.361,
+    "agentic": 1.69,
+    "reasoning": 2.454,
+    "chat": 0.822
+   },
+   "benchmarks": 56,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-4-7-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-1-pro",
+   "theta": 2.505,
+   "by_skill": {
+    "code": 0.398,
+    "agentic": 1.283,
+    "reasoning": 2.492,
+    "chat": 2.078
+   },
+   "benchmarks": 60,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.1-pro",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-6",
+   "theta": 2.442,
+   "by_skill": {
+    "code": 0.975,
+    "agentic": 2.251,
+    "reasoning": 1.981,
+    "chat": 1.031
+   },
+   "benchmarks": 35,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-7",
+   "theta": 2.398,
+   "by_skill": {
+    "code": 0.859,
+    "agentic": 1.375,
+    "reasoning": 2.15,
+    "chat": 1.007
+   },
+   "benchmarks": 38,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "grok-4.7-high",
+     "pool": "cursor-models"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-5",
+   "theta": 2.305,
+   "by_skill": {
+    "code": 0.811,
+    "agentic": 1.202,
+    "reasoning": 2.145,
+    "chat": 0.94
+   },
+   "benchmarks": 48,
+   "band": "R2",
+   "proxy": true,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.5-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-5"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-5",
+   "theta": 2.278,
+   "by_skill": {
+    "code": 1.302,
+    "agentic": 0.723,
+    "reasoning": 2.251,
+    "chat": 0.377
+   },
+   "benchmarks": 46,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-5-flash",
+   "theta": 2.249,
+   "by_skill": {
+    "code": 0.756,
+    "agentic": 0.673,
+    "reasoning": 2.203,
+    "chat": 1.545
+   },
+   "benchmarks": 49,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.5-flash",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-6-flash",
+   "theta": 2.214,
+   "by_skill": {
+    "code": 0.664,
+    "agentic": 0.687,
+    "reasoning": 2.094,
+    "chat": 1.343
+   },
+   "benchmarks": 46,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.6-flash-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-2",
+   "theta": 2.175,
+   "by_skill": {
+    "code": 0.962,
+    "agentic": 1.512,
+    "reasoning": 2.006,
+    "chat": 0.585
+   },
+   "benchmarks": 57,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.2-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-haiku-5-5",
+   "theta": 2.175,
+   "by_skill": {
+    "code": 0.948,
+    "agentic": 0.248,
+    "reasoning": 2.249,
+    "chat": 0.127
+   },
+   "benchmarks": 25,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-haiku-5-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-luna",
+   "theta": 2.165,
+   "by_skill": {
+    "code": 1.193,
+    "agentic": 1.247,
+    "reasoning": 2.056,
+    "chat": -0.152
+   },
+   "benchmarks": 48,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-luna"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-luna-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-3-codex",
+   "theta": 2.152,
+   "by_skill": {
+    "code": 0.122,
+    "agentic": 1.711,
+    "reasoning": 1.65,
+    "chat": 0.829
+   },
+   "benchmarks": 9,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.3-codex-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-flash",
+   "theta": 2.07,
+   "by_skill": {
+    "code": 0.971,
+    "agentic": 1.32,
+    "reasoning": 1.948,
+    "chat": 1.223
+   },
+   "benchmarks": 30,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3-flash",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-luna",
+   "theta": 2.044,
+   "by_skill": {
+    "code": 0.889,
+    "agentic": 1.182,
+    "reasoning": 2.064,
+    "chat": -0.549
+   },
+   "benchmarks": 43,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-luna"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-4-6",
+   "theta": 1.906,
+   "by_skill": {
+    "code": 0.202,
+    "agentic": 1.43,
+    "reasoning": 1.69,
+    "chat": 0.551
+   },
+   "benchmarks": 29,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-sonnet-4-6",
+     "display": "Claude Sonnet 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    }
+   ]
+  },
+  {
+   "family": "glm-5-2",
+   "theta": 1.895,
+   "by_skill": {
+    "code": 0.813,
+    "agentic": 1.021,
+    "reasoning": 1.617,
+    "chat": 0.594
+   },
+   "benchmarks": 51,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "glm-5.2-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-1",
+   "theta": 1.796,
+   "by_skill": {
+    "code": 0.763,
+    "agentic": 0.773,
+    "reasoning": 1.814,
+    "chat": 0.913
+   },
+   "benchmarks": 31,
+   "band": "R2",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.1-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "kimi-k2-7-code",
+   "theta": 1.376,
+   "by_skill": {
+    "code": 0.374,
+    "agentic": -0.148,
+    "reasoning": 1.439,
+    "chat": -0.359
+   },
+   "benchmarks": 40,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k2.7-code",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4-mini",
+   "theta": 1.267,
+   "by_skill": {
+    "code": 0.083,
+    "agentic": 0.61,
+    "reasoning": 0.991,
+    "chat": 0.291
+   },
+   "benchmarks": 45,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-5-sonnet",
+   "theta": 1.165,
+   "by_skill": {
+    "code": 0.571,
+    "agentic": 1.058,
+    "reasoning": 0.792,
+    "chat": 0.22
+   },
+   "benchmarks": 7,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4-nano",
+   "theta": 1.136,
+   "by_skill": {
+    "code": 0.165,
+    "agentic": 0.263,
+    "reasoning": 0.903,
+    "chat": 0.134
+   },
+   "benchmarks": 42,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-sonnet",
+   "theta": 1.028,
+   "by_skill": {
+    "code": 0.266,
+    "agentic": 1.16,
+    "reasoning": 0.707,
+    "chat": 0.158
+   },
+   "benchmarks": 7,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-mini",
+   "theta": 0.994,
+   "by_skill": {
+    "code": 0.312,
+    "agentic": 0.393,
+    "reasoning": 0.86,
+    "chat": 0.776
+   },
+   "benchmarks": 29,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-haiku-4-5",
+   "theta": 0.571,
+   "by_skill": {
+    "code": -0.058,
+    "agentic": -0.125,
+    "reasoning": 0.389,
+    "chat": 0.373
+   },
+   "benchmarks": 19,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    }
+   ]
+  },
+  {
+   "family": "gpt-oss-120b",
+   "theta": 0.248,
+   "by_skill": {
+    "code": -0.18,
+    "agentic": -0.581,
+    "reasoning": 0.371,
+    "chat": 0.16
+   },
+   "benchmarks": 25,
+   "band": "R1",
+   "proxy": false,
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    }
+   ]
+  },
+  {
+   "family": "composer-2-5",
+   "band": null,
+   "why": "no or too few public benchmark scores: unranked, never routed by benchmarks",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "composer-2.5",
+     "pool": "cursor-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-5-extra",
+   "band": null,
+   "why": "no or too few public benchmark scores: unranked, never routed by benchmarks",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-extra-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-6-sonnet",
+   "band": null,
+   "why": "no or too few public benchmark scores: unranked, never routed by benchmarks",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.6-sonnet-medium",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-6-opus",
+   "band": null,
+   "why": "no or too few public benchmark scores: unranked, never routed by benchmarks",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.6-opus-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-5-opus",
+   "band": null,
+   "why": "no or too few public benchmark scores: unranked, never routed by benchmarks",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-opus-high",
+     "pool": "other-models"
+    }
+   ]
+  }
+ ],
+ "bands": {
+  "R1": {
+   "default": [
+    {
+     "family": "kimi-k2-7-code",
+     "score": 1.376,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k2.7-code",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 1.267,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 1.165,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-nano",
+     "score": 1.136,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.571,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": 0.248,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-7-flash",
+     "score": 2.849,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.7-flash-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.832,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra",
+     "fail_up": true
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.831,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini",
+     "fail_up": true
+    }
+   ],
+   "code": [
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.766,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-sonnet",
+     "score": 0.624,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-mini",
+     "score": 0.344,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.294,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": -0.085,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": -0.34,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "kimi-k3",
+     "score": 1.655,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k3-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.536,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.485,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt",
+     "fail_up": true
+    }
+   ],
+   "ops": [
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.912,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-sonnet",
+     "score": 0.892,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.452,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-mini",
+     "score": 0.369,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": -0.105,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": -0.461,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.868,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.748,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.748,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models",
+     "fail_up": true
+    }
+   ],
+   "research": [
+    {
+     "family": "kimi-k2-7-code",
+     "score": 0.9,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k2.7-code",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-mini",
+     "score": 0.835,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.781,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-nano",
+     "score": 0.672,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.384,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": 0.308,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.657,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.657,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.227,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra",
+     "fail_up": true
+    }
+   ],
+   "planning": [
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.898,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-sonnet",
+     "score": 0.888,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.839,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "kimi-k2-7-code",
+     "score": 0.804,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k2.7-code",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.183,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": -0.01,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.505,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.505,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "grok-4-6",
+     "score": 2.169,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6",
+     "fail_up": true
+    }
+   ],
+   "writing": [
+    {
+     "family": "gpt-5-mini",
+     "score": 0.793,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.431,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.376,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.334,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-nano",
+     "score": 0.288,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": 0.202,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.66,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.66,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini",
+     "fail_up": true
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.293,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6",
+     "fail_up": true
+    }
+   ],
+   "conversation": [
+    {
+     "family": "gpt-5-mini",
+     "score": 0.801,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.501,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.392,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.378,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-5-4-nano",
+     "score": 0.365,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": 0.223,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.659,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.659,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini",
+     "fail_up": true
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.448,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6",
+     "fail_up": true
+    }
+   ],
+   "capture/log": [
+    {
+     "family": "claude-4-sonnet",
+     "score": 0.659,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-4-5-sonnet",
+     "score": 0.639,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-mini",
+     "score": 0.585,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-4-mini",
+     "score": 0.451,
+     "tier_band": "R1",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-haiku-4-5",
+     "score": 0.124,
+     "tier_band": "R1",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    },
+    {
+     "family": "gpt-oss-120b",
+     "score": -0.21,
+     "tier_band": "R1",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 1.801,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 1.801,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.641,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt",
+     "fail_up": true
+    }
+   ]
+  },
+  "R2": {
+   "default": [
+    {
+     "family": "gemini-3-7-flash",
+     "score": 2.849,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.7-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.832,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.831,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 2.7,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 2.442,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 2.278,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 3.597,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.514,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.432,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    }
+   ],
+   "code": [
+    {
+     "family": "kimi-k3",
+     "score": 1.655,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k3-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.536,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.485,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.417,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 1.07,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 0.988,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 2.162,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.08,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.06,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    }
+   ],
+   "ops": [
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.868,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.748,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.748,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.521,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 0.965,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 0.897,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.31,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.31,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.17,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    }
+   ],
+   "research": [
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.657,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.657,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.227,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 2.067,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.696,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 1.689,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 2.86,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.813,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.77,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    }
+   ],
+   "planning": [
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.505,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 2.505,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 2.169,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 2.089,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 1.97,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 1.64,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.104,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.104,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.064,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    }
+   ],
+   "writing": [
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.66,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.66,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.293,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.221,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.161,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 0.752,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "muse-spark-1-3",
+     "score": 1.974,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.614,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.501,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    }
+   ],
+   "conversation": [
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.659,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 2.659,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.448,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.374,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.316,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 0.939,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "muse-spark-1-3",
+     "score": 2.062,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.838,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.763,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    }
+   ],
+   "capture/log": [
+    {
+     "family": "gemini-3-8-flash",
+     "score": 1.801,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gemini-3-8-flash",
+     "score": 1.801,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    },
+    {
+     "family": "claude-opus-4-6",
+     "score": 1.641,
+     "tier_band": "R2",
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    },
+    {
+     "family": "gpt-5-6-terra",
+     "score": 1.348,
+     "tier_band": "R2",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "family": "grok-4-6",
+     "score": 1.304,
+     "tier_band": "R2",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    },
+    {
+     "family": "claude-sonnet-5",
+     "score": 0.55,
+     "tier_band": "R2",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.867,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5",
+     "fail_up": true
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.867,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models",
+     "fail_up": true
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.618,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5",
+     "fail_up": true
+    }
+   ]
+  },
+  "R3": {
+   "default": [
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 3.597,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.514,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.514,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.432,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.432,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-6-sol",
+     "score": 3.175,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-sol"
+    }
+   ],
+   "code": [
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 2.162,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.08,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.08,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.06,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.06,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.75,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    }
+   ],
+   "ops": [
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.31,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.31,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.17,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.17,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 2.117,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 2.117,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    }
+   ],
+   "research": [
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 2.86,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.813,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 2.813,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.77,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 2.77,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 2.522,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    }
+   ],
+   "planning": [
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.104,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 3.104,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.064,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 3.064,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-6-sol",
+     "score": 2.891,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-sol"
+    },
+    {
+     "family": "claude-sonnet-5-5",
+     "score": 2.862,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    }
+   ],
+   "writing": [
+    {
+     "family": "muse-spark-1-3",
+     "score": 1.974,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.614,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.614,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.606,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.606,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.501,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    }
+   ],
+   "conversation": [
+    {
+     "family": "muse-spark-1-3",
+     "score": 2.062,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.838,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.838,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.796,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.796,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.763,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    }
+   ],
+   "capture/log": [
+    {
+     "family": "gpt-5-5",
+     "score": 1.867,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "family": "gpt-5-5",
+     "score": 1.867,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.849,
+     "tier_band": "R3",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "family": "gpt-5-6-sol",
+     "score": 1.849,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "muse-spark-1-3",
+     "score": 1.756,
+     "tier_band": "R3",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5",
+     "score": 1.618,
+     "tier_band": "R3",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    }
+   ]
+  },
+  "R4": {
+   "default": [
+    {
+     "family": "gpt-6-astra",
+     "score": 4.312,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 4.304,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 4.304,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 3.934,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 3.886,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    }
+   ],
+   "code": [
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.159,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.159,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-6-astra",
+     "score": 2.586,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 2.384,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 1.958,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    }
+   ],
+   "ops": [
+    {
+     "family": "gpt-6-astra",
+     "score": 3.138,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 2.927,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 2.927,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 2.328,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 2.32,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    }
+   ],
+   "research": [
+    {
+     "family": "gpt-6-astra",
+     "score": 3.507,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.296,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.296,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 3.289,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 3.262,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    }
+   ],
+   "planning": [
+    {
+     "family": "gpt-6-astra",
+     "score": 4.141,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.621,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 3.621,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 3.57,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 3.265,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    }
+   ],
+   "writing": [
+    {
+     "family": "claude-fable-5-1",
+     "score": 2.208,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-astra",
+     "score": 1.95,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 1.778,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 1.728,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 1.728,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    }
+   ],
+   "conversation": [
+    {
+     "family": "claude-fable-5-1",
+     "score": 2.424,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-astra",
+     "score": 2.261,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 2.075,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 2.042,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 2.042,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    }
+   ],
+   "capture/log": [
+    {
+     "family": "gpt-6-astra",
+     "score": 2.508,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    },
+    {
+     "family": "claude-fable-5-1",
+     "score": 2.015,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    },
+    {
+     "family": "gpt-6-1-sol",
+     "score": 1.941,
+     "tier_band": "R4",
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 1.899,
+     "tier_band": "R4",
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    },
+    {
+     "family": "claude-opus-5-5",
+     "score": 1.899,
+     "tier_band": "R4",
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    }
+   ]
+  }
+ }
+}

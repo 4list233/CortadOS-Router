@@ -1,0 +1,11 @@
+name: cortados-router
+version: "0.1.0"
+description: >
+  Shadow-mode router. For every turn it scores the request on the Wangcai 2.0 six-feature scale with typed questions,
+  resolves the band, lane, model and sub-agent count from the mutable routing table, logs the decision and the outcome,
+  and appends a one-line footer. It changes NO behaviour: the face still answers on its configured model.
+manifest_version: 1
+provides_hooks:
+  - pre_llm_call
+  - transform_llm_output
+  - post_llm_call

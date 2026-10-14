@@ -1,0 +1,1668 @@
+{
+ "generated": "2026-10-13 17:53",
+ "scale": "index 100 = best published model on that use case (any vendor, reachable or not); from public benchmarks only",
+ "use_cases": {
+  "code": "building and fixing software in a repo: product modules, scripts, migrations, tests",
+  "ops": "operating things with tools: terminals, deployments, fleet management, browser and desktop actions, long multi-step jobs",
+  "research": "finding out what is true and synthesising it: market, client, technical and school research",
+  "planning": "turning a goal into an ordered plan: strategy, scheduling, decomposition, goal cascades",
+  "writing": "drafting for people: emails, briefs, proposals, posts, in Forest's voice",
+  "conversation": "talking with Forest: answers, advice, status, banter",
+  "capture/log": "taking something down faithfully: notes, logs, reformatting, filing"
+ },
+ "use_case_benchmarks_missing_from_data": [],
+ "reference_index": {
+  "R1": {
+   "general": 13.3,
+   "code": 14.2,
+   "ops": 13.8,
+   "research": 11.0,
+   "planning": 6.1,
+   "writing": 18.2,
+   "conversation": 19.0,
+   "capture/log": 11.5
+  },
+  "R2": {
+   "general": 52.8,
+   "code": 47.9,
+   "ops": 46.6,
+   "research": 46.6,
+   "planning": 50.8,
+   "writing": 42.3,
+   "conversation": 50.6,
+   "capture/log": 49.8
+  },
+  "R3": {
+   "general": 79.6,
+   "code": 67.0,
+   "ops": 76.8,
+   "research": 72.5,
+   "planning": 76.1,
+   "writing": 57.3,
+   "conversation": 70.1,
+   "capture/log": 64.3
+  },
+  "R4": {
+   "general": 91.2,
+   "code": 78.5,
+   "ops": 80.9,
+   "research": 85.9,
+   "planning": 87.4,
+   "writing": 76.4,
+   "conversation": 80.9,
+   "capture/log": 79.7
+  }
+ },
+ "models": [
+  {
+   "family": "gpt-6-astra",
+   "benchmarks": 52,
+   "proxy": false,
+   "ceiling": true,
+   "price_1m_blended_usd": 20.0,
+   "tokens_per_s": 55.053,
+   "ttft_s": 18.547,
+   "index": {
+    "general": 100.0,
+    "code": 78.5,
+    "ops": 100.0,
+    "research": 100.0,
+    "planning": 100.0,
+    "writing": 76.4,
+    "conversation": 80.9,
+    "capture/log": 100.0
+   },
+   "use_case_benchmarks": {
+    "code": 11,
+    "ops": 5,
+    "research": 8,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-astra"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-5-5",
+   "benchmarks": 45,
+   "proxy": false,
+   "ceiling": true,
+   "price_1m_blended_usd": 8.0,
+   "tokens_per_s": 71.599,
+   "ttft_s": 16.91,
+   "index": {
+    "general": 99.8,
+    "code": 100.0,
+    "ops": 95.7,
+    "research": 90.0,
+    "planning": 97.7,
+    "writing": 70.4,
+    "conversation": 100.0,
+    "capture/log": 76.4
+   },
+   "use_case_benchmarks": {
+    "code": 8,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-fable-5-1",
+   "benchmarks": 49,
+   "proxy": false,
+   "ceiling": true,
+   "price_1m_blended_usd": 20.0,
+   "tokens_per_s": 50.989,
+   "ttft_s": 2.21,
+   "index": {
+    "general": 91.2,
+    "code": 84.0,
+    "ops": 80.9,
+    "research": 85.9,
+    "planning": 87.4,
+    "writing": 80.9,
+    "conversation": 89.9,
+    "capture/log": 79.7
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 5,
+    "research": 7,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-fable-5-1"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-1-sol",
+   "benchmarks": 42,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.0,
+   "tokens_per_s": 55.733,
+   "ttft_s": 16.263,
+   "index": {
+    "general": 90.1,
+    "code": 66.2,
+    "ops": 81.9,
+    "research": 92.9,
+    "planning": 88.8,
+    "writing": 71.9,
+    "conversation": 81.2,
+    "capture/log": 97.2
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6.1-sol"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-5-5",
+   "benchmarks": 39,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.0,
+   "tokens_per_s": 92.184,
+   "ttft_s": 4.392,
+   "index": {
+    "general": 83.4,
+    "code": 80.4,
+    "ops": 80.6,
+    "research": 71.4,
+    "planning": 87.8,
+    "writing": 64.9,
+    "conversation": 71.7,
+    "capture/log": 65.8
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 7,
+    "planning": 7,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-5",
+   "benchmarks": 52,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 10.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 81.5,
+    "code": 76.3,
+    "ops": 76.8,
+    "research": 72.5,
+    "planning": 82.4,
+    "writing": 57.3,
+    "conversation": 84.2,
+    "capture/log": 64.3
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 6,
+    "research": 8,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-opus-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-sol",
+   "benchmarks": 55,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 8.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 79.6,
+    "code": 67.0,
+    "ops": 79.3,
+    "research": 75.3,
+    "planning": 76.1,
+    "writing": 63.9,
+    "conversation": 70.1,
+    "capture/log": 77.7
+   },
+   "use_case_benchmarks": {
+    "code": 11,
+    "ops": 7,
+    "research": 7,
+    "planning": 8,
+    "writing": 6,
+    "conversation": 5,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-sol"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-sol-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-sol",
+   "benchmarks": 43,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 73.6,
+    "code": 57.6,
+    "ops": 69.9,
+    "research": 71.6,
+    "planning": 71.6,
+    "writing": 52.0,
+    "conversation": 59.0,
+    "capture/log": 73.4
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-sol"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-5",
+   "benchmarks": 60,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 11.25,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 73.0,
+    "code": 57.5,
+    "ops": 71.3,
+    "research": 70.8,
+    "planning": 66.2,
+    "writing": 62.9,
+    "conversation": 69.5,
+    "capture/log": 79.5
+   },
+   "use_case_benchmarks": {
+    "code": 13,
+    "ops": 9,
+    "research": 9,
+    "planning": 10,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "muse-spark-1-3",
+   "benchmarks": 37,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 2.0,
+   "tokens_per_s": 157.418,
+   "ttft_s": 25.517,
+   "index": {
+    "general": 70.7,
+    "code": 61.4,
+    "ops": 62.0,
+    "research": 67.7,
+    "planning": 65.9,
+    "writing": 79.2,
+    "conversation": 73.8,
+    "capture/log": 94.5
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 5,
+    "planning": 7,
+    "writing": 5,
+    "conversation": 3,
+    "capture/log": 5
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "muse-spark-1.3-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-7-flash",
+   "benchmarks": 47,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.5,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 66.1,
+    "code": 54.3,
+    "ops": 56.9,
+    "research": 71.4,
+    "planning": 61.7,
+    "writing": 89.3,
+    "conversation": 72.2,
+    "capture/log": 85.7
+   },
+   "use_case_benchmarks": {
+    "code": 9,
+    "ops": 5,
+    "research": 7,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.7-flash-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-terra",
+   "benchmarks": 51,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.5,
+   "tokens_per_s": 97.789,
+   "ttft_s": 1.741,
+   "index": {
+    "general": 65.7,
+    "code": 54.7,
+    "ops": 69.2,
+    "research": 56.0,
+    "planning": 62.2,
+    "writing": 50.8,
+    "conversation": 56.8,
+    "capture/log": 67.7
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 5,
+    "research": 8,
+    "planning": 9,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-terra"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-terra-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-8-flash",
+   "benchmarks": 46,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.5,
+   "tokens_per_s": 149.564,
+   "ttft_s": 13.859,
+   "index": {
+    "general": 65.7,
+    "code": 57.7,
+    "ops": 55.6,
+    "research": 76.6,
+    "planning": 54.3,
+    "writing": 100.0,
+    "conversation": 75.0,
+    "capture/log": 91.3
+   },
+   "use_case_benchmarks": {
+    "code": 9,
+    "ops": 4,
+    "research": 8,
+    "planning": 7,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.8-flash-high",
+     "pool": "other-models"
+    },
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gemini-3.8-flash-high",
+     "display": "Gemini 3.8 Flash (High)",
+     "pool": "gemini"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-8",
+   "benchmarks": 56,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 10.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 65.1,
+    "code": 55.5,
+    "ops": 60.1,
+    "research": 57.1,
+    "planning": 56.7,
+    "writing": 64.8,
+    "conversation": 57.2,
+    "capture/log": 48.9
+   },
+   "use_case_benchmarks": {
+    "code": 11,
+    "ops": 8,
+    "research": 9,
+    "planning": 10,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-4-8-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "kimi-k3",
+   "benchmarks": 50,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 6.0,
+   "tokens_per_s": 41.766,
+   "ttft_s": 2.538,
+   "index": {
+    "general": 65.1,
+    "code": 60.1,
+    "ops": 53.0,
+    "research": 58.7,
+    "planning": 60.6,
+    "writing": 63.0,
+    "conversation": 65.4,
+    "capture/log": 64.0
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 5,
+    "research": 8,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k3-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-6",
+   "benchmarks": 49,
+   "proxy": true,
+   "ceiling": false,
+   "price_1m_blended_usd": 3.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 62.6,
+    "code": 55.2,
+    "ops": 60.2,
+    "research": 58.2,
+    "planning": 67.1,
+    "writing": 59.1,
+    "conversation": 61.2,
+    "capture/log": 72.1
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 4,
+    "research": 8,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.6-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-6"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4",
+   "benchmarks": 58,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 5.625,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 60.9,
+    "code": 47.0,
+    "ops": 62.4,
+    "research": 37.7,
+    "planning": 62.1,
+    "writing": 58.2,
+    "conversation": 64.1,
+    "capture/log": 65.8
+   },
+   "use_case_benchmarks": {
+    "code": 13,
+    "ops": 8,
+    "research": 9,
+    "planning": 9,
+    "writing": 6,
+    "conversation": 5,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-7",
+   "benchmarks": 56,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 10.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 60.2,
+    "code": 57.7,
+    "ops": 58.8,
+    "research": 53.2,
+    "planning": 55.8,
+    "writing": 52.4,
+    "conversation": 61.5,
+    "capture/log": 51.4
+   },
+   "use_case_benchmarks": {
+    "code": 13,
+    "ops": 7,
+    "research": 8,
+    "planning": 9,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-opus-4-7-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-1-pro",
+   "benchmarks": 60,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.5,
+   "tokens_per_s": 137.133,
+   "ttft_s": 14.38,
+   "index": {
+    "general": 58.1,
+    "code": 27.6,
+    "ops": 55.9,
+    "research": 72.4,
+    "planning": 60.5,
+    "writing": 81.2,
+    "conversation": 74.6,
+    "capture/log": 86.0
+   },
+   "use_case_benchmarks": {
+    "code": 12,
+    "ops": 8,
+    "research": 10,
+    "planning": 10,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.1-pro",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-opus-4-6",
+   "benchmarks": 35,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 10.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 56.6,
+    "code": 50.1,
+    "ops": 61.1,
+    "research": 60.5,
+    "planning": 58.7,
+    "writing": 53.8,
+    "conversation": 60.2,
+    "capture/log": 44.5
+   },
+   "use_case_benchmarks": {
+    "code": 6,
+    "ops": 5,
+    "research": 8,
+    "planning": 6,
+    "writing": 2,
+    "conversation": 5,
+    "capture/log": 3
+   },
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-opus-4-6-thinking",
+     "display": "Claude Opus 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-7",
+   "benchmarks": 38,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 3.0,
+   "tokens_per_s": 60.967,
+   "ttft_s": 7.968,
+   "index": {
+    "general": 55.6,
+    "code": 42.6,
+    "ops": 54.1,
+    "research": 57.2,
+    "planning": 53.3,
+    "writing": 58.5,
+    "conversation": 50.8,
+    "capture/log": 73.0
+   },
+   "use_case_benchmarks": {
+    "code": 6,
+    "ops": 3,
+    "research": 7,
+    "planning": 6,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "grok-4.7-high",
+     "pool": "cursor-models"
+    }
+   ]
+  },
+  {
+   "family": "grok-4-5",
+   "benchmarks": 48,
+   "proxy": true,
+   "ceiling": false,
+   "price_1m_blended_usd": 3.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 53.5,
+    "code": 40.9,
+    "ops": 50.9,
+    "research": 53.1,
+    "planning": 53.9,
+    "writing": 55.6,
+    "conversation": 56.6,
+    "capture/log": 71.5
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 5,
+    "research": 8,
+    "planning": 9,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "cursor-grok-4.5-high",
+     "pool": "cursor-models",
+     "proxy_for": "cursor-grok-4-5"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-5",
+   "benchmarks": 46,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 52.8,
+    "code": 47.9,
+    "ops": 46.6,
+    "research": 46.6,
+    "planning": 50.8,
+    "writing": 42.3,
+    "conversation": 50.6,
+    "capture/log": 49.8
+   },
+   "use_case_benchmarks": {
+    "code": 11,
+    "ops": 4,
+    "research": 8,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-sonnet-5"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-sonnet-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-5-flash",
+   "benchmarks": 49,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 3.375,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 52.2,
+    "code": 38.8,
+    "ops": 39.3,
+    "research": 62.1,
+    "planning": 47.4,
+    "writing": 65.3,
+    "conversation": 66.1,
+    "capture/log": 66.1
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 4,
+    "research": 7,
+    "planning": 9,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.5-flash",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-6-flash",
+   "benchmarks": 46,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.5,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 51.4,
+    "code": 37.5,
+    "ops": 42.6,
+    "research": 59.6,
+    "planning": 44.9,
+    "writing": 63.0,
+    "conversation": 62.5,
+    "capture/log": 68.6
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3.6-flash-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-haiku-5-5",
+   "benchmarks": 25,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.2,
+   "tokens_per_s": 161.828,
+   "ttft_s": 14.707,
+   "index": {
+    "general": 50.5,
+    "code": 45.5,
+    "ops": 44.2,
+    "research": 51.1,
+    "planning": 47.4,
+    "writing": 47.6,
+    "conversation": 74.6,
+    "capture/log": 42.5
+   },
+   "use_case_benchmarks": {
+    "code": 6,
+    "ops": 2,
+    "research": 3,
+    "planning": 6,
+    "writing": 4,
+    "conversation": 1,
+    "capture/log": 4
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-haiku-5-5-thinking-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-2",
+   "benchmarks": 57,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.813,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 50.4,
+    "code": 39.3,
+    "ops": 50.1,
+    "research": 38.3,
+    "planning": 45.2,
+    "writing": 41.2,
+    "conversation": 45.1,
+    "capture/log": 59.7
+   },
+   "use_case_benchmarks": {
+    "code": 12,
+    "ops": 6,
+    "research": 9,
+    "planning": 10,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.2-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-6-luna",
+   "benchmarks": 48,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.45,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 50.2,
+    "code": 49.9,
+    "ops": 51.3,
+    "research": 47.5,
+    "planning": 44.8,
+    "writing": 34.3,
+    "conversation": 44.4,
+    "capture/log": 48.3
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 3,
+    "research": 8,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 5,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-5.6-luna"
+    },
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.6-luna-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-3-codex",
+   "benchmarks": 9,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 4.813,
+   "tokens_per_s": 106.059,
+   "ttft_s": 23.691,
+   "index": {
+    "general": 49.9,
+    "code": 42.9,
+    "ops": 61.3,
+    "research": 49.7,
+    "planning": 50.7,
+    "writing": 51.9,
+    "conversation": 60.2,
+    "capture/log": 56.0
+   },
+   "use_case_benchmarks": {
+    "code": 4,
+    "ops": 3,
+    "research": 2,
+    "planning": 2,
+    "writing": 1,
+    "conversation": 1,
+    "capture/log": 1
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.3-codex-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gemini-3-flash",
+   "benchmarks": 30,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.125,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 48.0,
+    "code": 40.0,
+    "ops": 43.7,
+    "research": 52.0,
+    "planning": 41.7,
+    "writing": 49.0,
+    "conversation": 59.9,
+    "capture/log": 62.8
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 2,
+    "research": 7,
+    "planning": 3,
+    "writing": 2,
+    "conversation": 5,
+    "capture/log": 3
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gemini-3-flash",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-6-luna",
+   "benchmarks": 43,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.2,
+   "tokens_per_s": 124.884,
+   "ttft_s": 12.592,
+   "index": {
+    "general": 47.4,
+    "code": 44.9,
+    "ops": 50.8,
+    "research": 45.0,
+    "planning": 43.9,
+    "writing": 21.9,
+    "conversation": 40.5,
+    "capture/log": 38.4
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "codex",
+     "provider": "openai-codex",
+     "model": "gpt-6-luna"
+    }
+   ]
+  },
+  {
+   "family": "claude-sonnet-4-6",
+   "benchmarks": 29,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 6.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 44.2,
+    "code": 28.7,
+    "ops": 40.9,
+    "research": 53.8,
+    "planning": 43.3,
+    "writing": 37.1,
+    "conversation": 39.0,
+    "capture/log": 30.7
+   },
+   "use_case_benchmarks": {
+    "code": 6,
+    "ops": 4,
+    "research": 5,
+    "planning": 3,
+    "writing": 2,
+    "conversation": 4,
+    "capture/log": 3
+   },
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "claude-sonnet-4-6",
+     "display": "Claude Sonnet 4.6 (Thinking)",
+     "pool": "claude-gpt"
+    }
+   ]
+  },
+  {
+   "family": "glm-5-2",
+   "benchmarks": 51,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 2.15,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 43.9,
+    "code": 39.5,
+    "ops": 46.5,
+    "research": 43.2,
+    "planning": 39.5,
+    "writing": 41.0,
+    "conversation": 50.8,
+    "capture/log": 42.1
+   },
+   "use_case_benchmarks": {
+    "code": 11,
+    "ops": 5,
+    "research": 8,
+    "planning": 8,
+    "writing": 6,
+    "conversation": 6,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "glm-5.2-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-1",
+   "benchmarks": 31,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 3.438,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 41.7,
+    "code": 26.8,
+    "ops": 38.6,
+    "research": 37.2,
+    "planning": 33.0,
+    "writing": 40.3,
+    "conversation": 46.2,
+    "capture/log": 47.1
+   },
+   "use_case_benchmarks": {
+    "code": 8,
+    "ops": 2,
+    "research": 7,
+    "planning": 3,
+    "writing": 2,
+    "conversation": 5,
+    "capture/log": 3
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.1-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "kimi-k2-7-code",
+   "benchmarks": 40,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.712,
+   "tokens_per_s": 61.451,
+   "ttft_s": 1.193,
+   "index": {
+    "general": 31.9,
+    "code": 27.3,
+    "ops": 28.5,
+    "research": 34.2,
+    "planning": 34.9,
+    "writing": 24.6,
+    "conversation": 36.5,
+    "capture/log": 8.8
+   },
+   "use_case_benchmarks": {
+    "code": 10,
+    "ops": 4,
+    "research": 7,
+    "planning": 8,
+    "writing": 5,
+    "conversation": 4,
+    "capture/log": 6
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "kimi-k2.7-code",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4-mini",
+   "benchmarks": 45,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 1.688,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 29.4,
+    "code": 25.9,
+    "ops": 51.0,
+    "research": 17.8,
+    "planning": 21.5,
+    "writing": 31.3,
+    "conversation": 38.2,
+    "capture/log": 44.9
+   },
+   "use_case_benchmarks": {
+    "code": 9,
+    "ops": 3,
+    "research": 7,
+    "planning": 7,
+    "writing": 6,
+    "conversation": 5,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-mini-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-5-sonnet",
+   "benchmarks": 7,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 6.0,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 27.0,
+    "code": 30.2,
+    "ops": 30.6,
+    "research": 27.6,
+    "planning": 24.1,
+    "writing": 24.6,
+    "conversation": 26.1,
+    "capture/log": 24.3
+   },
+   "use_case_benchmarks": {
+    "code": 3,
+    "ops": 1,
+    "research": 2,
+    "planning": 1,
+    "writing": 1,
+    "conversation": 1,
+    "capture/log": 1
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-sonnet",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-4-nano",
+   "benchmarks": 42,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.463,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 26.4,
+    "code": 25.4,
+    "ops": 37.5,
+    "research": 18.7,
+    "planning": 22.8,
+    "writing": 29.8,
+    "conversation": 30.3,
+    "capture/log": 25.2
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 3,
+    "research": 6,
+    "planning": 7,
+    "writing": 6,
+    "conversation": 5,
+    "capture/log": 7
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.4-nano-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-sonnet",
+   "benchmarks": 7,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": null,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 23.8,
+    "code": 29.5,
+    "ops": 26.2,
+    "research": 24.5,
+    "planning": 21.1,
+    "writing": 21.2,
+    "conversation": 22.1,
+    "capture/log": 20.5
+   },
+   "use_case_benchmarks": {
+    "code": 3,
+    "ops": 1,
+    "research": 2,
+    "planning": 1,
+    "writing": 1,
+    "conversation": 1,
+    "capture/log": 1
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4-sonnet",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-mini",
+   "benchmarks": 29,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.688,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 23.1,
+    "code": 13.6,
+    "ops": 23.2,
+    "research": 22.3,
+    "planning": 15.1,
+    "writing": 26.5,
+    "conversation": 27.7,
+    "capture/log": 31.2
+   },
+   "use_case_benchmarks": {
+    "code": 6,
+    "ops": 2,
+    "research": 6,
+    "planning": 2,
+    "writing": 4,
+    "conversation": 4,
+    "capture/log": 3
+   },
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5-mini",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-haiku-4-5",
+   "benchmarks": 19,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": null,
+   "tokens_per_s": null,
+   "ttft_s": null,
+   "index": {
+    "general": 13.3,
+    "code": 14.2,
+    "ops": 13.8,
+    "research": 11.0,
+    "planning": 6.1,
+    "writing": 18.2,
+    "conversation": 19.0,
+    "capture/log": 11.5
+   },
+   "use_case_benchmarks": {
+    "code": 3,
+    "ops": 1,
+    "research": 3,
+    "planning": 1,
+    "writing": 1,
+    "conversation": 3,
+    "capture/log": 2
+   },
+   "reach": [
+    {
+     "lane": "claude",
+     "provider": "claude-cli",
+     "model": "claude-haiku-4-5-20251001"
+    }
+   ]
+  },
+  {
+   "family": "gpt-oss-120b",
+   "benchmarks": 25,
+   "proxy": false,
+   "ceiling": false,
+   "price_1m_blended_usd": 0.248,
+   "tokens_per_s": 235.775,
+   "ttft_s": 0.499,
+   "index": {
+    "general": 5.8,
+    "code": 0.9,
+    "ops": 0.0,
+    "research": 5.6,
+    "planning": 0.0,
+    "writing": 6.4,
+    "conversation": 12.5,
+    "capture/log": 16.9
+   },
+   "use_case_benchmarks": {
+    "code": 7,
+    "ops": 4,
+    "research": 4,
+    "planning": 4,
+    "writing": 4,
+    "conversation": 4,
+    "capture/log": 2
+   },
+   "reach": [
+    {
+     "lane": "antigravity",
+     "provider": "agy-cli",
+     "model": "gpt-oss-120b-medium",
+     "display": "GPT-OSS 120B (Medium)",
+     "pool": "claude-gpt"
+    }
+   ]
+  }
+ ],
+ "unranked": [
+  {
+   "family": "composer-2-5",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "composer-2.5",
+     "pool": "cursor-models"
+    }
+   ]
+  },
+  {
+   "family": "gpt-5-5-extra",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "gpt-5.5-extra-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-6-sonnet",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.6-sonnet-medium",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-6-opus",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.6-opus-high",
+     "pool": "other-models"
+    }
+   ]
+  },
+  {
+   "family": "claude-4-5-opus",
+   "reach": [
+    {
+     "lane": "cursor",
+     "provider": "cursor-cli",
+     "model": "claude-4.5-opus-high",
+     "pool": "other-models"
+    }
+   ]
+  }
+ ]
+}

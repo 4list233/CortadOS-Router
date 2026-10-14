@@ -1,0 +1,32 @@
+{
+ "base": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+ "adapter": "~/cortados-router/s1/runs/2026-09-28/adapter",
+ "temperatures": {
+  "steps": 1.5,
+  "ambiguity": 2.5,
+  "blast_radius": 2.5,
+  "context_size": 1.5,
+  "novelty": 2.5,
+  "parallelizability": 2.0,
+  "outward": 2.0,
+  "work_kind": 2.0,
+  "urgency": 2.0,
+  "needs_clarification": 2.5,
+  "parts": 1.5,
+  "diversity": 1.5
+ },
+ "promoted": "2026-09-29 10:10",
+ "inference": {
+  "fail_up_below": 0.75,
+  "outward_at": 0.25
+ },
+ "report": "~/cortados-router/s1/runs/2026-09-28/report.json",
+ "holdout": {
+  "band_accuracy": 0.572,
+  "under_routed": 0.057,
+  "over_routed": 0.371,
+  "outward_recall": 0.966
+ },
+ "holdout_rows": 229,
+ "note": "Shape of s1/current.json, which s1/nightly.sh writes on promotion and s1/serve.py loads. The numbers are the promoted CortadOS Router S1 adapter's holdout grade; the adapter itself is not published. Paths must be absolute in a real current.json."
+}

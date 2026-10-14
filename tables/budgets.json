@@ -1,0 +1,96 @@
+{
+ "_doc": "Scarcity is measured in SUBSCRIPTION UNITS, never dollars (Forest 2026-09-19, 2026-09-21): % of the plan's window used versus % of the window's time elapsed, read from each vendor's own usage screen through a PTY (cortados_router/scarcity.py \u2192 ~/.cortados/scarcity.json, history in scarcity-history.jsonl). Local lanes cost nothing; their only scarce resource is free memory. This file holds the plan names and the policy knobs only; the readings are never written here.",
+ "lanes": {
+  "claude": {
+   "plan": "Claude Max 20x",
+   "windows": [
+    "5h",
+    "7d"
+   ],
+   "usage_source": "claude /usage",
+   "unit_cost_pct_per_mtok": null
+  },
+  "codex": {
+   "plan": "ChatGPT 20x",
+   "windows": [
+    "5h",
+    "7d"
+   ],
+   "usage_source": "codex /status",
+   "unit_cost_pct_per_mtok": null
+  },
+  "antigravity": {
+   "plan": "Google AI Pro",
+   "windows": [
+    "5h",
+    "7d"
+   ],
+   "usage_source": "agy /usage (Gemini group; a separate Claude+GPT group exists, unused)",
+   "unit_cost_pct_per_mtok": null
+  },
+  "cursor": {
+   "plan": "Cursor Pro",
+   "windows": [
+    "1mo"
+   ],
+   "usage_source": "cursor-agent /usage (Included; Auto and named-model pools listed)",
+   "unit_cost_pct_per_mtok": null
+  },
+  "local": {
+   "plan": "free",
+   "resource": "vram",
+   "ram_gate_factor": 1.5,
+   "note": "scarcity = memory pressure; 0 when the model is resident and the gate passes"
+  }
+ },
+ "policy": {
+  "reserve_for_forest_interactive_pct": 30,
+  "nightly_jobs_max_pct_of_window": 15,
+  "reserve_heavy_tiers_when_scarcity_above": 0.7,
+  "diversity_off_above": 0.5,
+  "demote_above": 0.5,
+  "prefer_expiring_headroom_pct": 10,
+  "_doc": "demote_above: a lane on pace to overshoot its window goes behind its band-mates. prefer_expiring_headroom_pct: a lane within the last 15% of a \u22651-day window with at least this much headroom about to be wiped goes first. reserve_heavy_tiers_when_scarcity_above: background work is deferred and sub-agents held to the minimum. 1.0 = window spent or vendor refusing \u2192 lane skipped."
+ },
+ "context": {
+  "_doc": "Context policy (Hermes Agents Context session, 2026-09-24, measured over 1,285 brain calls): the harness costs ~31k prompt tokens before any history (system prompt 7-15k + persona skill + tool schemas); the ledger shows 62k average per brain call. A route must FIT the measured turn: harness + history estimate, \u00d71.2 headroom, \u2264 the lane's transport ceiling. Fallbacks are never smaller than the primary. Local lanes only for fresh-context work (cron/report jobs, sub-agents with their own context, reflex answers on a compacted view).",
+  "harness_tokens": 31000,
+  "headroom": 1.2,
+  "ceiling_tokens": {
+   "claude": 200000,
+   "claude[1m]": 1000000,
+   "codex": 100000,
+   "cursor": 200000,
+   "antigravity": 0,
+   "local": 65536
+  },
+  "ceiling_notes": {
+   "codex": "272k window but the native route fails on ~400 KB request bodies: treat as 100k per call and never swap onto it mid-session",
+   "local": "qwen3-8b-nothink-64k at 65,536 (the only model allowed resident on this Mac, Forest 2026-09-26); ~35k usable after the harness \u2192 fresh-context work only",
+   "antigravity": "TEMPORARY CONTAINMENT 2026-10-04: automatic selection disabled (ceiling 0) until exact-session fit accounting and the 180,000 UTF-8 byte guard are activated and verified. Previous policy ceiling 40,000 tokens. AGY USER_INPUT truncates around 192,000 bytes; never clip protected exchanges or the current tool loop to fit."
+  },
+  "local_fresh_only_history_tokens": 8000
+ },
+ "stickiness": {
+  "_doc": "Interactive and browser turns stay on one model (context session's item 2): a session keeps its routed model until the band rises, the requirement exceeds the model's index, or the model's pool is spent. Browser/desktop sessions are pinned harder: only a spent pool moves them.",
+  "browser_tools": [
+   "browser",
+   "playwright",
+   "computer_use",
+   "desk_",
+   "screenshot",
+   "chrome"
+  ],
+  "pin_ttl_s": 7200
+ },
+ "escalation": {
+  "_doc": "Forest 2026-09-29: difficulty is a prior from the request text; a task can turn out bigger once the code is mapped. Two signals raise it for the rest of the session (ttl_s) and for its sub-agents: the face calling router_escalate (scope larger \u2192 D_floor_larger, much_larger \u2192 D_floor_much_larger), or the turn's trajectory crossing tool_calls or files_touched (\u2192 D_floor_trajectory). An image-only message (screenshot with no text) shows the scorer nothing but boilerplate, so it read a 20-question quiz as R0 chit-chat (2026-09-29) \u2014 such turns are floored at D_floor_attachment.",
+  "tool_calls": 25,
+  "files_touched": 8,
+  "D_floor_trajectory": 9,
+  "D_floor_larger": 9,
+  "D_floor_much_larger": 11,
+  "ttl_s": 7200,
+  "D_floor_attachment": 9
+ }
+}

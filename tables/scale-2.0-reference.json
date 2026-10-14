@@ -1,0 +1,537 @@
+{
+  "schema_version": 1,
+  "authority_note": "CANDIDATE, NOT LAW. This is the acceptance author's machine transcription of docs/design/B3-ROUTING-TABLE-v1.md (Appendix A), which WCO-RES-001 marks a PROPOSAL until Forest's acceptance ratifies it. No ratification G-entry exists for any table version as of package authorship (observed). The production machine copy at config/res/routing-tables/routing-table-v1.json is authored at WCO-RES-101; its SHAPE is pinned here because no ratified authority states one (see acceptance/res/AMENDMENT-NEEDS.md ESC-RES-PKG-1).",
+  "table_id": "RES-TABLE-001",
+  "table_version": 1,
+  "status": "proposed",
+  "features": [
+    {
+      "name": "steps",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "one action or lookup",
+        "1": "a short sequence with one dependency",
+        "2": "a multi-step chain with several dependencies",
+        "3": "a long dependent chain"
+      }
+    },
+    {
+      "name": "ambiguity",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "directive fully determines the work",
+        "1": "minor interpretation with an evident objective",
+        "2": "substantial interpretation among plausible objectives",
+        "3": "intent must be substantially interpreted"
+      }
+    },
+    {
+      "name": "blast_radius",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "words only, nothing changes",
+        "1": "a bounded reversible workspace change",
+        "2": "a broad or difficult-to-reverse system change",
+        "3": "law, money, production, or irreversible effects nearby"
+      }
+    },
+    {
+      "name": "context_size",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "fits well inside the local 40,960-token window",
+        "1": "fits the local window with moderate headroom",
+        "2": "approaches or crosses the local window and benefits from decomposition",
+        "3": "exceeds a single frontier context; must be decomposed"
+      }
+    },
+    {
+      "name": "novelty",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "matches patterns in memory/corpus",
+        "1": "a known pattern with a small variation",
+        "2": "a materially new pattern needing investigation",
+        "3": "nothing like it recorded"
+      }
+    },
+    {
+      "name": "parallelizability",
+      "min": 0,
+      "max": 3,
+      "anchors": {
+        "0": "strictly serial",
+        "1": "mostly serial with one independent branch",
+        "2": "several independent subtasks can proceed concurrently",
+        "3": "mostly independent subtasks"
+      }
+    }
+  ],
+  "difficulty": {
+    "formula": "steps + ambiguity + blast_radius + novelty",
+    "terms": [
+      "steps",
+      "ambiguity",
+      "blast_radius",
+      "novelty"
+    ],
+    "modifiers_not_difficulty": [
+      "context_size",
+      "parallelizability"
+    ],
+    "min": 0,
+    "max": 12
+  },
+  "bands": [
+    {
+      "band": "R0",
+      "label": "reflex",
+      "condition": {
+        "all": [
+          {
+            "lte": [
+              "D",
+              2
+            ]
+          },
+          {
+            "eq": [
+              "blast_radius",
+              0
+            ]
+          },
+          {
+            "lte": [
+              "context_size",
+              1
+            ]
+          }
+        ]
+      },
+      "orchestrator": {
+        "background": "none",
+        "subtask": "none",
+        "interactive": "pipeline_l2_firing"
+      },
+      "worker_tier": {
+        "default": "W-local",
+        "overrides": []
+      }
+    },
+    {
+      "band": "R1",
+      "label": "light",
+      "condition": {
+        "all": [
+          {
+            "lte": [
+              "D",
+              5
+            ]
+          },
+          {
+            "lte": [
+              "blast_radius",
+              1
+            ]
+          },
+          {
+            "lte": [
+              "context_size",
+              1
+            ]
+          },
+          {
+            "lte": [
+              "parallelizability",
+              1
+            ]
+          }
+        ]
+      },
+      "orchestrator": {
+        "background": "none",
+        "subtask": "none",
+        "interactive": "pipeline_l2_firing"
+      },
+      "worker_tier": {
+        "default": "W-fast",
+        "overrides": []
+      }
+    },
+    {
+      "band": "R3",
+      "label": "hard",
+      "condition": {
+        "any": [
+          {
+            "gte": [
+              "D",
+              9
+            ]
+          },
+          {
+            "eq": [
+              "blast_radius",
+              3
+            ]
+          }
+        ]
+      },
+      "orchestrator": {
+        "background": "O-opus",
+        "subtask": "O-opus",
+        "interactive": "O-opus"
+      },
+      "worker_tier": {
+        "default": "W-std",
+        "overrides": [
+          {
+            "when": {
+              "eq": [
+                "blast_radius",
+                3
+              ]
+            },
+            "tier": "W-heavy"
+          }
+        ]
+      }
+    },
+    {
+      "band": "R2",
+      "label": "standard",
+      "condition": {
+        "any": [
+          {
+            "lte": [
+              "D",
+              8
+            ]
+          },
+          {
+            "gte": [
+              "parallelizability",
+              2
+            ]
+          },
+          {
+            "gte": [
+              "context_size",
+              2
+            ]
+          }
+        ]
+      },
+      "orchestrator": {
+        "background": "O-sonnet",
+        "subtask": "O-sonnet",
+        "interactive": "O-sonnet"
+      },
+      "worker_tier": {
+        "default": "W-std",
+        "floor": "W-std",
+        "policy": "per_subtask_rescore",
+        "overrides": []
+      }
+    },
+    {
+      "band": "R4",
+      "label": "ceiling",
+      "condition": {
+        "never": true
+      },
+      "reachable_by": "escalation_only",
+      "orchestrator": {
+        "background": "O-fable",
+        "subtask": "O-fable",
+        "interactive": "O-fable"
+      },
+      "worker_tier": {
+        "default": "W-ceiling",
+        "overrides": []
+      }
+    }
+  ],
+  "fallback": {
+    "interactive": "R2",
+    "background": "R1",
+    "features": null,
+    "degraded": true
+  },
+  "pinned_vectors": [
+    {
+      "id": "PV1",
+      "features": {
+        "steps": 3,
+        "ambiguity": 3,
+        "blast_radius": 3,
+        "context_size": 2,
+        "novelty": 3,
+        "parallelizability": 0
+      },
+      "D": 12,
+      "band": "R3",
+      "worker_tier": "W-heavy"
+    },
+    {
+      "id": "PV2",
+      "features": {
+        "steps": 1,
+        "ambiguity": 1,
+        "blast_radius": 0,
+        "context_size": 3,
+        "novelty": 0,
+        "parallelizability": 0
+      },
+      "D": 2,
+      "band": "R2",
+      "worker_tier": "W-std"
+    },
+    {
+      "id": "PV3",
+      "features": {
+        "steps": 1,
+        "ambiguity": 0,
+        "blast_radius": 3,
+        "context_size": 0,
+        "novelty": 0,
+        "parallelizability": 0
+      },
+      "D": 4,
+      "band": "R3",
+      "worker_tier": "W-heavy"
+    },
+    {
+      "id": "PV4",
+      "features": {
+        "steps": 3,
+        "ambiguity": 2,
+        "blast_radius": 2,
+        "context_size": 1,
+        "novelty": 2,
+        "parallelizability": 3
+      },
+      "D": 9,
+      "band": "R3",
+      "worker_tier": "W-std"
+    },
+    {
+      "id": "PV5",
+      "features": {
+        "steps": 2,
+        "ambiguity": 1,
+        "blast_radius": 1,
+        "context_size": 2,
+        "novelty": 1,
+        "parallelizability": 1
+      },
+      "D": 5,
+      "band": "R2",
+      "worker_tier": "W-std"
+    },
+    {
+      "id": "PV6",
+      "features": {
+        "steps": 2,
+        "ambiguity": 1,
+        "blast_radius": 1,
+        "context_size": 1,
+        "novelty": 1,
+        "parallelizability": 1
+      },
+      "D": 5,
+      "band": "R1",
+      "worker_tier": "W-fast"
+    }
+  ],
+  "tiers": {
+    "W-local": {
+      "kind": "worker",
+      "primary_engine": {
+        "runtime": "ollama",
+        "model_id": "qwen3:8b",
+        "digest_prefix": "500a1f067a9f",
+        "pin": "F-LMS-003",
+        "pin_state": "pinned"
+      },
+      "alternates": [],
+      "lane": "local-lane"
+    },
+    "W-fast": {
+      "kind": "worker",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-haiku-4-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [
+        {
+          "runtime": "gemini",
+          "model_class": "flash",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        }
+      ],
+      "lane": "claude-lane"
+    },
+    "W-std": {
+      "kind": "worker",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-sonnet-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [
+        {
+          "runtime": "codex",
+          "model_class": "runtime_default",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        },
+        {
+          "runtime": "gemini",
+          "model_class": "pro",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        }
+      ],
+      "lane": "claude-lane"
+    },
+    "W-heavy": {
+      "kind": "worker",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-opus-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [
+        {
+          "runtime": "codex",
+          "model_class": "high_effort",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        }
+      ],
+      "lane": "claude-lane"
+    },
+    "W-ceiling": {
+      "kind": "worker",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-fable-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [],
+      "alternates_note": "none — the ceiling is not substituted",
+      "lane": "claude-lane"
+    },
+    "O-sonnet": {
+      "kind": "orchestrator",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-sonnet-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [
+        {
+          "runtime": "codex",
+          "model_class": "runtime_default",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        },
+        {
+          "runtime": "gemini",
+          "model_class": "pro",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        }
+      ],
+      "lane": "claude-lane"
+    },
+    "O-opus": {
+      "kind": "orchestrator",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-opus-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [
+        {
+          "runtime": "codex",
+          "model_class": "high_effort",
+          "pin_state": "inert_awaiting_ESC-RES-C"
+        }
+      ],
+      "lane": "claude-lane"
+    },
+    "O-fable": {
+      "kind": "orchestrator",
+      "primary_engine": {
+        "runtime": "claude",
+        "model_id": "claude-fable-5",
+        "pin_state": "recommended_awaiting_ESC-RES-G"
+      },
+      "alternates": [],
+      "alternates_note": "none — the ceiling is not substituted",
+      "lane": "claude-lane"
+    }
+  },
+  "ladders": {
+    "worker": [
+      "W-local",
+      "W-fast",
+      "W-std",
+      "W-heavy",
+      "W-ceiling"
+    ],
+    "orchestrator": [
+      "O-sonnet",
+      "O-opus",
+      "O-fable"
+    ],
+    "step": 1,
+    "skip_allowed": false,
+    "ceiling_terminal": "ceiling_exhausted"
+  },
+  "lanes": [
+    "claude-lane",
+    "codex-lane",
+    "gemini-lane",
+    "local-lane"
+  ],
+  "lane_mapping": "one lane per runtime (WCO-RES-001 §14 seat→lane row, [FIXED] option a at G133.16); pooled per-group quotas are a future table-version change",
+  "scorer": {
+    "engine": {
+      "runtime": "ollama",
+      "model_id": "qwen3:8b"
+    },
+    "deadline_ms": 2000,
+    "feature_count": 6,
+    "feature_min": 0,
+    "feature_max": 3,
+    "output_form": "six integers or a refusal — never free text into the route path"
+  },
+  "local_lane_admission": {
+    "policy": "background admitted only while the interactive lane is idle",
+    "background_output_token_cap": 512,
+    "on_interactive_arrival": "wait at most the one capped generation already running",
+    "further_background_admission": "paused until interactive drains",
+    "worst_case_added_latency_ms": null,
+    "worst_case_added_latency_state": "AWAITING_MEASUREMENT at WCO-RES-102 (INV-RES-012 requires it stated and measured; AC-RES-007 measures it)",
+    "authority": "WCO-RES-001 §14 ESC-RES-D [FIXED] option a, G133.16"
+  },
+  "caps": {
+    "per_seat": null,
+    "per_lane": null,
+    "interactive_reserved_slots_per_frontier_lane": null,
+    "state": "AWAITING_ESC-RES-A — every number is Forest's; this package asserts no cap value",
+    "recommended_not_law": {
+      "note": "WCO-RES-001 §14 ESC-RES-A `recommended` starting sheet, reproduced ONLY so a case can prove it is never read as ground truth",
+      "interactive_seat": 1,
+      "builder_seats": 2,
+      "other_seats": 1,
+      "frontier_lane_concurrent": 2,
+      "frontier_lane_reserved_interactive": 1
+    }
+  }
+}

@@ -1,0 +1,642 @@
+{
+ "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
+ "version": 17,
+ "updated": "2026-09-21",
+ "updated_by": "claude (Forest 2026-09-21: measure every pool, list every model we can reach)",
+ "features": [
+  "steps",
+  "ambiguity",
+  "blast_radius",
+  "context_size",
+  "novelty",
+  "parallelizability"
+ ],
+ "difficulty": {
+  "terms": [
+   "steps",
+   "ambiguity",
+   "blast_radius",
+   "novelty"
+  ],
+  "min": 0,
+  "max": 12
+ },
+ "bands": [
+  {
+   "band": "R0",
+   "label": "reflex",
+   "when": {
+    "all": [
+     {
+      "lte": [
+       "D",
+       2
+      ]
+     },
+     {
+      "eq": [
+       "blast_radius",
+       0
+      ]
+     },
+     {
+      "lte": [
+       "context_size",
+       1
+      ]
+     }
+    ]
+   },
+   "orchestrator": null,
+   "subagents": {
+    "min": 0,
+    "max": 0
+   }
+  },
+  {
+   "band": "R1",
+   "label": "light",
+   "when": {
+    "all": [
+     {
+      "lte": [
+       "D",
+       5
+      ]
+     },
+     {
+      "lte": [
+       "blast_radius",
+       1
+      ]
+     },
+     {
+      "lte": [
+       "context_size",
+       1
+      ]
+     },
+     {
+      "lte": [
+       "parallelizability",
+       1
+      ]
+     }
+    ]
+   },
+   "orchestrator": null,
+   "subagents": {
+    "min": 0,
+    "max": 0
+   }
+  },
+  {
+   "band": "R3",
+   "label": "hard",
+   "when": {
+    "any": [
+     {
+      "gte": [
+       "D",
+       9
+      ]
+     },
+     {
+      "eq": [
+       "blast_radius",
+       3
+      ]
+     }
+    ]
+   },
+   "orchestrator": "O-opus",
+   "subagents": {
+    "min": 3,
+    "max": 5,
+    "verifier": true
+   }
+  },
+  {
+   "band": "R2",
+   "label": "standard",
+   "when": {
+    "any": [
+     {
+      "lte": [
+       "D",
+       8
+      ]
+     },
+     {
+      "gte": [
+       "parallelizability",
+       2
+      ]
+     },
+     {
+      "gte": [
+       "context_size",
+       2
+      ]
+     }
+    ]
+   },
+   "orchestrator": "O-sonnet",
+   "subagents": {
+    "min": 0,
+    "max": 3,
+    "decompose_when": {
+     "any": [
+      {
+       "gte": [
+        "parts",
+        2
+       ]
+      },
+      {
+       "gte": [
+        "parallelizability",
+        2
+       ]
+      },
+      {
+       "gte": [
+        "context_size",
+        2
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "band": "R4",
+   "label": "ceiling",
+   "when": {
+    "never": true
+   },
+   "reachable_by": "escalation_only",
+   "orchestrator": "O-ceiling",
+   "subagents": {
+    "min": 3,
+    "max": 5,
+    "verifier": true
+   }
+  }
+ ],
+ "fallback": {
+  "interactive": "R2",
+  "background": "R1",
+  "routes": [
+   {
+    "lane": "codex",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-terra",
+    "tier": "W-std"
+   }
+  ]
+ },
+ "ladders": {
+  "worker": [
+   "W-local",
+   "W-fast",
+   "W-std",
+   "W-heavy",
+   "W-ceiling"
+  ],
+  "orchestrator": [
+   "O-sonnet",
+   "O-opus",
+   "O-ceiling"
+  ],
+  "step": 1,
+  "skip_allowed": false
+ },
+ "candidates": {
+  "R0": [],
+  "R1": [
+   {
+    "lane": "cursor",
+    "provider": "cursor-cli",
+    "model": "cursor-grok-4.6-medium-fast",
+    "tier": "W-fast",
+    "pool": "cursor-models"
+   },
+   {
+    "lane": "antigravity",
+    "provider": "agy-cli",
+    "model": "Gemini 3.7 Flash (Medium)",
+    "tier": "W-fast",
+    "pool": "gemini"
+   },
+   {
+    "lane": "claude",
+    "provider": "claude-cli",
+    "model": "claude-haiku-4-5-20251001",
+    "tier": "W-fast"
+   }
+  ],
+  "R2": [
+   {
+    "lane": "claude",
+    "provider": "claude-cli",
+    "model": "claude-sonnet-5",
+    "tier": "W-std"
+   },
+   {
+    "lane": "codex",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-terra",
+    "tier": "W-std"
+   },
+   {
+    "lane": "cursor",
+    "provider": "cursor-cli",
+    "model": "claude-sonnet-5-thinking-high",
+    "tier": "W-std",
+    "pool": "other-models",
+    "same_as": "claude-sonnet-5"
+   },
+   {
+    "lane": "cursor",
+    "provider": "cursor-cli",
+    "model": "gpt-5.6-terra-medium",
+    "tier": "W-std",
+    "pool": "other-models",
+    "same_as": "gpt-5.6-terra"
+   }
+  ],
+  "R3": [
+   {
+    "lane": "claude",
+    "provider": "claude-cli",
+    "model": "claude-opus-5",
+    "tier": "W-heavy"
+   },
+   {
+    "lane": "codex",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "tier": "W-heavy"
+   },
+   {
+    "lane": "cursor",
+    "provider": "cursor-cli",
+    "model": "claude-opus-5-thinking-high",
+    "tier": "W-heavy",
+    "pool": "other-models",
+    "same_as": "claude-opus-5"
+   },
+   {
+    "lane": "cursor",
+    "provider": "cursor-cli",
+    "model": "gpt-5.6-sol-high",
+    "tier": "W-heavy",
+    "pool": "other-models",
+    "same_as": "gpt-5.6-sol"
+   }
+  ],
+  "R4": [
+   {
+    "lane": "claude",
+    "provider": "claude-cli",
+    "model": "claude-fable-5-1",
+    "tier": "W-ceiling",
+    "pool": "fable"
+   },
+   {
+    "lane": "codex",
+    "provider": "openai-codex",
+    "model": "gpt-6-astra",
+    "tier": "W-ceiling"
+   }
+  ]
+ },
+ "orchestrators": {
+  "O-sonnet": {
+   "provider": "claude-cli",
+   "model": "claude-sonnet-5"
+  },
+  "O-opus": {
+   "provider": "claude-cli",
+   "model": "claude-opus-5"
+  },
+  "O-ceiling": {
+   "provider": "claude-cli",
+   "model": "claude-fable-5-1"
+  }
+ },
+ "work_kind_preference": {
+  "code": [
+   "codex",
+   "claude",
+   "cursor"
+  ],
+  "research": [
+   "claude",
+   "antigravity"
+  ],
+  "writing": [
+   "claude"
+  ],
+  "capture/log": [
+   "local"
+  ],
+  "conversation": [],
+  "planning": [
+   "claude"
+  ],
+  "ops": []
+ },
+ "subagent_policy": {
+  "route_each_subtask": true,
+  "note": "Every sub-agent is scored and routed by this same table (2.0: per_subtask_rescore). The count is a maximum; scarcity and the concurrency cap reduce it.",
+  "max_concurrent_workers": 3,
+  "diversity_mode": {
+   "enabled": false,
+   "work_kinds": [
+    "planning",
+    "research"
+   ]
+  }
+ },
+ "inventory": {
+  "_doc": "Every model each subscription can reach, as listed by its own CLI on 2026-09-21 (full id lists in tables/inventory/). `pool` is the separately metered quota the model draws on (scarcity.py scores each pool). A model being listed here does NOT place it in a band: only `candidates` does. Unplaced models wait for a task-benchmark result or Forest's ruling (no invented tiers).",
+  "claude": {
+   "plan": "Claude Max 20x",
+   "source": "claude CLI",
+   "pools": {
+    "all": "5-hour session + week (all models)",
+    "fable": "week (Fable): its own weekly limit on top of the all-models week"
+   },
+   "models": [
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001"
+   ]
+  },
+  "codex": {
+   "plan": "ChatGPT Pro",
+   "source": "~/.codex/models_cache.json",
+   "pools": {
+    "all": "week (+5-hour when shown). /status shows no separately limited model on this account today; any '<model> limit:' line that appears is picked up as its own pool"
+   },
+   "models": [
+    "gpt-6-astra",
+    "gpt-reserve",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "codex-auto-review"
+   ]
+  },
+  "cursor": {
+   "plan": "Cursor Pro",
+   "source": "cursor-agent models (231 ids)",
+   "pools": {
+    "cursor-models": "Cursor's own models: Cursor Grok, Grok, Composer, Auto. Overflow spills into other-models",
+    "other-models": "third-party API models: Claude, GPT, Gemini, Kimi, GLM, Muse Spark"
+   },
+   "families": {
+    "cursor-models": [
+     "auto",
+     "composer-2.5",
+     "cursor-grok-4.5",
+     "cursor-grok-4.6",
+     "grok-4.7"
+    ],
+    "other-models": [
+     "claude-4-sonnet",
+     "claude-4-sonnet-thinking",
+     "claude-4.5-opus",
+     "claude-4.5-opus-high-thinking",
+     "claude-4.5-sonnet",
+     "claude-4.5-sonnet-thinking",
+     "claude-4.6-opus",
+     "claude-4.6-opus-high-thinking",
+     "claude-4.6-opus-max-thinking",
+     "claude-4.6-sonnet",
+     "claude-4.6-sonnet-medium-thinking",
+     "claude-fable-5",
+     "claude-fable-5-1",
+     "claude-opus-4-7",
+     "claude-opus-4-8",
+     "claude-opus-5",
+     "claude-sonnet-5",
+     "gemini-3-flash",
+     "gemini-3.1-pro",
+     "gemini-3.5-flash",
+     "gemini-3.6-flash",
+     "gemini-3.7-flash",
+     "gemini-3.8-flash",
+     "glm-5.2",
+     "gpt-5-mini",
+     "gpt-5.1",
+     "gpt-5.2",
+     "gpt-5.3-codex",
+     "gpt-5.4",
+     "gpt-5.4-mini",
+     "gpt-5.4-nano",
+     "gpt-5.5",
+     "gpt-5.5-extra",
+     "gpt-5.6-luna",
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
+     "kimi-k2.7-code",
+     "kimi-k3",
+     "muse-spark-1.3"
+    ]
+   },
+   "note": "Claude Fable ids on Cursor are flagged NO ZDR by Cursor (no zero-data-retention): not placed."
+  },
+  "antigravity": {
+   "plan": "Google AI Pro",
+   "source": "agy models",
+   "pools": {
+    "gemini": "Gemini Flash + Pro: 5-hour + week",
+    "claude-gpt": "Claude Sonnet/Opus 4.6 + GPT-OSS: separate 5-hour + week, untouched so far"
+   },
+   "models": {
+    "gemini": [
+     {
+      "id": "gemini-3.8-flash-high",
+      "name": "Gemini 3.8 Flash (High)"
+     },
+     {
+      "id": "gemini-3.8-flash-medium",
+      "name": "Gemini 3.8 Flash (Medium)"
+     },
+     {
+      "id": "gemini-3.8-flash-low",
+      "name": "Gemini 3.8 Flash (Low)"
+     },
+     {
+      "id": "gemini-3.7-flash-high",
+      "name": "Gemini 3.7 Flash (High)"
+     },
+     {
+      "id": "gemini-3.7-flash-medium",
+      "name": "Gemini 3.7 Flash (Medium)"
+     },
+     {
+      "id": "gemini-3.7-flash-low",
+      "name": "Gemini 3.7 Flash (Low)"
+     },
+     {
+      "id": "gemini-3.6-flash-high",
+      "name": "Gemini 3.6 Flash (High)"
+     },
+     {
+      "id": "gemini-3.6-flash-medium",
+      "name": "Gemini 3.6 Flash (Medium)"
+     },
+     {
+      "id": "gemini-3.6-flash-low",
+      "name": "Gemini 3.6 Flash (Low)"
+     },
+     {
+      "id": "gemini-3.1-pro-high",
+      "name": "Gemini 3.1 Pro (High)"
+     },
+     {
+      "id": "gemini-3.1-pro-low",
+      "name": "Gemini 3.1 Pro (Low)"
+     }
+    ],
+    "claude-gpt": [
+     {
+      "id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6 (Thinking)"
+     },
+     {
+      "id": "claude-opus-4-6-thinking",
+      "name": "Claude Opus 4.6 (Thinking)"
+     },
+     {
+      "id": "gpt-oss-120b-medium",
+      "name": "GPT-OSS 120B (Medium)"
+     }
+    ]
+   }
+  },
+  "local": {
+   "plan": "free (M1 Max, 32 GB)",
+   "source": "ollama list",
+   "models": [
+    "qwen3-8b-nothink-64k:latest",
+    "qwen3.5:27b",
+    "qwen3:4b",
+    "nomic-embed-text:latest",
+    "hf.co/unsloth/Qwen3-8B-128K-GGUF:Q4_K_M",
+    "qwen3:8b",
+    "qwen3:14b"
+   ],
+   "training": "MLX 0.32.2 + mlx-lm 0.31.3 in .venv-mlx (installed 2026-09-21)"
+  }
+ },
+ "policy_cursor": {
+  "allow_other_models": true,
+  "_doc": "Forest 2026-09-21: Cursor's third-party pool is a lane of its own. The Cursor lane accepts Grok/auto plus any id listed in tables/inventory/cursor.txt. Supersedes the 2.0 Grok-only rule for THIS system; Fable ids stay R4-only (G112) and Cursor's NO-ZDR Fable ids are not placed at all."
+ },
+ "tiering": {
+  "_doc": "Forest 2026-09-21 (evening): no band lists for choosing models. Every reachable model has an index per use case (tables/model-scores.generated.json, from public benchmarks weighted by tables/use-cases.json; 100 = best published model, 0 = the average published model). Every task gets a REQUIRED index (see `selection`). Bands survive only for what they were always about: hard rules, the orchestrator and how many sub-agents. band_references fix what the knots mean; `candidates` below is only the fallback if the generated file is unreadable.",
+  "mode": "scores",
+  "band_references": {
+   "R1": [
+    "claude-haiku-4-5"
+   ],
+   "R2": [
+    "claude-sonnet-5",
+    "gpt-5.6-terra"
+   ],
+   "R3": [
+    "claude-opus-5",
+    "gpt-5.6-sol"
+   ],
+   "R4": [
+    "claude-fable-5-1",
+    "gpt-6-astra"
+   ]
+  },
+  "ridge": 1.5,
+  "min_benchmarks": 3,
+  "max_candidates_per_band": 6,
+  "refresh": "weekly (Sunday night, before training) via bin/refresh-tiers.sh",
+  "live": true,
+  "_live": "Forest 2026-09-22: faces follow the router per turn. pre_gateway_dispatch scores with the CortadOS Router S1 service (never the 14B) and applies a one-turn model override; a degraded/slow decision leaves the configured brain in place. Set false (hot-reload) or CORTADOS_ROUTER_LIVE=0 to fall back to shadow."
+ },
+ "selection": {
+  "_doc": "required index for use case u = interpolation over the task's difficulty D through the knots, never below the reference of the band the hard rules put the task in (blast radius 3 / outward → Opus-class). A knot's value is the use-case index of that band's reference models (the lower of the two). All reachable models at or above the requirement qualify; the winner has the lowest cost = its GENERAL index (a heavier model is slower and burns a scarcer subscription; qualifying is by use-case index, paying is by overall weight) + scarcity_points × scarcity of the pool it draws on − expiring_bonus when that pool's headroom is about to be wiped. Spent pools are skipped. Ceiling models (general ability ≥ the R4 references) only by escalation (G112). Nothing qualifies → the strongest available model.",
+  "knots": [
+   {
+    "D": 3,
+    "ref": "R1"
+   },
+   {
+    "D": 6,
+    "ref": "R2"
+   },
+   {
+    "D": 9,
+    "ref": "R3"
+   },
+   {
+    "D": 11,
+    "ref": "R4"
+   },
+   {
+    "D": 12,
+    "ref": "best"
+   }
+  ],
+  "scarcity_points": 30,
+  "lane_tiebreak": [
+   "local",
+   "antigravity",
+   "codex",
+   "claude",
+   "cursor"
+  ],
+  "expiring_credit_points": 80,
+  "_cost": "cost = weight + scarcity_points × max(scarcity,0) − expiring_credit_points × max(−scarcity,0) − capacity credit. weight = BURN: model $/1M ÷ learned pool size (tokens per % of the pool's window), normalised to 100 for the heaviest candidate (Forest 2026-09-29: pools differ ~10× in size, so price alone under-charged Claude). Falls back to price-only for pools without a learned size.",
+  "r0": "R0 is scored too: requirement 0, so the cheapest route wins; that is local unless a subscription window is about to expire unused.",
+  "same_price_band": 20,
+  "_same_price_band": "within one lane+pool, models whose general index is within this many points are the same price class: only the strongest of them is a candidate (Gemini 3.8 Flash over 3.6 Flash; Opus and Sonnet stay separate)",
+  "_lane_tiebreak": "equal cost → this order: local first (a tie at R0 is the reflex case), then the lane whose pool is least fought over",
+  "primary_sources": {
+   "claude": "claude (Claude Code CLI)",
+   "gpt": "codex",
+   "gemini": "antigravity",
+   "_doc": "Forest 2026-09-23: native subscription first; Cursor and Antigravity's Claude/GPT pool are secondary for these vendors' models and only qualify when the native pool is spent (ok=False). Cursor is primary for Grok, Composer, Kimi, GLM, Muse and anything without a native lane here."
+  },
+  "ceiling_by_score": true,
+  "_ceiling": "Forest 2026-09-23: Fable 5.1 and GPT-6 Astra WIN BY SCORE (supersedes G112 escalation-only). The requirement reaches their index at D≥11 (a hard, high-novelty, high-ambiguity task) and any use case where only they clear the bar; their price ($20/1M Fable) keeps them off easy work. Thinking/strategy work: see the specialization file (tables/community-sentiment.json) once the nightly rating exists.",
+  "sticky_slack_points": 15,
+  "_sticky": "a session keeps its model only while that model is within sticky_slack_points of the cheapest qualifying route; scarcity or price changes move it. Browser/desktop sessions are pinned (budgets.json stickiness) until their pool is spent.",
+  "ceiling_work": {
+   "use_cases": [
+    "planning",
+    "research"
+   ],
+   "min_D": 7,
+   "require": "R4",
+   "_doc": "Forest 2026-09-25: Fable and Astra are what the expensive subscriptions are FOR: strategic decisions and insight. Planning and research work of at least moderate difficulty (D ≥ 5) requires the R4 reference index for that use case, so only the ceiling models clear it (Astra 100/100 on planning/research, Fable 91/90). min_D 7 (Forest 2026-09-29): an outward turn already carries blast_radius 3, so D ≥ 5 caught ordinary replies tagged planning; real strategic asks (ambiguity/novelty) clear 7. Everything else keeps the price ladder, where open and mid models take what they can. Their pools' underuse credit then decides how much of the rest they attract."
+  },
+  "ceiling_underuse": {
+   "attract_when_scarcity_below": -0.3,
+   "min_D": 9,
+   "_doc": "when a ceiling model's own pool is underused (scarcity ≤ −0.3: the allowance would otherwise expire unused), it also takes any R3-level task (D ≥ 6) in every use case: paid-for capacity is used, not lost."
+  },
+  "capacity_credit_points": 20,
+  "_capacity": "Forest 2026-09-26: subscriptions are not normalised (Codex > Claude > Gemini > Cursor in absolute allowance). unitcost.py learns tokens-per-percent per pool from our own samples and ledger; among pools with room (scarcity ≤ 0), the route on the pool with the most tokens left gets up to capacity_credit_points off. Re-learned every 6 h and nightly.",
+  "interactive_min_general_index": 50,
+  "_interactive_floor": "Forest: the right answer over cost. A FACE turn (unit_kind interactive) never runs on a model below this general index even at R0 — 2026-09-27 09:13 the cheapest qualifying route (gpt-oss-120b, index 0) answered Forest's 'done' in Donna's 150k-token session with leaked reasoning. Crons and sub-agents keep the full ladder."
+ },
+ "review_policy": {
+  "_doc": "Explicit router_review only; no automatic reviewer fan-out. Compare the actual author model, not task difficulty. Ceiling flag defines frontier vs smaller; Samantha stays in that class within a use-case index gap, Rachel switches classes. Vendor means model maker, not subscription lane. OpenAI/Anthropic are preferred reciprocal partners; use another eligible vendor if unavailable. Never relax diversity/class for scarcity.",
+  "comparable_index_gap": 20,
+  "minimum_general_index": 50
+ }
+}

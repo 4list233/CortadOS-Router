@@ -1,0 +1,111 @@
+{
+  "_doc": "What each of OUR use cases is measured by (Forest 2026-09-21: models are distinguished by benchmark scores relevant to our use cases). Keys are the scorer's work kinds. Each lists public benchmarks (ids as in tables/benchmarks/scores.csv → source:benchmark) with a weight 1-3 = how closely that benchmark resembles the work our agents do. A model's use-case ability is the weighted mean of its results on these, pulled toward its general ability where it has few of them (shrink). Mutable: edit weights, add benchmarks, add use cases; bin/refresh-tiers.sh rebuilds. Benchmarks I could not characterise (LMCA, DTBench, EBR-bench, Mystery Game Puzzles, Chess Puzzles) carry no use-case weight; they still count toward general ability.",
+  "shrink": 3.0,
+  "use_cases": {
+    "code": {
+      "what": "building and fixing software in a repo: product modules, scripts, migrations, tests",
+      "benchmarks": {
+        "epoch_eci:DeepSWE": 3,
+        "epoch_eci:SWE-Bench verified": 3,
+        "swebench_verified:swe_bench_verified_resolved": 3,
+        "epoch_eci:Terminal Bench": 2,
+        "epoch_eci:FrontierCode": 2,
+        "lmarena_webdev:lmarena_webdev_arena_overall": 2,
+        "epoch_eci:GSO-Bench": 1,
+        "epoch_eci:MirrorCode": 1,
+        "epoch_eci:WeirdML": 1,
+        "aider_polyglot:aider_polyglot_pass_rate_2": 1,
+        "epoch_eci:Aider polyglot": 1,
+        "livebench:livebench_code_generation": 1,
+        "livebench:livebench_code_completion": 1,
+        "livebench:livebench_python": 1,
+        "livebench:livebench_typescript": 1,
+        "livebench:livebench_javascript": 1,
+        "artificial_analysis:artificial_analysis_coding_index": 2,
+        "artificial_analysis:livecodebench": 1
+      }
+    },
+    "ops": {
+      "what": "operating things with tools: terminals, deployments, fleet management, browser and desktop actions, long multi-step jobs",
+      "benchmarks": {
+        "epoch_eci:Terminal Bench": 3,
+        "epoch_eci:APEX-Agents": 3,
+        "lmarena_agent:lmarena_agent_arena_overall": 2,
+        "epoch_eci:METR Time Horizons": 2,
+        "epoch_eci:OSWorld 2.0": 2,
+        "epoch_eci:Remote Labor Index": 2,
+        "epoch_eci:PostTrainBench": 1,
+        "livebench:livebench_tablejoin": 1,
+        "livebench:livebench_tablereformat": 1,
+        "artificial_analysis:terminalbench_hard": 3
+      }
+    },
+    "research": {
+      "what": "finding out what is true and synthesising it: market, client, technical and school research",
+      "benchmarks": {
+        "epoch_eci:DeepResearch Bench": 3,
+        "epoch_eci:SimpleQA Verified": 3,
+        "epoch_eci:GPQA diamond": 2,
+        "epoch_eci:HLE": 2,
+        "epoch_eci:SimpleBench": 1,
+        "epoch_eci:FrontierMath-Tiers-1-3-v2-Private": 1,
+        "livebench:livebench_summarize": 1,
+        "lmarena_agent:lmarena_agent_arena_overall": 1,
+        "artificial_analysis:artificial_analysis_intelligence_index": 1,
+        "artificial_analysis:lcr": 1
+      }
+    },
+    "planning": {
+      "what": "turning a goal into an ordered plan: strategy, scheduling, decomposition, goal cascades",
+      "benchmarks": {
+        "epoch_eci:APEX-Agents": 2,
+        "epoch_eci:METR Time Horizons": 2,
+        "epoch_eci:SimpleBench": 2,
+        "epoch_eci:Remote Labor Index": 1,
+        "epoch_eci:ARC-AGI-2": 1,
+        "livebench:livebench_zebra_puzzle": 1,
+        "livebench:livebench_logic_with_navigation": 1,
+        "livebench:livebench_plot_unscrambling": 1,
+        "livebench:livebench_consecutive_events": 1,
+        "livebench:livebench_theory_of_mind": 1,
+        "artificial_analysis:artificial_analysis_intelligence_index": 1
+      }
+    },
+    "writing": {
+      "what": "drafting for people: emails, briefs, proposals, posts, in Forest's voice",
+      "benchmarks": {
+        "lmarena_text_style_control:lmarena_text_arena_style_controlled_overall": 3,
+        "epoch_eci:Lech Mazur Writing": 2,
+        "livebench:livebench_story_generation": 2,
+        "livebench:livebench_summarize": 2,
+        "epoch_eci:Fiction.LiveBench": 1,
+        "livebench:livebench_paraphrase": 1,
+        "livebench:livebench_typos": 1,
+        "artificial_analysis:ifbench": 1
+      }
+    },
+    "conversation": {
+      "what": "talking with Forest: answers, advice, status, banter",
+      "benchmarks": {
+        "lmarena_text:lmarena_text_arena_overall": 3,
+        "lmarena_text_style_control:lmarena_text_arena_style_controlled_overall": 3,
+        "epoch_eci:SimpleQA Verified": 1,
+        "epoch_eci:SimpleBench": 1,
+        "livebench:livebench_theory_of_mind": 1,
+        "artificial_analysis:ifbench": 2
+      }
+    },
+    "capture/log": {
+      "what": "taking something down faithfully: notes, logs, reformatting, filing",
+      "benchmarks": {
+        "livebench:livebench_summarize": 2,
+        "livebench:livebench_tablereformat": 2,
+        "livebench:livebench_typos": 2,
+        "livebench:livebench_paraphrase": 1,
+        "epoch_eci:SimpleQA Verified": 1,
+        "lmarena_text_style_control:lmarena_text_arena_style_controlled_overall": 1,
+        "artificial_analysis:ifbench": 2
+      }
+    }
+  }
+}

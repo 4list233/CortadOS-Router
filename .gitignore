@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv*/
+# CortadOS Router S1: training data, runs, adapters and the promotion record are local only (never published)
+s1/data/
+s1/runs/
+s1/sources/
+s1/laya/
+s1/current.json
+*.safetensors
+# runtime state belongs in ~/.cortados, never in the repository
+*.db
+# third-party benchmark downloads: re-fetched by tables/benchmarks/fetch_benchmarks.py, never redistributed
+tables/benchmarks/raw/
