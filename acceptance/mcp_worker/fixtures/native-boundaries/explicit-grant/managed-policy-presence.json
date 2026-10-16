@@ -1,0 +1,14 @@
+{
+  "domain": "com.openai.codex",
+  "method": "CFPreferencesAppValueIsForced only; no preference values read",
+  "forced_keys": {
+    "config_toml_base64": false,
+    "requirements_toml_base64": false
+  },
+  "system_files": {
+    "/etc/codex/config.toml": false,
+    "/etc/codex/requirements.toml": false,
+    "/etc/codex/managed_config.toml": false
+  },
+  "cloud_policy": "not established by these local checks"
+}

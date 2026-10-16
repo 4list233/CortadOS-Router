@@ -1,0 +1,20 @@
+{
+  "frames": [
+    {
+      "method": "config/read",
+      "raw_frame_sha256": "34956ce1d0ce578d553a31167949c6d68f766ae2d04010a8ef7c4558cbbc2acf",
+      "redacted_frame_sha256": "a36298e99a05dd8fd5e8a22ce7913c5832a3b1dd227cf0ff07ab2df771fcb029",
+      "file": "config-read.redacted.jsonl"
+    },
+    {
+      "method": "configRequirements/read",
+      "raw_frame_sha256": "5a2a63ca8d4eacb208e2502e52403bbdce5c6244f343a8b425c1262d550ad997",
+      "redacted_frame_sha256": "5a2a63ca8d4eacb208e2502e52403bbdce5c6244f343a8b425c1262d550ad997",
+      "file": "requirements-read.redacted.jsonl"
+    }
+  ],
+  "wire_sha256": "d518a6d3a9a0d5cf3680d2599f393f1239947e127ece13575e72557786d25468",
+  "raw_frames_memory_only": true,
+  "alias_count": 1831,
+  "procedure": "All string scalar values redacted except ConfigLayerSource name.type discriminators; dynamic map keys and origins keys consistently aliased; null/boolean/number values and all field/list/map structure retained. Native frame line hashes computed before redaction; raw frames never persisted."
+}

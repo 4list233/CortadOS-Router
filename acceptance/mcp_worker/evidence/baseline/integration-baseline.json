@@ -1,0 +1,191 @@
+[
+  {
+    "file": "tests/integration/test_auxiliary_model_routing.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_auxiliary_model_routing.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_auxiliary_model_routing.xml"
+    ],
+    "exit_code": 1,
+    "elapsed_s": 5.226806163787842,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-9y3ga6ox",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "31",
+      "time": "4.814",
+      "timestamp": "2026-10-16T02:53:24.545913+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_cron_dispatch_routing.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_cron_dispatch_routing.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_cron_dispatch_routing.xml"
+    ],
+    "exit_code": 1,
+    "elapsed_s": 0.9306318759918213,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-x7rhuuat",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "2",
+      "time": "0.669",
+      "timestamp": "2026-10-16T02:53:29.717143+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_delegation_model_routing.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_delegation_model_routing.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_delegation_model_routing.xml"
+    ],
+    "exit_code": 1,
+    "elapsed_s": 1.2155988216400146,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-i7nieiih",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "17",
+      "time": "0.969",
+      "timestamp": "2026-10-16T02:53:30.650036+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_required_model_routing.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_required_model_routing.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_required_model_routing.xml"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 1.4757142066955566,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-oi0rtil2",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "15",
+      "time": "1.141",
+      "timestamp": "2026-10-16T02:53:31.869889+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_required_routing_full_loop.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_required_routing_full_loop.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_required_routing_full_loop.xml"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 17.099343061447144,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-p75gis3l",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "5",
+      "time": "16.897",
+      "timestamp": "2026-10-16T02:53:33.349223+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_router_gateway_admission.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_router_gateway_admission.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_router_gateway_admission.xml"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 1.3114960193634033,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-ws2gasoq",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "2",
+      "time": "1.005",
+      "timestamp": "2026-10-16T02:53:50.449946+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  },
+  {
+    "file": "tests/integration/test_router_reviews_cortados.py",
+    "command": [
+      "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "/Users/velox/.cortados-builds/cortados-router-repo/tests/integration/test_router_reviews_cortados.py",
+      "-p",
+      "no:cacheprovider",
+      "--junitxml=/private/tmp/cortados-router-mcp-qa-baseline/test_router_reviews_cortados.xml"
+    ],
+    "exit_code": 1,
+    "elapsed_s": 0.28482890129089355,
+    "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-integration-baseline-z_6pcsk_",
+    "totals": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "1",
+      "skipped": "0",
+      "tests": "2",
+      "time": "0.061",
+      "timestamp": "2026-10-16T02:53:51.751063+00:00",
+      "hostname": "Forests-Mac-Studio.local"
+    }
+  }
+]

@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `projects.\"/REDACTED/capture/gpt-6.1-sol/workspace\"` is ignored."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `projects.\"/REDACTED/capture/gpt-6.1-sol/workspace\"` is ignored."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I’ll create capture.txt with the exact text and read it back in one shell command.\n"}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'printf %s MCP_WORKER_CAPTURE_OK > capture.txt && cat capture.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'printf %s MCP_WORKER_CAPTURE_OK > capture.txt && cat capture.txt'","aggregated_output":"MCP_WORKER_CAPTURE_OK","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"MCP_WORKER_CAPTURE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":35578,"cached_input_tokens":29696,"cache_write_input_tokens":0,"output_tokens":75,"reasoning_output_tokens":0}}

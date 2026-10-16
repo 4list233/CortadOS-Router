@@ -1,0 +1,7 @@
+MCP resource result: `MCP_RESOURCE_READ_OK`
+
+Write outcomes:
+
+```json
+{"/private/tmp/cortados-mcp-capture-20261015/resource-filesystem/connector-workspace/inside-write": "write_succeeded", "/private/tmp/cortados-mcp-capture-20261015/resource-filesystem/outside-cwd-write": "PermissionError: [Errno 1] Operation not permitted: '/private/tmp/cortados-mcp-capture-20261015/resource-filesystem/outside-cwd-write'", "/private/tmp/cortados-mcp-exclude-slash-tmp-20261015": "PermissionError: [Errno 1] Operation not permitted: '/private/tmp/cortados-mcp-exclude-slash-tmp-20261015'"}
+```

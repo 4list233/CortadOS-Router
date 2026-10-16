@@ -1,0 +1,14 @@
+[
+  {
+    "command": "node /Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js -i acceptance/mcp_worker/evidence/design-review-2/diagram-1.mmd -o acceptance/mcp_worker/evidence/design-review-2/diagram-1.svg -p /Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json",
+    "exit_code": 0
+  },
+  {
+    "command": "node /Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js -i acceptance/mcp_worker/evidence/design-review-2/diagram-2.mmd -o acceptance/mcp_worker/evidence/design-review-2/diagram-2.svg -p /Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json",
+    "exit_code": 0
+  },
+  {
+    "command": "node /Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js -i acceptance/mcp_worker/evidence/design-review-2/diagram-3.mmd -o acceptance/mcp_worker/evidence/design-review-2/diagram-3.svg -p /Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json",
+    "exit_code": 0
+  }
+]

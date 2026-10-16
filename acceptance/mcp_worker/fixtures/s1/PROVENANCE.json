@@ -1,0 +1,9 @@
+{
+  "source": "/private/tmp/cortados-mcp-capture-20261015/s1",
+  "capture": "read-only live S1 /score; no scorer changes",
+  "sha256": {
+    "request.json": "cea495a73dc1b6857b67d7c493903e3b06c595264cc38d61fe7b078cccbe603d",
+    "response.json": "40bd94ad85bf4be9a794a5fa50b89dbe37e4e058d228cb2f0bc4c49cd41b5c2a",
+    "meta.json": "62051524f10a4354af82937ad6b12c4ce9345c2e634c560b0e7af32725d1c0e5"
+  }
+}

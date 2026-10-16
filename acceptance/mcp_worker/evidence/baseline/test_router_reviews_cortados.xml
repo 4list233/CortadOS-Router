@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="2" time="0.061" timestamp="2026-10-16T02:53:51.751063+00:00" hostname="Forests-Mac-Studio.local"><testcase classname="tests.integration.test_router_reviews_cortados.CortadOSReviewTests" name="test_mail_read_guard_covers_review_dispatch" time="0.008" /><testcase classname="tests.integration.test_router_reviews_cortados.CortadOSReviewTests" name="test_profile_instructions_are_opt_in_and_dynamic" time="0.002"><failure message="AssertionError: True is not false">self = &lt;tests.integration.test_router_reviews_cortados.CortadOSReviewTests testMethod=test_profile_instructions_are_opt_in_and_dynamic&gt;
+
+    def test_profile_instructions_are_opt_in_and_dynamic(self):
+        faces = json.loads((CORTADOS/'faces.json').read_text())
+&gt;       self.assertFalse(any('before it is called done' in r for r in faces['rules']))
+E       AssertionError: True is not false
+
+tests/integration/test_router_reviews_cortados.py:35: AssertionError</failure></testcase></testsuite></testsuites>

@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"01a142b1-55f4-78c1-9652-6e58c3e7efa1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run the exact command you specified and wait on that process."}}

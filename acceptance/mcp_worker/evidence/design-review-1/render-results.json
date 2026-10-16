@@ -1,0 +1,34 @@
+[
+  {
+    "diagram": 1,
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": "",
+    "command": [
+      "/opt/homebrew/bin/node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "/private/tmp/cortados-mcp-d-review/contract-1.mmd",
+      "-o",
+      "/private/tmp/cortados-mcp-d-review/contract-1.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ]
+  },
+  {
+    "diagram": 2,
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": "",
+    "command": [
+      "/opt/homebrew/bin/node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "/private/tmp/cortados-mcp-d-review/contract-2.mmd",
+      "-o",
+      "/private/tmp/cortados-mcp-d-review/contract-2.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ]
+  }
+]

@@ -1,0 +1,99 @@
+{
+  "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "executable": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "node": "/opt/homebrew/bin/node",
+  "pytest": "None",
+  "hermes_cli": "None",
+  "test_modules": [
+    {
+      "path": "tests/integration/test_auxiliary_model_routing.py",
+      "count_unparametrized": 18,
+      "sha256": "0aa43974914e1f522a942850317858d4304eda8ff6305932c18c3cd6dee9722d"
+    },
+    {
+      "path": "tests/integration/test_cron_dispatch_routing.py",
+      "count_unparametrized": 2,
+      "sha256": "5920fbc6c5b45a4e9dd703f66f4fa584517e2afb13f4cdb39cca9e1e0d6c8df5"
+    },
+    {
+      "path": "tests/integration/test_delegation_model_routing.py",
+      "count_unparametrized": 14,
+      "sha256": "b3a1ad8a94a27870de1a90bfe0b841792d2d016eacf3500a208535e71fe25c8e"
+    },
+    {
+      "path": "tests/integration/test_required_model_routing.py",
+      "count_unparametrized": 15,
+      "sha256": "85391661715b8cc9dcf6453743272cf7253b15c7302937501336698999057c05"
+    },
+    {
+      "path": "tests/integration/test_required_routing_full_loop.py",
+      "count_unparametrized": 1,
+      "sha256": "fe0245a16ea03b6852c979de6f51b2fe16fbfbb9b113c1c2fa08d63df0b7db0f"
+    },
+    {
+      "path": "tests/integration/test_router_gateway_admission.py",
+      "count_unparametrized": 2,
+      "sha256": "796aa4d78e087fd60e6cf46f4c37161e1bb0634aab14e0765136ae6686033749"
+    },
+    {
+      "path": "tests/integration/test_router_reviews_cortados.py",
+      "count_unparametrized": 2,
+      "sha256": "4ab22f964fea45b68bfe022c4e2cadac9a46e5f9204a72ebe7e92c78008d6785"
+    },
+    {
+      "path": "tests/test_router.py",
+      "count_unparametrized": 30,
+      "sha256": "3a00b764daeb32f3338070acbf6483540b20989a7741a89d0071ad1408c642dd"
+    },
+    {
+      "path": "tests/test_router_call_context.py",
+      "count_unparametrized": 7,
+      "sha256": "245dd814a4076d6eab4db116a41e256871acd460e94d3fcd2b8ac8d66b1518e5"
+    },
+    {
+      "path": "tests/test_router_context.py",
+      "count_unparametrized": 11,
+      "sha256": "ea1ebc185104a0efa73f447fda031c837d36dc1d2accec53a85762d399be8378"
+    },
+    {
+      "path": "tests/test_router_images.py",
+      "count_unparametrized": 27,
+      "sha256": "ee3f3847f397f33cf7cab8234d88cecaf03f6374cc6bcee6d14e9ab630f81a5b"
+    },
+    {
+      "path": "tests/test_router_nightly_runs.py",
+      "count_unparametrized": 7,
+      "sha256": "b963a2aa3985b59b5b687f332f4aa28529041dbb01669c143bdb8682e3423c95"
+    },
+    {
+      "path": "tests/test_router_overnight.py",
+      "count_unparametrized": 9,
+      "sha256": "a4bc6bdf2cba3212318131e2b25f10f1494d0b01d702176475ad23b47f0416a7"
+    },
+    {
+      "path": "tests/test_router_probe_reaper.py",
+      "count_unparametrized": 4,
+      "sha256": "42f35616a61fec7a71c317fa626f63089651beaa00638ee417ce600af39ffc6c"
+    },
+    {
+      "path": "tests/test_router_reviews.py",
+      "count_unparametrized": 21,
+      "sha256": "2db1854d96434a940e68930989747c1dceb754309fa3de3b0e3424e20ae323d7"
+    },
+    {
+      "path": "tests/test_router_terra_fallback.py",
+      "count_unparametrized": 4,
+      "sha256": "f55238bb5d2cd999fd4b6eee5fa70d53583c4ed8bf6a1ebf2564306ef0e6b30a"
+    },
+    {
+      "path": "tests/test_router_transport.py",
+      "count_unparametrized": 17,
+      "sha256": "f0cb06180340ea6015453e865b708935cade0c6cb31b4a6724ef4d4516b78d2b"
+    },
+    {
+      "path": "tests/test_router_usage_capture.py",
+      "count_unparametrized": 10,
+      "sha256": "3582e53274d4f5912ff8a3936dd160591bbf40e61516a3c9d407ffcef87bc2ff"
+    }
+  ]
+}

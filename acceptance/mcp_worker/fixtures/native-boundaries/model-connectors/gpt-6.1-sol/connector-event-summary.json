@@ -1,0 +1,53 @@
+{
+  "model": "gpt-6.1-sol",
+  "final": "MCP_SERVER_SHARED_OK",
+  "mcp_events": [
+    {
+      "type": "item.started",
+      "item": {
+        "id": "item_0",
+        "type": "mcp_tool_call",
+        "server": "approved_probe",
+        "tool": "worker_probe",
+        "arguments": {},
+        "result": null,
+        "error": null,
+        "status": "in_progress"
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "id": "item_0",
+        "type": "mcp_tool_call",
+        "server": "approved_probe",
+        "tool": "worker_probe",
+        "arguments": {},
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "MCP_SERVER_SHARED_OK"
+            }
+          ],
+          "structured_content": {
+            "result": "MCP_SERVER_SHARED_OK"
+          }
+        },
+        "error": null,
+        "status": "completed"
+      }
+    }
+  ],
+  "native_errors": [],
+  "usage": [
+    {
+      "input_tokens": 35589,
+      "cached_input_tokens": 29696,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 76,
+      "reasoning_output_tokens": 0
+    }
+  ],
+  "stderr_bytes": 0
+}

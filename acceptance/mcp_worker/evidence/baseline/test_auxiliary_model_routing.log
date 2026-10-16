@@ -1,0 +1,20 @@
+..............................F                                          [100%]
+=================================== FAILURES ===================================
+_________________ test_installer_dry_run_idempotence_and_drift _________________
+
+staged = (<module 'auxiliary_installer' from '/Users/velox/.cortados-builds/cortados-router-repo/integrations/hermes/patches/au...vate/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/pytest-of-velox/pytest-728/test_installer_dry_run_idempot0/host'))
+
+    def test_installer_dry_run_idempotence_and_drift(staged):
+        installer, root = staged
+        before = {p: p.read_bytes() for p in root.rglob("*.py")}
+>       assert len(installer.apply(root, check=True)) == 3
+E       AssertionError: assert 1 == 3
+E        +  where 1 = len(['agent/auxiliary_model_routing.py'])
+E        +    where ['agent/auxiliary_model_routing.py'] = <function apply at 0x10c5928e0>(PosixPath('/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/pytest-of-velox/pytest-728/test_installer_dry_run_idempot0/host'), check=True)
+E        +      where <function apply at 0x10c5928e0> = <module 'auxiliary_installer' from '/Users/velox/.cortados-builds/cortados-router-repo/integrations/hermes/patches/auxiliary-routing.py'>.apply
+
+tests/integration/test_auxiliary_model_routing.py:389: AssertionError
+- generated xml file: /private/tmp/cortados-router-mcp-qa-baseline/test_auxiliary_model_routing.xml -
+=========================== short test summary info ============================
+FAILED tests/integration/test_auxiliary_model_routing.py::test_installer_dry_run_idempotence_and_drift
+1 failed, 30 passed in 4.81s

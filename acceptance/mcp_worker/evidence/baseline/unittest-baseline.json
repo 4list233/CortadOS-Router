@@ -1,0 +1,26 @@
+{
+  "command": [
+    "python3",
+    "-B",
+    "-m",
+    "unittest",
+    "discover",
+    "-v",
+    "-s",
+    "tests",
+    "-t",
+    "."
+  ],
+  "exit_code": 1,
+  "elapsed_s": 14.763683080673218,
+  "scratch": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-baseline-state-rpyej13l",
+  "state_environment": {
+    "CORTADOS_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-baseline-state-rpyej13l/state",
+    "CORTADOS_HERMES_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-baseline-state-rpyej13l/hermes",
+    "HERMES_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-baseline-state-rpyej13l/hermes",
+    "HERMES_IGNORE_USER_CONFIG": "1",
+    "HERMES_TELEMETRY_ENABLED": "false",
+    "CORTADOS_LIVE_WRITE": "0",
+    "WANGCAI_LIVE_WRITE": "0"
+  }
+}

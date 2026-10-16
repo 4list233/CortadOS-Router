@@ -1,0 +1,85 @@
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+__ test_each_fire_routes_with_current_capacity_and_profile_without_repinning ___
+
+tmp_path = PosixPath('/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/pytest-of-velox/pytest-729/test_each_fire_routes_with_cur0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10c041250>
+
+    def test_each_fire_routes_with_current_capacity_and_profile_without_repinning(tmp_path, monkeypatch):
+        core = load("cron_test_core", "cortados_router/core.py")
+        monkeypatch.setattr(core, "STATE", tmp_path)
+        routing = load("cron_test_routing", "cortados_router/cron_routing.py")
+        answers = {f: 0 for f in core.FEATURES}
+        answers.update(work_kind="ops", outward=False, parts=0)
+        monkeypatch.setattr(core, "decide", lambda *a: dict(answers=answers, degraded=False, engine="test", engine_ms=0))
+        candidates = [dict(lane=lane, provider=provider, model=model, family="test", general=70,
+                           index=70, price=4, tokens_per_s=1, ceiling=False, use_case="ops")
+                      for lane, provider, model in [("codex", "openai-codex", "test-a"),
+                                                    ("claude", "claude-cli", "test-b")]]
+        monkeypatch.setattr(core, "model_scores", lambda: {"models": [{"reach": candidates}]})
+        monkeypatch.setattr(core, "scored_candidates", lambda *a: copy.deepcopy(candidates))
+        monkeypatch.setattr(core, "required_index", lambda *a: 0)
+        monkeypatch.setattr(core, "_pool_tokens_per_pct", lambda c: None)
+        monkeypatch.setattr(core, "_tokens_left_for", lambda c: None)
+        health = {}
+        monkeypatch.setattr(core, "lane_health", lambda: health)
+        monkeypatch.setattr(core, "log_route", lambda *a: None)
+        auth_calls = []
+        def auth(**kw):
+            auth_calls.append((str(get_hermes_home()), kw["requested"]))
+            return {"provider": kw["requested"]}
+        monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", auth)
+        # Real hook dispatcher; no discovery of production Context or other plugins.
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["route_cron_model"] = [lambda **kw: routing.route(core, face=get_hermes_home().name, **kw)]
+        monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+        saved = dict(id="scheduled", prompt="check status", provider="claude-cli", model="old-pin", base_url="https://old.invalid")
+        cfg = {"cron": {"model_router": "cortados-router"},
+               "fallback_providers": [{"provider": "claude-cli", "model": "old-fallback"}]}
+        jc = scheduler._CronJobConfig(cfg, "old-pin", {}, "claude-cli")
+        for face, preferred in [("A", "codex"), ("B", "claude"), ("A", "codex")]:
+            home = tmp_path / face; home.mkdir(exist_ok=True)
+            token = set_hermes_home_override(home)
+            try:
+                health.clear()
+                health.update({lane: {"ok": True, "scarcity": -.6 if lane == preferred else .9} for lane in ["codex", "claude"]})
+                job, resolved = route_job(saved, jc, prompt="check status", session_id=f"run-{face}")
+                assert job["provider"] == ("openai-codex" if preferred == "codex" else "claude-cli")
+                assert resolved.model == job["model"]
+                assert resolved.cfg["fallback_providers"] == resolved.cfg["fallback_model"] == []
+                assert "base_url" not in job
+                header = scheduler._run_doc_header(job, "check", job["id"], "check status")
+                assert f"**Provider:** {job['provider']}" in header
+                assert f"**Model:** {resolved.model}" in header
+                assert f"**Routing Session:** run-{face}" in header
+                assert auth_calls[-1][0] == str(home)
+            finally:
+                reset_hermes_home_override(token)
+        assert saved["model"] == "old-pin" and cfg["fallback_providers"]
+        # The outcome sampler must attribute this occurrence, not the stored pin.
+        monkeypatch.setitem(sys.modules, "core", core)
+>       sampler = load("cron_test_sampler", "bin/route-crons.py")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/test_cron_dispatch_routing.py:85: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_cron_dispatch_routing.py:27: in load
+    spec.loader.exec_module(module)
+<frozen importlib._bootstrap_external>:995: in exec_module
+    ???
+<frozen importlib._bootstrap_external>:1132: in get_code
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <_frozen_importlib_external.SourceFileLoader object at 0x10bee6b70>
+path = '/Users/velox/.cortados-builds/cortados-router-repo/bin/route-crons.py'
+
+>   ???
+E   FileNotFoundError: [Errno 2] No such file or directory: '/Users/velox/.cortados-builds/cortados-router-repo/bin/route-crons.py'
+
+<frozen importlib._bootstrap_external>:1190: FileNotFoundError
+- generated xml file: /private/tmp/cortados-router-mcp-qa-baseline/test_cron_dispatch_routing.xml -
+=========================== short test summary info ============================
+FAILED tests/integration/test_cron_dispatch_routing.py::test_each_fire_routes_with_current_capacity_and_profile_without_repinning
+1 failed, 1 passed in 0.67s

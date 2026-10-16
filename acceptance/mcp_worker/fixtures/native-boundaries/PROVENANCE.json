@@ -1,0 +1,415 @@
+{
+  "source_directory": "/private/tmp/cortados-mcp-capture-20261015",
+  "capture_owner": "root and mcp_connectors independent native probes",
+  "redactions": [
+    "local username in path strings; response fields and scalar types retained"
+  ],
+  "limitations": "Native probes prove native behavior, not integrated worker service acceptance. Policy source was hashed in memory; secret raw config was never persisted. Each nested provenance retains those hashes.",
+  "files": [
+    {
+      "file": "explicit-grant/managed_policy_presence.py",
+      "original_sha256": "78f0674d3b157a7ed959d7691482b6cef5ba05732aef59e848c6ca2906d92bf4",
+      "fixture_sha256": "78f0674d3b157a7ed959d7691482b6cef5ba05732aef59e848c6ca2906d92bf4"
+    },
+    {
+      "file": "explicit-grant/connector-stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "explicit-grant/connector-meta.json",
+      "original_sha256": "02945abecb9cc6bb308ceab4d2709fa3a7e032e173ae59fa7c51d38c2a387be4",
+      "fixture_sha256": "02945abecb9cc6bb308ceab4d2709fa3a7e032e173ae59fa7c51d38c2a387be4"
+    },
+    {
+      "file": "explicit-grant/connector-final.txt",
+      "original_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91",
+      "fixture_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91"
+    },
+    {
+      "file": "explicit-grant/managed-policy-presence.json",
+      "original_sha256": "aac55e06765c86a84403f91ca20a61e021cb8e98a9fa7e0b87181c560501647b",
+      "fixture_sha256": "aac55e06765c86a84403f91ca20a61e021cb8e98a9fa7e0b87181c560501647b"
+    },
+    {
+      "file": "explicit-grant/capture_connectors.py",
+      "original_sha256": "42cfffc8911cee79d11f1fd46298ca2052928941e3b24dd13dd44023ed5cf869",
+      "fixture_sha256": "42cfffc8911cee79d11f1fd46298ca2052928941e3b24dd13dd44023ed5cf869"
+    },
+    {
+      "file": "explicit-grant/connector_probe.py",
+      "original_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265",
+      "fixture_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265"
+    },
+    {
+      "file": "explicit-grant/connector-stdout.jsonl",
+      "original_sha256": "3ca02968b2b3e08bc129f1c4a6133cc2190fc259b4a92c16bceaa403ee2bea0c",
+      "fixture_sha256": "3ca02968b2b3e08bc129f1c4a6133cc2190fc259b4a92c16bceaa403ee2bea0c"
+    },
+    {
+      "file": "resource-filesystem/connector-stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "resource-filesystem/connector-meta.json",
+      "original_sha256": "67c1c9ec6966781ee0a5024214e91122c66c893a77669cc19441ef6937110813",
+      "fixture_sha256": "67c1c9ec6966781ee0a5024214e91122c66c893a77669cc19441ef6937110813"
+    },
+    {
+      "file": "resource-filesystem/connector-final.txt",
+      "original_sha256": "c1c7348e6f6cee27a3c38a04928e37f3b4e16a7604f8ae87e079443c2f52303b",
+      "fixture_sha256": "c1c7348e6f6cee27a3c38a04928e37f3b4e16a7604f8ae87e079443c2f52303b"
+    },
+    {
+      "file": "resource-filesystem/capture_connectors.py",
+      "original_sha256": "6d64192e9c3b1f4a73e6e66cbb3d831cb4309c92c86b3f6727228983a6839270",
+      "fixture_sha256": "6d64192e9c3b1f4a73e6e66cbb3d831cb4309c92c86b3f6727228983a6839270"
+    },
+    {
+      "file": "resource-filesystem/connector_probe.py",
+      "original_sha256": "a93789439b0c0467dc6e8fc431eec12095d6249609601fbf77bb4569db341b6b",
+      "fixture_sha256": "a93789439b0c0467dc6e8fc431eec12095d6249609601fbf77bb4569db341b6b"
+    },
+    {
+      "file": "resource-filesystem/connector-stdout.jsonl",
+      "original_sha256": "cc7967b9d68bd3662cf4c3ae0d2b5ea275f9d3db479065cfadf66aadb2ec323c",
+      "fixture_sha256": "cc7967b9d68bd3662cf4c3ae0d2b5ea275f9d3db479065cfadf66aadb2ec323c"
+    },
+    {
+      "file": "project.path/connector-stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "project.path/connector-meta.json",
+      "original_sha256": "eb3e70d48e330810acce7e77ebe5a0edf8cc8e85b41e2d83c7a4743d45bb8910",
+      "fixture_sha256": "eb3e70d48e330810acce7e77ebe5a0edf8cc8e85b41e2d83c7a4743d45bb8910"
+    },
+    {
+      "file": "project.path/connector-final.txt",
+      "original_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91",
+      "fixture_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91"
+    },
+    {
+      "file": "project.path/capture_connectors.py",
+      "original_sha256": "0eb198c485d252e22dcae86961742f33db5d9a2f7a8506f766303169729a5380",
+      "fixture_sha256": "0eb198c485d252e22dcae86961742f33db5d9a2f7a8506f766303169729a5380"
+    },
+    {
+      "file": "project.path/connector_probe.py",
+      "original_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265",
+      "fixture_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265"
+    },
+    {
+      "file": "project.path/connector-stdout.jsonl",
+      "original_sha256": "3d1e1e355bdb92c4b0cd290aa3a694a4513c874fc61a696e5aa5047d4fa8551a",
+      "fixture_sha256": "3d1e1e355bdb92c4b0cd290aa3a694a4513c874fc61a696e5aa5047d4fa8551a"
+    },
+    {
+      "file": "cancellation/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "cancellation/processes-before.txt",
+      "original_sha256": "fd7f18c02d26285c876d6246be7389e5bc86edeb3e6597568f0087dcaab30b82",
+      "fixture_sha256": "fd7f18c02d26285c876d6246be7389e5bc86edeb3e6597568f0087dcaab30b82"
+    },
+    {
+      "file": "cancellation/stdout.jsonl",
+      "original_sha256": "ae723dc8db1a3f531044ffc3604d52077cb986f3cd0d2ffd184957d84a99495c",
+      "fixture_sha256": "ae723dc8db1a3f531044ffc3604d52077cb986f3cd0d2ffd184957d84a99495c"
+    },
+    {
+      "file": "cancellation/meta.json",
+      "original_sha256": "29f617d0a982228488c9a141e863bd985dce5102647c107b0ca38229a2b81ddd",
+      "fixture_sha256": "29f617d0a982228488c9a141e863bd985dce5102647c107b0ca38229a2b81ddd"
+    },
+    {
+      "file": "cancellation/workspace/child.json",
+      "original_sha256": "251a34af4b48e2367fc3a2f0d4b077cbb77f15461db609b3c505164168f53351",
+      "fixture_sha256": "251a34af4b48e2367fc3a2f0d4b077cbb77f15461db609b3c505164168f53351"
+    },
+    {
+      "file": "cancellation-session/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "cancellation-session/processes-before.txt",
+      "original_sha256": "43649012c7cfacc283a404c46a894b54f93d31bdf1c71ee7aff20599a238f802",
+      "fixture_sha256": "43649012c7cfacc283a404c46a894b54f93d31bdf1c71ee7aff20599a238f802"
+    },
+    {
+      "file": "cancellation-session/stdout.jsonl",
+      "original_sha256": "8fe49dfac2fd5334fe83f705a2b0335fd242e5924186fea4ee060a2d16738fc1",
+      "fixture_sha256": "8fe49dfac2fd5334fe83f705a2b0335fd242e5924186fea4ee060a2d16738fc1"
+    },
+    {
+      "file": "cancellation-session/meta.json",
+      "original_sha256": "6b2f5836df12200579f010a5b7b327dd51ef75122f3166ac9fbcae0a13c0bc6f",
+      "fixture_sha256": "6b2f5836df12200579f010a5b7b327dd51ef75122f3166ac9fbcae0a13c0bc6f"
+    },
+    {
+      "file": "cancellation-session/workspace/child.json",
+      "original_sha256": "57a42d6e3f7617d5be42898c3d6d263e24e45cc84d8874166d2a03363c1a1b8c",
+      "fixture_sha256": "57a42d6e3f7617d5be42898c3d6d263e24e45cc84d8874166d2a03363c1a1b8c"
+    },
+    {
+      "file": "cancellation-interrupt/stderr.txt",
+      "original_sha256": "22cf4c86f8e1984bc630a7d0777fd0042b3faa0017e45563ee22f2de94d06746",
+      "fixture_sha256": "22cf4c86f8e1984bc630a7d0777fd0042b3faa0017e45563ee22f2de94d06746"
+    },
+    {
+      "file": "cancellation-interrupt/processes-before.txt",
+      "original_sha256": "e49cd0a5f143d3f35060b5e4cf3890af42f3e568afc779e1a740b17e7ab30dce",
+      "fixture_sha256": "e49cd0a5f143d3f35060b5e4cf3890af42f3e568afc779e1a740b17e7ab30dce"
+    },
+    {
+      "file": "cancellation-interrupt/stdout.jsonl",
+      "original_sha256": "8666737e2d665e88da754ec005cd98c57a3185be5c0d17615c123da64b00d998",
+      "fixture_sha256": "8666737e2d665e88da754ec005cd98c57a3185be5c0d17615c123da64b00d998"
+    },
+    {
+      "file": "cancellation-interrupt/meta.json",
+      "original_sha256": "a3c57e426906a8a717fc156212b0a71a22ac12dc60a1141f97392921170c02c4",
+      "fixture_sha256": "a3c57e426906a8a717fc156212b0a71a22ac12dc60a1141f97392921170c02c4"
+    },
+    {
+      "file": "cancellation-interrupt/workspace/child.json",
+      "original_sha256": "b7bb5749f4665f38cf6a8ed17c3516373ce694bac19e97cefd05fd0615e18055",
+      "fixture_sha256": "b7bb5749f4665f38cf6a8ed17c3516373ce694bac19e97cefd05fd0615e18055"
+    },
+    {
+      "file": "handoff-boundary/request.json",
+      "original_sha256": "baa850aabaea9997f36877e691fd0f579a5b43d5c28d9911cb131c362dd3ffcd",
+      "fixture_sha256": "baa850aabaea9997f36877e691fd0f579a5b43d5c28d9911cb131c362dd3ffcd"
+    },
+    {
+      "file": "handoff-boundary/handoff.txt",
+      "original_sha256": "341ecb27bc7bf1e7bf6d3856362844fdbf286815e46016a144def37635921828",
+      "fixture_sha256": "341ecb27bc7bf1e7bf6d3856362844fdbf286815e46016a144def37635921828"
+    },
+    {
+      "file": "handoff-boundary/gpt-6.1-sol/final.txt",
+      "original_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1",
+      "fixture_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1"
+    },
+    {
+      "file": "handoff-boundary/gpt-6.1-sol/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "handoff-boundary/gpt-6.1-sol/stdout.jsonl",
+      "original_sha256": "780de61acca271c628431684c2ce513c26f2317af7856eadd49717f45b5e9d5d",
+      "fixture_sha256": "780de61acca271c628431684c2ce513c26f2317af7856eadd49717f45b5e9d5d"
+    },
+    {
+      "file": "handoff-boundary/gpt-6.1-sol/meta.json",
+      "original_sha256": "a75b715d45b83bd5d44ea998a07230711f7660709a9679de412686b87ee7398c",
+      "fixture_sha256": "a75b715d45b83bd5d44ea998a07230711f7660709a9679de412686b87ee7398c"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-astra/final.txt",
+      "original_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1",
+      "fixture_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-astra/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-astra/stdout.jsonl",
+      "original_sha256": "b112373d5f03575aa5a2fce4e24c1ecc94afead2d95ff0c87e01309f8eb682e7",
+      "fixture_sha256": "b112373d5f03575aa5a2fce4e24c1ecc94afead2d95ff0c87e01309f8eb682e7"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-astra/meta.json",
+      "original_sha256": "195ad9c92e83f2887b79a6762d82cbecf94a7f31d6071f68a2ddc4b91144fb9d",
+      "fixture_sha256": "195ad9c92e83f2887b79a6762d82cbecf94a7f31d6071f68a2ddc4b91144fb9d"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-luna/final.txt",
+      "original_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1",
+      "fixture_sha256": "872da9bfc840508604f2c610e398b7418020686e0c6b8ddbe32509c68e8054a1"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-luna/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-luna/stdout.jsonl",
+      "original_sha256": "db8f86e292ea1b138366b10bd244ee127a48c3c0268f2b707af021661edd8df8",
+      "fixture_sha256": "db8f86e292ea1b138366b10bd244ee127a48c3c0268f2b707af021661edd8df8"
+    },
+    {
+      "file": "handoff-boundary/gpt-6-luna/meta.json",
+      "original_sha256": "0eaa0f0e56654875a979eb66197bee9794f06d43df4851991d7372c60f3d5fa2",
+      "fixture_sha256": "0eaa0f0e56654875a979eb66197bee9794f06d43df4851991d7372c60f3d5fa2"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector-stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector-event-summary.json",
+      "original_sha256": "b7e6685b48bb4bf1201a0c44c70b0d3bb16c552ee2dd959aa91c8da44cbdf240",
+      "fixture_sha256": "b7e6685b48bb4bf1201a0c44c70b0d3bb16c552ee2dd959aa91c8da44cbdf240"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector-meta.json",
+      "original_sha256": "a23665898c05af972c4ec0231c4e710d82aa3e64d90cf579c9782169fa500cf1",
+      "fixture_sha256": "a23665898c05af972c4ec0231c4e710d82aa3e64d90cf579c9782169fa500cf1"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector-final.txt",
+      "original_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91",
+      "fixture_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/capture_connectors.py",
+      "original_sha256": "b8cf4e674bf48756b756b09a3a81ca7fb94517b8bc203a581aeb26fa4541fbbe",
+      "fixture_sha256": "b8cf4e674bf48756b756b09a3a81ca7fb94517b8bc203a581aeb26fa4541fbbe"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector_probe.py",
+      "original_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265",
+      "fixture_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265"
+    },
+    {
+      "file": "model-connectors/gpt-6.1-sol/connector-stdout.jsonl",
+      "original_sha256": "be7d55752f83aeed12f6182c2c1e786e274454b79c2f321dddb03e79e05ef167",
+      "fixture_sha256": "be7d55752f83aeed12f6182c2c1e786e274454b79c2f321dddb03e79e05ef167"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector-stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector-event-summary.json",
+      "original_sha256": "7a5baa36dac3c2d6e9a1696656feb50b0f7bcb6d752af7a392de2a32e1a97a9f",
+      "fixture_sha256": "7a5baa36dac3c2d6e9a1696656feb50b0f7bcb6d752af7a392de2a32e1a97a9f"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector-meta.json",
+      "original_sha256": "f341da7aa1ce9681e52bdb92b72096dfd25c0e75fd8106b77432afa9baaf161b",
+      "fixture_sha256": "f341da7aa1ce9681e52bdb92b72096dfd25c0e75fd8106b77432afa9baaf161b"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector-final.txt",
+      "original_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91",
+      "fixture_sha256": "0c4a34b748a07ad70e727d5efd1e765a85e398de5815a849e414742e4f5d8f91"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/capture_connectors.py",
+      "original_sha256": "d098e5f07dda6ba9b88fedfdfb58f85e08b9b5e51236728f67c1cbd17e1a2d87",
+      "fixture_sha256": "d098e5f07dda6ba9b88fedfdfb58f85e08b9b5e51236728f67c1cbd17e1a2d87"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector_probe.py",
+      "original_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265",
+      "fixture_sha256": "bf42b16a8d73344ef9ee500be4bd94711b82d753c6a1d8cdefd67ca03ccfe265"
+    },
+    {
+      "file": "model-connectors/gpt-6-astra/connector-stdout.jsonl",
+      "original_sha256": "8494beb57a8159f55ae355cf0d4724e0bb4d39aec0c1451944a34e15683799d8",
+      "fixture_sha256": "8494beb57a8159f55ae355cf0d4724e0bb4d39aec0c1451944a34e15683799d8"
+    },
+    {
+      "file": "policy-wire-redacted/policy-wire.redacted.jsonl",
+      "original_sha256": "d518a6d3a9a0d5cf3680d2599f393f1239947e127ece13575e72557786d25468",
+      "fixture_sha256": "d518a6d3a9a0d5cf3680d2599f393f1239947e127ece13575e72557786d25468"
+    },
+    {
+      "file": "policy-wire-redacted/capture_policy_metadata.py",
+      "original_sha256": "94586bc39555eeebc827489714404a07aa3b485c074584a91afe6aa5eb37f0ce",
+      "fixture_sha256": "94586bc39555eeebc827489714404a07aa3b485c074584a91afe6aa5eb37f0ce"
+    },
+    {
+      "file": "policy-wire-redacted/wire-provenance.json",
+      "original_sha256": "57e7943a0bd2da988213ac90cbdc8d39c7c706058096b9c9e24af3c2f15cb914",
+      "fixture_sha256": "57e7943a0bd2da988213ac90cbdc8d39c7c706058096b9c9e24af3c2f15cb914"
+    },
+    {
+      "file": "policy-wire-redacted/policy-metadata.json",
+      "original_sha256": "9afb02540ada76e3330efd8efbb304071bce8f40d0a637b90f85f8125eb8e271",
+      "fixture_sha256": "9afb02540ada76e3330efd8efbb304071bce8f40d0a637b90f85f8125eb8e271"
+    },
+    {
+      "file": "policy-wire-redacted/requirements-read.redacted.jsonl",
+      "original_sha256": "5a2a63ca8d4eacb208e2502e52403bbdce5c6244f343a8b425c1262d550ad997",
+      "fixture_sha256": "5a2a63ca8d4eacb208e2502e52403bbdce5c6244f343a8b425c1262d550ad997"
+    },
+    {
+      "file": "policy-wire-redacted/config-read.redacted.jsonl",
+      "original_sha256": "a36298e99a05dd8fd5e8a22ce7913c5832a3b1dd227cf0ff07ab2df771fcb029",
+      "fixture_sha256": "a36298e99a05dd8fd5e8a22ce7913c5832a3b1dd227cf0ff07ab2df771fcb029"
+    },
+    {
+      "file": "final-profile/gpt-6.1-sol/final.txt",
+      "original_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539",
+      "fixture_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539"
+    },
+    {
+      "file": "final-profile/gpt-6.1-sol/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "final-profile/gpt-6.1-sol/stdout.jsonl",
+      "original_sha256": "408085288476a5437651055ef4b1b951e0bd9b45eeef60da6d68a2a8dd076dc9",
+      "fixture_sha256": "408085288476a5437651055ef4b1b951e0bd9b45eeef60da6d68a2a8dd076dc9"
+    },
+    {
+      "file": "final-profile/gpt-6.1-sol/meta.json",
+      "original_sha256": "f3026aba2cdeaa88acc2d3fd86e468c1c81b518868cc6d1c3b728efebe760dd7",
+      "fixture_sha256": "f3026aba2cdeaa88acc2d3fd86e468c1c81b518868cc6d1c3b728efebe760dd7"
+    },
+    {
+      "file": "final-profile/gpt-6-astra/final.txt",
+      "original_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539",
+      "fixture_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539"
+    },
+    {
+      "file": "final-profile/gpt-6-astra/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "final-profile/gpt-6-astra/stdout.jsonl",
+      "original_sha256": "9f7a0df5579e19d4a5f4573b9ac03c1032daeb873e7f85d266494d453d0b4294",
+      "fixture_sha256": "9f7a0df5579e19d4a5f4573b9ac03c1032daeb873e7f85d266494d453d0b4294"
+    },
+    {
+      "file": "final-profile/gpt-6-astra/meta.json",
+      "original_sha256": "3c49f313707c5e2931df44d0e8ad7ee2faccee113e44f5299a85f8f97ffc4286",
+      "fixture_sha256": "3c49f313707c5e2931df44d0e8ad7ee2faccee113e44f5299a85f8f97ffc4286"
+    },
+    {
+      "file": "final-profile/gpt-6-luna/final.txt",
+      "original_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539",
+      "fixture_sha256": "ed2725cedbda5e08ef20789f6adcf8b4768580703f8f4b4eb51eac335dfaf539"
+    },
+    {
+      "file": "final-profile/gpt-6-luna/stderr.txt",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "final-profile/gpt-6-luna/stdout.jsonl",
+      "original_sha256": "6eda1087632e4edf1674a99d49ab32e1d1038ec4c90cf890871c9f91ab5593c1",
+      "fixture_sha256": "6eda1087632e4edf1674a99d49ab32e1d1038ec4c90cf890871c9f91ab5593c1"
+    },
+    {
+      "file": "final-profile/gpt-6-luna/meta.json",
+      "original_sha256": "085bc9a09cb3bbe2404d14c628f6bf39cb347fac127c5062523dbd5055d410f8",
+      "fixture_sha256": "085bc9a09cb3bbe2404d14c628f6bf39cb347fac127c5062523dbd5055d410f8"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "-C",
+    "/REDACTED/capture/workspace",
+    "-s",
+    "workspace-write",
+    "-m",
+    "gpt-6-luna",
+    "-c",
+    "approval_policy=\"never\"",
+    "-c",
+    "model_reasoning_effort=\"low\"",
+    "--json",
+    "--color",
+    "never",
+    "-o",
+    "/REDACTED/capture/final.txt",
+    "-"
+  ],
+  "started_at_unix": 1792119278.097097,
+  "elapsed_s": 5.750486135482788,
+  "exit_code": 0,
+  "version": "codex-cli 0.162.1",
+  "auth_source": "native saved ChatGPT login; no credentials captured",
+  "prompt": "This is a tiny worker protocol test. Run one shell command that creates the file capture.txt in the current workspace with the exact text MCP_WORKER_CAPTURE_OK, then reads that file. Do not inspect any other files, use network, or access connectors. Your final answer must be exactly MCP_WORKER_CAPTURE_OK.",
+  "stdout.jsonl_sha256": "a5ae41d118dc73cabe671e3d9ae5c57a29afc06996bf2242d7d70bc4e2d9db64",
+  "stderr.txt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "evidence_class": "real-provider-capture",
+  "source_original_directory": "/private/tmp/cortados-mcp-capture-20261015",
+  "source_original_stdout_sha256": "a5ae41d118dc73cabe671e3d9ae5c57a29afc06996bf2242d7d70bc4e2d9db64",
+  "redacted_stdout_sha256": "331a69529bee858ebc36abb2a1aeb59de958c22b71c401d1e724aaa7b2da4d5d",
+  "redaction": "One thread UUID replaced by fixed equal-length UUID; meta argv temporary root replaced. No structure, whitespace, line ending, number spelling, key order, event or tail changes.",
+  "captured_model": "gpt-6-luna",
+  "captured_output_kinds": [
+    "command_execution",
+    "agent_message",
+    "turn.completed_usage"
+  ],
+  "claim_exclusions": [
+    "other models",
+    "reasoning items",
+    "mcp_tool_call",
+    "provider failure grammar"
+  ],
+  "exam_owner": "/root/mcp_qa"
+}

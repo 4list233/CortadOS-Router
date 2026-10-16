@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a142b0-8065-79e3-bca9-bbaad1557b38"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"approved_probe","tool":"worker_probe","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"approved_probe","tool":"worker_probe","arguments":{},"result":{"content":[{"type":"text","text":"MCP_SERVER_SHARED_OK"}],"structured_content":{"result":"MCP_SERVER_SHARED_OK"}},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"MCP_SERVER_SHARED_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":51308,"cached_input_tokens":45056,"cache_write_input_tokens":0,"output_tokens":80,"reasoning_output_tokens":0}}

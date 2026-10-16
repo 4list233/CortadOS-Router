@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant Front as MCP frontend
+    participant Broker as Broker sole writer
+    participant Store as Canonical job store
+    participant Watch as Process watchdog
+    participant Native as Native Codex worker
+    Front->>Broker: validated delegate and request identity
+    Broker->>Store: commit queued request route nonce and claims
+    Broker->>Watch: spawn with control pipe and nonce
+    Watch-->>Broker: return watchdog process identity
+    Broker->>Store: commit watchdog identity
+    Broker->>Watch: START once if no committed stop intent
+    Watch->>Native: spawn native and observe descendants
+    Note over Broker,Watch: Lost control triggers SIGINT then verified escalation
+    Native-->>Watch: events final artifact and native exit
+    Watch-->>Broker: closed artifacts and termination receipt
+    Broker->>Store: commit terminal result and release claims
+    Front->>Broker: job_result after any frontend reconnect
+    Broker-->>Front: durable snapshot and evidence paths

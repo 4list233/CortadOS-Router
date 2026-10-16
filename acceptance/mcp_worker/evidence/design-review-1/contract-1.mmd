@@ -1,0 +1,19 @@
+flowchart TD
+    Planner["Claude supplies task and selected context"] --> Front["MCP frontend validates tool input"]
+    Front --> Broker["Broker admits and owns jobs"]
+    Broker --> Router["Existing Router scores optionally and resolves"]
+    Config[("Canonical operator config grants models and connectors")] --> Broker
+    Quota[("Projection scarcity cache exposes measured quota")] --> Router
+    Broker --> Store[("Canonical SQLite stores identity and transitions")]
+    Broker --> Watch["Watchdog owns native process lifetime"]
+    Watch --> Native["Native Codex performs the scoped attempt"]
+    Native --> Evidence[("Evidence artifacts retain native results")]
+    Evidence --> Broker
+    Broker --> Front
+    Front --> Planner
+    classDef canonical fill:#e8eaff,stroke:#5058a0
+    classDef projection fill:#fff4ce,stroke:#ad8500
+    classDef evidence fill:#daf3e4,stroke:#207343
+    class Config,Store canonical
+    class Quota projection
+    class Evidence evidence

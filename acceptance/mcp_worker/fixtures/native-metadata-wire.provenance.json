@@ -1,0 +1,26 @@
+{
+  "captured_at_unix": 1792120005.050529,
+  "cli_version": "0.162.1",
+  "original_sha256": "c8d9c434e1d8fca4dfe71b8277c2ae5099bc7b5e7a7efb432b29c211893534ba",
+  "redacted_sha256": "9093967e2c286d8c5fd4a3063dc40a8d4dd0686e31311b64ea832b93875641a1",
+  "redactions": [
+    "email string to redacted@example.invalid",
+    "accountId string to redacted-account-id"
+  ],
+  "methods": [
+    "initialize",
+    "account/read",
+    "account/rateLimits/read",
+    "model/list"
+  ],
+  "source_original_directory": "/private/tmp/cortados-mcp-capture-20261015",
+  "parent_redacted_sha256": "0f1a7780c14109838870b64cd52c097a5c3846a74ed5f00f44086462020c2601",
+  "exam_owner": "/root/mcp_qa",
+  "additional_redactions": [
+    "native codexHome path username",
+    "credits balance string to fixed 0.0000000000; numeric-string shape retained, never used by quota admission",
+    "workspaceRouting.chatgptAccountId string"
+  ],
+  "balance_string_redaction_count": 2,
+  "prior_private_balance_redaction_sha256": "787c6dfc343fc7be04b1e5650f189ad16f4e712f8b0e223f93ac30bc41fedce9"
+}

@@ -1,0 +1,18 @@
+stateDiagram-v2
+    [*] --> queued: persist identity and reservations
+    queued --> running: native worker identity recorded
+    queued --> failed: native startup refused
+    queued --> cancelling: cancel intent recorded
+    running --> cancelling: cancel or deadline intent recorded
+    running --> succeeded: accepted terminal evidence persisted
+    running --> failed: error observed and worker stopped
+    cancelling --> cancelled: cancellation termination observed
+    cancelling --> timed_out: deadline termination observed
+    queued --> interrupted: broker recovery reconciles unfinished job
+    running --> interrupted: broker recovery reconciles unfinished job
+    cancelling --> interrupted: broker recovery reconciles unfinished job
+    succeeded --> [*]: immutable result available
+    failed --> [*]: immutable error available
+    cancelled --> [*]: immutable cancellation available
+    timed_out --> [*]: immutable deadline result available
+    interrupted --> [*]: planner decides any new attempt

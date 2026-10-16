@@ -1,0 +1,54 @@
+{
+  "layers": [
+    {
+      "source_type": "sessionFlags",
+      "version": "sha256:dadec294c13899b1c540b6091596d7c1cd497d9216c25c9daac5c0d7e2e0d95c",
+      "has_config_entries": true,
+      "disabled": false,
+      "mcp_server_name_count": 0,
+      "disallowed_authority_layer_present": false
+    },
+    {
+      "source_type": "user",
+      "version": "sha256:458ddc9f45f9588c7e5a757790dedac002905f5b2e47eadfb75758adb89f6c06",
+      "has_config_entries": true,
+      "disabled": false,
+      "mcp_server_name_count": 6,
+      "disallowed_authority_layer_present": false
+    },
+    {
+      "source_type": "system",
+      "version": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "has_config_entries": false,
+      "disabled": false,
+      "mcp_server_name_count": 0,
+      "disallowed_authority_layer_present": false
+    }
+  ],
+  "any_disallowed_authority_layer": false,
+  "effective_mcp_server_name_count": 6,
+  "requirements_present": false,
+  "non_null_requirement_fields": [],
+  "elapsed_seconds": 0.18759262503590435,
+  "native_exit_code": 0,
+  "stderr_byte_count": 0,
+  "cli_version": "0.162.1",
+  "argv": [
+    "/opt/homebrew/bin/codex",
+    "app-server",
+    "--listen",
+    "stdio://",
+    "--disable",
+    "hooks",
+    "--disable",
+    "plugins",
+    "--disable",
+    "apps",
+    "--disable",
+    "multi_agent"
+  ],
+  "source_sha256": "94586bc39555eeebc827489714404a07aa3b485c074584a91afe6aa5eb37f0ce",
+  "raw_configuration_retained": false,
+  "worker_turn_started": false,
+  "ignore_user_config_available_on_app_server": false
+}

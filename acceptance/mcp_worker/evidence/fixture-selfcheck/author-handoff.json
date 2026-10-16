@@ -1,0 +1,10 @@
+{
+  "test_permissions.py": {
+    "sha256": "e94906bd3dfd25dd15b96c19bc8949dafc71fd704dc30a88a304a2c87b50261a",
+    "lines": 251
+  },
+  "fake_mcp_server.py": {
+    "sha256": "0f26e4ba1bc332c4696ddf7bcecc3acffbde6f40dcfcfd5dfeef53034a940bc8",
+    "lines": 101
+  }
+}
