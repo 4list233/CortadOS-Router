@@ -13,6 +13,21 @@ It does this in three steps:
    clears the requirement. The winner is the cheapest of those, where cost comes from the model's burn on its quota
    pool and that pool's live scarcity.
 
+## Standalone MCP workers
+
+The Codex-first MCP service lets Claude plan a task and delegate execution to a native Codex worker
+using the saved ChatGPT subscription. Choose an exact model or opt into S1 selection. Both paths
+require current known quota; S1 uses the existing capability and scarcity resolver. The worker gets
+the full supplied task/context, a folder-scoped sandbox and only explicitly granted MCP tools.
+
+Five tools expose durable start/poll/cancel execution: `route`, `delegate`, `job_status`, `job_result`
+and `job_cancel`. This first version runs Codex only, on the captured macOS CLI 0.162.1 profile. It does
+not place arbitrary models inside Claude's harness or import Claude's live connector sessions.
+
+See the [operator guide](docs/mcp-worker/USAGE.md), [reviewed contract](docs/mcp-worker/CONTRACT.md)
+and [independent acceptance package](acceptance/mcp_worker/README.md). Candidate verification is
+recorded separately from the legacy baseline below. No live client configuration is installed by this build.
+
 ## The 12 questions
 
 Six 0–3 rubric scores (the anchors are in `cortados_router/core.py → ANCHORS`):
@@ -126,6 +141,7 @@ cortados_router/      the router: core (scoring client, rules, resolve, logging)
                       transport (input-size estimate), images (local OCR first, vision model only for photos), reviews (opt-in
                       dual review), execution_routing / cron_routing (mandatory per-call selection), task_context
                       (scorer wire contract), compat (env + optional host modules), paths
+integrations/mcp/     standalone Codex subscription workers, quota admission, durable jobs and per-job MCP grants
 integrations/hermes/  the Hermes plugin (hooks, tools, /router command) and patches/ that install mandatory routing
                       at Hermes call sites (agent requests, cron, delegation, auxiliary calls)
 s1/                   CortadOS Router S1: dataset, label, build_sft, evaluate, serve, student, coverage, drift, nightly
@@ -172,7 +188,7 @@ This is the code CortadOS runs today, extracted from its private repo without re
 - Mandatory routing for agent, cron, delegation and auxiliary calls, when a profile sets `agent.model_router`.
 - Shadow logging of every decision.
 
-**Tests.** `python3 -B -m unittest discover -s tests -t .` runs 155 tests: 148 pass, 6 are skipped and 1 fails.
+**Legacy baseline before the MCP build.** `python3 -B -m unittest discover -s tests -t .` ran 155 tests: 148 passed, 6 were skipped and 1 failed. Running all real integration cases separately accounted for 221 unique cases: 217 passed and four failed. See [the complete baseline](docs/mcp-worker/QA-BASELINE.md); the skipped module placeholders are not full integration coverage.
 - **Skipped:** the six Hermes integration modules in `tests/integration`, which need pytest and an importable Hermes.
 - **Failing:** `test_profile_instructions_are_opt_in_and_dynamic`. It reads CortadOS's live `faces.json` and fails until the
   opt-in dual-review rules are applied there; that deployment is still pending.

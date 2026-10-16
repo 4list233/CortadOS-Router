@@ -408,7 +408,7 @@ def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> in
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
-            execution: bool = False, minimum_band: str | None = None) -> dict[str, Any]:
+            execution: bool = False, minimum_band: str | None = None, resources=None) -> dict[str, Any]:
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -440,7 +440,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     row = next(b for b in t["bands"] if b["band"] == band)
     # candidates: table order, work-kind preference first; then subscription scarcity re-ranks them (never below the band):
     #   spent / refusing lane → skipped · lane burning faster than its window → behind the others · lane whose headroom expires soon → first
-    health, pol = lane_health(), _policy()
+    health, pol = (resources.health() if resources is not None else lane_health()), _policy()
+    tokens_per_pct = resources.tokens_per_pct if resources is not None else _pool_tokens_per_pct
     demote, expiring = float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
     scored = scored_candidates(t, band, ans.get("work_kind"))
@@ -527,7 +528,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             # BURN, not price (Forest 2026-09-29, after the Claude pool ran out while Codex had barely moved): what a call costs is the share of ITS POOL's window it
             # consumes. Pools differ ~10× in size (Claude ≈ 53 M of our tokens per week, Codex ≈ 563 M), so weight = model price ÷ pool size,
             # normalised so the heaviest candidate = 100. Price alone (the old weight) is used only for pools whose size is not yet learned.
-            c["burn"] = (c["price"] / (_pool_tokens_per_pct(c) / 1e6)) if c.get("price") and _pool_tokens_per_pct(c) else None
+            c["burn"] = (c["price"] / (tokens_per_pct(c) / 1e6)) if c.get("price") and tokens_per_pct(c) else None
         burn_ref = max([x["burn"] for x in cands if x.get("burn")] + [0.0])
         price_ref = max([x["price"] for x in cands if x.get("price") and not x.get("ceiling")] + [1.0])
         for c in cands:
@@ -539,7 +540,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             sc = sc_of(c)
             c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0) - sel.get("expiring_credit_points", 80) * max(-sc, 0.0), 1)
             # capacity (Forest 2026-09-26): plans are not normalised; among pools with room, the one with the most TOKENS left gets a further credit
-            tl = _tokens_left_for(c)
+            tl = resources.tokens_left(c) if resources is not None else _tokens_left_for(c)
             if tl is not None and sc <= 0:
                 c["tokens_left"] = tl
         most = max((c.get("tokens_left") or 0) for c in cands) or 0

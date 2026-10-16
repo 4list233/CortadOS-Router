@@ -15,6 +15,7 @@ part of this build.
 | [REUSE.md](REUSE.md) | Contract author; existing-owner search and reuse dispositions. |
 | [DECISIONS-PENDING.md](DECISIONS-PENDING.md) | Contract author; resolved user direction and remaining evidence gates. |
 | [QA-REVIEW.md](QA-REVIEW.md) | Independent QA; D/A findings and exact review revisions. |
+| [USAGE.md](USAGE.md) | Root orchestrator; standalone setup, Claude handoff and explicit connector grants. |
 | [QA-BASELINE.md](QA-BASELINE.md) | Independent QA; all maintained suites and pre-existing failures. |
 | `acceptance/mcp_worker/` | Independent QA; protected exams, native captures and evidence. Builders may read only. |
 | `integrations/mcp/` | Scoped production builder after D/A approval; MCP service, lifecycle and native boundary. |

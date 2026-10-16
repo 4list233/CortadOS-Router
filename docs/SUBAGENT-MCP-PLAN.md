@@ -1,6 +1,12 @@
 # Router as a subagent MCP: plan
 
-Status: **plan only** (Forest, 2026-10-15). Copied from CortadOS `ROUTER-DESIGN.md` §11 so that work can start
+Status: **historical plan, superseded for the first implementation** by
+[RT-MCP-001](mcp-worker/CONTRACT.md), independently approved in `4c41a3f`. The current build is
+Codex-only, supports explicit or S1 selection, and reads structured native quota. It does not change
+the existing Hermes TUI sampler. Multi-provider runners, feedback and escalation remain future scope.
+See [the operator guide](mcp-worker/USAGE.md).
+
+Original plan (Forest, 2026-10-15), copied from CortadOS `ROUTER-DESIGN.md` §11 so that work can start
 in this repo. Section numbers are kept so the two documents stay comparable.
 
 
