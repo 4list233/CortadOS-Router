@@ -127,3 +127,14 @@ tree, `docs/harness/deepseek-prototype/router-l1/r0/QUOTA-PRODUCER-DESIGN.md` re
   - (N3) Port to the live copy hunk by hunk, never by file copy. The live copy differs in exactly three places:
     the `context.env_compat` import, the `_plans` budgets path, and a comment.
   - (N3) Take a byte backup before the port, and check afterwards that all three deltas survive.
+- **Status 2026-10-15:** design READY for build (D checks through `d5763913`; full spec in the build tree's
+  `QUOTA-PRODUCER-DESIGN.md` rev 4 `995536fb`, §1.4, §2.3 and §3.3, cases QP-01..05 and QP-03b–g). The builder
+  brief must also include:
+  - (C1) the done-when compares the lane's `fetched_at` with the Hermes gateway's `start_time / 100` (the value is
+    in centiseconds), and `sampled_by` must be the state-file pid;
+  - (C2) runs of spaces inside a model label collapse before matching the grammar
+    `^(?:(GPT-\d+(?:\.\d+)*(?:-[A-Za-z][A-Za-z0-9]*)*) )?(5h|Weekly)$`.
+  - Forest approves:
+    1. one real `/status` capture;
+    2. the hunk-level port into the live `plugins/cortados-router/`;
+    3. an idle-point `hermes gateway restart` afterwards, and after any rollback.
