@@ -1,0 +1,176 @@
+[
+  {
+    "job_id": "5605abad-9784-4381-8f7a-9e664b897900",
+    "route": {
+      "route_id": "f083321a-4881-4254-8d5e-f6d3b5b10ce2",
+      "selection_mode": "explicit",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6-luna",
+        "account_ref": "native-default"
+      },
+      "band": null,
+      "D": null,
+      "suggested_subagents": null,
+      "skipped": [],
+      "context": {
+        "worker_bytes": 328,
+        "scorer_chars": 0,
+        "scorer_digest": null
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123619826
+      },
+      "warnings": []
+    }
+  },
+  {
+    "job_id": "5895e2b7-b870-4261-8aaf-4d3ea7db6afd",
+    "route": {
+      "route_id": "eaf74cff-e880-48db-ba2f-28d17258dad7",
+      "selection_mode": "explicit",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6.1-sol",
+        "account_ref": "native-default"
+      },
+      "band": null,
+      "D": null,
+      "suggested_subagents": null,
+      "skipped": [],
+      "context": {
+        "worker_bytes": 328,
+        "scorer_chars": 0,
+        "scorer_digest": null
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123619826
+      },
+      "warnings": []
+    }
+  },
+  {
+    "job_id": "5668eb18-2e1b-42d0-90e0-af83cbcd122a",
+    "route": {
+      "route_id": "f92b8bd6-8554-4037-9081-fc533bbccd6b",
+      "selection_mode": "explicit",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6-astra",
+        "account_ref": "native-default"
+      },
+      "band": null,
+      "D": null,
+      "suggested_subagents": null,
+      "skipped": [],
+      "context": {
+        "worker_bytes": 328,
+        "scorer_chars": 0,
+        "scorer_digest": null
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123619826
+      },
+      "warnings": []
+    }
+  },
+  {
+    "job_id": "ea43f3ad-45b4-4919-8a37-b601067b6cc9",
+    "route": {
+      "route_id": "b9a2faf6-ae5e-49a5-9b06-fc6d22f92b03",
+      "selection_mode": "s1",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6.1-sol",
+        "account_ref": "native-default"
+      },
+      "band": "R1",
+      "D": 2,
+      "suggested_subagents": 0,
+      "skipped": [
+        {
+          "provider": "codex-cli",
+          "model": "gpt-6-luna",
+          "reason": "below the face floor (general 47.4 < 50)"
+        }
+      ],
+      "context": {
+        "worker_bytes": 276,
+        "scorer_chars": 112,
+        "scorer_digest": "61c04c4690c0808de00b15b92df938acb7ef99bba1d4cabf2a94b7c444320cd0"
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123619826
+      },
+      "warnings": []
+    }
+  },
+  {
+    "job_id": "36452271-e300-42ff-a184-35e7b53c3d86",
+    "route": {
+      "route_id": "dd38a698-e2f0-4edd-b2c8-665a08fd751f",
+      "selection_mode": "explicit",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6-luna",
+        "account_ref": "native-default"
+      },
+      "band": null,
+      "D": null,
+      "suggested_subagents": null,
+      "skipped": [],
+      "context": {
+        "worker_bytes": 679,
+        "scorer_chars": 0,
+        "scorer_digest": null
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123651525
+      },
+      "warnings": []
+    }
+  },
+  {
+    "job_id": "2048ea7a-81aa-4328-9e85-131167c07967",
+    "route": {
+      "route_id": "2a93d59a-0029-40ea-b89a-9272fbe0f21a",
+      "selection_mode": "explicit",
+      "chosen": {
+        "lane": "codex",
+        "provider": "codex-cli",
+        "model": "gpt-6-luna",
+        "account_ref": "native-default"
+      },
+      "band": null,
+      "D": null,
+      "suggested_subagents": null,
+      "skipped": [],
+      "context": {
+        "worker_bytes": 323,
+        "scorer_chars": 0,
+        "scorer_digest": null
+      },
+      "quota": {
+        "status": "fresh",
+        "source": "codex-app-server",
+        "sampled_at_ms": 1792123651525
+      },
+      "warnings": []
+    }
+  }
+]

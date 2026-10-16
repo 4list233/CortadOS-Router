@@ -1,0 +1,125 @@
+{
+  "base": "1fc76cc29bb5f49f8d3e8b6701ae586a059fc06d",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "sha256": "b824d320aafa5e5ebf32b72d97e5535945bad6266f1f3c2cc8b65f63fb19a88a",
+      "bytes": 866,
+      "lines": 21
+    },
+    {
+      "path": "cortados_router/route_task.py",
+      "sha256": "81fe901f6384df8f91440a42a571942a356c021727e263f581cb607f8fd6beab",
+      "bytes": 6802,
+      "lines": 119
+    },
+    {
+      "path": "cortados_router/worker_admission.py",
+      "sha256": "0a39a8660d40f25060459b009e99ddbbee5addbbd6e418fa711a09b8e7b8fddd",
+      "bytes": 3059,
+      "lines": 57
+    },
+    {
+      "path": "cortados_router/scarcity_codex_native.py",
+      "sha256": "e8fd608b717f65aba449c360806bf8e3ae98fdf43c37598db4c3cebdd3dd030e",
+      "bytes": 2743,
+      "lines": 49
+    },
+    {
+      "path": "cortados_router/selection_resources.py",
+      "sha256": "c433a94909176eccc490d5045efa79bf995233f75583011f4b2e535c74fdfff7",
+      "bytes": 1185,
+      "lines": 33
+    },
+    {
+      "path": "cortados_router/core.py",
+      "sha256": "763ca14c2c28e4d10bb9caa2eee5ab96b474467db91e16fe5a5ca1ad5cd138b1",
+      "bytes": 52459,
+      "lines": 803
+    },
+    {
+      "path": "integrations/mcp/__init__.py",
+      "sha256": "64c638673c2034097f2374fc1eda6d832f12e4b29da84b12c5f26df1088a5720",
+      "bytes": 314,
+      "lines": 4
+    },
+    {
+      "path": "integrations/mcp/__main__.py",
+      "sha256": "acb683bfd74f50aab3f1ae70bafd652aa5bee3dc02601f051a201a9bd790448e",
+      "bytes": 2101,
+      "lines": 52
+    },
+    {
+      "path": "integrations/mcp/server.py",
+      "sha256": "6a989e8583320288caed96ea9430dcfec8d044d18c8198e6a6e33abc4b86e16c",
+      "bytes": 3904,
+      "lines": 78
+    },
+    {
+      "path": "integrations/mcp/config.py",
+      "sha256": "b085650e418fbb60d34a2e69940f5dec4674a0fee339788d72d99fb72cdc008d",
+      "bytes": 7978,
+      "lines": 142
+    },
+    {
+      "path": "integrations/mcp/schemas.py",
+      "sha256": "3cb2aabe1fa4db944524b7ce1175d1f451896219b2c194423a5faecce2cc18ba",
+      "bytes": 8562,
+      "lines": 166
+    },
+    {
+      "path": "integrations/mcp/native_metadata.py",
+      "sha256": "c6f904f62137cad0d5ca5ae5cdc7f2e2de2692a7bfadc287054e14ec9ba4c2b3",
+      "bytes": 10218,
+      "lines": 199
+    },
+    {
+      "path": "integrations/mcp/grant_proxy.py",
+      "sha256": "b311a99ed35ef28384628215e9027c2a122f172cb44da5d350d3712992aed0f0",
+      "bytes": 9993,
+      "lines": 247
+    },
+    {
+      "path": "integrations/mcp/broker.py",
+      "sha256": "dcf259fdace2eae36670425da899643590411915215a29d77e4fce1c1deed59b",
+      "bytes": 16567,
+      "lines": 336
+    },
+    {
+      "path": "integrations/mcp/job_store.py",
+      "sha256": "54d03a567ade743d19734b918b442724f040c9b85bba2a8f998ba8dcd8446aa9",
+      "bytes": 10368,
+      "lines": 211
+    },
+    {
+      "path": "integrations/mcp/codex.py",
+      "sha256": "2db52adf76bc984cc855495673454c853684b8d71c2e68bd1db89f3cc819c025",
+      "bytes": 7218,
+      "lines": 143
+    },
+    {
+      "path": "integrations/mcp/worker.py",
+      "sha256": "e810371e0f4d2a3415c5ca4ceedc5ce7afc946c7ab5ab3d242c6d5c813a875a6",
+      "bytes": 11974,
+      "lines": 257
+    },
+    {
+      "path": "integrations/mcp/native_process.py",
+      "sha256": "f452a30183e8e0c78e7bd64e94080f11f347045a414b100981b8cbfcd868ef99",
+      "bytes": 12114,
+      "lines": 267
+    },
+    {
+      "path": "tests/test_mcp_worker.py",
+      "sha256": "5e070d30f3647f9cad4767fd8ecdada22fe0a191d7371b00841e2cce9c61be2d",
+      "bytes": 12793,
+      "lines": 229
+    },
+    {
+      "path": "tests/test_mcp_route_task.py",
+      "sha256": "cc4cc4e8679c8dd1ea97d20a3d60a6d583a89d45ae238f30a0d71b1b223646c4",
+      "bytes": 15624,
+      "lines": 277
+    }
+  ]
+}

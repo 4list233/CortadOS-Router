@@ -1,0 +1,41 @@
+{
+  "candidate": "c0588b727270bd63e0af94ecd5c6bd761fa348dc",
+  "protected_exam_commit": "1fc76cc29bb5f49f8d3e8b6701ae586a059fc06d",
+  "protected_manifest_sha256": "a889f2a26aeaf983b27cf245d7ae1df4ddaade51b93ef613dfda663ae5e2f25b",
+  "contract_sha256": "a7934cdb9a78e18dc18e70eaf8973052308cec696776e2b9c55ac88768b9a740",
+  "source_manifest_match": true,
+  "standalone": {
+    "pass": 181,
+    "fail": 0,
+    "error": 0,
+    "skip": 0
+  },
+  "integrations": {
+    "pass": 70,
+    "fail": 4,
+    "error": 0,
+    "skip": 0
+  },
+  "protected_acceptance": {
+    "pass": 53,
+    "fail": 0,
+    "error": 0,
+    "skip": 0
+  },
+  "unique_total": {
+    "pass": 304,
+    "fail": 4,
+    "error": 0,
+    "skip": 0
+  },
+  "new_worker_cases": 87,
+  "native_checks": {
+    "pass": 6,
+    "fail": 0
+  },
+  "implementation_defects": 0,
+  "overall_acceptance": "FAIL",
+  "reason": "Four unchanged pre-existing integration failures; no new regressions",
+  "deployment": "not performed",
+  "remaining_native_check_processes": 0
+}

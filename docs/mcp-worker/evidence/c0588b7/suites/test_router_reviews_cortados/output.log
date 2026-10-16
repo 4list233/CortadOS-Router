@@ -1,0 +1,16 @@
+.F                                                                       [100%]
+=================================== FAILURES ===================================
+_____ CortadOSReviewTests.test_profile_instructions_are_opt_in_and_dynamic _____
+
+self = <tests.integration.test_router_reviews_cortados.CortadOSReviewTests testMethod=test_profile_instructions_are_opt_in_and_dynamic>
+
+    def test_profile_instructions_are_opt_in_and_dynamic(self):
+        faces = json.loads((CORTADOS/'faces.json').read_text())
+>       self.assertFalse(any('before it is called done' in r for r in faces['rules']))
+E       AssertionError: True is not false
+
+tests/integration/test_router_reviews_cortados.py:35: AssertionError
+- generated xml file: /private/tmp/mcp-root-verification-c0588b7/test_router_reviews_cortados.xml -
+=========================== short test summary info ============================
+FAILED tests/integration/test_router_reviews_cortados.py::CortadOSReviewTests::test_profile_instructions_are_opt_in_and_dynamic
+1 failed, 1 passed in 0.06s

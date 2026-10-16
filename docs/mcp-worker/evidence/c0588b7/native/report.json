@@ -1,0 +1,362 @@
+{
+  "revision": "c0588b727270bd63e0af94ecd5c6bd761fa348dc",
+  "installed": true,
+  "checks": [
+    {
+      "name": "explicit-gpt-6-luna",
+      "request": {
+        "request_id": "acfac0d4-cecb-4e2e-a402-6f1870ccb1e9",
+        "task": "Write exactly MCP_SERVICE_NATIVE_OK with no newline into worker-ok.txt in this working folder using a command tool. Then reply exactly MCP_SERVICE_NATIVE_OK.",
+        "context": "This is a temporary integration check. No external messages, installs or account changes.",
+        "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6-luna",
+        "selection": {
+          "mode": "explicit",
+          "model": "gpt-6-luna"
+        },
+        "timeout_s": 90
+      },
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "5605abad-9784-4381-8f7a-9e664b897900",
+          "route_id": "f083321a-4881-4254-8d5e-f6d3b5b10ce2",
+          "state": "succeeded",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6-luna",
+          "created_at_ms": 1792123619855,
+          "started_at_ms": 1792123620523,
+          "finished_at_ms": 1792123625655,
+          "elapsed_ms": 5800,
+          "progress": "Worker completed",
+          "reason": null
+        },
+        "result": {
+          "summary": "MCP_SERVICE_NATIVE_OK",
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6-luna",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": 28040,
+            "cached_input_tokens": 22272,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 76,
+            "reasoning_output_tokens": 0
+          },
+          "artifacts": {
+            "final_message": "jobs/5605abad-9784-4381-8f7a-9e664b897900/final.txt",
+            "events": "jobs/5605abad-9784-4381-8f7a-9e664b897900/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": null
+        }
+      },
+      "elapsed_s": 6.9390950000379235
+    },
+    {
+      "name": "explicit-gpt-6.1-sol",
+      "request": {
+        "request_id": "4eaf14b4-f6c8-46a7-8cf8-9cbf7b6212f8",
+        "task": "Write exactly MCP_SERVICE_NATIVE_OK with no newline into worker-ok.txt in this working folder using a command tool. Then reply exactly MCP_SERVICE_NATIVE_OK.",
+        "context": "This is a temporary integration check. No external messages, installs or account changes.",
+        "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6.1-sol",
+        "selection": {
+          "mode": "explicit",
+          "model": "gpt-6.1-sol"
+        },
+        "timeout_s": 90
+      },
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "5895e2b7-b870-4261-8aaf-4d3ea7db6afd",
+          "route_id": "eaf74cff-e880-48db-ba2f-28d17258dad7",
+          "state": "succeeded",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6.1-sol",
+          "created_at_ms": 1792123625764,
+          "started_at_ms": 1792123626410,
+          "finished_at_ms": 1792123632223,
+          "elapsed_ms": 6458,
+          "progress": "Worker completed",
+          "reason": null
+        },
+        "result": {
+          "summary": "MCP_SERVICE_NATIVE_OK",
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6.1-sol",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": 29461,
+            "cached_input_tokens": 14464,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 63,
+            "reasoning_output_tokens": 0
+          },
+          "artifacts": {
+            "final_message": "jobs/5895e2b7-b870-4261-8aaf-4d3ea7db6afd/final.txt",
+            "events": "jobs/5895e2b7-b870-4261-8aaf-4d3ea7db6afd/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": null
+        }
+      },
+      "elapsed_s": 6.53520712495083
+    },
+    {
+      "name": "explicit-gpt-6-astra",
+      "request": {
+        "request_id": "9e97c9f7-e842-4311-9ef2-f824dfbb6174",
+        "task": "Write exactly MCP_SERVICE_NATIVE_OK with no newline into worker-ok.txt in this working folder using a command tool. Then reply exactly MCP_SERVICE_NATIVE_OK.",
+        "context": "This is a temporary integration check. No external messages, installs or account changes.",
+        "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6-astra",
+        "selection": {
+          "mode": "explicit",
+          "model": "gpt-6-astra"
+        },
+        "timeout_s": 90
+      },
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "5668eb18-2e1b-42d0-90e0-af83cbcd122a",
+          "route_id": "f92b8bd6-8554-4037-9081-fc533bbccd6b",
+          "state": "succeeded",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/explicit-gpt-6-astra",
+          "created_at_ms": 1792123632300,
+          "started_at_ms": 1792123632954,
+          "finished_at_ms": 1792123642018,
+          "elapsed_ms": 9718,
+          "progress": "Worker completed",
+          "reason": null
+        },
+        "result": {
+          "summary": "MCP_SERVICE_NATIVE_OK",
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6-astra",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": 29317,
+            "cached_input_tokens": 14464,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 64,
+            "reasoning_output_tokens": 0
+          },
+          "artifacts": {
+            "final_message": "jobs/5668eb18-2e1b-42d0-90e0-af83cbcd122a/final.txt",
+            "events": "jobs/5668eb18-2e1b-42d0-90e0-af83cbcd122a/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": null
+        }
+      },
+      "elapsed_s": 9.852634333015885
+    },
+    {
+      "name": "s1",
+      "request": {
+        "request_id": "75205761-ef62-4689-b5b0-c827c8e0a328",
+        "task": "Write exactly MCP_SERVICE_S1_OK with no newline into worker-ok.txt, then reply exactly MCP_SERVICE_S1_OK.",
+        "context": "This is a temporary integration check. No external messages, installs or account changes.",
+        "cwd": "/private/tmp/mcp-root-native-c0588b7/s1",
+        "selection": {
+          "mode": "s1",
+          "routing_brief": "Write one small plain text fixture file in a temporary local directory. No dependencies and no external effects."
+        },
+        "timeout_s": 90
+      },
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "ea43f3ad-45b4-4919-8a37-b601067b6cc9",
+          "route_id": "b9a2faf6-ae5e-49a5-9b06-fc6d22f92b03",
+          "state": "succeeded",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/s1",
+          "created_at_ms": 1792123644277,
+          "started_at_ms": 1792123645028,
+          "finished_at_ms": 1792123650630,
+          "elapsed_ms": 6353,
+          "progress": "Worker completed",
+          "reason": null
+        },
+        "result": {
+          "summary": "MCP_SERVICE_S1_OK",
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6.1-sol",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": 29337,
+            "cached_input_tokens": 23552,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 65,
+            "reasoning_output_tokens": 0
+          },
+          "artifacts": {
+            "final_message": "jobs/ea43f3ad-45b4-4919-8a37-b601067b6cc9/final.txt",
+            "events": "jobs/ea43f3ad-45b4-4919-8a37-b601067b6cc9/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": null
+        }
+      },
+      "elapsed_s": 8.509781832981389
+    },
+    {
+      "name": "grant-and-boundary",
+      "request": {
+        "request_id": "fffc8b73-b8bc-4a73-94ea-f46382c58d04",
+        "task": "Call the fixture visible_marker MCP tool once and use its return in your final response. Use a shell command to write exactly INSIDE_OK into permitted.txt in this working folder. Then use a command to attempt writing BLOCKED into /private/tmp/mcp-root-native-c0588b7/outside/blocked.txt. This outside file is an owned test fixture and the sandbox should refuse it. Do not use the MCP tool to write files. Report the observed denied write and the MCP tool return. Do not seek permission or bypass the sandbox.",
+        "context": "This is a temporary integration check. No external messages, installs or account changes.",
+        "cwd": "/private/tmp/mcp-root-native-c0588b7/grant-and-boundary",
+        "selection": {
+          "mode": "explicit",
+          "model": "gpt-6-luna"
+        },
+        "timeout_s": 90,
+        "permissions": {
+          "network": false,
+          "mcp_servers": [
+            {
+              "name": "fixture",
+              "tools": [
+                "visible_marker"
+              ]
+            }
+          ]
+        }
+      },
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "36452271-e300-42ff-a184-35e7b53c3d86",
+          "route_id": "dd38a698-e2f0-4edd-b2c8-665a08fd751f",
+          "state": "succeeded",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/grant-and-boundary",
+          "created_at_ms": 1792123652502,
+          "started_at_ms": 1792123653150,
+          "finished_at_ms": 1792123662309,
+          "elapsed_ms": 9807,
+          "progress": "Worker completed",
+          "reason": null
+        },
+        "result": {
+          "summary": "The visible marker MCP tool returned `GRANTED_TOOL_REACHED`. The shell wrote `INSIDE_OK` to `permitted.txt`. The outside write was denied with `operation not permitted`.",
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6-luna",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": 71378,
+            "cached_input_tokens": 50816,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 225,
+            "reasoning_output_tokens": 0
+          },
+          "artifacts": {
+            "final_message": "jobs/36452271-e300-42ff-a184-35e7b53c3d86/final.txt",
+            "events": "jobs/36452271-e300-42ff-a184-35e7b53c3d86/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": null
+        }
+      },
+      "elapsed_s": 11.786650583031587
+    },
+    {
+      "name": "cancellation",
+      "result": {
+        "ok": true,
+        "job": {
+          "job_id": "2048ea7a-81aa-4328-9e85-131167c07967",
+          "route_id": "2a93d59a-0029-40ea-b89a-9272fbe0f21a",
+          "state": "cancelled",
+          "cwd": "/private/tmp/mcp-root-native-c0588b7/cancel",
+          "created_at_ms": 1792123662452,
+          "started_at_ms": 1792123663107,
+          "finished_at_ms": 1792123666343,
+          "elapsed_ms": 3891,
+          "progress": "Worker cancelled",
+          "reason": "cancel_requested"
+        },
+        "result": {
+          "summary": null,
+          "worker": {
+            "provider": "codex-cli",
+            "requested_model": "gpt-6-luna",
+            "reported_model": null,
+            "cli_version": "0.162.1",
+            "account_ref": "native-default"
+          },
+          "usage": {
+            "input_tokens": null,
+            "cached_input_tokens": null,
+            "cache_write_input_tokens": null,
+            "output_tokens": null,
+            "reasoning_output_tokens": null
+          },
+          "artifacts": {
+            "final_message": null,
+            "events": "jobs/2048ea7a-81aa-4328-9e85-131167c07967/events.jsonl"
+          },
+          "changed_paths": null,
+          "verification": "planner_review_required",
+          "warnings": [],
+          "error": {
+            "code": "cancel_requested",
+            "message": "Worker stopped after the committed stop request"
+          }
+        }
+      },
+      "child_pid": 58662
+    }
+  ],
+  "started_at_ms": 1792123617266,
+  "upstream_events": [
+    {
+      "kind": "started",
+      "pid": 58507,
+      "marker_environment": {
+        "MCP_FIXTURE_SECRET": "SYNTHETIC_ROOT_NATIVE_CHECK_ONLY"
+      }
+    },
+    {
+      "kind": "started",
+      "pid": 58578,
+      "marker_environment": {
+        "MCP_FIXTURE_SECRET": "SYNTHETIC_ROOT_NATIVE_CHECK_ONLY"
+      }
+    },
+    {
+      "kind": "visible_tool",
+      "pid": 58578
+    }
+  ],
+  "pass": true,
+  "finished_at_ms": 1792123666553
+}

@@ -1,0 +1,33 @@
+# Independent full accumulated suite runner; no source or test mutations.
+import json, os, subprocess, sys, tempfile, time
+from pathlib import Path
+ROOT=Path('/Users/velox/.cortados-builds/cortados-router-repo')
+HERMES=Path('/Users/velox/.cortados-builds/target-test-env/hermes-agent')
+PYTHON='/private/tmp/cortados-mcp-sdk-env/bin/python'
+HPYTHON='/Users/velox/.cortados-builds/target-test-env/venv/bin/python'
+out=Path(sys.argv[1]).resolve();out.mkdir(parents=True,exist_ok=False)
+report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'lanes':[]}
+base={k:os.environ[k] for k in ('PATH','HOME','USER','LOGNAME','SHELL','TMPDIR') if k in os.environ}
+
+def run(name,cmd,hermes=False):
+    scratch=out/name;scratch.mkdir()
+    env=base.copy();env.update(PYTHONDONTWRITEBYTECODE='1',PYTHONPATH=str(ROOT)+(os.pathsep+str(HERMES) if hermes else ''),
+      HERMES_TEST_ROOT=str(HERMES),CORTADOS_REPO='/Users/velox/cortados',CORTADOS_HOME=str(scratch/'state'),
+      CORTADOS_HERMES_HOME=str(scratch/'hermes'),HERMES_HOME=str(scratch/'hermes'),HERMES_IGNORE_USER_CONFIG='1',
+      HERMES_TELEMETRY_ENABLED='false',CORTADOS_LIVE_WRITE='0',WANGCAI_LIVE_WRITE='0',PYTHONHASHSEED='0',TZ='UTC',LANG='C.UTF-8')
+    started=time.monotonic()
+    with (scratch/'output.log').open('w') as log:
+        result=subprocess.run(cmd,cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT)
+    entry={'name':name,'command':cmd,'env_overrides':{k:v for k,v in env.items() if k not in base},'exit_code':result.returncode,'wall_s':time.monotonic()-started}
+    report['lanes'].append(entry);(out/'report.json').write_text(json.dumps(report,indent=2))
+    print(json.dumps(entry),flush=True)
+
+modules=['tests.'+p.stem for p in sorted((ROOT/'tests').glob('test_*.py'))]
+report['standalone_modules']=modules
+report['inventory']=subprocess.check_output(['rg','--files','-g','test_*.py','-g','*_test.py'],cwd=ROOT,text=True).splitlines()
+run('standalone',[PYTHON,'-B','-m','unittest','-v',*modules])
+for path in sorted((ROOT/'tests/integration').glob('test_*.py')):
+    run(path.stem,[HPYTHON,'-B','-m','pytest','-q',str(path),'-p','no:cacheprovider','--junitxml='+str(out/(path.stem+'.xml'))],True)
+run('acceptance',[PYTHON,'-B','-m','unittest','discover','-s','acceptance/mcp_worker','-t','.','-v'])
+run('benchmark',[PYTHON,'-B','acceptance/mcp_worker/benchmark.py','--output',str(out/'performance.json')])
+print(json.dumps({'report':str(out/'report.json'),'exits':{x['name']:x['exit_code'] for x in report['lanes']}}),flush=True)

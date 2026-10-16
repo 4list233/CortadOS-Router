@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"01a142e4-f367-7e10-acb1-4bcf9eda7f3f"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll start the exact command now and leave its 60-second sleep intact."}}

@@ -25,8 +25,8 @@ and `job_cancel`. This first version runs Codex only, on the captured macOS CLI 
 not place arbitrary models inside Claude's harness or import Claude's live connector sessions.
 
 See the [operator guide](docs/mcp-worker/USAGE.md), [reviewed contract](docs/mcp-worker/CONTRACT.md)
-and [independent acceptance package](acceptance/mcp_worker/README.md). Candidate verification is
-recorded separately from the legacy baseline below. No live client configuration is installed by this build.
+and [build verification](docs/mcp-worker/BUILD-REPORT.md). All 87 new worker tests and six real-native
+checks pass; the complete accumulated suite remains at 304 pass and four pre-existing failures. No live client configuration is installed by this build.
 
 ## The 12 questions
 

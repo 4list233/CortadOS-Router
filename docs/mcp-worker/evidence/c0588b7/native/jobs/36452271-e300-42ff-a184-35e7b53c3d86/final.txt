@@ -1,0 +1,1 @@
+The visible marker MCP tool returned `GRANTED_TOOL_REACHED`. The shell wrote `INSIDE_OK` to `permitted.txt`. The outside write was denied with `operation not permitted`.

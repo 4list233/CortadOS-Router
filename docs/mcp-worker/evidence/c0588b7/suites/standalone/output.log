@@ -1,0 +1,231 @@
+test_config_can_parse_the_same_bytes_used_for_broker_identity (tests.test_mcp_route_task.RouteContract.test_config_can_parse_the_same_bytes_used_for_broker_identity) ... ok
+test_config_required_numeric_limits_and_duplicate_json_keys (tests.test_mcp_route_task.RouteContract.test_config_required_numeric_limits_and_duplicate_json_keys) ... ok
+test_config_restart_timeout_policy_does_not_change_request_identity (tests.test_mcp_route_task.RouteContract.test_config_restart_timeout_policy_does_not_change_request_identity) ... ok
+test_context_bounds_refuse_before_metadata_or_scorer (tests.test_mcp_route_task.RouteContract.test_context_bounds_refuse_before_metadata_or_scorer) ... ok
+test_empty_allowed_models_and_uncaptured_model_refuse (tests.test_mcp_route_task.RouteContract.test_empty_allowed_models_and_uncaptured_model_refuse) ... ok
+test_event_closed_shape_discards_invalid_request_id (tests.test_mcp_route_task.RouteContract.test_event_closed_shape_discards_invalid_request_id) ... ok
+test_executable_symlink_preserves_virtual_environment_selection (tests.test_mcp_route_task.RouteContract.test_executable_symlink_preserves_virtual_environment_selection) ... ok
+test_explicit_context_is_exact_and_has_no_scorer_or_advice (tests.test_mcp_route_task.RouteContract.test_explicit_context_is_exact_and_has_no_scorer_or_advice) ... ok
+test_malformed_ipv6_connector_url_returns_typed_invalid_request (tests.test_mcp_route_task.RouteContract.test_malformed_ipv6_connector_url_returns_typed_invalid_request) ... ok
+test_metadata_fixture_pagination_cache_and_failed_refresh (tests.test_mcp_route_task.RouteContract.test_metadata_fixture_pagination_cache_and_failed_refresh) ... ok
+test_metadata_refresh_rejects_changed_native_binary_version (tests.test_mcp_route_task.RouteContract.test_metadata_refresh_rejects_changed_native_binary_version) ... ok
+test_native_quota_projection_calls_existing_math_owners (tests.test_mcp_route_task.RouteContract.test_native_quota_projection_calls_existing_math_owners) ... ok
+test_policy_unknown_managed_and_requirements_fail_closed (tests.test_mcp_route_task.RouteContract.test_policy_unknown_managed_and_requirements_fail_closed) ... ok
+test_quota_invalid_geometry_bucket_mapping_and_permission_refuse (tests.test_mcp_route_task.RouteContract.test_quota_invalid_geometry_bucket_mapping_and_permission_refuse) ... ok
+test_quota_refresh_after_scorer_prevents_launch_advice (tests.test_mcp_route_task.RouteContract.test_quota_refresh_after_scorer_prevents_launch_advice) ... ok
+test_resource_snapshot_is_immutable_and_returned_health_is_detached (tests.test_mcp_route_task.RouteContract.test_resource_snapshot_is_immutable_and_returned_health_is_detached) ... ok
+test_s1_resource_snapshot_never_reads_live_health_or_unit_cost (tests.test_mcp_route_task.RouteContract.test_s1_resource_snapshot_never_reads_live_health_or_unit_cost) ... ok
+test_schema_defaults_and_canonical_identity_preserve_whitespace (tests.test_mcp_route_task.RouteContract.test_schema_defaults_and_canonical_identity_preserve_whitespace) ... ok
+test_schema_rejects_nested_fields_boolean_timeout_and_duplicate_grants (tests.test_mcp_route_task.RouteContract.test_schema_rejects_nested_fields_boolean_timeout_and_duplicate_grants) ... ok
+test_scorer_failure_and_clarification_do_not_resolve (tests.test_mcp_route_task.RouteContract.test_scorer_failure_and_clarification_do_not_resolve) ... ok
+test_subscription_gate_rejects_api_and_missing_login (tests.test_mcp_route_task.RouteContract.test_subscription_gate_rejects_api_and_missing_login) ... ok
+test_validly_shaped_denied_permissions_refuse_before_metadata (tests.test_mcp_route_task.RouteContract.test_validly_shaped_denied_permissions_refuse_before_metadata) ... ok
+test_job_store_first_stop_intent_is_durable (tests.test_mcp_worker.JobStoreRegressions.test_job_store_first_stop_intent_is_durable) ... ok
+test_job_store_partial_claim_rolls_back_identity_workspace_and_capacity (tests.test_mcp_worker.JobStoreRegressions.test_job_store_partial_claim_rolls_back_identity_workspace_and_capacity) ... ok
+test_job_store_terminal_duration_and_result_cannot_change (tests.test_mcp_worker.JobStoreRegressions.test_job_store_terminal_duration_and_result_cannot_change) ... ok
+test_job_store_unfinished_identity_never_replays_another_attempt (tests.test_mcp_worker.JobStoreRegressions.test_job_store_unfinished_identity_never_replays_another_attempt) ... ok
+test_job_store_unknown_schema_refuses_without_migration (tests.test_mcp_worker.JobStoreRegressions.test_job_store_unknown_schema_refuses_without_migration) ... ok
+test_job_store_uuid_and_request_identity_use_unique_indexes (tests.test_mcp_worker.JobStoreRegressions.test_job_store_uuid_and_request_identity_use_unique_indexes) ... ok
+test_refreshed_inventory_must_include_the_already_selected_model (tests.test_mcp_worker.LaunchAdmissionRegressions.test_refreshed_inventory_must_include_the_already_selected_model) ... ok
+test_failed_process_observation_retains_claim_evidence_and_refuses_signals (tests.test_mcp_worker.NativeIdentityRegressions.test_failed_process_observation_retains_claim_evidence_and_refuses_signals) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py:307: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107595210>
+  class _PointerTypeCache:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_natural_exit_between_inventory_and_signal_does_not_lose_ownership (tests.test_mcp_worker.NativeIdentityRegressions.test_natural_exit_between_inventory_and_signal_does_not_lose_ownership) ... ok
+test_process_groups_signal_descendants_before_native_parent (tests.test_mcp_worker.NativeIdentityRegressions.test_process_groups_signal_descendants_before_native_parent) ... ok
+test_process_identity_reuse_never_authorizes_a_signal (tests.test_mcp_worker.NativeIdentityRegressions.test_process_identity_reuse_never_authorizes_a_signal) ... ok
+test_watchdog_stop_and_control_loss_before_start_never_launch_native (tests.test_mcp_worker.NativeIdentityRegressions.test_watchdog_stop_and_control_loss_before_start_never_launch_native) ... ok
+test_degraded_uses_fallback (tests.test_router.Bands.test_degraded_uses_fallback) ... ok
+test_outward_floors_blast_radius (tests.test_router.Bands.test_outward_floors_blast_radius) ... ok
+test_r0_r1 (tests.test_router.Bands.test_r0_r1) ... ok
+test_r2_decomposes_only_when_parts_or_parallel (tests.test_router.Bands.test_r2_decomposes_only_when_parts_or_parallel) ... ok
+test_r3_by_difficulty_and_by_blast (tests.test_router.Bands.test_r3_by_difficulty_and_by_blast) ... ok
+test_r4_never_by_score (tests.test_router.Bands.test_r4_never_by_score) ... ok
+test_work_kind_reorders_lanes (tests.test_router.Bands.test_work_kind_reorders_lanes) ... ok
+test_discord_shapes (tests.test_router.CleanRequest.test_discord_shapes) ... ok
+test_expiring_headroom_goes_first (tests.test_router.Scarcity.test_expiring_headroom_goes_first) ... ok
+test_fast_burning_lane_goes_behind (tests.test_router.Scarcity.test_fast_burning_lane_goes_behind) ... ok
+test_model_pool_is_scored_separately (tests.test_router.Scarcity.test_model_pool_is_scored_separately) ... ok
+test_scarce_lane_holds_subagents_to_minimum (tests.test_router.Scarcity.test_scarce_lane_holds_subagents_to_minimum) ... ok
+test_spent_lane_is_skipped (tests.test_router.Scarcity.test_spent_lane_is_skipped) ... ok
+test_context_policy_and_stickiness (tests.test_router.ScoredSelection.test_context_policy_and_stickiness) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pty.py:66: DeprecationWarning: This process (pid=56780) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pty.py:66: DeprecationWarning: This process (pid=56780) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+ok
+test_face_turns_have_a_floor_but_background_does_not (tests.test_router.ScoredSelection.test_face_turns_have_a_floor_but_background_does_not) ... ok
+test_insight_work_goes_to_the_frontier (tests.test_router.ScoredSelection.test_insight_work_goes_to_the_frontier) ... ok
+test_least_overqualified_model_that_clears_the_bar (tests.test_router.ScoredSelection.test_least_overqualified_model_that_clears_the_bar) ... ok
+test_requirement_is_continuous_in_difficulty (tests.test_router.ScoredSelection.test_requirement_is_continuous_in_difficulty) ... ok
+test_scarcity_moves_the_choice (tests.test_router.ScoredSelection.test_scarcity_moves_the_choice) ... ok
+test_secondary_source_only_when_native_spent (tests.test_router.ScoredSelection.test_secondary_source_only_when_native_spent) ... ok
+test_underused_frontier_pool_takes_hard_work (tests.test_router.ScoredSelection.test_underused_frontier_pool_takes_hard_work) ... ok
+test_use_case_changes_the_winner_and_ceiling_never_by_score (tests.test_router.ScoredSelection.test_use_case_changes_the_winner_and_ceiling_never_by_score) ... ok
+test_rejects_ceiling_outside_r4_and_non_grok_cursor (tests.test_router.TableValidation.test_rejects_ceiling_outside_r4_and_non_grok_cursor) ... ok
+test_antigravity (tests.test_router.UsageScreens.test_antigravity) ... ok
+test_claude (tests.test_router.UsageScreens.test_claude) ... ok
+test_claude_fable_week_is_its_own_pool (tests.test_router.UsageScreens.test_claude_fable_week_is_its_own_pool) ... ok
+test_codex (tests.test_router.UsageScreens.test_codex) ... ok
+test_codex_named_limit (tests.test_router.UsageScreens.test_codex_named_limit) ... ok
+test_cursor (tests.test_router.UsageScreens.test_cursor) ... ok
+test_window_view_is_pct_vs_time (tests.test_router.UsageScreens.test_window_view_is_pct_vs_time) ... ok
+test_busy_log_writer_is_bounded_and_does_not_open_a_second_database (tests.test_router_call_context.RouterCallContext.test_busy_log_writer_is_bounded_and_does_not_open_a_second_database) ... ok
+test_call_identity_is_idempotent_and_conflicts_do_not_rewrite_observation (tests.test_router_call_context.RouterCallContext.test_call_identity_is_idempotent_and_conflicts_do_not_rewrite_observation) ... ok
+test_changed_or_incomplete_context_cannot_label_turn_outcome (tests.test_router_call_context.RouterCallContext.test_changed_or_incomplete_context_cannot_label_turn_outcome) ... ok
+test_late_initial_score_detects_already_observed_changed_context (tests.test_router_call_context.RouterCallContext.test_late_initial_score_detects_already_observed_changed_context) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:2259: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x1076674c0>
+  def __init__(self, name, parent):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+cortados-router: host module context.hermes_input unavailable; task lookup gets the full turn text, not the projected current utterance
+ok
+test_missing_native_identity_or_wrong_session_does_not_guess (tests.test_router_call_context.RouterCallContext.test_missing_native_identity_or_wrong_session_does_not_guess) ... ok
+test_observation_failure_is_explicit_without_interrupting_native_call (tests.test_router_call_context.RouterCallContext.test_observation_failure_is_explicit_without_interrupting_native_call) ... ok
+test_task_switch_reaches_each_call_without_mutating_route_or_request (tests.test_router_call_context.RouterCallContext.test_task_switch_reaches_each_call_without_mutating_route_or_request) ... ok
+test_alias_home_and_named_face (tests.test_router_context.RouterContext.test_alias_home_and_named_face) ... ok
+test_cold_gateway_resolves_actual_session_before_context_lookup (tests.test_router_context.RouterContext.test_cold_gateway_resolves_actual_session_before_context_lookup) ... ok
+test_live_scores_and_shadow_logs_the_same_task_snapshot (tests.test_router_context.RouterContext.test_live_scores_and_shadow_logs_the_same_task_snapshot) ... ok
+test_local_context_stop_is_not_provider_authorship_or_training_outcome (tests.test_router_context.RouterContext.test_local_context_stop_is_not_provider_authorship_or_training_outcome) ... ok
+test_main_key_uses_harvey_but_preserves_session_key (tests.test_router_context.RouterContext.test_main_key_uses_harvey_but_preserves_session_key) ... ok
+test_ordinary_provider_response_still_records_author_and_call (tests.test_router_context.RouterContext.test_ordinary_provider_response_still_records_author_and_call) ... ok
+test_shadow_cannot_reuse_same_text_from_an_older_task_snapshot (tests.test_router_context.RouterContext.test_shadow_cannot_reuse_same_text_from_an_older_task_snapshot) ... ok
+test_shadow_does_not_reuse_another_faces_same_request (tests.test_router_context.RouterContext.test_shadow_does_not_reuse_another_faces_same_request) ... ok
+test_shadow_keeps_each_concurrent_turn_profile (tests.test_router_context.RouterContext.test_shadow_keeps_each_concurrent_turn_profile) ... ok
+test_shadow_passes_task_to_scorer_before_logging (tests.test_router_context.RouterContext.test_shadow_passes_task_to_scorer_before_logging) ... ok
+test_unknown_home_does_not_inherit_key_grants (tests.test_router_context.RouterContext.test_unknown_home_does_not_inherit_key_grants) ... ok
+test_captionless_discord_is_converted_then_scored_once_and_reused (tests.test_router_images.Gateway.test_captionless_discord_is_converted_then_scored_once_and_reused) ... ok
+test_failed_image_is_marked_and_escalated (tests.test_router_images.Gateway.test_failed_image_is_marked_and_escalated) ... ok
+test_long_caption_and_five_images_are_all_converted (tests.test_router_images.Gateway.test_long_caption_and_five_images_are_all_converted) ... ok
+test_typed_request_scores_the_text_with_the_image_as_context (tests.test_router_images.Gateway.test_typed_request_scores_the_text_with_the_image_as_context) ... ok
+test_unauthorized_image_never_calls_vision (tests.test_router_images.Gateway.test_unauthorized_image_never_calls_vision) ... ok
+test_all_attachments_even_with_long_caption (tests.test_router_images.Images.test_all_attachments_even_with_long_caption) ... ok
+test_answerer_gets_all_text_and_no_duplicate_vision (tests.test_router_images.Images.test_answerer_gets_all_text_and_no_duplicate_vision) ... ok
+test_complex_conversion_escalates_before_completion (tests.test_router_images.Images.test_complex_conversion_escalates_before_completion) ... cortados-router: host module hermes_cli.config unavailable; image conversion uses the configured vision model, not routed vision
+ok
+test_current_caption_reaches_both_vision_passes_without_quoted_history (tests.test_router_images.Images.test_current_caption_reaches_both_vision_passes_without_quoted_history) ... ok
+test_explicit_stronger_deadline_stays_bounded_and_preserves_partial_text (tests.test_router_images.Images.test_explicit_stronger_deadline_stays_bounded_and_preserves_partial_text) ... ok
+test_failure_retries_on_stronger_vision (tests.test_router_images.Images.test_failure_retries_on_stronger_vision) ... ok
+test_hermes_resize_note_preserves_model_json (tests.test_router_images.Images.test_hermes_resize_note_preserves_model_json) ... ok
+test_legacy_paths_are_deduplicated (tests.test_router_images.Images.test_legacy_paths_are_deduplicated) ... ok
+test_mime_wins_and_history_does_not_reconvert (tests.test_router_images.Images.test_mime_wins_and_history_does_not_reconvert) ... ok
+test_native_envelope_is_not_conversion (tests.test_router_images.Images.test_native_envelope_is_not_conversion) ... ok
+test_partial_failure_is_not_a_complete_batch (tests.test_router_images.Images.test_partial_failure_is_not_a_complete_batch) ... ok
+test_profile_context_reaches_vision_worker (tests.test_router_images.Images.test_profile_context_reaches_vision_worker) ... ok
+test_simple_image_uses_only_small_vision_and_saves_full_text (tests.test_router_images.Images.test_simple_image_uses_only_small_vision_and_saves_full_text) ... ok
+test_slow_stronger_conversion_gets_its_full_budget (tests.test_router_images.Images.test_slow_stronger_conversion_gets_its_full_budget) ... router image: conversion worker failed: TypeError
+ok
+test_unrecoverable_image_stays_incomplete_with_diagnostics (tests.test_router_images.Images.test_unrecoverable_image_stays_incomplete_with_diagnostics) ... ok
+test_engine_outputs_are_parsed (tests.test_router_images.OcrFirst.test_engine_outputs_are_parsed) ... ok
+test_image_only_routes_on_content_and_typed_request_routes_on_text (tests.test_router_images.OcrFirst.test_image_only_routes_on_content_and_typed_request_routes_on_text) ... ok
+test_photo_with_little_text_falls_back_to_vision (tests.test_router_images.OcrFirst.test_photo_with_little_text_falls_back_to_vision) ... ok
+test_readable_text_needs_no_vision_call (tests.test_router_images.OcrFirst.test_readable_text_needs_no_vision_call) ... ok
+test_sufficiency_boundaries (tests.test_router_images.OcrFirst.test_sufficiency_boundaries) ... ok
+test_unreadable_image_with_no_engine_falls_back (tests.test_router_images.OcrFirst.test_unreadable_image_with_no_engine_falls_back) ... cortados-router: host module ocr unavailable; no local OCR engine read the image; it goes to the vision model
+ok
+test_vision_warm_up_runs_once_per_binary_in_the_background (tests.test_router_images.OcrFirst.test_vision_warm_up_runs_once_per_binary_in_the_background) ... ok
+test_explicit_init_wins (tests.test_router_nightly_runs.NightlyRetrainsEveryNight.test_explicit_init_wins) ... ok
+test_new_run_warm_starts_from_promoted_adapter_with_a_night_sized_budget (tests.test_router_nightly_runs.NightlyRetrainsEveryNight.test_new_run_warm_starts_from_promoted_adapter_with_a_night_sized_budget) ... ok
+test_ordinary_nights_are_not_labelling_only (tests.test_router_nightly_runs.NightlyRetrainsEveryNight.test_ordinary_nights_are_not_labelling_only) ... ok
+test_pending_run_resumes_without_warm_start (tests.test_router_nightly_runs.NightlyRetrainsEveryNight.test_pending_run_resumes_without_warm_start) ... ok
+test_finished_pin_resumes_newest_unfinished_run (tests.test_router_nightly_runs.NightlyRunSelection.test_finished_pin_resumes_newest_unfinished_run) ... ok
+test_finished_pin_without_unfinished_run_starts_new_folder (tests.test_router_nightly_runs.NightlyRunSelection.test_finished_pin_without_unfinished_run_starts_new_folder) ... ok
+test_unfinished_pin_is_kept_and_promoted_unfinished_run_is_spared (tests.test_router_nightly_runs.NightlyRunSelection.test_unfinished_pin_is_kept_and_promoted_unfinished_run_is_spared) ... ok
+test_daytime_does_not_start_even_a_child (tests.test_router_overnight.Overnight.test_daytime_does_not_start_even_a_child) ... nightly: outside 01:30–07:00 Toronto; nothing started
+ok
+test_fall_clock_change_preserves_local_seven (tests.test_router_overnight.Overnight.test_fall_clock_change_preserves_local_seven) ... ok
+test_forced_stop_removes_only_its_own_pid_receipt (tests.test_router_overnight.Overnight.test_forced_stop_removes_only_its_own_pid_receipt) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_launch_time_until_seven (tests.test_router_overnight.Overnight.test_launch_time_until_seven) ... ok
+test_normal_child_exit_has_no_signal (tests.test_router_overnight.Overnight.test_normal_child_exit_has_no_signal) ... ok
+test_real_owned_child_is_stopped_at_deadline (tests.test_router_overnight.Overnight.test_real_owned_child_is_stopped_at_deadline) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_resume_interrupted_before_first_save_does_not_double_count (tests.test_router_overnight.Overnight.test_resume_interrupted_before_first_save_does_not_double_count) ... ok
+test_stubborn_child_gets_group_kill (tests.test_router_overnight.Overnight.test_stubborn_child_gets_group_kill) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_utc_boundary_is_not_offset_twice (tests.test_router_overnight.Overnight.test_utc_boundary_is_not_offset_twice) ... ok
+test_exit_mid_probe_leaves_no_cli_behind (tests.test_router_probe_reaper.ProbeReaper.test_exit_mid_probe_leaves_no_cli_behind) ... ok
+test_staleness_ignores_owner_pid_in_folder_name (tests.test_router_probe_reaper.ProbeReaper.test_staleness_ignores_owner_pid_in_folder_name) ... ok
+test_sweep_reclaims_cli_in_stale_folder (tests.test_router_probe_reaper.ProbeReaper.test_sweep_reclaims_cli_in_stale_folder) ... ok
+test_sweep_spares_fresh_and_tracked_folders (tests.test_router_probe_reaper.ProbeReaper.test_sweep_spares_fresh_and_tracked_folders) ... ok
+test_actual_model_observation_not_configured_route (tests.test_router_reviews.ReviewTests.test_actual_model_observation_not_configured_route) ... ok
+test_astra_gets_fable_and_smaller_claude (tests.test_router_reviews.ReviewTests.test_astra_gets_fable_and_smaller_claude) ... ok
+test_cursor_is_not_a_new_vendor (tests.test_router_reviews.ReviewTests.test_cursor_is_not_a_new_vendor) ... ok
+test_delivery_can_only_be_claimed_once_and_by_original_message (tests.test_router_reviews.ReviewTests.test_delivery_can_only_be_claimed_once_and_by_original_message) ... ok
+test_dispatch_both_and_retry_without_duplicates (tests.test_router_reviews.ReviewTests.test_dispatch_both_and_retry_without_duplicates) ... ok
+test_explicit_blocked_retry_only_sends_that_role (tests.test_router_reviews.ReviewTests.test_explicit_blocked_retry_only_sends_that_role) ... ok
+test_fable_reverses_to_openai (tests.test_router_reviews.ReviewTests.test_fable_reverses_to_openai) ... ok
+test_gateway_override_and_shadow_bypass (tests.test_router_reviews.ReviewTests.test_gateway_override_and_shadow_bypass) ... ok
+test_missing_metadata_dispatches_nothing (tests.test_router_reviews.ReviewTests.test_missing_metadata_dispatches_nothing) ... ok
+test_named_fable_pool_is_checked (tests.test_router_reviews.ReviewTests.test_named_fable_pool_is_checked) ... ok
+test_ordinary_turn_and_fixed_default_do_not_start_review (tests.test_router_reviews.ReviewTests.test_ordinary_turn_and_fixed_default_do_not_start_review) ... ok
+test_other_vendors_supported (tests.test_router_reviews.ReviewTests.test_other_vendors_supported) ... ok
+test_partial_failure_retry_only_failed_leg (tests.test_router_reviews.ReviewTests.test_partial_failure_retry_only_failed_leg) ... ok
+test_receive_rechecks_only_assigned_reviewer_and_keeps_announced_model (tests.test_router_reviews.ReviewTests.test_receive_rechecks_only_assigned_reviewer_and_keeps_announced_model) ... ok
+test_small_author_matches_small_and_gets_frontier_adversary (tests.test_router_reviews.ReviewTests.test_small_author_matches_small_and_gets_frontier_adversary) ... ok
+test_small_worker_below_interactive_floor_can_get_comparable_review (tests.test_router_reviews.ReviewTests.test_small_worker_below_interactive_floor_can_get_comparable_review) ... ok
+test_spent_frontier_does_not_silently_use_same_vendor_or_small (tests.test_router_reviews.ReviewTests.test_spent_frontier_does_not_silently_use_same_vendor_or_small) ... ok
+test_ticket_rejects_wrong_sender_profile_and_quoted_history (tests.test_router_reviews.ReviewTests.test_ticket_rejects_wrong_sender_profile_and_quoted_history) ... ok
+test_unknown_author_and_oversize_context_block (tests.test_router_reviews.ReviewTests.test_unknown_author_and_oversize_context_block) ... ok
+test_unknown_delivery_not_repeated (tests.test_router_reviews.ReviewTests.test_unknown_delivery_not_repeated) ... ok
+test_worker_provenance_and_path_validation (tests.test_router_reviews.ReviewTests.test_worker_provenance_and_path_validation) ... ok
+test_allowlist_cannot_leak_to_claude (tests.test_router_terra_fallback.TerraFallback.test_allowlist_cannot_leak_to_claude) ... ok
+test_context_limit_is_not_bypassed (tests.test_router_terra_fallback.TerraFallback.test_context_limit_is_not_bypassed) ... ok
+test_degraded_selects_terra (tests.test_router_terra_fallback.TerraFallback.test_degraded_selects_terra) ... ok
+test_quota_unavailable_does_not_force_model (tests.test_router_terra_fallback.TerraFallback.test_quota_unavailable_does_not_force_model) ... ok
+test_escalation_never_matches_a_similar_session_id (tests.test_router_transport.GatewayPreservation.test_escalation_never_matches_a_similar_session_id) ... ok
+test_no_estimated_fit_preserves_unadmitted_request_for_host_preflight (tests.test_router_transport.GatewayPreservation.test_no_estimated_fit_preserves_unadmitted_request_for_host_preflight) ... router fit: no candidate fits conservative estimate; retaining host assembly/preflight
+ok
+test_current_multibyte_request_recall_and_tool_envelope_count (tests.test_router_transport.IdentityAndSize.test_current_multibyte_request_recall_and_tool_envelope_count) ... ok
+test_display_and_api_content_are_alternatives_not_double_history (tests.test_router_transport.IdentityAndSize.test_display_and_api_content_are_alternatives_not_double_history) ... ok
+test_observer_includes_tool_arguments_and_does_not_mutate_tool_loop (tests.test_router_transport.IdentityAndSize.test_observer_includes_tool_arguments_and_does_not_mutate_tool_loop) ... ok
+test_read_only_scan_keeps_omitted_rows_and_database_unchanged (tests.test_router_transport.IdentityAndSize.test_read_only_scan_keeps_omitted_rows_and_database_unchanged) ... ok
+test_real_identifier_pair_and_cold_start_read_exact_history (tests.test_router_transport.IdentityAndSize.test_real_identifier_pair_and_cold_start_read_exact_history) ... ok
+test_session_reset_does_not_reuse_previous_session_cache (tests.test_router_transport.IdentityAndSize.test_session_reset_does_not_reuse_previous_session_cache) ... ok
+test_unknown_or_stale_compression_is_not_known_empty (tests.test_router_transport.IdentityAndSize.test_unknown_or_stale_compression_is_not_known_empty) ... ok
+test_all_transports_too_small_never_rescues_first_candidate (tests.test_router_transport.TransportGates.test_all_transports_too_small_never_rescues_first_candidate) ... ok
+test_gateway_transport_admits_large_codex_request_that_hermes_refuses (tests.test_router_transport.TransportGates.test_gateway_transport_admits_large_codex_request_that_hermes_refuses) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107400220>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x10744c6d0>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x1076674c0>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107667880>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x1077046d0>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107705e40>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x1077049a0>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py:806: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107705f30>
+  def __setattr__(self, name, value):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_oversized_current_request_excludes_agy_even_with_zero_history (tests.test_router_transport.TransportGates.test_oversized_current_request_excludes_agy_even_with_zero_history) ... ok
+test_scored_unfitting_stronger_model_cannot_hide_fitting_same_pool_model (tests.test_router_transport.TransportGates.test_scored_unfitting_stronger_model_cannot_hide_fitting_same_pool_model) ... ok
+test_transport_ceiling_applies_only_to_its_own_transport (tests.test_router_transport.TransportGates.test_transport_ceiling_applies_only_to_its_own_transport) ... ok
+test_unknown_history_excludes_constrained_route (tests.test_router_transport.TransportGates.test_unknown_history_excludes_constrained_route) ... ok
+test_utf8_byte_gate_applies_even_below_token_ceiling (tests.test_router_transport.TransportGates.test_utf8_byte_gate_applies_even_below_token_ceiling) ... ok
+test_zero_ceiling_containment_excludes_empty_history_on_degraded_route (tests.test_router_transport.TransportGates.test_zero_ceiling_containment_excludes_empty_history_on_degraded_route) ... ok
+test_boot_exit_recovers_once_and_retains_diagnostic (tests.test_router_usage_capture.Capture.test_boot_exit_recovers_once_and_retains_diagnostic) ... ok
+test_codex_probe_keeps_a_working_configured_binary (tests.test_router_usage_capture.Capture.test_codex_probe_keeps_a_working_configured_binary) ... ok
+test_codex_probe_survives_a_dead_configured_binary (tests.test_router_usage_capture.Capture.test_codex_probe_survives_a_dead_configured_binary) ... ok
+test_config_auth_and_exec_failures_are_not_retried (tests.test_router_usage_capture.Capture.test_config_auth_and_exec_failures_are_not_retried) ... ok
+test_empty_codex_error_reports_capture_state (tests.test_router_usage_capture.Capture.test_empty_codex_error_reports_capture_state) ... ok
+test_failed_exec_never_runs_a_forked_copy_of_the_caller (tests.test_router_usage_capture.Capture.test_failed_exec_never_runs_a_forked_copy_of_the_caller) ... ok
+test_persistent_boot_exit_is_bounded (tests.test_router_usage_capture.Capture.test_persistent_boot_exit_is_bounded) ... ok
+test_startup_classification_never_copies_private_text (tests.test_router_usage_capture.Capture.test_startup_classification_never_copies_private_text) ... ok
+test_startup_exit_retains_metadata_without_boot_text (tests.test_router_usage_capture.Capture.test_startup_exit_retains_metadata_without_boot_text) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pty.py:66: DeprecationWarning: This process (pid=56780) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+ok
+test_status_parser_still_uses_only_captured_panel (tests.test_router_usage_capture.Capture.test_status_parser_still_uses_only_captured_panel) ... ok
+
+----------------------------------------------------------------------
+Ran 181 tests in 9.957s
+
+OK

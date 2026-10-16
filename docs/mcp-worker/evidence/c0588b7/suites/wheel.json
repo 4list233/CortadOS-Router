@@ -1,0 +1,10 @@
+{
+  "wheel": "/private/tmp/cortados-mcp-wheel-c0588b7/cortados_router-1.0.0-py3-none-any.whl",
+  "sha256": "f7b47a28948a06a9a8a83c4464682a2cad8b7453f2266acc9aabdb09d81a933f",
+  "matched_source_entries": 46,
+  "outside_checkout_import": "/private/tmp/cortados-mcp-installed-check/lib/python3.14/site-packages/cortados_router/core.py",
+  "tables": "/private/tmp/cortados-mcp-installed-check/lib/python3.14/site-packages/tables",
+  "bands_loaded": 5,
+  "mcp": "1.30.0",
+  "cortados-router": "1.0.0"
+}

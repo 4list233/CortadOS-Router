@@ -1,0 +1,20 @@
+..............F..                                                        [100%]
+=================================== FAILURES ===================================
+__________ test_installer_check_idempotence_and_existing_generic_hook __________
+
+staged = (<module 'delegation_installer' from '/Users/velox/.cortados-builds/cortados-router-repo/integrations/hermes/patches/d...vate/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/pytest-of-velox/pytest-813/test_installer_check_idempoten0/host'))
+
+    def test_installer_check_idempotence_and_existing_generic_hook(staged):
+        installer, root = staged
+        before = {p: p.read_bytes() for p in root.rglob("*.py")}
+>       assert len(installer.apply(root, check=True)) == 4
+E       AssertionError: assert 1 == 4
+E        +  where 1 = len(['tools/delegate_model_routing.py'])
+E        +    where ['tools/delegate_model_routing.py'] = <function apply at 0x107f11620>(PosixPath('/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/pytest-of-velox/pytest-813/test_installer_check_idempoten0/host'), check=True)
+E        +      where <function apply at 0x107f11620> = <module 'delegation_installer' from '/Users/velox/.cortados-builds/cortados-router-repo/integrations/hermes/patches/delegation-routing.py'>.apply
+
+tests/integration/test_delegation_model_routing.py:295: AssertionError
+- generated xml file: /private/tmp/mcp-root-verification-c0588b7/test_delegation_model_routing.xml -
+=========================== short test summary info ============================
+FAILED tests/integration/test_delegation_model_routing.py::test_installer_check_idempotence_and_existing_generic_hook
+1 failed, 16 passed in 0.81s
