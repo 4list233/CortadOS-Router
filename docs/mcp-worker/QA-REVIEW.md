@@ -116,3 +116,38 @@ creation-identity checks. Those mechanisms are explicit contract obligations, no
 
 The production builder cannot edit tests, fixtures or this review. Any discovered exam defect returns
 to this reviewer for an independently recorded amendment, preserving the original failure evidence.
+
+
+## Exam-owner amendment 1 — observe environment before fixture runtime mutation
+
+Date: 2026-10-16. Independent owner: `/root/mcp_qa`. Root requested review of the builder's
+first integrated run: 53 cases, 49 pass / 1 fail / 3 errors. The permission environment failure
+reported only `__CF_USER_TEXT_ENCODING`. Original output is preserved without editing at
+`acceptance/mcp_worker/evidence/environment-observation-amendment/original-builder-failure.log`.
+The three other errors are not excused by this amendment and require their own disposition.
+
+The owner independently reproduced the distinction: `/usr/bin/env` receives exactly the provided
+names; the macOS framework Python runtime introduces the CoreFoundation name before the fixture
+observes `os.environ`. Python also normalizes a supplied sentinel value, so merely exempting that name
+would not preserve the inherited-environment invariant. The builder's proof is retained separately
+from the independent positive and negative probe controls.
+
+Disposition: **exam observation defect, repaired; no contract semantics change**. A protected native
+C launcher records names before exec of the unchanged Python harness. The single environment test
+compiles it with the validated Apple clang 21.0.0 and requires the boundary record to exist before
+applying the original exact allowed-name set. Runtime additions are recorded separately. API keys,
+provider overrides, connector values, arbitrary names and the CoreFoundation variable remain excluded
+at the actual exec boundary. The negative control records deliberately injected ungranted names,
+proving the predicate still detects such a service defect. No production path was edited.
+
+Focused command and source identity are in `focused-checks.json`: the corrected environment case
+and three fixture-integrity cases **4 pass / 0 fail / 0 error / 0 skip**, 1.501 seconds. Independent
+native-probe controls passed with clean and deliberately ungranted environments; clang warnings are
+errors. The production tree was under concurrent implementation, so these checks are evidence for
+this exam repair, not complete candidate acceptance. The root will rerun the full protected suite.
+
+D/A remain at zero defects: public behavior, source scope and acceptance intent are unchanged.
+The new compiler prerequisite is documented and validated on the captured host. The commit containing
+this amendment carries the required Exam-Owner trailer and refreshes SHA256SUMS; the original protected
+revision remains available in `4c41a3f5b13185b70c3e5c097a093c8ae20fd1be` with manifest hash
+`799ecb4950b96e513fa4f5ede6b0e0a638630038eb82a54c291a5432fa5ed3dd`. B remains a separate gate.

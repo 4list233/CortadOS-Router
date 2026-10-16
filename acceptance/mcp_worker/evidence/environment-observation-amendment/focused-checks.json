@@ -1,0 +1,13 @@
+{
+  "command": "/private/tmp/cortados-mcp-sdk-env/bin/python -B -m unittest acceptance.mcp_worker.test_permissions.Permissions.test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope acceptance.mcp_worker.test_fixtures -v",
+  "run": 4,
+  "passed": 4,
+  "failed": 0,
+  "errors": 0,
+  "skipped": 0,
+  "elapsed_s": 1.501,
+  "source_base_commit": "4c41a3f5b13185b70c3e5c097a093c8ae20fd1be",
+  "source_note": "Production working tree is under concurrent implementation; this focused check validates the exam observation repair, not a pinned full candidate acceptance.",
+  "observed_production_file": "integrations/mcp/codex.py",
+  "observed_production_sha256": "2db52adf76bc984cc855495673454c853684b8d71c2e68bd1db89f3cc819c025"
+}

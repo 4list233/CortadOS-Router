@@ -159,8 +159,10 @@ def execute():
     if argument("-C") or argument("--cd"):
         os.chdir(argument("-C") or argument("--cd"))
     prompt = sys.stdin.read()
+    boundary = HOME_DIR / f"fixture-boundary-env.{os.getpid()}.bin"
+    boundary_names = sorted(boundary.read_bytes().decode().split("\0")[:-1]) if boundary.exists() else None
     record("exec", argv=sys.argv[1:], cwd=str(Path.cwd()), prompt=prompt,
-           env_names=sorted(os.environ),
+           env_names=sorted(os.environ), boundary_env_names=boundary_names,
            marker_environment={key: os.environ[key] for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MCP_FIXTURE_SECRET", "MCP_UNDECLARED_SECRET", "CODEX_HOME") if key in os.environ})
     if config.get("mcp_probe"):
         asyncio.run(probe_proxy())

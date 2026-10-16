@@ -16,6 +16,10 @@ The prepared environment is `/private/tmp/cortados-mcp-sdk-env/bin/python`, Pyth
 /private/tmp/cortados-mcp-sdk-env/bin/python -B acceptance/mcp_worker/benchmark.py --output /private/tmp/mcp-worker-candidate-performance.json
 ```
 
+The native-environment permission case additionally requires `/usr/bin/clang`; the validated host
+has Apple clang 21.0.0. It compiles a small protected probe into that test's temporary directory.
+Missing compiler access is a blocked exam prerequisite, not a skipped permission check.
+
 The full legacy-suite commands/environment are in `docs/mcp-worker/QA-BASELINE.md`. A source-only
 unittest command does not account for the exported integration suites. Installation/wheel startup
 outside the checkout and real service/native calls must be measured after implementation; standalone
@@ -83,3 +87,17 @@ The synthetic operator profile uses these explicit values, not production defaul
 
 Test wait ceilings detect stalls and do not set runtime product policy. No benchmark or test purchases
 credits, sends external messages, deploys configuration, or changes native login.
+
+## Environment observation amendment (2026-10-16)
+
+Framework Python adds `__CF_USER_TEXT_ENCODING` after process launch. The original Python fixture's
+`os.environ` therefore did not represent the environment supplied by the service. The corrected
+permission case compiles `native_environment_probe.c`, records environment **names only** before
+executing the Python double, and applies the original exact allowlist to those names. It retains the
+Python runtime observation separately. No variable was added to the permitted environment.
+
+The independent negative control deliberately supplies both the CoreFoundation variable and an
+arbitrary ungranted variable; the native observation records both, so either still fails the whitelist.
+Original failure, builder proof, independent probe controls and focused results are retained in
+`evidence/environment-observation-amendment/`. The probe is used only by this one exam and is never
+part of the product or its native worker configuration.

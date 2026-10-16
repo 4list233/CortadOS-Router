@@ -1,0 +1,265 @@
+test_ac04_api_login_refuses_without_native_turn (acceptance.mcp_worker.test_admission.Admission.test_ac04_api_login_refuses_without_native_turn) ... ok
+test_ac04_delegate_rechecks_quota_after_route_advice (acceptance.mcp_worker.test_admission.Admission.test_ac04_delegate_rechecks_quota_after_route_advice) ... ok
+test_ac04_invalid_quota_geometry_never_becomes_neutral_capacity (acceptance.mcp_worker.test_admission.Admission.test_ac04_invalid_quota_geometry_never_becomes_neutral_capacity) ... ok
+test_ac04_missing_native_model_and_empty_allowlist_refuse (acceptance.mcp_worker.test_admission.Admission.test_ac04_missing_native_model_and_empty_allowlist_refuse) ... ok
+test_ac04_model_inventory_follows_pages_and_rejects_cursor_cycles (acceptance.mcp_worker.test_admission.Admission.test_ac04_model_inventory_follows_pages_and_rejects_cursor_cycles) ... ok
+test_ac04_unknown_and_spent_quota_refuse_both_modes (acceptance.mcp_worker.test_admission.Admission.test_ac04_unknown_and_spent_quota_refuse_both_modes) ... ok
+test_ac07_managed_policy_preflight_refuses_before_worker (acceptance.mcp_worker.test_admission.Admission.test_ac07_managed_policy_preflight_refuses_before_worker) ... ok
+test_ac07_requirements_preflight_refuses_before_worker (acceptance.mcp_worker.test_admission.Admission.test_ac07_requirements_preflight_refuses_before_worker) ... ok
+test_ac10_cancel_removes_native_and_separate_session_descendant (acceptance.mcp_worker.test_cancellation.Cancellation.test_ac10_cancel_removes_native_and_separate_session_descendant) ... ok
+test_ac10_cancellation_cannot_rewrite_already_succeeded_job (acceptance.mcp_worker.test_cancellation.Cancellation.test_ac10_cancellation_cannot_rewrite_already_succeeded_job) ... ok
+test_ac10_recorded_cancellation_intent_beats_late_success (acceptance.mcp_worker.test_cancellation.Cancellation.test_ac10_recorded_cancellation_intent_beats_late_success) ... ok
+test_ac10_timeout_is_observed_terminal_and_releases_workspace (acceptance.mcp_worker.test_cancellation.Cancellation.test_ac10_timeout_is_observed_terminal_and_releases_workspace) ... ok
+test_ac02_corrupt_missing_and_conflicting_terminal_are_not_success (acceptance.mcp_worker.test_codex_boundary.CodexBoundary.test_ac02_corrupt_missing_and_conflicting_terminal_are_not_success) ... ok
+test_ac02_each_captured_model_reaches_real_terminal_shape (acceptance.mcp_worker.test_codex_boundary.CodexBoundary.test_ac02_each_captured_model_reaches_real_terminal_shape) ... ok
+test_ac02_nonzero_exit_cannot_be_completed_by_success_shaped_output (acceptance.mcp_worker.test_codex_boundary.CodexBoundary.test_ac02_nonzero_exit_cannot_be_completed_by_success_shaped_output) ... ok
+test_ac02_unaccepted_native_version_never_starts_worker (acceptance.mcp_worker.test_codex_boundary.CodexBoundary.test_ac02_unaccepted_native_version_never_starts_worker) ... ERROR
+test_ac09_disjoint_jobs_run_until_capacity_is_exhausted (acceptance.mcp_worker.test_concurrency.Concurrency.test_ac09_disjoint_jobs_run_until_capacity_is_exhausted) ... ok
+test_ac09_overlapping_and_symlink_workspaces_refuse (acceptance.mcp_worker.test_concurrency.Concurrency.test_ac09_overlapping_and_symlink_workspaces_refuse) ... ok
+test_all_enabled_models_have_real_command_and_mcp_output_kinds (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_all_enabled_models_have_real_command_and_mcp_output_kinds) ... ok
+test_captured_native_boundaries_retain_provenance_hashes (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_captured_native_boundaries_retain_provenance_hashes) ... ok
+test_process_double_replays_wire_methods_without_provider_access (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_process_double_replays_wire_methods_without_provider_access) ... ok
+test_ac05_concurrent_identical_request_has_one_job_and_one_effect (acceptance.mcp_worker.test_identity.Identity.test_ac05_concurrent_identical_request_has_one_job_and_one_effect) ... ok
+test_ac05_conflicting_arguments_do_not_create_second_effect (acceptance.mcp_worker.test_identity.Identity.test_ac05_conflicting_arguments_do_not_create_second_effect) ... ok
+test_ac05_default_insertion_and_realpath_have_one_identity (acceptance.mcp_worker.test_identity.Identity.test_ac05_default_insertion_and_realpath_have_one_identity) ... ok
+test_ac05_invalid_input_does_not_claim_request_id (acceptance.mcp_worker.test_identity.Identity.test_ac05_invalid_input_does_not_claim_request_id) ... ok
+test_ac05_terminal_identity_replay_keeps_original_result (acceptance.mcp_worker.test_identity.Identity.test_ac05_terminal_identity_replay_keeps_original_result) ... ok
+test_ac11_each_transition_and_refusal_is_logged_once_without_private_payload (acceptance.mcp_worker.test_observability.Observability.test_ac11_each_transition_and_refusal_is_logged_once_without_private_payload) ... ok
+test_ac07_denied_server_tool_and_network_refuse_before_native_execution (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_denied_server_tool_and_network_refuse_before_native_execution) ... ok
+test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native) ... ERROR
+test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope) ... FAIL
+test_ac07_omitted_grants_start_no_proxy_or_upstream (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_omitted_grants_start_no_proxy_or_upstream) ... ok
+test_ac07_operator_allowed_network_reaches_native_policy (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_operator_allowed_network_reaches_native_policy) ... ok
+test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces) ... ERROR
+test_ac07_requests_cannot_replace_registry_endpoints_or_native_settings (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_requests_cannot_replace_registry_endpoints_or_native_settings) ... ok
+test_ac07_required_upstream_failure_is_visible_not_success (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_required_upstream_failure_is_visible_not_success) ... ok
+test_ac01_boolean_timeout_and_non_uuid_identity_refuse (acceptance.mcp_worker.test_protocol.Protocol.test_ac01_boolean_timeout_and_non_uuid_identity_refuse) ... ok
+test_ac01_exact_five_tools_and_typed_route (acceptance.mcp_worker.test_protocol.Protocol.test_ac01_exact_five_tools_and_typed_route) ... ok
+test_ac01_unknown_job_is_typed_refusal (acceptance.mcp_worker.test_protocol.Protocol.test_ac01_unknown_job_is_typed_refusal) ... ok
+test_ac01_unknown_nested_and_top_level_fields_refuse (acceptance.mcp_worker.test_protocol.Protocol.test_ac01_unknown_nested_and_top_level_fields_refuse) ... ok
+test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry (acceptance.mcp_worker.test_recovery.Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry) ... Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.115 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.111 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.123 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.101 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.104 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.171 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.230 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:57> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.111 seconds
+Executing <Task pending name='Task-226' coro=<Recovery.test_ac06_broker_crash_contains_descendants_then_interrupts_without_retry() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_recovery.py:51> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.279 seconds
+ok
+test_ac06_corrupt_store_refuses_without_replacing_bytes (acceptance.mcp_worker.test_recovery.Recovery.test_ac06_corrupt_store_refuses_without_replacing_bytes) ... ok
+test_ac06_frontend_disconnect_preserves_running_job_and_identity (acceptance.mcp_worker.test_recovery.Recovery.test_ac06_frontend_disconnect_preserves_running_job_and_identity) ... ok
+test_ac06_stopped_backup_restore_preserves_terminal_identity_and_artifacts (acceptance.mcp_worker.test_recovery.Recovery.test_ac06_stopped_backup_restore_preserves_terminal_identity_and_artifacts) ... ok
+test_ac06_unproven_termination_keeps_claim_and_never_restarts_worker (acceptance.mcp_worker.test_recovery.Recovery.test_ac06_unproven_termination_keeps_claim_and_never_restarts_worker) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/traceback.py:294: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107fb15d0>
+  def __init__(self, filename, lineno, name, *, lookup_line=True,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/traceback.py:294: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x107fb07c0>
+  def __init__(self, filename, lineno, name, *, lookup_line=True,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_ac08_missing_usage_remains_unknown (acceptance.mcp_worker.test_results.Results.test_ac08_missing_usage_remains_unknown) ... ok
+test_ac08_observed_usage_final_artifacts_and_review_status (acceptance.mcp_worker.test_results.Results.test_ac08_observed_usage_final_artifacts_and_review_status) ... ok
+test_ac08_output_limit_contains_worker_and_never_returns_truncated_success (acceptance.mcp_worker.test_results.Results.test_ac08_output_limit_contains_worker_and_never_returns_truncated_success) ... ok
+test_ac08_unknown_native_events_retained_without_fabricated_meaning (acceptance.mcp_worker.test_results.Results.test_ac08_unknown_native_events_retained_without_fabricated_meaning) ... ok
+test_ac03_clarification_refuses_without_execution (acceptance.mcp_worker.test_selection.Selection.test_ac03_clarification_refuses_without_execution) ... Executing <Task finished name='Task-284' coro=<Selection.test_ac03_clarification_refuses_without_execution() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_selection.py:87> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.448 seconds
+ok
+test_ac03_explicit_preserves_unicode_handoff_and_never_calls_s1 (acceptance.mcp_worker.test_selection.Selection.test_ac03_explicit_preserves_unicode_handoff_and_never_calls_s1) ... Executing <Task finished name='Task-290' coro=<Selection.test_ac03_explicit_preserves_unicode_handoff_and_never_calls_s1() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_selection.py:41> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.379 seconds
+ok
+test_ac03_s1_brief_and_assembled_context_are_exact_and_disclosed (acceptance.mcp_worker.test_selection.Selection.test_ac03_s1_brief_and_assembled_context_are_exact_and_disclosed) ... Executing <Task finished name='Task-296' coro=<Selection.test_ac03_s1_brief_and_assembled_context_are_exact_and_disclosed() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_selection.py:55> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.440 seconds
+ok
+test_ac03_s1_failure_refuses_without_fallback_execution (acceptance.mcp_worker.test_selection.Selection.test_ac03_s1_failure_refuses_without_fallback_execution) ... Executing <Task finished name='Task-302' coro=<Selection.test_ac03_s1_failure_refuses_without_fallback_execution() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_selection.py:81> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.449 seconds
+ok
+test_ac03_size_boundaries_refuse_before_scorer_or_worker (acceptance.mcp_worker.test_selection.Selection.test_ac03_size_boundaries_refuse_before_scorer_or_worker) ... Executing <Task finished name='Task-308' coro=<Selection.test_ac03_size_boundaries_refuse_before_scorer_or_worker() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_selection.py:69> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.247 seconds
+ok
+
+======================================================================
+ERROR: test_ac02_unaccepted_native_version_never_starts_worker (acceptance.mcp_worker.test_codex_boundary.CodexBoundary.test_ac02_unaccepted_native_version_never_starts_worker)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_codex_boundary.py", line 23, in test_ac02_unaccepted_native_version_never_starts_worker
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 214, in __aenter__
+  |     return await anext(self.gen)
+  |            ^^^^^^^^^^^^^^^^^^^^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 105, in session
+      |     await client.initialize()
+      |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/session.py", line 183, in initialize
+      |     result = await self.send_request(
+      |              ^^^^^^^^^^^^^^^^^^^^^^^^
+      |     ...<16 lines>...
+      |     )
+      |     ^
+      |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/shared/session.py", line 306, in send_request
+      |     raise McpError(response_or_error.error)
+      | mcp.shared.exceptions.McpError: Connection closed
+      +------------------------------------
+
+======================================================================
+ERROR: test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_permissions.py", line 227, in test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_permissions.py", line 229, in test_ac07_http_grant_uses_bearer_reference_without_exposing_it_to_native
+      |     result = await self.terminal(client, started["job"]["job_id"])
+      |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 133, in terminal
+      |     self.fail("lifecycle: job did not reach an observable terminal state")
+      |     ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: lifecycle: job did not reach an observable terminal state
+      +------------------------------------
+
+======================================================================
+ERROR: test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_permissions.py", line 63, in test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/private/tmp/cortados-mcp-sdk-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_permissions.py", line 64, in test_ac07_proxy_exposes_only_granted_tool_and_blocks_other_mcp_surfaces
+      |     started = await self.call(client, "delegate", self.request(permissions=self.grants()))
+      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+      |     self.assertFalse(result.isError, payload)
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: True is not false : {'ok': False, 'error': {'code': 'connector_unavailable', 'message': 'Selected connector startup or discovery failed'}}
+      +------------------------------------
+
+======================================================================
+FAIL: test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/test_permissions.py", line 180, in test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope
+    self.assertEqual(set(native["env_names"]) - allowed, set(), "permissions: native inherited undeclared environment")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Items in the first set but not the second:
+'__CF_USER_TEXT_ENCODING' : permissions: native inherited undeclared environment
+
+----------------------------------------------------------------------
+Ran 53 tests in 78.944s
+
+FAILED (failures=1, errors=3)

@@ -147,6 +147,15 @@ class Permissions(WorkerCase):
         self.assertEqual(self.upstream_events(), [])
 
     async def test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope(self):
+        # Framework Python mutates its own environment. This native probe records the supplied
+        # names first, so the runtime addition cannot widen the service's allowed environment.
+        probe = self.temp / "native-environment-probe"
+        subprocess.run(["/usr/bin/clang", "-Wall", "-Wextra", "-Werror",
+            "-DFAKE_CODEX_PATH=" + json.dumps(str(HERE / "fake_codex.py")),
+            str(HERE / "native_environment_probe.c"), "-o", str(probe)], check=True, capture_output=True)
+        self.config["codex_bin"] = str(probe)
+        self.write_config()
+        self.server_env["__CF_USER_TEXT_ENCODING"] = "SYNTHETIC_UNGRANTED_RUNTIME_VARIABLE"
         work = self.workspace / "folder.with.periods"
         work.mkdir()
         async with self.session() as client:
@@ -177,7 +186,8 @@ class Permissions(WorkerCase):
         self.assertEqual(trust_maps[0][1][str(work.resolve())]["trust_level"], "untrusted")
         allowed = {"HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
                    "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_HOME"}
-        self.assertEqual(set(native["env_names"]) - allowed, set(), "permissions: native inherited undeclared environment")
+        self.assertIsNotNone(native["boundary_env_names"], "permissions: native exec-boundary observation is missing")
+        self.assertEqual(set(native["boundary_env_names"]) - allowed, set(), "permissions: native inherited undeclared environment")
         self.assertEqual(native["marker_environment"], {"CODEX_HOME": str(self.native_home)})
 
     async def test_ac07_operator_allowed_network_reaches_native_policy(self):

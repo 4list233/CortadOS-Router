@@ -1,0 +1,51 @@
+{
+  "source": "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/codex.py",
+  "source_sha256": "2db52adf76bc984cc855495673454c853684b8d71c2e68bd1db89f3cc819c025",
+  "supplied_environment_names": [
+    "CODEX_HOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "TMPDIR",
+    "USER"
+  ],
+  "plain_command": [
+    "/usr/bin/env"
+  ],
+  "plain_environment_names": [
+    "CODEX_HOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "TMPDIR",
+    "USER"
+  ],
+  "python_command": [
+    "/private/tmp/cortados-mcp-sdk-env/bin/python",
+    "-B",
+    "-c",
+    "import os,json;print(json.dumps(sorted(os.environ)))"
+  ],
+  "python_environment_names": [
+    "CODEX_HOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "TMPDIR",
+    "USER",
+    "__CF_USER_TEXT_ENCODING"
+  ],
+  "injected_by_python": [
+    "__CF_USER_TEXT_ENCODING"
+  ],
+  "conclusion": "Python framework runtime introduces __CF_USER_TEXT_ENCODING after exec; supplied Popen environment matches whitelist."
+}

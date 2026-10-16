@@ -1,0 +1,9 @@
+test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope (acceptance.mcp_worker.test_permissions.Permissions.test_ac07_native_boundary_keeps_cwd_tmp_and_environment_scope) ... ok
+test_all_enabled_models_have_real_command_and_mcp_output_kinds (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_all_enabled_models_have_real_command_and_mcp_output_kinds) ... ok
+test_captured_native_boundaries_retain_provenance_hashes (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_captured_native_boundaries_retain_provenance_hashes) ... ok
+test_process_double_replays_wire_methods_without_provider_access (acceptance.mcp_worker.test_fixtures.FixtureIntegrity.test_process_double_replays_wire_methods_without_provider_access) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 1.501s
+
+OK

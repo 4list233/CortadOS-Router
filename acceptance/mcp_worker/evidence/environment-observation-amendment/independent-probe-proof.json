@@ -1,0 +1,73 @@
+{
+  "purpose": "Independent exec-boundary observation verification; synthetic process only",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+  "cases": [
+    {
+      "case": "allowlist_only",
+      "supplied_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH"
+      ],
+      "boundary_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH"
+      ],
+      "python_runtime_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH",
+        "__CF_USER_TEXT_ENCODING"
+      ],
+      "exit_code": 0
+    },
+    {
+      "case": "negative_control",
+      "supplied_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH",
+        "UNGRANTED_ENVIRONMENT_PROBE",
+        "__CF_USER_TEXT_ENCODING"
+      ],
+      "boundary_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH",
+        "UNGRANTED_ENVIRONMENT_PROBE",
+        "__CF_USER_TEXT_ENCODING"
+      ],
+      "python_runtime_names": [
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "PATH",
+        "UNGRANTED_ENVIRONMENT_PROBE",
+        "__CF_USER_TEXT_ENCODING"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "compile_command": [
+    "/usr/bin/clang",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-DFAKE_CODEX_PATH=\"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/fake_codex.py\"",
+    "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/native_environment_probe.c",
+    "-o",
+    "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/mcp-env-probe-selfcheck-2jtusv1r/native-probe"
+  ],
+  "passed": true,
+  "source_hashes": {
+    "native_environment_probe.c": "dcbc5264e4a82de7c9ea6cf64148e84d919fa92dbb9019b45cb7f5416dfe6002",
+    "fake_codex.py": "9d7b71b01b49a9dd65f4b04a36c785650ad84a555c5fd1ab7d4d3be457cb70e7",
+    "test_permissions.py": "852251ab0ae6493b6c0b8349db86ba134ff72c73623b1be0ccfba32a8431db85"
+  }
+}
