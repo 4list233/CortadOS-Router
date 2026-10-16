@@ -117,3 +117,13 @@ tree, `docs/harness/deepseek-prototype/router-l1/r0/QUOTA-PRODUCER-DESIGN.md` re
 - **Live sync.** The CortadOS fleet loads a copy at `plugins/cortados-router/scarcity.py`, which has uncommitted
   Router fixes from 10-13 (`probe_reaper`, the `_codex_binary` fallback, `os._exit` on exec failure). Syncing the
   fix there needs Forest's approval and must keep those changes.
+- **Review notes (D re-review 2026-10-15, `7243a55e`), to address before building:**
+  - (N1) A correctly dated weekly reset on the last day of the week must be accepted. Define behaviour for a
+    missing reset text and for a 5-hour window.
+  - (N2) `tests/test_router.py` fixtures use the old format with a fixed past date and need real-screen
+    replacements, never weakened.
+  - (N2) `tests/test_router_usage_capture.py` patches `scarcity.tui_capture`, so keep the re-exports and look
+    it up at call time.
+  - (N3) Port to the live copy hunk by hunk, never by file copy. The live copy differs in exactly three places:
+    the `context.env_compat` import, the `_plans` budgets path, and a comment.
+  - (N3) Take a byte backup before the port, and check afterwards that all three deltas survive.
