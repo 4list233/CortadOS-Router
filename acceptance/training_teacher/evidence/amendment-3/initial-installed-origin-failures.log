@@ -1,0 +1,76 @@
+test_enabled_main_writes_final_train_only_and_no_claude_usage (__main__.InstalledLabel.test_enabled_main_writes_final_train_only_and_no_claude_usage) ... FAIL
+test_flagoff_main_excludes_completed_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_completed_codex_slots) ... FAIL
+test_flagoff_main_excludes_reserved_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_reserved_codex_slots) ... FAIL
+test_flagoff_main_excludes_terminal_unpublished_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_terminal_unpublished_codex_slots) ... FAIL
+test_flagoff_main_preserves_primary_and_never_submits_codex (__main__.InstalledLabel.test_flagoff_main_preserves_primary_and_never_submits_codex) ... FAIL
+test_override_retains_partial_representation_and_full_prefix (__main__.InstalledLabel.test_override_retains_partial_representation_and_full_prefix) ... FAIL
+test_same_private_lock_refuses_every_main_mode_before_calls (__main__.InstalledLabel.test_same_private_lock_refuses_every_main_mode_before_calls) ... FAIL
+
+======================================================================
+FAIL: test_enabled_main_writes_final_train_only_and_no_claude_usage (__main__.InstalledLabel.test_enabled_main_writes_final_train_only_and_no_claude_usage)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_flagoff_main_excludes_completed_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_completed_codex_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_flagoff_main_excludes_reserved_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_reserved_codex_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_flagoff_main_excludes_terminal_unpublished_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_terminal_unpublished_codex_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_flagoff_main_preserves_primary_and_never_submits_codex (__main__.InstalledLabel.test_flagoff_main_preserves_primary_and_never_submits_codex)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_override_retains_partial_representation_and_full_prefix (__main__.InstalledLabel.test_override_retains_partial_representation_and_full_prefix)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+======================================================================
+FAIL: test_same_private_lock_refuses_every_main_mode_before_calls (__main__.InstalledLabel.test_same_private_lock_refuses_every_main_mode_before_calls)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/installed_driver.py", line 29, in setUp
+    self.assertEqual(Path(module.__file__).resolve().parent, site / 'cortados_router')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Posix[15 chars]lox/.cortados-builds/cortados-router-repo/cortados_router') != Posix[15 chars]lox/.local/share/cortados-workers/releases/tra[72 chars]ter')
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.020s
+
+FAILED (failures=7)
+{"tests": 7, "failures": 7, "errors": 0, "skips": 0, "pass": false}

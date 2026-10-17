@@ -621,6 +621,106 @@
         "AC-T04",
         "AC-T08"
       ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_closed_writer_cannot_publish_while_next_invocation_holds_lock",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_replaced_lock_inode_invalidates_old_writer",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_wrong_process_context_cannot_publish",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_same_process_worker_thread_retains_writer_authority",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_claude_duplicate_indices_publish_each_slot_once",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_claude_bool_index_retains_legacy_int_semantics",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_claude_override_skips_invalid_rows_and_preserves_bool_index",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_poststart_claude_nonquota_error_continues_without_codex_fallback",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_review_regressions.py",
+      "class": "ReviewRegressions",
+      "method": "test_poststart_claude_quota_error_stops_without_codex_fallback",
+      "ac": [
+        "AC-T02",
+        "AC-T04",
+        "AC-T07"
+      ]
     }
   ],
   "counts": {
@@ -652,5 +752,11 @@
     "installed staged main7 methods including all-mode completed/reserved/terminal slot exclusion",
     "synthetic raw performance/call/memory/logicalIO comparison",
     "guarded activation and preserved validation/holdout/promotion identities"
-  ]
+  ],
+  "amendment_3": {
+    "new_methods": 10,
+    "preserved_learning_command": "<new-release-python> -B acceptance/training_teacher/evidence/run-preserved-learning.py",
+    "preserved_learning_methods": 31,
+    "historical_assertions": "unchanged"
+  }
 }

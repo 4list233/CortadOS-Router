@@ -1,0 +1,45 @@
+{
+  "amendment": 3,
+  "exam_owner": "/root/quota_evaluation_qa",
+  "production_changed": false,
+  "providers_called": 0,
+  "historical_test_files_unchanged": {
+    "acceptance/mcp_learning/test_feedback.py": "a63e870434b1e75209d32117a8d5d6de2a7df8e5bbf9329ce0840244f8265b8c",
+    "acceptance/mcp_learning/support.py": "f3680dc096277c37979ebd1e5d154207270605cdfe1e4ca3e63994115dd7ff9c",
+    "acceptance/mcp_learning/pipeline_support.py": "5dfc2be5b8137a50964c2f51d6d985ab2af9204131970750fe69dad2178034e9",
+    "acceptance/mcp_learning/test_activation.py": "9e34dfd88be7e99aa8c188860c3a1eb54d146f9fd017164c3888d0e64d2399c8",
+    "acceptance/mcp_learning/__init__.py": "30ccda0867b6640b8afe0fad3cd12602d1417162cd4d1716ae9c34279ecee633",
+    "acceptance/mcp_learning/test_learning.py": "36aa148f0477631c140799adce0de445f4b72508d0f8ac5c7f9a16f94e5a5039",
+    "acceptance/mcp_learning/test_ground_truth.py": "29224a6a20c4a23ca9ee1ad52ce9c9c5add3eb09466c87f97435ad10544493ab",
+    "acceptance/mcp_learning/test_context.py": "0c64dd1e380fdf7497d9c2a4262ef30222fb00ced95edf19d0ea3090fd72054a",
+    "acceptance/mcp_learning/test_pipeline.py": "b4a0e06088a8eed4949c20031d49b3b06c9c6e4ac6ad97e62b8229e8be477d95"
+  },
+  "installed_assertions_identical": 30,
+  "fixture_changes": [
+    "Preload installed package roots before legacy common fixture sys.path edits; exact origin checks retained.",
+    "Run all 31 original mcp_learning methods under required 007 interpreter. Only current-label fixture gets sole-owner context for direct work, and fake config/quota/native executable boundaries. Every historical explicit source path delegates original fixture unchanged."
+  ],
+  "evidence": {
+    "installed_recheck": {
+      "tests": 7,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0
+    },
+    "preserved_learning_recheck": {
+      "tests": 31,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0
+    },
+    "amplification": {
+      "tests": 10,
+      "failed_methods": 9,
+      "passing_methods": 1,
+      "failure_records": 7,
+      "error_records": 5,
+      "skips": 0
+    }
+  },
+  "baseline_disposition": "Claude independently validates rows, including bool indices; duplicate full training slot suppression is the explicit 007 change. No Codex whole-response weakening. Baseline exception log/stop semantics pinned with zero native calls."
+}

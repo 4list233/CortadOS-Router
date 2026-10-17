@@ -1,0 +1,8 @@
+{
+  "first_lock_closed": true,
+  "second_writer_holds_lock": true,
+  "unauthorized_old_context_published": 1,
+  "labels": 1,
+  "source_sha256": "5bae5d2bcbf5de5c87327ad0f2535e98e38fe4aad413e1a6468aae683f2f188e",
+  "providers_called": 0
+}

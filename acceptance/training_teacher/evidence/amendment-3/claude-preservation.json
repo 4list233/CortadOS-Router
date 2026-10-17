@@ -1,0 +1,14 @@
+{
+  "claude_duplicate_index": {
+    "expected_distinct_valid_labels": 2,
+    "actual_published": 0,
+    "actual_labels": 0
+  },
+  "claude_poststart_error": {
+    "raised": "ValueError",
+    "summary": null,
+    "primary_calls": 1,
+    "codex_starts": 0,
+    "published_labels": 0
+  }
+}

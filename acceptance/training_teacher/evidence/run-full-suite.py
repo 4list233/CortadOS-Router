@@ -78,9 +78,13 @@ for path in sorted((ROOT / 'tests/integration').glob('test_*.py')):
     options = ['-p', 'preserved_required_quota'] if path.stem in {'test_required_model_routing', 'test_cron_dispatch_routing'} else []
     run(path.stem, [HPYTHON, '-B', '-m', 'pytest', '-q', str(path), '-p', 'no:cacheprovider', *options, '--junitxml=' + str(xml)],
         hermes=True, fixture=fixture, xml=xml)
+new_python = '/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017/venv/bin/python'
 for path in sorted((ROOT / 'acceptance').iterdir()):
     if path.is_dir() and list(path.glob('test_*.py')):
-        run('acceptance-' + path.name, [PYTHON, '-B', '-m', 'unittest', 'discover', '-s', str(path.relative_to(ROOT)), '-t', '.', '-v'])
+        if path.name == 'mcp_learning':
+            run('acceptance-mcp_learning', [new_python, '-B', str(ROOT / 'acceptance/training_teacher/evidence/run-preserved-learning.py')], installed=True)
+        else:
+            run('acceptance-' + path.name, [PYTHON, '-B', '-m', 'unittest', 'discover', '-s', str(path.relative_to(ROOT)), '-t', '.', '-v'])
 run('benchmark', [PYTHON, '-B', 'acceptance/mcp_worker/benchmark.py', '--output', str(out / 'performance.json')], benchmark=True)
 for pattern in ('test_router_nightly_runs.py', 'test_router_overnight.py'):
     run('shared-' + pattern[:-3], [PYTHON, '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', pattern, '-v'], cwd='/Users/velox/cortados')

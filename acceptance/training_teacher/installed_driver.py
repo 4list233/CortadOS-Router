@@ -11,6 +11,10 @@ import types
 import unittest
 from unittest.mock import patch
 
+# Pin package search paths before the legacy common fixture adds the checkout to sys.path.
+# Exact origin assertions below remain mandatory.
+import cortados_router
+import integrations
 from support import TeacherCase, COMMON, ANSWER, SYSTEM, BrokerFixture, answers
 
 RELEASE = Path('/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017')

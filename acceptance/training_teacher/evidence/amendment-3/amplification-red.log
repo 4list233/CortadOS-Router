@@ -1,0 +1,341 @@
+test_claude_bool_index_retains_legacy_int_semantics (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_bool_index_retains_legacy_int_semantics) ... FAIL
+test_claude_duplicate_indices_publish_each_slot_once (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_duplicate_indices_publish_each_slot_once) ... FAIL
+test_claude_override_skips_invalid_rows_and_preserves_bool_index (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_override_skips_invalid_rows_and_preserves_bool_index) ... FAIL
+test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors) ... FAIL
+test_closed_writer_cannot_publish_while_next_invocation_holds_lock (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_closed_writer_cannot_publish_while_next_invocation_holds_lock) ... FAIL
+test_poststart_claude_nonquota_error_continues_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_nonquota_error_continues_without_codex_fallback) ... ERROR
+test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) ... 
+  test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='rate limit') ... ERROR
+  test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='429') ... ERROR
+  test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='quota exhausted') ... ERROR
+  test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='overloaded') ... ERROR
+test_replaced_lock_inode_invalidates_old_writer (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_replaced_lock_inode_invalidates_old_writer) ... FAIL
+test_same_process_worker_thread_retains_writer_authority (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_same_process_worker_thread_retains_writer_authority) ... ok
+test_wrong_process_context_cannot_publish (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_wrong_process_context_cannot_publish) ... FAIL
+
+======================================================================
+ERROR: test_poststart_claude_nonquota_error_continues_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_nonquota_error_continues_without_codex_fallback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 88, in test_poststart_claude_nonquota_error_continues_without_codex_fallback
+    summary = self.run_labels(split='train', batch=1, workers=1, limit=2)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/support.py", line 125, in run_labels
+    return self.owner().run_labels(data_dir=self.data, snapshot=self.snapshot, options=opts,
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        system_prompt=SYSTEM, claude_environment=self.environment, claude_cwd=str(self.data),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        worker_config_path=self.config_path, validate_answers=COMMON.valid_answers, questions=QUESTIONS)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 225, in run_labels
+    return _run_locked(store, snapshot, options, system_prompt, claude_environment,
+                       claude_cwd, worker_config_path, summary)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 274, in _run_locked
+    for result in executor.map(work, jobs):
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 645, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 312, in _result_or_cancel
+    return fut.result(timeout)
+           ~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 447, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 396, in __get_result
+    raise self._exception
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 272, in work
+    return _work_batch(store, teacher, job, snapshot, options, system_prompt, environment, cwd)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 290, in _work_batch
+    answers, meta = call_claude(model, batch, system_prompt=system_prompt, environment=environment,
+                    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                               cwd=cwd, config=teacher.config, max_scarcity=options['max_scarcity'])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1247, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 83, in primary
+    raise ValueError('Synthetic malformed Claude JSON')
+ValueError: Synthetic malformed Claude JSON
+
+======================================================================
+ERROR: test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='rate limit')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 101, in test_poststart_claude_quota_error_stops_without_codex_fallback
+    summary = self.run_labels(split='train', batch=1, workers=1, limit=2)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/support.py", line 125, in run_labels
+    return self.owner().run_labels(data_dir=self.data, snapshot=self.snapshot, options=opts,
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        system_prompt=SYSTEM, claude_environment=self.environment, claude_cwd=str(self.data),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        worker_config_path=self.config_path, validate_answers=COMMON.valid_answers, questions=QUESTIONS)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 225, in run_labels
+    return _run_locked(store, snapshot, options, system_prompt, claude_environment,
+                       claude_cwd, worker_config_path, summary)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 274, in _run_locked
+    for result in executor.map(work, jobs):
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 645, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 312, in _result_or_cancel
+    return fut.result(timeout)
+           ~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 447, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 396, in __get_result
+    raise self._exception
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 272, in work
+    return _work_batch(store, teacher, job, snapshot, options, system_prompt, environment, cwd)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 290, in _work_batch
+    answers, meta = call_claude(model, batch, system_prompt=system_prompt, environment=environment,
+                    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                               cwd=cwd, config=teacher.config, max_scarcity=options['max_scarcity'])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: rate limit
+
+======================================================================
+ERROR: test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='429')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 101, in test_poststart_claude_quota_error_stops_without_codex_fallback
+    summary = self.run_labels(split='train', batch=1, workers=1, limit=2)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/support.py", line 125, in run_labels
+    return self.owner().run_labels(data_dir=self.data, snapshot=self.snapshot, options=opts,
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        system_prompt=SYSTEM, claude_environment=self.environment, claude_cwd=str(self.data),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        worker_config_path=self.config_path, validate_answers=COMMON.valid_answers, questions=QUESTIONS)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 225, in run_labels
+    return _run_locked(store, snapshot, options, system_prompt, claude_environment,
+                       claude_cwd, worker_config_path, summary)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 274, in _run_locked
+    for result in executor.map(work, jobs):
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 645, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 312, in _result_or_cancel
+    return fut.result(timeout)
+           ~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 447, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 396, in __get_result
+    raise self._exception
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 272, in work
+    return _work_batch(store, teacher, job, snapshot, options, system_prompt, environment, cwd)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 290, in _work_batch
+    answers, meta = call_claude(model, batch, system_prompt=system_prompt, environment=environment,
+                    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                               cwd=cwd, config=teacher.config, max_scarcity=options['max_scarcity'])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: 429
+
+======================================================================
+ERROR: test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='quota exhausted')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 101, in test_poststart_claude_quota_error_stops_without_codex_fallback
+    summary = self.run_labels(split='train', batch=1, workers=1, limit=2)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/support.py", line 125, in run_labels
+    return self.owner().run_labels(data_dir=self.data, snapshot=self.snapshot, options=opts,
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        system_prompt=SYSTEM, claude_environment=self.environment, claude_cwd=str(self.data),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        worker_config_path=self.config_path, validate_answers=COMMON.valid_answers, questions=QUESTIONS)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 225, in run_labels
+    return _run_locked(store, snapshot, options, system_prompt, claude_environment,
+                       claude_cwd, worker_config_path, summary)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 274, in _run_locked
+    for result in executor.map(work, jobs):
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 645, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 312, in _result_or_cancel
+    return fut.result(timeout)
+           ~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 447, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 396, in __get_result
+    raise self._exception
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 272, in work
+    return _work_batch(store, teacher, job, snapshot, options, system_prompt, environment, cwd)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 290, in _work_batch
+    answers, meta = call_claude(model, batch, system_prompt=system_prompt, environment=environment,
+                    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                               cwd=cwd, config=teacher.config, max_scarcity=options['max_scarcity'])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: quota exhausted
+
+======================================================================
+ERROR: test_poststart_claude_quota_error_stops_without_codex_fallback (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_poststart_claude_quota_error_stops_without_codex_fallback) (message='overloaded')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 101, in test_poststart_claude_quota_error_stops_without_codex_fallback
+    summary = self.run_labels(split='train', batch=1, workers=1, limit=2)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/support.py", line 125, in run_labels
+    return self.owner().run_labels(data_dir=self.data, snapshot=self.snapshot, options=opts,
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        system_prompt=SYSTEM, claude_environment=self.environment, claude_cwd=str(self.data),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        worker_config_path=self.config_path, validate_answers=COMMON.valid_answers, questions=QUESTIONS)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 225, in run_labels
+    return _run_locked(store, snapshot, options, system_prompt, claude_environment,
+                       claude_cwd, worker_config_path, summary)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 274, in _run_locked
+    for result in executor.map(work, jobs):
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 645, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 312, in _result_or_cancel
+    return fut.result(timeout)
+           ~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 447, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 396, in __get_result
+    raise self._exception
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 272, in work
+    return _work_batch(store, teacher, job, snapshot, options, system_prompt, environment, cwd)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py", line 290, in _work_batch
+    answers, meta = call_claude(model, batch, system_prompt=system_prompt, environment=environment,
+                    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                               cwd=cwd, config=teacher.config, max_scarcity=options['max_scarcity'])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+RuntimeError: overloaded
+
+======================================================================
+FAIL: test_claude_bool_index_retains_legacy_int_semantics (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_bool_index_retains_legacy_int_semantics)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 68, in test_claude_bool_index_retains_legacy_int_semantics
+    self.assertEqual(self.publish(store, [dict(i=False, **ANSWER), dict(i=True, **ANSWER)]), 2)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_claude_duplicate_indices_publish_each_slot_once (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_duplicate_indices_publish_each_slot_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 63, in test_claude_duplicate_indices_publish_each_slot_once
+    self.assertEqual(self.publish(store, result), 2)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_claude_override_skips_invalid_rows_and_preserves_bool_index (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_override_skips_invalid_rows_and_preserves_bool_index)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 74, in test_claude_override_skips_invalid_rows_and_preserves_bool_index
+    self.assertEqual(store.publish_override(self.batch(), model='claude-sonnet-5', sample=0,
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        answers=result, only=['outward'], defaults=ANSWER, snapshot=self.snapshot), 2)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 57, in test_claude_rows_skip_invalid_entries_without_discarding_valid_neighbors
+    self.assertEqual(self.publish(store, result), 2)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_closed_writer_cannot_publish_while_next_invocation_holds_lock (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_closed_writer_cannot_publish_while_next_invocation_holds_lock)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 27, in test_closed_writer_cannot_publish_while_next_invocation_holds_lock
+    with self.assertRaises(WorkerError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+AssertionError: WorkerError not raised
+
+======================================================================
+FAIL: test_replaced_lock_inode_invalidates_old_writer (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_replaced_lock_inode_invalidates_old_writer)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 37, in test_replaced_lock_inode_invalidates_old_writer
+    with self.assertRaises(WorkerError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+AssertionError: WorkerError not raised
+
+======================================================================
+FAIL: test_wrong_process_context_cannot_publish (acceptance.training_teacher.test_review_regressions.ReviewRegressions.test_wrong_process_context_cannot_publish)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_review_regressions.py", line 44, in test_wrong_process_context_cannot_publish
+    with self.assertRaises(WorkerError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+AssertionError: WorkerError not raised
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.043s
+
+FAILED (failures=7, errors=5)

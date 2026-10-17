@@ -1,0 +1,656 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "methods": [
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_teacher_config_is_explicit_and_normalized",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_ordinary_config_gets_no_new_defaults",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_policy_requires_closed_safe_teacher_config",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_policy_and_ceiling_must_appear_together",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_same_admitted_resource_snapshot_owns_scarcity_ceiling",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_ordinary_workers_keep_prior_scarcity_policy",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_teacher_does_not_bypass_account_freshness_or_quota",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_teacher_policy_does_not_change_native_argv",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_admission.py",
+      "class": "TeacherAdmission",
+      "method": "test_prompt_and_closed_delegate_arguments_use_existing_payload",
+      "ac": [
+        "AC-T05",
+        "AC-T06"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_available_claude_keeps_primary_and_never_submits_codex",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_unknown_primary_falls_back_only_for_final_training",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_final_validation_inside_raw_train_never_falls_back",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_no_fallback_after_arbitrary_or_started_failure",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_existing_teacher_closes_slot_and_prefix_is_immutable",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_limit_counts_primary_refusal_and_fallback_as_one_batch",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_only_override_never_uses_fallback",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_invalid_options_cause_zero_calls",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_changed_config_ceiling_refuses_fallback",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_accepted_failed_job_never_gets_a_second_identity",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_preacceptance_capacity_defers_same_identity_without_spin",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_lost_acceptance_response_replays_exact_original_batch",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_malformed_output_indexes_reject_whole_response",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_partial_unique_response_publishes_only_valid_present_answers",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_primary_call_runs_under_same_writer_lock",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_lower_ceiling_config_must_match_request_and_never_mutates_running_config",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_enabled_split_train_never_writes_validation_or_holdout_even_primary_available",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_changed_raw_config_refuses_replay_without_new_identity",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_selection.py",
+      "class": "TrainingSelection",
+      "method": "test_malformed_existing_label_history_refuses_before_any_teacher",
+      "ac": [
+        "AC-T01",
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_reservation_persists_uuid_arguments_and_private_modes",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_reserved_slot_cannot_be_reserved_twice_or_mutated_through_returned_dict",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_second_writer_refuses_while_first_context_owns_lock",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_private_journal_symlink_and_public_mode_refuse_without_repair",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_corrupt_manifest_never_resets_or_loses_identity",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_manifest_unknown_field_refuses",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_labels_symlink_and_truncated_history_never_get_repaired",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_published_lines_preserve_prefix_mode_and_truthful_receipt",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_final_partition_or_revision_change_refuses_publication",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_conflicting_terminal_identity_refuses_publication",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_crash_after_labels_replace_reconciles_without_duplicate_lines",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_reservation_replace_failure_does_not_expose_sendable_attempt",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_failed_terminal_cannot_publish_supplied_answers",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_attempts.py",
+      "class": "DurableAttempts",
+      "method": "test_data_directory_identity_change_refuses_reconciliation",
+      "ac": [
+        "AC-T02",
+        "AC-T03",
+        "AC-T04",
+        "AC-T07"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_claude_boundary.py",
+      "class": "ClaudeBoundary",
+      "method": "test_real_unproven_claude_source_refuses_before_subprocess",
+      "ac": [
+        "AC-T01",
+        "AC-T05"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_claude_boundary.py",
+      "class": "ClaudeBoundary",
+      "method": "test_known_unknown_and_spent_checks_never_start_native",
+      "ac": [
+        "AC-T01",
+        "AC-T05"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_claude_boundary.py",
+      "class": "ClaudeBoundary",
+      "method": "test_permission_error_is_not_reclassified_as_quota_refusal",
+      "ac": [
+        "AC-T01",
+        "AC-T05"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_claude_boundary.py",
+      "class": "ClaudeBoundary",
+      "method": "test_started_native_failure_never_becomes_prestart_refusal",
+      "ac": [
+        "AC-T01",
+        "AC-T05"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_stage.py",
+      "class": "StagedTeacher",
+      "method": "test_both_adapters_reexec_before_project_imports_with_exact_argv",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_stage.py",
+      "class": "StagedTeacher",
+      "method": "test_wrong_interpreter_with_marker_refuses_instead_of_reexec_loop",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_stage.py",
+      "class": "StagedTeacher",
+      "method": "test_nightly_uses_new_interpreter_only_for_label_phase",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/evidence/installed-parity.py",
+      "class": "InstalledParity",
+      "method": "test_installed_sources_match_reviewed_checkout",
+      "ac": [
+        "AC-T08",
+        "AC-T09"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/evidence/installed-parity.py",
+      "class": "InstalledParity",
+      "method": "test_runtime_imports_are_from_fixed_installed_release",
+      "ac": [
+        "AC-T08",
+        "AC-T09"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/evidence/installed-parity.py",
+      "class": "InstalledParity",
+      "method": "test_learning_and_native_execution_owners_are_unchanged",
+      "ac": [
+        "AC-T08",
+        "AC-T09"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/evidence/installed-parity.py",
+      "class": "InstalledParity",
+      "method": "test_existing_exam_and_model_settings_are_unchanged",
+      "ac": [
+        "AC-T08",
+        "AC-T09"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_enabled_main_writes_final_train_only_and_no_claude_usage",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_preserves_primary_and_never_submits_codex",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_same_private_lock_refuses_every_main_mode_before_calls",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_override_retains_partial_representation_and_full_prefix",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_completed_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_reserved_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_terminal_unpublished_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
+    }
+  ],
+  "counts": {
+    "source_methods": 49,
+    "installed_adapter_methods": 7,
+    "installed_parity_methods": 4,
+    "prior_methods": 695
+  },
+  "commands": {
+    "source": "python -B acceptance/training_teacher/run_exams.py /absolute/private/report.json",
+    "installed": "/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017/venv/bin/python -B acceptance/training_teacher/installed_driver.py",
+    "full": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python acceptance/training_teacher/evidence/run-full-suite.py /absolute/private/fresh-output",
+    "parity": "/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017/venv/bin/python -B acceptance/training_teacher/evidence/installed-parity.py /absolute/private/parity.json",
+    "performance": "python -B acceptance/training_teacher/evidence/benchmark.py /absolute/private/performance.json"
+  },
+  "environment": {
+    "CORTADOS_TRAINING_TEACHER_STAGE": "/Users/velox/.cortados-builds/training-teacher-activation",
+    "installed_lanes": "PYTHONPATH unset"
+  },
+  "script_hashes": {
+    "acceptance/training_teacher/evidence/baseline-label.py": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c",
+    "acceptance/training_teacher/evidence/benchmark.py": "3ca2ee8441a083e9ec5955d855e9468f871cd7ede719c0a3d370fd65d45672a6",
+    "acceptance/training_teacher/evidence/installed-parity.py": "971acfe22f6bb8e1866780c9fcb2a8c4884de6983504f55068aeac9c2cb64c08",
+    "acceptance/training_teacher/evidence/run-full-suite.py": "4240e72acd70792680f55d0f85c07f5306e4ff7bc690124ce69421d81372a61b"
+  },
+  "B_required": [
+    "all695 prior methods plus60new and builder regressions, no missing/skips",
+    "installed exact source set/hash and unchanged learning/native parity",
+    "installed staged main7 methods including all-mode completed/reserved/terminal slot exclusion",
+    "synthetic raw performance/call/memory/logicalIO comparison",
+    "guarded activation and preserved validation/holdout/promotion identities"
+  ]
+}

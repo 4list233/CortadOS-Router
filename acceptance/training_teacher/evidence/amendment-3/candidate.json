@@ -1,0 +1,192 @@
+{
+  "schema": "cortados.training-teacher-candidate.v1",
+  "base_revision": "e129362d1de90296c1428cbdb8f7550b1fe137c2",
+  "contract": "RT-TRAINING-TEACHER-007",
+  "contract_sha256": "f388af87eb7d9056dd332d396a366b45418a4642aa25f050b5139be235bdf7d3",
+  "exam_amendment_sha256": "25dd3603f59a1b557339179d9b9ad26fac6624c45af519988873846a346824ef",
+  "production_files": [
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py",
+      "checkout_relative": "cortados_router/teacher.py",
+      "sha256": "14b8290fb738dcb61b582d92d23cebdb96bda8312bbbd62e8c359ebc70dbe68a",
+      "lines": 315,
+      "before_sha256": null
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher_attempts.py",
+      "checkout_relative": "cortados_router/teacher_attempts.py",
+      "sha256": "5bae5d2bcbf5de5c87327ad0f2535e98e38fe4aad413e1a6468aae683f2f188e",
+      "lines": 437,
+      "before_sha256": null
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/worker_admission.py",
+      "checkout_relative": "cortados_router/worker_admission.py",
+      "sha256": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+      "lines": 74,
+      "before_sha256": "933b38bdf1292a0265b406c9c8ceb361752fab12c6345a607fb59cc22d323c28"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/config.py",
+      "checkout_relative": "integrations/mcp/config.py",
+      "sha256": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+      "lines": 155,
+      "before_sha256": "b085650e418fbb60d34a2e69940f5dec4674a0fee339788d72d99fb72cdc008d"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/s1/label.py",
+      "checkout_relative": "s1/label.py",
+      "sha256": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38",
+      "lines": 217,
+      "before_sha256": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/label.py",
+      "stage_relative": "train/label.py",
+      "sha256": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700",
+      "before_sha256": "781021a725a8a2ae1e91cd5c72700126908284be1f8a46abc6b771235573de84",
+      "lines": 222
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/nightly.sh",
+      "stage_relative": "train/nightly.sh",
+      "sha256": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7",
+      "before_sha256": "a01a86b212a60344ade3e1f5c5486383c64d63b7980af592b105197a666f7e7f",
+      "lines": 186
+    }
+  ],
+  "optional_tests": [
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_training_teacher.py",
+      "sha256": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_teacher_attempts.py",
+      "sha256": "d611ec398e652ebb3f3d3227d18e3a1c6e4bb9de42c316892b8597fbe71a0734"
+    }
+  ],
+  "checks": {
+    "source_exams": {
+      "pass": 49,
+      "fail": 0,
+      "error": 0,
+      "skip": 0,
+      "report": "/private/tmp/training-teacher-builder-exams.json"
+    },
+    "builder_regressions": {
+      "pass": 11,
+      "fail": 0,
+      "error": 0,
+      "skip": 0,
+      "log": "/private/tmp/training-teacher-builder-regressions.log"
+    },
+    "prior_focused": {
+      "pass": 33,
+      "fail": 0,
+      "error": 0,
+      "skip": 0,
+      "log": "/private/tmp/training-teacher-builder-prior-focused.log"
+    },
+    "full_inventory": "pending root verification",
+    "installed_lanes": "pending root release build",
+    "performance": "pending root verification"
+  },
+  "untouched_stage_inputs": {
+    "train/common.py": {
+      "expected": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+      "actual": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+      "matches": true
+    },
+    "train/dataset.py": {
+      "expected": "2a9df0126c5434aacbc9f14443f1d78febfa33ec17fa114fa81e99a5c42b7f04",
+      "actual": "2a9df0126c5434aacbc9f14443f1d78febfa33ec17fa114fa81e99a5c42b7f04",
+      "matches": true
+    },
+    "train/build_sft.py": {
+      "expected": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+      "actual": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+      "matches": true
+    },
+    "train/evaluate.py": {
+      "expected": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+      "actual": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+      "matches": true
+    },
+    "plugins/cortados-router/quota_policy.py": {
+      "expected": "f29e958c4408775effcffaebd33e78357d008ac24b9a866ee74813870c81defe",
+      "actual": "f29e958c4408775effcffaebd33e78357d008ac24b9a866ee74813870c81defe",
+      "matches": true
+    },
+    "plugins/cortados-router/core.py": {
+      "expected": "316aaa9f6c9759783bd16421d8a9321ebe46e549ec2269e2f72a85ec43d03f64",
+      "actual": "316aaa9f6c9759783bd16421d8a9321ebe46e549ec2269e2f72a85ec43d03f64",
+      "matches": true
+    },
+    "plugins/cortados-router/scarcity.py": {
+      "expected": "dbdb0ca968dff901207cb0c30483592d360fd8351df29aa22793ce9cd8588f01",
+      "actual": "dbdb0ca968dff901207cb0c30483592d360fd8351df29aa22793ce9cd8588f01",
+      "matches": true
+    }
+  },
+  "per_AC": {
+    "AC-T01": {
+      "status": "source_pass",
+      "evidence": "49-method source report: primary precedence, typed prestart refusal, final partitions, split=train and only exclusion"
+    },
+    "AC-T02": {
+      "status": "source_pass; installed identity pending",
+      "evidence": "source prefix/override and final partition tests; seven other staged inputs byte-identical"
+    },
+    "AC-T03": {
+      "status": "source_pass",
+      "evidence": "source occupancy/index/partial-answer/lock tests; builder concurrency and ContextVar nonce regressions"
+    },
+    "AC-T04": {
+      "status": "source_pass",
+      "evidence": "source crash-after-replace, lost acceptance, capacity deferral and canonical replay tests; builder same-UUID regressions"
+    },
+    "AC-T05": {
+      "status": "source_pass; full installed pending",
+      "evidence": "source teacher scarcity/account/two-clock checks and prior focused worker/quota33 methods"
+    },
+    "AC-T06": {
+      "status": "source_pass; installed parity pending",
+      "evidence": "source exact delegate payload/native-argv parity; no native lifecycle/transport files edited"
+    },
+    "AC-T07": {
+      "status": "source_pass",
+      "evidence": "source receipt/provider/model null provenance/private modes and terminal identity; usage extraction excludes Codex"
+    },
+    "AC-T08": {
+      "status": "source launcher pass; installed seven methods pending",
+      "evidence": "both adapter bootstrap reexec and nightly phase-isolation source tests; one-use PID/thread-bound owner handoff"
+    },
+    "AC-T09": {
+      "status": "BLOCKED until root full inventory",
+      "evidence": "source49 and builder11 and prior focused33 passing; not a claim for all695 prior or installed lanes"
+    },
+    "AC-T10": {
+      "status": "BLOCKED until root synthetic benchmark",
+      "evidence": "no benchmark performed by builder; cached historical slot index invalidates on label inode/size/mtime/ctime or manifest update"
+    }
+  },
+  "commands": [
+    "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/training_teacher/run_exams.py /private/tmp/training-teacher-builder-exams.json",
+    "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest tests.test_training_teacher tests.test_teacher_attempts",
+    "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest tests.test_mcp_worker tests.test_fresh_quota tests.test_quota_sources",
+    "git diff --check"
+  ],
+  "bounded_choices": [
+    "Private one-use LabelAttempts handoff validates current PID/thread, DATA, validator, questions and live exclusive lock; nonce is consumed before run_labels. Copies cannot authorize another invocation.",
+    "Claude quota calls receive the unchanged ordinary normalized config projection without the two admission-only teacher fields. Broker retains exact raw teacher config digest and policy.",
+    "One shared CodexTeacher and admission RLock cover fallback reservation/delegate/poll/publication; ThreadPoolExecutor retains requested maximum total workers.",
+    "Existing PTY usage.record behavior extracted once to teacher.record_claude_usage; only Claude execution calls it.",
+    "Journal and label writes use fsync/replace with original label prefix/modes; source files remain below500 lines."
+  ],
+  "residual_notes": [
+    "Independent B0, immutable wheel/release origins, installed adapters7/parity4, complete prior695 inventory and raw efficiency measurements remain root tasks; builder did not install or activate anything.",
+    "Submitted unknown-job replay follows frozen state policy and same UUID. A crash between persisted send intent and first RPC means replay can be first native acceptance; transport has no request-id read-only lookup to distinguish that from lost acceptance. Reported to orchestrator for independent interpretation.",
+    "Initial pre-fix development source run reached scarcity.current before mocked unknown quota and emitted a probe_reaper warning. No model inference was intentionally launched, but zero native metadata probes cannot be claimed for that initial run. Current code checks unknown/spent quota before any scarcity refresh; regression pins no refresh/start.",
+    "Focused prior suite first ran under sandbox and had3 host-boot-identity access errors; reviewed escalated rerun passed all33. No protected exam or fixture was changed by builder."
+  ]
+}

@@ -57,3 +57,7 @@ uses the pinned explicit setuptools package/data declaration rather than recursi
 eight unshipped Hermes patch modules. The exact installed set/hash requirement, execution-owner
 parity and all maintained source-patch suite lanes remain. The accepted006 wheel has55 members;
 the candidate declaration adds only the two reviewed teacher modules, totaling57.
+
+## B attempt 1 and amendment 3
+
+Candidate attempt 1 fails independent source review: stale writer authority, changed Claude exception handling, and changed Claude row validation. Ten additional protected methods reproduce these boundaries (one positive worker-thread method passes). Efficiency correctness assertions pass, but repeated full-history parse costs remain open. See B1-REVIEW.json and raw evidence. Fixture corrections preserve all installed assertions and all 31 historical learning methods; reruns pass 7/7 and 31/31 respectively. No provider calls or production edits.

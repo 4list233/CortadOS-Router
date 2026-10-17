@@ -1,0 +1,70 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "attempt": 1,
+  "B": "FAIL",
+  "candidate_manifest_sha256": "ea72cac14af3472247213a693883f93e24b1c87896de9148e9d16d2c86f83a0d",
+  "source_review_complete": true,
+  "findings": [
+    {
+      "id": "B1-01",
+      "priority": 1,
+      "path": "cortados_router/teacher_attempts.py:76",
+      "rule": "sole writer lifetime",
+      "detail": "_check permits closed context, different PID, or replaced lock inode while another invocation owns current lock. Preserve same-process worker-thread use."
+    },
+    {
+      "id": "B1-02",
+      "priority": 1,
+      "path": "cortados_router/teacher.py:290",
+      "rule": "Claude exceptions retain behavior",
+      "detail": "Post-start Claude error escapes executor and aborts run; preserve observable batch failure, nonquota continue and quota/limit/429/overloaded stop. Never gain Codex fallback permission."
+    },
+    {
+      "id": "B1-03",
+      "priority": 2,
+      "path": "cortados_router/teacher_attempts.py:406",
+      "rule": "Claude row validation preservation",
+      "detail": "Codex whole-array rejection applied to Claude discards valid neighbors. Retain old per-row checks including bool indices and override behavior, suppress duplicate occupied training slots."
+    },
+    {
+      "id": "B1-04",
+      "priority": 2,
+      "path": "cortados_router/teacher_attempts.py:257",
+      "rule": "ENG-13 repeated parse investigation",
+      "detail": "Required atomic prefix replacement invalidates cache, causing full historical parse/index rebuild after each publication. Investigate safe append-derived caches; preserve external generation checks. No invented timing threshold."
+    }
+  ],
+  "inventory": {
+    "original_reported_tests": 735,
+    "original_setup_failures": 7,
+    "original_learning_lane": "aborted before summary;31 maintained methods",
+    "fixture_recheck": "installed7/7; unchanged learning31/31",
+    "protected_amplification": "10 methods;7 failure records,5 error records across9 failing methods;0 skips"
+  },
+  "performance": {
+    "correctness": "PASS",
+    "efficiency": "OPEN; repeated scan investigation required",
+    "large_primary_median_s": 29.2566,
+    "large_baseline_median_s": 0.35805,
+    "notes": "Instrumented synthetic workload; atomic prefix durability required. Raw report retained. No speed claim."
+  },
+  "activation": "BLOCKED pending grouped repaired candidate and complete verification",
+  "evidence_sha256": {
+    "acceptance/training_teacher/evidence/amendment-3/METHOD-MAP.json.before": "01d822bd39b00c55be1e248160f2a53dce86939a8fb4cb7db9f310457484ed86",
+    "acceptance/training_teacher/evidence/amendment-3/amplification-red.log": "fb4ac3982b76dd47ffc624af36d7dec46d5aa742dfa7287618b0602bb57199f2",
+    "acceptance/training_teacher/evidence/amendment-3/baseline-branches.py": "8a335a3fac6859c70414f7a155cc180ed28fd547b4667c25447635132bba7219",
+    "acceptance/training_teacher/evidence/amendment-3/candidate.json": "ea72cac14af3472247213a693883f93e24b1c87896de9148e9d16d2c86f83a0d",
+    "acceptance/training_teacher/evidence/amendment-3/claude-baseline-branches.json": "3f8a938947b0cc3abb515942947260b6e51eed3be3754dc191b1b02183a88d85",
+    "acceptance/training_teacher/evidence/amendment-3/claude-preservation.json": "10ec7efa477d4e55fc7ffa57079ba927db82ced5d39d04415f225f4c32dccf9f",
+    "acceptance/training_teacher/evidence/amendment-3/full-suite-attempt1.json": "3a5ff2a23b78d63fb2e758cde118c74debdf277f59319ae67cd9c34464f6fcd2",
+    "acceptance/training_teacher/evidence/amendment-3/initial-installed-origin-failures.log": "59f1712847d9ff4d3913d6044d0c14844f89cee2a98104f5c1683db795501975",
+    "acceptance/training_teacher/evidence/amendment-3/initial-learning-abort.log": "2baa57b69de954ab60a12990dbd529724f96800ca30e7809367e5a2c55af7bcb",
+    "acceptance/training_teacher/evidence/amendment-3/installed-recheck.log": "5b5b6034fdbebaf5ac7e2d1e27e838b9b0c3872854b155ee8654c5fd117fb97c",
+    "acceptance/training_teacher/evidence/amendment-3/installed_driver.py.before": "31592385dc11186c4c6c7109688b79cd751635ce67b4ac8d63e729112aef4ce0",
+    "acceptance/training_teacher/evidence/amendment-3/lock-lifetime.json": "7a46c08d769e6cb3552e20037239082fac99e5e5df7a85c0eb8b3c8dd73a1cc2",
+    "acceptance/training_teacher/evidence/amendment-3/preserved-learning-recheck.log": "7d99bac8b081a9f877e0bd227793821078d48596b74f3b9ea6e94c67a55885df",
+    "acceptance/training_teacher/evidence/amendment-3/review.json": "194b628bd9df87ddff6aaa45a3c210cb99706ba088184db841d88235d1bae7e4",
+    "acceptance/training_teacher/evidence/amendment-3/run-full-suite.py.before": "4240e72acd70792680f55d0f85c07f5306e4ff7bc690124ce69421d81372a61b",
+    "acceptance/training_teacher/evidence/amendment-3/teacher-performance-attempt1.json": "1ebdffe020db6101b2324551d6428dfe7766f18d3cb5fd3dfa977189582b1a85"
+  }
+}

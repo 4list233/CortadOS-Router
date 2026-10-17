@@ -1,0 +1,60 @@
+{
+  "baseline_sha256": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c",
+  "rows": {
+    "invalid_neighbors": {
+      "count": 2
+    },
+    "duplicate": {
+      "count": 3
+    },
+    "bool": {
+      "count": 2
+    },
+    "override_bool": {
+      "count": 2
+    }
+  },
+  "exceptions": {
+    "malformed JSON": {
+      "counts": [
+        0,
+        1
+      ],
+      "calls": 2,
+      "stopped": false
+    },
+    "rate limit": {
+      "counts": [
+        0,
+        0
+      ],
+      "calls": 1,
+      "stopped": true
+    },
+    "429": {
+      "counts": [
+        0,
+        0
+      ],
+      "calls": 1,
+      "stopped": true
+    },
+    "quota exhausted": {
+      "counts": [
+        0,
+        0
+      ],
+      "calls": 1,
+      "stopped": true
+    },
+    "overloaded": {
+      "counts": [
+        0,
+        0
+      ],
+      "calls": 1,
+      "stopped": true
+    }
+  },
+  "provider_calls": 0
+}

@@ -1,0 +1,29 @@
+test_enabled_main_writes_final_train_only_and_no_claude_usage (__main__.InstalledLabel.test_enabled_main_writes_final_train_only_and_no_claude_usage) ... {"planned_batches": 2, "reconciled_batches": 2, "deferred_batches": 0, "published_labels": 24, "diagnostics": []}
+ok
+test_flagoff_main_excludes_completed_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_completed_codex_slots) ... 3 teacher calls to make (28 request-labels); already done 2
+  3/3 calls · 28 labels · 0 s · claude scarcity 0.1
+done: 28 labels written
+ok
+test_flagoff_main_excludes_reserved_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_reserved_codex_slots) ... 3 teacher calls to make (28 request-labels); already done 0
+  3/3 calls · 28 labels · 0 s · claude scarcity 0.1
+done: 28 labels written
+ok
+test_flagoff_main_excludes_terminal_unpublished_codex_slots (__main__.InstalledLabel.test_flagoff_main_excludes_terminal_unpublished_codex_slots) ... 3 teacher calls to make (28 request-labels); already done 0
+  3/3 calls · 28 labels · 0 s · claude scarcity 0.1
+done: 28 labels written
+ok
+test_flagoff_main_preserves_primary_and_never_submits_codex (__main__.InstalledLabel.test_flagoff_main_preserves_primary_and_never_submits_codex) ... 4 teacher calls to make (30 request-labels); already done 0
+  4/4 calls · 30 labels · 0 s · claude scarcity 0.1
+done: 30 labels written
+ok
+test_override_retains_partial_representation_and_full_prefix (__main__.InstalledLabel.test_override_retains_partial_representation_and_full_prefix) ... 4 teacher calls to make (30 request-labels); already done 0
+  4/4 calls · 30 labels · 0 s · claude scarcity 0.1
+done: 30 labels written
+ok
+test_same_private_lock_refuses_every_main_mode_before_calls (__main__.InstalledLabel.test_same_private_lock_refuses_every_main_mode_before_calls) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.095s
+
+OK
+{"tests": 7, "failures": 0, "errors": 0, "skips": 0, "pass": true}
