@@ -1,7 +1,8 @@
 # Shared frontier exam amendment
 
 Exam owner: `/root/quota_evaluation_qa`. Root explicitly approved this staged amendment on 2026-10-17.
-Production routing thresholds are unchanged. The live file is not yet modified.
+Production routing thresholds are unchanged. The live exam amendment was applied after B2
+signoff with the original-hash guard and a preserved backup; see `B2/shared-router-exam-activation.json`.
 
 The shared `tests/test_router.py` still expects frontier selection at planning D=5 and underused D=6.
 Current routing-table ceilings are D=7 and D=9, respectively. Standalone `tests/test_router.py` already

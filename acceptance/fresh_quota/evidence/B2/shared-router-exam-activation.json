@@ -1,0 +1,16 @@
+{
+  "source": "/Users/velox/cortados/tests/test_router.py",
+  "stage": "/Users/velox/.cortados-builds/fresh-quota-activation/tests/test_router.py",
+  "before_sha256": "8b1627890e5d7d2f70cbecfe287a09faa1e5d7b58d468e1f48b7cad49facae48",
+  "candidate_sha256": "a7524e3f68c530e43ea210018a7a7a6a2493d185c6370231d5eedb3a2fa7add5",
+  "scope": "Only approved two-method shared test amendment; no production files changed by QA.",
+  "authority": "Root scoped approval 2026-10-17, user-designated independent exam owner; current documented routing-table thresholds 7 and 9; prior standalone parity",
+  "preserved": "All bytes outside two methods unchanged; original two baseline failures retained as evidence; explicit old D5/D6 triggers now tested negative",
+  "applied_live": true,
+  "applied_utc": "2026-10-17T18:22:18.723649+00:00",
+  "backup": "/Users/velox/.cortados-builds/fresh-quota-verification/shared-router-exam-activation-before.py",
+  "backup_sha256": "8b1627890e5d7d2f70cbecfe287a09faa1e5d7b58d468e1f48b7cad49facae48",
+  "after_sha256": "a7524e3f68c530e43ea210018a7a7a6a2493d185c6370231d5eedb3a2fa7add5",
+  "qa_signoff_commit": "c3a6173",
+  "shared_git_commit": false
+}
