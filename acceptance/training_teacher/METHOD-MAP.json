@@ -525,38 +525,6 @@
       ]
     },
     {
-      "file": "acceptance/training_teacher/installed_driver.py",
-      "class": "InstalledLabel",
-      "method": "test_enabled_main_writes_final_train_only_and_no_claude_usage",
-      "ac": [
-        "AC-T08"
-      ]
-    },
-    {
-      "file": "acceptance/training_teacher/installed_driver.py",
-      "class": "InstalledLabel",
-      "method": "test_flagoff_main_preserves_primary_and_never_submits_codex",
-      "ac": [
-        "AC-T08"
-      ]
-    },
-    {
-      "file": "acceptance/training_teacher/installed_driver.py",
-      "class": "InstalledLabel",
-      "method": "test_same_private_lock_refuses_every_main_mode_before_calls",
-      "ac": [
-        "AC-T08"
-      ]
-    },
-    {
-      "file": "acceptance/training_teacher/installed_driver.py",
-      "class": "InstalledLabel",
-      "method": "test_override_retains_partial_representation_and_full_prefix",
-      "ac": [
-        "AC-T08"
-      ]
-    },
-    {
       "file": "acceptance/training_teacher/evidence/installed-parity.py",
       "class": "InstalledParity",
       "method": "test_installed_sources_match_reviewed_checkout",
@@ -591,11 +559,73 @@
         "AC-T08",
         "AC-T09"
       ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_enabled_main_writes_final_train_only_and_no_claude_usage",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_preserves_primary_and_never_submits_codex",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_same_private_lock_refuses_every_main_mode_before_calls",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_override_retains_partial_representation_and_full_prefix",
+      "ac": [
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_completed_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_reserved_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
+    },
+    {
+      "file": "acceptance/training_teacher/installed_driver.py",
+      "class": "InstalledLabel",
+      "method": "test_flagoff_main_excludes_terminal_unpublished_codex_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04",
+        "AC-T08"
+      ]
     }
   ],
   "counts": {
     "source_methods": 49,
-    "installed_adapter_methods": 4,
+    "installed_adapter_methods": 7,
     "installed_parity_methods": 4,
     "prior_methods": 695
   },
@@ -617,9 +647,9 @@
     "acceptance/training_teacher/evidence/run-full-suite.py": "4240e72acd70792680f55d0f85c07f5306e4ff7bc690124ce69421d81372a61b"
   },
   "B_required": [
-    "all695 prior methods plus57new and builder regressions, no missing/skips",
+    "all695 prior methods plus60new and builder regressions, no missing/skips",
     "installed exact source set/hash and unchanged learning/native parity",
-    "installed staged main4 methods",
+    "installed staged main7 methods including all-mode completed/reserved/terminal slot exclusion",
     "synthetic raw performance/call/memory/logicalIO comparison",
     "guarded activation and preserved validation/holdout/promotion identities"
   ]

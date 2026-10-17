@@ -1,6 +1,8 @@
 # PURPOSE: Exercise exact staged label.main with installed owners and private DATA in every mode.
 # CONTRACT: RT-TRAINING-TEACHER-007 AC-T08; only broker/Claude external boundaries are substituted.
 import importlib.util
+import hashlib
+import uuid
 import json
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from support import TeacherCase, COMMON, ANSWER, answers
+from support import TeacherCase, COMMON, ANSWER, SYSTEM, BrokerFixture, answers
 
 RELEASE = Path('/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017')
 STAGE = Path(os.environ.get('CORTADOS_TRAINING_TEACHER_STAGE', '/Users/velox/.cortados-builds/training-teacher-activation'))
@@ -34,6 +36,7 @@ class InstalledLabel(TeacherCase):
         config_home = self.data / '.config/cortados-workers'; config_home.mkdir(parents=True)
         (config_home / 'teacher.json').write_bytes(self.config_path.read_bytes())
         self.usage = []
+        self.primary_requests = []
         usage = types.ModuleType('usage'); usage.record = self.usage.append
         for context in (patch.object(Path, 'home', return_value=self.data),
                         patch.dict(os.environ, {'HOME': str(self.data), 'CORTADOS_MCP_LEARNING_SITE_PACKAGES': OLD_SITE}),
@@ -51,6 +54,7 @@ class InstalledLabel(TeacherCase):
             return self.module.main()
 
     def primary(self, model, batch, **kwargs):
+        self.primary_requests.extend(row['id'] for row in batch)
         return answers(batch), {'usage': {}, 'session_id': 'synthetic-only'}
 
     def legacy_primary(self):
@@ -108,6 +112,56 @@ class InstalledLabel(TeacherCase):
         overrides = [json.loads(line) for line in (self.data / 'labels-override-outward.jsonl').read_text().splitlines()]
         self.assertEqual(len(overrides), len(labels))
         self.assertTrue(all(row['override'] is True and row['answers']=={'outward': False} for row in overrides))
+
+
+    def seed_codex_attempt(self, state):
+        from cortados_router.teacher_attempts import LabelAttempts
+        batch = [row for row in self.snapshot['rows'] if self.snapshot['partitions'][row['id']] == 'train'][:2]
+        arguments = self.owner().codex_arguments(batch, sample=0, system_prompt=SYSTEM,
+            request_id=str(uuid.uuid4()), cwd=str(self.state / 'teacher-cwd'))
+        with LabelAttempts(self.data, validate_answers=COMMON.valid_answers, questions=COMMON.QUESTIONS) as store:
+            attempt = store.reserve(batch, sample=0, system_prompt=SYSTEM, arguments=arguments,
+                config_digest=hashlib.sha256(self.config_path.read_bytes()).hexdigest(), snapshot=self.snapshot)
+            if state in ('terminal', 'published'):
+                store.submitted(attempt['attempt_id'])
+                fixture = BrokerFixture()
+                receipt = fixture.submit(attempt['arguments'])
+                store.bind_job(attempt['attempt_id'], receipt['job']['job_id'])
+                terminal = fixture.result(receipt['job']['job_id'])
+                store.terminal(attempt['attempt_id'], terminal)
+                if state == 'published':
+                    self.assertEqual(store.publish(attempt['attempt_id'], terminal=terminal,
+                        answers=json.loads(terminal['result']['summary']), snapshot=self.snapshot), len(batch))
+        return attempt, {row['id'] for row in batch}
+
+    def assert_flagoff_excludes_codex_slots(self, state):
+        attempt, occupied = self.seed_codex_attempt(state)
+        labels = self.data / 'labels.jsonl'
+        prefix = labels.read_bytes() if labels.exists() else b''
+        self.transport(); self.legacy_primary()
+        with patch.dict(os.environ, {'CORTADOS_TRAINING_TEACHER_V1': '0'}):
+            self.main('--split', 'all')
+        self.assertEqual(self.broker.calls, [])
+        self.assertTrue(self.primary_requests, 'Unreserved primary work must still proceed')
+        self.assertTrue(occupied.isdisjoint(self.primary_requests), 'Codex-owned slots must not enter Claude prompts')
+        self.assertTrue(labels.read_bytes().startswith(prefix))
+        new_rows = [json.loads(line) for line in labels.read_bytes()[len(prefix):].splitlines()]
+        self.assertTrue(occupied.isdisjoint(row['id'] for row in new_rows))
+        slots = [(row['id'], row['sample']) for row in self.labels()]
+        self.assertEqual(len(slots), len(set(slots)))
+        journal = json.loads((self.data / '.teacher-attempts/manifest.json').read_text())
+        current = next(row for row in journal['attempts'] if row['attempt_id'] == attempt['attempt_id'])
+        self.assertEqual(current['state'], state)
+        self.assertEqual(current['request_id'], attempt['request_id'])
+
+    def test_flagoff_main_excludes_completed_codex_slots(self):
+        self.assert_flagoff_excludes_codex_slots('published')
+
+    def test_flagoff_main_excludes_reserved_codex_slots(self):
+        self.assert_flagoff_excludes_codex_slots('reserved')
+
+    def test_flagoff_main_excludes_terminal_unpublished_codex_slots(self):
+        self.assert_flagoff_excludes_codex_slots('terminal')
 
 
 if __name__ == '__main__':

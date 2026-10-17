@@ -1,0 +1,91 @@
+test_ordinary_config_gets_no_new_defaults (acceptance.training_teacher.test_admission.TeacherAdmission.test_ordinary_config_gets_no_new_defaults) ... ok
+test_ordinary_workers_keep_prior_scarcity_policy (acceptance.training_teacher.test_admission.TeacherAdmission.test_ordinary_workers_keep_prior_scarcity_policy) ... ok
+test_policy_and_ceiling_must_appear_together (acceptance.training_teacher.test_admission.TeacherAdmission.test_policy_and_ceiling_must_appear_together) ... ok
+test_policy_requires_closed_safe_teacher_config (acceptance.training_teacher.test_admission.TeacherAdmission.test_policy_requires_closed_safe_teacher_config) ... ok
+test_prompt_and_closed_delegate_arguments_use_existing_payload (acceptance.training_teacher.test_admission.TeacherAdmission.test_prompt_and_closed_delegate_arguments_use_existing_payload) ... ok
+test_same_admitted_resource_snapshot_owns_scarcity_ceiling (acceptance.training_teacher.test_admission.TeacherAdmission.test_same_admitted_resource_snapshot_owns_scarcity_ceiling) ... ok
+test_teacher_config_is_explicit_and_normalized (acceptance.training_teacher.test_admission.TeacherAdmission.test_teacher_config_is_explicit_and_normalized) ... ok
+test_teacher_does_not_bypass_account_freshness_or_quota (acceptance.training_teacher.test_admission.TeacherAdmission.test_teacher_does_not_bypass_account_freshness_or_quota) ... ok
+test_teacher_policy_does_not_change_native_argv (acceptance.training_teacher.test_admission.TeacherAdmission.test_teacher_policy_does_not_change_native_argv) ... ok
+test_conflicting_terminal_identity_refuses_publication (acceptance.training_teacher.test_attempts.DurableAttempts.test_conflicting_terminal_identity_refuses_publication) ... ok
+test_corrupt_manifest_never_resets_or_loses_identity (acceptance.training_teacher.test_attempts.DurableAttempts.test_corrupt_manifest_never_resets_or_loses_identity) ... ok
+test_crash_after_labels_replace_reconciles_without_duplicate_lines (acceptance.training_teacher.test_attempts.DurableAttempts.test_crash_after_labels_replace_reconciles_without_duplicate_lines) ... ok
+test_data_directory_identity_change_refuses_reconciliation (acceptance.training_teacher.test_attempts.DurableAttempts.test_data_directory_identity_change_refuses_reconciliation) ... ok
+test_failed_terminal_cannot_publish_supplied_answers (acceptance.training_teacher.test_attempts.DurableAttempts.test_failed_terminal_cannot_publish_supplied_answers) ... ok
+test_final_partition_or_revision_change_refuses_publication (acceptance.training_teacher.test_attempts.DurableAttempts.test_final_partition_or_revision_change_refuses_publication) ... ok
+test_labels_symlink_and_truncated_history_never_get_repaired (acceptance.training_teacher.test_attempts.DurableAttempts.test_labels_symlink_and_truncated_history_never_get_repaired) ... ok
+test_manifest_unknown_field_refuses (acceptance.training_teacher.test_attempts.DurableAttempts.test_manifest_unknown_field_refuses) ... ok
+test_private_journal_symlink_and_public_mode_refuse_without_repair (acceptance.training_teacher.test_attempts.DurableAttempts.test_private_journal_symlink_and_public_mode_refuse_without_repair) ... ok
+test_published_lines_preserve_prefix_mode_and_truthful_receipt (acceptance.training_teacher.test_attempts.DurableAttempts.test_published_lines_preserve_prefix_mode_and_truthful_receipt) ... ok
+test_reservation_persists_uuid_arguments_and_private_modes (acceptance.training_teacher.test_attempts.DurableAttempts.test_reservation_persists_uuid_arguments_and_private_modes) ... ok
+test_reservation_replace_failure_does_not_expose_sendable_attempt (acceptance.training_teacher.test_attempts.DurableAttempts.test_reservation_replace_failure_does_not_expose_sendable_attempt) ... ok
+test_reserved_slot_cannot_be_reserved_twice_or_mutated_through_returned_dict (acceptance.training_teacher.test_attempts.DurableAttempts.test_reserved_slot_cannot_be_reserved_twice_or_mutated_through_returned_dict) ... ok
+test_second_writer_refuses_while_first_context_owns_lock (acceptance.training_teacher.test_attempts.DurableAttempts.test_second_writer_refuses_while_first_context_owns_lock) ... ok
+test_known_unknown_and_spent_checks_never_start_native (acceptance.training_teacher.test_claude_boundary.ClaudeBoundary.test_known_unknown_and_spent_checks_never_start_native) ... ok
+test_permission_error_is_not_reclassified_as_quota_refusal (acceptance.training_teacher.test_claude_boundary.ClaudeBoundary.test_permission_error_is_not_reclassified_as_quota_refusal) ... ok
+test_real_unproven_claude_source_refuses_before_subprocess (acceptance.training_teacher.test_claude_boundary.ClaudeBoundary.test_real_unproven_claude_source_refuses_before_subprocess) ... ok
+test_started_native_failure_never_becomes_prestart_refusal (acceptance.training_teacher.test_claude_boundary.ClaudeBoundary.test_started_native_failure_never_becomes_prestart_refusal) ... ok
+test_accepted_failed_job_never_gets_a_second_identity (acceptance.training_teacher.test_selection.TrainingSelection.test_accepted_failed_job_never_gets_a_second_identity) ... FAIL
+test_available_claude_keeps_primary_and_never_submits_codex (acceptance.training_teacher.test_selection.TrainingSelection.test_available_claude_keeps_primary_and_never_submits_codex) ... ok
+test_changed_config_ceiling_refuses_fallback (acceptance.training_teacher.test_selection.TrainingSelection.test_changed_config_ceiling_refuses_fallback) ... ok
+test_changed_raw_config_refuses_replay_without_new_identity (acceptance.training_teacher.test_selection.TrainingSelection.test_changed_raw_config_refuses_replay_without_new_identity) ... ok
+test_enabled_split_train_never_writes_validation_or_holdout_even_primary_available (acceptance.training_teacher.test_selection.TrainingSelection.test_enabled_split_train_never_writes_validation_or_holdout_even_primary_available) ... ok
+test_existing_teacher_closes_slot_and_prefix_is_immutable (acceptance.training_teacher.test_selection.TrainingSelection.test_existing_teacher_closes_slot_and_prefix_is_immutable) ... ok
+test_final_validation_inside_raw_train_never_falls_back (acceptance.training_teacher.test_selection.TrainingSelection.test_final_validation_inside_raw_train_never_falls_back) ... ok
+test_invalid_options_cause_zero_calls (acceptance.training_teacher.test_selection.TrainingSelection.test_invalid_options_cause_zero_calls) ... ok
+test_limit_counts_primary_refusal_and_fallback_as_one_batch (acceptance.training_teacher.test_selection.TrainingSelection.test_limit_counts_primary_refusal_and_fallback_as_one_batch) ... ok
+test_lost_acceptance_response_replays_exact_original_batch (acceptance.training_teacher.test_selection.TrainingSelection.test_lost_acceptance_response_replays_exact_original_batch) ... FAIL
+test_lower_ceiling_config_must_match_request_and_never_mutates_running_config (acceptance.training_teacher.test_selection.TrainingSelection.test_lower_ceiling_config_must_match_request_and_never_mutates_running_config) ... ok
+test_malformed_existing_label_history_refuses_before_any_teacher (acceptance.training_teacher.test_selection.TrainingSelection.test_malformed_existing_label_history_refuses_before_any_teacher) ... ERROR
+test_malformed_output_indexes_reject_whole_response (acceptance.training_teacher.test_selection.TrainingSelection.test_malformed_output_indexes_reject_whole_response) ... ok
+test_no_fallback_after_arbitrary_or_started_failure (acceptance.training_teacher.test_selection.TrainingSelection.test_no_fallback_after_arbitrary_or_started_failure) ... ok
+test_only_override_never_uses_fallback (acceptance.training_teacher.test_selection.TrainingSelection.test_only_override_never_uses_fallback) ... ok
+test_partial_unique_response_publishes_only_valid_present_answers (acceptance.training_teacher.test_selection.TrainingSelection.test_partial_unique_response_publishes_only_valid_present_answers) ... ok
+test_preacceptance_capacity_defers_same_identity_without_spin (acceptance.training_teacher.test_selection.TrainingSelection.test_preacceptance_capacity_defers_same_identity_without_spin) ... FAIL
+test_primary_call_runs_under_same_writer_lock (acceptance.training_teacher.test_selection.TrainingSelection.test_primary_call_runs_under_same_writer_lock) ... ok
+test_unknown_primary_falls_back_only_for_final_training (acceptance.training_teacher.test_selection.TrainingSelection.test_unknown_primary_falls_back_only_for_final_training) ... ok
+test_both_adapters_reexec_before_project_imports_with_exact_argv (acceptance.training_teacher.test_stage.StagedTeacher.test_both_adapters_reexec_before_project_imports_with_exact_argv) ... ok
+test_nightly_uses_new_interpreter_only_for_label_phase (acceptance.training_teacher.test_stage.StagedTeacher.test_nightly_uses_new_interpreter_only_for_label_phase) ... ok
+test_wrong_interpreter_with_marker_refuses_instead_of_reexec_loop (acceptance.training_teacher.test_stage.StagedTeacher.test_wrong_interpreter_with_marker_refuses_instead_of_reexec_loop) ... ok
+
+======================================================================
+ERROR: test_malformed_existing_label_history_refuses_before_any_teacher (acceptance.training_teacher.test_selection.TrainingSelection.test_malformed_existing_label_history_refuses_before_any_teacher)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_selection.py", line 216, in test_malformed_existing_label_history_refuses_before_any_teacher
+    claude.assert_not_called()
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: '_patch' object has no attribute 'assert_not_called'
+
+======================================================================
+FAIL: test_accepted_failed_job_never_gets_a_second_identity (acceptance.training_teacher.test_selection.TrainingSelection.test_accepted_failed_job_never_gets_a_second_identity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_selection.py", line 108, in test_accepted_failed_job_never_gets_a_second_identity
+    self.assertTrue(initial)
+    ~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: [] is not true
+
+======================================================================
+FAIL: test_lost_acceptance_response_replays_exact_original_batch (acceptance.training_teacher.test_selection.TrainingSelection.test_lost_acceptance_response_replays_exact_original_batch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_selection.py", line 132, in test_lost_acceptance_response_replays_exact_original_batch
+    self.assertEqual(self.broker.native_starts, 1)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_preacceptance_capacity_defers_same_identity_without_spin (acceptance.training_teacher.test_selection.TrainingSelection.test_preacceptance_capacity_defers_same_identity_without_spin)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_selection.py", line 118, in test_preacceptance_capacity_defers_same_identity_without_spin
+    self.assertEqual(len(self.broker.calls), 1)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1
+
+----------------------------------------------------------------------
+Ran 49 tests in 0.183s
+
+FAILED (failures=3, errors=1)
+{"tests": 49, "failures": 3, "errors": 1, "skips": 0, "pass": false, "failure_ids": ["acceptance.training_teacher.test_selection.TrainingSelection.test_accepted_failed_job_never_gets_a_second_identity", "acceptance.training_teacher.test_selection.TrainingSelection.test_lost_acceptance_response_replays_exact_original_batch", "acceptance.training_teacher.test_selection.TrainingSelection.test_preacceptance_capacity_defers_same_identity_without_spin"], "error_ids": ["acceptance.training_teacher.test_selection.TrainingSelection.test_malformed_existing_label_history_refuses_before_any_teacher"]}

@@ -32,3 +32,19 @@ Codex starts, bytes replaced, peak Python memory and elapsed time. It makes no c
 quality or provider latency. Installed parity must compare the exact source file sets/hashes and
 unchanged learning/native owners. No model call occurs in QA or builder verification; the separately
 authorized bounded operator training invocation comes only after B0 and activation.
+
+
+Development-feedback amendment 1 (independent exam owner): frozen split=all/limit1 chooses a
+holdout batch first under the specified Random(7) ordering. The three replay tests must select
+final train to reach their claimed Codex boundary; the raw-config replay case received the same
+selection correction and a first-send assertion to prevent a vacuous pass. transport returned
+the patch controller instead of the started Mock; correcting that wiring retains the original
+no-call assertion. No old assertion was removed or inverted. Original failed development feedback
+and exact before bytes are preserved; this was not a stable B submission or failed B attempt.
+
+Three installed-main amplifications now require flag-off exclusion of published, reserved and
+terminal-unpublished Codex slots from both Claude prompts and label publication, while unreserved
+primary work proceeds. They preserve the one-owner rollback boundary already specified in007.
+The installed release did not yet exist during this amendment; those seven installed-main methods
+remain mandatory candidate B checks, not claimed passing. Current in-progress source passes all49
+ordinary methods. Exact recheck source hashes are evidence only, not a stable candidate pin.

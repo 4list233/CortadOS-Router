@@ -1,0 +1,56 @@
+{
+  "basis": "Frozen contract grouping, sample0, batch12, final-list Random(7), no production teacher implementation used",
+  "batches": [
+    {
+      "partition": "holdout",
+      "ids": [
+        "teacher-exam-14",
+        "teacher-exam-7",
+        "teacher-exam-21",
+        "teacher-exam-0",
+        "teacher-exam-28"
+      ]
+    },
+    {
+      "partition": "train",
+      "ids": [
+        "teacher-exam-9",
+        "teacher-exam-3",
+        "teacher-exam-25",
+        "teacher-exam-15",
+        "teacher-exam-1",
+        "teacher-exam-11",
+        "teacher-exam-23",
+        "teacher-exam-5",
+        "teacher-exam-19",
+        "teacher-exam-4",
+        "teacher-exam-17",
+        "teacher-exam-22"
+      ]
+    },
+    {
+      "partition": "train",
+      "ids": [
+        "teacher-exam-18",
+        "teacher-exam-16",
+        "teacher-exam-24",
+        "teacher-exam-12",
+        "teacher-exam-27",
+        "teacher-exam-8",
+        "teacher-exam-6",
+        "teacher-exam-13",
+        "teacher-exam-2",
+        "teacher-exam-20",
+        "teacher-exam-26",
+        "teacher-exam-10"
+      ]
+    },
+    {
+      "partition": "valid",
+      "ids": [
+        "teacher-exam-29"
+      ]
+    }
+  ],
+  "first_partition": "holdout"
+}

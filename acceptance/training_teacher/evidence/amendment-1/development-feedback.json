@@ -1,0 +1,15 @@
+{
+  "tests": 49,
+  "failures": 3,
+  "errors": 1,
+  "skips": 0,
+  "pass": false,
+  "failure_ids": [
+    "acceptance.training_teacher.test_selection.TrainingSelection.test_accepted_failed_job_never_gets_a_second_identity",
+    "acceptance.training_teacher.test_selection.TrainingSelection.test_lost_acceptance_response_replays_exact_original_batch",
+    "acceptance.training_teacher.test_selection.TrainingSelection.test_preacceptance_capacity_defers_same_identity_without_spin"
+  ],
+  "error_ids": [
+    "acceptance.training_teacher.test_selection.TrainingSelection.test_malformed_existing_label_history_refuses_before_any_teacher"
+  ]
+}

@@ -102,9 +102,9 @@ class TrainingSelection(TeacherCase):
     def test_accepted_failed_job_never_gets_a_second_identity(self):
         self.transport()
         self.broker.state = 'failed'
-        self.run_labels(limit=1)
+        self.run_labels(split='train', limit=1)
         initial = copy.deepcopy(self.broker.calls)
-        self.run_labels(limit=1)
+        self.run_labels(split='train', limit=1)
         self.assertTrue(initial)
         first_ids = {r['request_id'] for r in initial}
         first_payloads = {r['context'] for r in initial}
@@ -114,11 +114,11 @@ class TrainingSelection(TeacherCase):
     def test_preacceptance_capacity_defers_same_identity_without_spin(self):
         self.transport()
         self.broker.refusal = 'capacity_exhausted'
-        self.run_labels(limit=1)
+        self.run_labels(split='train', limit=1)
         self.assertEqual(len(self.broker.calls), 1)
         previous = copy.deepcopy(self.broker.calls[0])
         self.broker.refusal = None
-        self.run_labels(limit=1, batch=1)
+        self.run_labels(split='train', limit=1, batch=1)
         self.assertEqual(self.broker.calls[1], previous)
         self.assertEqual(self.broker.native_starts, 1)
 
@@ -126,13 +126,13 @@ class TrainingSelection(TeacherCase):
         self.transport()
         self.broker.lost_once = True
         try:
-            self.run_labels(limit=1)
+            self.run_labels(split='train', limit=1)
         except Exception as exc:
             self.assertEqual(getattr(exc, 'code', None), 'storage_error')
         self.assertEqual(self.broker.native_starts, 1)
         previous = copy.deepcopy(self.broker.calls[0])
         self.snapshot['rows'].reverse()
-        self.run_labels(limit=1, batch=1)
+        self.run_labels(split='train', limit=1, batch=1)
         replays = [call for call in self.broker.calls if call['request_id'] == previous['request_id']]
         self.assertGreaterEqual(len(replays), 2)
         self.assertTrue(all(call == previous for call in replays))
@@ -198,11 +198,12 @@ class TrainingSelection(TeacherCase):
 
     def test_changed_raw_config_refuses_replay_without_new_identity(self):
         self.transport(); self.broker.refusal = 'capacity_exhausted'
-        self.run_labels(limit=1)
+        self.run_labels(split='train', limit=1)
+        self.assertEqual(len(self.broker.calls), 1)
         previous = copy.deepcopy(self.broker.calls)
         self.config_path.write_bytes(self.config_path.read_bytes() + b'\n')
         try:
-            self.run_labels(limit=1)
+            self.run_labels(split='train', limit=1)
         except Exception as exc:
             self.assertIn(getattr(exc, 'code', None), ('storage_error', 'invalid_request'))
         self.assertEqual(self.broker.calls, previous)

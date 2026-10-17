@@ -147,6 +147,6 @@ class TeacherCase(unittest.TestCase):
         start = patch.object(broker, 'ensure_broker')
         start.start(); self.addCleanup(start.stop)
         b = patch.object(owner, 'call_claude', side_effect=claude or owner.PreStartRefusal('quota_unknown'))
-        a.start(); b.start()
+        a.start(); mocked_claude = b.start()
         self.addCleanup(a.stop); self.addCleanup(b.stop)
-        return b
+        return mocked_claude

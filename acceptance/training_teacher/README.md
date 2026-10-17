@@ -8,7 +8,7 @@ Run the 49 source/staged pre-import methods from the standalone repository:
 python -B acceptance/training_teacher/run_exams.py /absolute/private/report.json
 ```
 
-Run the four full staged-main methods with the unregistered fixed candidate release:
+Run the seven full staged-main methods with the unregistered fixed candidate release:
 
 ```sh
 /Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017/venv/bin/python -B acceptance/training_teacher/installed_driver.py

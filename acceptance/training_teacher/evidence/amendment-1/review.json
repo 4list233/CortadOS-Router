@@ -1,0 +1,67 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "amendment": 1,
+  "exam_owner": "/root/quota_evaluation_qa",
+  "base_freeze_commit": "3533874",
+  "kind": "fixture wiring/selection corrections and additive existing-rule coverage",
+  "contract_behavior_changed": false,
+  "attempt_classification": "development feedback, not stable B",
+  "authority": "Parent explicitly authorized independent correction and flag-off amplification",
+  "before_after": {
+    "support.py": {
+      "before_sha256": "38bcb291ac1b0a96fd5d927dfb44657aca6095f77296e4174505a3c982277cd8",
+      "after_sha256": "142abf94ecd1971d15d3202cefba09818d5edd5655aef6eac34a48ba51895c42"
+    },
+    "test_selection.py": {
+      "before_sha256": "67a571557fa1f8c74aa5fcbfd48b51b2883ad5d3edfc5f1536699e727eaa3573",
+      "after_sha256": "8c92e329f72e9a7a5e25f0531027414dab4349cb77ace5d9efd7b74476f3268b"
+    },
+    "installed_driver.py": {
+      "before_sha256": "68a7f96b58e818cc2cdcdce63bdb079bcce1a9d4710b8f5a3f7fbfaf6aee94a0",
+      "after_sha256": "31592385dc11186c4c6c7109688b79cd751635ce67b4ac8d63e729112aef4ce0"
+    },
+    "METHOD-MAP.json": {
+      "before_sha256": "2521cc9dcbb49be445d63abcf25592d68a466efcd6efe2854f2cf3bb2612a067",
+      "after_sha256": "c26c8bdcb77f20cb2f131bf0b216d4a27cd5636175ef5126702e3cbf7d0a2e84"
+    },
+    "README.md": {
+      "before_sha256": "5ece036cb4480286bfef27096259b6c02938498531efe14a227dc2fdc704227c",
+      "after_sha256": "ea5906ad7fc72d6fa1b33fc7751f9365669c8fd94d8400fe25b071ad94babe88"
+    },
+    "QA-REVIEW.md": {
+      "before_sha256": "66a8e4fa7381d1636614a13ee684ec5a9024209c29351417ac64d60c6bf238f4",
+      "after_sha256": "daa8d68ae427d2e577d7a3d811285126fb669e2093458c639e08442f17158f64"
+    }
+  },
+  "assertion_proof": {
+    "test_selection.py": {
+      "old_assertions": 55,
+      "new_assertions": 56,
+      "every_old_assertion_ast_retained": true
+    },
+    "installed_driver.py": {
+      "old_assertions": 18,
+      "new_assertions": 30,
+      "every_old_assertion_ast_retained": true
+    }
+  },
+  "development_recheck": {
+    "tests": 49,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "pass": true,
+    "failure_ids": [],
+    "error_ids": []
+  },
+  "installed_amplification": "pending candidate release, no skipped or passing claim",
+  "production_edits": false,
+  "provider_calls": 0,
+  "development_source_sha256": {
+    "cortados_router/teacher.py": "dfb99ed24f6935ff4c2911d63a458fe229d8bddaaf5ff398b4a36bfb17a8a344",
+    "cortados_router/teacher_attempts.py": "5bae5d2bcbf5de5c87327ad0f2535e98e38fe4aad413e1a6468aae683f2f188e",
+    "integrations/mcp/config.py": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+    "cortados_router/worker_admission.py": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+    "s1/label.py": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38"
+  }
+}
