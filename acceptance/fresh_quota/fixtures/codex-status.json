@@ -1,0 +1,29 @@
+{
+  "sampled_at": 1792256675.5028422,
+  "binary": "/opt/homebrew/bin/codex",
+  "diagnostics": {
+    "stage": "retry",
+    "eof": false,
+    "startup_chars": 810,
+    "response_chars": 2920,
+    "ready_seen": false
+  },
+  "quota_fragments": [
+    "Weekly limit: [\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591\u2591\u2591]\n64%\nleft (resets 3:22 AM on 22 Oct)"
+  ],
+  "parsed_windows": [
+    {
+      "window": "week (<session-uuid>)",
+      "used_pct": 36.0,
+      "elapsed_pct": 91.5,
+      "headroom_pct": 64.0,
+      "projected_pct_at_reset": 39,
+      "allowance_pct_per_h": 4.48,
+      "resets_at": "2026-10-18 03:22",
+      "resets_in_h": 14.3,
+      "scarcity": -1.0,
+      "expiring_pct": 61,
+      "pool": "<session-uuid>"
+    }
+  ]
+}

@@ -1,0 +1,309 @@
+{
+  "source": "/Users/velox/.cortados-builds/fresh-quota-activation/agent/auxiliary_client.py",
+  "sha256": "923261c9b73f3c43d7923f675c972397e1a6a6d55a0768739d0d806088095d1b",
+  "functions": [
+    {
+      "function": "_to_async_client",
+      "line": 4362,
+      "returns": [
+        {
+          "line": 4407,
+          "expression": "(AsyncOpenAI(**async_kwargs), model)"
+        },
+        {
+          "line": 4366,
+          "expression": "(sync_client, model)"
+        },
+        {
+          "line": 4368,
+          "expression": "(AsyncCodexAuxiliaryClient(sync_client), model)"
+        },
+        {
+          "line": 4370,
+          "expression": "(AsyncAnthropicAuxiliaryClient(sync_client), model)"
+        },
+        {
+          "line": 4372,
+          "expression": "(AsyncBedrockAuxiliaryClient(sync_client), model)"
+        },
+        {
+          "line": 4379,
+          "expression": "(sync_client, model)"
+        },
+        {
+          "line": 4376,
+          "expression": "(AsyncGeminiNativeClient(sync_client), model)"
+        }
+      ]
+    },
+    {
+      "function": "_route_client",
+      "line": 4612,
+      "returns": [
+        {
+          "line": 4616,
+          "expression": "(client_obj, final_model_str)"
+        },
+        {
+          "line": 4615,
+          "expression": "_to_async_client(client_obj, final_model_str, is_vision=req.is_vision)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_auto_branch",
+      "line": 4627,
+      "returns": [
+        {
+          "line": 4646,
+          "expression": "(routed_client, routed_model)"
+        },
+        {
+          "line": 4631,
+          "expression": "(None, None)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_openrouter_branch",
+      "line": 4649,
+      "returns": [
+        {
+          "line": 4656,
+          "expression": "_route_client(req, client, _normalize_resolved_model(req.model or default, req.provider))"
+        },
+        {
+          "line": 4655,
+          "expression": "(None, None)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_nous_branch",
+      "line": 4659,
+      "returns": [
+        {
+          "line": 4676,
+          "expression": "_route_client(req, client, final_model)"
+        },
+        {
+          "line": 4667,
+          "expression": "(None, None)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_openai_codex_branch",
+      "line": 4679,
+      "returns": [
+        {
+          "line": 4699,
+          "expression": "_route_or_warn(req, client, default, no_token_msg)"
+        },
+        {
+          "line": 4686,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4697,
+          "expression": "(raw_client, _normalize_resolved_model(model, req.provider))"
+        },
+        {
+          "line": 4693,
+          "expression": "(None, None)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_xai_oauth_branch",
+      "line": 4702,
+      "returns": [
+        {
+          "line": 4706,
+          "expression": "_route_or_warn(req, client, default, 'resolve_provider_client: xai-oauth requested but no xAI OAuth token found (run: hermes model -> xAI Grok OAuth \u2014 SuperGrok / Premium+)')"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_custom_branch",
+      "line": 4711,
+      "returns": [
+        {
+          "line": 4770,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4756,
+          "expression": "_route_client(req, client, final_model)"
+        },
+        {
+          "line": 4730,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4768,
+          "expression": "_route_client(req, client, final_model)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_named_custom_branch",
+      "line": 4783,
+      "returns": [
+        {
+          "line": 4844,
+          "expression": "_route_client(req, client, final_model)"
+        },
+        {
+          "line": 4796,
+          "expression": "None"
+        },
+        {
+          "line": 4814,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4836,
+          "expression": "_route_client(req, AnthropicAuxiliaryClient(real_client, final_model, custom_key, custom_base, is_oauth=False), final_model)"
+        },
+        {
+          "line": 4835,
+          "expression": "_route_client(req, _named_custom_openai_wire_client(custom_base, custom_key), final_model)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_azure_foundry_branch",
+      "line": 4847,
+      "returns": [
+        {
+          "line": 4852,
+          "expression": "_route_or_warn(req, client, default_model, 'resolve_provider_client: azure-foundry requested but runtime resolution failed (run: hermes doctor for diagnostics)')"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_api_key_branch",
+      "line": 4881,
+      "returns": [
+        {
+          "line": 4951,
+          "expression": "_route_client(req, client, final_model)"
+        },
+        {
+          "line": 4886,
+          "expression": "_route_or_warn(req, client, default_model, 'resolve_provider_client: anthropic requested but no Anthropic credentials found')"
+        },
+        {
+          "line": 4919,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4929,
+          "expression": "_route_client(req, profile_client, final_model)"
+        },
+        {
+          "line": 4935,
+          "expression": "_route_client(req, client, final_model)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_external_process_branch",
+      "line": 4954,
+      "returns": [
+        {
+          "line": 4991,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4973,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4976,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 4987,
+          "expression": "_route_client(req, client, final_model)"
+        }
+      ]
+    },
+    {
+      "function": "_resolve_registry_branch",
+      "line": 4994,
+      "returns": [
+        {
+          "line": 5031,
+          "expression": "_route_client(req, client, final_model) if client is not None else (None, None)"
+        },
+        {
+          "line": 5009,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 5012,
+          "expression": "_resolve_api_key_branch(req, pconfig, resolve_api_key_provider_credentials)"
+        },
+        {
+          "line": 5014,
+          "expression": "_resolve_external_process_branch(req, resolve_external_process_provider_credentials(provider))"
+        },
+        {
+          "line": 5004,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 5024,
+          "expression": "(None, None)"
+        },
+        {
+          "line": 5030,
+          "expression": "(None, None)"
+        }
+      ]
+    },
+    {
+      "function": "resolve_provider_client",
+      "line": 5046,
+      "returns": [
+        {
+          "line": 5120,
+          "expression": "_resolve_registry_branch(req)"
+        },
+        {
+          "line": 5110,
+          "expression": "branch(req)"
+        },
+        {
+          "line": 5117,
+          "expression": "result"
+        },
+        {
+          "line": 5119,
+          "expression": "_resolve_azure_foundry_branch(req)"
+        }
+      ]
+    },
+    {
+      "function": "_get_cached_client",
+      "line": 5606,
+      "returns": [
+        {
+          "line": 5670,
+          "expression": "(client, _compat_model(client, model, default_model))"
+        },
+        {
+          "line": 5656,
+          "expression": "(client, model or default_model)"
+        },
+        {
+          "line": 5633,
+          "expression": "(cached_client, _compat_model(cached_client, model, cached_default))"
+        }
+      ]
+    }
+  ],
+  "candidate_review": "Every concrete client return must retain actual provider. Cached/race winner returns retain winner evidence; unbound results refuse at strict hook. No caller infers scope from provider name."
+}

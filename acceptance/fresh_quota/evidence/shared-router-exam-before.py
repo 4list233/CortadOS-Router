@@ -1,0 +1,225 @@
+"""Offline tests for the router core: band resolution, hard rules, table validation, sub-agent counts. No model calls."""
+import importlib.util, json, os, sys, tempfile, unittest
+from pathlib import Path
+os.environ.setdefault("CORTADOS_HERMES_HOME", tempfile.mkdtemp(prefix="cortados-router-test-"))
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("core", str(ROOT / "plugins/cortados-router/core.py")); core = importlib.util.module_from_spec(spec); spec.loader.exec_module(core)
+core.lane_health = lambda: {}  # tests are about the table, not live lane state
+_scored = core.scored_candidates
+core.scored_candidates = lambda t, band, kind: None  # …and about the hand-written fallback candidates; scored selection has its own tests below
+
+def dec(steps=0, ambiguity=0, blast=0, ctx=0, novelty=0, par=0, **kw):
+    a = {"steps": steps, "ambiguity": ambiguity, "blast_radius": blast, "context_size": ctx, "novelty": novelty, "parallelizability": par,
+         "outward": False, "work_kind": "conversation", "urgency": "now", "needs_clarification": False, "parts": 0, "diversity": False, **kw}
+    return {"answers": a, "degraded": False, "engine": "test", "engine_ms": 1}
+
+class Bands(unittest.TestCase):
+    def test_r0_r1(self):
+        self.assertEqual(core.resolve(dec())["band"], "R0")
+        r = core.resolve(dec(steps=2, ambiguity=2, blast=1)); self.assertEqual((r["band"], r["D"], r["subagents"]), ("R1", 5, 0))
+    def test_r2_decomposes_only_when_parts_or_parallel(self):
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2))["subagents"], 0)          # D=7, serial, one part → orchestrated, no fan-out
+        r = core.resolve(dec(steps=2, ambiguity=1, blast=1, par=2, parts=2)); self.assertEqual((r["band"], r["subagents"]), ("R2", 3))
+    def test_r3_by_difficulty_and_by_blast(self):
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=3, novelty=3))["band"], "R3")
+        r = core.resolve(dec(blast=3)); self.assertEqual(r["band"], "R3"); self.assertTrue(r["verifier"]); self.assertGreaterEqual(r["subagents"], 3)
+    def test_outward_floors_blast_radius(self):
+        r = core.resolve(dec(steps=1, outward=True)); self.assertEqual((r["band"], r["features"]["blast_radius"]), ("R3", 3)); self.assertTrue(r["hard_rules"])
+    def test_r4_never_by_score(self):
+        self.assertNotEqual(core.resolve(dec(3, 3, 3, 3, 3, 3))["band"], "R4")
+    def test_degraded_uses_fallback(self):
+        d = {"answers": None, "degraded": True, "engine": "test", "engine_ms": 1}
+        self.assertEqual(core.resolve(d, "interactive")["band"], "R2"); self.assertEqual(core.resolve(d, "background")["band"], "R1")
+    def test_work_kind_reorders_lanes(self):
+        self.assertEqual(core.resolve(dec(steps=2, ambiguity=1, blast=1, par=2, work_kind="code"))["chosen"]["lane"], "codex")
+
+class TableValidation(unittest.TestCase):
+    def test_rejects_ceiling_outside_r4_and_non_grok_cursor(self):
+        t = json.loads((ROOT / "router/routing-table.json").read_text())
+        bad = json.loads(json.dumps(t)); bad["candidates"]["R2"].append({"lane": "claude", "provider": "claude-cli", "model": "claude-fable-5-1", "tier": "W-ceiling"})
+        bad.setdefault("selection", {})["ceiling_by_score"] = False
+        with self.assertRaises(ValueError): core.validate_table(bad)
+        bad = json.loads(json.dumps(t)); bad["candidates"]["R1"][0]["model"] = "claude-sonnet-5"
+        bad.setdefault("selection", {})["ceiling_by_score"] = False
+        with self.assertRaises(ValueError): core.validate_table(bad)
+        core.validate_table(t)
+
+class Scarcity(unittest.TestCase):
+    """Subscription scarcity re-ranks lanes inside the band; it never changes the band."""
+    def setUp(self):
+        self._lh = core.lane_health
+    def tearDown(self):
+        core.lane_health = self._lh
+    def _lanes(self, **kw):
+        core.lane_health = lambda: {l: {"ok": v.get("s", 0) < 1.0, "why": "spent", "scarcity": v.get("s", 0), "expiring_pct": v.get("exp", 0),
+                                        "tightest": {"window": "week", "used_pct": 80, "elapsed_pct": 40, "projected_pct_at_reset": 200, "resets_at": "x"}} for l, v in kw.items()}
+    def test_spent_lane_is_skipped(self):
+        self._lanes(cursor={"s": 1.0})
+        r = core.resolve(dec(steps=2, ambiguity=2, blast=1))
+        self.assertEqual(r["band"], "R1"); self.assertNotEqual(r["chosen"]["lane"], "cursor")
+        self.assertTrue(any(s['lane'] == 'cursor' for s in r['skipped']))
+    def test_fast_burning_lane_goes_behind(self):
+        first = core.resolve(dec(steps=2, ambiguity=2, blast=1))["chosen"]["lane"]
+        self._lanes(**{first: {"s": 0.8}})
+        r = core.resolve(dec(steps=2, ambiguity=2, blast=1))
+        self.assertEqual(r["band"], "R1"); self.assertNotEqual(r["chosen"]["lane"], first); self.assertTrue(any("demoted" in x for x in r["hard_rules"]))
+    def test_expiring_headroom_goes_first(self):
+        cands = core.table()["candidates"]["R2"]
+        last = cands[-1]["lane"]
+        self._lanes(**{last: {"s": 0.0, "exp": 30}})
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=2))
+        self.assertEqual(r["band"], "R2"); self.assertEqual(r["chosen"]["lane"], last)
+    def test_scarce_lane_holds_subagents_to_minimum(self):
+        self._lanes(claude={"s": 0.8}, codex={"s": 0.85}, cursor={"s": 0.9})   # every lane of the band is scarce
+        r = core.resolve(dec(steps=3, ambiguity=2, blast=1, novelty=2, par=3, parts=3))
+        row = next(b for b in core.table()["bands"] if b["band"] == r["band"])
+        self.assertEqual(r["subagents"], (row.get("subagents") or {}).get("min", 0))
+
+    def test_model_pool_is_scored_separately(self):
+        # Fable's own week is spent while the all-models week has room: Fable is skipped, other Claude models are not
+        week = {"window": "week (fable)", "used_pct": 100, "elapsed_pct": 90, "projected_pct_at_reset": 111, "resets_at": "x"}
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": 0.1, "expiring_pct": 0, "tightest": {},
+                                               "pools": {"fable": {"ok": False, "why": "week (fable) 100% used", "scarcity": 1.0, "expiring_pct": 0, "tightest": week}}}}
+        self.assertFalse(core.candidate_health({"lane": "claude", "model": "claude-fable-5-1"}, core.lane_health())["ok"])
+        self.assertTrue(core.candidate_health({"lane": "claude", "model": "claude-opus-5"}, core.lane_health())["ok"])
+
+
+
+class ScoredSelection(unittest.TestCase):
+    """No band lists: every model has an index per use case, every task a required index."""
+    MS = {"use_cases": {"code": "", "writing": ""}, "reference_index": {b: {"general": v, "code": v, "writing": v} for b, v in (("R1", 10), ("R2", 50), ("R3", 80), ("R4", 95))},
+          "models": [{"family": f, "ceiling": ceil, "proxy": False, "index": {"general": g, "code": c, "writing": w}, "price_1m_blended_usd": price, "reach": [{"lane": lane, "provider": prov, "model": f}]}
+                     for f, g, c, w, lane, prov, ceil, price in (("small", 12, 12, 30, "cursor", "cursor-cli", False, 1.0), ("mid", 55, 52, 70, "claude", "claude-cli", False, 4.0), ("mid2", 60, 58, 40, "codex", "openai-codex", False, 4.5),
+                                                                 ("big", 85, 88, 60, "claude", "claude-cli", False, 10.0), ("top", 99, 100, 90, "claude", "claude-cli", True, 20.0),
+                                                                 ("loc", 0, 0, 0, "local", "custom", False, None))]}
+    def setUp(self):
+        self._keep = (core.scored_candidates, core.model_scores, core.lane_health)
+        core.scored_candidates, core.model_scores, core.lane_health = _scored, (lambda: self.MS), (lambda: {})
+    def tearDown(self):
+        core.scored_candidates, core.model_scores, core.lane_health = self._keep
+    def test_requirement_is_continuous_in_difficulty(self):
+        t = core.table()
+        r = [core.required_index(t, self.MS, "code", D, "R2") for D in (6, 7, 8)]
+        self.assertEqual(r[0], 50); self.assertTrue(r[0] < r[1] < r[2] < 80)
+    def test_least_overqualified_model_that_clears_the_bar(self):
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))            # D=6 → needs 50
+        self.assertEqual((r["chosen"]["model"], r["required_index"]), ("mid", 50.0))
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"))            # D=8 → needs 70: mid and mid2 no longer clear it
+        self.assertEqual(r["chosen"]["model"], "big")
+    def test_use_case_changes_the_winner_and_ceiling_never_by_score(self):
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="writing"))["chosen"]["model"], "mid")    # D=7 needs 60: mid writes at 70
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="code"))["chosen"]["model"], "big")       # …but codes at 52
+        r = core.resolve(dec(3, 3, 3, 3, 3, 3, work_kind="code"))            # D=12: the ceiling model wins by score (Forest 2026-09-23)
+        self.assertEqual(r["chosen"]["model"], "top")
+        self.assertNotEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=2, work_kind="code"))["chosen"]["model"], "top")   # D=7: never on a medium task
+    def test_scarcity_moves_the_choice(self):
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": 0.9, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "mid2")      # 0.9 × 30 points outweighs 6 of surplus
+    def test_secondary_source_only_when_native_spent(self):
+        ms = {"use_cases": {"code": ""}, "reference_index": ScoredSelection.MS["reference_index"],
+              "models": [{"family": "claude-opus-5", "ceiling": False, "proxy": False, "index": {"general": 80, "code": 85},
+                          "reach": [{"lane": "claude", "provider": "claude-cli", "model": "claude-opus-5"}, {"lane": "cursor", "provider": "cursor-cli", "model": "claude-opus-5-thinking-high", "pool": "other-models"}]},
+                         {"family": "kimi-k3", "ceiling": False, "proxy": False, "index": {"general": 64, "code": 68}, "reach": [{"lane": "cursor", "provider": "cursor-cli", "model": "kimi-k3-high", "pool": "other-models"}]}]}
+        core.model_scores = lambda: ms
+        self._keep = (core.scored_candidates, core.model_scores, core.lane_health)
+        healthy = {"claude": {"ok": True, "why": None, "scarcity": 0.9, "expiring_pct": 0, "tightest": {}, "pools": {}}}      # scarce but NOT spent
+        core.lane_health = lambda: healthy
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"))                                            # D=8 needs 70: only Opus qualifies
+        self.assertEqual((r["chosen"]["lane"], r["chosen"]["model"]), ("claude", "claude-opus-5"))                            # native wins even at 0.9
+        spent = {"claude": {"ok": False, "why": "week 100% used", "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        core.lane_health = lambda: spent
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"))
+        self.assertEqual(r["chosen"]["lane"], "cursor")                                                                       # secondary source takes over
+        self.assertEqual(core.native_lane_for("kimi-k3"), None); self.assertEqual(core.native_lane_for("gpt-oss-120b"), None); self.assertEqual(core.native_lane_for("cursor-grok-4.6"), None)
+    def test_context_policy_and_stickiness(self):
+        big = 200 * 4 * 1000                                                      # 200k tokens of history
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"), history_chars=big)
+        self.assertTrue(all("ceiling" in s.get("why", "") for s in r["skipped"]) or r["chosen"] is None or r["chosen"]["lane"] == "claude")
+        self.assertEqual(core.resolve(dec())["chosen"]["lane"], "local")                      # fresh reflex: local
+        r = core.resolve(dec(), history_chars=40000)                              # 10k of history: local excluded for reflex work
+        self.assertNotEqual((r["chosen"] or {}).get("lane"), "local")
+        st = {"lane": "codex", "model": "mid2", "band": "R2", "pinned": False}
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"), sticky=st)     # mid2 (58) clears 50: stays
+        self.assertEqual(r["chosen"]["model"], "mid2")
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"), sticky=st)     # needs 70: outgrown, moves
+        self.assertNotEqual(r["chosen"]["model"], "mid2")
+
+
+    def test_insight_work_goes_to_the_frontier(self):
+        ms = json.loads(json.dumps(ScoredSelection.MS)); ms["use_cases"]["planning"] = ""
+        for m in ms["models"]:
+            m["index"]["planning"] = m["index"]["general"]
+        ms["reference_index"] = {b: {**v, "planning": v["general"]} for b, v in ms["reference_index"].items()}
+        core.model_scores = lambda: ms
+        self.assertEqual(core.resolve(dec(steps=2, ambiguity=2, novelty=1, work_kind="planning"))["chosen"]["model"], "top")    # D=5 planning → frontier
+        self.assertNotEqual(core.resolve(dec(steps=1, ambiguity=1, work_kind="planning"))["chosen"]["model"], "top")            # D=2 planning → not
+        self.assertNotEqual(core.resolve(dec(steps=2, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "top")     # D=5 code → price ladder
+    def test_underused_frontier_pool_takes_hard_work(self):
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.6, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "top")       # D=6 code, claude pool underused → top
+
+    def test_face_turns_have_a_floor_but_background_does_not(self):
+        r = core.resolve(dec(), "interactive")                                    # R0 face turn: "small" (12) is below the floor → not chosen
+        self.assertNotEqual(r["chosen"]["model"], "small")
+        self.assertEqual(core.resolve(dec(), "background")["chosen"]["lane"], "local")   # background reflex: cheapest still wins
+
+
+class CleanRequest(unittest.TestCase):
+    def test_discord_shapes(self):
+        c = core.clean_request
+        self.assertEqual(c("[Triggering message id: `1` — use as `message_id` for reply/react/pin via the discord tools.]\n\ngive me a confirmation when you see it"), "give me a confirmation when you see it")
+        self.assertEqual(c("[Triggering message id: `1` — x.]\n\n[Recent channel messages]\n[Donna [bot]] hi\n\n[New message]\ndo the thing\n\n-# router (shadow, nothing changed): R0"), "do the thing")
+        self.assertIsNone(c("[Triggering message id: `1` — x.]\n\n[Recent channel messages]\n[Donna [bot]] cut off he"))
+        self.assertEqual(c('[Replying to: "Which faces?"]\n\n[Triggering message id: `1` — x.]\n\nall of them'), '(in reply to: "Which faces?")\nall of them')
+        self.assertEqual(c("plain question"), "plain question")
+
+
+
+
+def _load_sc():
+    spec = importlib.util.spec_from_file_location("sc", str(ROOT / "plugins/cortados-router/scarcity.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+
+class UsageScreens(unittest.TestCase):
+    """Parsers run on the text the four vendor screens really printed on 2026-09-21."""
+    sc = _load_sc()
+    def test_window_view_is_pct_vs_time(self):
+        import time
+        w = self.sc.window_view("week", 70, time.time() + 0.1 * 7 * 86400, 7 * 86400)
+        self.assertEqual(w["elapsed_pct"], 90.0); self.assertEqual(w["projected_pct_at_reset"], 78); self.assertLess(w["scarcity"], 0.2); self.assertEqual(w["expiring_pct"], 22)
+        hot = self.sc.window_view("week", 60, time.time() + 0.7 * 7 * 86400, 7 * 86400)
+        self.assertEqual(hot["projected_pct_at_reset"], 200); self.assertEqual(hot["scarcity"], 0.9)
+        self.assertEqual(self.sc.window_view("week", 100, time.time() + 3600, 7 * 86400)["scarcity"], 1.0)
+    def test_claude(self):
+        w = self.sc.parse_claude_usage("Current session\r ███ \n20%\nused\r Resets 12pm (America/Toronto)\r Current week (all models)\r ████ \n70%\nused\r Resets Sep 21 at 3pm (America/Toronto)")
+        self.assertEqual([(x["window"], x["used_pct"]) for x in w], [("5-hour session", 20.0), ("week (all models)", 70.0)]); self.assertTrue(all(x["resets_at"] for x in w))
+    def test_codex(self):
+        w = self.sc.parse_codex_status("│ Weekly limit: [░░░░░░░░] 0% left (resets 11:35 on 23 Sep) │")
+        self.assertEqual((w[0]["window"], w[0]["used_pct"], w[0]["scarcity"], w[0]["pool"]), ("week", 100.0, 1.0, "all")); self.assertIn("-09-23 11:35", w[0]["resets_at"])
+    def test_cursor(self):
+        w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
+        self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])
+        rec = self.sc.finish("cursor", {"windows": w})
+        self.assertEqual(sorted(rec["pools"]), ["cursor-models", "other-models"]); self.assertEqual(rec["scarcity"], rec["pools"]["cursor-models"]["scarcity"])
+        self.assertEqual(self.sc.pool_for("cursor", "cursor-grok-4.6-medium-fast", []), "cursor-models"); self.assertEqual(self.sc.pool_for("cursor", "claude-opus-5", []), "other-models")
+    def test_claude_fable_week_is_its_own_pool(self):
+        import datetime
+        soon = (datetime.datetime.now() + datetime.timedelta(hours=3)).strftime("%b %-d at %-I%p").replace("AM", "am").replace("PM", "pm")   # the test must not age
+        w = self.sc.parse_claude_usage(f"Current session 3% used Resets 5pm (America/Toronto) Current week (all models) 73% used Resets {soon} (America/Toronto) "
+                                       f"Current week (Fable) 95% used Resets {soon} (America/Toronto)")
+        self.assertEqual([x["pool"] for x in w], ["all", "all", "fable"])
+        rec = self.sc.finish("claude", {"windows": w})
+        self.assertGreaterEqual(rec["pools"]["fable"]["scarcity"], 0.75); self.assertLess(rec["scarcity"], 0.3)   # 0.8 minus the small expiring credit
+        self.assertEqual(self.sc.pool_for("claude", "claude-fable-5-1", ["fable"]), "fable"); self.assertIsNone(self.sc.pool_for("claude", "claude-haiku-4-5", ["fable"]))
+    def test_codex_named_limit(self):
+        w = self.sc.parse_codex_status("│ 5h limit: [███] 80% left (resets 14:05) │ Weekly limit: [░] 0% left (resets 11:35 on 23 Sep) │ GPT-5.3-Codex-Spark Weekly limit: [███] 90% left (resets 11:35 on 23 Sep) │")
+        self.assertEqual([(x["window"], x["pool"]) for x in w], [("5-hour", "all"), ("week", "all"), ("week (GPT-5.3-Codex-Spark)", "gpt-5-3-codex-spark")])
+    def test_antigravity(self):
+        g = self.sc.parse_agy_usage("GEMINI MODELS Models within this group: Gemini Flash Weekly Limit Remaining [ ███ ] 99.03% Refreshes in 35h 32m Five Hour Limit Remaining [ ██ ] 98.02% Refreshes in 4h 25m "
+                                    "CLAUDE AND GPT MODELS Models within this group: Claude Opus Weekly Limit Remaining [ ███ ] 100.00% Quota available Five Hour Limit Remaining [ ███ ] 100.00% Quota available")
+        self.assertEqual(sorted(g), ["claude and gpt models", "gemini models"]); self.assertEqual(g["gemini models"][0]["used_pct"], 1.0)
+        self.assertEqual(self.sc.pool_for("antigravity", "Gemini 3.7 Flash (Medium)", []), "gemini"); self.assertEqual(self.sc.pool_for("antigravity", "claude-opus-5", []), "claude-gpt"); self.assertEqual(g["gemini models"][0]["resets_in_h"], 35.5)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

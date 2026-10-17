@@ -1,0 +1,13 @@
+{
+  "source": "/Users/velox/cortados/tests/test_router.py",
+  "stage": "/Users/velox/.cortados-builds/fresh-quota-activation/tests/test_router.py",
+  "before_sha256": "8b1627890e5d7d2f70cbecfe287a09faa1e5d7b58d468e1f48b7cad49facae48",
+  "candidate_sha256": "a7524e3f68c530e43ea210018a7a7a6a2493d185c6370231d5eedb3a2fa7add5",
+  "scope": [
+    "ScoredSelection.test_insight_work_goes_to_the_frontier",
+    "ScoredSelection.test_underused_frontier_pool_takes_hard_work"
+  ],
+  "authority": "Root scoped approval 2026-10-17, user-designated independent exam owner; current documented routing-table thresholds 7 and 9; prior standalone parity",
+  "preserved": "All bytes outside two methods unchanged; original two baseline failures retained as evidence; explicit old D5/D6 triggers now tested negative",
+  "applied_live": false
+}

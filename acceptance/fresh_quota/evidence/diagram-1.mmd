@@ -1,0 +1,15 @@
+flowchart LR
+  N[Existing native metadata reader] --> O[Bounded per-lane observations]
+  S[Existing lane sampler readers] --> O
+  O --> M[Ephemeral immutable observation snapshot]
+  C[Existing learned-cost file read once] --> R[Immutable selection resources]
+  M --> R
+  R --> E[Existing resolver ranks valid candidates]
+  E --> P[CLI source preflight or native refusal]
+  P --> F[Final actual scope quota check]
+  F -->|known fresh| D[Existing provider dispatch]
+  F -->|unknown or spent| X[Observable refusal with zero dispatch]
+  classDef projection fill:#dceeff
+  classDef view fill:#f0e3ff
+  class M,R projection
+  class X view

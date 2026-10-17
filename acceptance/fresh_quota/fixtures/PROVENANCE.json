@@ -1,0 +1,8 @@
+{
+  "source_directory": "/Users/velox/.cortados-builds/quota-evaluation-verification",
+  "privacy": "Operator-sanitized usage metadata and status fragment; no credentials or account identifiers",
+  "files": {
+    "codex-status.json": "625f9cca61c0c9088f6015461ad952760d232963a6b7e50810fd474774373ec2",
+    "native-quota.json": "154156f286f60776236025f74b54d8b7bbfecd31d9c6d1b7789a7453dc532aad"
+  }
+}

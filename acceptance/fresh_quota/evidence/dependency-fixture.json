@@ -1,0 +1,140 @@
+[
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/reviews.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/reviews.py",
+    "sha256": "35ceb54ba402dfe13f1ab4f9b6aef6bacf16a25c6121f81321e5c90cce14efbc",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/images.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/images.py",
+    "sha256": "bab2eefb5b9dbc71f75f2ad320d7000bed319dc1303a413e9cae27b1ebfa4649",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/transport.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/transport.py",
+    "sha256": "579d48dd55bf5e138d80d2f997fb3b84e4eb9b69d92564e061db054e06de8382",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/unitcost.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/unitcost.py",
+    "sha256": "95653bcce44eb294dcbf3e8ac5c6a381f0f31668535ecbe3514115b9357839c6",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/probe_reaper.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/probe_reaper.py",
+    "sha256": "9c969297cc0eabcc0346e0f231f1121bc55f15d411014643829082478a7093f7",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-router/cron_routing.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/cron_routing.py",
+    "sha256": "e19beb0d08040ae50f99abec99d7d9421730baff7f0a715619ea30e30aa3fdcc",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/cortados-pty/usage.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-pty/usage.py",
+    "sha256": "830bf5db6500836e94b0e65a7de07ec67b38d5a87df26b5edd62083b6ada5502",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/plugins/model-providers/cortados-cli/__init__.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/model-providers/cortados-cli/__init__.py",
+    "sha256": "fe212e389cb261dc089357dd14064269389d8440be470d8e82a00e91886f54a8",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/env_compat.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/env_compat.py",
+    "sha256": "fbb50e79e5705e35d6aaa7aeb4110bc918aff9ce1342c985e89622729918b625",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/routing.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/routing.py",
+    "sha256": "821f0e42c58f7542a8365ad48baa0eda7cd60228364728cd5cb69efa04601021",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/router/routing-table.json",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/router/routing-table.json",
+    "sha256": "76c01b0371d8c738a846dff3e195778c9450beb70f5032dbb6b5578adab7bbdd",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/router/model-scores.generated.json",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/router/model-scores.generated.json",
+    "sha256": "632e940eb4d4c24a45eb32eca2c365a0ccb9e8ec01c549db8a8a7ed54efe1823",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/router/budgets.json",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/router/budgets.json",
+    "sha256": "6ef73bb0d7285892cb3c5d118e13d1d42e0e86154187f40f4f9e64f1f64c4987",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/router/inventory/cursor.txt",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/router/inventory/cursor.txt",
+    "sha256": "4bda52bd48be9b6715230af31d63ab6549ee408a1cf3e6424f5ca336e4cc7ff0",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/faces.json",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/faces.json",
+    "sha256": "24d1c084dfc73e7cd8ee6cd3e2a892a88902ec2ce83fd082877b69440ead375e",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/__init__.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/__init__.py",
+    "sha256": "d4462a8ecdd53a79bdad4a4834a77a77120250c39be47a3b90d70b7176c11850",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/extractor.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/extractor.py",
+    "sha256": "02b328f8261f93207404fb9446a56ef88495d2d09b364d70e069ab172f05b4dd",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/buckets.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/buckets.py",
+    "sha256": "38d7066b05acc7cdfcfebc150c870bade60ddef944eeb7a2b8ad9aa789a73b6a",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/interfaces.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/interfaces.py",
+    "sha256": "5e52b1c8f9d6ce6a36dd3d99f93c0a24da38dac6921e72af2ef7e831a26d09e3",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/context/facts.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/context/facts.py",
+    "sha256": "79068a2fd1ddbcb3f9165ce9f8de8e6ff415e873b2a832f3bf49382e66a83724",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/train/common.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/train/common.py",
+    "sha256": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/train/student.py",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/train/student.py",
+    "sha256": "ba8820e625b5f0459c5bdba14c7b2309794714ad4fb3ff6504ecf1c064f1eefb",
+    "builder_writable": false
+  },
+  {
+    "source": "/Users/velox/cortados/train/current.json",
+    "fixture": "/Users/velox/.cortados-builds/fresh-quota-activation/train/current.json",
+    "sha256": "edd67078ecd05b8b8455cd4db7fabd3821ce9b9b52c51b6660fe43547703c372",
+    "builder_writable": false
+  }
+]

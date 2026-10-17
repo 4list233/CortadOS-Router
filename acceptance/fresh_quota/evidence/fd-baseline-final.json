@@ -1,0 +1,13 @@
+{
+  "kind": "fd",
+  "test_source": "/Users/velox/cortados/tests/test_pty_spawn_fd_leak.py",
+  "test_sha256": "141ffa71a9a0ebec7694a15dc3d95804776ee21562789ddd321a8e996bd1420d",
+  "staged_runner": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-pty/runner.py",
+  "staged_runner_sha256": "30914b03ea989d47df4e35cf84b999abeaa5c8165fa5c756af78d494958d69ad",
+  "tests": 2,
+  "failures": [],
+  "errors": [],
+  "skipped": [],
+  "successful_cli_launches": 0,
+  "network_calls": 0
+}

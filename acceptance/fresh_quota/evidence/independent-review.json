@@ -1,0 +1,61 @@
+{
+  "contract": "RT-FRESH-QUOTA-005",
+  "contract_version": 1,
+  "exam_owner": "/root/quota_evaluation_qa",
+  "D": 0,
+  "A": 0,
+  "B": "pending builder and independent candidate validation",
+  "baseline_revision": "7a71977822dc44153ff28c47a320a123897097fd",
+  "contract_sha256": "a24be3a94965e37c716d6acf8f7f2787c746aa822309a16a8286495e5faab2f8",
+  "independent_tests": 116,
+  "prebuild_failures": 60,
+  "prebuild_errors": 69,
+  "prebuild_skips": 0,
+  "counts_note": "Failures/errors include subtest records; not mutually exclusive method totals. All errors are absent APIs/owners, old signature, or missing raw window field.",
+  "preserved_baseline": {
+    "delivery": {
+      "tests": 25,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0
+    },
+    "fd": {
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skips": 0
+    }
+  },
+  "prior_protected_files_unchanged": 335,
+  "scoped_shared_exam_amendment": "tests/test_router.py, two frontier methods only, staged; no shared activation",
+  "B_obligations_owner": "/root",
+  "B_obligations": [
+    "full accumulated package with no missing/empty/skipped lanes",
+    "required-routing unchanged assertions with explicit quota fixture",
+    "fresh-stage migrated learning activation unchanged assertions with quota fixture",
+    "installed origin and host Python 3.12 imports",
+    "old/new learning owner bytes and clean_request AST parity",
+    "six workload raw baseline/candidate performance",
+    "actual candidate return-arm/source proof review",
+    "no activation before 004 completed and no active training"
+  ],
+  "render_proof": {
+    "renderer": "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/.bin/mmdc",
+    "config": "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json",
+    "artifacts": [
+      "diagram-1.mmd",
+      "diagram-1.svg",
+      "diagram-2.mmd",
+      "diagram-2.svg"
+    ],
+    "exit_codes": [
+      0,
+      0
+    ]
+  },
+  "limitations": [
+    "Configured-source provenance is not permanent account identity",
+    "native OAuth, nonstrict legacy Codex, and unproven local transports refuse",
+    "unrelated whole-CortadOS suite inventory remains separately unverified"
+  ]
+}

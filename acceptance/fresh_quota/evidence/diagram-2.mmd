@@ -1,0 +1,19 @@
+sequenceDiagram
+  participant H as Existing host boundary
+  participant Q as Quota admission owner
+  participant O as Existing observation readers
+  participant R as Existing scorer and resolver
+  H->>Q: Request current candidate resources
+  Q->>O: Bounded refresh of absent or expired lanes
+  O-->>Q: Actual observed records or errors
+  Q-->>H: Immutable resources
+  H->>R: Score and resolve under fresh snapshot
+  H->>Q: Check selected provider after final resolve
+  H->>Q: Check actual scope immediately before dispatch
+  alt Matching scope and age at most 30 seconds
+    Q-->>H: Available observation
+    H->>H: Existing transport submits request
+  else Missing, stale, invalid or spent
+    Q-->>H: Observable quota refusal
+    H->>H: Stop before transport side effects
+  end

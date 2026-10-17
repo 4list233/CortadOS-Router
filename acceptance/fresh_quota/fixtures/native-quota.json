@@ -1,0 +1,31 @@
+{
+  "sampled_at_ms": 1792256610013,
+  "version": "0.163.0",
+  "ordinaryUsageAllowed": true,
+  "rateLimits": {
+    "limitId": "codex",
+    "normalModelSlug": null,
+    "spendControlReached": false,
+    "rateLimitReachedType": null,
+    "primary": {
+      "usedPercent": 36,
+      "windowDurationMins": 10080,
+      "resetsAt": 1792653737
+    },
+    "secondary": null
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "limitId": "codex",
+      "normalModelSlug": null,
+      "spendControlReached": false,
+      "rateLimitReachedType": null,
+      "primary": {
+        "usedPercent": 36,
+        "windowDurationMins": 10080,
+        "resetsAt": 1792653737
+      },
+      "secondary": null
+    }
+  }
+}

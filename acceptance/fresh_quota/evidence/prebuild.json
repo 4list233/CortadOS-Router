@@ -1,0 +1,643 @@
+{
+  "tests": 116,
+  "selectors": [
+    "acceptance.fresh_quota.test_admission.Admission.test_absent_observation_refresh_failure_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_configured_larger_age_cannot_relax_thirty_seconds",
+    "acceptance.fresh_quota.test_admission.Admission.test_configured_lower_age_limit_remains_effective",
+    "acceptance.fresh_quota.test_admission.Admission.test_declared_local_resource_has_no_actual_transport_proof",
+    "acceptance.fresh_quota.test_admission.Admission.test_duplicate_lane_observations_are_integrity_failure",
+    "acceptance.fresh_quota.test_admission.Admission.test_exact_thirty_seconds_is_available_without_refresh",
+    "acceptance.fresh_quota.test_admission.Admission.test_existing_spent_threshold_is_refusal",
+    "acceptance.fresh_quota.test_admission.Admission.test_expired_observation_can_be_replaced_by_actual_fresh_success",
+    "acceptance.fresh_quota.test_admission.Admission.test_familiar_model_does_not_infer_unknown_provider",
+    "acceptance.fresh_quota.test_admission.Admission.test_fresh_envelope_cannot_hide_expired_window",
+    "acceptance.fresh_quota.test_admission.Admission.test_future_epoch_observation_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_future_monotonic_observation_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_info_pool_is_not_subscription_admission",
+    "acceptance.fresh_quota.test_admission.Admission.test_invalid_duration_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_invalid_used_percentage_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_local_name_without_declared_candidate_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_missing_raw_reset_is_unknown_despite_display_string",
+    "acceptance.fresh_quota.test_admission.Admission.test_missing_subscription_windows_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_native_oauth_provider_cannot_borrow_cli_store_observation",
+    "acceptance.fresh_quota.test_admission.Admission.test_observed_required_pool_authorizes_exact_provider",
+    "acceptance.fresh_quota.test_admission.Admission.test_old_monotonic_record_cannot_hide_behind_fresh_epoch",
+    "acceptance.fresh_quota.test_admission.Admission.test_over_thirty_seconds_cannot_authorize_after_failed_refresh",
+    "acceptance.fresh_quota.test_admission.Admission.test_reset_beyond_original_window_is_unknown",
+    "acceptance.fresh_quota.test_admission.Admission.test_scope_mismatch_cannot_authorize_matching_provider_and_model",
+    "acceptance.fresh_quota.test_admission.Admission.test_scope_shape_cannot_contain_unrecognized_fields",
+    "acceptance.fresh_quota.test_admission.Admission.test_source_failure_cannot_authorize_even_with_old_record",
+    "acceptance.fresh_quota.test_admission.Admission.test_unproven_scope_cannot_authorize_known_quota",
+    "acceptance.fresh_quota.test_admission.Admission.test_unrelated_pool_does_not_authorize_required_model_pool",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_allowed_routes_excludes_mismatched_scope_before_resolution",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_current_resources_reads_costs_once_and_collects_requested_lanes",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_missing_lane_is_explicitly_unavailable",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_mutating_observation_or_cost_map_cannot_change_snapshot",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_resources_and_supplied_empty_costs_never_read_live_files",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_resources_frozen_instant_checks_both_lanes_independently",
+    "acceptance.fresh_quota.test_admission.ResourceSnapshot.test_unknown_learned_cost_preserves_known_quota",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_claude_injected_token_or_key_cannot_claim_file_store_scope",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_codex_alternate_auth_or_base_url_is_unproven_without_secret_echo",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_cursor_override_store_cannot_match_observed_file_store",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_effective_home_or_codex_home_changes_scope",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_identical_cli_source_is_stable_and_contains_no_raw_paths",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_local_table_name_cannot_create_transport_scope",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_metadata_app_server_argv_is_not_public_dispatch_proof",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_native_oauth_never_borrows_native_cli_scope",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_nonstrict_codex_config_is_unproven",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_resolved_binary_identity_is_bound",
+    "acceptance.fresh_quota.test_auth_scope.AuthScope.test_scope_hash_uses_exact_nonsecret_descriptor",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_mode_off_checks_actual_client_identity",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_deferred_async_first_anext_rechecks_after_quota_changes",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_deferred_sync_first_next_rechecks_after_quota_changes",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_exact_cli_source_transport_gets_source_preflight",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_generic_host_without_callback_retains_behavior",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_hook_cannot_accept_unbound_client",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_malformed_exception_or_duplicate_results_refuse",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_source_preflight_result_never_grants_actual_dispatch_permission",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_async_in_both_router_modes",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_sync_in_both_router_modes",
+    "acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unproved_sdk_scope_does_not_become_configured_source_preflight",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_async_route_return_binds_actual_returned_wrapper",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_exact_cli_source_preserves_client_and_marks_preflight",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_existing_effective_identity_is_not_overwritten_by_auto_or_main",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_explicit_client_return_gets_concrete_identity",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_impostor_or_replaced_cli_method_never_gets_preflight",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_plain_async_constructor_preserves_effective_provider",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_specialized_async_wrappers_keep_resolved_provider",
+    "acceptance.fresh_quota.test_client_binding.ClientBinding.test_unknown_auto_client_does_not_get_fake_concrete_identity",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_absent_reset_is_not_fabricated",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_afternoon_reset_uses_pm",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_captured_weekly_reset_preserves_day_month_and_am",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_existing_24_hour_and_named_model_limits_remain_distinct",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_midnight_reset_is_hour_zero",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_noon_reset_is_hour_twelve",
+    "acceptance.fresh_quota.test_codex_status.CodexStatus.test_session_identifier_does_not_become_weekly_model_pool",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_absent_reset_is_not_fabricated",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_afternoon_reset_uses_pm",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_captured_weekly_reset_preserves_day_month_and_am",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_existing_24_hour_and_named_model_limits_remain_distinct",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_midnight_reset_is_hour_zero",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_noon_reset_is_hour_twelve",
+    "acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_session_identifier_does_not_become_weekly_model_pool",
+    "acceptance.fresh_quota.test_collection.Collection.test_changed_source_configuration_cannot_reuse_lane_cache",
+    "acceptance.fresh_quota.test_collection.Collection.test_child_cannot_supply_authoritative_timestamps",
+    "acceptance.fresh_quota.test_collection.Collection.test_deadline_reaps_probe_and_descendant",
+    "acceptance.fresh_quota.test_collection.Collection.test_deduplicated_lexical_lanes_keep_their_probe_start_times",
+    "acceptance.fresh_quota.test_collection.Collection.test_empty_lane_set_has_no_observation_io",
+    "acceptance.fresh_quota.test_collection.Collection.test_expired_success_followed_by_failed_refresh_never_reuses_old_record",
+    "acceptance.fresh_quota.test_collection.Collection.test_invalid_extra_or_failed_child_output_is_unknown",
+    "acceptance.fresh_quota.test_collection.Collection.test_invalid_lane_refuses_before_process_creation",
+    "acceptance.fresh_quota.test_collection.Collection.test_parent_never_calls_shared_sample_or_learner",
+    "acceptance.fresh_quota.test_collection.Collection.test_simultaneous_callers_share_one_inflight_lane_probe",
+    "acceptance.fresh_quota.test_collection.Collection.test_stdout_or_stderr_overflow_is_bounded_unknown",
+    "acceptance.fresh_quota.test_main_pty.MainDispatch.test_known_quota_reaches_main_next_call_exactly_once_mode_off",
+    "acceptance.fresh_quota.test_main_pty.MainDispatch.test_matching_provider_label_without_registered_source_proof_refuses",
+    "acceptance.fresh_quota.test_main_pty.MainDispatch.test_registered_cli_profile_with_wrong_actual_base_url_refuses",
+    "acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes",
+    "acceptance.fresh_quota.test_main_pty.PtyDispatch.test_available_continuation_checks_identity_and_writes_once",
+    "acceptance.fresh_quota.test_main_pty.PtyDispatch.test_quota_changed_after_route_still_prevents_physical_spawn",
+    "acceptance.fresh_quota.test_main_pty.PtyDispatch.test_reused_receipt_cannot_authorize_spent_brain_spawn",
+    "acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_continuation_bytes_even_mode_off",
+    "acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_runner_spawn_router_off",
+    "acceptance.fresh_quota.test_native.NativeObservation.test_observe_is_uncached_and_does_not_admit_spent",
+    "acceptance.fresh_quota.test_native.NativeObservation.test_snapshot_cache_cannot_exceed_thirty_seconds",
+    "acceptance.fresh_quota.test_native.NativeObservation.test_uncached_native_observation_uses_read_only_protocol",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_default_admission_keeps_rejecting_spent",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_invalid_window_stays_unknown_in_status_mode",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_status_can_display_valid_spent_windows_without_authorizing",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_status_does_not_invent_windows_for_explicit_spent",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_weekly_primary_is_one_weekly_window_without_invented_five_hour",
+    "acceptance.fresh_quota.test_native.NativeProjection.test_window_view_retains_fractional_raw_duration_and_unknown_reset",
+    "acceptance.fresh_quota.test_route_temporal.RouteTemporal.test_last_reresolve_delay_cannot_return_old_available_advice",
+    "acceptance.fresh_quota.test_route_temporal.RouteTemporal.test_scorer_delay_refreshes_before_resolution",
+    "acceptance.fresh_quota.test_selection.Selection.test_cached_scorer_answer_does_not_cache_available_quota",
+    "acceptance.fresh_quota.test_selection.Selection.test_cli_alias_survives_filter_and_native_oauth_does_not",
+    "acceptance.fresh_quota.test_teacher.TeacherDispatch.test_known_source_uses_exact_environment_and_resolved_actual_argv",
+    "acceptance.fresh_quota.test_teacher.TeacherDispatch.test_missing_teacher_executable_refuses_before_process",
+    "acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes"
+  ],
+  "failures": [
+    {
+      "test": "test_available_mode_off_checks_actual_client_identity (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_mode_off_checks_actual_client_identity)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 112, in test_available_mode_off_checks_actual_client_identity\n    self.assertEqual(len(self.hooks), 1)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\nAssertionError: 0 != 1\n"
+    },
+    {
+      "test": "test_deferred_async_first_anext_rechecks_after_quota_changes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_deferred_async_first_anext_rechecks_after_quota_changes)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 156, in test_deferred_async_first_anext_rechecks_after_quota_changes\n    self.assert_refused(lambda: asyncio.run(run()), 'quota_spent')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_deferred_sync_first_next_rechecks_after_quota_changes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_deferred_sync_first_next_rechecks_after_quota_changes)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 142, in test_deferred_sync_first_next_rechecks_after_quota_changes\n    self.assert_refused(lambda: next(stream), 'quota_spent')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_registered_hook_cannot_accept_unbound_client (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_hook_cannot_accept_unbound_client)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 126, in test_registered_hook_cannot_accept_unbound_client\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_registered_malformed_exception_or_duplicate_results_refuse (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_malformed_exception_or_duplicate_results_refuse) (result='[]')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 122, in test_registered_malformed_exception_or_duplicate_results_refuse\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_registered_malformed_exception_or_duplicate_results_refuse (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_malformed_exception_or_duplicate_results_refuse) (result='[{}]')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 122, in test_registered_malformed_exception_or_duplicate_results_refuse\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_registered_malformed_exception_or_duplicate_results_refuse (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_malformed_exception_or_duplicate_results_refuse) (result=\"[{'router': 'cortados-router', 'quota_stage': 'dispatch', 'quota': {'status': 'available', 'kind': 'subscription', 'lane': 'codex', 'pool': 'all', 'observed_at': 2000000000, 'age_s': 0, 'source': 'exam', 'reason': 'exam available'}}, {'router': 'cortados-router', 'quota_stage': 'dispatch', 'quota': {'status': 'available', 'kind': 'subscription', 'lane': 'codex', 'pool': 'all', 'observed_at': 2000000000, 'age_s': 0, 'source': 'exam', 'reason': 'exam available'}}]\")",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 122, in test_registered_malformed_exception_or_duplicate_results_refuse\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_registered_malformed_exception_or_duplicate_results_refuse (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_registered_malformed_exception_or_duplicate_results_refuse) (result=\"RuntimeError('fixture failure')\")",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 122, in test_registered_malformed_exception_or_duplicate_results_refuse\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_source_preflight_result_never_grants_actual_dispatch_permission (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_source_preflight_result_never_grants_actual_dispatch_permission)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 162, in test_source_preflight_result_never_grants_actual_dispatch_permission\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_async_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_async_in_both_router_modes) (required=False, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 105, in test_unknown_and_spent_refuse_async_in_both_router_modes\n    self.assert_refused(lambda: asyncio.run(self.adapter.required_asend(self.client, self.kwargs)), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_async_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_async_in_both_router_modes) (required=False, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 105, in test_unknown_and_spent_refuse_async_in_both_router_modes\n    self.assert_refused(lambda: asyncio.run(self.adapter.required_asend(self.client, self.kwargs)), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_async_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_async_in_both_router_modes) (required=True, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 105, in test_unknown_and_spent_refuse_async_in_both_router_modes\n    self.assert_refused(lambda: asyncio.run(self.adapter.required_asend(self.client, self.kwargs)), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_async_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_async_in_both_router_modes) (required=True, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 105, in test_unknown_and_spent_refuse_async_in_both_router_modes\n    self.assert_refused(lambda: asyncio.run(self.adapter.required_asend(self.client, self.kwargs)), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_sync_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_sync_in_both_router_modes) (required=False, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 91, in test_unknown_and_spent_refuse_sync_in_both_router_modes\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_sync_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_sync_in_both_router_modes) (required=False, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 91, in test_unknown_and_spent_refuse_sync_in_both_router_modes\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_sync_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_sync_in_both_router_modes) (required=True, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 91, in test_unknown_and_spent_refuse_sync_in_both_router_modes\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_refuse_sync_in_both_router_modes (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unknown_and_spent_refuse_sync_in_both_router_modes) (required=True, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 91, in test_unknown_and_spent_refuse_sync_in_both_router_modes\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_unproved_sdk_scope_does_not_become_configured_source_preflight (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_unproved_sdk_scope_does_not_become_configured_source_preflight)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 166, in test_unproved_sdk_scope_does_not_become_configured_source_preflight\n    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 79, in assert_refused\n    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AuxiliaryRoutingError not raised\n"
+    },
+    {
+      "test": "test_async_route_return_binds_actual_returned_wrapper (acceptance.fresh_quota.test_client_binding.ClientBinding.test_async_route_return_binds_actual_returned_wrapper)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 107, in test_async_route_return_binds_actual_returned_wrapper\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_exact_cli_source_preserves_client_and_marks_preflight (acceptance.fresh_quota.test_client_binding.ClientBinding.test_exact_cli_source_preserves_client_and_marks_preflight) (asynchronous=False)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 115, in test_exact_cli_source_preserves_client_and_marks_preflight\n    self.assertEqual(getattr(result, '_hermes_aux_quota_stage', None), 'source_preflight')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'source_preflight'\n"
+    },
+    {
+      "test": "test_exact_cli_source_preserves_client_and_marks_preflight (acceptance.fresh_quota.test_client_binding.ClientBinding.test_exact_cli_source_preserves_client_and_marks_preflight) (asynchronous=True)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 115, in test_exact_cli_source_preserves_client_and_marks_preflight\n    self.assertEqual(getattr(result, '_hermes_aux_quota_stage', None), 'source_preflight')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'source_preflight'\n"
+    },
+    {
+      "test": "test_explicit_client_return_gets_concrete_identity (acceptance.fresh_quota.test_client_binding.ClientBinding.test_explicit_client_return_gets_concrete_identity)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 70, in test_explicit_client_return_gets_concrete_identity\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_plain_async_constructor_preserves_effective_provider (acceptance.fresh_quota.test_client_binding.ClientBinding.test_plain_async_constructor_preserves_effective_provider)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 101, in test_plain_async_constructor_preserves_effective_provider\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_specialized_async_wrappers_keep_resolved_provider (acceptance.fresh_quota.test_client_binding.ClientBinding.test_specialized_async_wrappers_keep_resolved_provider) (wrapper='CodexAuxiliaryClient')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 94, in test_specialized_async_wrappers_keep_resolved_provider\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_specialized_async_wrappers_keep_resolved_provider (acceptance.fresh_quota.test_client_binding.ClientBinding.test_specialized_async_wrappers_keep_resolved_provider) (wrapper='AnthropicAuxiliaryClient')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 94, in test_specialized_async_wrappers_keep_resolved_provider\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_specialized_async_wrappers_keep_resolved_provider (acceptance.fresh_quota.test_client_binding.ClientBinding.test_specialized_async_wrappers_keep_resolved_provider) (wrapper='BedrockAuxiliaryClient')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_client_binding.py\", line 94, in test_specialized_async_wrappers_keep_resolved_provider\n    self.assertEqual(getattr(result, '_hermes_aux_effective_provider', None), 'codex-cli')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'codex-cli'\n"
+    },
+    {
+      "test": "test_afternoon_reset_uses_pm (acceptance.fresh_quota.test_codex_status.CodexStatus.test_afternoon_reset_uses_pm)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 71, in test_afternoon_reset_uses_pm\n    self.assert_clock('3:22 PM', '15:22')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-18 03:22' != '2026-10-22 15:22'\n- 2026-10-18 03:22\n?          ^^^^\n+ 2026-10-22 15:22\n?         +++ ^\n\n"
+    },
+    {
+      "test": "test_captured_weekly_reset_preserves_day_month_and_am (acceptance.fresh_quota.test_codex_status.CodexStatus.test_captured_weekly_reset_preserves_day_month_and_am)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 45, in test_captured_weekly_reset_preserves_day_month_and_am\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 03:22',\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                     'Codex reset must retain its reported calendar day after AM/PM')\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-18 03:22' != '2026-10-22 03:22'\n- 2026-10-18 03:22\n?         ^^\n+ 2026-10-22 03:22\n?         ^^\n : Codex reset must retain its reported calendar day after AM/PM\n"
+    },
+    {
+      "test": "test_midnight_reset_is_hour_zero (acceptance.fresh_quota.test_codex_status.CodexStatus.test_midnight_reset_is_hour_zero)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 65, in test_midnight_reset_is_hour_zero\n    self.assert_clock('12:05 AM', '00:05')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-17 12:05' != '2026-10-22 00:05'\n- 2026-10-17 12:05\n?         ----\n+ 2026-10-22 00:05\n?          ++++\n\n"
+    },
+    {
+      "test": "test_noon_reset_is_hour_twelve (acceptance.fresh_quota.test_codex_status.CodexStatus.test_noon_reset_is_hour_twelve)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 68, in test_noon_reset_is_hour_twelve\n    self.assert_clock('12:05 PM', '12:05')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-17 12:05' != '2026-10-22 12:05'\n- 2026-10-17 12:05\n?         ^^\n+ 2026-10-22 12:05\n?         ^^\n\n"
+    },
+    {
+      "test": "test_session_identifier_does_not_become_weekly_model_pool (acceptance.fresh_quota.test_codex_status.CodexStatus.test_session_identifier_does_not_become_weekly_model_pool)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 57, in test_session_identifier_does_not_become_weekly_model_pool\n    self.assertEqual(rows[0]['window'], 'week', 'session identity is not a metered model')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'week (11111111-1111-4111-8111-111111111111)' != 'week'\n- week (11111111-1111-4111-8111-111111111111)\n+ week\n : session identity is not a metered model\n"
+    },
+    {
+      "test": "test_afternoon_reset_uses_pm (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_afternoon_reset_uses_pm)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 71, in test_afternoon_reset_uses_pm\n    self.assert_clock('3:22 PM', '15:22')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-18 03:22' != '2026-10-22 15:22'\n- 2026-10-18 03:22\n?          ^^^^\n+ 2026-10-22 15:22\n?         +++ ^\n\n"
+    },
+    {
+      "test": "test_captured_weekly_reset_preserves_day_month_and_am (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_captured_weekly_reset_preserves_day_month_and_am)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 45, in test_captured_weekly_reset_preserves_day_month_and_am\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 03:22',\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                     'Codex reset must retain its reported calendar day after AM/PM')\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-18 03:22' != '2026-10-22 03:22'\n- 2026-10-18 03:22\n?         ^^\n+ 2026-10-22 03:22\n?         ^^\n : Codex reset must retain its reported calendar day after AM/PM\n"
+    },
+    {
+      "test": "test_midnight_reset_is_hour_zero (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_midnight_reset_is_hour_zero)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 65, in test_midnight_reset_is_hour_zero\n    self.assert_clock('12:05 AM', '00:05')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-17 12:05' != '2026-10-22 00:05'\n- 2026-10-17 12:05\n?         ----\n+ 2026-10-22 00:05\n?          ++++\n\n"
+    },
+    {
+      "test": "test_noon_reset_is_hour_twelve (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_noon_reset_is_hour_twelve)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 68, in test_noon_reset_is_hour_twelve\n    self.assert_clock('12:05 PM', '12:05')\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 62, in assert_clock\n    self.assertEqual(rows[0]['resets_at'], '2026-10-22 ' + expected)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: '2026-10-17 12:05' != '2026-10-22 12:05'\n- 2026-10-17 12:05\n?         ^^\n+ 2026-10-22 12:05\n?         ^^\n\n"
+    },
+    {
+      "test": "test_session_identifier_does_not_become_weekly_model_pool (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_session_identifier_does_not_become_weekly_model_pool)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py\", line 57, in test_session_identifier_does_not_become_weekly_model_pool\n    self.assertEqual(rows[0]['window'], 'week', 'session identity is not a metered model')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'week (11111111-1111-4111-8111-111111111111)' != 'week'\n- week (11111111-1111-4111-8111-111111111111)\n+ week\n : session identity is not a metered model\n"
+    },
+    {
+      "test": "test_known_quota_reaches_main_next_call_exactly_once_mode_off (acceptance.fresh_quota.test_main_pty.MainDispatch.test_known_quota_reaches_main_next_call_exactly_once_mode_off)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 40, in test_known_quota_reaches_main_next_call_exactly_once_mode_off\n    self.assertEqual([(r[0], r[1], r[2]) for r in self.calls()],\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                     [('source_preflight', 'codex-cli', 'gpt-6.1-sol')])\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: Lists differ: [] != [('source_preflight', 'codex-cli', 'gpt-6.1-sol')]\n\nSecond list contains 1 additional elements.\nFirst extra element 0:\n('source_preflight', 'codex-cli', 'gpt-6.1-sol')\n\n- []\n+ [('source_preflight', 'codex-cli', 'gpt-6.1-sol')]\n"
+    },
+    {
+      "test": "test_matching_provider_label_without_registered_source_proof_refuses (acceptance.fresh_quota.test_main_pty.MainDispatch.test_matching_provider_label_without_registered_source_proof_refuses)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 48, in test_matching_provider_label_without_registered_source_proof_refuses\n    self.assertEqual(getattr(result, 'reason', None), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: <Mock name='mock().reason' id='4479161008'> != 'quota_unknown'\n"
+    },
+    {
+      "test": "test_registered_cli_profile_with_wrong_actual_base_url_refuses (acceptance.fresh_quota.test_main_pty.MainDispatch.test_registered_cli_profile_with_wrong_actual_base_url_refuses)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 55, in test_registered_cli_profile_with_wrong_actual_base_url_refuses\n    self.assertEqual(getattr(result, 'reason', None), 'quota_unknown')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: <Mock name='mock().reason' id='4485274592'> != 'quota_unknown'\n"
+    },
+    {
+      "test": "test_unknown_and_spent_stop_main_next_call_in_both_modes (acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes) (mode=None, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 31, in test_unknown_and_spent_stop_main_next_call_in_both_modes\n    self.assertEqual(getattr(result, 'reason', None), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'quota_unknown'\n"
+    },
+    {
+      "test": "test_unknown_and_spent_stop_main_next_call_in_both_modes (acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes) (mode=None, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 31, in test_unknown_and_spent_stop_main_next_call_in_both_modes\n    self.assertEqual(getattr(result, 'reason', None), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'quota_spent'\n"
+    },
+    {
+      "test": "test_unknown_and_spent_stop_main_next_call_in_both_modes (acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes) (mode='cortados-router', status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 31, in test_unknown_and_spent_stop_main_next_call_in_both_modes\n    self.assertEqual(getattr(result, 'reason', None), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'quota_unknown'\n"
+    },
+    {
+      "test": "test_unknown_and_spent_stop_main_next_call_in_both_modes (acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes) (mode='cortados-router', status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 31, in test_unknown_and_spent_stop_main_next_call_in_both_modes\n    self.assertEqual(getattr(result, 'reason', None), 'quota_' + status)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'quota_spent'\n"
+    },
+    {
+      "test": "test_available_continuation_checks_identity_and_writes_once (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_available_continuation_checks_identity_and_writes_once)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 120, in test_available_continuation_checks_identity_and_writes_once\n    self.assertEqual([(r[0], r[1], r[2]) for r in self.calls()],\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                     [('dispatch', 'codex-cli', 'gpt-6.1-sol')])\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: Lists differ: [] != [('dispatch', 'codex-cli', 'gpt-6.1-sol')]\n\nSecond list contains 1 additional elements.\nFirst extra element 0:\n('dispatch', 'codex-cli', 'gpt-6.1-sol')\n\n- []\n+ [('dispatch', 'codex-cli', 'gpt-6.1-sol')]\n"
+    },
+    {
+      "test": "test_quota_changed_after_route_still_prevents_physical_spawn (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_quota_changed_after_route_still_prevents_physical_spawn)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 93, in test_quota_changed_after_route_still_prevents_physical_spawn\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_spent'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_reused_receipt_cannot_authorize_spent_brain_spawn (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_reused_receipt_cannot_authorize_spent_brain_spawn)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 83, in test_reused_receipt_cannot_authorize_spent_brain_spawn\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_spent'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_prevent_continuation_bytes_even_mode_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_continuation_bytes_even_mode_off) (status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 107, in test_unknown_and_spent_prevent_continuation_bytes_even_mode_off\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_prevent_continuation_bytes_even_mode_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_continuation_bytes_even_mode_off) (status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 107, in test_unknown_and_spent_prevent_continuation_bytes_even_mode_off\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_prevent_runner_spawn_router_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_runner_spawn_router_off) (status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 76, in test_unknown_and_spent_prevent_runner_spawn_router_off\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_prevent_runner_spawn_router_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_runner_spawn_router_off) (status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_main_pty.py\", line 76, in test_unknown_and_spent_prevent_runner_spawn_router_off\n    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised\n"
+    },
+    {
+      "test": "test_snapshot_cache_cannot_exceed_thirty_seconds (acceptance.fresh_quota.test_native.NativeObservation.test_snapshot_cache_cannot_exceed_thirty_seconds)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 94, in test_snapshot_cache_cannot_exceed_thirty_seconds\n    collect.assert_called_once()\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py\", line 965, in assert_called_once\n    raise AssertionError(msg)\nAssertionError: Expected '_collect' to have been called once. Called 0 times.\n"
+    },
+    {
+      "test": "test_weekly_primary_is_one_weekly_window_without_invented_five_hour (acceptance.fresh_quota.test_native.NativeProjection.test_weekly_primary_is_one_weekly_window_without_invented_five_hour)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 24, in test_weekly_primary_is_one_weekly_window_without_invented_five_hour\n    self.assertEqual(window['window'], 'week')\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'primary' != 'week'\n- primary\n+ week\n\n"
+    },
+    {
+      "test": "test_last_reresolve_delay_cannot_return_old_available_advice (acceptance.fresh_quota.test_route_temporal.RouteTemporal.test_last_reresolve_delay_cannot_return_old_available_advice)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_route_temporal.py\", line 70, in test_last_reresolve_delay_cannot_return_old_available_advice\n    self.expect_spent()\n    ~~~~~~~~~~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_route_temporal.py\", line 46, in expect_spent\n    with self.assertRaises(WorkerError) as failure:\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\nAssertionError: WorkerError not raised\n"
+    },
+    {
+      "test": "test_known_source_uses_exact_environment_and_resolved_actual_argv (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_known_source_uses_exact_environment_and_resolved_actual_argv) (enabled=False)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 78, in test_known_source_uses_exact_environment_and_resolved_actual_argv\n    canonicalize.assert_called_once()\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py\", line 965, in assert_called_once\n    raise AssertionError(msg)\nAssertionError: Expected 'auth_scope' to have been called once. Called 0 times.\n"
+    },
+    {
+      "test": "test_known_source_uses_exact_environment_and_resolved_actual_argv (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_known_source_uses_exact_environment_and_resolved_actual_argv) (enabled=True)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 78, in test_known_source_uses_exact_environment_and_resolved_actual_argv\n    canonicalize.assert_called_once()\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py\", line 965, in assert_called_once\n    raise AssertionError(msg)\nAssertionError: Expected 'auth_scope' to have been called once. Called 0 times.\n"
+    },
+    {
+      "test": "test_missing_teacher_executable_refuses_before_process (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_missing_teacher_executable_refuses_before_process)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 90, in test_missing_teacher_executable_refuses_before_process\n    with self.assertRaisesRegex(RuntimeError, 'quota_unknown'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RuntimeError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes) (enabled=False, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 61, in test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes\n    with self.assertRaisesRegex(RuntimeError, 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RuntimeError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes) (enabled=False, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 61, in test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes\n    with self.assertRaisesRegex(RuntimeError, 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RuntimeError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes) (enabled=True, status='unknown')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 61, in test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes\n    with self.assertRaisesRegex(RuntimeError, 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RuntimeError not raised\n"
+    },
+    {
+      "test": "test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes) (enabled=True, status='spent')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_teacher.py\", line 61, in test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes\n    with self.assertRaisesRegex(RuntimeError, 'quota_' + status):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RuntimeError not raised\n"
+    }
+  ],
+  "errors": [
+    {
+      "test": "test_absent_observation_refresh_failure_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_absent_observation_refresh_failure_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_configured_larger_age_cannot_relax_thirty_seconds (acceptance.fresh_quota.test_admission.Admission.test_configured_larger_age_cannot_relax_thirty_seconds)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_configured_lower_age_limit_remains_effective (acceptance.fresh_quota.test_admission.Admission.test_configured_lower_age_limit_remains_effective)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_declared_local_resource_has_no_actual_transport_proof (acceptance.fresh_quota.test_admission.Admission.test_declared_local_resource_has_no_actual_transport_proof)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_duplicate_lane_observations_are_integrity_failure (acceptance.fresh_quota.test_admission.Admission.test_duplicate_lane_observations_are_integrity_failure)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_exact_thirty_seconds_is_available_without_refresh (acceptance.fresh_quota.test_admission.Admission.test_exact_thirty_seconds_is_available_without_refresh)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_existing_spent_threshold_is_refusal (acceptance.fresh_quota.test_admission.Admission.test_existing_spent_threshold_is_refusal)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_expired_observation_can_be_replaced_by_actual_fresh_success (acceptance.fresh_quota.test_admission.Admission.test_expired_observation_can_be_replaced_by_actual_fresh_success)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_familiar_model_does_not_infer_unknown_provider (acceptance.fresh_quota.test_admission.Admission.test_familiar_model_does_not_infer_unknown_provider)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_fresh_envelope_cannot_hide_expired_window (acceptance.fresh_quota.test_admission.Admission.test_fresh_envelope_cannot_hide_expired_window)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_future_epoch_observation_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_future_epoch_observation_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_future_monotonic_observation_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_future_monotonic_observation_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_info_pool_is_not_subscription_admission (acceptance.fresh_quota.test_admission.Admission.test_info_pool_is_not_subscription_admission)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_invalid_duration_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_invalid_duration_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_invalid_used_percentage_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_invalid_used_percentage_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_local_name_without_declared_candidate_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_local_name_without_declared_candidate_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_missing_raw_reset_is_unknown_despite_display_string (acceptance.fresh_quota.test_admission.Admission.test_missing_raw_reset_is_unknown_despite_display_string)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_missing_subscription_windows_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_missing_subscription_windows_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_native_oauth_provider_cannot_borrow_cli_store_observation (acceptance.fresh_quota.test_admission.Admission.test_native_oauth_provider_cannot_borrow_cli_store_observation)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_observed_required_pool_authorizes_exact_provider (acceptance.fresh_quota.test_admission.Admission.test_observed_required_pool_authorizes_exact_provider)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_old_monotonic_record_cannot_hide_behind_fresh_epoch (acceptance.fresh_quota.test_admission.Admission.test_old_monotonic_record_cannot_hide_behind_fresh_epoch)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_over_thirty_seconds_cannot_authorize_after_failed_refresh (acceptance.fresh_quota.test_admission.Admission.test_over_thirty_seconds_cannot_authorize_after_failed_refresh)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_reset_beyond_original_window_is_unknown (acceptance.fresh_quota.test_admission.Admission.test_reset_beyond_original_window_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_scope_mismatch_cannot_authorize_matching_provider_and_model (acceptance.fresh_quota.test_admission.Admission.test_scope_mismatch_cannot_authorize_matching_provider_and_model)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_scope_shape_cannot_contain_unrecognized_fields (acceptance.fresh_quota.test_admission.Admission.test_scope_shape_cannot_contain_unrecognized_fields)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_source_failure_cannot_authorize_even_with_old_record (acceptance.fresh_quota.test_admission.Admission.test_source_failure_cannot_authorize_even_with_old_record)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_unproven_scope_cannot_authorize_known_quota (acceptance.fresh_quota.test_admission.Admission.test_unproven_scope_cannot_authorize_known_quota)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_unrelated_pool_does_not_authorize_required_model_pool (acceptance.fresh_quota.test_admission.Admission.test_unrelated_pool_does_not_authorize_required_model_pool)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_allowed_routes_excludes_mismatched_scope_before_resolution (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_allowed_routes_excludes_mismatched_scope_before_resolution)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_current_resources_reads_costs_once_and_collects_requested_lanes (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_current_resources_reads_costs_once_and_collects_requested_lanes)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_missing_lane_is_explicitly_unavailable (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_missing_lane_is_explicitly_unavailable)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_mutating_observation_or_cost_map_cannot_change_snapshot (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_mutating_observation_or_cost_map_cannot_change_snapshot)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_resources_and_supplied_empty_costs_never_read_live_files (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_resources_and_supplied_empty_costs_never_read_live_files)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_resources_frozen_instant_checks_both_lanes_independently (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_resources_frozen_instant_checks_both_lanes_independently)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_unknown_learned_cost_preserves_known_quota (acceptance.fresh_quota.test_admission.ResourceSnapshot.test_unknown_learned_cost_preserves_known_quota)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_claude_injected_token_or_key_cannot_claim_file_store_scope (acceptance.fresh_quota.test_auth_scope.AuthScope.test_claude_injected_token_or_key_cannot_claim_file_store_scope)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_codex_alternate_auth_or_base_url_is_unproven_without_secret_echo (acceptance.fresh_quota.test_auth_scope.AuthScope.test_codex_alternate_auth_or_base_url_is_unproven_without_secret_echo)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_cursor_override_store_cannot_match_observed_file_store (acceptance.fresh_quota.test_auth_scope.AuthScope.test_cursor_override_store_cannot_match_observed_file_store)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_effective_home_or_codex_home_changes_scope (acceptance.fresh_quota.test_auth_scope.AuthScope.test_effective_home_or_codex_home_changes_scope)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_identical_cli_source_is_stable_and_contains_no_raw_paths (acceptance.fresh_quota.test_auth_scope.AuthScope.test_identical_cli_source_is_stable_and_contains_no_raw_paths)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_local_table_name_cannot_create_transport_scope (acceptance.fresh_quota.test_auth_scope.AuthScope.test_local_table_name_cannot_create_transport_scope)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_metadata_app_server_argv_is_not_public_dispatch_proof (acceptance.fresh_quota.test_auth_scope.AuthScope.test_metadata_app_server_argv_is_not_public_dispatch_proof)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_native_oauth_never_borrows_native_cli_scope (acceptance.fresh_quota.test_auth_scope.AuthScope.test_native_oauth_never_borrows_native_cli_scope)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_nonstrict_codex_config_is_unproven (acceptance.fresh_quota.test_auth_scope.AuthScope.test_nonstrict_codex_config_is_unproven)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_resolved_binary_identity_is_bound (acceptance.fresh_quota.test_auth_scope.AuthScope.test_resolved_binary_identity_is_bound)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_scope_hash_uses_exact_nonsecret_descriptor (acceptance.fresh_quota.test_auth_scope.AuthScope.test_scope_hash_uses_exact_nonsecret_descriptor)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport) (client='CliBrainClient', runtime='codex')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 196, in test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport\n    self.assert_refused(enter_dispatch, 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 80, in assert_refused\n    callback()\n    ~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 194, in enter_dispatch\n    with self.adapter._dispatch(client, self.kwargs):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 305, in helper\n    return _GeneratorContextManager(func, args, kwds)\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 109, in __init__\n    self.gen = func(*args, **kwds)\n               ~~~~^^^^^^^^^^^^^^^\nTypeError: _dispatch() takes 1 positional argument but 2 were given\n"
+    },
+    {
+      "test": "test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport) (client='CliBrainClient', runtime='claude')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 196, in test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport\n    self.assert_refused(enter_dispatch, 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 80, in assert_refused\n    callback()\n    ~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 194, in enter_dispatch\n    with self.adapter._dispatch(client, self.kwargs):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 305, in helper\n    return _GeneratorContextManager(func, args, kwds)\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 109, in __init__\n    self.gen = func(*args, **kwds)\n               ~~~~^^^^^^^^^^^^^^^\nTypeError: _dispatch() takes 1 positional argument but 2 were given\n"
+    },
+    {
+      "test": "test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport) (client='CliBrainClient', runtime='codex')",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 196, in test_cli_source_mark_cannot_be_forged_or_survive_replaced_transport\n    self.assert_refused(enter_dispatch, 'quota_unknown')\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 80, in assert_refused\n    callback()\n    ~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 194, in enter_dispatch\n    with self.adapter._dispatch(client, self.kwargs):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 305, in helper\n    return _GeneratorContextManager(func, args, kwds)\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 109, in __init__\n    self.gen = func(*args, **kwds)\n               ~~~~^^^^^^^^^^^^^^^\nTypeError: _dispatch() takes 1 positional argument but 2 were given\n"
+    },
+    {
+      "test": "test_exact_cli_source_transport_gets_source_preflight (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_exact_cli_source_transport_gets_source_preflight)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py\", line 176, in test_exact_cli_source_transport_gets_source_preflight\n    with self.adapter._dispatch(client, self.kwargs):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 305, in helper\n    return _GeneratorContextManager(func, args, kwds)\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py\", line 109, in __init__\n    self.gen = func(*args, **kwds)\n               ~~~~^^^^^^^^^^^^^^^\nTypeError: _dispatch() takes 1 positional argument but 2 were given\n"
+    },
+    {
+      "test": "test_changed_source_configuration_cannot_reuse_lane_cache (acceptance.fresh_quota.test_collection.Collection.test_changed_source_configuration_cannot_reuse_lane_cache)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_child_cannot_supply_authoritative_timestamps (acceptance.fresh_quota.test_collection.Collection.test_child_cannot_supply_authoritative_timestamps)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_deadline_reaps_probe_and_descendant (acceptance.fresh_quota.test_collection.Collection.test_deadline_reaps_probe_and_descendant)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_deduplicated_lexical_lanes_keep_their_probe_start_times (acceptance.fresh_quota.test_collection.Collection.test_deduplicated_lexical_lanes_keep_their_probe_start_times)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_empty_lane_set_has_no_observation_io (acceptance.fresh_quota.test_collection.Collection.test_empty_lane_set_has_no_observation_io)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_expired_success_followed_by_failed_refresh_never_reuses_old_record (acceptance.fresh_quota.test_collection.Collection.test_expired_success_followed_by_failed_refresh_never_reuses_old_record)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_invalid_extra_or_failed_child_output_is_unknown (acceptance.fresh_quota.test_collection.Collection.test_invalid_extra_or_failed_child_output_is_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_invalid_lane_refuses_before_process_creation (acceptance.fresh_quota.test_collection.Collection.test_invalid_lane_refuses_before_process_creation)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_parent_never_calls_shared_sample_or_learner (acceptance.fresh_quota.test_collection.Collection.test_parent_never_calls_shared_sample_or_learner)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_simultaneous_callers_share_one_inflight_lane_probe (acceptance.fresh_quota.test_collection.Collection.test_simultaneous_callers_share_one_inflight_lane_probe)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_stdout_or_stderr_overflow_is_bounded_unknown (acceptance.fresh_quota.test_collection.Collection.test_stdout_or_stderr_overflow_is_bounded_unknown)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 41, in setUp\n    from cortados_router import quota_observations\nImportError: cannot import name 'quota_observations' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_observe_is_uncached_and_does_not_admit_spent (acceptance.fresh_quota.test_native.NativeObservation.test_observe_is_uncached_and_does_not_admit_spent)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 77, in test_observe_is_uncached_and_does_not_admit_spent\n    first = self.reader.observe()\n            ^^^^^^^^^^^^^^^^^^^\nAttributeError: 'NativeMetadata' object has no attribute 'observe'\n"
+    },
+    {
+      "test": "test_uncached_native_observation_uses_read_only_protocol (acceptance.fresh_quota.test_native.NativeObservation.test_uncached_native_observation_uses_read_only_protocol)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 99, in test_uncached_native_observation_uses_read_only_protocol\n    reader.observe()\n    ^^^^^^^^^^^^^^\nAttributeError: 'NativeMetadata' object has no attribute 'observe'\n"
+    },
+    {
+      "test": "test_invalid_window_stays_unknown_in_status_mode (acceptance.fresh_quota.test_native.NativeProjection.test_invalid_window_stays_unknown_in_status_mode)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 54, in test_invalid_window_stays_unknown_in_status_mode\n    scarcity_codex_native.project(self.raw, now=self.now, admission=False)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: project() got an unexpected keyword argument 'admission'\n"
+    },
+    {
+      "test": "test_status_can_display_valid_spent_windows_without_authorizing (acceptance.fresh_quota.test_native.NativeProjection.test_status_can_display_valid_spent_windows_without_authorizing)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 39, in test_status_can_display_valid_spent_windows_without_authorizing\n    record = scarcity_codex_native.project(self.raw, now=self.now, admission=False)\nTypeError: project() got an unexpected keyword argument 'admission'\n"
+    },
+    {
+      "test": "test_status_does_not_invent_windows_for_explicit_spent (acceptance.fresh_quota.test_native.NativeProjection.test_status_does_not_invent_windows_for_explicit_spent)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 47, in test_status_does_not_invent_windows_for_explicit_spent\n    record = scarcity_codex_native.project(self.raw, now=self.now, admission=False)\nTypeError: project() got an unexpected keyword argument 'admission'\n"
+    },
+    {
+      "test": "test_window_view_retains_fractional_raw_duration_and_unknown_reset (acceptance.fresh_quota.test_native.NativeProjection.test_window_view_retains_fractional_raw_duration_and_unknown_reset)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_native.py\", line 60, in test_window_view_retains_fractional_raw_duration_and_unknown_reset\n    self.assertEqual(row['window_s'], 3600.5)\n                     ~~~^^^^^^^^^^^^\nKeyError: 'window_s'\n"
+    },
+    {
+      "test": "test_cached_scorer_answer_does_not_cache_available_quota (acceptance.fresh_quota.test_selection.Selection.test_cached_scorer_answer_does_not_cache_available_quota)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_selection.py\", line 15, in setUp\n    super().setUp()\n    ~~~~~~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    },
+    {
+      "test": "test_cli_alias_survives_filter_and_native_oauth_does_not (acceptance.fresh_quota.test_selection.Selection.test_cli_alias_survives_filter_and_native_oauth_does_not)",
+      "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_selection.py\", line 15, in setUp\n    super().setUp()\n    ~~~~~~~~~~~~~^^\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/support.py\", line 66, in setUp\n    from cortados_router import quota_admission, quota_observations\nImportError: cannot import name 'quota_admission' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)\n"
+    }
+  ],
+  "skips": [],
+  "state": "prebuild; missing implementations and old behavior are expected red"
+}
