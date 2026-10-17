@@ -3,10 +3,13 @@
 # DEPENDS: Public MCP fixture jobs; standard SQLite transactions and filesystem fault injection.
 # CEILING: Synthetic teacher assertions and fixtures are not hand-labelled routing quality.
 import copy
+from contextlib import redirect_stdout
 import fcntl
 import importlib
+import io
 import json
 import sqlite3
+import sys
 from unittest.mock import patch
 
 from .support import WorkerCase, SECTION, canonical, digest, evidence, feedback, jobs, rows, scorer
@@ -116,7 +119,11 @@ class Collection(WorkerCase):
             self.assertEqual((self.data / "mcp-observations.jsonl").read_bytes(), old_projection)
             review = feedback(terminal["job"]["job_id"])
             await self.call(client, "job_feedback", review)
-            self.assertEqual(self.collect()["added"], 1)
+            collected = self.collect()
+            self.assertEqual(collected["added"], 1)
+            self.assertEqual(collected["status"], "ok", "superseded history is not source degradation")
+            expected_diagnostic = {"component": "mcp_learning", "code": "superseded", "source": None, "id": first["id"]}
+            self.assertEqual(collected["diagnostics"], [expected_diagnostic], "each excluded old revision must be observable exactly once")
             self.assertTrue((self.data / "requests.jsonl").read_bytes().startswith(old_requests))
             current = self.observations()[0]
             self.assertEqual(current["planner_verdict"], "accepted")
@@ -132,6 +139,24 @@ class Collection(WorkerCase):
             material = {key: current[key] for key in ("job_id", "learning_text", "native_outcome", "reason", "worker", "usage", "elapsed_ms", "feedback")}
             self.assertEqual(current["observation_digest"], digest(canonical(material)))
             self.assertEqual(second["id"], "mcp." + current["job_id"] + "." + current["observation_digest"])
+            current_bytes = {name: (self.data / name).read_bytes() for name in ("requests.jsonl", "mcp-observations.jsonl")}
+            output = io.StringIO()
+            with redirect_stdout(output):
+                repeated = self.collect()
+            self.assertEqual(output.getvalue(), "", "collection helper returns its receipt without separately printing it")
+            self.assertEqual(repeated["status"], "ok")
+            self.assertEqual(repeated["added"], 0)
+            self.assertEqual(repeated["diagnostics"], [expected_diagnostic], "unchanged scans must still disclose historical exclusions once")
+            for name, value in current_bytes.items():
+                self.assertEqual((self.data / name).read_bytes(), value)
+            from .pipeline_support import pipeline
+            with pipeline("dataset", self.data) as (module, _), patch.object(sys, "argv", ["dataset.py", "--mcp-state-dir", str(self.state)]):
+                module.SHEET = self.data / "absent-sheet.csv"
+                module.ROUTER_DB = self.data / "absent-hermes.db"
+                with redirect_stdout(output):
+                    module.main()
+            receipts = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+            self.assertEqual(receipts, [repeated], "dataset prints the complete collection receipt exactly once")
 
     async def test_l07_lock_corruption_and_missing_sources_keep_published_evidence(self):
         async with self.session() as client:

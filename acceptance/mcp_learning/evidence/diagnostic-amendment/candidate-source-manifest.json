@@ -1,0 +1,28 @@
+{
+  "base_commit": "26773c597d505524f626d9be737e80f128b68278",
+  "candidate_source_sha256": {
+    "cortados_router/learning_data.py": "28a766b721b7c36863ef34c92c50c5b64f8423f97cd1271dbb8efc20906f63ee",
+    "cortados_router/learning_source.py": "e03a75b76992a973496bdbf14a18febe2e4012222fce513355bde6bea2bb8c66",
+    "cortados_router/route_task.py": "abf4dc13bb549ea4154a509500f434217a9ca8b49f85a59995868170aa2bd504",
+    "cortados_router/task_evidence.py": "f25082f9d4065a57cf244e5705709ebbf16b5afcb7a510feb6744d7eab8be788",
+    "integrations/mcp/broker.py": "afccb68597afa01083761a555ced00c0621ec32e19352d0dec0f5fe9e2a23697",
+    "integrations/mcp/job_store.py": "07fb691f9916c47da9c42e460e0a0d7631c764bda4c1d5a90f3882b0103d3312",
+    "integrations/mcp/schemas.py": "bd1cdfc0e84a18b960a3efe9a60f06c389e5cf93e3b165e9a8fe38980b22594a",
+    "integrations/mcp/server.py": "dcfbce0873b6e01345e7488bf079c55387fbc68ae8a85b19c1005e733adc6c31",
+    "s1/build_sft.py": "644982991dc8164f99500c755b4fd41cbed8407fee511e0eb9beb86e6a8d433f",
+    "s1/common.py": "0262b42e7ee046ed2dfc3ad6168336d726d3dd68b24c4a7aeaade48ba76ec8ad",
+    "s1/dataset.py": "a7a96d51c983d182f6f0a9df527237470bdb8b311243715c07559c9f69faeb44",
+    "s1/evaluate.py": "7db8ccc54fc14245d30593b34c42947c9c0d637eab4ab70391e15576055a9550",
+    "s1/label.py": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c"
+  },
+  "test": "acceptance.mcp_learning.test_learning.Collection.test_l07_late_feedback_appends_revision_preserves_prefix_and_selects_latest",
+  "command": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest acceptance.mcp_learning.test_learning.Collection.test_l07_late_feedback_appends_revision_preserves_prefix_and_selects_latest -v",
+  "pre_fix_result": {
+    "tests": 1,
+    "passed": 0,
+    "failed": 0,
+    "errors": 1,
+    "skipped": 0
+  },
+  "reason": "Missing superseded collection receipt diagnostic; no production edit made by exam owner."
+}

@@ -77,3 +77,14 @@ full accumulated suite, performance/query evidence, installed-wheel checks and s
 activation. Root's inventory must retain the original 331 cases, add these 31 and all
 builder regressions, and run the actual shared 7 nightly/9 overnight cases. The full
 shared CortadOS suite is outside this standalone package and is not claimed green.
+
+The diagnostic amendment closes a contradiction discovered on the first implementation
+candidate: the contract required every eligibility exclusion to be observable, while
+its Diagnostic enum omitted the already-defined `superseded` exclusion. The enum now
+includes it, with source=null and successful collection status unchanged. The existing
+late-feedback case is strengthened without removing any assertion: one diagnostic for
+the old revision on each scan, no duplicate revisions or rewritten evidence, a silent
+collection helper and one printed dataset receipt. Case counts remain 31 overall and
+28 in the main phase. `evidence/diagnostic-amendment/` records the exact dirty candidate
+source hashes and the focused pre-fix result: one error, zero pass/fail/skip, caused by
+the absent diagnostic. No production source is part of this exam-owner correction.

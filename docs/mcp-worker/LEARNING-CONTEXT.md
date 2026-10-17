@@ -225,7 +225,9 @@ Both arguments are absolute filesystem paths (str or pathlib.Path); data_dir is 
 [FIXED] It MUST return `{status:"ok"|"degraded",added:int>=0,observations:int>=0,diagnostics:Diagnostic[]}`. (AC-L06/07)
 Diagnostic is `{component:"mcp_learning",code:string,source:string|null,id:string|null}`.
 The code vocabulary is mcp_source_unavailable, mcp_collection_busy, mcp_source_invalid,
-scoring_digest_mismatch, scoring_context_too_large or split_conflict; source is an absolute DB path or null.
+scoring_digest_mismatch, scoring_context_too_large, split_conflict or superseded; source is an absolute DB path or null.
+[FIXED] A superseded diagnostic MUST use source=null and identify the excluded historical request revision. (AC-L07)
+[FIXED] This expected historical exclusion MUST NOT change a successful collection status from ok. (AC-L07)
 No row text belongs in diagnostics; storage publication errors return degraded with mcp_source_invalid.
 [FIXED] It MUST return added=0 for a failure before request publication. (AC-L07)
 [FIXED] Its learning_source reader MUST open `state_dir/jobs.db` and `state_dir/router/router.db` with SQLite mode=ro using explicit read transactions. (AC-L06)
@@ -374,7 +376,9 @@ A cache based only on row IDs cannot prove a richer-context comparison.
 | Recovery | Feedback crash before commit yields no row; crash after commit replays receipt; projection crash leaves old/new complete file; AC-L05/07. |
 | Corruption/containment | Source malformed row prevents new snapshot; prior provenance retained; foreground worker unaffected; AC-L07. |
 
-[FIXED] Any eligibility exclusion MUST emit one structured diagnostic with row ID and reason per collection. (AC-L07)
+[FIXED] Any eligibility exclusion MUST appear once with row ID and reason in the collection receipt diagnostics. (AC-L07)
+[FIXED] The dataset invocation MUST print that collection receipt once. (AC-L07)
+[FIXED] collect_mcp MUST NOT print that receipt separately. (AC-L07)
 [FIXED] Unknown or corrupt source state MUST NOT be silently replaced by successful outcome data. (AC-L06/07)
 [FIXED] New numeric tuning values MUST state units, reason and both too-small/too-large effects beside definitions. (AC-L10)
 
