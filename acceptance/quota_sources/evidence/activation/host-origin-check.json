@@ -1,0 +1,8 @@
+{
+  "python": "3.12.13",
+  "adapter": "/Users/velox/cortados/plugins/cortados-router/quota_policy.py",
+  "owner": "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_admission.py",
+  "has_prepare_actual": true,
+  "has_check_actual": true,
+  "model_calls": 0
+}

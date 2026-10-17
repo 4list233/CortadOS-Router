@@ -1,0 +1,35 @@
+{
+  "verified_at": 1792271165.789522,
+  "live_files": 9,
+  "backup_hashes": 9,
+  "installed_release_exact": true,
+  "protected_current_and_schedule_unchanged": true,
+  "new_broker_identity_verified": {
+    "pid": 31976,
+    "pgid": 31976,
+    "creation_time_us": 1792271059578499
+  },
+  "old_broker_identity_absent": true,
+  "claude_mcp_command_verified": true,
+  "claude_other_current_changes": [
+    "/fullscreenBootPending"
+  ],
+  "claude_operator_immediate_only_command_delta": "Only cortados-workers command replaced",
+  "mcp_config_unchanged": true,
+  "job_records_identical": 3,
+  "feedback_records_identical": 2,
+  "live_host_owner": "verified independently through live Hermes Python3.12.13, prepare_actual/check_actual present",
+  "provider_calls": 0,
+  "model_calls": 0,
+  "gateway_health": {
+    "expected_enabled": 12,
+    "connected": 12,
+    "scheduled_units_loaded": true,
+    "s1_healthy": true,
+    "root_report_sha256": "c32b17d9053157b1e51024a8bf3a2d7ec39d43f235c37a2b152151bc8325e941"
+  },
+  "pass_so_far": true,
+  "pass": true,
+  "scope": "Common/Cursor006 activation; Claude/Agy remain unknown; Air actual SSH authentication remains unverified.",
+  "claude_app_state_caveat": "Operator verified exactly the intended command change at replacement. A later fullscreenBootPending difference is unattributed; concurrent app state preserved, no present whole-file-equality claim."
+}

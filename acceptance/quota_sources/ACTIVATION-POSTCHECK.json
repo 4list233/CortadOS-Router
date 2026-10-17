@@ -1,0 +1,20 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "reviewer": "/root/quota_evaluation_qa",
+  "post_activation": "PASS with recorded app-state caveat",
+  "product_B": 0,
+  "tests_repeated": false,
+  "reason": "Production source unchanged from reviewed candidate; identity/state/health verification only.",
+  "files": {
+    "acceptance/quota_sources/evidence/activation/qa-activation-postcheck.json": "7bf81202f25675b35cabec7ab59c5eeb5482a04cd148a7b74659ba00e5f10a48",
+    "acceptance/quota_sources/evidence/activation/mcp-activation/report.json": "9a1b93df62af715672d4619481b051bb3248bcf8f6e4d3444d9f122c4008c883",
+    "acceptance/quota_sources/evidence/activation/host-origin-check.json": "14f47b3a489c403d77be094b06df6585e002d6c9bc96bf842868d3a6866ae6a8",
+    "acceptance/quota_sources/evidence/activation/post-activation-health.json": "c32b17d9053157b1e51024a8bf3a2d7ec39d43f235c37a2b152151bc8325e941",
+    "acceptance/quota_sources/evidence/activation/gateway-roster-precheck.json": "2d56e360997f071783e3ae1d8a7938240fd5fd410bdc7f74020feac8ed52de19",
+    "acceptance/quota_sources/evidence/activation/gateway-restart.log": "72a3449586d95f289c1a8d97ae8df4a73c6216810e0f0af95d6461a8a0ad73cd"
+  },
+  "provider_calls": 0,
+  "model_calls": 0,
+  "limitations": "Common/Cursor006 activation; Claude/Agy remain unknown; Air actual SSH authentication remains unverified.",
+  "claude_app_state_caveat": "Operator verified exactly the intended command change at replacement. A later fullscreenBootPending difference is unattributed; concurrent app state preserved, no present whole-file-equality claim."
+}

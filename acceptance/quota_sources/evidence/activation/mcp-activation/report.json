@@ -1,0 +1,29 @@
+{
+  "old_identity": {
+    "pid": 184,
+    "pgid": 184,
+    "creation_time_us": 1792261366351446
+  },
+  "new": {
+    "argv": [
+      "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/bin/python",
+      "-B",
+      "-m",
+      "integrations.mcp",
+      "--broker",
+      "--config",
+      "/Users/velox/.config/cortados-workers/config.json"
+    ],
+    "pid": 31976,
+    "identity": {
+      "pid": 31976,
+      "pgid": 31976,
+      "creation_time_us": 1792271059578499
+    }
+  },
+  "prior_records_unchanged": true,
+  "module_origin": "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/integrations/mcp/broker.py",
+  "config_sha256": "41b579779ad64ada69c8d31ef70090fbac5a6ca5b9fdffe4e1a6c30ee85ade82",
+  "claude_change": "Only cortados-workers command replaced",
+  "completed_at": 1792271059.89991
+}

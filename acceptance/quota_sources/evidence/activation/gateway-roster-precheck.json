@@ -1,0 +1,75 @@
+{
+  "profiles": [
+    {
+      "face": "alex",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "donna",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "elon",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "gary",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "harvey",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "jessica",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "marc",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "rachel",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "rc28",
+      "config_unchanged": true,
+      "expected_enabled": false
+    },
+    {
+      "face": "robert-zane",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "samantha",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "sheryl",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "tim-cook",
+      "config_unchanged": true,
+      "expected_enabled": true
+    },
+    {
+      "face": "salivan-build",
+      "config_unchanged": true,
+      "expected_enabled": false
+    }
+  ],
+  "enabled_expected": 12
+}

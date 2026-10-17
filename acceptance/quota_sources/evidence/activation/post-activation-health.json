@@ -1,0 +1,31 @@
+{
+  "observed_at": 1792271135.5592399,
+  "gateway_restart_output": "gateway restarted at 17:04:06: 12 faces reconnected \u00b7 supervised by launchd (PID 31757)",
+  "expected_enabled": 12,
+  "connected": 12,
+  "launchd_units": {
+    "ai.hermes.gateway-866ce901": {
+      "loaded": true,
+      "state": "state = running"
+    },
+    "com.cortados.route-crons": {
+      "loaded": true,
+      "state": "state = not running"
+    },
+    "com.cortados.burndown": {
+      "loaded": true,
+      "state": "state = not running"
+    },
+    "com.cortados.router-nightly": {
+      "loaded": true,
+      "state": "state = not running"
+    }
+  },
+  "s1_health": {
+    "ok": true,
+    "model": "s1 2026-10-16 05:40 (2026-10-16-0130)"
+  },
+  "mcp_connected": true,
+  "mcp_release": "quota-sources-v1-20261017",
+  "air_actual_auth_unverified": true
+}
