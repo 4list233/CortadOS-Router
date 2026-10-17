@@ -29,19 +29,25 @@ STALE_PROBE_AGE_S = 600
 # Executable names the vendor CLIs and their helpers run under; lsof matches these as name prefixes.
 PROBE_COMMANDS = ("claude", "agy", "cursor-agent", "codex", "node")
 
-_active: dict[int, tuple[int, Path | None, Path]] = {}      # child pid -> (pty fd, probe folder, probe root)
+_active: dict = {}      # child pid -> (pty fd, probe folder, probe root)
 _active_lock = threading.Lock()
 
 
 def track(pid: int, fd: int, my_dir: Path | None, probe_dir: Path) -> None:
     """Record a running probe so a process exit mid-probe still reaps it."""
+    from integrations.mcp.native_process import ProcessTracker, process_identity
+    identity = process_identity(pid)
+    if identity is None:
+        raise RuntimeError('Probe process identity is unavailable')
+    tracker = ProcessTracker(identity)
+    tracker.sample()
     with _active_lock:
-        _active[pid] = (fd, my_dir, probe_dir)
+        _active[pid] = (fd, my_dir, probe_dir, tracker)
 
 
 def untrack(pid: int) -> None:
     with _active_lock:
-        _active.pop(pid, None)
+        return _active.pop(pid, None)
 
 
 def _reap_active() -> None:
@@ -49,7 +55,9 @@ def _reap_active() -> None:
     with _active_lock:
         pending = list(_active.items())
         _active.clear()
-    for pid, (fd, my_dir, probe_dir) in pending:
+    for pid, (fd, my_dir, probe_dir, tracker) in pending:
+        with _active_lock:
+            _active[pid] = (fd, my_dir, probe_dir, tracker)
         reap(pid, fd, probe_dir, my_dir)
 
 
@@ -98,27 +106,34 @@ def _inside(path: str, folder: Path) -> bool:
     return path == folder_s or path.startswith(folder_s + os.sep)
 
 
+def sample(pid):
+    with _active_lock:
+        entry = _active.get(pid)
+    if entry:
+        entry[3].sample()
+        if entry[3].lost_ownership:
+            raise RuntimeError('Probe process ownership is unavailable')
+
+
 def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None:
-    """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder. 2026-09-26: the old killpg left 437 orphaned
-    claude/agy/cursor/codex helpers (load 63, gateway liveness kills). Order matters on macOS: close the PTY master before waiting."""
-    untrack(pid)
-    tree = descendants(pid)
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        for p in [pid, *tree]:
-            try:
-                os.kill(p, sig)
-            except OSError:
-                pass
+    """Contain tracked identities only; stale-folder inventory is a separate diagnostic."""
+    entry = untrack(pid)
+    if entry is None:
+        raise RuntimeError('Probe process ownership is unavailable')
+    tracker = entry[3]
+    try:
+        tracker.signal_groups(signal.SIGTERM)
+        # Existing diagnostic cleanup grace (seconds): shorter races exit;
+        # longer retains a refusing CLI. Admission children use configured bounds.
+        deadline = time.monotonic() + 1.5
+        while tracker.remaining() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        tracker.signal_groups(signal.SIGKILL)
+    finally:
         try:
-            os.killpg(pid, sig)
+            os.close(fd)
         except OSError:
             pass
-        if sig == signal.SIGTERM:
-            time.sleep(1.5)
-    try:
-        os.close(fd)
-    except OSError:
-        pass
     for _ in range(30):
         try:
             if os.waitpid(pid, os.WNOHANG)[0]:
@@ -126,12 +141,8 @@ def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None
         except ChildProcessError:
             break
         time.sleep(0.1)
-    for p in probe_cwd_pids(probe_dir, my_dir):     # this probe's own leftovers only (2026-09-28: a shared folder let concurrent probes kill each other → EIO)
-        if p != os.getpid():
-            try:
-                os.kill(p, signal.SIGKILL)
-            except OSError:
-                pass
+    if not tracker.contained():
+        raise RuntimeError('Probe process containment could not be proven')
 
 
 def sweep_stale(probe_dir: Path, max_age_s: float = STALE_PROBE_AGE_S, now: float | None = None) -> dict[str, int]:
@@ -139,7 +150,7 @@ def sweep_stale(probe_dir: Path, max_age_s: float = STALE_PROBE_AGE_S, now: floa
     Called under the scarcity sampler's cross-process lock, so no other sampler is starting probes meanwhile."""
     now = time.time() if now is None else now
     with _active_lock:
-        mine = {d for _, d, _ in _active.values() if d is not None}
+        mine = {d for _, d, _, _ in _active.values() if d is not None}
     stale = []
     for folder in probe_dir.glob("p*"):
         try:

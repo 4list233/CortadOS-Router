@@ -18,4 +18,5 @@ packages = ["cortados_router", "integrations", "integrations.hermes", "integrati
 include-package-data = false
 
 [tool.setuptools.package-data]
+cortados_router = ["cursor_quota.cjs"]
 tables = ["*.json", "inventory/*.txt", "benchmarks/*.json", "benchmarks/*.csv", "benchmarks/*.txt", "community/*.jsonl"]

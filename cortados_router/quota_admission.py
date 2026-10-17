@@ -81,9 +81,9 @@ def auth_scope(provider, *, environment, executable, config, argv=()):
     return _source_scope(lane, environment, executable, config)
 
 
-def _valid_scope(scope, lane):
+def _valid_scope(scope, lane, *, native=False):
     return (isinstance(scope, dict) and set(scope) == {'kind', 'lane', 'scope_id'} and
-            scope['kind'] == 'cli_store' and scope['lane'] == lane and
+            scope['kind'] in (('cli_store', 'native_subscription') if native else ('cli_store',)) and scope['lane'] == lane and
             isinstance(scope['scope_id'], str) and re.fullmatch('[0-9a-f]{64}', scope['scope_id']) is not None)
 
 
@@ -101,7 +101,7 @@ def _result(lane, row=None, age=None, pool=None, status='unknown', reason='Quota
                 age_s=age, source=row.get('source') if row else None, reason=reason)
 
 
-def _evaluate(candidate, observations, *, now, monotonic, max_age_s):
+def _evaluate(candidate, observations, *, now, monotonic, max_age_s, _native=False):
     lane = PROVIDERS.get(candidate.get('provider'))
     if lane is None:
         return _result('local' if candidate.get('provider') in ('ollama', 'custom') else None,
@@ -118,7 +118,7 @@ def _evaluate(candidate, observations, *, now, monotonic, max_age_s):
         return result
     if not isinstance(row['source'], str) or not row['source'].strip():
         return result
-    if not _valid_scope(candidate.get('auth_scope'), lane) or candidate['auth_scope'] != row.get('auth_scope'):
+    if not _valid_scope(candidate.get('auth_scope'), lane, native=_native) or candidate['auth_scope'] != row.get('auth_scope'):
         return {**result, 'reason': 'Actual authentication source is unproven or mismatched'}
     if row.get('error') is not None:
         error = row['error']
@@ -161,7 +161,7 @@ def resources(candidates, observations, cost_estimates=None, *, now, monotonic, 
             raise ValueError('Invalid quota resource candidate')
         lane = candidate['lane']
         health.setdefault(lane, {'ok': False, 'scarcity': None, 'pools': {}})
-        outcome = _evaluate(candidate, observations, now=now, monotonic=monotonic, max_age_s=max_age_s)
+        outcome = _evaluate(candidate, observations, now=now, monotonic=monotonic, max_age_s=max_age_s, _native=True)
         if outcome['status'] == 'available':
             row = next(r for r in observations if r['lane'] == lane)
             record = scarcity.finish(lane, copy.deepcopy(row['record']))
@@ -202,6 +202,8 @@ def check(provider, model, *, auth_scope, config, observations=None):
     lane = PROVIDERS.get(provider)
     candidate = dict(provider=provider, model=model, auth_scope=auth_scope)
     now, monotonic = time.time(), time.monotonic()
+    if isinstance(auth_scope, dict) and auth_scope.get('kind') == 'native_subscription':
+        return _result(lane, reason='Actual source context is required')
     rows = tuple(observations or ())
     matching = [r for r in rows if isinstance(r, dict) and r.get('lane') == lane]
     if lane and (not matching or (len(matching) == 1 and _age(matching[0], now, monotonic, _maximum(config)) is None)):
@@ -213,7 +215,128 @@ def check(provider, model, *, auth_scope, config, observations=None):
 def source_preflight(provider, model, *, config):
     from . import quota_observations
     lane = PROVIDERS.get(provider)
+    if provider == 'cursor-cli':
+        try:
+            actual = _configured_actual(provider, model, config)
+            return {'quota_stage': 'source_preflight', 'auth_scope': actual.public_scope,
+                    'quota': check_actual(provider, model, actual=actual, config=config)}
+        except (ValueError, OSError):
+            return {'quota_stage': 'source_preflight', 'auth_scope': _unproven(lane), 'quota': _result(lane)}
     rows = quota_observations.collect((lane,), config=config) if lane else ()
     scope = rows[0]['auth_scope'] if len(rows) == 1 else _unproven(lane)
     return {'quota_stage': 'source_preflight', 'auth_scope': scope,
             'quota': check(provider, model, auth_scope=scope, config=config, observations=rows)}
+
+# Context membership proves owner creation; it stores no quota authorization.
+from dataclasses import dataclass
+import secrets
+import weakref
+
+_contexts = weakref.WeakKeyDictionary()
+os.register_at_fork(after_in_child=_contexts.clear)
+
+
+@dataclass(frozen=True, eq=False, repr=False)
+class ActualSource:
+    _scope: tuple
+
+    @property
+    def public_scope(self):
+        return dict(zip(('kind', 'lane', 'scope_id'), self._scope))
+
+    def __repr__(self):
+        return '<ActualSource redacted>'
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError('Private source cannot be serialized')
+
+
+def prepare_actual(provider, *, environment, executable, argv, cwd, config):
+    from . import quota_sources
+    try:
+        env = dict(environment)
+        args = tuple(argv)
+        binary, folder = _path(executable), _path(cwd)
+        if any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()) or any(not isinstance(v, str) for v in args):
+            raise ValueError()
+        if provider == 'codex-cli':
+            scope = auth_scope(provider, environment=env, executable=binary, argv=args, config=config)
+            if not _valid_scope(scope, 'codex'):
+                raise ValueError()
+            capture = quota_sources.SourceCapture(profile=quota_sources.CODEX_PROFILE, lane='codex',
+                       source_argv=(), files=(), material=json.dumps([scope, env], sort_keys=True).encode())
+        else:
+            capture = quota_sources.capture_source(provider, environment=env, executable=binary, argv=args, cwd=folder, config=config)
+            scope = {'kind': 'native_subscription', 'lane': capture.lane, 'scope_id': secrets.token_hex(32)}
+        actual = ActualSource(tuple(scope[k] for k in ('kind', 'lane', 'scope_id')))
+        _contexts[actual] = (os.getpid(), provider, env, binary, args, folder, capture)
+        return actual
+    except (AttributeError, KeyError, TypeError, ValueError, OSError):
+        raise ValueError('Actual source is unavailable') from None
+
+
+def _same_actual(actual, config):
+    from . import quota_sources
+    entry = _contexts.get(actual)
+    if not entry:
+        return None
+    if entry[0] != os.getpid():
+        _contexts.pop(actual, None)
+        return None
+    pid, provider, env, executable, argv, cwd, capture = entry
+    try:
+        if capture.profile == quota_sources.CODEX_PROFILE:
+            valid = auth_scope(provider, environment=env, executable=executable, argv=argv, config=config) == actual.public_scope
+        else:
+            latest = quota_sources.capture_source(provider, environment=dict(env), executable=executable, argv=argv, cwd=cwd, config=config)
+            valid = latest == capture
+    except (ValueError, OSError):
+        valid = False
+    if valid:
+        return entry
+    from . import quota_observations
+    _contexts.pop(actual, None)
+    quota_observations.invalidate_actual(entry, config)
+    return None
+
+
+def check_actual(provider, model, *, actual, config):
+    from . import quota_observations, quota_sources
+    lane = PROVIDERS.get(provider) if isinstance(provider, str) else None
+    try:
+        entry = _same_actual(actual, config) if isinstance(actual, ActualSource) else None
+        if not entry or entry[1] != provider:
+            return _result(lane, reason='Actual source context is unavailable')
+        if entry[-1].profile == quota_sources.CODEX_PROFILE:
+            token = quota_observations._codex_environment.set(entry[2])
+            try:
+                return check(provider, model, auth_scope=actual.public_scope, config=config)
+            finally:
+                quota_observations._codex_environment.reset(token)
+        source_argv = entry[-1].source_argv
+        if len(source_argv) != 2 or source_argv != ('--model', model):
+            return _result(lane, reason='Actual model identity is unavailable')
+        row = quota_observations.collect_actual(entry, config=config)
+        if _same_actual(actual, config) is None:
+            return _result(lane, reason='Actual source generation changed')
+        row = {**row, 'auth_scope': actual.public_scope}
+        now, monotonic = time.time(), time.monotonic()
+        if not quota_observations._usable(row, config, now=now, monotonic=monotonic):
+            return _result(lane, reason='Actual source proof is unavailable')
+        return _evaluate(dict(provider=provider, model=model, auth_scope=actual.public_scope), (row,),
+                         now=now, monotonic=monotonic, max_age_s=_maximum(config), _native=True)
+    except (TypeError, ValueError, KeyError, OSError):
+        return _result(lane, reason='Actual source context is unavailable')
+
+
+def _configured_actual(provider, model, config, environment=None):
+    from . import quota_observations
+    lane = PROVIDERS[provider]
+    if environment is None:
+        env, executable, _ = quota_observations._environment(lane, config)
+    else:
+        import shutil
+        env = dict(environment)
+        executable = shutil.which('cursor-agent', path=env.get('PATH'))
+    argv = (executable, '-p', '--output-format', 'stream-json', '--trust', '--model', model)
+    return prepare_actual(provider, environment=env, executable=executable, argv=argv, cwd=os.getcwd(), config=config)

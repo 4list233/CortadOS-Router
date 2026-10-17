@@ -147,6 +147,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         nonlocal buf, eof
         end, last, hit = time.time() + max_s, time.time(), 0.0
         while time.time() < end:
+            _reaper.sample(pid)
             r, _, _ = select.select([fd], [], [], 0.25)
             if r:
                 try:
@@ -182,13 +183,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             return ""
         if re.search(r"trust (this|the contents)|Trust this workspace", _plain(buf), re.I):
             stage = "trust"
-            os.write(fd, b"\r")
-            pump(boot_s, until=ready, mark=len(buf))
-            startup_chars = len(_plain(buf))
-            ready_seen = bool(ready and re.search(ready, _plain(buf)))
-            if eof:
-                mark = len(buf)
-                return ""
+            return ""
         mark = len(buf)
         stage = "command"
         os.write(fd, command.encode())
@@ -413,12 +408,9 @@ def parse_cursor_usage(text: str) -> list[dict[str, Any]]:
 
 
 def _cursor(*, environment=None) -> dict[str, Any]:
-    env = {**_cli_env(), "AGENT_CLI_CREDENTIAL_STORE": "file"} if environment is None else environment
-    text = tui_capture(["cursor-agent"], "/usage", r"Included \d+% used[\s\S]*Esc to close", env, boot_s=15, ready=r"Cursor Agent")
-    wins = parse_cursor_usage(text)
-    if not wins:
-        raise RuntimeError("no '% used' lines on the /usage screen: " + re.sub(r"\s+", " ", text)[-200:])
-    return {"source": "cursor-agent /usage (pty)", "windows": wins}
+    from integrations.mcp.config import load_config
+    from cortados_router.quota_observations import status_record
+    return status_record("cursor", config=load_config("/Users/velox/.config/cortados-workers/config.json"), environment=environment)
 
 
 def _local() -> dict[str, Any]:
