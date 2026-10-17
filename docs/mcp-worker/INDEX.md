@@ -20,6 +20,7 @@ publication is outside this task.
 | [FOLLOWUP.md](FOLLOWUP.md) | Independent QA; baseline repair scope, exact review policy and pristine installer inputs. |
 | [NATIVE-PROFILE-002.md](NATIVE-PROFILE-002.md) | Independent QA; captured 0.163.0 extension and immutable job version provenance. |
 | [INSTALLATION.md](INSTALLATION.md) | Root; actual local release, operator limits, Claude registration and activation evidence. |
+| [AIR-TO-STUDIO.md](AIR-TO-STUDIO.md) | Root; existing Tailscale SSH workflow with Claude, S1 and workers on the Studio; actual Air login verification remains an operator check. |
 | [S1-CONTEXT.md](S1-CONTEXT.md) | Root; scoring brief, worker handoff and measured classifier limitations. |
 | [USAGE.md](USAGE.md) | Root orchestrator; standalone setup, Claude handoff and explicit connector grants. |
 | [QA-BASELINE.md](QA-BASELINE.md) | Independent QA; all maintained suites and pre-existing failures. |
