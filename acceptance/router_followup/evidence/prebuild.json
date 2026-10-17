@@ -1,0 +1,24 @@
+{
+  "command": [
+    "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python",
+    "-B",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "acceptance/router_followup",
+    "-t",
+    ".",
+    "-v"
+  ],
+  "cwd": "/Users/velox/.cortados-builds/cortados-router-repo",
+  "exit_code": 1,
+  "duration_s": 0.2775073330012674,
+  "expected": {
+    "pass": 2,
+    "failure": 2,
+    "error": 2,
+    "skip": 0
+  },
+  "candidate_before_build": "eb2d82eb9afbf1bbae41dad34f8f38e39daeda7d"
+}

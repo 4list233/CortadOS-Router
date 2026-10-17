@@ -1,0 +1,32 @@
+{
+  "command": [
+    "/Users/velox/.cortados-builds/target-test-env/venv/bin/python",
+    "-B",
+    "-m",
+    "pytest",
+    "-q",
+    "tests/integration/test_auxiliary_model_routing.py",
+    "-p",
+    "no:cacheprovider",
+    "--junitxml=/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/evidence/test_auxiliary_model_routing.xml"
+  ],
+  "env": {
+    "PATH": "/Users/velox/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/opt/homebrew/bin:/Applications/ChatGPT.app/Contents/Resources/codex-cli/codex-path:/Users/velox/.codex/tmp/arg0/codex-arg0kCA6x5:/Users/velox/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override:/Users/velox/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback:/Applications/ChatGPT.app/Contents/Resources:/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS",
+    "HOME": "/Users/velox",
+    "USER": "velox",
+    "LOGNAME": "velox",
+    "TMPDIR": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/",
+    "PYTHONPATH": "/Users/velox/.cortados-builds/cortados-router-repo:/Users/velox/.cortados-builds/target-test-env/hermes-agent",
+    "HERMES_TEST_ROOT": "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/hermes_pristine",
+    "CORTADOS_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-followup-fixture-xbolhtas/state",
+    "CORTADOS_HERMES_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-followup-fixture-xbolhtas/hermes",
+    "HERMES_HOME": "/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/router-followup-fixture-xbolhtas/hermes",
+    "HERMES_IGNORE_USER_CONFIG": "1",
+    "HERMES_TELEMETRY_ENABLED": "false",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CORTADOS_LIVE_WRITE": "0",
+    "WANGCAI_LIVE_WRITE": "0"
+  },
+  "exit_code": 0,
+  "duration_s": 5.25922695799818
+}

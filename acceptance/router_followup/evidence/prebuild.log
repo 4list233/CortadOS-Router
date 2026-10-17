@@ -1,0 +1,64 @@
+test_f01_pristine_inputs_match_recorded_git_objects (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f01_pristine_inputs_match_recorded_git_objects) ... ok
+test_f01_pristine_installers_keep_original_pending_counts (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f01_pristine_installers_keep_original_pending_counts) ... ok
+test_f02_sampler_attributes_occurrence_and_preserves_saved_pin (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_attributes_occurrence_and_preserves_saved_pin) ... ERROR
+test_f02_sampler_records_missing_metadata_without_inventing_saved_model (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_records_missing_metadata_without_inventing_saved_model) ... ERROR
+test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes) ... FAIL
+test_f04_roster_contains_exact_approved_opt_in_review_fields (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f04_roster_contains_exact_approved_opt_in_review_fields) ... FAIL
+
+======================================================================
+ERROR: test_f02_sampler_attributes_occurrence_and_preserves_saved_pin (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_attributes_occurrence_and_preserves_saved_pin)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 73, in test_f02_sampler_attributes_occurrence_and_preserves_saved_pin
+    sampler, jobs, output = self.sampler()
+                            ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 38, in sampler
+    sampler = load("followup_sampler", ROOT / "bin/route-crons.py")
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 24, in load
+    spec.loader.exec_module(module)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 755, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 892, in get_code
+  File "<frozen importlib._bootstrap_external>", line 950, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/velox/.cortados-builds/cortados-router-repo/bin/route-crons.py'
+
+======================================================================
+ERROR: test_f02_sampler_records_missing_metadata_without_inventing_saved_model (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_records_missing_metadata_without_inventing_saved_model)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 88, in test_f02_sampler_records_missing_metadata_without_inventing_saved_model
+    sampler, _, output = self.sampler()
+                         ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 38, in sampler
+    sampler = load("followup_sampler", ROOT / "bin/route-crons.py")
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 24, in load
+    spec.loader.exec_module(module)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 755, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 892, in get_code
+  File "<frozen importlib._bootstrap_external>", line 950, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/velox/.cortados-builds/cortados-router-repo/bin/route-crons.py'
+
+======================================================================
+FAIL: test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 106, in test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 2 != 0 : /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python: can't open file '/Users/velox/.cortados-builds/cortados-router-repo/bin/route-crons.py': [Errno 2] No such file or directory
+
+
+======================================================================
+FAIL: test_f04_roster_contains_exact_approved_opt_in_review_fields (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f04_roster_contains_exact_approved_opt_in_review_fields)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/router_followup/test_baseline_repairs.py", line 115, in test_f04_roster_contains_exact_approved_opt_in_review_fields
+    self.assertIn(expected["rule"], actual["rules"])
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: "Dual review is opt-in: when a review is explicitly requested, ask BOTH Samantha and Rachel independently to review the same original artifact. Samantha matches the actual author's capability on another model vendor; Rachel uses the opposite capability level on another vendor. Ordinary author turns do not dispatch reviews." not found in ['Only Forest approves anything that sends, spends, books, or deletes. Ask once with `clarify`, then wait.', 'Faces talk to each other only through `bus_post` in #agent-bus, tagged; never by mentioning each other in other channels unless that face must act there.', 'Work written by a Claude brain or a Claude/Codex worker goes to Rachel (routine) or Samantha (high stakes) before it is called done; Gemini-written work is reviewed by a Claude face.', 'Only Donna briefs Forest (#briefing, 07:00 weekdays / 09:30 weekends); every face files nightly notes at 21:30 instead of messaging him.', "Jessica may provision new agents with fleet_provision and administer fleet schedules with bin/fleet-cron. Outside these managed capabilities, never edit the runtime (Hermes source, plugins, launchd, another face's profile). One diagnosis, then report in #ops and tag Forest.", "Browser logins and OAuth approvals are Forest's; ask once, move on.", 'Never paste secrets, tokens or full email bodies anywhere; reference files by path.', 'After changing your own files, run `bin/commit-self.sh <face> "<why>"`.']
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.194s
+
+FAILED (failures=2, errors=2)

@@ -1,0 +1,26 @@
+{
+  "source_revision": "9796235822b89e08597a402dad045b5b4464e474",
+  "source_repository": "Hermes host Git object store",
+  "files": {
+    "agent/auxiliary_client.py": {
+      "sha256": "6a6e09867f0e15890421d883b840eeff7b2622dedae162b9e093381deeadc1aa",
+      "bytes": 396795,
+      "git_blob": "22b69e3e3091d89a5ef4394948b4b6bf2c4c1353"
+    },
+    "hermes_cli/plugins.py": {
+      "sha256": "77853fdef1a8b9eac4904d21d78f0f746e324473c86806a5be2b148328fce094",
+      "bytes": 119784,
+      "git_blob": "a979c394918c77e95e5122c0c15d1613e3c2a113"
+    },
+    "tools/delegate_tool.py": {
+      "sha256": "eebef774876a59d62dcbd7e1b10a2cacd5fe85f19146f186248803d777174ec3",
+      "bytes": 42947,
+      "git_blob": "3d5b11019fe1acd14758f735c1f18096cc37e725"
+    },
+    "agent/review_engine.py": {
+      "sha256": "a0e03c77eef78191f91363e1f63518b37079bbc6b9834e6c562ca3215021ab96",
+      "bytes": 9431,
+      "git_blob": "18f500b6d5a937b87b204ddbfc0484d1f0148b13"
+    }
+  }
+}
