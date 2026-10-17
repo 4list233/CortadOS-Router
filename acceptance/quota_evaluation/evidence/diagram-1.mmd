@@ -1,0 +1,9 @@
+flowchart LR
+  A[Candidate in existing cost loop] --> P{Price truthy?}
+  P -->|No| F[Existing no-burn fallback]
+  P -->|Yes| R[Read selected estimate owner once]
+  R --> E{Observation truthy?}
+  E -->|No| F
+  E -->|Yes| B[Compute burn using same observation]
+  B --> N[Existing normalization and selection]
+  F --> N

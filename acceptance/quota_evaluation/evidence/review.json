@@ -1,0 +1,28 @@
+{
+  "contract": "RT-QUOTA-EVALUATION-004",
+  "version": 1,
+  "reviewer": "/root/quota_evaluation_qa",
+  "D_unresolved": 0,
+  "A_unresolved": 0,
+  "B": "pending",
+  "attempts": [],
+  "baseline": {
+    "tests": 21,
+    "pass": 12,
+    "fail": 6,
+    "errors": 3,
+    "skip": 0
+  },
+  "original_protected_hashes": {
+    "checked": 321,
+    "mismatch": 0
+  },
+  "diagram_commands": [
+    "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/.bin/mmdc -p /Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json -i acceptance/quota_evaluation/evidence/diagram-1.mmd -o acceptance/quota_evaluation/evidence/diagram-1.svg",
+    "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/.bin/mmdc -p /Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json -i acceptance/quota_evaluation/evidence/diagram-2.mmd -o acceptance/quota_evaluation/evidence/diagram-2.svg"
+  ],
+  "diagram_exit_codes": [
+    0,
+    0
+  ]
+}

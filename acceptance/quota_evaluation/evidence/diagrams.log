@@ -1,0 +1,30 @@
+Generating single mermaid chart
+
+Error: Could not find chrome-headless-shell (ver. 155.0.8059.39). This can occur if either
+ 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or
+ 2. your cache path is incorrectly configured (which is: /Users/velox/.cache/puppeteer).
+For (2), check out our guide on configuring puppeteer at https://pptr.dev/guides/configuration.
+    at ChromeLauncher.resolveExecutablePath (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/BrowserLauncher.js:392:19)
+    at async ChromeLauncher.computeLaunchArguments (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/ChromeLauncher.js:92:19)
+    at async ChromeLauncher.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/BrowserLauncher.js:95:28)
+    at async ChromeLauncher.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/ChromeLauncher.js:39:16)
+    at async PuppeteerNode.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/PuppeteerNode.js:124:16)
+    at async run (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/index.js:1090:19)
+    at async cli (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/index.js:493:3)
+
+Generating single mermaid chart
+
+Error: Could not find chrome-headless-shell (ver. 155.0.8059.39). This can occur if either
+ 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or
+ 2. your cache path is incorrectly configured (which is: /Users/velox/.cache/puppeteer).
+For (2), check out our guide on configuring puppeteer at https://pptr.dev/guides/configuration.
+    at ChromeLauncher.resolveExecutablePath (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/BrowserLauncher.js:392:19)
+    at async ChromeLauncher.computeLaunchArguments (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/ChromeLauncher.js:92:19)
+    at async ChromeLauncher.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/BrowserLauncher.js:95:28)
+    at async ChromeLauncher.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/ChromeLauncher.js:39:16)
+    at async PuppeteerNode.launch (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/puppeteer-core/lib/puppeteer/node/PuppeteerNode.js:124:16)
+    at async run (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/index.js:1090:19)
+    at async cli (file:///Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/index.js:493:3)
+
+Generating single mermaid chart
+Generating single mermaid chart

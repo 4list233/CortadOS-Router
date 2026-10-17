@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant Q as Independent QA
+  participant B as Scoped builder
+  participant O as Operator
+  participant E as Existing evaluator
+  Q->>B: Freeze failing observations and accepted contract
+  B->>Q: Standalone and staged live call-site repair
+  Q->>O: Passing exams and source hashes
+  O->>B: Apply exact live diff after before-hash check
+  O->>E: Saved checkpoint, legacy mode, existing settings
+  E-->>O: Fresh report and exit status
+  alt Existing promotion gates pass
+    O->>O: Publish existing current-pointer schema
+  else Failure or rejected candidate
+    O->>O: Preserve current pointer
+  end

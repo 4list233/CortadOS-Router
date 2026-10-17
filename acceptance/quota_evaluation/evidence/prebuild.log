@@ -1,0 +1,164 @@
+test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.FrozenLive.test_next_calculation_observes_new_quota_estimate) ... FAIL
+test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.FrozenLive.test_positive_then_changed_value_keeps_first_observation) ... FAIL
+test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.FrozenLive.test_positive_then_none_uses_first_observation_without_crash) ... ERROR
+test_spent_candidate_remains_excluded_with_unknown_estimate (acceptance.quota_evaluation.test_consistency.FrozenLive.test_spent_candidate_remains_excluded_with_unknown_estimate) ... ok
+test_unknown_estimate_retains_price_fallback_without_quota_evidence (acceptance.quota_evaluation.test_consistency.FrozenLive.test_unknown_estimate_retains_price_fallback_without_quota_evidence) ... ok
+test_unpriced_candidate_does_not_read_quota_estimate (acceptance.quota_evaluation.test_consistency.FrozenLive.test_unpriced_candidate_does_not_read_quota_estimate) ... ok
+test_zero_estimate_retains_existing_no_estimate_fallback (acceptance.quota_evaluation.test_consistency.FrozenLive.test_zero_estimate_retains_existing_no_estimate_fallback) ... ok
+test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_next_calculation_observes_new_quota_estimate) ... FAIL
+test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_positive_then_changed_value_keeps_first_observation) ... FAIL
+test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_positive_then_none_uses_first_observation_without_crash) ... ERROR
+test_spent_candidate_remains_excluded_with_unknown_estimate (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_spent_candidate_remains_excluded_with_unknown_estimate) ... ok
+test_unknown_estimate_retains_price_fallback_without_quota_evidence (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_unknown_estimate_retains_price_fallback_without_quota_evidence) ... ok
+test_unpriced_candidate_does_not_read_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_unpriced_candidate_does_not_read_quota_estimate) ... ok
+test_zero_estimate_retains_existing_no_estimate_fallback (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_zero_estimate_retains_existing_no_estimate_fallback) ... ok
+test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_next_calculation_observes_new_quota_estimate) ... FAIL
+test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_positive_then_changed_value_keeps_first_observation) ... FAIL
+test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_positive_then_none_uses_first_observation_without_crash) ... ERROR
+test_spent_candidate_remains_excluded_with_unknown_estimate (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_spent_candidate_remains_excluded_with_unknown_estimate) ... ok
+test_unknown_estimate_retains_price_fallback_without_quota_evidence (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_unknown_estimate_retains_price_fallback_without_quota_evidence) ... ok
+test_unpriced_candidate_does_not_read_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_unpriced_candidate_does_not_read_quota_estimate) ... ok
+test_zero_estimate_retains_existing_no_estimate_fallback (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_zero_estimate_retains_existing_no_estimate_fallback) ... ok
+
+======================================================================
+ERROR: test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.FrozenLive.test_positive_then_none_uses_first_observation_without_crash)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 14, in test_positive_then_none_uses_first_observation_without_crash
+    result, calls = resolve(self, {'codex': [1000.0, None], 'claude': [4000.0, None]})
+                    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/support.py", line 68, in resolve
+    result = case.core.resolve({'answers': answer, 'degraded': False}, **options)
+  File "/Users/velox/.cortados-builds/quota-evaluation-verification/live-before/plugins/cortados-router/core.py", line 521, in resolve
+    c["burn"] = (c["price"] / (_pool_tokens_per_pct(c) / 1e6)) if c.get("price") and _pool_tokens_per_pct(c) else None
+                               ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+TypeError: unsupported operand type(s) for /: 'NoneType' and 'float'
+
+======================================================================
+ERROR: test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_positive_then_none_uses_first_observation_without_crash)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 14, in test_positive_then_none_uses_first_observation_without_crash
+    result, calls = resolve(self, {'codex': [1000.0, None], 'claude': [4000.0, None]})
+                    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/support.py", line 68, in resolve
+    result = case.core.resolve({'answers': answer, 'degraded': False}, **options)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/core.py", line 531, in resolve
+    c["burn"] = (c["price"] / (tokens_per_pct(c) / 1e6)) if c.get("price") and tokens_per_pct(c) else None
+                               ~~~~~~~~~~~~~~~~~~^~~~~
+TypeError: unsupported operand type(s) for /: 'NoneType' and 'float'
+
+======================================================================
+ERROR: test_positive_then_none_uses_first_observation_without_crash (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_positive_then_none_uses_first_observation_without_crash)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 14, in test_positive_then_none_uses_first_observation_without_crash
+    result, calls = resolve(self, {'codex': [1000.0, None], 'claude': [4000.0, None]})
+                    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/support.py", line 68, in resolve
+    result = case.core.resolve({'answers': answer, 'degraded': False}, **options)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/core.py", line 531, in resolve
+    c["burn"] = (c["price"] / (tokens_per_pct(c) / 1e6)) if c.get("price") and tokens_per_pct(c) else None
+                               ~~~~~~~~~~~~~~~~~~^~~~~
+TypeError: unsupported operand type(s) for /: 'NoneType' and 'float'
+
+======================================================================
+FAIL: test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.FrozenLive.test_next_calculation_observes_new_quota_estimate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 58, in test_next_calculation_observes_new_quota_estimate
+    self.assertEqual(first_calls, ['codex', 'claude'])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['codex', 'codex', 'claude', 'claude'] != ['codex', 'claude']
+
+First differing element 1:
+'codex'
+'claude'
+
+First list contains 2 additional elements.
+First extra element 2:
+'claude'
+
+- ['codex', 'codex', 'claude', 'claude']
++ ['codex', 'claude']
+
+======================================================================
+FAIL: test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.FrozenLive.test_positive_then_changed_value_keeps_first_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 24, in test_positive_then_changed_value_keeps_first_observation
+    self.assertEqual(result['chosen']['lane'], 'claude', 'second read must not invert quota-cost ranking')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'codex' != 'claude'
+- codex
++ claude
+ : second read must not invert quota-cost ranking
+
+======================================================================
+FAIL: test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_next_calculation_observes_new_quota_estimate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 58, in test_next_calculation_observes_new_quota_estimate
+    self.assertEqual(first_calls, ['codex', 'claude'])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['codex', 'codex', 'claude', 'claude'] != ['codex', 'claude']
+
+First differing element 1:
+'codex'
+'claude'
+
+First list contains 2 additional elements.
+First extra element 2:
+'claude'
+
+- ['codex', 'codex', 'claude', 'claude']
++ ['codex', 'claude']
+
+======================================================================
+FAIL: test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.StandaloneLegacy.test_positive_then_changed_value_keeps_first_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 24, in test_positive_then_changed_value_keeps_first_observation
+    self.assertEqual(result['chosen']['lane'], 'claude', 'second read must not invert quota-cost ranking')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'codex' != 'claude'
+- codex
++ claude
+ : second read must not invert quota-cost ranking
+
+======================================================================
+FAIL: test_next_calculation_observes_new_quota_estimate (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_next_calculation_observes_new_quota_estimate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 58, in test_next_calculation_observes_new_quota_estimate
+    self.assertEqual(first_calls, ['codex', 'claude'])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['codex', 'codex', 'claude', 'claude'] != ['codex', 'claude']
+
+First differing element 1:
+'codex'
+'claude'
+
+First list contains 2 additional elements.
+First extra element 2:
+'claude'
+
+- ['codex', 'codex', 'claude', 'claude']
++ ['codex', 'claude']
+
+======================================================================
+FAIL: test_positive_then_changed_value_keeps_first_observation (acceptance.quota_evaluation.test_consistency.StandaloneResources.test_positive_then_changed_value_keeps_first_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_evaluation/test_consistency.py", line 24, in test_positive_then_changed_value_keeps_first_observation
+    self.assertEqual(result['chosen']['lane'], 'claude', 'second read must not invert quota-cost ranking')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'codex' != 'claude'
+- codex
++ claude
+ : second read must not invert quota-cost ranking
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.222s
+
+FAILED (failures=6, errors=3)
