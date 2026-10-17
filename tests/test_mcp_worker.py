@@ -19,6 +19,7 @@ from unittest import mock
 
 from integrations.mcp.job_store import JobStore, failure_result
 from integrations.mcp.schemas import WorkerError, validate
+from integrations.mcp.native_profile import HISTORICAL_VERSION, check_version, record_version
 
 
 class JobStoreRegressions(unittest.TestCase):
@@ -49,21 +50,21 @@ class JobStoreRegressions(unittest.TestCase):
         request = self.request()
         self.store.db.execute("CREATE TRIGGER fail_insert AFTER INSERT ON jobs BEGIN SELECT RAISE(ABORT,'fault'); END")
         with self.assertRaises(WorkerError) as fault:
-            self.store.accept(request, self.route())
+            self.store.accept(request, self.route(), cli_version=HISTORICAL_VERSION)
         self.assertEqual(fault.exception.code, 'storage_error')
         self.assertFalse(self.store.db.in_transaction)
         self.assertEqual(self.store.active(), [])
         self.assertIsNone(self.store.replay(request))
         self.assertEqual(self.events.getvalue(), '')
         self.store.db.execute('DROP TRIGGER fail_insert')
-        accepted, created = self.store.accept(request, self.route())
+        accepted, created = self.store.accept(request, self.route(), cli_version=HISTORICAL_VERSION)
         self.assertTrue(created)
         self.assertEqual(accepted['state'], 'queued')
         self.assertEqual(len(self.store.active()), 1)
 
     def test_job_store_uuid_and_request_identity_use_unique_indexes(self):
         request = self.request()
-        record, _ = self.store.accept(request, self.route())
+        record, _ = self.store.accept(request, self.route(), cli_version=HISTORICAL_VERSION)
         for query, values in (
             ('SELECT record FROM jobs WHERE job_id=?', (record['job_id'],)),
             ('SELECT record FROM jobs WHERE client_id=? AND request_id=?', ('test', request['request_id']))):
@@ -74,7 +75,7 @@ class JobStoreRegressions(unittest.TestCase):
             self.store.db.execute('INSERT INTO jobs SELECT * FROM jobs')
 
     def test_job_store_terminal_duration_and_result_cannot_change(self):
-        accepted, _ = self.store.accept(self.request(), self.route())
+        accepted, _ = self.store.accept(self.request(), self.route(), cli_version=HISTORICAL_VERSION)
         job_id = accepted['job_id']
         self.store.transition(job_id, 'running')
         with mock.patch('integrations.mcp.job_store.time.monotonic', return_value=accepted['accepted_monotonic'] + 4):
@@ -87,7 +88,7 @@ class JobStoreRegressions(unittest.TestCase):
         self.assertEqual([event['state'] for event in events], ['queued', 'running', 'failed'])
 
     def test_job_store_first_stop_intent_is_durable(self):
-        record, _ = self.store.accept(self.request(), self.route())
+        record, _ = self.store.accept(self.request(), self.route(), cli_version=HISTORICAL_VERSION)
         first = self.store.transition(record['job_id'], 'cancelling', reason='timeout')
         repeated = self.store.transition(record['job_id'], 'cancelling', reason='cancel_requested')
         self.assertEqual(repeated['stop_intent'], 'timeout')
@@ -107,13 +108,88 @@ class JobStoreRegressions(unittest.TestCase):
 
     def test_job_store_unfinished_identity_never_replays_another_attempt(self):
         request = self.request()
-        record, _ = self.store.accept(request, self.route())
+        record, _ = self.store.accept(request, self.route(), cli_version=HISTORICAL_VERSION)
         self.store.close()
         self.store = JobStore(self.config, 'test-boot')
-        repeated, created = self.store.accept(request, self.route())
+        repeated, created = self.store.accept(request, self.route(), cli_version=HISTORICAL_VERSION)
         self.assertFalse(created)
         self.assertEqual(repeated['job_id'], record['job_id'])
         self.assertEqual(repeated['launch_nonce'], record['launch_nonce'])
+
+    def test_job_store_persists_profile_and_replay_cannot_substitute_an_upgrade(self):
+        request = self.request()
+        record, _ = self.store.accept(request, self.route(), cli_version='0.162.1')
+        replay, created = self.store.accept(request, self.route(), cli_version='0.163.0')
+        self.assertFalse(created)
+        self.assertEqual(replay, record)
+        self.assertEqual(self.store.get(record['job_id'])['cli_version'], '0.162.1')
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone(), (1,))
+
+    def test_job_store_identity_update_cannot_overwrite_admitted_profile(self):
+        record, _ = self.store.accept(self.request(), self.route(), cli_version='0.163.0')
+        with self.assertRaises(WorkerError) as refused:
+            self.store.identify(record['job_id'], cli_version='0.162.1')
+        self.assertEqual(refused.exception.code, 'storage_error')
+        self.assertEqual(self.store.get(record['job_id'])['cli_version'], '0.163.0')
+
+    def test_job_store_new_attempt_requires_a_captured_nonempty_profile(self):
+        for version in (None, '', '0.164.0'):
+            with self.subTest(version=version), self.assertRaises(WorkerError) as refused:
+                self.store.accept(self.request(), self.route(), cli_version=version)
+            self.assertEqual(refused.exception.code, 'native_version_mismatch')
+        self.assertEqual(self.store.active(), [])
+        self.assertFalse(self.store.db.in_transaction)
+
+
+class NativeProfileRegressions(unittest.TestCase):
+    # Probe subprocesses are mocked: the one-second synthetic deadlines below
+    # exercise remaining-budget forwarding without imposing real execution caps.
+    # The 10-to-13 second clock sample pins a three-second forwarded remainder.
+    def config(self):
+        return {'codex_bin': '/captured/codex', 'state_dir': '/private/state', 'codex_home': '/private/auth'}
+
+    def test_native_profile_probe_uses_closed_environment_and_remaining_startup_budget(self):
+        config = self.config()
+        result = subprocess.CompletedProcess([], 0, stdout=b'codex-cli 0.163.0\n')
+        with mock.patch('integrations.mcp.native_profile.time.monotonic', return_value=10), \
+             mock.patch('integrations.mcp.codex.native_environment', return_value={'CODEX_HOME': '/private/auth'}), \
+             mock.patch('integrations.mcp.native_profile.subprocess.run', return_value=result) as probe:
+            self.assertEqual(check_version(config, 13), '0.163.0')
+        probe.assert_called_once_with(['/captured/codex', '--version'], shell=False,
+            cwd='/private/state', env={'CODEX_HOME': '/private/auth'}, capture_output=True, timeout=3)
+
+    def test_native_profile_malformed_output_and_nonzero_exit_refuse(self):
+        for status, output in ((0, b'codex-cli 0.164.0\n'), (1, b'codex-cli 0.163.0\n'),
+                               (0, b' codex-cli 0.163.0\n'), (0, b'codex-cli 0.163.0 extra\n'),
+                               (0, b'codex-cli 0.163.0\nextra\n'), (0, b'\xff')):
+            with self.subTest(status=status, output=output), \
+                 mock.patch('integrations.mcp.native_profile.subprocess.run',
+                            return_value=subprocess.CompletedProcess([], status, stdout=output)), \
+                 self.assertRaises(WorkerError) as refused:
+                check_version(self.config(), time.monotonic() + 1)
+            self.assertEqual(refused.exception.code, 'native_version_mismatch')
+
+    def test_native_profile_timeout_and_launch_errors_refuse(self):
+        for error in (subprocess.TimeoutExpired('codex --version', 1), OSError('missing executable')):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch('integrations.mcp.native_profile.subprocess.run', side_effect=error), \
+                 self.assertRaises(WorkerError) as refused:
+                check_version(self.config(), time.monotonic() + 1)
+            self.assertEqual(refused.exception.code, 'native_version_mismatch')
+
+    def test_native_profile_other_captured_version_still_refuses_an_admitted_attempt(self):
+        result = subprocess.CompletedProcess([], 0, stdout=b'codex-cli 0.163.0\n')
+        with mock.patch('integrations.mcp.native_profile.subprocess.run', return_value=result), \
+             self.assertRaises(WorkerError) as refused:
+            check_version(self.config(), time.monotonic() + 1, expected='0.162.1')
+        self.assertEqual(refused.exception.code, 'native_version_mismatch')
+
+    def test_native_profile_legacy_default_applies_only_to_an_absent_field(self):
+        self.assertEqual(record_version({}), '0.162.1')
+        self.assertEqual(record_version({'cli_version': '0.163.0'}), '0.163.0')
+        for value in (None, '', '0.164.0'):
+            with self.subTest(value=value), self.assertRaises(WorkerError):
+                record_version({'cli_version': value})
 
 
 class NativeIdentityRegressions(unittest.TestCase):

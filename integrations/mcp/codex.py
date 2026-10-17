@@ -7,8 +7,8 @@ from pathlib import Path
 import sys
 
 from .schemas import WorkerError
+from .native_profile import captured_version
 
-CLI_VERSION = "0.162.1"
 ENVIRONMENT_NAMES = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
                      "SSL_CERT_FILE", "SSL_CERT_DIR")
 USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -130,12 +130,12 @@ class EventReader:
         return self.final_message, usage
 
 
-def terminal_result(route, job_id, artifacts, *, summary=None, usage=None, warnings=None, error=None):
+def terminal_result(route, job_id, artifacts, *, cli_version, summary=None, usage=None, warnings=None, error=None):
     """Closed service result; failed/interrupted native prose never becomes a summary."""
     return {
         "summary": summary if error is None else None,
         "worker": {"provider": "codex-cli", "requested_model": route["chosen"]["model"],
-                   "reported_model": None, "cli_version": CLI_VERSION, "account_ref": "native-default"},
+                   "reported_model": None, "cli_version": captured_version(cli_version), "account_ref": "native-default"},
         "usage": usage if error is None and usage is not None else {key: None for key in USAGE_FIELDS},
         "artifacts": {key: f"jobs/{job_id}/{name}" if name else None for key, name in artifacts.items()},
         "changed_paths": None, "verification": "planner_review_required", "warnings": warnings or [],

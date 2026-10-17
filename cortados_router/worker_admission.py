@@ -9,7 +9,7 @@ from .selection_resources import SelectionResources
 
 
 # Only these exact models have the protected command/final/usage and handoff
-# captures for the accepted 0.162.1 native profile. Inventory alone is insufficient.
+# captures for both accepted native profiles (0.162.1 and 0.163.0). Inventory alone is insufficient.
 CAPTURED_MODELS = frozenset(("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"))
 
 

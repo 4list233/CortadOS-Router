@@ -17,6 +17,7 @@ import time
 
 from .schemas import WorkerError, emit_event, validate
 from .job_store import JobStore, TERMINAL, failure_result
+from .native_profile import record_version
 
 
 def socket_path(state_dir):
@@ -147,7 +148,7 @@ class Broker:
                 if previous:
                     return self.store.response(previous)
                 route = await asyncio.to_thread(route_task, arguments, self.config, self.metadata)
-                record, created = self.store.accept(arguments, route)
+                record, created = self.store.accept(arguments, route, cli_version=self.metadata.version)
                 if created:
                     task = asyncio.create_task(self.run_worker(record))
                     self.tasks.add(task)
@@ -232,7 +233,7 @@ class Broker:
             self.workers[job_id] = process
             await self.send(process, {'config': self.config, 'arguments': accepted['arguments'],
                 'route': accepted['route'], 'job_id': job_id, 'launch_nonce': accepted['launch_nonce'],
-                'host_boot_id': accepted['host_boot_id']})
+                'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted)})
             while line := await process.stdout.readline():
                 message = json.loads(line)
                 record = self.store.get(job_id)

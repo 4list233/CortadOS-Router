@@ -14,6 +14,7 @@ import time
 from .codex import EventReader, native_arguments, native_environment, terminal_result
 from .grant_proxy import GrantPayloadServer
 from .native_process import ProcessTracker, atomic_json, process_identity
+from .native_profile import check_version, record_version
 from .schemas import WorkerError
 
 
@@ -31,6 +32,7 @@ class Watchdog:
         self.bootstrap = bootstrap
         self.config, self.arguments, self.route = (bootstrap[name] for name in ("config", "arguments", "route"))
         self.job_id = bootstrap["job_id"]
+        self.cli_version = record_version(bootstrap)
         self.directory = Path(self.config["state_dir"]) / "jobs" / self.job_id
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.identity = process_identity(os.getpid())
@@ -94,9 +96,12 @@ class Watchdog:
             self.proxy = GrantPayloadServer(self.config, self.arguments["permissions"])
         self.streams = {name: (self.directory / (name + ".tmp")).open("wb")
                         for name in ("events.jsonl", "native.stderr")}
-        self.native = subprocess.Popen(native_arguments(self.config, self.arguments, self.route,
-            self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None),
-            cwd=self.arguments["cwd"], env=native_environment(self.config), stdin=subprocess.PIPE,
+        argv = native_arguments(self.config, self.arguments, self.route,
+                                self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None)
+        environment = native_environment(self.config)
+        check_version(self.config, time.monotonic() + self.config["limits"]["startup_timeout_s"],
+                      expected=self.cli_version)
+        self.native = subprocess.Popen(argv, cwd=self.arguments["cwd"], env=environment, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, shell=False)
         identity = process_identity(self.native.pid)
         if identity is None:
@@ -232,7 +237,7 @@ class Watchdog:
                    "contained": contained, "observed_at_ms": time.time_ns() // 1_000_000}
         atomic_json(self.directory / "termination.json", receipt)
         result = terminal_result(self.route, self.job_id, self.artifacts, summary=summary, usage=usage,
-                                 warnings=self.reader.warnings, error=self.error)
+                                 cli_version=self.cli_version, warnings=self.reader.warnings, error=self.error)
         send({"event": "done", "result": result, "state": "failed" if self.error else "succeeded",
               "reason": self.error.code if self.error else None, "contained": contained})
         self.selector.close()

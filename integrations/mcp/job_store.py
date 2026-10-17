@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .schemas import WorkerError, canonical, emit_event
+from .native_profile import captured_version, record_version
 
 TERMINAL = frozenset({'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'})
 # Schema version is an identity, not a tunable budget: unknown layouts must refuse.
@@ -32,7 +33,7 @@ def failure_result(record, code, message):
     base = Path('jobs') / record['job_id']
     return {'summary': None,
             'worker': {'provider': 'codex-cli', 'requested_model': record['route']['chosen']['model'],
-                       'reported_model': None, 'cli_version': '0.162.1', 'account_ref': 'native-default'},
+                       'reported_model': None, 'cli_version': record_version(record), 'account_ref': 'native-default'},
             'usage': {key: None for key in ('input_tokens', 'cached_input_tokens',
                       'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens')},
             'artifacts': {key: str(base / name) if (state / base / name).is_file() else None
@@ -98,12 +99,13 @@ class JobStore:
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise WorkerError('storage_error', 'Cannot read active reservations') from exc
 
-    def accept(self, arguments, route):
+    def accept(self, arguments, route, *, cli_version):
         encoded = canonical(arguments)
         record = {'job_id': str(uuid.uuid4()), 'route_id': route['route_id'], 'state': 'queued',
                   'cwd': arguments['cwd'], 'created_at_ms': utc_ms(), 'started_at_ms': None,
                   'finished_at_ms': None, 'elapsed_ms': 0, 'progress': PROGRESS['queued'],
                   'reason': None, 'arguments': arguments, 'route': route,
+                  'cli_version': captured_version(cli_version),
                   'argument_hash': hashlib.sha256(encoded).hexdigest(),
                   'launch_nonce': str(uuid.uuid4()), 'host_boot_id': self.boot_id,
                   'watchdog': None, 'native': None, 'accepted_monotonic': time.monotonic(),
@@ -151,6 +153,8 @@ class JobStore:
                    state=record['state'], reason=record['reason'])
 
     def identify(self, job_id, **identities):
+        if 'cli_version' in identities:
+            raise WorkerError('storage_error', 'Accepted native profile is immutable')
         record = self.get(job_id)
         if record['state'] not in TERMINAL:
             record.update(identities)

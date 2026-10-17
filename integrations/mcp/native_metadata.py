@@ -12,9 +12,9 @@ import threading
 import time
 
 from .schemas import WorkerError
+from .native_profile import check_version
 
 
-ACCEPTED_VERSION = "0.162.1"
 # Bytes per pipe read, not an admission cap: larger chunks increase transient
 # allocations and smaller chunks add syscalls; max_output_bytes bounds retention.
 READ_CHUNK_BYTES = 65536
@@ -128,21 +128,10 @@ class NativeMetadata:
         self._lock = threading.RLock()
         self.version = None
 
-    def _check_version(self, deadline):
-        from .codex import native_environment
-        try:
-            result = subprocess.run([self.config["codex_bin"], "--version"], shell=False,
-                                    cwd=self.config["state_dir"], env=native_environment(self.config),
-                                    capture_output=True, timeout=max(0, deadline - time.monotonic()))
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise WorkerError("native_version_mismatch", "Native CLI version could not be checked") from exc
-        if result.returncode != 0 or result.stdout.strip() != ("codex-cli " + ACCEPTED_VERSION).encode():
-            raise WorkerError("native_version_mismatch", "Native CLI does not match accepted version " + ACCEPTED_VERSION)
-
     def preflight(self):
         with self._lock:
             deadline = time.monotonic() + self.config["limits"]["startup_timeout_s"]
-            self._check_version(deadline)
+            version = check_version(self.config, deadline)
             session = _Session(self.config, deadline)
             try:
                 session.initialize()
@@ -151,7 +140,7 @@ class NativeMetadata:
                 _policy(policy, requirements)
             finally:
                 session.close()
-            self.version = ACCEPTED_VERSION
+            self.version = version
 
     def snapshot(self):
         with self._lock:
@@ -165,12 +154,13 @@ class NativeMetadata:
             # otherwise a refusal could incorrectly outlive a corrected native read.
             from cortados_router.worker_admission import validate_snapshot
             validate_snapshot(snapshot)
+            self.version = snapshot["version"]
             self._cached = snapshot
             return copy.deepcopy(snapshot)
 
     def _collect(self):
         deadline = time.monotonic() + self.config["limits"]["startup_timeout_s"]
-        self._check_version(deadline)
+        version = check_version(self.config, deadline)
         session = _Session(self.config, deadline)
         try:
             session.initialize()
@@ -194,6 +184,6 @@ class NativeMetadata:
             quota = session.call("account/rateLimits/read", {}, "quota_unknown")
             return {"account": account, "models": sorted(set(models)), "rate_limits": quota,
                     "sampled_at_ms": time.time_ns() // 1_000_000,
-                    "sampled_monotonic": time.monotonic(), "version": self.version}
+                    "sampled_monotonic": time.monotonic(), "version": version}
         finally:
             session.close()
