@@ -61,5 +61,27 @@ class NativeProofBoundary(unittest.TestCase):
         self.assertTrue(all(w['reset_epoch'] == 1 and w['window_s'] == 2 for w in windows))
 
 
+class ProbeAcquisitionCleanup(unittest.TestCase):
+    def test_unregistered_probe_never_signals_an_already_reaped_child(self):
+        from cortados_router import probe_reaper
+        with patch.object(probe_reaper, 'untrack', return_value=None), \
+             patch.object(probe_reaper.os, 'waitpid', side_effect=ChildProcessError), \
+             patch.object(probe_reaper.os, 'kill') as kill, \
+             patch.object(probe_reaper.os, 'close') as close:
+            with self.assertRaisesRegex(RuntimeError, 'ownership is unavailable'):
+                probe_reaper.reap(123, 456, None)
+        kill.assert_not_called()
+        close.assert_called_once_with(456)
+
+    def test_direct_child_reap_has_finite_cleanup_allowance(self):
+        from cortados_router import probe_reaper
+        with patch.object(probe_reaper.os, 'waitpid', return_value=(0, 0)) as wait, \
+             patch.object(probe_reaper.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, 'cleanup allowance'):
+                probe_reaper._wait_child(123)
+        self.assertEqual(wait.call_count, 30)
+        self.assertEqual(sleep.call_count, 30)
+
+
 if __name__ == '__main__':
     unittest.main()

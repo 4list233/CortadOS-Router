@@ -115,10 +115,39 @@ def sample(pid):
             raise RuntimeError('Probe process ownership is unavailable')
 
 
+def _close_pty(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _wait_child(pid: int) -> None:
+    # Existing 30 x 0.1-second reap allowance: bound refusal latency while giving
+    # the killed direct child time to exit; a shorter allowance risks a zombie.
+    for _ in range(30):
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+        except ChildProcessError:
+            return
+        time.sleep(0.1)
+    raise RuntimeError('Probe direct child could not be reaped within cleanup allowance')
+
+
 def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None:
     """Contain tracked identities only; stale-folder inventory is a separate diagnostic."""
     entry = untrack(pid)
     if entry is None:
+        try:
+            # waitpid proves direct unreaped-child ownership; its PID cannot be reused.
+            if not os.waitpid(pid, os.WNOHANG)[0]:
+                os.kill(pid, signal.SIGKILL)
+        except (ChildProcessError, ProcessLookupError):
+            pass
+        finally:
+            _close_pty(fd)
+        _wait_child(pid)
         raise RuntimeError('Probe process ownership is unavailable')
     tracker = entry[3]
     try:
@@ -130,17 +159,8 @@ def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None
             time.sleep(0.1)
         tracker.signal_groups(signal.SIGKILL)
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    for _ in range(30):
-        try:
-            if os.waitpid(pid, os.WNOHANG)[0]:
-                break
-        except ChildProcessError:
-            break
-        time.sleep(0.1)
+        _close_pty(fd)
+    _wait_child(pid)
     if not tracker.contained():
         raise RuntimeError('Probe process containment could not be proven')
 

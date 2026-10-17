@@ -136,8 +136,6 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             os.execvpe(argv[0], argv, {**env, "TERM": "xterm-256color"})
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
-    _reaper.track(pid, fd, my_dir, PROBE_DIR)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
     buf = b""
     eof = False
     stage, startup_chars, ready_seen = "boot", 0, False
@@ -175,6 +173,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 return
     mark = 0
     try:
+        _reaper.track(pid, fd, my_dir, PROBE_DIR)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and re.search(ready, _plain(buf)))
