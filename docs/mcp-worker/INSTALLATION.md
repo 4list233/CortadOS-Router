@@ -123,3 +123,21 @@ newer unrelated configuration changes. No launchd job was installed.
 An update should build and verify another pinned release, then change the registered interpreter.
 The service refuses unvalidated native Codex versions; an automatic CLI upgrade requires a reviewed
 profile extension before worker execution resumes. Existing job provenance remains unchanged.
+
+
+## Training teacher release 007
+
+On October 17, 2026, the separate training teacher was enabled after independent D0/A0/B0 and
+785 scoped tests. The ordinary worker service described above remains on release 006. The label
+phase alone uses `~/.local/share/cortados-workers/releases/training-teacher-v1-20261017`, with
+private `~/.config/cortados-workers/teacher.json` and `~/.local/state/cortados-teacher-workers`.
+It reuses the same Codex login and broker implementation, with one teacher job, fresh quota,
+scarcity ceiling 0.7, network disabled and no connector grants. Teacher jobs are separated from
+ordinary MCP observations so they do not recursively become new user training tasks.
+
+A real `gpt-6.1-sol` subscription job produced 12 new final-training labels; the original labels,
+held-out exam and promotion gates were independently verified unchanged. Nightly remains loaded
+at 01:30 Toronto. No full training run or model promotion was performed during this activation.
+See [the teacher report](CODEX-TRAINING-TEACHER-BUILD-REPORT.md) for source/wheel identities,
+verification, live receipts and rollback limits. Disabling fallback must retain the new label writer
+and existing reservations; do not restore an older writer that ignores accepted Codex slots.

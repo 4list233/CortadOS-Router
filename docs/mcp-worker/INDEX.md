@@ -81,9 +81,9 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Training teacher path | RT-TRAINING-TEACHER-007 responsibility |
 |---|---|
-| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; B1/B2 failures retained; revision2 cumulative attempt3 accepted D0/A0/B0 with785 passing tests; guarded activation pending. |
+| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; B1/B2 failures retained; revision2 cumulative attempt3 accepted D0/A0/B0 with 785 passing tests; activated and independently verified with 12 new training labels. |
 | `cortados_router/teacher.py` | Teacher selection and existing broker client adapter; no native harness or split implementation. |
 | `cortados_router/teacher_attempts.py` | Training slots, private fallback attempt mapping and sole label publication owner. |
 | `cortados_router/worker_admission.py` | Existing native admission plus closed teacher-only scarcity ceiling; ordinary worker behavior unchanged. |
 | `acceptance/training_teacher/` | Independent exam owner; split isolation, replay/publication, native parity and installed labeling path. |
-| [CODEX-TRAINING-TEACHER-BUILD-REPORT.md](CODEX-TRAINING-TEACHER-BUILD-REPORT.md) | Root; rejected B2 candidate, 782 passing tests plus one failing regression, preserved live state and proposed cache-lifetime revision. |
+| [CODEX-TRAINING-TEACHER-BUILD-REPORT.md](CODEX-TRAINING-TEACHER-BUILD-REPORT.md) | Root; accepted revision 2, 785 passing tests, guarded activation, 12 verified training labels, preserved exam and operating limits. |
