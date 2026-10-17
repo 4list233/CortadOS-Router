@@ -1,0 +1,81 @@
+{
+  "job_id": "5e612218-93ea-46dc-8471-fef3acdbb7e8",
+  "state": "succeeded",
+  "created_at_ms": 1792214744437,
+  "started_at_ms": 1792214744799,
+  "finished_at_ms": 1792214752222,
+  "arguments": {
+    "task": "Write exactly CLAUDE_CODEX_MCP_OK with no newline into worker-ok.txt in this assigned working folder using a command tool. Then reply exactly CLAUDE_CODEX_MCP_OK.",
+    "context": "Temporary integration smoke test. No other files, installs, network calls or account changes.",
+    "selection": {
+      "mode": "s1",
+      "routing_brief": "Write one fixed plain text marker in an empty temporary folder. Exact content and filename provided. One reversible local action; no dependencies or external effects."
+    },
+    "constraints": {},
+    "permissions": {
+      "network": false,
+      "mcp_servers": []
+    },
+    "account_ref": "native-default",
+    "cwd": "/Users/velox/.cortados-builds/mcp-worker-followup-verification/claude-planner-check/work",
+    "timeout_s": 90,
+    "request_id": "7c16f714-6bc2-4d4a-81e2-20e8f5d7a3bb"
+  },
+  "route": {
+    "route_id": "f31c56d4-830e-41c8-89fe-10d831efa76f",
+    "selection_mode": "s1",
+    "chosen": {
+      "lane": "codex",
+      "provider": "codex-cli",
+      "model": "gpt-6.1-sol",
+      "account_ref": "native-default"
+    },
+    "band": "R1",
+    "D": 3,
+    "suggested_subagents": 0,
+    "skipped": [
+      {
+        "provider": "codex-cli",
+        "model": "gpt-6-luna",
+        "reason": "below the face floor (general 47.4 < 50)"
+      }
+    ],
+    "context": {
+      "worker_bytes": 337,
+      "scorer_chars": 166,
+      "scorer_digest": "9eecac945df050b7afc9ba8c3769129db77d0dde3d5ce5a4d399c15b4d0f0d9f"
+    },
+    "quota": {
+      "status": "fresh",
+      "source": "codex-app-server",
+      "sampled_at_ms": 1792214742230
+    },
+    "warnings": []
+  },
+  "cli_version": "0.163.0",
+  "result": {
+    "summary": "CLAUDE_CODEX_MCP_OK",
+    "worker": {
+      "provider": "codex-cli",
+      "requested_model": "gpt-6.1-sol",
+      "reported_model": null,
+      "cli_version": "0.163.0",
+      "account_ref": "native-default"
+    },
+    "usage": {
+      "input_tokens": 29590,
+      "cached_input_tokens": 23680,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 69,
+      "reasoning_output_tokens": 0
+    },
+    "artifacts": {
+      "final_message": "jobs/5e612218-93ea-46dc-8471-fef3acdbb7e8/final.txt",
+      "events": "jobs/5e612218-93ea-46dc-8471-fef3acdbb7e8/events.jsonl"
+    },
+    "changed_paths": null,
+    "verification": "planner_review_required",
+    "warnings": [],
+    "error": null
+  }
+}

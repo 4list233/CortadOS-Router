@@ -1,0 +1,3 @@
+- The `visible_marker` MCP tool returned `GRANTED_TOOL_REACHED`.
+- Wrote exactly `INSIDE_OK` to `permitted.txt` in the working folder.
+- The outside write was denied with `operation not permitted` (exit code 1).

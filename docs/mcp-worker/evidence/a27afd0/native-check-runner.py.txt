@@ -1,0 +1,127 @@
+# Independent operator seam check. Runs only in explicitly created scratch folders.
+import argparse, asyncio, contextlib, hashlib, json, os, signal, subprocess, sys, time, uuid
+from pathlib import Path
+from datetime import timedelta
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+ROOT = Path('/Users/velox/.cortados-builds/cortados-router-repo')
+TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'}
+
+def owned_brokers(state):
+    output = subprocess.check_output(['/bin/ps', '-axo', 'pid=,args='], text=True)
+    return [(int(row.strip().split(None, 1)[0]), row) for row in output.splitlines()
+            if str(state.parent) in row and ('--broker' in row or 'integrations.mcp.broker' in row)]
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--directory', required=True, type=Path)
+    parser.add_argument('--python', default=sys.executable)
+    parser.add_argument('--installed', action='store_true')
+    args = parser.parse_args()
+    directory = args.directory.resolve()
+    directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+    state = directory/'state'; state.mkdir(mode=0o700)
+    outside = directory/'outside'; outside.mkdir()
+    events = directory/'upstream.jsonl'
+    fixture = ROOT/'acceptance/mcp_worker/fake_mcp_server.py'
+    config = {'schema':'cortados.mcp-worker.config.v1','client_id':'independent-native-check',
+              'state_dir':str(state),'codex_bin':'/opt/homebrew/bin/codex','codex_home':str(Path.home()/'.codex'),
+              'model_allowlist':['gpt-6-luna','gpt-6.1-sol','gpt-6-astra'], 'allow_network':False,
+              'connector_registry':{'fixture':{'transport':'stdio','command':sys.executable,
+                'args':[str(fixture),str(events)],'env_vars':['MCP_FIXTURE_SECRET'],'tools':['visible_marker','hidden_marker']}},
+              # Seconds: 90 covers measured <12 s native calls plus slow-tool cancellation; 20 startup
+              # covers native metadata and proxy init. Higher prolongs stalls; lower risks slow-host flakes.
+              'limits':{'max_concurrent_jobs':2,'max_timeout_s':90,'termination_grace_s':5,
+                        'startup_timeout_s':20,'max_handoff_bytes':65536,'max_output_bytes':1048576,
+                        'metadata_max_age_s':30,'process_poll_ms':20}}
+    config_path = directory/'config.json'; config_path.write_text(json.dumps(config))
+    env = {key:os.environ[key] for key in ['PATH','HOME','USER','LOGNAME','TMPDIR','LANG'] if key in os.environ}
+    env['MCP_FIXTURE_SECRET'] = 'SYNTHETIC_ROOT_NATIVE_CHECK_ONLY'
+    if not args.installed: env['PYTHONPATH'] = str(ROOT)
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    env['CORTADOS_S1_URL'] = 'http://127.0.0.1:8431'
+    parameters = StdioServerParameters(command=args.python,args=['-B','-m','integrations.mcp','--config',str(config_path)],
+                                      cwd=str(directory if args.installed else ROOT),env=env)
+    report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+            'installed':args.installed,'checks':[], 'started_at_ms':int(time.time()*1000)}
+    async def call(client,tool,arguments):
+        value=await client.call_tool(tool,arguments)
+        body=value.structuredContent or json.loads(next(item.text for item in value.content if item.type=='text'))
+        if value.isError: raise AssertionError((tool,body))
+        return body
+    async def wait(client,job):
+        deadline=time.monotonic()+100
+        while time.monotonic()<deadline:
+            body=await call(client,'job_result',{'job_id':job})
+            if body['job']['state'] in TERMINAL:return body
+            await asyncio.sleep(.15)
+        raise AssertionError('native job failed to finish within check deadline')
+    async def run(client,name,task,selection,permissions=None):
+        work=directory/name;work.mkdir()
+        request={'request_id':str(uuid.uuid4()),'task':task,'context':'This is a temporary integration check. No external messages, installs or account changes.',
+                 'cwd':str(work),'selection':selection,'timeout_s':90}
+        if permissions:request['permissions']=permissions
+        started=time.monotonic()
+        accepted=await call(client,'delegate',request)
+        result=await wait(client,accepted['job']['job_id'])
+        report['checks'].append({'name':name,'request':request,'result':result,'elapsed_s':time.monotonic()-started})
+        (directory/'report.json').write_text(json.dumps(report,indent=2))
+        assert result['job']['state']=='succeeded',result
+        assert result['result']['verification']=='planner_review_required'
+        return work,result
+    try:
+        with (directory/'frontend-stderr.log').open('w') as log:
+            async with stdio_client(parameters,errlog=log) as streams:
+                async with ClientSession(*streams,read_timeout_seconds=timedelta(seconds=35)) as client:
+                    await client.initialize()
+                    assert {x.name for x in (await client.list_tools()).tools}=={'route','delegate','job_status','job_result','job_cancel'}
+                    for model in config['model_allowlist']:
+                        work,result=await run(client,'explicit-'+model,'Write exactly MCP_SERVICE_NATIVE_OK with no newline into worker-ok.txt in this working folder using a command tool. Then reply exactly MCP_SERVICE_NATIVE_OK.',{'mode':'explicit','model':model})
+                        assert (work/'worker-ok.txt').read_text()=='MCP_SERVICE_NATIVE_OK'
+                        assert result['result']['summary']=='MCP_SERVICE_NATIVE_OK'
+                    work,result=await run(client,'s1','Write exactly MCP_SERVICE_S1_OK with no newline into worker-ok.txt, then reply exactly MCP_SERVICE_S1_OK.',
+                        {'mode':'s1','routing_brief':'Write one small plain text fixture file in a temporary local directory. No dependencies and no external effects.'})
+                    assert (work/'worker-ok.txt').read_text()=='MCP_SERVICE_S1_OK'
+                    task=('Call the fixture visible_marker MCP tool once and use its return in your final response. '
+                          'Use a shell command to write exactly INSIDE_OK into permitted.txt in this working folder. '
+                          'Then use a command to attempt writing BLOCKED into '+str(outside/'blocked.txt')+'. '
+                          'This outside file is an owned test fixture and the sandbox should refuse it. Do not use the MCP tool to write files. '
+                          'Report the observed denied write and the MCP tool return. Do not seek permission or bypass the sandbox.')
+                    work,result=await run(client,'grant-and-boundary',task,{'mode':'explicit','model':'gpt-6-luna'},
+                        {'network':False,'mcp_servers':[{'name':'fixture','tools':['visible_marker']}]})
+                    assert not (outside/'blocked.txt').exists(),'outside-directory write escaped'
+                    assert (work/'permitted.txt').read_text()=='INSIDE_OK'
+                    records=[json.loads(line) for line in events.read_text().splitlines()]
+                    assert [x['kind'] for x in records if x['kind']!='started']==['visible_tool'],records
+                    assert 'GRANTED_TOOL_REACHED' in result['result']['summary']
+                    report['upstream_events']=records
+                    work=directory/'cancel';work.mkdir()
+                    code='import os,time,pathlib; pathlib.Path("child.pid").write_text(str(os.getpid())); time.sleep(60)'
+                    request={'request_id':str(uuid.uuid4()),'task':'Immediately run python3 -c '+repr(code)+' as one command. This is a cancellation test; do not replace or shorten the sleep.',
+                             'context':'Temporary process containment check.','cwd':str(work),
+                             'selection':{'mode':'explicit','model':'gpt-6-luna'},'timeout_s':90}
+                    accepted=await call(client,'delegate',request)
+                    deadline=time.monotonic()+45
+                    while not (work/'child.pid').exists() and time.monotonic()<deadline:await asyncio.sleep(.1)
+                    assert (work/'child.pid').exists(),'native cancellation child was not observed'
+                    pid=int((work/'child.pid').read_text())
+                    cancelled=await call(client,'job_cancel',{'job_id':accepted['job']['job_id']})
+                    result=await wait(client,accepted['job']['job_id'])
+                    report['checks'].append({'name':'cancellation','result':result,'child_pid':pid})
+                    assert result['job']['state']=='cancelled',result
+                    current=subprocess.run(['/bin/ps','-p',str(pid),'-o','state='],capture_output=True,text=True).stdout.strip()
+                    assert not current or current.startswith('Z'),('child survived',pid,current)
+        assert all(x['result']['result']['worker']['cli_version'] == '0.163.0' for x in report['checks'])
+        report['pass']=True
+    except BaseException as exc:
+        report['pass']=False; report['error']=repr(exc)
+        raise
+    finally:
+        report['finished_at_ms']=int(time.time()*1000)
+        (directory/'report.json').write_text(json.dumps(report,indent=2))
+        for pid,row in owned_brokers(state):
+            with contextlib.suppress(ProcessLookupError):os.kill(pid,signal.SIGTERM)
+        print(json.dumps({'directory':str(directory),'pass':report['pass'],'completed_checks':len(report['checks'])}))
+
+asyncio.run(main())

@@ -1,0 +1,24 @@
+{
+  "schema": "cortados.mcp-worker.config.v1",
+  "client_id": "claude-local",
+  "state_dir": "/Users/velox/.local/state/cortados-workers",
+  "codex_bin": "/opt/homebrew/bin/codex",
+  "codex_home": "/Users/velox/.codex",
+  "model_allowlist": [
+    "gpt-6-luna",
+    "gpt-6.1-sol",
+    "gpt-6-astra"
+  ],
+  "allow_network": false,
+  "connector_registry": {},
+  "limits": {
+    "max_concurrent_jobs": 2,
+    "max_timeout_s": 1800,
+    "termination_grace_s": 5,
+    "startup_timeout_s": 20,
+    "max_handoff_bytes": 65536,
+    "max_output_bytes": 8388608,
+    "metadata_max_age_s": 30,
+    "process_poll_ms": 20
+  }
+}

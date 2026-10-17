@@ -1,0 +1,10 @@
+cortados-workers:
+  Scope: User config (available in all your projects)
+  Status: ✔ Connected
+  Type: stdio
+  Command: /Users/velox/.local/share/cortados-workers/releases/a27afd05c4c1/venv/bin/python
+  Args: -B -m integrations.mcp --config /Users/velox/.config/cortados-workers/config.json
+  Environment:
+    CORTADOS_S1_URL=http://127.0.0.1:8431
+
+To remove this server, run: claude mcp remove cortados-workers -s user

@@ -1,6 +1,6 @@
 <!-- PURPOSE: Explain standalone operator setup and Claude-to-Codex delegation.
      CONTRACT: RT-MCP-001; examples do not install a service or grant live access.
-     DEPENDS: Built package, native Codex 0.162.1, saved ChatGPT login, optional S1. -->
+     DEPENDS: Built package, captured native Codex profiles, saved ChatGPT login, optional S1. -->
 # Use Claude as planner and Codex as worker
 
 The service gives Claude five MCP tools: `route`, `delegate`, `job_status`, `job_result` and
@@ -15,8 +15,9 @@ A route is advice; execution rechecks admission. A worker result always requires
 
 ## Install the standalone package
 
-Use the validated macOS Codex CLI **0.162.1** profile with an existing ChatGPT login. The service
-refuses a different CLI version or API-key login; it never extracts subscription credentials.
+Use a validated macOS Codex CLI **0.162.1 or 0.163.0** profile with an existing ChatGPT login.
+The [profile amendment](NATIVE-PROFILE-002.md) pins the observed version for each job and rechecks it
+before execution. Other versions and API-key logins refuse; subscription credentials stay native.
 Create a Python environment and install from this branch:
 
 ```sh
@@ -77,8 +78,8 @@ For a compatible stdio MCP client, the server entry is:
 }
 ```
 
-This example is supplied for your Claude configuration; the build does not install it into your live
-workspace. A client must be able to start the local process. A remote or sandboxed client cannot assume
+This is the portable configuration shape. The [installation record](INSTALLATION.md) records the
+actual local package, operator limits, Claude registration and verification status. A client must be able to start the local process. A remote or sandboxed client cannot assume
 it can reach your Mac's saved native login. Managed native policy or requirements that the captured
 profile cannot establish cause a visible startup refusal.
 
@@ -122,6 +123,7 @@ does not start or train S1. The routing brief is limited to 6,000 Unicode charac
 when too large. The full task and context go to the worker separately and unchanged. Omitting the
 brief scores `task + "\n\nCONTEXT:\n" + context`; the worker handoff has its own explicit reference-data label. S1 does not retain a conversation of its
 own; the planner supplies the relevant context. If S1 is unavailable, the request refuses visibly.
+See [S1 context and difficulty](S1-CONTEXT.md) for the exact context flow, evaluation limits and a useful brief.
 
 ## Share selected MCP tools
 
@@ -171,4 +173,5 @@ tracking is validated for the captured native harness; it does not promise conta
 unobserved daemon escapes.
 
 See [the contract](CONTRACT.md) for the exact protocol and [the baseline report](QA-BASELINE.md) for
-existing repository failures. The final build report records candidate verification separately.
+historical repository failures. The [build report](BUILD-REPORT.md) records their repairs and the
+current green verification separately.

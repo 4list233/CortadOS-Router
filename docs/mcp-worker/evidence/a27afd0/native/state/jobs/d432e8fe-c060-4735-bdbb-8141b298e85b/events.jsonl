@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a1484e-4f14-76c3-8dc9-5e3aa8575e09"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll write the exact text to `worker-ok.txt`.\n"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'printf %s MCP_SERVICE_NATIVE_OK > worker-ok.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'printf %s MCP_SERVICE_NATIVE_OK > worker-ok.txt'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"MCP_SERVICE_NATIVE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":29680,"cached_input_tokens":23680,"cache_write_input_tokens":0,"output_tokens":65,"reasoning_output_tokens":0}}

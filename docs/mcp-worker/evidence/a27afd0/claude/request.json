@@ -1,0 +1,15 @@
+{
+  "request_id": "7c16f714-6bc2-4d4a-81e2-20e8f5d7a3bb",
+  "task": "Write exactly CLAUDE_CODEX_MCP_OK with no newline into worker-ok.txt in this assigned working folder using a command tool. Then reply exactly CLAUDE_CODEX_MCP_OK.",
+  "context": "Temporary integration smoke test. No other files, installs, network calls or account changes.",
+  "cwd": "/Users/velox/.cortados-builds/mcp-worker-followup-verification/claude-planner-check/work",
+  "selection": {
+    "mode": "s1",
+    "routing_brief": "Write one fixed plain text marker in an empty temporary folder. Exact content and filename provided. One reversible local action; no dependencies or external effects."
+  },
+  "permissions": {
+    "network": false,
+    "mcp_servers": []
+  },
+  "timeout_s": 90
+}

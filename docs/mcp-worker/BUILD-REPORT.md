@@ -3,6 +3,13 @@
      DEPENDS: Pinned candidate, independently owned exam, retained command and native evidence. -->
 # MCP worker build verification
 
+**Current result:** follow-up source `a27afd0` passes all 331 accumulated router tests with no failures,
+errors or skips, the performance gate and six installed native subscription probes. See
+[2026-10-17 follow-up verification](#2026-10-17-follow-up-verification) and
+[the installation record](INSTALLATION.md). The original report below remains historical evidence.
+
+## Original 2026-10-16 report
+
 **Implementation verified; overall acceptance remains FAIL solely because of four documented
 pre-existing integration failures.** No new implementation failure, error or skip was found. No live
 Claude configuration, CortadOS runtime, installed plugin, login, launchd job or model weights were
@@ -162,3 +169,118 @@ limits and explicitly configuring compatible connector endpoints.
 Raw verification evidence is in [evidence/c0588b7](evidence/c0588b7/summary.json), with SHA256SUMS.
 Private runtime SQLite/config remain in the named scratch directories; no account or real connector credentials are copied into
 the repository. The connector proof uses a clearly labeled synthetic test value. The shared `/Users/velox/cortados` checkout was not edited by this implementation.
+
+## 2026-10-17 follow-up verification
+
+**PASS:** all 331 maintained router tests, the performance gate, six installed-wheel native probes,
+and the actual Claude planner → MCP → S1 → Codex chain. This supersedes the original report's
+four-failure gate and installation limitation. Tested production revision:
+`a27afd05c4c1293b0984bf09f0a547896b247b23`. The root's documentation changes were present during the
+run; the report retains their diff. All 395 tracked non-documentation files remained byte-identical
+through final evidence capture. This is the standalone router inventory plus its seven host integration
+modules, not a claim to have run unrelated CortadOS workstream suites.
+
+### Repairs and reviewed scope
+
+The independently committed baseline contract/exam `168397b` preceded builder commit
+`d40803fdf57369c19641e29a8a12ba6a66f3660a`. The four failures were resolved as follows:
+
+- Adopted the existing cron outcome collector into standalone `bin/route-crons.py`, preserving
+  occurrence attribution and idempotency without copying unrelated provider-steering behavior.
+- Updated exactly seven authorized source fields in shared `/Users/velox/cortados/faces.json` to the
+  frozen opt-in/dynamic reviewer policy. Root verified the complete before/after structural diff.
+  The shared checkout remains uncommitted; fleet rendering and live Hermes deployment were not run.
+- Corrected the two installer test inputs through QA-owned pristine Hermes source captures from
+  `9796235822b89e08597a402dad045b5b4464e474`. Original tests and assertions remain unchanged.
+  Only auxiliary/delegation installer lanes use these inputs; full-loop tests retain the real host.
+
+Codex had updated to 0.163.0. Independent compatibility capture verified all three models before the
+QA owner committed amendment/exam `9e649c4`. Builder `a27afd0` then added one native-profile owner,
+immutable accepted-version provenance, and a pre-execution version recheck. Original protected tests
+remain unchanged. Independent `/root/mcp_qa_followup` reviewed `9e649c4..a27afd0` with **no actionable
+findings**. Root ran the full gate independently afterward. No protected exam was changed by a builder.
+
+### Complete accumulated result
+
+| Lane | Passed | Failed / error / skipped |
+|---|---:|---:|
+| Standalone component and existing router cases | 189 | 0 / 0 / 0 |
+| Seven real host integration modules | 74 | 0 / 0 / 0 |
+| Original protected MCP acceptance | 53 | 0 / 0 / 0 |
+| Protected native-profile acceptance | 9 | 0 / 0 / 0 |
+| Protected baseline-repair acceptance | 6 | 0 / 0 / 0 |
+| **Total** | **331** | **0 / 0 / 0** |
+
+Exact root commands:
+
+```sh
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B \
+  /Users/velox/.cortados-builds/mcp-worker-followup-verification/run_full_suite.py \
+  /Users/velox/.cortados-builds/mcp-worker-followup-verification/a27afd0-full
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B \
+  /Users/velox/.cortados-builds/mcp-worker-followup-verification/native_check.py \
+  --installed \
+  --python /Users/velox/.local/share/cortados-workers/releases/a27afd05c4c1/venv/bin/python \
+  --directory /Users/velox/.cortados-builds/mcp-worker-followup-verification/a27afd0-native
+```
+
+Both exited zero. The [full report](evidence/a27afd0/suites/report.json) records every subprocess
+command, isolated environment override, duration and count. The saved runner rejects empty or skipped
+test lanes and keeps benchmark execution separate from test counts. All three protected manifests
+verified (167 original worker, 18 follow-up, 98 native-profile entries). Python/MCP and Hermes runtime
+versions remain those documented above. Existing SQLite ResourceWarnings are visible in the logs;
+they did not change test outcomes and were not suppressed.
+
+### Measured efficiency
+
+The same protected benchmark compares the original implementation with the candidate containing the
+extra native version probes. Raw samples are retained in both evidence directories. These are synthetic
+single-run orchestration measurements, not provider latency estimates or a statistical speed claim.
+
+| Workload | Direct reference median ms | Original c0588b7 end-to-end ms | Candidate a27afd0 end-to-end ms | Candidate added ms | Candidate polling p99 ms |
+|---|---:|---:|---:|---:|---:|
+| Small | 75.789 | 507.387 | 591.529 | 515.741 | 1.391 |
+| Typical | 67.304 | 409.080 | 459.887 | 392.583 | 1.461 |
+| 65,536-byte boundary | 69.068 | 578.856 | 626.735 | 557.667 | 1.602 |
+| Malformed terminal | 67.846 | 374.040 | 460.384 | 392.538 | 1.681 |
+
+Candidate end-to-end times increased by about 48–86 ms in these runs. Public polling remains below
+the protected 420.958375 ms p99 budget, preserves immutable results, and starts no new native work.
+The malformed-terminal workload fails visibly as required. No latency regression is concealed by
+changing the required semantics or acceptance threshold.
+
+### Actual subscription and Claude checks
+
+The installed release is a non-editable wheel from `a27afd0`; its 48 source/data entries match the
+tested source. Wheel SHA-256 is `bb6cebf49114a19ae8fcf2add5121af05dd8992bec07df747c4363809e5f7f3b`.
+It was exercised outside the checkout without a source PYTHONPATH.
+
+| Installed native probe | Result | End-to-end seconds |
+|---|---|---:|
+| Explicit `gpt-6-luna` | Exact marker file and terminal receipt | 6.561 |
+| Explicit `gpt-6.1-sol` | Exact marker file and terminal receipt | 5.425 |
+| Explicit `gpt-6-astra` | Exact marker file and terminal receipt | 6.368 |
+| Optional S1 selection | Actual scorer and subscription worker, exact marker | 7.631 |
+| MCP grant and folder boundary | Granted upstream tool reached; outside write denied and absent | 8.722 |
+| Cancellation | Observed real native child exited; cancelled result, no invented summary | Event timestamps retained |
+
+All six report native version 0.163.0. The separate QA capture corpus contains 12/12 per-model native
+command/MCP/boundary/cancellation checks. Root stopped only its temporary verification broker.
+
+Claude's user-scoped `cortados-workers` entry reports **Connected**. The user ran the prepared final
+check in their working Max-authenticated Terminal because Claude launched from Codex still returned
+an OAuth error. Root independently read the resulting [report](evidence/a27afd0/claude/report.json),
+persisted job, worker events and marker. **The complete planner/worker chain passed**: S1 R1/D=3,
+fresh subscription quota, `gpt-6.1-sol`, successful native 0.163.0 job and exact result retrieved by Claude.
+There is exactly one durable job for the request ID. No credentials or API keys were copied or changed.
+Claude's reported list-price telemetry is not evidence of an API charge.
+
+See [INSTALLATION.md](INSTALLATION.md) for paths, explicit limit reasons, connector setup and disabling
+the client entry. Connectors are supported but the operational registry is initially empty. No native
+Claude conversation or in-memory connector session is inherited. S1's actual context boundary and
+current evaluation are explained in [S1-CONTEXT.md](S1-CONTEXT.md).
+
+Ledger: `RT-MCP-FOLLOWUP-001 + RT-MCP-NATIVE-PROFILE-002 · source a27afd0 · root independent B ·
+0 unresolved findings · accumulated suite PASS · installed subscription seam PASS · Claude planner seam PASS`.
+Raw follow-up evidence is in [evidence/a27afd0](evidence/a27afd0/summary.json), with SHA256SUMS.
+The private job database, credential stores and full roster before-image are not committed.

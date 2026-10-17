@@ -1,0 +1,63 @@
+# Independent operator smoke check. Run from the terminal with the existing Claude login.
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent
+request = json.loads((ROOT / 'request.json').read_text())
+prompt = (
+    'You are the planner for a temporary integration check. Use only the cortados-workers MCP service. '
+    'Call its delegate tool with the exact following JSON, then poll job_result for that returned job_id '
+    'until terminal. Do not repeat the job under a new request ID, modify arguments, or do the worker task yourself. '
+    'On success reply exactly CLAUDE_CODEX_MCP_OK; on failure report the actual error. Request: '
+    + json.dumps(request)
+)
+command = ['/opt/homebrew/bin/claude', '-p', '--tools', '', '--strict-mcp-config',
+           '--mcp-config', str(ROOT / 'mcp.json'), '--setting-sources', '',
+           '--settings', '{"disableAllHooks":true}', '--no-session-persistence',
+           '--allowedTools', 'mcp__cortados-workers__delegate,mcp__cortados-workers__job_result,mcp__cortados-workers__job_status',
+           '--output-format', 'json', prompt]
+environment = os.environ.copy()
+for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+             'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'):
+    environment.pop(name, None)
+started = time.monotonic()
+print('Checking Claude planner -> S1 routing -> subscription Codex worker...', flush=True)
+try:
+    # Seconds: 180 covers planner startup, the 90-second worker cap and final polling.
+    # A shorter bound can cut off a valid check; a longer one hides a stalled planner.
+    result = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True, timeout=180)
+    (ROOT / 'claude-output.json').write_text(result.stdout)
+    (ROOT / 'claude-stderr.log').write_text(result.stderr)
+    reply = json.loads(result.stdout)
+    if result.returncode or reply.get('is_error'):
+        raise RuntimeError(reply.get('result', result.stderr or 'Claude invocation failed'))
+    db_path = Path.home() / '.local/state/cortados-workers/jobs.db'
+    with sqlite3.connect('file:' + str(db_path) + '?mode=ro', uri=True) as db:
+        row = db.execute('SELECT record FROM jobs WHERE client_id=? AND request_id=?',
+                         ('claude-local', request['request_id'])).fetchone()
+    if row is None:
+        raise RuntimeError('Claude did not submit the expected MCP worker request')
+    record = json.loads(row[0])
+    marker = Path(request['cwd']) / 'worker-ok.txt'
+    assert record['state'] == 'succeeded', record['state']
+    assert record['route']['selection_mode'] == 's1'
+    assert record['cli_version'] == '0.163.0'
+    assert marker.read_text() == 'CLAUDE_CODEX_MCP_OK'
+    assert reply.get('result', '').strip() == 'CLAUDE_CODEX_MCP_OK'
+    report = {'pass': True, 'elapsed_s': time.monotonic() - started,
+              'request_id': request['request_id'], 'job_id': record['job_id'],
+              'route': record['route'], 'worker_state': record['state'],
+              'cli_version': record['cli_version'], 'marker_verified': True,
+              'claude_reply': reply['result'], 'claude_model_usage': reply.get('modelUsage')}
+    (ROOT / 'report.json').write_text(json.dumps(report, indent=2))
+    print('PASS: Claude planned, S1 routed, Codex wrote the marker, and Claude retrieved the result.')
+except Exception as error:
+    (ROOT / 'report.json').write_text(json.dumps({'pass': False, 'error': str(error),
+                                                'elapsed_s': time.monotonic() - started}, indent=2))
+    print('CHECK NOT COMPLETE:', error)
+    sys.exit(1)

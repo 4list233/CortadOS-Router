@@ -1,0 +1,28 @@
+{
+  "revision": "a27afd05c4c1293b0984bf09f0a547896b247b23",
+  "full_suite": {
+    "passed": 331,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "benchmark_pass": true,
+  "installed_native_checks": {
+    "passed": 6,
+    "failed": 0
+  },
+  "compatibility_captures": {
+    "passed": 12,
+    "failed": 0
+  },
+  "claude_planner_smoke_pass": true,
+  "claude_job_id": "5e612218-93ea-46dc-8471-fef3acdbb7e8",
+  "claude_mcp_connected": true,
+  "unchanged_non_documentation_files_since_test": 395,
+  "independent_source_review": {
+    "reviewer": "/root/mcp_qa_followup",
+    "diff": "9e649c4..a27afd0",
+    "actionable_findings": 0
+  },
+  "claude_report_cost_note": "costUSD is reported list-price telemetry, not evidence of an API charge; the check used existing subscription authentication."
+}

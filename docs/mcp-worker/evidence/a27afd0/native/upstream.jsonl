@@ -1,0 +1,3 @@
+{"kind": "started", "pid": 76726, "marker_environment": {"MCP_FIXTURE_SECRET": "SYNTHETIC_ROOT_NATIVE_CHECK_ONLY"}}
+{"kind": "started", "pid": 76799, "marker_environment": {"MCP_FIXTURE_SECRET": "SYNTHETIC_ROOT_NATIVE_CHECK_ONLY"}}
+{"kind": "visible_tool", "pid": 76799}

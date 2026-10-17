@@ -1,0 +1,16 @@
+{
+  "before_sha256": "837507ba8570900871fa2a78751fde783bc71f4e90095e41f7f2113fe45f40ab",
+  "after_sha256": "24d1c084dfc73e7cd8ee6cd3e2a892a88902ec2ce83fd082877b69440ead375e",
+  "changed_json_paths": [
+    "rules[2]",
+    "faces.rachel.brain",
+    "faces.rachel.identity",
+    "faces.rachel.role",
+    "faces.samantha.brain",
+    "faces.samantha.identity",
+    "faces.samantha.role"
+  ],
+  "other_json_values_unchanged": true,
+  "shared_checkout_committed": false,
+  "private_before_image": "/Users/velox/.cortados-builds/mcp-worker-followup-verification/private/faces-before.json"
+}

@@ -1,0 +1,57 @@
+{
+  "pass": true,
+  "elapsed_s": 20.45482566699866,
+  "request_id": "7c16f714-6bc2-4d4a-81e2-20e8f5d7a3bb",
+  "job_id": "5e612218-93ea-46dc-8471-fef3acdbb7e8",
+  "route": {
+    "route_id": "f31c56d4-830e-41c8-89fe-10d831efa76f",
+    "selection_mode": "s1",
+    "chosen": {
+      "lane": "codex",
+      "provider": "codex-cli",
+      "model": "gpt-6.1-sol",
+      "account_ref": "native-default"
+    },
+    "band": "R1",
+    "D": 3,
+    "suggested_subagents": 0,
+    "skipped": [
+      {
+        "provider": "codex-cli",
+        "model": "gpt-6-luna",
+        "reason": "below the face floor (general 47.4 < 50)"
+      }
+    ],
+    "context": {
+      "worker_bytes": 337,
+      "scorer_chars": 166,
+      "scorer_digest": "9eecac945df050b7afc9ba8c3769129db77d0dde3d5ce5a4d399c15b4d0f0d9f"
+    },
+    "quota": {
+      "status": "fresh",
+      "source": "codex-app-server",
+      "sampled_at_ms": 1792214742230
+    },
+    "warnings": []
+  },
+  "worker_state": "succeeded",
+  "cli_version": "0.163.0",
+  "marker_verified": true,
+  "claude_reply": "CLAUDE_CODEX_MCP_OK",
+  "claude_model_usage": {
+    "claude-opus-5-5": {
+      "inputTokens": 12,
+      "outputTokens": 801,
+      "cacheReadInputTokens": 30475,
+      "cacheCreationInputTokens": 7399,
+      "webSearchRequests": 0,
+      "costUSD": 0.081355,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "thinkingTokens": 0,
+      "canonicalModel": "claude-opus-5-5",
+      "provider": "firstParty",
+      "costBasis": "list"
+    }
+  }
+}

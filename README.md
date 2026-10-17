@@ -21,12 +21,14 @@ require current known quota; S1 uses the existing capability and scarcity resolv
 the full supplied task/context, a folder-scoped sandbox and only explicitly granted MCP tools.
 
 Five tools expose durable start/poll/cancel execution: `route`, `delegate`, `job_status`, `job_result`
-and `job_cancel`. This first version runs Codex only, on the captured macOS CLI 0.162.1 profile. It does
+and `job_cancel`. This first version runs Codex only, on captured macOS CLI 0.162.1 and 0.163.0 profiles. It does
 not place arbitrary models inside Claude's harness or import Claude's live connector sessions.
 
 See the [operator guide](docs/mcp-worker/USAGE.md), [reviewed contract](docs/mcp-worker/CONTRACT.md)
-and [build verification](docs/mcp-worker/BUILD-REPORT.md). All 87 new worker tests and six real-native
-checks pass; the complete accumulated suite remains at 304 pass and four pre-existing failures. No live client configuration is installed by this build.
+and [build verification](docs/mcp-worker/BUILD-REPORT.md). The complete accumulated router suite now
+passes **331 tests with no failures, errors or skips**, and all six installed native subscription checks
+pass. The [local installation record](docs/mcp-worker/INSTALLATION.md) tracks Claude Code activation.
+See [S1 context and difficulty](docs/mcp-worker/S1-CONTEXT.md) for what the scorer actually receives.
 
 ## The 12 questions
 
@@ -188,10 +190,11 @@ This is the code CortadOS runs today, extracted from its private repo without re
 - Mandatory routing for agent, cron, delegation and auxiliary calls, when a profile sets `agent.model_router`.
 - Shadow logging of every decision.
 
-**Legacy baseline before the MCP build.** `python3 -B -m unittest discover -s tests -t .` ran 155 tests: 148 passed, 6 were skipped and 1 failed. Running all real integration cases separately accounted for 221 unique cases: 217 passed and four failed. See [the complete baseline](docs/mcp-worker/QA-BASELINE.md); the skipped module placeholders are not full integration coverage.
-- **Skipped:** the six Hermes integration modules in `tests/integration`, which need pytest and an importable Hermes.
-- **Failing:** `test_profile_instructions_are_opt_in_and_dynamic`. It reads CortadOS's live `faces.json` and fails until the
-  opt-in dual-review rules are applied there; that deployment is still pending.
+**Current standalone verification:** source `a27afd0` passes all 331 maintained cases, including seven
+real integration modules and all three protected acceptance packages. The [follow-up report](docs/mcp-worker/BUILD-REPORT.md#2026-10-17-follow-up-verification)
+records commands, pinned host inputs, source hashes and native checks. The four failures in the
+[historical baseline](docs/mcp-worker/QA-BASELINE.md) are resolved. Running unittest discovery alone
+still does not replace the separate pytest integration lanes.
 
 The tests use a pinned benchmark catalog (`tests/fixtures/`), so the nightly table refresh can't break them.
 
