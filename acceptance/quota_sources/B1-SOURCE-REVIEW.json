@@ -1,0 +1,139 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "reviewer": "/root/quota_evaluation_qa",
+  "attempt": 1,
+  "state": "source_review_complete; full_suite_performance_parity_pending; activation_blocked",
+  "package_revision": "b0ed0fbe3eb67557603cd48d103aaa4ab57f3107",
+  "package_sources": {
+    "cortados_router/cursor_quota.cjs": "944941eaf6fdf18bd504d0cf1bbe156c77a28d9d5e0b670e51d57255130c81fd",
+    "cortados_router/probe_reaper.py": "734d9a10e2c5fb7ce8920a44f51504c04ee111baae0597909c0f354dc285ffec",
+    "cortados_router/quota_admission.py": "aae2704833d224a4c3a0f1f13001d82c47c34da34864a4787dcf470e4f710b03",
+    "cortados_router/quota_observations.py": "9cd1c459c18d8e452625ab7241c89857dddb4f1cdb868faf4feba3622f0c1fd2",
+    "cortados_router/quota_sources.py": "c61c3d91a950d0310ae5df9223cdb2bae238a44e31d9b5d45e628cdf8f9471cd",
+    "cortados_router/scarcity.py": "e2db4e034029c0d826506a0aa3ec7621e8f6085d0e0c094b13631633fcde419c",
+    "pyproject.toml": "f7516262d17c7ddb3f19ba0b1e6e4ac3c99067244c95795a07e16a9b28e3fa7d",
+    "tests/test_quota_sources.py": "0fb5f030e34be7ff3c2392f3b6db6fcff0cd514a7aa083e43749e12f7aac27af"
+  },
+  "stage_manifest_sha256": "4be3747fa8a9ded123daa0648ab157624274c8abe5af4f7b5e4f2eda5db66741",
+  "stage_manifest": {
+    "train/build_sft.py": {
+      "before_sha256": "983b22139a8c836ae07430ede1ce9e51296dbedec39e1c39d551cb46e459355a",
+      "candidate_sha256": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+      "bytes": 4842,
+      "lines_before": 95,
+      "lines_candidate": 95,
+      "mode": 420
+    },
+    "train/nightly.sh": {
+      "before_sha256": "2476cfb97abf79b9b78b927387e9e8c945a56bb986ca267a8ff58b5d3118c2aa",
+      "candidate_sha256": "a01a86b212a60344ade3e1f5c5486383c64d63b7980af592b105197a666f7e7f",
+      "bytes": 13422,
+      "lines_before": 185,
+      "lines_candidate": 185,
+      "mode": 493
+    },
+    "train/dataset.py": {
+      "before_sha256": "5d8255e4d57489ad995266b1e68316af5c36e95642f189db388de7bd20945b98",
+      "candidate_sha256": "2a9df0126c5434aacbc9f14443f1d78febfa33ec17fa114fa81e99a5c42b7f04",
+      "bytes": 3249,
+      "lines_before": 65,
+      "lines_candidate": 65,
+      "mode": 420
+    },
+    "train/label.py": {
+      "before_sha256": "b1655232a7ff54c799af2668b063ca23f16fd08a88aa454c31035346989fa5f4",
+      "candidate_sha256": "781021a725a8a2ae1e91cd5c72700126908284be1f8a46abc6b771235573de84",
+      "bytes": 11738,
+      "lines_before": 205,
+      "lines_candidate": 208,
+      "mode": 420
+    },
+    "train/evaluate.py": {
+      "before_sha256": "19032becc842cee2baa935136314548bc727104b968bc1123188138e9947f285",
+      "candidate_sha256": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+      "bytes": 15993,
+      "lines_before": 266,
+      "lines_candidate": 266,
+      "mode": 420
+    },
+    "plugins/cortados-pty/runner.py": {
+      "before_sha256": "c4a41ed67148f7f153d46f4e49edace559a1a212843c1c7fdcdfe63abb6d1e3f",
+      "candidate_sha256": "922963708783a25bcac875cfd530bc5aa21a7a8a4437dba8f2a3097e8aff33d6",
+      "bytes": 49039,
+      "lines_before": 945,
+      "lines_candidate": 953,
+      "mode": 420
+    },
+    "plugins/cortados-pty/model_routing.py": {
+      "before_sha256": "4a8341b1b73b2f45a70e2688218b4af97b3db9851e17fdcfd477d583f1e15d9f",
+      "candidate_sha256": "bd0c3458460c12897c754382d0ae3c609e8123c0f3efb1fcc87322c32f8b6791",
+      "bytes": 9575,
+      "lines_before": 190,
+      "lines_candidate": 213,
+      "mode": 420
+    },
+    "plugins/cortados-router/scarcity.py": {
+      "before_sha256": "188a85d752f91d9921235f72614dcf7bd90c3c39916fa62ec91829fc8b919c4d",
+      "candidate_sha256": "3ea3ef9d15eda2ffa6aa765ae461f68a6f6866f0d5c375575243a598d71420d4",
+      "bytes": 35811,
+      "lines_before": 672,
+      "lines_candidate": 668,
+      "mode": 420
+    },
+    "plugins/cortados-router/quota_policy.py": {
+      "before_sha256": "fd0405bb8e09bcd966a6c580713df57cad330fc37f4ab7ad33fe8599bfc1778a",
+      "candidate_sha256": "f29e958c4408775effcffaebd33e78357d008ac24b9a866ee74813870c81defe",
+      "bytes": 4208,
+      "lines_before": 72,
+      "lines_candidate": 100,
+      "mode": 420
+    }
+  },
+  "confirmed_findings": [
+    {
+      "id": "B1-01",
+      "priority": "P1",
+      "file": "plugins/cortados-router/scarcity.py",
+      "line": 418,
+      "problem": "Bare import can select unrelated cached quota_policy or fail in maintained train/common -> core -> scarcity file-loader geometry. Bind sibling bridge with pinned installed owner origin.",
+      "exam_commit": "2683408",
+      "evidence": "acceptance/quota_sources/evidence/status-origin-b1-red.log",
+      "red": {
+        "tests": 2,
+        "failures": 1,
+        "errors": 1,
+        "skips": 0
+      }
+    },
+    {
+      "id": "B1-02",
+      "priority": "P1",
+      "file": "cortados_router/scarcity.py",
+      "line": 139,
+      "related_file": "cortados_router/probe_reaper.py:39",
+      "problem": "New fallible identity acquisition executes before cleanup scope after real PTY fork. Missing identity or identity OSError leaves the direct child and PTY fd alive. Refusal must clean the unreaped directly owned root and fd without guessing descendant identities.",
+      "exam_commit": "f65eefc",
+      "evidence": "acceptance/quota_sources/evidence/probe-start-failure-b1-red.log",
+      "red": {
+        "tests": 2,
+        "failures": 2,
+        "errors": 0,
+        "skips": 0
+      }
+    }
+  ],
+  "non_findings": [
+    {
+      "issue": "Final recapture token validity",
+      "result": "Current source rechecks _usable after capture; two independent methods pass and guard-removal mutant fails both. Additional coverage commit26b3026, not a frozen-candidate defect."
+    },
+    {
+      "issue": "DIRENV_DISABLE=1",
+      "result": "Exact captured native direnv owner returns skipped/disabled before envrc lookup; actual captured value is supported. No bypass finding."
+    }
+  ],
+  "reviewed": "All eight package diff paths and nine staged diff paths; capture env/argv/cwd and file generations, fixed native dependency manifest, credential/config read-only guards, source geometry, child envelope/nonce, lifecycle bounds, private context/cache surfaces, Codex v005 delegation, final deadline, Runner/teacher private context migration.",
+  "independent_methods": 83,
+  "production_edits": false,
+  "provider_calls": false
+}
