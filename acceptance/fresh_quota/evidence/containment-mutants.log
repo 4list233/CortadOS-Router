@@ -1,0 +1,34 @@
+test_deadline_contains_pty_session_and_nested_setsid_helper (__main__.GroupMutant.test_deadline_contains_pty_session_and_nested_setsid_helper) ... FAIL
+
+======================================================================
+FAIL: test_deadline_contains_pty_session_and_nested_setsid_helper (__main__.GroupMutant.test_deadline_contains_pty_session_and_nested_setsid_helper)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py", line 212, in test_deadline_contains_pty_session_and_nested_setsid_helper
+    self.assertTrue(proc.returncode or not proc.stdout.strip() or proc.stdout.strip().startswith('Z'),
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    'quota observation left an escaped PTY/session helper runnable')
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : quota observation left an escaped PTY/session helper runnable
+
+----------------------------------------------------------------------
+Ran 1 test in 2.085s
+
+FAILED (failures=1)
+test_child_that_never_reads_config_cannot_block_deadline (__main__.WriteMutant.test_child_that_never_reads_config_cannot_block_deadline) ... FAIL
+
+======================================================================
+FAIL: test_child_that_never_reads_config_cannot_block_deadline (__main__.WriteMutant.test_child_that_never_reads_config_cannot_block_deadline)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py", line 219, in test_child_that_never_reads_config_cannot_block_deadline
+    result = self.bounded_call()
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py", line 196, in bounded_call
+    self.assertTrue(timely, 'quota collection exceeded its deadline while writing/reading pipes')
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : quota collection exceeded its deadline while writing/reading pipes
+
+----------------------------------------------------------------------
+Ran 1 test in 5.023s
+
+FAILED (failures=1)

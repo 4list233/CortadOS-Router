@@ -1,5 +1,5 @@
 # PURPOSE: Pin the observed Codex status reset and session-label parsing defects.
-# CONTRACT: Draft fresh-quota 005; expected quota values are source observations.
+# CONTRACT: RT-FRESH-QUOTA-005; expected quota values are source observations.
 # DEPENDS: Actual scarcity.parse_codex_status and sanitized captured status fragment.
 # CEILING: Parser fixtures do not establish provider freshness or execution permission.
 from datetime import datetime
@@ -83,6 +83,15 @@ class CodexStatus(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]['resets_at'])
         self.assertIsNone(rows[0]['resets_in_h'])
+
+    def test_malformed_calendar_or_clock_keeps_reset_unknown(self):
+        for when in ('3:99 AM on 22 Oct', '3:22 AM on 31 Feb', '13:22 AM on 22 Oct',
+                     '00:22 PM on 22 Oct', '24:22 on 22 Oct', '3:22 AM on 22 Xxx'):
+            with self.subTest(when=when):
+                rows = self.parse(f'Weekly limit: [bar] 64% left (resets {when})')
+                self.assertEqual(len(rows), 1)
+                self.assertIsNone(rows[0]['reset_epoch'])
+                self.assertIsNone(rows[0]['resets_at'])
 
 
 class FrozenLiveCodexStatus(CodexStatus):

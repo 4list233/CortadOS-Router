@@ -11,6 +11,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import traceback
 import time
 import unittest
 from unittest.mock import patch
@@ -55,11 +57,23 @@ class Collection(unittest.TestCase):
         self.addCleanup(self.cleanup_processes)
 
     def cleanup_processes(self):
+        # Only PIDs written by this private fixture; contain escaped test children even on red.
+        for row in self.rows():
+            pid = row.get('escaped_pid') or row.get('child_pid')
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         for process in self.processes:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    if process.poll() is None:
+                        raise
             process.wait(timeout=3)
 
     def call(self, lanes=('codex',)):
@@ -162,3 +176,57 @@ class Collection(unittest.TestCase):
     def test_empty_lane_set_has_no_observation_io(self):
         self.assertEqual(self.call(()), ())
         self.launch.assert_not_called()
+
+    def bounded_call(self):
+        results, errors = [], []
+        def run():
+            try:
+                results.append(self.call())
+            except BaseException as exc:
+                errors.append(traceback.format_exc())
+        started = time.monotonic()
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        # 1s probe + 1s cleanup grace + 3s scheduler allowance; never mask an unbounded write.
+        worker.join(5)
+        timely = not worker.is_alive()
+        if not timely:
+            self.cleanup_processes()
+            worker.join(3)
+        self.assertTrue(timely, 'quota collection exceeded its deadline while writing/reading pipes')
+        self.assertFalse(errors, repr(errors))
+        self.assertLess(time.monotonic() - started, 5)
+        return results[0]
+
+    def test_deadline_contains_pty_session_and_nested_setsid_helper(self):
+        self.control['mode'] = 'escaped-hang'
+        result = self.bounded_call()
+        self.assertEqual(result[0]['error']['code'], 'quota_unknown')
+        escaped = [row for row in self.rows() if 'escaped_pid' in row]
+        self.assertEqual(len(escaped), 2, 'fixture must create both PTY child and nested setsid helper')
+        root_pid = self.processes[0].pid
+        for row in escaped:
+            self.assertNotEqual(row['pgid'], root_pid, 'fixture must escape original probe group')
+            proc = subprocess.run(['ps', '-o', 'stat=', '-p', str(row['escaped_pid'])],
+                                  capture_output=True, text=True)
+            self.assertTrue(proc.returncode or not proc.stdout.strip() or proc.stdout.strip().startswith('Z'),
+                            'quota observation left an escaped PTY/session helper runnable')
+
+    def test_child_that_never_reads_config_cannot_block_deadline(self):
+        self.control['mode'] = 'no-read-stdin'
+        # 2MiB is deliberately larger than the platform pipe buffer; valid config has no text cap.
+        self.config['client_id'] = 'fixture-client-' + 'x' * 2097152
+        result = self.bounded_call()
+        self.assertEqual(result[0]['error']['code'], 'quota_unknown')
+        self.assertIsNone(result[0]['record'])
+        self.assertEqual(len(self.processes), 1)
+        self.assertIsNotNone(self.processes[0].poll(), 'nonreading child was not reaped')
+
+    def test_process_inventory_failure_cannot_make_cleanup_unbounded(self):
+        from integrations.mcp import native_process
+        self.control['mode'] = 'no-read-stdin'
+        with patch.object(native_process, 'process_table', side_effect=OSError('fixture inventory unavailable')):
+            result = self.bounded_call()
+        self.assertEqual(result[0]['error']['code'], 'quota_unknown')
+        self.assertIsNone(result[0]['record'])
+        self.assertIsNotNone(self.processes[0].poll(), 'owned probe root remains runnable after inventory failure')

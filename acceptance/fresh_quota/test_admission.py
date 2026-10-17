@@ -152,6 +152,52 @@ class Admission(PolicyCase):
         proof = dict(scope(), extra='not canonical')
         self.assertEqual(self.check([observation()], auth_scope=proof)['status'], 'unknown')
 
+    def test_explicit_native_spent_without_windows_is_spent_not_unknown(self):
+        row = observation()
+        row['record']['windows'] = []
+        row['record']['refusing'] = True
+        result = self.check([row])
+        self.assertEqual(result['status'], 'spent')
+        self.assertIsNone(result['pool'], 'absent windows cannot invent a pool observation')
+
+
+    def test_antigravity_other_pool_spent_does_not_refuse_selected_pool(self):
+        from cortados_router import scarcity
+        for selected, other, model in (('gemini', 'claude-gpt', 'gemini-3-pro'),
+                                        ('claude-gpt', 'gemini', 'claude-fable-5')):
+            with self.subTest(selected=selected):
+                row = observation('antigravity', pool=selected)
+                row['record']['windows'] += observation('antigravity', pool=other, used=99)['record']['windows']
+                row['record'] = scarcity.finish('antigravity', row['record'])
+                self.assertEqual(self.check([row], provider='agy-cli', model=model)['status'], 'available')
+
+    def cursor_record(self, *, own=99, other=36, general=None):
+        from cortados_router import scarcity
+        row = observation('cursor', pool='cursor-models', used=own)
+        row['record']['windows'] += observation('cursor', pool='other-models', used=other)['record']['windows']
+        if general is not None:
+            row['record']['windows'] += observation('cursor', pool='all', used=general)['record']['windows']
+        row['record'] = scarcity.finish('cursor', row['record'])
+        return row
+
+    def test_cursor_own_pool_spent_preserves_existing_other_pool_overflow(self):
+        result = self.check([self.cursor_record()], provider='cursor-cli', model='composer-2')
+        self.assertEqual(result['status'], 'available')
+
+    def test_cursor_both_pools_spent_refuses(self):
+        result = self.check([self.cursor_record(other=99)], provider='cursor-cli', model='composer-2')
+        self.assertEqual(result['status'], 'spent')
+
+    def test_cursor_general_spent_still_binds_overflow_pool(self):
+        result = self.check([self.cursor_record(own=36, other=36, general=99)],
+                            provider='cursor-cli', model='composer-2')
+        self.assertEqual(result['status'], 'spent')
+
+    def test_native_global_spent_flag_binds_even_when_windows_have_headroom(self):
+        row = observation()
+        row['record']['refusing'] = True
+        self.assertEqual(self.check([row])['status'], 'spent')
+
 
 class ResourceSnapshot(PolicyCase):
     def test_unknown_learned_cost_preserves_known_quota(self):
@@ -220,3 +266,19 @@ class ResourceSnapshot(PolicyCase):
         bad = candidate(provider='openai-codex')
         resources = self.resources([good, bad], (observation(),))
         self.assertEqual(resources.allowed_routes, (('codex-cli', 'gpt-6.1-sol'),))
+
+    def test_actual_model_pool_cannot_be_hidden_by_generic_candidate_family(self):
+        from cortados_router import scarcity
+        row = observation('claude')
+        row['record']['windows'] += observation('claude', pool='fable', used=99)['record']['windows']
+        row['record'] = scarcity.finish('claude', row['record'])
+        c = candidate('claude', 'claude-fable-5', 'claude-cli', family='claude')
+        self.assertEqual(self.resources([c], (row,)).allowed_routes, ())
+
+    def test_explicit_candidate_pool_remains_binding(self):
+        from cortados_router import scarcity
+        row = observation('claude')
+        row['record']['windows'] += observation('claude', pool='fable', used=99)['record']['windows']
+        row['record'] = scarcity.finish('claude', row['record'])
+        c = candidate('claude', 'claude-sonnet-5', 'claude-cli', family='claude', pool='fable')
+        self.assertEqual(self.resources([c], (row,)).allowed_routes, ())

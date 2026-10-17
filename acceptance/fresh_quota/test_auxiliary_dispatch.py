@@ -194,3 +194,13 @@ class AuxiliaryDispatch(StageCase):
                     with self.adapter._dispatch(client, self.kwargs):
                         pass
                 self.assert_refused(enter_dispatch, 'quota_unknown')
+
+    def test_available_callback_with_malformed_observation_metadata_refuses(self):
+        for field, value in (('age_s', None), ('age_s', float('nan')), ('age_s', True),
+                             ('observed_at', None), ('observed_at', float('inf')),
+                             ('lane', None), ('pool', None)):
+            with self.subTest(field=field, value=value):
+                result = quota()
+                result['quota'][field] = value
+                self.result = [result]
+                self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')

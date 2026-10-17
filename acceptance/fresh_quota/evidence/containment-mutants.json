@@ -1,0 +1,33 @@
+{
+  "source_sha256": "58870f1551af4c1a5196bb53697b997114322a00ca4e667a8df89be133fe41dc",
+  "results": [
+    {
+      "mutant": "GroupMutant",
+      "test": "test_deadline_contains_pty_session_and_nested_setsid_helper",
+      "tests": 1,
+      "failures": [
+        {
+          "test": "test_deadline_contains_pty_session_and_nested_setsid_helper (__main__.GroupMutant.test_deadline_contains_pty_session_and_nested_setsid_helper)",
+          "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 212, in test_deadline_contains_pty_session_and_nested_setsid_helper\n    self.assertTrue(proc.returncode or not proc.stdout.strip() or proc.stdout.strip().startswith('Z'),\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                    'quota observation left an escaped PTY/session helper runnable')\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: False is not true : quota observation left an escaped PTY/session helper runnable\n"
+        }
+      ],
+      "errors": [],
+      "skips": [],
+      "detected": true
+    },
+    {
+      "mutant": "WriteMutant",
+      "test": "test_child_that_never_reads_config_cannot_block_deadline",
+      "tests": 1,
+      "failures": [
+        {
+          "test": "test_child_that_never_reads_config_cannot_block_deadline (__main__.WriteMutant.test_child_that_never_reads_config_cannot_block_deadline)",
+          "traceback": "Traceback (most recent call last):\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 219, in test_child_that_never_reads_config_cannot_block_deadline\n    result = self.bounded_call()\n  File \"/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_collection.py\", line 196, in bounded_call\n    self.assertTrue(timely, 'quota collection exceeded its deadline while writing/reading pipes')\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: False is not true : quota collection exceeded its deadline while writing/reading pipes\n"
+        }
+      ],
+      "errors": [],
+      "skips": [],
+      "detected": true
+    }
+  ]
+}

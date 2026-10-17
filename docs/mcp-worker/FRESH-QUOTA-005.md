@@ -11,7 +11,7 @@ status: frozen
 implements: [RT-MCP-001]
 depends_on: [RT-QUOTA-EVALUATION-004, RT-MCP-LEARNING-003]
 blocks: []
-attempt_ledger: ["D/A-1: independent review closed; B candidate pending"]
+attempt_ledger: ["D/A-1: independent review closed", "A2: 130 exams; pool-scope clarification", "B1: eight grouped findings returned; corrected candidate pending"]
 ---
 
 # Fresh quota admission for MCP and the legacy fleet
@@ -202,7 +202,8 @@ as one UTF-8 JSON object. Stdout is exactly one newline-terminated JSON object w
 `{source: nonblank string, auth_scope: AuthScope, record: existing scarcity record|null, error: null|{code:
 "quota_unknown"|"quota_spent", reason: nonblank string}}`. Successful source observation has nonnull
 record and null error; a typed source failure has null record and nonnull error. A complete spent
-record may have null error and `refusing:true`; admission still refuses it. Timestamps are absent from
+record may have null error and `refusing:true`; admission interprets that flag at its existing
+general/native or selected-pool scope, as defined below. Timestamps are absent from
 child output: only the parent assigns its probe-start timestamps. Both typed outcomes exit zero;
 invalid CLI input exits nonzero, as do unexpected crashes. Nonzero exit, extra stdout values/keys,
 invalid JSON or inconsistent record/error fields yield parent `quota_unknown`. Stderr is diagnostic data. No secrets or
@@ -321,7 +322,20 @@ owner; Claude needs general `all` and any observed matching specific pool return
 An explicit candidate pool must exist. The `info` pool is never sufficient for admission. If a required
 pool is absent, refuse as unknown; do not substitute an unrelated pool. This does not invent unseen
 Claude pool names; observed general windows plus matching reported pools retain their existing meaning. Codex's captured bucket
-is general `all`, and a session UUID cannot create a pool. Local records require fresh finite resource
+is general `all`, and a session UUID cannot create a pool.
+
+**[FIXED; AC-FQ03]** A record's `refusing` flag retains its existing scope. Codex native/global
+refusal remains binding, and Codex/Claude required general windows remain binding. For Cursor and
+Antigravity, admission MUST use the selected pool's `spent` result from unchanged
+`scarcity.finish(lane, validated_record)["pools"][selected]`. That owner already combines applicable
+general windows and preserves Cursor's existing overflow from spent `cursor-models` into
+`other-models`. Admission MUST NOT apply the default-lane `record.refusing` flag to every pool, nor
+reapply a raw selected-window `used_pct >= 99` check after `finish` has applied overflow. Without a
+general window, the lane display may reflect spent Gemini or Cursor-models usage while another
+selected pool remains available. Missing required pools remain unknown; spent general windows and
+spent selected pools remain refused. No new overflow, pool substitution or scarcity formula is added.
+
+Local records require fresh finite resource
 scarcity and a successful source observation but no subscription windows; status `kind=local_resource`
 expresses that distinction with no invented percent.
 
@@ -718,7 +732,7 @@ sequenceDiagram
 ```
 
 Independent D/A review: **D=0, A=0**, `/root/quota_evaluation_qa`, October 17, 2026.
-The protected package records 116 executable cases, method selectors, sanitized capture provenance,
+The protected package records 130 executable cases, method selectors, sanitized capture provenance,
 exact before manifests, source-binding inventory, render artifacts and intentional prebuild failures.
 Preserved shared PTY delivery and FD cleanup baseline: 27 passed, zero failures/errors/skips.
 Builder implementation and B validation remain pending. Root owns the unchanged required-routing

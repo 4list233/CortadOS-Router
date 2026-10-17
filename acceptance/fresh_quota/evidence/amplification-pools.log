@@ -1,0 +1,35 @@
+test_antigravity_other_pool_spent_does_not_refuse_selected_pool (acceptance.fresh_quota.test_admission.Admission.test_antigravity_other_pool_spent_does_not_refuse_selected_pool) ...
+  test_antigravity_other_pool_spent_does_not_refuse_selected_pool (acceptance.fresh_quota.test_admission.Admission.test_antigravity_other_pool_spent_does_not_refuse_selected_pool) (selected='claude-gpt') ... FAIL
+test_cursor_own_pool_spent_preserves_existing_other_pool_overflow (acceptance.fresh_quota.test_admission.Admission.test_cursor_own_pool_spent_preserves_existing_other_pool_overflow) ... FAIL
+test_cursor_both_pools_spent_refuses (acceptance.fresh_quota.test_admission.Admission.test_cursor_both_pools_spent_refuses) ... ok
+test_cursor_general_spent_still_binds_overflow_pool (acceptance.fresh_quota.test_admission.Admission.test_cursor_general_spent_still_binds_overflow_pool) ... ok
+test_native_global_spent_flag_binds_even_when_windows_have_headroom (acceptance.fresh_quota.test_admission.Admission.test_native_global_spent_flag_binds_even_when_windows_have_headroom) ... ok
+
+======================================================================
+FAIL: test_antigravity_other_pool_spent_does_not_refuse_selected_pool (acceptance.fresh_quota.test_admission.Admission.test_antigravity_other_pool_spent_does_not_refuse_selected_pool) (selected='claude-gpt')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_admission.py", line 172, in test_antigravity_other_pool_spent_does_not_refuse_selected_pool
+    self.assertEqual(self.check([row], provider='agy-cli', model=model)['status'], 'available')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'spent' != 'available'
+- spent
++ available
+
+
+======================================================================
+FAIL: test_cursor_own_pool_spent_preserves_existing_other_pool_overflow (acceptance.fresh_quota.test_admission.Admission.test_cursor_own_pool_spent_preserves_existing_other_pool_overflow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_admission.py", line 185, in test_cursor_own_pool_spent_preserves_existing_other_pool_overflow
+    self.assertEqual(result['status'], 'available')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'spent' != 'available'
+- spent
++ available
+
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.043s
+
+FAILED (failures=2)

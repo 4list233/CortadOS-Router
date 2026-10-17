@@ -26,13 +26,13 @@ parser output is defect evidence, never expected behavior.
 | AC-FQ09 accumulated and installed-release verification | full runner and preserved commands below; candidate performance/learning parity required |
 | AC-FQ10 exact staged source and activation | stage fixtures, before/dependency manifests, candidate operator hash/origin/reload evidence required |
 
-`evidence/selectors.json` is the exact 116-method inventory (subtests add matrix
+`evidence/selectors.json` is the exact 130-method inventory (subtests add matrix
 coverage). Prebuild results have 60 failure records and 69 error records, **not**
 129 separate methods: unittest counts subtest outcomes independently. There are
 zero skips. Errors are solely absent new APIs/owners or unchanged old signatures/
 raw fields. These are intended prebuild failures, not a passing candidate result.
 The complete report preserves each failure/error traceback. Candidate B requires
-116 passing methods, zero failures/errors/skips, plus every accumulated lane.
+130 passing methods, zero failures/errors/skips, plus every accumulated lane.
 
 Run from `/Users/velox/.cortados-builds/cortados-router-repo`:
 
@@ -83,3 +83,15 @@ reports must name revisions, hashes, command, counts and any blocked lane. Old
 learning release remains immutable. Activation waits for completed 004 evaluation
 and report publication and no active training invocation. No GPU/teacher calls
 are made by these exams. Unrelated whole-CortadOS suites remain separately unverified.
+
+
+A2 amplification (same contract obligations): 14 new methods bring the inventory to
+130. They cover escaped PTY/session helpers, nonreading stdin, failed process
+inventory, malformed callback/calendar data, native spent without windows, selected
+pool overflow, and actual-model/explicit-pool binding. The author/root clarified
+that existing scarcity.finish owns Cursor overflow and pool-specific spent state.
+`amendment-A2-review-B1.json` records eight grouped findings from B attempt 1. Fixes
+remain subject to the combined candidate rerun. Two in-memory mutants demonstrate
+that process-group-only cleanup and blocking stdin writes fail at the intended
+assertions, with zero fixture errors/skips. Existing original prebuild results above
+remain historical evidence for the first 116-method freeze.

@@ -1,0 +1,70 @@
+{
+  "reviewer": "/root/quota_evaluation_qa",
+  "base_freeze": "c7b6b667cb45ad3a75ddc7f1e7fc49c85495b8d4",
+  "amendment": "A2, independent exam amplification and approved pool clarification",
+  "D": 0,
+  "A": 0,
+  "new_methods": 14,
+  "total_methods": 130,
+  "B_attempt": 1,
+  "B_status": "returned with eight grouped findings; combined corrected candidate and full package evidence pending",
+  "findings": [
+    {
+      "id": "B1-01",
+      "component": "quota_observations",
+      "rule": "Contain actual PTY/session descendants, not only the original process group",
+      "evidence": "containment-mutants.json"
+    },
+    {
+      "id": "B1-02",
+      "component": "quota_observations",
+      "rule": "Overall deadline includes writing normalized configuration to child stdin",
+      "evidence": "containment-mutants.json"
+    },
+    {
+      "id": "B1-03",
+      "component": "quota_observations",
+      "rule": "Process-inventory failure cannot produce an unbounded cleanup wait",
+      "evidence": "amplification-inventory-spent.log"
+    },
+    {
+      "id": "B1-04",
+      "component": "scarcity.parse_codex_status, standalone and staged",
+      "rule": "Invalid clock/calendar text remains unknown without exception or normalization",
+      "evidence": "amplification-current.log"
+    },
+    {
+      "id": "B1-05",
+      "component": "auxiliary_model_routing._quota_dispatch",
+      "rule": "Available callbacks with malformed timestamps/lane/pool refuse before transport",
+      "evidence": "amplification-current.log"
+    },
+    {
+      "id": "B1-06",
+      "component": "quota_admission._evaluate",
+      "rule": "Explicit native spent status survives missing windows without invented pool evidence",
+      "evidence": "amplification-inventory-spent.log"
+    },
+    {
+      "id": "B1-07",
+      "component": "quota_admission._evaluate",
+      "rule": "Preserve selected pool semantics and existing Cursor overflow through scarcity.finish",
+      "evidence": "amplification-pools.log"
+    },
+    {
+      "id": "B1-08",
+      "component": "quota_admission._evaluate",
+      "rule": "Actual model selects its quota pool; generic family cannot hide a spent model pool; preserve explicit pool",
+      "evidence": "amplification-model-pool.log"
+    }
+  ],
+  "mutation_proof": {
+    "mutants": 2,
+    "detected": 2,
+    "fixture_errors": 0,
+    "skips": 0
+  },
+  "scope": "Existing contract obligations; author/root approved pool-scope clarification. No production edits by QA.",
+  "preexisting_exams": "335 files outside fresh_quota unchanged; original116 methods retained and strengthened",
+  "source_review": "Legacy candidate initial16-file manifest and full diff reviewed, plus package owner/metadata/core/selector deltas. Candidate manifest must refresh after fixes."
+}

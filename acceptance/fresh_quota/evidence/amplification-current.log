@@ -1,0 +1,184 @@
+test_deadline_contains_pty_session_and_nested_setsid_helper (acceptance.fresh_quota.test_collection.Collection.test_deadline_contains_pty_session_and_nested_setsid_helper) ... ok
+test_child_that_never_reads_config_cannot_block_deadline (acceptance.fresh_quota.test_collection.Collection.test_child_that_never_reads_config_cannot_block_deadline) ... ok
+test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.CodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) ... ok
+test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) ...
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:99 AM on 22 Oct') ... ERROR
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:22 AM on 31 Feb') ... ERROR
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='13:22 AM on 22 Oct') ... FAIL
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='00:22 PM on 22 Oct') ... FAIL
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='24:22 on 22 Oct') ... ERROR
+  test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:22 AM on 22 Xxx') ... ERROR
+test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) ...
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=None) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=nan) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=True) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='observed_at', value=None) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='observed_at', value=inf) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='lane', value=None) ... FAIL
+  test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='pool', value=None) ... FAIL
+
+======================================================================
+ERROR: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:99 AM on 22 Oct')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 91, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    rows = self.parse(f'Weekly limit: [bar] 64% left (resets {when})')
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 39, in parse
+    return self.scarcity.parse_codex_status(value)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/scarcity.py", line 337, in parse_codex_status
+    reset_dt = now.replace(hour=hour, minute=int(t.group(2)), second=0, microsecond=0)
+ValueError: minute must be in 0..59, not 99
+
+======================================================================
+ERROR: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:22 AM on 31 Feb')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 91, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    rows = self.parse(f'Weekly limit: [bar] 64% left (resets {when})')
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 39, in parse
+    return self.scarcity.parse_codex_status(value)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/scarcity.py", line 339, in parse_codex_status
+    reset_dt = reset_dt.replace(month=datetime.strptime(t.group(5), "%b").month, day=int(t.group(4)))
+ValueError: day 31 must be in range 1..28 for month 2 in year 2026
+
+======================================================================
+ERROR: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='24:22 on 22 Oct')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 91, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    rows = self.parse(f'Weekly limit: [bar] 64% left (resets {when})')
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 39, in parse
+    return self.scarcity.parse_codex_status(value)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/scarcity.py", line 337, in parse_codex_status
+    reset_dt = now.replace(hour=hour, minute=int(t.group(2)), second=0, microsecond=0)
+ValueError: hour must be in 0..23, not 24
+
+======================================================================
+ERROR: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='3:22 AM on 22 Xxx')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 91, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    rows = self.parse(f'Weekly limit: [bar] 64% left (resets {when})')
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 39, in parse
+    return self.scarcity.parse_codex_status(value)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/scarcity.py", line 339, in parse_codex_status
+    reset_dt = reset_dt.replace(month=datetime.strptime(t.group(5), "%b").month, day=int(t.group(4)))
+                                      ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/_strptime.py", line 815, in _strptime_datetime_datetime
+    tt, fraction, gmtoff_fraction = _strptime(data_string, format)
+                                    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/_strptime.py", line 555, in _strptime
+    raise ValueError("time data %r does not match format %r" %
+                     (data_string, format))
+ValueError: time data 'Xxx' does not match format '%b'
+
+======================================================================
+FAIL: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='13:22 AM on 22 Oct')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 93, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    self.assertIsNone(rows[0]['reset_epoch'])
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1792646520.0 is not None
+
+======================================================================
+FAIL: test_malformed_calendar_or_clock_keeps_reset_unknown (acceptance.fresh_quota.test_codex_status.FrozenLiveCodexStatus.test_malformed_calendar_or_clock_keeps_reset_unknown) (when='00:22 PM on 22 Oct')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_codex_status.py", line 93, in test_malformed_calendar_or_clock_keeps_reset_unknown
+    self.assertIsNone(rows[0]['reset_epoch'])
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1792686120.0 is not None
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='age_s', value=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='observed_at', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='observed_at', value=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='lane', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+======================================================================
+FAIL: test_available_callback_with_malformed_observation_metadata_refuses (acceptance.fresh_quota.test_auxiliary_dispatch.AuxiliaryDispatch.test_available_callback_with_malformed_observation_metadata_refuses) (field='pool', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 206, in test_available_callback_with_malformed_observation_metadata_refuses
+    self.assert_refused(lambda: self.adapter.required_send(self.client, self.kwargs), 'quota_unknown')
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/fresh_quota/test_auxiliary_dispatch.py", line 79, in assert_refused
+    with self.assertRaises(self.adapter.AuxiliaryRoutingError) as raised:
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: AuxiliaryRoutingError not raised
+
+----------------------------------------------------------------------
+Ran 5 tests in 4.207s
+
+FAILED (failures=9, errors=4)
