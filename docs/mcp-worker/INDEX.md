@@ -67,3 +67,10 @@ promotion gates. The build reports record independent verification and limitatio
 | `cortados_router/selection_resources.py` | Immutable lanes, health, exact allowed routes and optional learned-cost snapshot; adopts core mapping. |
 | `integrations/mcp/native_metadata.py::observe` | Uncached read-only validated status, preserving spent readings; snapshot remains strict. |
 | `cortados_router/scarcity.py::_codex_native` | Existing inspection source delegates typed native status; TUI parser remains diagnostic only. |
+
+| Quota-source repair path | RT-QUOTA-SOURCES-006 responsibility |
+|---|---|
+| [FRESH-QUOTA-SOURCES-006.md](FRESH-QUOTA-SOURCES-006.md) | Contract author; native subscription-source repair, private actual-context binding and independent source evidence. Common/Cursor slice frozen after independent D=0/A=0; candidate B and activation pending. |
+| `cortados_router/quota_sources.py` (proposed) | Native source selection/read-only projection; existing observation/admission owners remain canonical. |
+| `cortados_router/cursor_quota.cjs` (proposed) | Version-bound reuse of installed Cursor native credential/configuration/DashboardClient owners; no quota policy or cache. |
+| `acceptance/quota_sources/` | Independent QA; real native shapes, actual-context and staged-boundary exams; builder read-only. |

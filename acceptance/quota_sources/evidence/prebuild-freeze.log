@@ -1,0 +1,1339 @@
+test_cached_quota_cannot_outlive_native_validity_startup_allowance (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cached_quota_cannot_outlive_native_validity_startup_allowance) ... ERROR
+test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport) ... ERROR
+test_concurrent_same_source_checks_share_one_inflight_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_concurrent_same_source_checks_share_one_inflight_observation) ... ERROR
+test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch) ... ERROR
+test_context_of_another_provider_refuses_before_collection (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_of_another_provider_refuses_before_collection) ... ERROR
+test_context_redacts_repr_and_refuses_pickle_or_json (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_redacts_repr_and_refuses_pickle_or_json) ... ERROR
+test_cursor_status_reuses_actual_collector_with_exact_supplied_environment (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cursor_status_reuses_actual_collector_with_exact_supplied_environment) ... ERROR
+test_expired_read_failure_does_not_restore_prior_admission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_expired_read_failure_does_not_restore_prior_admission) ... ERROR
+test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback) ... ERROR
+test_first_check_proves_without_registry_and_returns_closed_quota (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_first_check_proves_without_registry_and_returns_closed_quota) ... ERROR
+test_forged_context_and_public_scope_are_never_authority (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_forged_context_and_public_scope_are_never_authority) ... ERROR
+test_fresh_repeated_check_reuses_one_source_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_fresh_repeated_check_reuses_one_source_observation) ... ERROR
+test_legacy_check_cannot_authorize_random_native_public_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_legacy_check_cannot_authorize_random_native_public_scope) ... ERROR
+test_missing_null_nonfinite_or_extra_private_proof_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_missing_null_nonfinite_or_extra_private_proof_refuses) ... ERROR
+test_native_validity_shorter_than_startup_bound_refuses_initial_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_native_validity_shorter_than_startup_bound_refuses_initial_read) ... ERROR
+test_nonce_replay_after_expiry_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_nonce_replay_after_expiry_refuses) ... ERROR
+test_prepare_captures_without_permission_or_child_io (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_prepare_captures_without_permission_or_child_io) ... ERROR
+test_private_proof_never_enters_public_result_or_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_private_proof_never_enters_public_result_or_scope) ... ERROR
+test_process_generation_change_retires_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_process_generation_change_retires_context) ... ERROR
+test_public_scope_is_random_sanitized_copy_and_not_permission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_public_scope_is_random_sanitized_copy_and_not_permission) ... ERROR
+test_rotation_during_read_refuses_late_success (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_rotation_during_read_refuses_late_success) ... ERROR
+test_selection_snapshot_is_frozen_when_new_source_becomes_spent (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_selection_snapshot_is_frozen_when_new_source_becomes_spent) ... ERROR
+test_source_capture_failure_does_not_echo_private_material (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_capture_failure_does_not_echo_private_material) ... ERROR
+test_source_file_rotation_invalidates_original_and_new_context_gets_own_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_file_rotation_invalidates_original_and_new_context_gets_own_read) ... ERROR
+test_uninitialized_owner_class_instance_is_not_valid_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_uninitialized_owner_class_instance_is_not_valid_context) ... ERROR
+test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses) ... ERROR
+test_codex_actual_alternate_auth_selector_does_not_gain_native_profile (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_alternate_auth_selector_does_not_gain_native_profile) ... ERROR
+test_codex_actual_known_spent_still_refuses (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_known_spent_still_refuses) ... ERROR
+test_codex_actual_nonstrict_argv_refuses_before_collection (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_nonstrict_argv_refuses_before_collection) ... ERROR
+test_codex_actual_scope_and_existing_collection_remain_compatible (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_scope_and_existing_collection_remain_compatible) ... ERROR
+test_both_exhausted_pools_remain_spent (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_both_exhausted_pools_remain_spent) ... ERROR
+test_display_and_money_do_not_override_native_pool_percentages (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_display_and_money_do_not_override_native_pool_percentages) ... ERROR
+test_integral_numeric_epoch_milliseconds_match_native_decimal_strings (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_integral_numeric_epoch_milliseconds_match_native_decimal_strings) ... ERROR
+test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) ... 
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=None) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=True) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=1791671555000.5) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='nan') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='inf') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='1e12') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='1791671555000.5') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=nan) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=inf) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=None) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=True) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=1791671555000.5) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='nan') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='inf') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='1e12') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='1791671555000.5') ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=nan) ... ERROR
+  test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=inf) ... ERROR
+test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) ... 
+  test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) (key='billingCycleStart') ... ERROR
+  test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) (key='billingCycleEnd') ... ERROR
+test_missing_or_invalid_required_pool_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_invalid_required_pool_usage_refuses) ... ERROR
+test_missing_or_non_object_plan_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_non_object_plan_usage_refuses) ... ERROR
+test_native_enabled_is_diagnostic_and_never_overrides_allowance (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_enabled_is_diagnostic_and_never_overrides_allowance) ... ERROR
+test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days) ... ERROR
+test_native_exact_cycle_and_percentage_fields (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exact_cycle_and_percentage_fields) ... ERROR
+test_native_exhausted_auto_preserves_existing_other_pool_overflow (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exhausted_auto_preserves_existing_other_pool_overflow) ... ERROR
+test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) ... 
+  test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=None) ... ERROR
+  test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=True) ... ERROR
+  test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now='1792267794.079') ... ERROR
+  test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=nan) ... ERROR
+  test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=inf) ... ERROR
+test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) ... 
+  test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1791671554.999) ... ERROR
+  test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1794349955.0) ... ERROR
+  test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1794349955.001) ... ERROR
+test_projection_does_not_mutate_native_payload (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_projection_does_not_mutate_native_payload) ... ERROR
+test_reversed_or_empty_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_reversed_or_empty_cycle_refuses) ... ERROR
+test_seconds_in_millisecond_fields_refuse (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_seconds_in_millisecond_fields_refuse) ... ERROR
+test_zero_usage_retains_actual_cycle_not_fabricated_reset (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_zero_usage_retains_actual_cycle_not_fabricated_reset) ... ERROR
+test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt) ... FAIL
+test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof) ... FAIL
+test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values) ... ERROR
+test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice) ... ERROR
+test_keychain_or_unknown_credential_backend_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_keychain_or_unknown_credential_backend_refuses) ... ERROR
+test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes) ... ERROR
+test_new_project_config_or_envrc_is_not_invisible_to_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_new_project_config_or_envrc_is_not_invisible_to_capture) ... ERROR
+test_private_capture_redacts_and_rejects_serialization (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_private_capture_redacts_and_rejects_serialization) ... ERROR
+test_prompt_resume_and_force_do_not_change_source_identity (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_prompt_resume_and_force_do_not_change_source_identity) ... ERROR
+test_settings_rotation_changes_private_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_settings_rotation_changes_private_capture) ... ERROR
+test_symlink_retarget_changes_source_generation_even_identical_content (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_symlink_retarget_changes_source_generation_even_identical_content) ... ERROR
+test_token_rotation_changes_private_capture_and_never_public_repr (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_token_rotation_changes_private_capture_and_never_public_repr) ... ERROR
+test_unknown_duplicate_or_source_selecting_argv_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unknown_duplicate_or_source_selecting_argv_refuses) ... ERROR
+test_unreviewed_executable_chain_refuses_without_system_node_fallback (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unreviewed_executable_chain_refuses_without_system_node_fallback) ... ERROR
+test_active_direnv_is_not_disabled_only_for_probe (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_active_direnv_is_not_disabled_only_for_probe) ... FAIL
+test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard) ... FAIL
+test_malformed_native_expiry_is_unknown_without_refresh_or_quota (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_malformed_native_expiry_is_unknown_without_refresh_or_quota) ... FAIL
+test_missing_settings_directory_cannot_be_created_by_native_reader (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_missing_settings_directory_cannot_be_created_by_native_reader) ... FAIL
+test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard) ... FAIL
+test_native_exact_300_seconds_retains_current_token_without_refresh (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_exact_300_seconds_retains_current_token_without_refresh) ... FAIL
+test_project_override_is_unproven_not_silently_skipped (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_project_override_is_unproven_not_silently_skipped) ... FAIL
+test_stored_api_key_refuses_without_login_or_api_billing (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_stored_api_key_refuses_without_login_or_api_billing) ... FAIL
+test_swallowed_native_config_repair_write_refuses_before_quota_call (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_swallowed_native_config_repair_write_refuses_before_quota_call) ... FAIL
+test_continuation_keeps_original_private_context_when_global_environment_changes (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_continuation_keeps_original_private_context_when_global_environment_changes) ... FAIL
+test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata) ... FAIL
+test_installed_owner_missing_new_api_never_falls_back_to_old_check (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_installed_owner_missing_new_api_never_falls_back_to_old_check) ... FAIL
+test_metadata_only_job_cannot_authorize_continuation (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_metadata_only_job_cannot_authorize_continuation) ... FAIL
+test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) ... 
+  test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) (learning=False) ... FAIL
+  test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) (learning=True) ... FAIL
+test_shared_status_bridge_and_scarcity_use_installed_bounded_owner (acceptance.quota_sources.test_status_delegation.SharedStatusDelegation.test_shared_status_bridge_and_scarcity_use_installed_bounded_owner) ... ERROR
+test_cursor_status_callsite_passes_exact_environment_to_bounded_owner (acceptance.quota_sources.test_status_delegation.StandaloneStatusDelegation.test_cursor_status_callsite_passes_exact_environment_to_bounded_owner) ... FAIL
+
+======================================================================
+ERROR: test_cached_quota_cannot_outlive_native_validity_startup_allowance (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cached_quota_cannot_outlive_native_validity_startup_allowance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_concurrent_same_source_checks_share_one_inflight_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_concurrent_same_source_checks_share_one_inflight_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_context_of_another_provider_refuses_before_collection (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_of_another_provider_refuses_before_collection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_context_redacts_repr_and_refuses_pickle_or_json (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_redacts_repr_and_refuses_pickle_or_json)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_cursor_status_reuses_actual_collector_with_exact_supplied_environment (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cursor_status_reuses_actual_collector_with_exact_supplied_environment)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_expired_read_failure_does_not_restore_prior_admission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_expired_read_failure_does_not_restore_prior_admission)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_first_check_proves_without_registry_and_returns_closed_quota (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_first_check_proves_without_registry_and_returns_closed_quota)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_forged_context_and_public_scope_are_never_authority (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_forged_context_and_public_scope_are_never_authority)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_fresh_repeated_check_reuses_one_source_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_fresh_repeated_check_reuses_one_source_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_legacy_check_cannot_authorize_random_native_public_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_legacy_check_cannot_authorize_random_native_public_scope)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_missing_null_nonfinite_or_extra_private_proof_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_missing_null_nonfinite_or_extra_private_proof_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_native_validity_shorter_than_startup_bound_refuses_initial_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_native_validity_shorter_than_startup_bound_refuses_initial_read)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_nonce_replay_after_expiry_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_nonce_replay_after_expiry_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_prepare_captures_without_permission_or_child_io (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_prepare_captures_without_permission_or_child_io)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_private_proof_never_enters_public_result_or_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_private_proof_never_enters_public_result_or_scope)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_process_generation_change_retires_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_process_generation_change_retires_context)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_public_scope_is_random_sanitized_copy_and_not_permission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_public_scope_is_random_sanitized_copy_and_not_permission)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_rotation_during_read_refuses_late_success (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_rotation_during_read_refuses_late_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_selection_snapshot_is_frozen_when_new_source_becomes_spent (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_selection_snapshot_is_frozen_when_new_source_becomes_spent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_source_capture_failure_does_not_echo_private_material (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_capture_failure_does_not_echo_private_material)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_source_file_rotation_invalidates_original_and_new_context_gets_own_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_file_rotation_invalidates_original_and_new_context_gets_own_read)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_uninitialized_owner_class_instance_is_not_valid_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_uninitialized_owner_class_instance_is_not_valid_context)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_actual_protocol.py", line 25, in setUp
+    from cortados_router import quota_sources, quota_admission, quota_observations
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_codex_actual_alternate_auth_selector_does_not_gain_native_profile (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_alternate_auth_selector_does_not_gain_native_profile)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 50, in test_codex_actual_alternate_auth_selector_does_not_gain_native_profile
+    self.prepare()
+    ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 16, in prepare
+    return self.policy.prepare_actual('codex-cli', environment=self.environment,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'cortados_router.quota_admission' has no attribute 'prepare_actual'
+
+======================================================================
+ERROR: test_codex_actual_known_spent_still_refuses (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_known_spent_still_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 34, in test_codex_actual_known_spent_still_refuses
+    actual = self.prepare()
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 16, in prepare
+    return self.policy.prepare_actual('codex-cli', environment=self.environment,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'cortados_router.quota_admission' has no attribute 'prepare_actual'
+
+======================================================================
+ERROR: test_codex_actual_nonstrict_argv_refuses_before_collection (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_nonstrict_argv_refuses_before_collection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 44, in test_codex_actual_nonstrict_argv_refuses_before_collection
+    self.prepare()
+    ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 16, in prepare
+    return self.policy.prepare_actual('codex-cli', environment=self.environment,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'cortados_router.quota_admission' has no attribute 'prepare_actual'
+
+======================================================================
+ERROR: test_codex_actual_scope_and_existing_collection_remain_compatible (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_scope_and_existing_collection_remain_compatible)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 20, in test_codex_actual_scope_and_existing_collection_remain_compatible
+    actual = self.prepare()
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_codex_compatibility.py", line 16, in prepare
+    return self.policy.prepare_actual('codex-cli', environment=self.environment,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'cortados_router.quota_admission' has no attribute 'prepare_actual'
+
+======================================================================
+ERROR: test_both_exhausted_pools_remain_spent (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_both_exhausted_pools_remain_spent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 83, in test_both_exhausted_pools_remain_spent
+    record = scarcity.finish('cursor', self.projected(raw))
+                                       ~~~~~~~~~~~~~~^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_display_and_money_do_not_override_native_pool_percentages (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_display_and_money_do_not_override_native_pool_percentages)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 61, in test_display_and_money_do_not_override_native_pool_percentages
+    original = self.windows(self.projected(raw))
+                            ~~~~~~~~~~~~~~^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_integral_numeric_epoch_milliseconds_match_native_decimal_strings (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_integral_numeric_epoch_milliseconds_match_native_decimal_strings)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 154, in test_integral_numeric_epoch_milliseconds_match_native_decimal_strings
+    expected = self.windows(self.projected(raw))
+                            ~~~~~~~~~~~~~~^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=1791671555000.5)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='nan')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='inf')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='1e12')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value='1791671555000.5')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleStart', value=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=1791671555000.5)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='nan')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='inf')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='1e12')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value='1791671555000.5')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) (key='billingCycleEnd', value=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 109, in test_invalid_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) (key='billingCycleStart')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 101, in test_missing_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) (key='billingCycleEnd')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 101, in test_missing_cycle_endpoint_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_missing_or_invalid_required_pool_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_invalid_required_pool_usage_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 134, in test_missing_or_invalid_required_pool_usage_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_missing_or_non_object_plan_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_non_object_plan_usage_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 170, in test_missing_or_non_object_plan_usage_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_native_enabled_is_diagnostic_and_never_overrides_allowance (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_enabled_is_diagnostic_and_never_overrides_allowance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 143, in test_native_enabled_is_diagnostic_and_never_overrides_allowance
+    original = self.windows(self.projected(raw))
+                            ~~~~~~~~~~~~~~^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 48, in test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days
+    for row in self.windows(self.projected()).values():
+                            ~~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_native_exact_cycle_and_percentage_fields (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exact_cycle_and_percentage_fields)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 38, in test_native_exact_cycle_and_percentage_fields
+    windows = self.windows(self.projected())
+                           ~~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_native_exhausted_auto_preserves_existing_other_pool_overflow (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exhausted_auto_preserves_existing_other_pool_overflow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 74, in test_native_exhausted_auto_preserves_existing_other_pool_overflow
+    record = scarcity.finish('cursor', self.projected())
+                                       ~~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 164, in test_nonfinite_or_non_numeric_observation_time_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 164, in test_nonfinite_or_non_numeric_observation_time_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now='1792267794.079')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 164, in test_nonfinite_or_non_numeric_observation_time_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=nan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 164, in test_nonfinite_or_non_numeric_observation_time_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) (now=inf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 164, in test_nonfinite_or_non_numeric_observation_time_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1791671554.999)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 128, in test_observation_outside_native_cycle_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1794349955.0)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 128, in test_observation_outside_native_cycle_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) (now=1794349955.001)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 128, in test_observation_outside_native_cycle_refuses
+    self.assert_unknown(raw, now)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_projection_does_not_mutate_native_payload (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_projection_does_not_mutate_native_payload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 56, in test_projection_does_not_mutate_native_payload
+    self.project(raw, reference['observed_at'])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_reversed_or_empty_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_reversed_or_empty_cycle_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 115, in test_reversed_or_empty_cycle_refuses
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_seconds_in_millisecond_fields_refuse (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_seconds_in_millisecond_fields_refuse)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 121, in test_seconds_in_millisecond_fields_refuse
+    self.assert_unknown(raw, reference['observed_at'])
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 17, in assert_unknown
+    self.project(payload, now)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_zero_usage_retains_actual_cycle_not_fabricated_reset (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_zero_usage_retains_actual_cycle_not_fabricated_reset)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 91, in test_zero_usage_retains_actual_cycle_not_fabricated_reset
+    for row in self.windows(self.projected(raw)).values():
+                            ~~~~~~~~~~~~~~^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/cursor_projection_cases.py", line 26, in projected
+    return self.project(raw if payload is None else payload,
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        reference['observed_at'] if now is None else now)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_cursor_projection.py", line 12, in project
+    from cortados_router.quota_sources import cursor_record
+ModuleNotFoundError: No module named 'cortados_router.quota_sources'
+
+======================================================================
+ERROR: test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_keychain_or_unknown_credential_backend_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_keychain_or_unknown_credential_backend_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_new_project_config_or_envrc_is_not_invisible_to_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_new_project_config_or_envrc_is_not_invisible_to_capture)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_private_capture_redacts_and_rejects_serialization (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_private_capture_redacts_and_rejects_serialization)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_prompt_resume_and_force_do_not_change_source_identity (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_prompt_resume_and_force_do_not_change_source_identity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_settings_rotation_changes_private_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_settings_rotation_changes_private_capture)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_symlink_retarget_changes_source_generation_even_identical_content (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_symlink_retarget_changes_source_generation_even_identical_content)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_token_rotation_changes_private_capture_and_never_public_repr (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_token_rotation_changes_private_capture_and_never_public_repr)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_unknown_duplicate_or_source_selecting_argv_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unknown_duplicate_or_source_selecting_argv_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_unreviewed_executable_chain_refuses_without_system_node_fallback (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unreviewed_executable_chain_refuses_without_system_node_fallback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_profile.py", line 25, in setUp
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+======================================================================
+ERROR: test_shared_status_bridge_and_scarcity_use_installed_bounded_owner (acceptance.quota_sources.test_status_delegation.SharedStatusDelegation.test_shared_status_bridge_and_scarcity_use_installed_bounded_owner)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_delegation.py", line 41, in test_shared_status_bridge_and_scarcity_use_installed_bounded_owner
+    direct = bridge.cursor_status()
+             ^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'quota_sources_fixture_status_bridge' has no attribute 'cursor_status'
+
+======================================================================
+FAIL: test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_containment.py", line 64, in test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt
+    self.assertFalse(any(row.get('input_hex') for row in rows),
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     'Read-only quota source sent input to a workspace trust prompt')
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : Read-only quota source sent input to a workspace trust prompt
+
+======================================================================
+FAIL: test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_containment.py", line 56, in test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof
+    self.assertEqual(result['attempts'], [], 'Admission PTY cleanup attempted external ps/lsof inventory')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['ps', 'lsof'] != []
+
+First list contains 2 additional elements.
+First extra element 0:
+'ps'
+
+- ['ps', 'lsof']
++ [] : Admission PTY cleanup attempted external ps/lsof inventory
+
+======================================================================
+FAIL: test_active_direnv_is_not_disabled_only_for_probe (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_active_direnv_is_not_disabled_only_for_probe)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 143, in test_active_direnv_is_not_disabled_only_for_probe
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 120, in test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_malformed_native_expiry_is_unknown_without_refresh_or_quota (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_malformed_native_expiry_is_unknown_without_refresh_or_quota)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 168, in test_malformed_native_expiry_is_unknown_without_refresh_or_quota
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_missing_settings_directory_cannot_be_created_by_native_reader (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_missing_settings_directory_cannot_be_created_by_native_reader)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 107, in test_missing_settings_directory_cannot_be_created_by_native_reader
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 90, in test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_native_exact_300_seconds_retains_current_token_without_refresh (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_exact_300_seconds_retains_current_token_without_refresh)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 155, in test_native_exact_300_seconds_retains_current_token_without_refresh
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_project_override_is_unproven_not_silently_skipped (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_project_override_is_unproven_not_silently_skipped)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 137, in test_project_override_is_unproven_not_silently_skipped
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_stored_api_key_refuses_without_login_or_api_billing (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_stored_api_key_refuses_without_login_or_api_billing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 129, in test_stored_api_key_refuses_without_login_or_api_billing
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_swallowed_native_config_repair_write_refuses_before_quota_call (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_swallowed_native_config_repair_write_refuses_before_quota_call)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 100, in test_swallowed_native_config_repair_write_refuses_before_quota_call
+    result, calls = self.read()
+                    ~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_native_reader.py", line 68, in read
+    self.assertEqual(process.returncode, 0, stderr.decode(errors='replace'))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/fixtures/native_reader_driver.py", line 11, in <module>
+    from cortados_router import quota_sources
+ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/__init__.py)
+
+
+======================================================================
+FAIL: test_continuation_keeps_original_private_context_when_global_environment_changes (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_continuation_keeps_original_private_context_when_global_environment_changes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 83, in test_continuation_keeps_original_private_context_when_global_environment_changes
+    check.assert_called_once()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 965, in assert_called_once
+    raise AssertionError(msg)
+AssertionError: Expected 'check_actual' to have been called once. Called 0 times.
+
+======================================================================
+FAIL: test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 43, in test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata
+    prepare.assert_called_once()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 965, in assert_called_once
+    raise AssertionError(msg)
+AssertionError: Expected 'prepare_actual' to have been called once. Called 0 times.
+
+======================================================================
+FAIL: test_installed_owner_missing_new_api_never_falls_back_to_old_check (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_installed_owner_missing_new_api_never_falls_back_to_old_check)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 64, in test_installed_owner_missing_new_api_never_falls_back_to_old_check
+    with self.assertRaises((ValueError, RuntimeError, TypeError, AttributeError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'ValueError'>, <class 'RuntimeError'>, <class 'TypeError'>, <class 'AttributeError'>) not raised
+
+======================================================================
+FAIL: test_metadata_only_job_cannot_authorize_continuation (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_metadata_only_job_cannot_authorize_continuation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 34, in test_metadata_only_job_cannot_authorize_continuation
+    with self.assertRaisesRegex((ValueError, RuntimeError), 'quota_unknown'):
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'ValueError'>, <class 'RuntimeError'>) not raised
+
+======================================================================
+FAIL: test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) (learning=False)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 106, in test_both_learning_modes_bind_exact_teacher_transport_to_new_owner
+    prepare.assert_called_once()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 965, in assert_called_once
+    raise AssertionError(msg)
+AssertionError: Expected 'prepare_actual' to have been called once. Called 0 times.
+
+======================================================================
+FAIL: test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) (learning=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_stage_actual.py", line 106, in test_both_learning_modes_bind_exact_teacher_transport_to_new_owner
+    prepare.assert_called_once()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 965, in assert_called_once
+    raise AssertionError(msg)
+AssertionError: Expected 'prepare_actual' to have been called once. Called 0 times.
+
+======================================================================
+FAIL: test_cursor_status_callsite_passes_exact_environment_to_bounded_owner (acceptance.quota_sources.test_status_delegation.StandaloneStatusDelegation.test_cursor_status_callsite_passes_exact_environment_to_bounded_owner)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_delegation.py", line 26, in test_cursor_status_callsite_passes_exact_environment_to_bounded_owner
+    result = scarcity._cursor(environment=environment)
+  File "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/scarcity.py", line 417, in _cursor
+    text = tui_capture(["cursor-agent"], "/usage", r"Included \d+% used[\s\S]*Esc to close", env, boot_s=15, ready=r"Cursor Agent")
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1241, in _execute_mock_call
+    raise effect
+AssertionError: Old Cursor TUI must not run
+
+----------------------------------------------------------------------
+Ran 77 tests in 9.024s
+
+FAILED (failures=18, errors=86)

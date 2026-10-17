@@ -1,0 +1,31 @@
+{
+  "observed_at": 1792267794.079,
+  "cycle_start_epoch": 1791671555.0,
+  "reset_epoch": 1794349955.0,
+  "window_s": 2678400.0,
+  "windows_by_pool": {
+    "info": {
+      "used_pct": 100
+    },
+    "cursor-models": {
+      "used_pct": 100
+    },
+    "other-models": {
+      "used_pct": 33.22222222222222
+    }
+  },
+  "existing_policy_outcomes": {
+    "cursor-models": "available through existing other-model overflow",
+    "other-models": "available"
+  },
+  "not_authority": [
+    "displayMessage",
+    "autoModelSelectedDisplayMessage",
+    "namedModelSelectedDisplayMessage",
+    "totalSpend",
+    "includedSpend",
+    "bonusSpend",
+    "limit",
+    "displayThreshold"
+  ]
+}

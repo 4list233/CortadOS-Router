@@ -1,0 +1,21 @@
+{
+  "files": {
+    "run-full-suite.py": {
+      "source": "/Users/velox/.cortados-builds/fresh-quota-verification/run-full-suite.py",
+      "source_sha256": "c8e611f0da242bd0dea3a01c454175f8dd4115d8845ee727bab9e29d08db101f",
+      "sha256": "2d1ad50a3f6228072bb3855b821799fa48ee6cf48e9ea37203a6732e0b4eea37"
+    },
+    "run-migrated-learning.py": {
+      "source": "/Users/velox/.cortados-builds/fresh-quota-verification/run-migrated-learning.py",
+      "source_sha256": "07399712bf99835b1e5da1da45c1bd2effa2a2962ae375e4ab0a96e8bbd65e59",
+      "sha256": "f5ecece612217bc1c20c8d2b8a54dbe617fd692a6e9f06c8e30d26c5d1874b38"
+    },
+    "preserved_required_quota.py": {
+      "source": "/Users/velox/.cortados-builds/fresh-quota-verification/preserved_required_quota.py",
+      "source_sha256": "dd61381e4af35bb5b6de358d53a11bfdcd076e2c0a15063b373d13fbb5e91b17",
+      "sha256": "dd61381e4af35bb5b6de358d53a11bfdcd076e2c0a15063b373d13fbb5e91b17"
+    }
+  },
+  "scope": "Preserve accumulated605 lanes and discover new quota_sources acceptance; candidate stage and migrated actual gate fixture only",
+  "execution_status": "Not run; candidate production and unregistered installed artifact pending"
+}

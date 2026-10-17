@@ -1,0 +1,65 @@
+{
+  "status": "Frozen independent common/Cursor source fixture",
+  "source": "/Users/velox/.cortados-builds/quota-verification-repair/cursor-native-rpc-response.json",
+  "source_sha256": "1c06a0acf0af37873802daa78b47a6cddc72d30bb55c03681012631eb1019a22",
+  "fixture_sha256": "f6d37639a51b3bab3981f0ef8ae875c47edfac03d92f8c3ec062a307a43d2276",
+  "redactions": [
+    {
+      "path": "cwd",
+      "replacement": "/fixture/existing-workspace",
+      "reason": "Local workspace path identifier only; response structure and all quota facts unchanged"
+    }
+  ],
+  "capture_reader": "/Users/velox/.cortados-builds/quota-verification-repair/cursor_native_read.cjs",
+  "capture_reader_sha256": "6a1a8deed1afa6f130461a705d814e8547271405a95ca4b16485873788d064fd",
+  "capture_reader_is_production": false,
+  "source_profile": "Cursor2026.10.16-e3cb207 native credential owner file backend and Dashboard getCurrentPeriodUsage",
+  "native_schema_evidence": {
+    "path": "/Users/velox/.cortados-builds/quota-verification-repair/cursor-typed-cycle-schema.json",
+    "sha256": "c59c21dc5e9abb7414d5207804a8bb805efd12d0fa328d72993360f7e1af577d"
+  },
+  "caveats": [
+    "Capture reader deletes CURSOR_API_KEY after selecting existing file credential. Final production profile must reject actual alternateauth/env/argv rather than assume this deletion proves dispatch equality.",
+    "Capture reader monkeypatches mkdir as no-op during config loading. Exact read-only source profile and refusal behavior remain author-owned readiness requirements.",
+    "No original secret credential or raw account identifier is present. Native cycle strings, nested response structures, percentages, spend fields and model list retained exactly."
+  ],
+  "additional_fixtures": {
+    "cursor-native-token-branch.json": {
+      "source_sha256": "f750fefaa9f531e9d3b0551d6481b28f19f4296f77d1b9b69546b4ba7b5eeab8",
+      "fixture_sha256": "f750fefaa9f531e9d3b0551d6481b28f19f4296f77d1b9b69546b4ba7b5eeab8",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    },
+    "cursor-profile-parity.json": {
+      "source_sha256": "c2f81a5c70964f4c5abaa8411c65b0cf168450886e126c61c751996faa4b03c1",
+      "fixture_sha256": "c2f81a5c70964f4c5abaa8411c65b0cf168450886e126c61c751996faa4b03c1",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    },
+    "cursor-native-profile-proof.json": {
+      "source_sha256": "5cc3fa1cc235bcef7866cf13abaa37c0da94f5cd729cc927c7edc46c6b63c722",
+      "fixture_sha256": "d464a83d0311559f1c989e8aa38a6a423e31814fba16fa6853ded91b75ea903a",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    },
+    "cursor-enabled-renderer-fixture.json": {
+      "source_sha256": "c57ff89a9b4023546ff0984a79baf1e3d7cd48904cb27720cbd53791537431f5",
+      "fixture_sha256": "c57ff89a9b4023546ff0984a79baf1e3d7cd48904cb27720cbd53791537431f5",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    },
+    "cursor-synthetic-fixture-validation.json": {
+      "source_sha256": "09ccb7745ea496d5419166f9c7fa4f990874aa512e08cad833c0e228f8d2da62",
+      "fixture_sha256": "3ad6ef7b123d44d52e8fc62ff8c59328aac706c8eadbd3e26fad89eec9a52cf4",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    },
+    "cursor-synthetic-fixture-provenance.json": {
+      "source_sha256": "aa740cc47a21bbbe9b942d1dd4a8c7c11580a8d9c776a6eba3011e7272118afd",
+      "fixture_sha256": "9c6b3fdb53c8e364c96d585a013a9e2a8a7ba298549192e78b634a33f61e1f3a",
+      "redaction": "Absolute /Users/velox prefix becomes /fixture/home; native values and structures retained"
+    }
+  },
+  "synthetic_native_store": {
+    "files": [
+      "synthetic-auth.json",
+      "synthetic-cli-config.json"
+    ],
+    "meaning": "Invented values, offline exact-native-schema/credential-owner validation, never a real subscription credential"
+  }
+}

@@ -1,0 +1,17 @@
+test_known_quota_reaches_main_next_call_exactly_once_mode_off (acceptance.fresh_quota.test_main_pty.MainDispatch.test_known_quota_reaches_main_next_call_exactly_once_mode_off) ... ok
+test_matching_provider_label_without_registered_source_proof_refuses (acceptance.fresh_quota.test_main_pty.MainDispatch.test_matching_provider_label_without_registered_source_proof_refuses) ... ok
+test_registered_cli_profile_with_wrong_actual_base_url_refuses (acceptance.fresh_quota.test_main_pty.MainDispatch.test_registered_cli_profile_with_wrong_actual_base_url_refuses) ... ok
+test_unknown_and_spent_stop_main_next_call_in_both_modes (acceptance.fresh_quota.test_main_pty.MainDispatch.test_unknown_and_spent_stop_main_next_call_in_both_modes) ... ok
+test_available_continuation_checks_identity_and_writes_once (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_available_continuation_checks_identity_and_writes_once) ... ok
+test_quota_changed_after_route_still_prevents_physical_spawn (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_quota_changed_after_route_still_prevents_physical_spawn) ... ok
+test_reused_receipt_cannot_authorize_spent_brain_spawn (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_reused_receipt_cannot_authorize_spent_brain_spawn) ... ok
+test_unknown_and_spent_prevent_continuation_bytes_even_mode_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_continuation_bytes_even_mode_off) ... ok
+test_unknown_and_spent_prevent_runner_spawn_router_off (acceptance.fresh_quota.test_main_pty.PtyDispatch.test_unknown_and_spent_prevent_runner_spawn_router_off) ... ok
+test_known_source_uses_exact_environment_and_resolved_actual_argv (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_known_source_uses_exact_environment_and_resolved_actual_argv) ... ok
+test_missing_teacher_executable_refuses_before_process (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_missing_teacher_executable_refuses_before_process) ... ok
+test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes (acceptance.fresh_quota.test_teacher.TeacherDispatch.test_unknown_and_spent_have_zero_teacher_processes_in_both_learning_modes) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.576s
+
+OK

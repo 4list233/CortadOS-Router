@@ -1,0 +1,11 @@
+{
+  "settings_file": true,
+  "project_files": true,
+  "config_file_hashes": true,
+  "safe_env": true,
+  "selector_presence": true,
+  "envrc_ancestors": true,
+  "native_direnv_result": true,
+  "native_store": true,
+  "native_credential_file": true
+}

@@ -1,0 +1,9 @@
+flowchart LR
+  C[Existing configured source selects native authentication] --> O[Existing bounded collector reads source]
+  O --> Q[Existing admission owner validates fresh complete quota]
+  E[Actual worker environment selects its source] --> Q
+  Q -->|same proven source and available quota| D[Existing dispatch boundary permits transport]
+  Q -->|unknown stale mismatched or spent| R[Existing dispatch boundary refuses]
+  F[Immutable sanitized source evidence] -. pins interpretation .-> O
+  classDef evidence fill:#fff3d6
+  class F evidence

@@ -1,0 +1,59 @@
+{
+  "profile": "cursor-2026.10.16-e3cb207-file-v1",
+  "version_directory": "2026.10.16-e3cb207",
+  "files": {
+    "node_modules/node-gyp-build/index.js": {
+      "sha256": "a7ed0d5ae218a19bdbdf15a590d0893790ddf536313b66a787554693cfaae078",
+      "bytes": 390
+    },
+    "node_modules/node-gyp-build/node-gyp-build.js": {
+      "sha256": "134f0585f7c665db89f332a379158c6f113274422e42aaf54e0aa9d5ac37f577",
+      "bytes": 6078
+    },
+    "7956.index.js": {
+      "sha256": "67c5b06ab772041f694b72e358671fa870a238dca6b8e1e5ca2a49cd6060172e",
+      "bytes": 1017640
+    },
+    "node_modules/tree-sitter-bash/bindings/node/index.js": {
+      "sha256": "609bdf22b8fd183025b3c24e8587f6211d50358e8f2e4c526b9217349ed9dbc0",
+      "bytes": 201
+    },
+    "node_modules/tree-sitter-bash/build/Release/tree_sitter_bash_binding.node": {
+      "sha256": "852011b968215769e3e82400a71a96c70ac348c69d6ef909983f99511c1f9b15",
+      "bytes": 1510400
+    },
+    "node_modules/tree-sitter/build/Release/tree_sitter_runtime_binding.node": {
+      "sha256": "b838a262071563b569319dd5fa8a2a653dfbb016e1d74381308aec3e29166197",
+      "bytes": 555104
+    },
+    "node_modules/tree-sitter-bash/src/node-types.json": {
+      "sha256": "39763582e682b132eb5349af6e1d7be78aed98decf808ffa6bcf92cfed4ac5dc",
+      "bytes": 49267
+    },
+    "cursor-agent": {
+      "sha256": "2ccc9a8e167797641448b5e5c936f006ba137a2555f117f38c5eb76a5238a233",
+      "bytes": 1096
+    },
+    "node_modules/tree-sitter/package.json": {
+      "sha256": "8cca5044dd3381dbf958dea36ef6d9f81f379886d32ef845919cf07679c6e42c",
+      "bytes": 1757
+    },
+    "node_modules/tree-sitter-bash/package.json": {
+      "sha256": "ee9d6515031266905123792f891fc9c3db75f55c5d9c1e027a315a60a09557c4",
+      "bytes": 1616
+    },
+    "node_modules/tree-sitter/index.js": {
+      "sha256": "ba5e8461e5068f2b58ea860aea331ed0c6d8a25f21142d75a6145a1544fc9ffe",
+      "bytes": 25716
+    },
+    "node": {
+      "sha256": "ebd2d552c7bebde593dd0390530963ad28de56bccde6ce387cdbe55fb0b6fb8e",
+      "bytes": 145803984
+    },
+    "index.js": {
+      "sha256": "d0e2097119ed8ef3509c6e9e4c629809f2b7345d81de33bf591875b4b6e4722c",
+      "bytes": 7994465
+    }
+  },
+  "source_sha256": "81bf27ad172eff54ce7d2f924749f37d4730fc3657cb036a7c16a0d850cb5927"
+}

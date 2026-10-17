@@ -1,0 +1,38 @@
+{
+  "loader": true,
+  "credentialOwner": "../cli-credentials/dist/index.js",
+  "domain": "cursor",
+  "backend": "file",
+  "cwd": "/fixture/home/cortados",
+  "observed_at": "2026-10-17T20:13:44.023Z",
+  "config_merge_equal": true,
+  "settings_file": "/fixture/home/.cursor/cli-config.json",
+  "project_files": [],
+  "config_file_hashes": [
+    {
+      "path": "/fixture/home/.cursor/cli-config.json",
+      "sha256": "4399a52c78b021c524ac522dddae2863074b95b7bc7509e137eef7e19bd12149"
+    }
+  ],
+  "safe_env": {
+    "HOME": "/fixture/home",
+    "CURSOR_CONFIG_DIR": null,
+    "XDG_CONFIG_HOME": null,
+    "CURSOR_DATA_DIR": null,
+    "AGENT_CLI_CREDENTIAL_STORE": "file",
+    "DIRENV_DISABLE": null
+  },
+  "selector_presence": {
+    "CURSOR_API_KEY": false,
+    "CURSOR_AUTH_TOKEN": false,
+    "CURSOR_API_ENDPOINT": false,
+    "CURSOR_API_URL": false
+  },
+  "envrc_ancestors": [],
+  "native_direnv_result": {
+    "kind": "skipped",
+    "reason": "no-envrc"
+  },
+  "native_store": "file",
+  "native_credential_file": "/fixture/home/.cursor/auth.json"
+}

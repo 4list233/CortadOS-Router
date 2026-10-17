@@ -1,0 +1,4 @@
+{
+  "accessToken": "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJmaXh0dXJlLWFjY291bnQiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6ImZpeHR1cmUtbmF0aXZlIiwic2NvcGUiOiJmaXh0dXJlIiwiYXVkIjoiZml4dHVyZSIsInR5cGUiOiJmaXh0dXJlIn0.fixture-signature",
+  "refreshToken": "fixture-refresh-token"
+}

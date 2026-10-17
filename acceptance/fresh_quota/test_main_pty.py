@@ -100,6 +100,7 @@ class PtyDispatch(StageCase):
         job.meta = {'runtime': 'codex', 'model': 'gpt-6.1-sol', 'owner': 'exam',
                     'quota_stage': 'dispatch', 'quota_auth_scope': {'kind': 'cli_store', 'lane': 'codex', 'scope_id': 'b' * 64}}
         job.save = Mock()
+        self.bind_job_context(job)
         for status in ('unknown', 'spent'):
             with self.subTest(status=status):
                 self.write_quota(status)
@@ -114,6 +115,7 @@ class PtyDispatch(StageCase):
         job.meta = {'runtime': 'codex', 'model': 'gpt-6.1-sol', 'owner': 'exam',
                     'quota_stage': 'dispatch', 'quota_auth_scope': {'kind': 'cli_store', 'lane': 'codex', 'scope_id': 'b' * 64}}
         job.save = Mock()
+        self.bind_job_context(job)
         with patch.object(self.runner.os, 'write') as write:
             job.send('fixture prompt')
         write.assert_called_once_with(123, b'fixture prompt\r')

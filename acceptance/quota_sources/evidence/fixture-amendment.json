@@ -1,0 +1,16 @@
+{
+  "status": "reviewed additive plumbing; assertions identical",
+  "authorization": "Root approved additive prepare/check fake-owner support and private context setup in two continuation tests; all assertions retained",
+  "before": {
+    "acceptance/fresh_quota/stage_support.py": "95733b7003708d0f2a0a6a3e0f944c44cfd04a99d6fd5ae3f10c3f2ed15e87eb",
+    "acceptance/fresh_quota/test_main_pty.py": "9e05b57664dc7d48ab2f745d2db542a32339a96ab14ce526ae8eadc15c89f9b9"
+  },
+  "after": {
+    "acceptance/fresh_quota/stage_support.py": "1444a4e2160789aea437717e0895eb31aa3091a37b2b2bdf6f9a69b98d287de6",
+    "acceptance/fresh_quota/test_main_pty.py": "b8a3a8448ee16e39b4d8b7716b55ef50e3c391c85d005241a11438ceb94b975b"
+  },
+  "assertions_ast_identical": true,
+  "assertion_count": 20,
+  "preserved_prebuild_methods": 12,
+  "preserved_prebuild_result": "pass, zero failures/errors/skips"
+}

@@ -1,0 +1,17 @@
+{
+  "observed_at": "2026-10-17T20:15:38.107Z",
+  "native_threshold_s": 300,
+  "strict_comparison": "refresh if exp - floor(Date.now()/1000) <300; equality300 retains current",
+  "native_worker_invalid_claim": "missing/nonfinite/nonnumeric/malformed exp \u2192 refresh-needed",
+  "current_token_booleans": {
+    "exp_number": true,
+    "exp_finite": true,
+    "unexpired": true,
+    "at_least_native_300s": true,
+    "native_worker_isTokenExpiringSoon": false,
+    "api_key_credential_present": false,
+    "ephemeral_override_not_initialized": true
+  },
+  "diagnostic_refresh": "getApiKey returns undefined; CURSOR_API_KEY absent; setAuthentication throws; native policy retains same current token when refresh returns null",
+  "conservative_profile": "refuse refresh-needed before quota read and immediately before actual dispatch; no claim of atomic future token stability"
+}

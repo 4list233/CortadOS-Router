@@ -1,0 +1,13 @@
+sequenceDiagram
+  participant W as Existing worker or teacher
+  participant A as Existing admission owner
+  participant O as Existing observation parent
+  participant N as Native read-only source
+  W->>A: Check actual effective source
+  A->>O: Collect absent or expired observation
+  O->>O: Capture source start clocks
+  O->>N: Bounded read-only request
+  N-->>O: Actual quota facts or explicit failure
+  O->>O: Prove owned process containment
+  O-->>A: Immutable source observation
+  A-->>W: Available or typed refusal

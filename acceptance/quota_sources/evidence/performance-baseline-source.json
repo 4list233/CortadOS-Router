@@ -1,0 +1,7 @@
+{
+  "revision": "a5a2733fea3c700369d2c628a6bd9e27b72561c5",
+  "archive_sha256": "c48f843cbfb01f3ce7e9eecdbdc74a5b9f3d2c9ec03ed8e777ea9da6c6cac2fe",
+  "benchmark_sha256": "dbbeb095a53aeb0160f24129b148587533ad4dcff597eb957798beb2d73958ed",
+  "baseline_source": "/Users/velox/.cortados-builds/quota-verification-repair/baseline-source",
+  "scope": "Six preserved Codex protocol workloads; excludes native Cursor source latency and provider network."
+}

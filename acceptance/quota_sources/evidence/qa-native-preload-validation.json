@@ -1,0 +1,14 @@
+{
+  "fixture_only": true,
+  "production_pass_claim": false,
+  "returncode": 0,
+  "calls": [
+    {
+      "kind": "dashboard-quota"
+    }
+  ],
+  "native_record_exact": true,
+  "error_type": null,
+  "preload_sha256": "81f7ac768a3fd48cd09a9dfcf3071f356b8daeb02604a4452bbed7bf68c5ae52",
+  "clock": "Frozen recorded observation time in fixture only"
+}

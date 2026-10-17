@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "editor": {
+    "vimMode": false
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "authInfo": {
+    "userId": 101,
+    "authId": "fixture-account",
+    "activeTeamId": 202
+  }
+}

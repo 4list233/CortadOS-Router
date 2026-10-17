@@ -78,6 +78,16 @@ def auth_scope(provider, *, environment, executable, config, argv=()):
  return dict(_SCOPE)
 def current_resources(candidates, *, config):
  return None
+class ActualSource:
+ def __init__(self, scope):
+  self._scope = dict(scope)
+ @property
+ def public_scope(self):
+  return dict(self._scope)
+def prepare_actual(provider, *, environment, executable, argv, cwd, config):
+ return ActualSource(auth_scope(provider, environment=environment, executable=executable, argv=argv, config=config))
+def check_actual(provider, model, *, actual, config):
+ return check(provider, model, auth_scope=actual.public_scope, config=config)
 """)
         for directory in ('plugins/cortados-router', 'plugins/cortados-pty', 'plugins/model-providers/cortados-cli', 'context', 'router'):
             shutil.copytree(STAGE / directory, self.root / directory)
@@ -119,6 +129,15 @@ def current_resources(candidates, *, config):
         sys.modules.update({'hermes_cli': host, 'hermes_cli.config': config,
                             'hermes_constants': constants_mod, 'hermes_cli.local_execution': local,
                             'agent': agent, 'agent.agent_model_routing': routing})
+
+    def bind_job_context(self, job):
+        """006 additive setup: existing continuation assertions exercise a live private binding."""
+        from cortados_router import quota_admission
+        config = json.loads(self.config_path.read_text())
+        job._quota_actual_source = quota_admission.prepare_actual(
+            'codex-cli', environment={'HOME': str(self.root)}, executable='fixture-native',
+            argv=('fixture-native',), cwd=str(self.root), config=config)
+        job.meta['quota_auth_scope'] = job._quota_actual_source.public_scope
 
     def restore_imports(self):
         for name in list(sys.modules):
