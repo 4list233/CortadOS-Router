@@ -643,7 +643,7 @@
   "script_hashes": {
     "acceptance/training_teacher/evidence/baseline-label.py": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c",
     "acceptance/training_teacher/evidence/benchmark.py": "3ca2ee8441a083e9ec5955d855e9468f871cd7ede719c0a3d370fd65d45672a6",
-    "acceptance/training_teacher/evidence/installed-parity.py": "bc939b49a0cf94c6849e502940e49fd6f96697b052dba33478c888933038c5d1",
+    "acceptance/training_teacher/evidence/installed-parity.py": "971acfe22f6bb8e1866780c9fcb2a8c4884de6983504f55068aeac9c2cb64c08",
     "acceptance/training_teacher/evidence/run-full-suite.py": "4240e72acd70792680f55d0f85c07f5306e4ff7bc690124ce69421d81372a61b"
   },
   "B_required": [

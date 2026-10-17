@@ -159,9 +159,12 @@ If a known pending job cannot be reconciled before its existing timeout/terminat
 with a pending marker: later waiting threads defer without first submission or new request IDs.
 A finite --limit counts an actually attempted planned batch as below, not waiting on this lock.
 
-Reconcile every reserved/submitted/terminal Codex attempt first. Read-only replay/status/result
-of previously submitted work does not consume --limit because it cannot create a new identity or
-native attempt. A reserved-but-never-submitted batch does consume one planned slot when first sent;
+Reconcile every reserved/submitted/terminal Codex attempt first. Status/result reads are read-only.
+Reconciliation of an already persisted submitted identity does not consume a new --limit planned
+identity slot. Exact delegate replay may first accept that previously planned attempt if the crash
+preceded broker receipt; it cannot create a second accepted job for the same UUID/arguments. A
+submitted journal state does not prove a prior native start. A reserved-but-never-submitted batch
+does consume one planned slot when first sent;
 process those by journal insertion order before new batches. A finite --limit bounds the combined
 number of these first submissions plus new Claude/planned batches in this invocation. A primary
 zero-start refusal plus its Codex fallback is ONE planned slot, even if fallback is also refused.

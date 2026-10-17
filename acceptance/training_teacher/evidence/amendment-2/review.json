@@ -1,0 +1,29 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "amendment": 2,
+  "exam_owner": "/root/quota_evaluation_qa",
+  "authority": "Root explicitly authorized narrow replay wording and declared wheel membership correction before stable B",
+  "policy_changed": false,
+  "replay_clarification": "Submitted persists before send. Exact replay can perform first acceptance, retains UUID/arguments and original planned identity budget; journal state never proves prior native start.",
+  "packaging_correction": "Pinned setuptools explicit package list includes direct Python modules and declared package-data only. Eight integrations/hermes/patches files are maintained source fixtures, not declared installed packages; prior recursive expectation was wrong. No packaging/product changes required.",
+  "coverage_retained": [
+    "exact installed package set and every file hash",
+    "exact fixed runtime import origins",
+    "unchanged learning/native owners",
+    "protected exam/model settings",
+    "all source patch full-suite lanes"
+  ],
+  "before_after": {
+    "docs/mcp-worker/CODEX-TRAINING-TEACHER-007.md": {
+      "before": "f388af87eb7d9056dd332d396a366b45418a4642aa25f050b5139be235bdf7d3",
+      "after": "9b14c51c140e3f695edf09d8f0890d42173f877346374d5c8a95433e1061aee8"
+    },
+    "acceptance/training_teacher/evidence/installed-parity.py": {
+      "before": "bc939b49a0cf94c6849e502940e49fd6f96697b052dba33478c888933038c5d1",
+      "after": "971acfe22f6bb8e1866780c9fcb2a8c4884de6983504f55068aeac9c2cb64c08"
+    }
+  },
+  "test_counts_unchanged": true,
+  "provider_calls": 0,
+  "production_edits": false
+}

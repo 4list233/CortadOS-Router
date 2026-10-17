@@ -4,6 +4,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import tomllib
 import unittest
 
 ROOT = Path('/Users/velox/.cortados-builds/cortados-router-repo')
@@ -19,20 +20,26 @@ def digest(path):
 
 class InstalledParity(unittest.TestCase):
     def test_installed_sources_match_reviewed_checkout(self):
+        configuration = ROOT / 'pyproject.toml'
+        self.assertEqual(digest(configuration), 'f7516262d17c7ddb3f19ba0b1e6e4ac3c99067244c95795a07e16a9b28e3fa7d')
+        declaration = tomllib.loads(configuration.read_text())['tool']['setuptools']
+        expected = set()
+        for package in declaration['packages']:
+            directory = ROOT / Path(*package.split('.'))
+            expected.update(str(path.relative_to(ROOT)) for path in directory.glob('*.py') if path.is_file())
+            for pattern in declaration.get('package-data', {}).get(package, []):
+                expected.update(str(path.relative_to(ROOT)) for path in directory.glob(pattern) if path.is_file())
+        roots = {package.split('.')[0] for package in declaration['packages']}
+        actual = {str(path.relative_to(SITE)) for package in roots for path in (SITE / package).rglob('*')
+                  if path.is_file() and '__pycache__' not in path.parts}
+        self.assertEqual(actual, expected, 'Exact declared installed package file set')
         compared = {}
-        for package in ('cortados_router', 'integrations'):
-            expected = {str(p.relative_to(ROOT)) for p in (ROOT / package).rglob('*') if p.suffix in ('.py', '.cjs')}
-            actual = {str(p.relative_to(SITE)) for p in (SITE / package).rglob('*') if p.suffix in ('.py', '.cjs')}
-            self.assertEqual(actual, expected, package + ' installed source file set')
-            for source in sorted((ROOT / package).rglob('*')):
-                if source.suffix not in ('.py', '.cjs'):
-                    continue
-                relative = source.relative_to(ROOT)
-                self.assertTrue((SITE / relative).is_file(), str(relative))
-                self.assertEqual(digest(source), digest(SITE / relative), str(relative))
-                compared[str(relative)] = digest(source)
+        for relative in sorted(expected):
+            self.assertEqual(digest(ROOT / relative), digest(SITE / relative), relative)
+            compared[relative] = digest(ROOT / relative)
         self.assertGreaterEqual(len(compared), 55)
         DETAILS['installed_source_sha256'] = compared
+        DETAILS['package_declaration_sha256'] = digest(configuration)
 
     def test_runtime_imports_are_from_fixed_installed_release(self):
         self.assertEqual(Path(sys.executable), RELEASE / 'venv/bin/python')

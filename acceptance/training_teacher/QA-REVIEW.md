@@ -48,3 +48,12 @@ primary work proceeds. They preserve the one-owner rollback boundary already spe
 The installed release did not yet exist during this amendment; those seven installed-main methods
 remain mandatory candidate B checks, not claimed passing. Current in-progress source passes all49
 ordinary methods. Exact recheck source hashes are evidence only, not a stable candidate pin.
+
+
+Amendment2 clarifies submitted-state evidence: an exact UUID replay can first reach the broker
+after a crash before receipt. It preserves the already-planned identity budget and never proves
+a prior native start. No new identity or retry permission is introduced. Installed parity now
+uses the pinned explicit setuptools package/data declaration rather than recursively inventing
+eight unshipped Hermes patch modules. The exact installed set/hash requirement, execution-owner
+parity and all maintained source-patch suite lanes remain. The accepted006 wheel has55 members;
+the candidate declaration adds only the two reviewed teacher modules, totaling57.
