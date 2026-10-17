@@ -23,6 +23,12 @@ These estimates can be rough: ledger coverage, model mix, caching and provider a
 
 The current relative burn heuristic is `published_blended_price_per_million / (learned_tokens_per_percentage_point / 1_000_000)`. It is normalized across candidates. Unknown learned cost retains the existing price fallback. Selection cost then adds a scarcity penalty, subtracts an underused/expiring-capacity credit, and may subtract an absolute-capacity credit. Lower cost wins among candidates satisfying capability, fit, permissions and availability rules. These are ranking scores, not a dollar charge or an exact forecast of the next job's quota debit.
 
+The current configured score is `weight + 30 * max(scarcity, 0) - 80 * max(-scarcity, 0) - capacity_credit`.
+The largest measured burn among candidates is normalized to weight 100. A non-scarce pool may receive
+up to 20 additional points of credit in proportion to its estimated remaining tokens. These existing
+weights express a preference for using spare paid capacity before reset; they do not override task fit
+or the fresh-quota refusal. Neither the coefficients nor the learner were retuned in this repair.
+
 ## Freshness policy requested for both systems
 
 The approved 005 policy requires validated quota no more than 30 seconds old in both the MCP gateway and the legacy fleet. The limit applies to the source observation start, using both wall and monotonic clocks; wrapping an old reading in a fresh response does not refresh it. A cached routing decision is not permission to dispatch: the exact provider/model and matching authentication scope must pass the final quota check. Refresh failure, stale/malformed quota or an exhausted applicable pool must prevent that dispatch. A missing learned token-cost estimate is different from missing provider quota.
@@ -59,3 +65,17 @@ The unchanged evaluator completed successfully against frozen inputs. Candidate 
 | Outward-action recall | 92.9% | 88.1% | Pass |
 
 The report was published to `train/runs/2026-10-17-0130/report.json` without changing `train/current.json`. The October 16 model remains active. Nightly scheduling remains 01:30 America/Toronto, with unchanged training and promotion gates. This recovery did not retrain or relabel the saved checkpoint.
+
+## Latest verified operating observation
+
+At 14:23 EDT on October 17, the diagnostic refresh reported Claude weekly 76% used / 24% left /
+71.1% elapsed (projected 107%, cautious), and Codex weekly 47% used / 53% left / 35.1% elapsed
+(projected 134%, avoid). Codex resets October 22 at 03:22 EDT; Claude resets October 19 at 15:00 EDT.
+Cursor's displayed 100%/33% pool usage and Antigravity's 0% were retained from 13:53 EDT, so they
+are not fresh admission evidence. These are timestamped observations, not permanent balances.
+
+A separate strict installed-source check at 14:24 EDT admitted Codex. Claude/Antigravity metadata
+was unavailable, Cursor process containment could not be proven, and the local transport endpoint
+was unproven. These routes refused even where diagnostic status displayed a percentage. Existing
+status stance text describes the scarcity heuristic; final admission overrides it when evidence is
+unknown. Nightly training stays scheduled, but its teacher will pause if its quota cannot be verified.

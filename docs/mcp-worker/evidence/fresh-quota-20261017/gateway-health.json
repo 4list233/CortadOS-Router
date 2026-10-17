@@ -1,0 +1,86 @@
+{
+  "checked_utc": "2026-10-17T18:28:00.656450+00:00",
+  "script_log": "gateway restarted at 14:22:49: 12 faces reconnected \u00b7 supervised by launchd (PID 222)\n",
+  "default_13_face_check": "FAIL: only12connected; rc28 profile alreadydisabled",
+  "enabled_service_health": "PASS12/12",
+  "cron_units_after_script": [
+    {
+      "unit": "com.cortados.route-crons",
+      "loaded": true,
+      "returncode": 0
+    },
+    {
+      "unit": "com.cortados.burndown",
+      "loaded": true,
+      "returncode": 0
+    }
+  ],
+  "gateway_status": "Launchd plist: /Users/velox/Library/LaunchAgents/ai.hermes.gateway-866ce901.plist\n\u2713 Service definition matches the current Hermes install\n\u2713 Gateway is supervised by launchd (PID 222)\n  Auto-start at login and auto-restart on crash are available.\n",
+  "final_hashes": [
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/core.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/execution_routing.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/__init__.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/scarcity.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-pty/model_routing.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-pty/runner.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/patches/auxiliary-routing/auxiliary_model_routing.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_model_routing.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_client.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/.cortados/hermes/hermes-agent/hermes_cli/plugins.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/train/dataset.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/train/label.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/train/build_sft.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/train/evaluate.py",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/train/nightly.sh",
+      "matches": true
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/quota_policy.py",
+      "matches": true
+    }
+  ],
+  "protected_still_unchanged": true
+}

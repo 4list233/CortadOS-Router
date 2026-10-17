@@ -1,0 +1,27 @@
+{
+  "at": "2026-10-17T18:29:33.578787+00:00",
+  "claude_command": [
+    "/opt/homebrew/bin/claude",
+    "mcp",
+    "get",
+    "cortados-workers"
+  ],
+  "claude_exit": 0,
+  "claude_output": "cortados-workers:\n  Scope: User config (available in all your projects)\n  Status: \u2714 Connected\n  Type: stdio\n  Command: /Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/bin/python\n  Args: -B -m integrations.mcp --config /Users/velox/.config/cortados-workers/config.json\n  Environment:\n    CORTADOS_S1_URL=http://127.0.0.1:8431\n\nTo remove this server, run: claude mcp remove cortados-workers -s user\n",
+  "s1": {
+    "ok": true,
+    "model": "s1 2026-10-16 05:40 (2026-10-16-0130)",
+    "loaded_s": 2.3
+  },
+  "nightly_loaded": true,
+  "nightly_launchctl_lines": [
+    "state = not running",
+    "last exit code = 1",
+    "\"Minute\" => 30",
+    "\"Hour\" => 1",
+    "state = active",
+    "state = active",
+    "job state = exited"
+  ],
+  "source_commit": "660ae562fa361710e8ebcbe34fb41454b3e61bd2"
+}

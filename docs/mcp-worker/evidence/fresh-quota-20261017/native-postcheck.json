@@ -1,0 +1,21 @@
+{
+  "verified_at_ms": 1792261426054,
+  "broker_identity": {
+    "pid": 184,
+    "pgid": 184,
+    "creation_time_us": 1792261366351446
+  },
+  "old_broker_absent": true,
+  "job_id": "bcaeb64a-2cb1-423a-aadd-ba24242a108a",
+  "state": "succeeded",
+  "permissions": {
+    "network": false,
+    "mcp_servers": []
+  },
+  "marker_sha256": "2d6c6a1f8d7194eb5f192012b254de3e7b0488cf1875458a1dd8243f7d852cc3",
+  "feedback_id": "59d268df-c54d-4808-958c-445168334161",
+  "active_jobs": 0,
+  "jobs": 3,
+  "feedback_rows": 2,
+  "integrity": "ok"
+}

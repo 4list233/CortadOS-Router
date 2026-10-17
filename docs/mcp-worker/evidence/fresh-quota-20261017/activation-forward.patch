@@ -1,0 +1,721 @@
+--- before/Users/velox/cortados/plugins/cortados-router/quota_policy.py
++++ after/Users/velox/cortados/plugins/cortados-router/quota_policy.py
+@@ -0,0 +1,72 @@
++# PURPOSE: Forward legacy boundaries to the exact installed fresh-quota owners.
++# CONTRACT: RT-FRESH-QUOTA-005; source mismatches refuse rather than load a checkout.
++# DEPENDS: Pinned quota admission/config and native status owners only.
++# CEILING: No quota arithmetic, collection, account discovery or persistent writes.
++"""Exact-release adapter. Quota decisions belong to the installed quota owners."""
++import importlib
++from pathlib import Path
++import sys
++
++RELEASE_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
++RELEASE_PYTHON = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/bin/python"
++CONFIG_PATH = "/Users/velox/.config/cortados-workers/config.json"
++
++
++def _owners():
++    site = Path(RELEASE_SITE_PACKAGES).resolve()
++    if not site.is_dir():
++        raise RuntimeError("quota_unknown: pinned quota release unavailable")
++    if str(site) not in sys.path:
++        sys.path.insert(0, str(site))
++    quota = importlib.import_module("cortados_router.quota_admission")
++    config = importlib.import_module("integrations.mcp.config")
++    for module in (quota, config):
++        if not Path(module.__file__).resolve().is_relative_to(site):
++            raise RuntimeError("quota_unknown: quota owner outside pinned release")
++    return quota, config.load_config(CONFIG_PATH)
++
++
++def _unknown():
++    return {"status": "unknown", "kind": "subscription", "lane": None,
++            "pool": None, "observed_at": None, "age_s": None,
++            "source": "pinned-release", "reason": "quota owner or configuration unavailable"}
++
++
++def check(provider, model, *, auth_scope):
++    try:
++        owner, config = _owners()
++        return owner.check(provider, model, auth_scope=auth_scope, config=config)
++    except Exception:
++        return _unknown()
++
++
++def source_preflight(provider, model):
++    try:
++        owner, config = _owners()
++        return owner.source_preflight(provider, model, config=config)
++    except Exception:
++        return {"quota_stage": "source_preflight", "auth_scope": {
++            "kind": "unproven", "lane": None, "scope_id": None}, "quota": _unknown()}
++
++
++def auth_scope(provider, *, environment, executable, argv=()):
++    try:
++        owner, config = _owners()
++        return owner.auth_scope(provider, environment=environment, executable=executable,
++                                argv=argv, config=config)
++    except Exception:
++        return {"kind": "unproven", "lane": None, "scope_id": None}
++
++
++def resources(candidates):
++    owner, config = _owners()
++    return owner.current_resources(candidates, config=config)
++
++
++def codex_status():
++    """Normal status uses the installed native source, never the diagnostic TUI."""
++    _owners()
++    owner = importlib.import_module("cortados_router.scarcity")
++    if not Path(owner.__file__).resolve().is_relative_to(Path(RELEASE_SITE_PACKAGES).resolve()):
++        raise RuntimeError("quota_unknown: status owner outside pinned release")
++    return owner._codex_native()
+--- before/Users/velox/cortados/plugins/cortados-router/core.py
++++ after/Users/velox/cortados/plugins/cortados-router/core.py
+@@ -317 +317 @@
+-def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
++def _pool_tokens_per_pct(c: dict[str, Any], *, lanes=None, costs=None) -> float | None:
+@@ -321 +321 @@
+-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
++        lane = ((sc.current().get("lanes") or {}) if lanes is None else lanes).get(c["lane"]) or {}
+@@ -325 +325 @@
+-        uc = (sc.unit_costs() or {}).get(key or "") or {}
++        uc = ((sc.unit_costs() or {}) if costs is None else costs).get(key or "") or {}
+@@ -331 +331 @@
+-def _tokens_left_for(c: dict[str, Any]) -> float | None:
++def _tokens_left_for(c: dict[str, Any], *, lanes=None, costs=None) -> float | None:
+@@ -335 +335 @@
+-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
++        lane = ((sc.current().get("lanes") or {}) if lanes is None else lanes).get(c["lane"]) or {}
+@@ -339 +339 @@
+-        uc = (sc.unit_costs() or {}).get(key or "") or {}
++        uc = ((sc.unit_costs() or {}) if costs is None else costs).get(key or "") or {}
+@@ -402 +402 @@
+-            execution: bool = False, minimum_band: str | None = None) -> dict[str, Any]:
++            execution: bool = False, minimum_band: str | None = None, resources=None) -> dict[str, Any]:
+@@ -434 +434 @@
+-    health, pol = lane_health(), _policy()
++    health, pol = (resources.health() if resources is not None else lane_health()), _policy()
+@@ -521 +521 @@
+-            c["burn"] = (c["price"] / (estimate / 1e6)) if c.get("price") and (estimate := _pool_tokens_per_pct(c)) else None
++            c["burn"] = (c["price"] / (estimate / 1e6)) if c.get("price") and (estimate := (resources.tokens_per_pct(c) if resources is not None else _pool_tokens_per_pct(c))) else None
+@@ -533 +533 @@
+-            tl = _tokens_left_for(c)
++            tl = resources.tokens_left(c) if resources is not None else _tokens_left_for(c)
+--- before/Users/velox/cortados/plugins/cortados-router/execution_routing.py
++++ after/Users/velox/cortados/plugins/cortados-router/execution_routing.py
+@@ -11,0 +12,2 @@
++import importlib.util
++from pathlib import Path
+@@ -50,0 +53,11 @@
++    spec = importlib.util.spec_from_file_location("cortados_selection_quota_policy", Path(__file__).with_name("quota_policy.py"))
++    quota_policy = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(quota_policy)
++    table = core.table()
++    candidates = [r for m in (core.model_scores() or {}).get('models', []) for r in m.get('reach', [])]
++    candidates += [r for rows in table['candidates'].values() for r in rows]
++    candidates += [dict(r, provider='codex-cli') for r in candidates if r['provider'] == 'openai-codex']
++    try:
++        snapshot = quota_policy.resources(candidates)
++    except Exception:
++        return {'router': ROUTER, 'error': 'quota_unknown: quota resources unavailable'}
+@@ -71,3 +83,0 @@
+-    table = core.table()
+-    candidates = [r for m in (core.model_scores() or {}).get('models', []) for r in m.get('reach', [])]
+-    candidates += [r for rows in table['candidates'].values() for r in rows]
+@@ -101,0 +112,5 @@
++    try:
++        snapshot = quota_policy.resources(candidates)
++    except Exception:
++        return {'router': ROUTER, 'error': 'quota_unknown: quota resources unavailable'}
++    allowed &= set(snapshot.allowed_routes)
+@@ -105 +120 @@
+-                             minimum_band=(constraints or {}).get('min_band'))
++                             minimum_band=(constraints or {}).get('min_band'), resources=snapshot)
+@@ -117 +132 @@
+-        if not core.candidate_health(choice, core.lane_health()).get('ok', True):
++        if not core.candidate_health(choice, snapshot.health()).get('ok', True):
+@@ -120,0 +136,5 @@
++        final = quota_policy.source_preflight(provider, model)
++        quota = final.get('quota') or {}
++        if quota.get('status') != 'available':
++            code = 'quota_spent' if quota.get('status') == 'spent' else 'quota_unknown'
++            return {'router': ROUTER, 'error': code + ': ' + str(quota.get('reason', 'final quota unavailable'))}
+@@ -130 +150 @@
+-        return {'router': ROUTER, 'provider': provider, 'model': model, 'context_length': cap,
++        return {'router': ROUTER, 'quota_stage': 'source_preflight', 'quota': quota, 'provider': provider, 'model': model, 'context_length': cap,
+--- before/Users/velox/cortados/plugins/cortados-router/__init__.py
++++ after/Users/velox/cortados/plugins/cortados-router/__init__.py
+@@ -35,0 +36,3 @@
++
++_quota_spec = _ilu.spec_from_file_location("cortados_router_quota_policy", str(_HERE / "quota_policy.py"))
++quota_policy = _ilu.module_from_spec(_quota_spec); _quota_spec.loader.exec_module(quota_policy)
+@@ -160 +163,47 @@
+-def _execution_admission(request, next_call, *, turn_id='', api_request_id='', provider='', model='', **_):
++def _admit_model_quota(provider, model, entrypoint, *, auth_scope, quota_stage="dispatch", **_):
++    if quota_stage == "source_preflight":
++        result = quota_policy.source_preflight(provider, model)
++        quota = result.get("quota") or quota_policy._unknown()
++    elif quota_stage == "dispatch":
++        quota = quota_policy.check(provider, model, auth_scope=auth_scope)
++    else:
++        quota = quota_policy._unknown()
++    return {"router": "cortados-router", "quota_stage": quota_stage, "quota": quota}
++
++
++def _cli_source_profile(provider, base_url, api_mode):
++    """Trust only the registered frozen profile and its original constructor."""
++    import inspect
++    from providers import get_provider_profile
++    runtime = {"claude-cli": "claude", "codex-cli": "codex", "agy-cli": "agy", "cursor-cli": "cursor"}.get(provider)
++    try:
++        profile = get_provider_profile(provider)
++        source = _HERE.parent / "model-providers/cortados-cli/__init__.py"
++        base = next(cls for cls in type(profile).__mro__ if cls.__name__ == "_CliProfile")
++        return (runtime is not None and Path(inspect.getfile(base)).resolve() == source.resolve()
++                and profile._runtime == runtime and profile.auth_type == "external_process"
++                and profile.api_mode == "chat_completions" and api_mode == "chat_completions"
++                and base_url == "acp://cortados-" + runtime
++                and getattr(profile.create_client, "__func__", None) is base.create_client
++                and Path(inspect.getfile(base.create_client)).resolve() == source.resolve())
++    except (AttributeError, TypeError, StopIteration, OSError):
++        return False
++
++
++def _execution_admission(request, next_call, *, turn_id='', api_request_id='', provider='', model='',
++                         base_url='', api_mode='', **_):
++    from hermes_cli.local_execution import LocalExecutionFailure
++    try:
++        proven = _cli_source_profile(provider, base_url, api_mode)
++        if not proven:
++            raise ValueError("unproven main transport")
++        scope = {"kind": "unproven", "lane": None, "scope_id": None}
++        result = _admit_model_quota(provider, model, "main-dispatch", auth_scope=scope,
++                                    quota_stage="source_preflight" if proven else "dispatch")
++        quota = result.get("quota") or {}
++    except Exception:
++        quota = {"status": "unknown", "reason": "quota source proof unavailable"}
++    if quota.get("status") != "available":
++        code = "quota_spent" if quota.get("status") == "spent" else "quota_unknown"
++        return LocalExecutionFailure(message=code + ": " + str(quota.get("reason", "quota unavailable")),
++                                     reason=code, retryable=True, origin="cortados_router")
+@@ -972,0 +1022 @@
++    ctx.register_hook("admit_model_quota", _admit_model_quota)
+--- before/Users/velox/cortados/plugins/cortados-router/scarcity.py
++++ after/Users/velox/cortados/plugins/cortados-router/scarcity.py
+@@ -93 +93 @@
+-    return {"window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
++    return {"window_s": window_s, "reset_epoch": reset_at, "window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
+@@ -328 +328 @@
+-    for m in re.finditer(r"((?:[A-Za-z0-9.-]+ ){0,3}?(?:5h|[Ww]eekly)|[A-Za-z0-9.-]+) limit: \[[^\]]*\] (\d{1,3})% left(?: \(resets ([^)]+)\))?", text):
++    for m in re.finditer(r"((?:(?:[Gg][Pp][Tt]-[A-Za-z0-9.-]+|[Oo][1-9][A-Za-z0-9.-]*) )?(?:5h|[Ww]eekly)) limit: \[[^\]]*\] (\d{1,3})% left(?: \(resets ([^)]+)\))?", text):
+@@ -331 +331 @@
+-        t = re.search(r"(\d{1,2}):(\d{2})(?: on (\d{1,2}) ([A-Z][a-z]{2}))?", when or "")
++        t = re.fullmatch(r"(\d{1,2}):(\d{2})(?: (AM|PM))?(?: on (\d{1,2}) ([A-Z][a-z]{2}))?", when or "")
+@@ -333,9 +333,18 @@
+-            now = datetime.now()
+-            reset_dt = now.replace(hour=int(t.group(1)), minute=int(t.group(2)), second=0, microsecond=0)
+-            if t.group(3):
+-                reset_dt = reset_dt.replace(month=datetime.strptime(t.group(4), "%b").month, day=int(t.group(3)))
+-                if reset_dt < now - timedelta(days=1):
+-                    reset_dt = reset_dt.replace(year=now.year + 1)
+-            elif reset_dt <= now:
+-                reset_dt += timedelta(days=1)
+-            reset = reset_dt.timestamp()
++            try:
++                now = datetime.now()
++                hour, minute = int(t.group(1)), int(t.group(2))
++                if t.group(3):
++                    if not 1 <= hour <= 12:
++                        raise ValueError("invalid twelve-hour clock")
++                    hour = hour % 12 + (12 if t.group(3) == "PM" else 0)
++                reset_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
++                if t.group(4):
++                    reset_dt = reset_dt.replace(month=datetime.strptime(t.group(5), "%b").month, day=int(t.group(4)))
++                    if reset_dt < now - timedelta(days=1):
++                        reset_dt = reset_dt.replace(year=now.year + 1)
++                elif reset_dt <= now:
++                    reset_dt += timedelta(days=1)
++                reset = reset_dt.timestamp()
++            except (ValueError, OverflowError, OSError):
++                # Unsupported clock/calendar geometry has no trustworthy reset evidence.
++                reset = None
+@@ -467 +476,9 @@
+-SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local}
++def _codex_native():
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("cortados_status_quota_policy", Path(__file__).with_name("quota_policy.py"))
++    bridge = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(bridge)
++    return bridge.codex_status()
++
++
++SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex_native, "cursor": _cursor, "local": _local}
+--- before/Users/velox/cortados/plugins/cortados-pty/model_routing.py
++++ after/Users/velox/cortados/plugins/cortados-pty/model_routing.py
+@@ -1,0 +2 @@
++import importlib
+@@ -116,0 +118,73 @@
++
++
++RELEASE_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
++RELEASE_PYTHON = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/bin/python"
++CONFIG_PATH = "/Users/velox/.config/cortados-workers/config.json"
++
++
++def _owners():
++    site = Path(RELEASE_SITE_PACKAGES).resolve()
++    if not site.is_dir():
++        raise RuntimeError("quota_unknown: pinned quota release unavailable")
++    if str(site) not in sys.path:
++        sys.path.insert(0, str(site))
++    quota = importlib.import_module("cortados_router.quota_admission")
++    config = importlib.import_module("integrations.mcp.config")
++    for module in (quota, config):
++        if not Path(module.__file__).resolve().is_relative_to(site):
++            raise RuntimeError("quota_unknown: quota owner outside pinned release")
++    return quota, config.load_config(CONFIG_PATH)
++
++
++def _unknown():
++    return {"status": "unknown", "kind": "subscription", "lane": None,
++            "pool": None, "observed_at": None, "age_s": None,
++            "source": "pinned-release", "reason": "quota owner or configuration unavailable"}
++
++
++def check(provider, model, *, auth_scope):
++    try:
++        owner, config = _owners()
++        return owner.check(provider, model, auth_scope=auth_scope, config=config)
++    except Exception:
++        return _unknown()
++
++
++def source_preflight(provider, model):
++    try:
++        owner, config = _owners()
++        return owner.source_preflight(provider, model, config=config)
++    except Exception:
++        return {"quota_stage": "source_preflight", "auth_scope": {
++            "kind": "unproven", "lane": None, "scope_id": None}, "quota": _unknown()}
++
++
++def auth_scope(provider, *, environment, executable, argv=()):
++    try:
++        owner, config = _owners()
++        return owner.auth_scope(provider, environment=environment, executable=executable,
++                                argv=argv, config=config)
++    except Exception:
++        return {"kind": "unproven", "lane": None, "scope_id": None}
++
++
++def quota_resources(candidates):
++    owner, config = _owners()
++    return owner.current_resources(candidates, config=config)
++
++
++def admit(runtime, model, *, environment=None, argv=(), scope=None):
++    """Final submission uses actual built argv/env; continuations retain its scope."""
++    import shutil
++    provider = RUNTIME_PROVIDER.get(runtime, "")
++    if scope is None:
++        executable = shutil.which(argv[0], path=(environment or {}).get("PATH")) if argv else None
++        if executable:
++            argv[0] = str(Path(executable).resolve())
++        scope = auth_scope(provider, environment=environment or {},
++                           executable=argv[0] if argv else "", argv=tuple(argv))
++    quota = check(provider, model, auth_scope=scope)
++    if not isinstance(quota, dict) or quota.get("status") != "available":
++        code = "quota_spent" if isinstance(quota, dict) and quota.get("status") == "spent" else "quota_unknown"
++        raise ValueError(code + ": " + str(quota.get("reason", "invalid quota result") if isinstance(quota, dict) else "invalid quota result"))
++    return {"quota_stage": "dispatch", "quota_auth_scope": scope, "quota": quota}
+--- before/Users/velox/cortados/plugins/cortados-pty/runner.py
++++ after/Users/velox/cortados/plugins/cortados-pty/runner.py
+@@ -697,0 +698,4 @@
++        self.meta.update(model_routing.admit(self.meta['runtime'], self.meta.get('model'),
++                                            scope=self.meta.get('quota_auth_scope') or {
++                                                'kind': 'unproven', 'lane': None, 'scope_id': None}))
++        self.save()
+@@ -768,0 +773 @@
++        job.meta.update(model_routing.admit(runtime, model, environment=child_env, argv=argv))
+@@ -834,0 +840 @@
++            job.meta.update(model_routing.admit(runtime, model, environment=child_env, argv=argv))
+@@ -839 +845,3 @@
+-            job.spawn(argv + [text], str(cwd), child_env)
++            argv = argv + [text]
++            job.meta.update(model_routing.admit(runtime, model, environment=child_env, argv=argv))
++            job.spawn(argv, str(cwd), child_env)
+@@ -840,0 +849 @@
++            job.meta.update(model_routing.admit(runtime, model, environment=child_env, argv=argv))
+--- before/Users/velox/cortados/patches/auxiliary-routing/auxiliary_model_routing.py
++++ after/Users/velox/cortados/patches/auxiliary-routing/auxiliary_model_routing.py
+@@ -12,0 +13,3 @@
++from pathlib import Path
++
++PROVIDER_PLUGIN_SOURCE = "/Users/velox/cortados/plugins/model-providers/cortados-cli/__init__.py"
+@@ -268,0 +272,62 @@
++def _quota_dispatch(client, kwargs):
++    """A registered strict hook is mandatory even with model routing disabled."""
++    from hermes_cli.plugins import has_hook, invoke_hook
++    registered = has_hook("admit_model_quota")
++    if not registered:
++        return
++    provider = getattr(client, "_hermes_aux_effective_provider", "")
++    model = kwargs.get("model", "")
++    scope = getattr(client, "_hermes_aux_auth_scope", None)
++    stage = getattr(client, "_hermes_aux_quota_stage", "dispatch")
++    if not isinstance(provider, str) or not provider.strip() or provider in {"auto", "main", "moa"}:
++        raise AuxiliaryRoutingError("quota_unknown: actual auxiliary provider is unbound")
++    if stage == "source_preflight":
++        try:
++            runtime = {"claude-cli": "claude", "codex-cli": "codex", "agy-cli": "agy", "cursor-cli": "cursor"}.get(provider)
++            method = client.chat.completions.create
++            proven = (runtime is not None and type(client).__name__ == "CliBrainClient"
++                      and Path(inspect.getfile(type(client))).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve()
++                      and client.runtime == runtime and getattr(method, "__self__", None) is client
++                      and getattr(method, "__func__", None) is type(client)._create
++                      and Path(inspect.getfile(type(client)._create)).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve())
++        except (AttributeError, TypeError, OSError):
++            proven = False
++        if not proven:
++            raise AuxiliaryRoutingError("quota_unknown: auxiliary CLI transport proof changed")
++        scope = {"kind": "unproven", "lane": None, "scope_id": None}
++    elif stage != "dispatch" or not isinstance(scope, dict):
++        raise AuxiliaryRoutingError("quota_unknown: auxiliary authentication scope is unbound")
++    try:
++        results = invoke_hook("admit_model_quota", provider=provider, model=model,
++                              auth_scope=scope, entrypoint="auxiliary-dispatch", quota_stage=stage)
++        if not isinstance(results, (tuple, list)) or len(results) != 1:
++            raise ValueError("missing or duplicate quota callback")
++        result = results[0]
++        if not isinstance(result, dict) or set(result) != {"router", "quota_stage", "quota"} or result.get("router") != "cortados-router" or result.get("quota_stage") != stage:
++            raise ValueError("invalid quota callback")
++        quota = result["quota"]
++        if not isinstance(quota, dict) or set(quota) != {"status", "kind", "lane", "pool", "observed_at", "age_s", "source", "reason"}:
++            raise ValueError("invalid quota shape")
++        if quota.get("kind") not in {"subscription", "local_resource"} or not all(isinstance(quota.get(k), str) and quota[k].strip() for k in ("source", "reason")):
++            raise ValueError("invalid quota metadata")
++        status = quota.get("status")
++        if status == "available":
++            expected_lane = {"codex-cli": "codex", "claude-cli": "claude", "agy-cli": "antigravity", "cursor-cli": "cursor"}.get(provider)
++            if expected_lane is None or quota["kind"] != "subscription" or quota["lane"] != expected_lane:
++                raise ValueError("quota result does not identify the actual source")
++            if not isinstance(quota["pool"], str) or not quota["pool"].strip() or quota["pool"] == "info":
++                raise ValueError("quota result lacks an admitted pool")
++            if stage == "dispatch" and scope.get("lane") != expected_lane:
++                raise ValueError("quota result does not match the bound scope")
++            if any(type(quota[k]) not in (int, float) or not math.isfinite(quota[k]) for k in ("observed_at", "age_s")):
++                raise ValueError("quota result lacks finite observation geometry")
++            # RT-FRESH-QUOTA-005 bounds returned age in seconds: stale results cannot authorize dispatch.
++            if quota["observed_at"] <= 0 or not 0 <= quota["age_s"] <= 30:
++                raise ValueError("quota result observation geometry is unavailable")
++    except Exception as exc:
++        raise AuxiliaryRoutingError("quota_unknown: auxiliary quota callback unavailable or malformed") from exc
++    if status != "available":
++        code = "quota_spent" if status == "spent" else "quota_unknown"
++        raise AuxiliaryRoutingError(code + ": " + str(quota.get("reason", "auxiliary quota unavailable")))
++
++
+@@ -270 +335,2 @@
+-def _dispatch(kwargs):
++def _dispatch(client, kwargs):
++    _quota_dispatch(client, kwargs)
+@@ -289,2 +355,5 @@
+-    with _dispatch(kwargs):
+-        return client.chat.completions.create(**kwargs)
++    with _dispatch(client, kwargs):
++        result = client.chat.completions.create(**kwargs)
++    if hasattr(result, "__next__"):
++        return _QuotaStream(result, client, kwargs)
++    return result
+@@ -294,2 +363,37 @@
+-    with _dispatch(kwargs):
+-        return await client.chat.completions.create(**kwargs)
++    with _dispatch(client, kwargs):
++        result = await client.chat.completions.create(**kwargs)
++    if hasattr(result, "__anext__"):
++        return _QuotaAsyncStream(result, client, kwargs)
++    if hasattr(result, "__next__"):
++        return _QuotaStream(result, client, kwargs)
++    return result
++
++
++class _QuotaStream:
++    """A lazy transport is rechecked once immediately before its first advance."""
++    def __init__(self, stream, client, kwargs):
++        self.stream, self.client, self.kwargs = stream, client, dict(kwargs)
++        self.started = False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        if not self.started:
++            _quota_dispatch(self.client, self.kwargs)
++            self.started = True
++        return next(self.stream)
++
++    def __getattr__(self, name):
++        return getattr(self.stream, name)
++
++
++class _QuotaAsyncStream(_QuotaStream):
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        if not self.started:
++            _quota_dispatch(self.client, self.kwargs)
++            self.started = True
++        return await self.stream.__anext__()
+--- before/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_model_routing.py
++++ after/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_model_routing.py
+@@ -12,0 +13,3 @@
++from pathlib import Path
++
++PROVIDER_PLUGIN_SOURCE = "/Users/velox/cortados/plugins/model-providers/cortados-cli/__init__.py"
+@@ -268,0 +272,62 @@
++def _quota_dispatch(client, kwargs):
++    """A registered strict hook is mandatory even with model routing disabled."""
++    from hermes_cli.plugins import has_hook, invoke_hook
++    registered = has_hook("admit_model_quota")
++    if not registered:
++        return
++    provider = getattr(client, "_hermes_aux_effective_provider", "")
++    model = kwargs.get("model", "")
++    scope = getattr(client, "_hermes_aux_auth_scope", None)
++    stage = getattr(client, "_hermes_aux_quota_stage", "dispatch")
++    if not isinstance(provider, str) or not provider.strip() or provider in {"auto", "main", "moa"}:
++        raise AuxiliaryRoutingError("quota_unknown: actual auxiliary provider is unbound")
++    if stage == "source_preflight":
++        try:
++            runtime = {"claude-cli": "claude", "codex-cli": "codex", "agy-cli": "agy", "cursor-cli": "cursor"}.get(provider)
++            method = client.chat.completions.create
++            proven = (runtime is not None and type(client).__name__ == "CliBrainClient"
++                      and Path(inspect.getfile(type(client))).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve()
++                      and client.runtime == runtime and getattr(method, "__self__", None) is client
++                      and getattr(method, "__func__", None) is type(client)._create
++                      and Path(inspect.getfile(type(client)._create)).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve())
++        except (AttributeError, TypeError, OSError):
++            proven = False
++        if not proven:
++            raise AuxiliaryRoutingError("quota_unknown: auxiliary CLI transport proof changed")
++        scope = {"kind": "unproven", "lane": None, "scope_id": None}
++    elif stage != "dispatch" or not isinstance(scope, dict):
++        raise AuxiliaryRoutingError("quota_unknown: auxiliary authentication scope is unbound")
++    try:
++        results = invoke_hook("admit_model_quota", provider=provider, model=model,
++                              auth_scope=scope, entrypoint="auxiliary-dispatch", quota_stage=stage)
++        if not isinstance(results, (tuple, list)) or len(results) != 1:
++            raise ValueError("missing or duplicate quota callback")
++        result = results[0]
++        if not isinstance(result, dict) or set(result) != {"router", "quota_stage", "quota"} or result.get("router") != "cortados-router" or result.get("quota_stage") != stage:
++            raise ValueError("invalid quota callback")
++        quota = result["quota"]
++        if not isinstance(quota, dict) or set(quota) != {"status", "kind", "lane", "pool", "observed_at", "age_s", "source", "reason"}:
++            raise ValueError("invalid quota shape")
++        if quota.get("kind") not in {"subscription", "local_resource"} or not all(isinstance(quota.get(k), str) and quota[k].strip() for k in ("source", "reason")):
++            raise ValueError("invalid quota metadata")
++        status = quota.get("status")
++        if status == "available":
++            expected_lane = {"codex-cli": "codex", "claude-cli": "claude", "agy-cli": "antigravity", "cursor-cli": "cursor"}.get(provider)
++            if expected_lane is None or quota["kind"] != "subscription" or quota["lane"] != expected_lane:
++                raise ValueError("quota result does not identify the actual source")
++            if not isinstance(quota["pool"], str) or not quota["pool"].strip() or quota["pool"] == "info":
++                raise ValueError("quota result lacks an admitted pool")
++            if stage == "dispatch" and scope.get("lane") != expected_lane:
++                raise ValueError("quota result does not match the bound scope")
++            if any(type(quota[k]) not in (int, float) or not math.isfinite(quota[k]) for k in ("observed_at", "age_s")):
++                raise ValueError("quota result lacks finite observation geometry")
++            # RT-FRESH-QUOTA-005 bounds returned age in seconds: stale results cannot authorize dispatch.
++            if quota["observed_at"] <= 0 or not 0 <= quota["age_s"] <= 30:
++                raise ValueError("quota result observation geometry is unavailable")
++    except Exception as exc:
++        raise AuxiliaryRoutingError("quota_unknown: auxiliary quota callback unavailable or malformed") from exc
++    if status != "available":
++        code = "quota_spent" if status == "spent" else "quota_unknown"
++        raise AuxiliaryRoutingError(code + ": " + str(quota.get("reason", "auxiliary quota unavailable")))
++
++
+@@ -270 +335,2 @@
+-def _dispatch(kwargs):
++def _dispatch(client, kwargs):
++    _quota_dispatch(client, kwargs)
+@@ -289,2 +355,5 @@
+-    with _dispatch(kwargs):
+-        return client.chat.completions.create(**kwargs)
++    with _dispatch(client, kwargs):
++        result = client.chat.completions.create(**kwargs)
++    if hasattr(result, "__next__"):
++        return _QuotaStream(result, client, kwargs)
++    return result
+@@ -294,2 +363,37 @@
+-    with _dispatch(kwargs):
+-        return await client.chat.completions.create(**kwargs)
++    with _dispatch(client, kwargs):
++        result = await client.chat.completions.create(**kwargs)
++    if hasattr(result, "__anext__"):
++        return _QuotaAsyncStream(result, client, kwargs)
++    if hasattr(result, "__next__"):
++        return _QuotaStream(result, client, kwargs)
++    return result
++
++
++class _QuotaStream:
++    """A lazy transport is rechecked once immediately before its first advance."""
++    def __init__(self, stream, client, kwargs):
++        self.stream, self.client, self.kwargs = stream, client, dict(kwargs)
++        self.started = False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        if not self.started:
++            _quota_dispatch(self.client, self.kwargs)
++            self.started = True
++        return next(self.stream)
++
++    def __getattr__(self, name):
++        return getattr(self.stream, name)
++
++
++class _QuotaAsyncStream(_QuotaStream):
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        if not self.started:
++            _quota_dispatch(self.client, self.kwargs)
++            self.started = True
++        return await self.stream.__anext__()
+--- before/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_client.py
++++ after/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_client.py
+@@ -22,0 +23 @@
++from pathlib import Path
+@@ -23,0 +25,2 @@
++
++PROVIDER_PLUGIN_SOURCE = "/Users/velox/cortados/plugins/model-providers/cortados-cli/__init__.py"
+@@ -25 +28 @@
+-    auxiliary_scope, prepare_required_request, required_send, required_asend,
++    auxiliary_scope, prepare_required_request, required_send, required_asend, AuxiliaryRoutingError,
+@@ -4361,0 +4365,12 @@
++def _aux_identity_handoff(source, target):
++    """Preserve concrete identity on the actual wrapper without overriding its identity."""
++    for name in ("_hermes_aux_effective_provider", "_hermes_aux_auth_scope", "_hermes_aux_quota_stage"):
++        value = getattr(source, name, None)
++        if value is not None and not getattr(target, name, None):
++            try:
++                setattr(target, name, value)
++            except (AttributeError, TypeError):
++                logger.debug("Auxiliary wrapper cannot retain transport identity")
++    return target
++
++
+@@ -4368 +4383 @@
+-        return AsyncCodexAuxiliaryClient(sync_client), model
++        return _aux_identity_handoff(sync_client, AsyncCodexAuxiliaryClient(sync_client)), model
+@@ -4370 +4385 @@
+-        return AsyncAnthropicAuxiliaryClient(sync_client), model
++        return _aux_identity_handoff(sync_client, AsyncAnthropicAuxiliaryClient(sync_client)), model
+@@ -4372 +4387 @@
+-        return AsyncBedrockAuxiliaryClient(sync_client), model
++        return _aux_identity_handoff(sync_client, AsyncBedrockAuxiliaryClient(sync_client)), model
+@@ -4376 +4391 @@
+-            return AsyncGeminiNativeClient(sync_client), model
++            return _aux_identity_handoff(sync_client, AsyncGeminiNativeClient(sync_client)), model
+@@ -4407 +4422 @@
+-    return AsyncOpenAI(**async_kwargs), model
++    return _aux_identity_handoff(sync_client, AsyncOpenAI(**async_kwargs)), model
+@@ -4615 +4630,16 @@
+-        return _to_async_client(client_obj, final_model_str, is_vision=req.is_vision)
++        client_obj, final_model_str = _to_async_client(client_obj, final_model_str, is_vision=req.is_vision)
++    if client_obj is not None:
++        provider = _effective_provider_for_client(client_obj, req.provider)
++        if provider and provider not in {"auto", "main", "moa"}:
++            try:
++                client_obj._hermes_aux_effective_provider = provider
++                runtime = {"claude-cli": "claude", "codex-cli": "codex", "agy-cli": "agy", "cursor-cli": "cursor"}.get(provider)
++                method = client_obj.chat.completions.create
++                proven = (runtime is not None and type(client_obj).__name__ == "CliBrainClient"
++                          and Path(inspect.getfile(type(client_obj))).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve()
++                          and client_obj.runtime == runtime and getattr(method, "__self__", None) is client_obj
++                          and getattr(method, "__func__", None) is type(client_obj)._create
++                          and Path(inspect.getfile(type(client_obj)._create)).resolve() == Path(PROVIDER_PLUGIN_SOURCE).resolve())
++                client_obj._hermes_aux_quota_stage = "source_preflight" if proven else "dispatch"
++            except (AttributeError, TypeError, OSError):
++                logger.debug("Auxiliary transport identity could not be bound")
+@@ -4646 +4676 @@
+-    return routed_client, routed_model
++    return _route_client(SimpleNamespace(provider=effective_provider, async_mode=False), routed_client, routed_model)
+@@ -4697 +4727 @@
+-        return raw_client, _normalize_resolved_model(model, req.provider)
++        return _route_client(req, raw_client, _normalize_resolved_model(model, req.provider))
+@@ -5210,0 +5241 @@
++    sync_client, final_model = _route_client(SimpleNamespace(provider=resolved_provider, async_mode=False), sync_client, final_model)
+@@ -5464,0 +5496 @@
++    sync_client, model = _route_client(SimpleNamespace(provider="nous", async_mode=False), sync_client, model)
+@@ -5633 +5665 @@
+-                return cached_client, _compat_model(cached_client, model, cached_default)
++                return _route_client(SimpleNamespace(provider=provider, async_mode=False), cached_client, _compat_model(cached_client, model, cached_default))
+@@ -5656 +5688 @@
+-        return client, model or default_model
++        return _route_client(SimpleNamespace(provider=provider, async_mode=False), client, model or default_model)
+@@ -5670 +5702 @@
+-    return client, _compat_model(client, model, default_model)
++    return _route_client(SimpleNamespace(provider=provider, async_mode=False), client, _compat_model(client, model, default_model))
+@@ -7461 +7493 @@
+-    if req.required_route is not None:
++    if req.required_route is not None or isinstance(first_err, AuxiliaryRoutingError):
+--- before/Users/velox/.cortados/hermes/hermes-agent/hermes_cli/plugins.py
++++ after/Users/velox/.cortados/hermes/hermes-agent/hermes_cli/plugins.py
+@@ -133 +133 @@
+-    "pre_gateway_dispatch", "route_agent_model", "route_cron_model",
++    "pre_gateway_dispatch", "route_agent_model", "route_cron_model", "admit_model_quota",
+--- before/Users/velox/cortados/train/dataset.py
++++ after/Users/velox/cortados/train/dataset.py
+@@ -18 +18 @@
+-    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
+--- before/Users/velox/cortados/train/label.py
++++ after/Users/velox/cortados/train/label.py
+@@ -10,0 +11,2 @@
++import importlib.util
++import shutil
+@@ -27 +29 @@
+-    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
+@@ -97 +99,14 @@
+-    p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=_env())
++    env = _env()
++    executable = shutil.which(argv[0], path=env.get("PATH"))
++    if not executable:
++        raise RuntimeError("quota_unknown: teacher executable unavailable")
++    argv[0] = str(Path(executable).resolve())
++    spec = importlib.util.spec_from_file_location("cortados_teacher_quota_policy", REPO / "plugins/cortados-router/quota_policy.py")
++    quota_policy = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(quota_policy)
++    scope = quota_policy.auth_scope("claude-cli", environment=env, executable=argv[0], argv=tuple(argv))
++    quota = quota_policy.check("claude-cli", model, auth_scope=scope)
++    if quota.get("status") != "available":
++        code = "quota_spent" if quota.get("status") == "spent" else "quota_unknown"
++        raise RuntimeError(code + ": " + str(quota.get("reason", "teacher quota unavailable")))
++    p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=env)
+--- before/Users/velox/cortados/train/build_sft.py
++++ after/Users/velox/cortados/train/build_sft.py
+@@ -21 +21 @@
+-    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
+--- before/Users/velox/cortados/train/evaluate.py
++++ after/Users/velox/cortados/train/evaluate.py
+@@ -26 +26 @@
+-    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"
+--- before/Users/velox/cortados/train/nightly.sh
++++ after/Users/velox/cortados/train/nightly.sh
+@@ -9 +9 @@
+-export CORTADOS_MCP_LEARNING_SITE_PACKAGES="/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++export CORTADOS_MCP_LEARNING_SITE_PACKAGES="/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages"

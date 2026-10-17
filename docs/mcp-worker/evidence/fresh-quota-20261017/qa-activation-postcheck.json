@@ -1,0 +1,30 @@
+{
+  "reviewer": "/root/quota_evaluation_qa",
+  "checked_utc": "2026-10-17T18:26:51.549765+00:00",
+  "implementation_commit": "660ae562fa361710e8ebcbe34fb41454b3e61bd2",
+  "live_candidate_hashes_verified": 16,
+  "before_backups_verified": 15,
+  "reviewed_python_source_and_installed_release_unchanged": true,
+  "current_pointer_and_nightly_schedule_unchanged": true,
+  "real_worker_marker_independently_verified": true,
+  "unknown_mismatch_unproven_transport_calls": 0,
+  "enabled_gateway_profiles_connected": 12,
+  "enabled_gateway_profiles_expected": 12,
+  "disabled_rc28_preexisting": true,
+  "contract_bypass_found": false,
+  "activation_identity_blocker": null,
+  "limitations": [
+    "Real bounded collector supports Codex configured source at capture; Claude/Agy metadata unknown or unproven, Cursor containment unproven, local actual source unproven. All correctly refused; diagnostic percentages are not dispatch permission.",
+    "Cursor result is not affirmative containment proof. Read-only process-name inventory saw no cursor-agent/agy CLI; this alone does not attribute every descendant. Parent retains cleanup evidence and must report limitation.",
+    "Gateway restart monitor expected13 despite12enabled; monitor timeout/cleanup is separate from12/12connection evidence.",
+    "No suite rerun: executable source hashes equal independently reviewed and tested candidate."
+  ],
+  "evidence_sha256": {
+    "activation/report.json": "ecdf6b1604df4e0bbf2e16b5b9b5b7f6ed02dbf48ff8997b1ff0be9cb7c7bf96",
+    "activation/live-host-roster.json": "51207887c193c1f764b928a2efcfb7d47c092012a05e7f83651bc50dd60d3915",
+    "mcp-activation/broker-activation.json": "ff8896dc37929c8a915a11d5eb066daaa7ff24748fe420c0ebe299615aa11568",
+    "mcp-activation/installed-smoke.json": "3d832f3e4bfccec7ad47ff6f11035341535f824363ccdfab72326b46dbf45728",
+    "mcp-activation/independent-postcheck.json": "394bec84301a75b6c1cb0476550481c326c65e0c4f64c9d0cb29270e7edb665c",
+    "live-bounded-quota.json": "c9693d96bce1f7bbdc55c4c517e666d004763b482648bec73392e0f6479cbe69"
+  }
+}

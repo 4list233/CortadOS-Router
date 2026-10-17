@@ -45,19 +45,21 @@ publication is outside this task.
 | `cortados_router/core.py::resolve` | Existing candidate burn owner; [RT-QUOTA-EVALUATION-004 v1](QUOTA-EVALUATION-004.md) pins one estimate observation per priced candidate; AC-Q01–Q06, protected `acceptance/quota_evaluation/`. |
 
 The [original branch plan](../SUBAGENT-MCP-PLAN.md) remains historical until the reviewed contract
-supersedes its implementation details. No document here changes CortadOS's global decisions log or
-claims that its live Hermes deployment has been modified.
+supersedes its implementation details. No document here changes CortadOS's global decisions log.
+The authorized live Hermes and MCP changes are recorded in [FRESH-QUOTA-BUILD-REPORT.md](FRESH-QUOTA-BUILD-REPORT.md).
 
 The standalone learning implementation exposes installed-owner helpers to the separate activation
 package. Its source reads only accepted SQLite evidence; requests and labels retain immutable revisions,
 and `mcp-observations.jsonl` can be rebuilt by collection. The main-phase protected exam is the five
 modules named in [the exam README](../../acceptance/mcp_learning/README.md). The separately tested
-activation stage is installed for the next nightly invocation; the active October 17 run keeps its
-old environment and script inode. The build report records independent verification and limitations.
+activation stage is installed for the next nightly invocation. The October 17 run retained its old
+environment/script inode; its saved-checkpoint evaluation is now complete and rejected by the unchanged
+promotion gates. The build reports record independent verification and limitations.
 
 | Fresh-quota path | RT-FRESH-QUOTA-005 responsibility |
 |---|---|
 | [FRESH-QUOTA-005.md](FRESH-QUOTA-005.md) | Frozen strict fresh quota contract; independent `acceptance/fresh_quota/` exams. |
+| [FRESH-QUOTA-BUILD-REPORT.md](FRESH-QUOTA-BUILD-REPORT.md) | Root; final suite, frozen source, performance, guarded live activation and operational limitations. |
 | [QUOTA-OPERATIONS.md](QUOTA-OPERATIONS.md) | Root; quota percentages, pace, learned cost, inspection command, dispatch limits and saved-checkpoint result. |
 | `cortados_router/quota_admission.py` | Sole source scope canonicalizer, fresh pool validation, `check`, `source_preflight`, pure `resources` and `current_resources`. |
 | `cortados_router/quota_observations.py` | Bounded per-source process-group collection and ephemeral in-flight/cache owner; no store writes. |

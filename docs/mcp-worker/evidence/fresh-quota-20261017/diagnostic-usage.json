@@ -1,0 +1,257 @@
+{
+ "fetched_at": 1792261374.053578,
+ "lanes": {
+  "local": {
+   "source": "vm_stat + ollama ps",
+   "windows": [],
+   "free_gb": 15.0,
+   "resident": [],
+   "scarcity": 0.62,
+   "fetched_at": 1792261374.119634,
+   "tried_at": 1792261374.119634,
+   "error": null,
+   "plan": "free"
+  },
+  "codex": {
+   "source": "codex-app-server",
+   "windows": [
+    {
+     "window_s": 604800,
+     "reset_epoch": 1792653737,
+     "window": "week",
+     "used_pct": 47,
+     "elapsed_pct": 35.1,
+     "headroom_pct": 53.0,
+     "projected_pct_at_reset": 134,
+     "allowance_pct_per_h": 0.49,
+     "resets_at": "2026-10-22 03:22",
+     "resets_in_h": 109.0,
+     "scarcity": 0.9,
+     "expiring_pct": 0,
+     "pool": "all",
+     "native_window": "primary"
+    }
+   ],
+   "scarcity": 0.9,
+   "refusing": false,
+   "pools": {},
+   "fetched_at": 1792261375.176695,
+   "tried_at": 1792261375.176695,
+   "error": null,
+   "plan": "ChatGPT 20x"
+  },
+  "antigravity": {
+   "source": "agy /usage (pty)",
+   "windows": [
+    {
+     "window": "week (gemini)",
+     "used_pct": 0.0,
+     "elapsed_pct": 0.0,
+     "headroom_pct": 100.0,
+     "projected_pct_at_reset": 0,
+     "allowance_pct_per_h": 0.6,
+     "resets_at": null,
+     "resets_in_h": null,
+     "scarcity": -0.6,
+     "expiring_pct": 0,
+     "pool": "gemini"
+    },
+    {
+     "window": "week (claude-gpt)",
+     "used_pct": 0.0,
+     "elapsed_pct": 0.0,
+     "headroom_pct": 100.0,
+     "projected_pct_at_reset": 0,
+     "allowance_pct_per_h": 0.6,
+     "resets_at": null,
+     "resets_in_h": null,
+     "scarcity": -0.6,
+     "expiring_pct": 0,
+     "pool": "claude-gpt"
+    }
+   ],
+   "scarcity": -0.6,
+   "refusing": false,
+   "pools": {
+    "claude-gpt": {
+     "scarcity": -0.6,
+     "tightest": {
+      "window": "week (claude-gpt)",
+      "used_pct": 0.0,
+      "elapsed_pct": 0.0,
+      "headroom_pct": 100.0,
+      "projected_pct_at_reset": 0,
+      "allowance_pct_per_h": 0.6,
+      "resets_at": null,
+      "resets_in_h": null,
+      "scarcity": -0.6,
+      "expiring_pct": 0,
+      "pool": "claude-gpt"
+     },
+     "expiring_pct": 0,
+     "spent": false
+    },
+    "gemini": {
+     "scarcity": -0.6,
+     "tightest": {
+      "window": "week (gemini)",
+      "used_pct": 0.0,
+      "elapsed_pct": 0.0,
+      "headroom_pct": 100.0,
+      "projected_pct_at_reset": 0,
+      "allowance_pct_per_h": 0.6,
+      "resets_at": null,
+      "resets_in_h": null,
+      "scarcity": -0.6,
+      "expiring_pct": 0,
+      "pool": "gemini"
+     },
+     "expiring_pct": 0,
+     "spent": false
+    }
+   },
+   "fetched_at": 1792259580.6009102,
+   "tried_at": 1792259580.6009111,
+   "error": null,
+   "plan": "Google AI Pro"
+  },
+  "cursor": {
+   "source": "cursor-agent /usage (pty)",
+   "windows": [
+    {
+     "window": "month (included, both pools)",
+     "used_pct": 100.0,
+     "elapsed_pct": 19.5,
+     "headroom_pct": 0.0,
+     "projected_pct_at_reset": 512,
+     "allowance_pct_per_h": 0.0,
+     "resets_at": "2026-11-10 23:59",
+     "resets_in_h": 587.1,
+     "scarcity": 1.0,
+     "expiring_pct": 0,
+     "pool": "info"
+    },
+    {
+     "window": "month (Cursor models: Grok, Composer, Auto)",
+     "used_pct": 100.0,
+     "elapsed_pct": 19.5,
+     "headroom_pct": 0.0,
+     "projected_pct_at_reset": 512,
+     "allowance_pct_per_h": 0.0,
+     "resets_at": "2026-11-10 23:59",
+     "resets_in_h": 587.1,
+     "scarcity": 1.0,
+     "expiring_pct": 0,
+     "pool": "cursor-models"
+    },
+    {
+     "window": "month (other models: Claude, GPT, Gemini \u2026)",
+     "used_pct": 33.0,
+     "elapsed_pct": 19.5,
+     "headroom_pct": 67.0,
+     "projected_pct_at_reset": 169,
+     "allowance_pct_per_h": 0.11,
+     "resets_at": "2026-11-10 23:59",
+     "resets_in_h": 587.1,
+     "scarcity": 0.9,
+     "expiring_pct": 0,
+     "pool": "other-models"
+    }
+   ],
+   "scarcity": 1.0,
+   "refusing": true,
+   "pools": {
+    "cursor-models": {
+     "scarcity": 0.9,
+     "tightest": {
+      "window": "month (other models: Claude, GPT, Gemini \u2026)",
+      "used_pct": 33.0,
+      "elapsed_pct": 19.5,
+      "headroom_pct": 67.0,
+      "projected_pct_at_reset": 169,
+      "allowance_pct_per_h": 0.11,
+      "resets_at": "2026-11-10 23:59",
+      "resets_in_h": 587.1,
+      "scarcity": 0.9,
+      "expiring_pct": 0,
+      "pool": "other-models"
+     },
+     "expiring_pct": 0,
+     "spent": false,
+     "note": "Cursor-models pool spent: overflow draws on other-models"
+    },
+    "other-models": {
+     "scarcity": 0.9,
+     "tightest": {
+      "window": "month (other models: Claude, GPT, Gemini \u2026)",
+      "used_pct": 33.0,
+      "elapsed_pct": 19.5,
+      "headroom_pct": 67.0,
+      "projected_pct_at_reset": 169,
+      "allowance_pct_per_h": 0.11,
+      "resets_at": "2026-11-10 23:59",
+      "resets_in_h": 587.1,
+      "scarcity": 0.9,
+      "expiring_pct": 0,
+      "pool": "other-models"
+     },
+     "expiring_pct": 0,
+     "spent": false
+    }
+   },
+   "fetched_at": 1792259581.111604,
+   "tried_at": 1792259581.111604,
+   "error": null,
+   "plan": "Cursor Pro"
+  },
+  "claude": {
+   "source": "claude /usage (pty)",
+   "per_model": "not shown this read (vendor rate limit on the per-model panel)",
+   "windows": [
+    {
+     "window_s": 18000.0,
+     "reset_epoch": 1792263000.0,
+     "window": "5-hour session",
+     "used_pct": 0.0,
+     "elapsed_pct": 91.3,
+     "headroom_pct": 100.0,
+     "projected_pct_at_reset": 0,
+     "allowance_pct_per_h": 230.02,
+     "resets_at": "2026-10-17 14:50",
+     "resets_in_h": 0.4,
+     "scarcity": 0.0,
+     "expiring_pct": 0,
+     "pool": "all"
+    },
+    {
+     "window_s": 604800.0,
+     "reset_epoch": 1792436400.0,
+     "window": "week (all models)",
+     "used_pct": 76.0,
+     "elapsed_pct": 71.1,
+     "headroom_pct": 24.0,
+     "projected_pct_at_reset": 107,
+     "allowance_pct_per_h": 0.49,
+     "resets_at": "2026-10-19 15:00",
+     "resets_in_h": 48.6,
+     "scarcity": 0.62,
+     "expiring_pct": 0,
+     "pool": "all"
+    }
+   ],
+   "scarcity": 0.62,
+   "refusing": false,
+   "pools": {},
+   "fetched_at": 1792261434.953092,
+   "tried_at": 1792261434.953092,
+   "error": null,
+   "plan": "Claude Max 20x"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 1,
+  "killed": 0,
+  "removed": 1
+ }
+}

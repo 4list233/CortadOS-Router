@@ -1,0 +1,163 @@
+{
+  "at": "2026-10-17T18:24:48.338331+00:00",
+  "wall_s": 7.127608042006614,
+  "observations": [
+    {
+      "source": "quota-observation",
+      "auth_scope": {
+        "kind": "unproven",
+        "lane": "antigravity",
+        "scope_id": null
+      },
+      "record": null,
+      "error": {
+        "code": "quota_unknown",
+        "reason": "Quota source metadata is unavailable"
+      },
+      "lane": "antigravity",
+      "observed_at": 1792261481.218234,
+      "observed_monotonic": 74573.494404375
+    },
+    {
+      "source": "quota-observation",
+      "auth_scope": {
+        "kind": "unproven",
+        "lane": "claude",
+        "scope_id": null
+      },
+      "record": null,
+      "error": {
+        "code": "quota_unknown",
+        "reason": "Quota source metadata is unavailable"
+      },
+      "lane": "claude",
+      "observed_at": 1792261481.219268,
+      "observed_monotonic": 74573.495443958
+    },
+    {
+      "source": "codex-app-server",
+      "auth_scope": {
+        "kind": "cli_store",
+        "lane": "codex",
+        "scope_id": "88bffd9531495757cd49b0aab8407db4f4d9b2aeedb1aa20d707040e5640848a"
+      },
+      "record": {
+        "source": "codex-app-server",
+        "windows": [
+          {
+            "window_s": 604800,
+            "reset_epoch": 1792653737,
+            "window": "week",
+            "used_pct": 47,
+            "elapsed_pct": 35.1,
+            "headroom_pct": 53.0,
+            "projected_pct_at_reset": 134,
+            "allowance_pct_per_h": 0.49,
+            "resets_at": "2026-10-22 03:22",
+            "resets_in_h": 109.0,
+            "scarcity": 0.9,
+            "expiring_pct": 0,
+            "pool": "all",
+            "native_window": "primary"
+          }
+        ],
+        "scarcity": 0.9,
+        "refusing": false,
+        "pools": {}
+      },
+      "error": null,
+      "lane": "codex",
+      "observed_at": 1792261481.21827,
+      "observed_monotonic": 74573.494440458
+    },
+    {
+      "lane": "cursor",
+      "source": "quota-observation",
+      "auth_scope": {
+        "kind": "cli_store",
+        "lane": "cursor",
+        "scope_id": "c6fcceb3846697e9df18e95f2c40bf6ef5f3161a2b0c33b93d681532df0f62c0"
+      },
+      "observed_at": 1792261481.221457,
+      "observed_monotonic": 74573.497630708,
+      "record": null,
+      "error": {
+        "code": "quota_unknown",
+        "reason": "Quota observation process containment could not be proven"
+      }
+    },
+    {
+      "source": "vm_stat + ollama ps",
+      "auth_scope": {
+        "kind": "unproven",
+        "lane": "local",
+        "scope_id": null
+      },
+      "record": {
+        "source": "vm_stat + ollama ps",
+        "windows": [],
+        "free_gb": 14.4,
+        "resident": [],
+        "scarcity": 0.7
+      },
+      "error": null,
+      "lane": "local",
+      "observed_at": 1792261481.2237492,
+      "observed_monotonic": 74573.499919916
+    }
+  ],
+  "configured_source_checks": {
+    "claude": {
+      "status": "unknown",
+      "kind": "subscription",
+      "lane": "claude",
+      "pool": null,
+      "observed_at": 1792261481.219268,
+      "age_s": 7.118990417002351,
+      "source": "quota-observation",
+      "reason": "Actual authentication source is unproven or mismatched"
+    },
+    "codex": {
+      "status": "available",
+      "kind": "subscription",
+      "lane": "codex",
+      "pool": "all",
+      "observed_at": 1792261481.21827,
+      "age_s": 7.120023625000613,
+      "source": "codex-app-server",
+      "reason": "Known fresh configured-source quota"
+    },
+    "cursor": {
+      "status": "unknown",
+      "kind": "subscription",
+      "lane": "cursor",
+      "pool": null,
+      "observed_at": 1792261481.221457,
+      "age_s": 7.116876916988986,
+      "source": "quota-observation",
+      "reason": "Quota source reported unavailable usage"
+    },
+    "antigravity": {
+      "status": "unknown",
+      "kind": "subscription",
+      "lane": "antigravity",
+      "pool": null,
+      "observed_at": 1792261481.218234,
+      "age_s": 7.120115166006144,
+      "source": "quota-observation",
+      "reason": "Actual authentication source is unproven or mismatched"
+    },
+    "local": {
+      "status": "unknown",
+      "kind": "local_resource",
+      "lane": "local",
+      "pool": null,
+      "observed_at": null,
+      "age_s": null,
+      "source": null,
+      "reason": "Actual transport source is unproven"
+    }
+  },
+  "quota_owner": "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_admission.py",
+  "collector": "/Users/velox/.local/share/cortados-workers/releases/fresh-quota-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_observations.py"
+}
