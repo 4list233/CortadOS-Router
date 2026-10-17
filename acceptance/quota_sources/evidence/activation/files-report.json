@@ -1,0 +1,137 @@
+{
+  "approved": {
+    "contract": "RT-QUOTA-SOURCES-006",
+    "scope": "Common actual-source proof and Cursor native source/status only",
+    "reviewer": "/root/quota_evaluation_qa",
+    "attempt": 2,
+    "D": 0,
+    "A": 0,
+    "B": 0,
+    "outcome": "PASS for frozen common/Cursor slice",
+    "package_revision": "bd01f179e2874bb6b9abac86a3d2874d1b44a28f",
+    "wheel_sha256": "3307d94c4a0857214fae4a949fd603ca72c8aa2a9b45271b3104f8345f8b4d90",
+    "stage_manifest_sha256": "e1ed76a5b107792b3736b9e8be6c888f158fad601df8e5a3b7e1d1d6c4f00762",
+    "full_suite_pass": true,
+    "totals": {
+      "tests": 695,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "lanes": 22,
+    "independent_methods": 83,
+    "installed_exact_file_count": 55,
+    "installed_byte_parity": true,
+    "learning_byte_parity": true,
+    "closed_findings": [
+      "B1-01",
+      "B1-02"
+    ],
+    "performance": {
+      "comparison": "Six preserved Codex protocol workloads retain output and source-request counts. Median cache1.2276665\u21921.219854ms, uncached280.349417\u2192280.336521ms. Raw tails retained; no broad speedup claim.",
+      "new_source": "Six actual-source synthetic workloads pass plus real pure native file capture median87.5554375ms. No successful old/native comparator exists; baseline real Cursor containment failed.",
+      "provider_model_turns": 0
+    },
+    "installed_source_observation": {
+      "cursor": "available; exact native31-day cycle/reset and existing pool overflow",
+      "codex": "available preflight",
+      "claude": "unknown before worker/teacher subprocess",
+      "antigravity": "unknown before worker subprocess"
+    },
+    "activation_review": "Guarded operators reviewed: exact installed file set+hashes and wheel parity pinned, stage before/candidate guards, backups, protected current/schedule unchanged, nightly last, idle broker/state preservation. Root may activate only these reviewed artifacts under existing authorization; this record does not claim activation occurred.",
+    "limitations": [
+      "Claude and Antigravity new source profiles remain disabled, so the full three-lane user repair is not complete.",
+      "Freshness proof is bounded observation evidence, not a guarantee against later vendor-side changes.",
+      "695 tests are the scoped maintained package inventory, not every unrelated CortadOS suite."
+    ],
+    "evidence_sha256": {
+      "full-suite-attempt2/report.json": "f918304f27add868eec4bdce656e0c3227eed7e86199db5bebd034be971c39a5",
+      "installed-candidate-parity.json": "b9c1eac4f094677892609219aff1b62bb190730e8a50b56d427646c9907ba157",
+      "learning-parity.json": "52776079d7048a5e507f6acc8a4b67d024bbf8ababceef7337fcd75058dd5734",
+      "installed-source-check.json": "323fde49d470c19d8dccba68a2f1264315b3492e77ba4ab011b75b5e03189f1c",
+      "installed-source-check.py": "d9c3edc886b63b2ff14440034f70e9012e9fbd1a8083fba7f17fdd372f34b330",
+      "installed-teacher-source-check.json": "c8517c654cb37759c93d499190b5408d1fc5541e78aecf783dfa9691e9e2824a",
+      "performance-baseline/report.json": "58eb11f8977542dc42e6a1c694f2c8e2ddd569c22625c649492d0970701d97d1",
+      "performance-candidate/report.json": "5185af08074f830dbf19d97091ed42e708abb358ae19aa2b4769b2edb55082ba",
+      "performance-actual-candidate/report.json": "a53dd8aa112e22ca61b32efb077e7e5b0e47ea8b6a22cafe056326a9ba53ce72",
+      "activate-reviewed-files.py": "ee34767bf5253dca297e1541add17316da5196d948339a8d3f4ccbb921ee9472",
+      "activate-reviewed-mcp.py": "a84d2742cb3a314da6ee17da5c3ab4d79ba3e8aa7518a6e9df9d2c8acf10ffc4",
+      "verify-reviewed-release.py": "732836396ff0e7cf42f0a42685266c2151d52a7d2f060bb643409d6ef0b89341",
+      "staged006-attempt2/candidate-manifest.json": "e1ed76a5b107792b3736b9e8be6c888f158fad601df8e5a3b7e1d1d6c4f00762",
+      "release.json": "a3a4fd3815bc50ec8ae37c742399e62d77390938c5e8cc0e96f417db3c959db1"
+    },
+    "prior_attempt": "B1-OUTCOME.json retains failed attempt and red logs; not overwritten.",
+    "review_commit": "bf87e39",
+    "root_authorized_at": 1792270969.772325,
+    "signoff_sha256": "260ff97fcde091372690e85e326b0b7e9f0013d78d0cc58849fc268e45629342"
+  },
+  "started_at": 1792270969.86098,
+  "files": [
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-pty/model_routing.py",
+      "before_sha256": "4a8341b1b73b2f45a70e2688218b4af97b3db9851e17fdcfd477d583f1e15d9f",
+      "after_sha256": "bd0c3458460c12897c754382d0ae3c609e8123c0f3efb1fcc87322c32f8b6791",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/0",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-pty/runner.py",
+      "before_sha256": "c4a41ed67148f7f153d46f4e49edace559a1a212843c1c7fdcdfe63abb6d1e3f",
+      "after_sha256": "922963708783a25bcac875cfd530bc5aa21a7a8a4437dba8f2a3097e8aff33d6",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/1",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/quota_policy.py",
+      "before_sha256": "fd0405bb8e09bcd966a6c580713df57cad330fc37f4ab7ad33fe8599bfc1778a",
+      "after_sha256": "f29e958c4408775effcffaebd33e78357d008ac24b9a866ee74813870c81defe",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/2",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/plugins/cortados-router/scarcity.py",
+      "before_sha256": "188a85d752f91d9921235f72614dcf7bd90c3c39916fa62ec91829fc8b919c4d",
+      "after_sha256": "dbdb0ca968dff901207cb0c30483592d360fd8351df29aa22793ce9cd8588f01",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/3",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/build_sft.py",
+      "before_sha256": "983b22139a8c836ae07430ede1ce9e51296dbedec39e1c39d551cb46e459355a",
+      "after_sha256": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/4",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/dataset.py",
+      "before_sha256": "5d8255e4d57489ad995266b1e68316af5c36e95642f189db388de7bd20945b98",
+      "after_sha256": "2a9df0126c5434aacbc9f14443f1d78febfa33ec17fa114fa81e99a5c42b7f04",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/5",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/evaluate.py",
+      "before_sha256": "19032becc842cee2baa935136314548bc727104b968bc1123188138e9947f285",
+      "after_sha256": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/6",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/label.py",
+      "before_sha256": "b1655232a7ff54c799af2668b063ca23f16fd08a88aa454c31035346989fa5f4",
+      "after_sha256": "781021a725a8a2ae1e91cd5c72700126908284be1f8a46abc6b771235573de84",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/7",
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/nightly.sh",
+      "before_sha256": "2476cfb97abf79b9b78b927387e9e8c945a56bb986ca267a8ff58b5d3118c2aa",
+      "after_sha256": "a01a86b212a60344ade3e1f5c5486383c64d63b7980af592b105197a666f7e7f",
+      "backup": "/Users/velox/.cortados-builds/quota-verification-repair/activation/before/8",
+      "mode": "0o755"
+    }
+  ],
+  "nightly_last": true,
+  "protected_files_unchanged": true,
+  "completed_at": 1792270969.868343
+}

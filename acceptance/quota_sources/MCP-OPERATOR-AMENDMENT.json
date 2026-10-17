@@ -1,0 +1,24 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "reviewer": "/root/quota_evaluation_qa",
+  "operator_amendment_only": true,
+  "approved": true,
+  "script_sha256": "fbdcd1108c5e3369c48cc275f9e521beac8849ba7ac8434b25d24f14fa55c961",
+  "prior_record_sha256": "ff8896dc37929c8a915a11d5eb066daaa7ff24748fe420c0ebe299615aa11568",
+  "verified_old_native_identity": {
+    "pid": 184,
+    "pgid": 184,
+    "creation_time_us": 1792261366351446
+  },
+  "verification": "Exact prior launch argv, exact native creation identity and exact previously captured framework ps command all match. Recheck remains in operator before writes; no basename loosening. Installed artifact/state/config guards unchanged.",
+  "file_activation": {
+    "verified_files": 9,
+    "verified_backups": 9,
+    "nightly_last": true,
+    "protected_unchanged_report": true,
+    "report_sha256": "62846c91968eaa0c977534f14c8e22811441cec004e84386c9b33c2ca302beb6"
+  },
+  "product_revision_unchanged": "bd01f179e2874bb6b9abac86a3d2874d1b44a28f",
+  "B": 0,
+  "mcp_activation_performed_by_qa": false
+}
