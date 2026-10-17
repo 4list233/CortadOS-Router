@@ -5,15 +5,15 @@ contract_id: RT-TRAINING-TEACHER-007
 contract_version: 2
 owner: Forest
 author: /root/quota_repair_contract
-status: revised-design-frozen
+status: accepted-pending-activation
 implements: [RT-MCP-LEARNING-003, RT-FRESH-QUOTA-005, RT-QUOTA-SOURCES-006]
 exam_owner: /root/quota_evaluation_qa
 depends_on: [RT-MCP-001, RT-MCP-LEARNING-003, RT-FRESH-QUOTA-005, RT-QUOTA-SOURCES-006]
 blocks: []
-attempt_ledger: [{attempt: 1, result: failed, review: acceptance/training_teacher/B1-REVIEW.json}, {attempt: 2, result: design_error, review: acceptance/training_teacher/B2-REVIEW.json}]
+attempt_ledger: [{attempt: 1, result: failed, review: acceptance/training_teacher/B1-REVIEW.json}, {attempt: 2, result: design_error, review: acceptance/training_teacher/B2-REVIEW.json}, {attempt: 3, revision: 2, result: accepted, review: acceptance/training_teacher/B3-SIGNOFF.json}]
 D: 0
 A: 0
-B: pending-revised-design
+B: 0
 ---
 
 # Codex fallback for new training labels

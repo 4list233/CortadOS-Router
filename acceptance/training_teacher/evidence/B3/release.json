@@ -1,0 +1,217 @@
+{
+  "built_at": "2026-10-17T22:21:05.783746+00:00",
+  "exam_pin": "8217bafa0bc81c4d0cca1eaf0750008b1d7feb52",
+  "source_diff": " cortados_router/worker_admission.py |  11 +++-\n integrations/mcp/config.py          |  15 ++++-\n s1/label.py                         | 122 +++++++++++++++++++++++++-----------\n 3 files changed, 108 insertions(+), 40 deletions(-)\n",
+  "source_sha256": {
+    "LICENSE": "e57f1c320b8cf8798a7d2ff83a6f9e06a33a03585f6e065fea97f1d86db84052",
+    "pyproject.toml": "f7516262d17c7ddb3f19ba0b1e6e4ac3c99067244c95795a07e16a9b28e3fa7d",
+    "README.md": "b13cafe00834e40740d4723bcbc7c48b630d358b05960f309d22a057be8d6fa5",
+    "tables/use-cases.json": "e028c684f2d9e3e69d5ce2b60bf47e74a78e105a687f3bf69064f38a266a61e0",
+    "tables/tiers.prev.json": "bb85052c7c3241b3c0efdee5161b93981623506984d69d66cb5ffba8eac43dcb",
+    "tables/community-sentiment.json": "63f54eae594a79f8ffafa5bddd2830a1f47e35311262e5109a7b00dbcfa89966",
+    "tables/tiers.generated.json": "548caf806dc6496f4732ed45fbffecb6b6f72e2481ef8082a7204879746f45e2",
+    "tables/model-scores.generated.json": "47133feee34c8cd12a83ccac06951562f5dfd436b313b8cb468b8477c2d490bb",
+    "tables/routing-table.json": "2c106360cea488acbb4b6cc3e19860cc228ab296e707c793cd7fb761afef676d",
+    "tables/budgets.json": "9aacf897fcc872daf7d9917602e3ed92622315d2aa681cc5476fff1fce2f3530",
+    "tables/scale-2.0-reference.json": "05aeeb0268bae265f4b139a6fa93b37874db29c6ab2ee5b929a0360954b489e7",
+    "cortados_router/reviews.py": "35ceb54ba402dfe13f1ab4f9b6aef6bacf16a25c6121f81321e5c90cce14efbc",
+    "cortados_router/cron_routing.py": "e19beb0d08040ae50f99abec99d7d9421730baff7f0a715619ea30e30aa3fdcc",
+    "cortados_router/compat.py": "d2ad3a5da8a43ed69fab437b25b92cb7ae8bb072d7a750e0fb7d99851982229a",
+    "cortados_router/teacher.py": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb",
+    "cortados_router/teacher_attempts.py": "562661698ccd83cdd3d13d46b1aa5738ba2cf497bc381df6298d96597b7cb621",
+    "cortados_router/paths.py": "7dd9497ca075f4404fd6c189b14713395907dc84d15a97ca41cdb04656bee214",
+    "cortados_router/route_task.py": "f0e7a2e9be004df03596c9675c8b9972aeb0a68e0880141a5fa53e1affafe671",
+    "cortados_router/learning_source.py": "a6bf89b541c4b98116aec8073c5063053ece2141bafe4ca16bd9d99ef0501b2f",
+    "cortados_router/transport.py": "579d48dd55bf5e138d80d2f997fb3b84e4eb9b69d92564e061db054e06de8382",
+    "cortados_router/scarcity_codex_native.py": "17d4e4d660d2824afaab46bacaeb66ced789515c932b3064e1e681a3002d2b41",
+    "cortados_router/selection_resources.py": "6c947a58caa4374e3eba2bc9985064077384b1852674e6b9aff1363bd5d28f33",
+    "cortados_router/scarcity.py": "07e66c8202c7fef120117f52472a9d24d3993f813b36f353e0bf2035864716d7",
+    "cortados_router/ocr_vision.swift": "8f9fa3bffbd657d4f125b3321751b1419c20d1a2911afc26735c64b3e1e0823a",
+    "cortados_router/__init__.py": "d3b7d402c4f54288252a97c13d814ad21349b4395fbc4f862a3675a3938eefaa",
+    "cortados_router/core.py": "ebbada91f0be291cb553188c4079661c8a62a53055c1e7b408329a850b08e93f",
+    "cortados_router/cursor_quota.cjs": "944941eaf6fdf18bd504d0cf1bbe156c77a28d9d5e0b670e51d57255130c81fd",
+    "cortados_router/execution_routing.py": "445b7d7a49894e30edec2a0c54361fe1044d6da09c5b873a4db557b9dc93b2c4",
+    "cortados_router/quota_admission.py": "aae2704833d224a4c3a0f1f13001d82c47c34da34864a4787dcf470e4f710b03",
+    "cortados_router/unitcost.py": "dcd4c115242685a0b383566910c5f38fe3d07675409c065912d01e3e31cf7662",
+    "cortados_router/task_evidence.py": "f25082f9d4065a57cf244e5705709ebbf16b5afcb7a510feb6744d7eab8be788",
+    "cortados_router/images.py": "d36d895b076f0466a1d3e0fbad3221dc864cfc79ae493880b1f83fa9bb93c945",
+    "cortados_router/learning_data.py": "86ac3b448d111b0d31209094ca361a2b2f654e4cf2bceadc7857c2911172da6c",
+    "cortados_router/task_context.py": "3103628500a7e5510c3ba606ef2201a7baf33e66bbcd2a083c75f0dad1a4dd69",
+    "cortados_router/quota_sources.py": "c61c3d91a950d0310ae5df9223cdb2bae238a44e31d9b5d45e628cdf8f9471cd",
+    "cortados_router/probe_reaper.py": "1f6b50baf9d063b6a5180d9289dae94a02f6999d93c867724e50abaf119dc963",
+    "cortados_router/worker_admission.py": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+    "cortados_router/quota_observations.py": "9cd1c459c18d8e452625ab7241c89857dddb4f1cdb868faf4feba3622f0c1fd2",
+    "integrations/mcp/worker.py": "bf596478aed116db05e39919132f81c8fd3399f5933a30e46f96c476b127a2e0",
+    "integrations/mcp/server.py": "8f99ff57287edc993c2126a439533cef3877ecfa8451cc7dc2c9e247dcbdd87e",
+    "integrations/mcp/config.py": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+    "integrations/mcp/grant_proxy.py": "b311a99ed35ef28384628215e9027c2a122f172cb44da5d350d3712992aed0f0",
+    "integrations/mcp/codex.py": "34f5ce9ca1838399fbd995ef124b29a40292084cd4bda4d4b43fc702c47c02d1",
+    "integrations/mcp/native_profile.py": "3e486bade33795b12694dc8c4d25400e6e2a29254061af6c5f9524c536a7e6b9",
+    "integrations/mcp/native_metadata.py": "31d76ef12c6f73846175da228b4cf1256808c10b2778f262e51347facff9eb52",
+    "integrations/mcp/__init__.py": "64c638673c2034097f2374fc1eda6d832f12e4b29da84b12c5f26df1088a5720",
+    "integrations/mcp/schemas.py": "bd1cdfc0e84a18b960a3efe9a60f06c389e5cf93e3b165e9a8fe38980b22594a",
+    "integrations/mcp/broker.py": "afccb68597afa01083761a555ced00c0621ec32e19352d0dec0f5fe9e2a23697",
+    "integrations/mcp/native_process.py": "f452a30183e8e0c78e7bd64e94080f11f347045a414b100981b8cbfcd868ef99",
+    "integrations/mcp/job_store.py": "07fb691f9916c47da9c42e460e0a0d7631c764bda4c1d5a90f3882b0103d3312",
+    "integrations/mcp/__main__.py": "acb683bfd74f50aab3f1ae70bafd652aa5bee3dc02601f051a201a9bd790448e",
+    "integrations/hermes/plugin.yaml": "c5849bdce5f12ca7595dff0142b4071de50c9a761c2bf823aa4abe22f848dc84",
+    "integrations/hermes/__init__.py": "9c9e4e81e9a9c403f39672e7e4671fa9517485db79a01db82c7a0069b0761283",
+    "integrations/hermes/patches/cron-routing.py": "b1d029e2b5733e596b82f9b3ec4f8f8476e8a479b970d1678f8a126f25f37d1f",
+    "integrations/hermes/patches/auxiliary-routing.py": "7ddee13f893e583ad5413d5dadb5b47086fb18d54a9acf289623e5603d5837bf",
+    "integrations/hermes/patches/required-routing.py": "797d4c04fc69a81cc638f3cbdd360536c90116ed7f6fdc533829328e50d8f6b6",
+    "integrations/hermes/patches/delegation-routing.py": "06c8bd05f7773574579d3fda3c8d583565082f228b5ac994b8cf3bee48786076",
+    "integrations/hermes/patches/delegation-routing/README.md": "e4b10b90058874f0ccf06118031624f455c930767ecae0f8a0a9e1d9813614ef",
+    "integrations/hermes/patches/delegation-routing/delegate_model_routing.py": "1726822328a9c13eb871478355a140e6b0c6a77d906d150c4f11170155272209",
+    "integrations/hermes/patches/required-routing/agent_model_routing.py": "6b2c37e36ed4a4df69bc22349d4411ccbdd3526f381ad5228d208dd60290d83f",
+    "integrations/hermes/patches/required-routing/README.md": "1d5bf2e892afd867c65b0bfe8ea3edd2475d00b3153c39451a71c6a07ad7a2b8",
+    "integrations/hermes/patches/cron-routing/scheduler_model_routing.py": "17a411b47ca48fc73366649ff5b9600b87a858736ae3f081309929ce41b93909",
+    "integrations/hermes/patches/cron-routing/README.md": "abc35bb7aeb51a03c7d2d6f5dada431fdaec768875074919632b11e3ce468521",
+    "integrations/hermes/patches/auxiliary-routing/auxiliary_model_routing.py": "7fbcf664bc66f5786cb0455b28686782edcef9d47b0c07ddcaeeb76372719b83",
+    "integrations/hermes/patches/auxiliary-routing/README.md": "1a8a65b0610f6cc03aaf3785c3b739cf67de37c90d05fc6613a7fda69fe913a6",
+    "tables/inventory/cursor.txt": "09a786f500a084fd476bab7916ef82537adf9d3af9c72c502a55d0fa8edbab1b",
+    "tables/inventory/agy.txt": "85e245eeb6ee6aa8450b0a953be6bc93480da5086eaa233722cfd9057961fa32",
+    "tables/inventory/codex.txt": "acae1a8dc570f21ee6e2c84d1a7b4c724ab956a762e39e7fc131668b100c3b1a",
+    "tables/inventory/ollama.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tables/benchmarks/sources.json": "4e43cef8542b55e80aa7e98ecbd250569c21707b83c127bda8ba25e7e2613755",
+    "tables/benchmarks/last-build.txt": "d727537841e316d7bd1711831d9c921e35ac18a8d8356d6646a71b494e174832",
+    "tables/benchmarks/fetch_benchmarks.py": "02b4514544e67fdbb3f7d0ce83991c7319775eadaefce83a58f0259bceaae49a",
+    "tables/benchmarks/scores.csv": "1adbbc1e525304bc8d15dc37dc7a4c0921c86d77b7e5646cad6a2e629feebc06",
+    "tables/benchmarks/scores.prev.csv": "1cf47d712af069916bd0f7e1bcb1a2b32790462dcd7455061f42bdbe18e7c4b2",
+    "tables/benchmarks/COVERAGE.md": "7c0eacffd6cb49623a23d3a9cb25fcfdba25faeee096c0a24671baaabd21cd6f",
+    "tables/benchmarks/build_tiers.py": "c25bcffb5fafc4d15634820a8a741d50ad6acd94d7c1009b77a548acfb1475d2",
+    "tables/community/claims.jsonl": "cf723cbef8eeac3b56825f96bafb9a354547e1f6e01001f0c077fd23fef532af",
+    "tables/community/fold_sentiment.py": "f575d751bd848f3db5386b13fd0bc96388a767ad0d71b64416737db3f2c986b2",
+    "tables/community/SPEC.md": "6e06faeec420faac0a4cb99386e46db69ee3d348c19e2110059eac120d2ed828"
+  },
+  "wheel": "/Users/velox/.cortados-builds/training-teacher-verification/wheels/cortados_router-1.0.0-py3-none-any.whl",
+  "wheel_sha256": "c240455c13958a712bbe007f85a8efc00829edcd3627e0e563a3b0666caa0081",
+  "release": "/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017",
+  "site_packages": "/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017/venv/lib/python3.14/site-packages",
+  "activated": false,
+  "dependencies": [
+    {
+      "name": "annotated-types",
+      "version": "0.8.0"
+    },
+    {
+      "name": "anyio",
+      "version": "4.15.1"
+    },
+    {
+      "name": "attrs",
+      "version": "26.1.0"
+    },
+    {
+      "name": "certifi",
+      "version": "2026.7.22"
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.1"
+    },
+    {
+      "name": "click",
+      "version": "8.5.0"
+    },
+    {
+      "name": "cortados-router",
+      "version": "1.0.0"
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.2"
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0"
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9"
+    },
+    {
+      "name": "httpx",
+      "version": "0.28.1"
+    },
+    {
+      "name": "httpx-sse",
+      "version": "0.4.3"
+    },
+    {
+      "name": "idna",
+      "version": "3.20"
+    },
+    {
+      "name": "jsonschema",
+      "version": "4.26.0"
+    },
+    {
+      "name": "jsonschema-specifications",
+      "version": "2025.9.1"
+    },
+    {
+      "name": "mcp",
+      "version": "1.30.0"
+    },
+    {
+      "name": "pip",
+      "version": "26.1.2"
+    },
+    {
+      "name": "pycparser",
+      "version": "3.11"
+    },
+    {
+      "name": "pydantic",
+      "version": "2.14.1"
+    },
+    {
+      "name": "pydantic_core",
+      "version": "2.50.1"
+    },
+    {
+      "name": "pydantic-settings",
+      "version": "2.16.0"
+    },
+    {
+      "name": "PyJWT",
+      "version": "2.15.1"
+    },
+    {
+      "name": "python-dotenv",
+      "version": "1.2.4"
+    },
+    {
+      "name": "python-multipart",
+      "version": "0.0.32"
+    },
+    {
+      "name": "referencing",
+      "version": "0.37.0"
+    },
+    {
+      "name": "rpds-py",
+      "version": "2026.9.1"
+    },
+    {
+      "name": "sse-starlette",
+      "version": "3.5.0"
+    },
+    {
+      "name": "starlette",
+      "version": "1.8.0"
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0"
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4"
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.54.0"
+    }
+  ]
+}

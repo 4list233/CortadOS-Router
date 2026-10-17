@@ -1,0 +1,35 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "contract_version": 2,
+  "cumulative_attempt": 3,
+  "D": 0,
+  "A": 0,
+  "B": "pending full independent inventory",
+  "prior_failures_retained": [
+    1,
+    2
+  ],
+  "source_review_findings": 0,
+  "exam_owner": "/root/quota_evaluation_qa",
+  "owner_sha256": "562661698ccd83cdd3d13d46b1aa5738ba2cf497bc381df6298d96597b7cb621",
+  "builder_tests_sha256": "cbdb2feb7ff52f320aa3e84100b21ec69508ae8a732eed3586660785436184cd",
+  "frozen_file_count": 93,
+  "frozen_files_verified": true,
+  "independent_focused": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "command": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest -v acceptance.training_teacher.test_invocation_cache"
+  },
+  "review": "Both parsed-label and reserved-slot indexes retire under mutex after successful lock acquisition before durable reload, and on serialized exit. No new owner or change to within-invocation generation validation. Reusable instances continue, active reentry and concurrent owner refusals retained.",
+  "source_diff": "--- B2/teacher_attempts.py\n+++ B3/teacher_attempts.py\n@@ -109,6 +109,9 @@\n                 try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n                 except BlockingIOError as exc:\n                     raise WorkerError('workspace_busy', 'Teacher labels already have a writer') from exc\n+                # A new lock acquisition starts a fresh derived-cache generation.\n+                self._label_cache.clear()\n+                self._slot_cache = None\n                 if self.path.exists() or self.path.is_symlink():\n                     self._secure(self.path, 0o600)\n                     self.manifest = json.loads(self.path.read_text(), object_pairs_hook=_unique)\n@@ -129,6 +132,8 @@\n \n     def __exit__(self, *args):\n         with self.mutex:\n+            self._label_cache.clear()\n+            self._slot_cache = None\n             if self.active_token is not None:\n                 _ACTIVE.reset(self.active_token)\n                 self.active_token = None\n",
+  "operator_script": {
+    "path": "/private/tmp/activate-training-teacher-007.py",
+    "sha256": "1d06d2f1a051871b821c50d735480c1382dc92bc522a5be57a0dcfc9c599fdd1",
+    "findings": 0
+  },
+  "environment_note": "Worker initially used umask077, which conflicts with an existing fixture asserting0755. Unchanged fixture passed under022; parent independently reports61/61 protected and18/18 builder tests. Full inventory and exact installed release remain pending.",
+  "provider_calls": 0,
+  "production_edits": false
+}

@@ -1,0 +1,78 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "revision": 2,
+  "cumulative_attempt": 3,
+  "exam_commit": "8217baf",
+  "sources": [
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py",
+      "sha256": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb",
+      "B2_sha256": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb",
+      "lines": 321
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher_attempts.py",
+      "sha256": "562661698ccd83cdd3d13d46b1aa5738ba2cf497bc381df6298d96597b7cb621",
+      "B2_sha256": "80a53da7d59804b9246b4a78f9305ea0324fb18b8e1b6c708dce8ca1aa7a89f0",
+      "lines": 491
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/worker_admission.py",
+      "sha256": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+      "B2_sha256": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+      "lines": 74
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/config.py",
+      "sha256": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+      "B2_sha256": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+      "lines": 155
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/s1/label.py",
+      "sha256": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38",
+      "B2_sha256": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38",
+      "lines": 217
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/label.py",
+      "sha256": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700",
+      "B2_sha256": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700",
+      "lines": 222
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/nightly.sh",
+      "sha256": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7",
+      "B2_sha256": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7",
+      "lines": 186
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_training_teacher.py",
+      "sha256": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f",
+      "B2_sha256": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f",
+      "lines": 87
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_teacher_attempts.py",
+      "sha256": "cbdb2feb7ff52f320aa3e84100b21ec69508ae8a732eed3586660785436184cd",
+      "B2_sha256": "e9d222036f2f5d197c9e89815451a180e5a4287f6e0874eace27f679ff697759",
+      "lines": 198
+    }
+  ],
+  "root_source_exams": {
+    "tests": 61,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "pass": true,
+    "failure_ids": [],
+    "error_ids": []
+  },
+  "root_units": {
+    "tests": 18,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0
+  },
+  "freeze_sha256": "c049981e9fa9594b5fa0d60e8c35391e8053822e54d72d75ad4e49fc2d7f1987"
+}
