@@ -1,0 +1,29 @@
+test_cursor_status_ignores_unrelated_cached_quota_policy (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_cursor_status_ignores_unrelated_cached_quota_policy) ... FAIL
+test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path) ... ERROR
+
+======================================================================
+ERROR: test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_origin.py", line 29, in test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path
+    self.assertEqual(scarcity._cursor(), {'source': 'native fixture', 'windows': []})
+                     ~~~~~~~~~~~~~~~~^^
+  File "/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/fresh-quota-stage-exam-krumy8re/plugins/cortados-router/scarcity.py", line 418, in _cursor
+    import quota_policy
+ModuleNotFoundError: No module named 'quota_policy'
+
+======================================================================
+FAIL: test_cursor_status_ignores_unrelated_cached_quota_policy (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_cursor_status_ignores_unrelated_cached_quota_policy)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_origin.py", line 38, in test_cursor_status_ignores_unrelated_cached_quota_policy
+    self.assertEqual(scarcity._cursor(), {'source': 'native fixture', 'windows': []})
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'source': 'unrelated policy', 'windows': []} != {'source': 'native fixture', 'windows': []}
+- {'source': 'unrelated policy', 'windows': []}
++ {'source': 'native fixture', 'windows': []}
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.056s
+
+FAILED (failures=1, errors=1)

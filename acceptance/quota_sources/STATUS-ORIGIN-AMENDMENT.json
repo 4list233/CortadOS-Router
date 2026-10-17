@@ -1,0 +1,25 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "exam_owner": "/root/quota_evaluation_qa",
+  "base_freeze_commit": "f484e4536662e6466984f9f1c44f64bf375fd8b9",
+  "reason": "Existing exact sibling/pinned bridge obligation: maintained file-loaded scarcity must neither require ambient plugin sys.path nor trust unrelated quota_policy cache.",
+  "AC": [
+    "AC-QS03",
+    "AC-QS07"
+  ],
+  "methods_added": 2,
+  "methods_total": 79,
+  "old_tests_changed": false,
+  "candidate_sha256": "3ea3ef9d15eda2ffa6aa765ae461f68a6f6866f0d5c375575243a598d71420d4",
+  "red": {
+    "tests": 2,
+    "failures": 1,
+    "errors": 1,
+    "skips": 0
+  },
+  "command": "CORTADOS_FRESH_QUOTA_STAGE=/Users/velox/.cortados-builds/quota-sources-activation /Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -m unittest -v acceptance.quota_sources.test_status_origin",
+  "files": {
+    "acceptance/quota_sources/test_status_origin.py": "641beb8c0d2fdd0884d7c6adf230c79c53a41e340b538c0f0f37c526647a2d58",
+    "acceptance/quota_sources/evidence/status-origin-b1-red.log": "1eeafc8a65ae867a87360e36df7f97d187315447f02f3e9ad22439cadad2cc0a"
+  }
+}
