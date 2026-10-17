@@ -1,0 +1,74 @@
+{
+  "train/build_sft.py": {
+    "before_sha256": "983b22139a8c836ae07430ede1ce9e51296dbedec39e1c39d551cb46e459355a",
+    "candidate_sha256": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+    "bytes": 4842,
+    "lines_before": 95,
+    "lines_candidate": 95,
+    "mode": 420
+  },
+  "train/nightly.sh": {
+    "before_sha256": "2476cfb97abf79b9b78b927387e9e8c945a56bb986ca267a8ff58b5d3118c2aa",
+    "candidate_sha256": "a01a86b212a60344ade3e1f5c5486383c64d63b7980af592b105197a666f7e7f",
+    "bytes": 13422,
+    "lines_before": 185,
+    "lines_candidate": 185,
+    "mode": 493
+  },
+  "train/dataset.py": {
+    "before_sha256": "5d8255e4d57489ad995266b1e68316af5c36e95642f189db388de7bd20945b98",
+    "candidate_sha256": "2a9df0126c5434aacbc9f14443f1d78febfa33ec17fa114fa81e99a5c42b7f04",
+    "bytes": 3249,
+    "lines_before": 65,
+    "lines_candidate": 65,
+    "mode": 420
+  },
+  "train/label.py": {
+    "before_sha256": "b1655232a7ff54c799af2668b063ca23f16fd08a88aa454c31035346989fa5f4",
+    "candidate_sha256": "781021a725a8a2ae1e91cd5c72700126908284be1f8a46abc6b771235573de84",
+    "bytes": 11738,
+    "lines_before": 205,
+    "lines_candidate": 208,
+    "mode": 420
+  },
+  "train/evaluate.py": {
+    "before_sha256": "19032becc842cee2baa935136314548bc727104b968bc1123188138e9947f285",
+    "candidate_sha256": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+    "bytes": 15993,
+    "lines_before": 266,
+    "lines_candidate": 266,
+    "mode": 420
+  },
+  "plugins/cortados-pty/runner.py": {
+    "before_sha256": "c4a41ed67148f7f153d46f4e49edace559a1a212843c1c7fdcdfe63abb6d1e3f",
+    "candidate_sha256": "922963708783a25bcac875cfd530bc5aa21a7a8a4437dba8f2a3097e8aff33d6",
+    "bytes": 49039,
+    "lines_before": 945,
+    "lines_candidate": 953,
+    "mode": 420
+  },
+  "plugins/cortados-pty/model_routing.py": {
+    "before_sha256": "4a8341b1b73b2f45a70e2688218b4af97b3db9851e17fdcfd477d583f1e15d9f",
+    "candidate_sha256": "bd0c3458460c12897c754382d0ae3c609e8123c0f3efb1fcc87322c32f8b6791",
+    "bytes": 9575,
+    "lines_before": 190,
+    "lines_candidate": 213,
+    "mode": 420
+  },
+  "plugins/cortados-router/scarcity.py": {
+    "before_sha256": "188a85d752f91d9921235f72614dcf7bd90c3c39916fa62ec91829fc8b919c4d",
+    "candidate_sha256": "dbdb0ca968dff901207cb0c30483592d360fd8351df29aa22793ce9cd8588f01",
+    "bytes": 36031,
+    "lines_before": 672,
+    "lines_candidate": 671,
+    "mode": 420
+  },
+  "plugins/cortados-router/quota_policy.py": {
+    "before_sha256": "fd0405bb8e09bcd966a6c580713df57cad330fc37f4ab7ad33fe8599bfc1778a",
+    "candidate_sha256": "f29e958c4408775effcffaebd33e78357d008ac24b9a866ee74813870c81defe",
+    "bytes": 4208,
+    "lines_before": 72,
+    "lines_candidate": 100,
+    "mode": 420
+  }
+}

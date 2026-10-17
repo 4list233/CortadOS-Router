@@ -1,0 +1,33 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "reviewer": "/root/quota_evaluation_qa",
+  "attempt": 2,
+  "package_revision": "bd01f179e2874bb6b9abac86a3d2874d1b44a28f",
+  "source_review": "no remaining confirmed defects",
+  "closed_findings": [
+    "B1-01 exact sibling origin bridge",
+    "B1-02 direct unreaped child and PTY cleanup on acquisition failure"
+  ],
+  "package_delta_paths": [
+    "cortados_router/probe_reaper.py",
+    "cortados_router/scarcity.py",
+    "tests/test_quota_sources.py"
+  ],
+  "stage_changed_path": "plugins/cortados-router/scarcity.py",
+  "stage_manifest_sha256": "e1ed76a5b107792b3736b9e8be6c888f158fad601df8e5a3b7e1d1d6c4f00762",
+  "targeted": {
+    "tests": 8,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "command": "CORTADOS_FRESH_QUOTA_STAGE=/Users/velox/.cortados-builds/quota-sources-activation /Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest -v acceptance.quota_sources.test_status_origin acceptance.quota_sources.test_probe_start_failure acceptance.quota_sources.test_native_containment acceptance.quota_sources.test_final_capture_deadline"
+  },
+  "full_inventory": "pending",
+  "performance": "pending",
+  "installed_parity": "pending final candidate",
+  "overall_B": "pending; not activation approval",
+  "evidence": {
+    "acceptance/quota_sources/evidence/B2/stage-manifest.json": "e1ed76a5b107792b3736b9e8be6c888f158fad601df8e5a3b7e1d1d6c4f00762",
+    "acceptance/quota_sources/evidence/B2/targeted.log": "e834bbcffce69b8661f5693693be2f847384c4eec2fbe2667678e448958339ab"
+  }
+}
