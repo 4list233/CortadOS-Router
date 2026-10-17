@@ -42,6 +42,7 @@ publication is outside this task.
 | `cortados_router/route_task.py` | Scoped production builder; optional scoring and existing resolver integration. |
 | `cortados_router/worker_admission.py` | Scoped production builder; common execution admission. |
 | `cortados_router/scarcity_codex_native.py` | Scoped production builder; typed native quota input to the existing scarcity owner. |
+| `cortados_router/core.py::resolve` | Existing candidate burn owner; [RT-QUOTA-EVALUATION-004 v1](QUOTA-EVALUATION-004.md) pins one estimate observation per priced candidate; AC-Q01–Q06, protected `acceptance/quota_evaluation/`. |
 
 The [original branch plan](../SUBAGENT-MCP-PLAN.md) remains historical until the reviewed contract
 supersedes its implementation details. No document here changes CortadOS's global decisions log or

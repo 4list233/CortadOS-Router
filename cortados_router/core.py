@@ -528,7 +528,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             # BURN, not price (Forest 2026-09-29, after the Claude pool ran out while Codex had barely moved): what a call costs is the share of ITS POOL's window it
             # consumes. Pools differ ~10× in size (Claude ≈ 53 M of our tokens per week, Codex ≈ 563 M), so weight = model price ÷ pool size,
             # normalised so the heaviest candidate = 100. Price alone (the old weight) is used only for pools whose size is not yet learned.
-            c["burn"] = (c["price"] / (tokens_per_pct(c) / 1e6)) if c.get("price") and tokens_per_pct(c) else None
+            c["burn"] = (c["price"] / (estimate / 1e6)) if c.get("price") and (estimate := tokens_per_pct(c)) else None
         burn_ref = max([x["burn"] for x in cands if x.get("burn")] + [0.0])
         price_ref = max([x["price"] for x in cands if x.get("price") and not x.get("ceiling")] + [1.0])
         for c in cands:
