@@ -1,0 +1,369 @@
+--- a/train/dataset.py
++++ b/train/dataset.py
+@@ -2,19 +2,38 @@
+ Sources: Forest's 761 scrubbed 1.0 requests (labeling-sheet.csv) + every turn the shadow router has logged (router.db)."""
+ from __future__ import annotations
+ 
++import argparse
+ import csv
+ import json
++import os
+ import sqlite3
+ import sys
+ from pathlib import Path
+ 
+ from common import DATA, clean_request, read_jsonl, split_of
+ 
++# RT-MCP-LEARNING-003 §8: this process keeps the legacy path unless explicitly enabled.
++_MCP_LEARNING = None
++if os.environ.get("CORTADOS_MCP_LEARNING_V1") == "1":
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    if (os.environ.get("CORTADOS_MCP_LEARNING_SITE_PACKAGES") != _MCP_SITE_PACKAGES
++            or not Path(_MCP_SITE_PACKAGES).is_dir()):
++        raise RuntimeError("mcp_learning_release_unavailable: expected pinned site-packages")
++    sys.path.insert(0, _MCP_SITE_PACKAGES)
++    from cortados_router import learning_data as _MCP_LEARNING
++    if Path(_MCP_LEARNING.__file__).resolve() != Path(_MCP_SITE_PACKAGES) / "cortados_router/learning_data.py":
++        raise RuntimeError("mcp_learning_release_mismatch: learning_data is outside pinned release")
++
++
+ SHEET = Path(__file__).resolve().parent / "sources/labeling-sheet.csv"
+ ROUTER_DB = Path.home() / ".cortados/router.db"
+ 
+ 
+ def main() -> None:
++    if _MCP_LEARNING is not None:
++        parser = argparse.ArgumentParser()
++        parser.add_argument("--mcp-state-dir", type=Path, default=Path.home() / ".local/state/cortados-workers")
++        arguments = parser.parse_args()
+     out = DATA / "requests.jsonl"
+     have = {r["id"] for r in read_jsonl(out)}
+     seen_text = {r["request"] for r in read_jsonl(out)}
+@@ -35,6 +54,8 @@
+             r["split"] = split_of(r["id"])
+             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+             have.add(r["id"]); seen_text.add(r["request"]); added += 1
++    if _MCP_LEARNING is not None:
++        print(json.dumps(_MCP_LEARNING.collect_mcp(arguments.mcp_state_dir, DATA), sort_keys=True))
+     rows = read_jsonl(out)
+     print(f"requests.jsonl: +{added} new, {len(rows)} total, holdout {sum(r['split'] == 'holdout' for r in rows)}, by source "
+           + json.dumps({s: sum(r['source'] == s for r in rows) for s in sorted({r['source'] for r in rows})}))
+--- a/train/label.py
++++ b/train/label.py
+@@ -21,6 +21,19 @@
+ 
+ from common import DATA, QUESTIONS, REPO, core, read_jsonl, valid_answers
+ 
++# RT-MCP-LEARNING-003 §8: this process keeps the legacy path unless explicitly enabled.
++_MCP_LEARNING = None
++if os.environ.get("CORTADOS_MCP_LEARNING_V1") == "1":
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    if (os.environ.get("CORTADOS_MCP_LEARNING_SITE_PACKAGES") != _MCP_SITE_PACKAGES
++            or not Path(_MCP_SITE_PACKAGES).is_dir()):
++        raise RuntimeError("mcp_learning_release_unavailable: expected pinned site-packages")
++    sys.path.insert(0, _MCP_SITE_PACKAGES)
++    from cortados_router import learning_data as _MCP_LEARNING
++    if Path(_MCP_LEARNING.__file__).resolve() != Path(_MCP_SITE_PACKAGES) / "cortados_router/learning_data.py":
++        raise RuntimeError("mcp_learning_release_mismatch: learning_data is outside pinned release")
++
++
+ STATE = Path.home() / ".cortados"
+ LABELS = DATA / "labels.jsonl"
+ DEFAULTS = {"steps": 0, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0, "outward": False, "work_kind": "conversation",
+@@ -36,6 +49,10 @@
+           "anchor literally says. blast_radius and outward are about what CARRYING OUT the request would touch, not about the topic mentioned. "
+           "Reply with ONLY a JSON array, one object per request, in the same order, each: {\"i\": <the request's i>, "
+           + ", ".join(f'"{q}": …' for q in QUESTIONS) + "}. No prose, no code fence.")
++
++
++if _MCP_LEARNING is not None:
++    SYSTEM += "\n\n" + _MCP_LEARNING.TEACHER_EVIDENCE_NOTE
+ 
+ 
+ def _env() -> dict[str, str]:
+@@ -64,13 +81,17 @@
+         return SYSTEM
+     return (core.SYSTEM + "\n\nYou are the TEACHER producing training labels for ONLY these questions: " + ", ".join(ONLY) + ". Read each definition "
+             "again and apply it literally. Reply with ONLY a JSON array, one object per request, in the same order, each: {\"i\": <the request's i>, "
+-            + ", ".join(f'"{q}": …' for q in ONLY) + "}. No prose, no code fence.")
++            + ", ".join(f'"{q}": …' for q in ONLY) + "}. No prose, no code fence."
++            + ("\n\n" + _MCP_LEARNING.TEACHER_EVIDENCE_NOTE if _MCP_LEARNING is not None else ""))
+ 
+ 
+ def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
+     cwd = STATE / "teacher-cwd"
+     cwd.mkdir(parents=True, exist_ok=True)
+-    payload = json.dumps([{"i": n, "unit_kind": r["unit_kind"], "request": r["request"]} for n, r in enumerate(batch)], ensure_ascii=False)
++    if _MCP_LEARNING is not None:
++        payload = json.dumps(_MCP_LEARNING.teacher_payload(batch), ensure_ascii=False)
++    else:
++        payload = json.dumps([{"i": n, "unit_kind": r["unit_kind"], "request": r["request"]} for n, r in enumerate(batch)], ensure_ascii=False)
+     argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence", "--max-turns", "1", "--tools", "", "--disable-slash-commands",
+             "--strict-mcp-config", "--setting-sources", "project", "--model", model, "--system-prompt", system_prompt()]
+     p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=_env())
+@@ -101,10 +122,12 @@
+             if ONLY:
+                 if all(q in a for q in ONLY) and valid_answers({**DEFAULTS, **{q: a[q] for q in ONLY}}):
+                     f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()), "override": True,
++                                        **(_MCP_LEARNING.label_provenance(batch[a["i"]]) if _MCP_LEARNING is not None else {}),
+                                         "answers": {q: a[q] for q in ONLY}}, ensure_ascii=False) + "\n")
+                     good += 1
+             elif valid_answers(a):
+                 f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
++                                    **(_MCP_LEARNING.label_provenance(batch[a["i"]]) if _MCP_LEARNING is not None else {}),
+                                     "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
+                 good += 1
+     try:                                                   # the subscription ledger sees teacher work like any other lane use
+@@ -130,7 +153,10 @@
+     global LABELS
+     if ONLY:
+         LABELS = DATA / f"labels-override-{'-'.join(ONLY)}.jsonl"
+-    rows = [r for r in read_jsonl(DATA / "requests.jsonl") if a.split in ("all", r["split"])]
++    if _MCP_LEARNING is not None:
++        rows = [r for r in _MCP_LEARNING.bind_snapshot(DATA)["rows"] if a.split in ("all", r["split"])]
++    else:
++        rows = [r for r in read_jsonl(DATA / "requests.jsonl") if a.split in ("all", r["split"])]
+     done = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(LABELS)}
+     if ONLY:                                             # override rows only make sense where a full label exists
+         full = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(DATA / "labels.jsonl")}
+--- a/train/build_sft.py
++++ b/train/build_sft.py
+@@ -8,12 +8,26 @@
+ import random
+ import sys
+ from collections import Counter, defaultdict
++from pathlib import Path
+ 
+-from common import DATA, core, read_jsonl, read_labels
++from common import DATA, core, read_jsonl, read_labels, valid_answers
+ from student import messages
+ 
+ 
+ import os
++# RT-MCP-LEARNING-003 §8: this process keeps the legacy path unless explicitly enabled.
++_MCP_LEARNING = None
++if os.environ.get("CORTADOS_MCP_LEARNING_V1") == "1":
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    if (os.environ.get("CORTADOS_MCP_LEARNING_SITE_PACKAGES") != _MCP_SITE_PACKAGES
++            or not Path(_MCP_SITE_PACKAGES).is_dir()):
++        raise RuntimeError("mcp_learning_release_unavailable: expected pinned site-packages")
++    sys.path.insert(0, _MCP_SITE_PACKAGES)
++    from cortados_router import learning_data as _MCP_LEARNING
++    if Path(_MCP_LEARNING.__file__).resolve() != Path(_MCP_SITE_PACKAGES) / "cortados_router/learning_data.py":
++        raise RuntimeError("mcp_learning_release_mismatch: learning_data is outside pinned release")
++
++
+ REPS = {"R0": 1, "R1": 1, "R2": 3, "R3": 4}
+ UPWEIGHT_HIGH = int(os.environ.get("CORTADOS_S1_UPWEIGHT_HIGH", "2"))
+ for kv in (os.environ.get("CORTADOS_S1_REPS") or "").split(","):      # e.g. "R2:4,R3:6" — rare bands are the expensive mistakes
+@@ -27,15 +41,30 @@
+ 
+ 
+ def main() -> int:
+-    reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
++    if _MCP_LEARNING is not None:
++        snapshot = _MCP_LEARNING.bind_snapshot(DATA)
++        reqs = {r["id"]: r for r in snapshot["rows"]}
++        tokenizer = None
++        if any(row.get("source") == "mcp-worker" for row in reqs.values()):
++            try:
++                tokenizer = _MCP_LEARNING.training_tokenizer()
++            except Exception:
++                # The owner emits training_tokenizer_unavailable for each excluded MCP example.
++                tokenizer = None
++    else:
++        reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+     by_id = defaultdict(list)
+     for l in read_labels():
+-        if l["id"] in reqs and reqs[l["id"]]["split"] == "train":
++        if (l["id"] in reqs and reqs[l["id"]]["split"] == "train"
++                and (_MCP_LEARNING is None or valid_answers(l["answers"]))):
+             by_id[l["id"]].append(l["answers"])
+     train, valid, bands = [], [], Counter()
+     for rid, samples in by_id.items():
+         r = reqs[rid]
+-        is_valid = int(hashlib.sha1(("v" + rid).encode()).hexdigest(), 16) % 10 == 0
++        if _MCP_LEARNING is not None:
++            is_valid = snapshot["partitions"][rid] == "valid"
++        else:
++            is_valid = int(hashlib.sha1(("v" + rid).encode()).hexdigest(), 16) % 10 == 0
+         b = Counter(band_of(a) for a in samples).most_common(1)[0][0]
+         bands[b] += 1
+         # rare bands are the expensive mistakes: repeat them (requests stay real; nothing synthetic is invented here)
+@@ -44,6 +73,11 @@
+         top = max(d_of(a) for a in samples)
+         for a in samples:
+             ex = {"messages": messages(r["request"], r["unit_kind"], a)}
++            if _MCP_LEARNING is not None:
++                refusal = _MCP_LEARNING.training_context(r, ex["messages"], tokenizer)
++                if refusal:
++                    print(json.dumps(refusal, sort_keys=True))
++                    continue
+             # Forest 2026-09-24: "the bigger weighting should always be on the worst answers" — the sample that read the task as hardest
+             # counts UPWEIGHT_HIGH times when the samples disagree, so under-estimation is the costlier error in the loss
+             k = reps * (UPWEIGHT_HIGH if (not is_valid and len(samples) > 1 and d_of(a) == top and any(d_of(b) < top for b in samples)) else 1)
+--- a/train/evaluate.py
++++ b/train/evaluate.py
+@@ -10,6 +10,7 @@
+ import hashlib
+ import json
+ import math
++import os
+ import statistics
+ import sys
+ import time
+@@ -17,9 +18,31 @@
+ from pathlib import Path
+ 
+ from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
+-from student import N_OPTIONS, Scorer, encode
++from student import N_OPTIONS, Scorer, encode, messages
++
++# RT-MCP-LEARNING-003 §8: this process keeps the legacy path unless explicitly enabled.
++_MCP_LEARNING = None
++if os.environ.get("CORTADOS_MCP_LEARNING_V1") == "1":
++    _MCP_SITE_PACKAGES = "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
++    if (os.environ.get("CORTADOS_MCP_LEARNING_SITE_PACKAGES") != _MCP_SITE_PACKAGES
++            or not Path(_MCP_SITE_PACKAGES).is_dir()):
++        raise RuntimeError("mcp_learning_release_unavailable: expected pinned site-packages")
++    sys.path.insert(0, _MCP_SITE_PACKAGES)
++    from cortados_router import learning_data as _MCP_LEARNING
++    if Path(_MCP_LEARNING.__file__).resolve() != Path(_MCP_SITE_PACKAGES) / "cortados_router/learning_data.py":
++        raise RuntimeError("mcp_learning_release_mismatch: learning_data is outside pinned release")
++
+ 
+ BANDS = ["R0", "R1", "R2", "R3", "R4"]
++
++
++def cache_identity(holdout, fail_up, current, snapshot=None, labels=None):
++    return _MCP_LEARNING.evaluation_identity(holdout, fail_up=fail_up, outward_at=OUTWARD_AT,
++        adapter=current.get("adapter"), base=current.get("base"),
++        partitions=snapshot["partitions"] if snapshot is not None else None, labels=labels,
++        scorer_path=Path(__file__).resolve().parent / "student.py", scorer_config=current,
++        scorer_material={"messages": messages("", "interactive"), "questions": QUESTIONS,
++                         "options": N_OPTIONS, "work_kinds": core.WORK_KINDS, "urgency": core.URGENCY})
+ 
+ 
+ def band_of(a: dict) -> str:
+@@ -107,19 +130,22 @@
+             "latency_ms_median": int(statistics.median(lat)) if lat else None}
+ 
+ 
+-def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, str | None]:
++def promoted_bar_for_laya(holdout: list, fail_up: float, snapshot=None, labels=None) -> tuple[dict | None, str | None]:
+     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
+     writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
+     same inference settings. Never loads MLX here (the laya venv has none; only the 8B may sit beside the trainer). Returns (bar, source)."""
+     cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+     if not cur.get("adapter"):
+         return None, None
+-    hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
++    if _MCP_LEARNING is not None:
++        hkey = cache_identity(holdout, fail_up, cur, snapshot, labels)
++    else:
++        hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+     cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
+     if cache_p.exists():
+         return json.loads(cache_p.read_text()), f"promoted adapter {cur['adapter']} re-graded on this holdout (cached {cache_p.name})"
+     rep_p = Path(cur.get("report") or "")
+-    if rep_p.exists():
++    if _MCP_LEARNING is None and rep_p.exists():
+         rep = json.loads(rep_p.read_text())
+         if rep.get("holdout_rows") == len(holdout) and rep.get("fail_up_below") == fail_up and rep.get("outward_at") == OUTWARD_AT and rep.get("candidate"):
+             return rep["candidate"], f"promoted adapter's own report {rep_p} (same {len(holdout)} holdout rows, same fail-up/outward settings; not re-graded)"
+@@ -140,12 +166,22 @@
+     if a.engine == "laya" and not a.checkpoint:
+         ap.error("--engine laya requires --checkpoint <dir>")
+     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+-    reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
++    snapshot = None
++    if _MCP_LEARNING is not None:
++        snapshot = _MCP_LEARNING.bind_snapshot(DATA)
++        reqs = {r["id"]: r for r in snapshot["rows"]}
++    else:
++        reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
++    labels = read_labels()
+     samples = defaultdict(list)
+-    for l in read_labels():
+-        samples[l["id"]].append(l["answers"])
++    for l in labels:
++        if _MCP_LEARNING is None or (l["id"] in reqs and valid_answers(l["answers"])):
++            samples[l["id"]].append(l["answers"])
+     holdout = [(reqs[i], teacher_view(s)) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "holdout"]
+-    valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "train" and int(hashlib.sha1(("v" + i).encode()).hexdigest(), 16) % 10 == 0]
++    if _MCP_LEARNING is not None:
++        valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and snapshot["partitions"][i] == "valid"]
++    else:
++        valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "train" and int(hashlib.sha1(("v" + i).encode()).hexdigest(), 16) % 10 == 0]
+     if a.engine == "laya":
+         sys.path.insert(0, str(Path(__file__).resolve().parent / "laya"))
+         from predict import LayaScorer                    # duck-types Scorer: .T and .score(request, unit_kind) -> answers/probs/confidence/ms
+@@ -159,7 +195,10 @@
+               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
+               "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
+     if a.baseline:
+-        cache_p = DATA / "baseline-incumbent.jsonl"
++        if _MCP_LEARNING is not None:
++            cache_p = DATA / ("baseline-incumbent-" + cache_identity(holdout, a.fail_up, {"base": core.ENGINE_MODEL}, snapshot, labels) + ".jsonl")
++        else:
++            cache_p = DATA / "baseline-incumbent.jsonl"
+         cache = {x["id"]: x for x in read_jsonl(cache_p)}
+ 
+         def incumbent(r):
+@@ -183,7 +222,10 @@
+     bar = None
+     if a.engine == "laya":
+         try:
+-            bar, src = promoted_bar_for_laya(holdout, a.fail_up)
++            if _MCP_LEARNING is not None:
++                bar, src = promoted_bar_for_laya(holdout, a.fail_up, snapshot, labels)
++            else:
++                bar, src = promoted_bar_for_laya(holdout, a.fail_up)
+             if src:
+                 report["bar_source"] = src
+         except Exception as exc:
+@@ -192,7 +234,10 @@
+         try:
+             cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+             if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
+-                hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
++                if _MCP_LEARNING is not None:
++                    hkey = cache_identity(holdout, a.fail_up, cur, snapshot, labels)
++                else:
++                    hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
+                 if cache_p.exists():
+                     bar = json.loads(cache_p.read_text())
+--- a/train/nightly.sh
++++ b/train/nightly.sh
+@@ -4,6 +4,9 @@
+ #   - it is Sunday night (weekly cadence), or
+ #   - at least 150 newly labelled requests since the last training run (a busy week should not wait).
+ # Forest 2026-09-21: cadence is Claude's call. Reason: a day adds <10% data; nightly retrains on that are noise and churn promotions.
++# RT-MCP-LEARNING-003 §8: inherited only by the next invocation and its supervised re-exec.
++export CORTADOS_MCP_LEARNING_V1=1
++export CORTADOS_MCP_LEARNING_SITE_PACKAGES="/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages"
+ set -u
+ cd "$(dirname "$0")" || exit 1
+ PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop
+@@ -28,6 +31,7 @@
+ PY=../.venv-mlx/bin/python
+ BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
+ [ -f data/train-config.env ] && . data/train-config.env
++export CORTADOS_S1_BASE="$BASE"
+ newest_unfinished_run() {   # most recent run that began a training segment but never wrote a report
+   local d
+   for d in $(ls -td runs/20*/ 2>/dev/null); do
+@@ -69,7 +73,11 @@
+ ../bin/refresh-tiers.sh      # every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case. New models appear in routing the next morning, nobody edits a list.
+ python3 dataset.py
+ python3 label.py --workers 3
+-python3 build_sft.py || exit 1
++if [ "${CORTADOS_MCP_LEARNING_V1:-}" = "1" ]; then
++  "$PY" build_sft.py || exit 1
++else
++  python3 build_sft.py || exit 1
++fi
+ 
+ labelled=$(python3 -c "import json;print(len({json.loads(l)['id'] for l in open('data/labels.jsonl')}))")
+ last=$(cat data/last-train-count 2>/dev/null || echo 0)

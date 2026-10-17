@@ -1,15 +1,17 @@
 <!-- PURPOSE: Record the authorized local installation and its independently observed status.
      CONTRACT: RT-MCP-001, FOLLOWUP-001 and NATIVE-PROFILE-002; no new service policy.
-     DEPENDS: Pinned a27afd0 wheel, native ChatGPT login, Claude Code user configuration. -->
+     DEPENDS: Pinned e1fb2e4 wheel, native ChatGPT login, Claude Code user configuration. -->
 # Local Claude Code installation
 
-Installed on 2026-10-17 at Forest's request. Claude remains the planner; Codex uses the existing
-ChatGPT subscription for worker execution. The package is a non-editable wheel from source
-`a27afd05c4c1293b0984bf09f0a547896b247b23`, branch `plan/subagent-mcp`. Nothing was pushed.
+Updated on 2026-10-17 at Forest's request. Claude remains the planner; Codex uses the existing
+ChatGPT subscription for worker execution. The current non-editable wheel is from source
+`e1fb2e4ded95a298946cdcd9d26a15d35f07c42a`, branch `plan/subagent-mcp`. Nothing was pushed.
+It includes `context_requirements`, `job_feedback` and the installed nightly learning owner.
+See the [learning build report](LEARNING-BUILD-REPORT.md) for this update's independent verification.
 
 | Item | Local path or setting |
 |---|---|
-| Release | `/Users/velox/.local/share/cortados-workers/releases/a27afd05c4c1` |
+| Release | `/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017` |
 | Interpreter | Release directory plus `/venv/bin/python` (Python 3.14.6) |
 | Configuration | `/Users/velox/.config/cortados-workers/config.json` (mode 0600) |
 | Durable state | `/Users/velox/.local/state/cortados-workers` (directory mode 0700) |
@@ -20,17 +22,17 @@ ChatGPT subscription for worker execution. The package is a non-editable wheel f
 | Optional S1 | `CORTADOS_S1_URL=http://127.0.0.1:8431` |
 | Network and connectors | Shell network disabled; connector registry initially empty |
 
-Wheel SHA-256: `bb6cebf49114a19ae8fcf2add5121af05dd8992bec07df747c4363809e5f7f3b`.
-All 48 shipped source/data entries match the tested source. Dependencies use the tested versions
-recorded in the release's `requirements-tested.txt`. Editing the development checkout does not alter
-this installed release. The existing Claude MCP entries were preserved; no credentials were modified.
+Wheel SHA-256: `fb717b214580304b3468d4ee3ccab273887ba14cdf828c28792405829bef2289`.
+All 51 shipped source/data entries match the tested source. Dependencies are pinned to the prior
+tested release's installed versions and recorded in `release.json`. Editing the development checkout
+does not alter this installed release. Other Claude MCP entries were preserved; no credentials changed.
 
-The authorized registration command was:
+The equivalent registration command is:
 
 ```sh
 /opt/homebrew/bin/claude mcp add --scope user --transport stdio cortados-workers \
   --env CORTADOS_S1_URL=http://127.0.0.1:8431 -- \
-  /Users/velox/.local/share/cortados-workers/releases/a27afd05c4c1/venv/bin/python \
+  /Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/bin/python \
   -B -m integrations.mcp --config /Users/velox/.config/cortados-workers/config.json
 ```
 
@@ -59,6 +61,14 @@ not load-tested. The 8 MiB output ceiling is workload headroom, not a measured o
 | `process_poll_ms` | 20 milliseconds | Captured native descendant sampling; lower increases process-table CPU work, higher widens short-lived-process observation gaps. |
 
 ## Verification and activation
+
+The current update passed **388 tests**: 372 in the complete standalone Router inventory plus the
+16 maintained tests for the actual shared nightly adapters. The installed seven-tool service then
+passed a real Codex subscription task, independent file verification, durable feedback/replay and
+read-only learning collection. The previous accepted job's record remained byte-identical. Claude's
+MCP entry reports Connected. Reopen existing Claude sessions to load the new catalog.
+
+The following evidence describes the original installation, before the learning/context update:
 
 - Complete router inventory: **331 passed, 0 failures, 0 errors, 0 skips** at `a27afd0`.
 - Installed wheel, outside the source checkout: **6/6 native subscription probes passed**, covering

@@ -1,0 +1,48 @@
+{
+  "started_at": "2026-10-17T06:35:11.056276+00:00",
+  "previous_entry": {
+    "type": "stdio",
+    "command": "/Users/velox/.local/share/cortados-workers/releases/a27afd05c4c1/venv/bin/python",
+    "args": [
+      "-B",
+      "-m",
+      "integrations.mcp",
+      "--config",
+      "/Users/velox/.config/cortados-workers/config.json"
+    ],
+    "env": {
+      "CORTADOS_S1_URL": "http://127.0.0.1:8431"
+    }
+  },
+  "config_sha256": "41b579779ad64ada69c8d31ef70090fbac5a6ca5b9fdffe4e1a6c30ee85ade82",
+  "existing_job_hashes": {
+    "5e612218-93ea-46dc-8471-fef3acdbb7e8": "e7af21bbc6b5e1033de0a164a1b1b002b19adb304a4c68026cdc9c6bb5a891c5"
+  },
+  "active_jobs_at_stop": 0,
+  "old_broker_identity": "76947     1 Sat Oct 17 01:21:45 2026     /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -B -m integrations.mcp --broker --config /Users/velox/.config/cortados-workers/config.json",
+  "old_broker_stopped": true,
+  "new_entry": {
+    "type": "stdio",
+    "command": "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/bin/python",
+    "args": [
+      "-B",
+      "-m",
+      "integrations.mcp",
+      "--config",
+      "/Users/velox/.config/cortados-workers/config.json"
+    ],
+    "env": {
+      "CORTADOS_S1_URL": "http://127.0.0.1:8431"
+    }
+  },
+  "other_mcp_entries_unchanged": true,
+  "post_update": {
+    "original_jobs_byte_identical": true,
+    "active_jobs": 0,
+    "jobs": 2,
+    "feedback_rows": 1,
+    "user_version": 1,
+    "connection_verified_at": "2026-10-17T06:36:16.680129+00:00"
+  },
+  "connection_check": "cortados-workers:\n  Scope: User config (available in all your projects)\n  Status: \u2714 Connected\n  Type: stdio\n  Command: /Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/bin/python\n  Args: -B -m integrations.mcp --config /Users/velox/.config/cortados-workers/config.json\n  Environment:\n    CORTADOS_S1_URL=http://127.0.0.1:8431\n\nTo remove this server, run: claude mcp remove cortados-workers -s user\n"
+}

@@ -1,0 +1,18 @@
+test_daytime_does_not_start_even_a_child (test_router_overnight.Overnight.test_daytime_does_not_start_even_a_child) ... nightly: outside 01:30–07:00 Toronto; nothing started
+ok
+test_fall_clock_change_preserves_local_seven (test_router_overnight.Overnight.test_fall_clock_change_preserves_local_seven) ... ok
+test_forced_stop_removes_only_its_own_pid_receipt (test_router_overnight.Overnight.test_forced_stop_removes_only_its_own_pid_receipt) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_launch_time_until_seven (test_router_overnight.Overnight.test_launch_time_until_seven) ... ok
+test_normal_child_exit_has_no_signal (test_router_overnight.Overnight.test_normal_child_exit_has_no_signal) ... ok
+test_real_owned_child_is_stopped_at_deadline (test_router_overnight.Overnight.test_real_owned_child_is_stopped_at_deadline) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_resume_interrupted_before_first_save_does_not_double_count (test_router_overnight.Overnight.test_resume_interrupted_before_first_save_does_not_double_count) ... ok
+test_stubborn_child_gets_group_kill (test_router_overnight.Overnight.test_stubborn_child_gets_group_kill) ... nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints
+ok
+test_utc_boundary_is_not_offset_twice (test_router_overnight.Overnight.test_utc_boundary_is_not_offset_twice) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.409s
+
+OK

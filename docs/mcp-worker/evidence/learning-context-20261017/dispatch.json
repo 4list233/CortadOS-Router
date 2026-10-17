@@ -1,0 +1,14 @@
+{
+  "contract_id": "RT-MCP-LEARNING-003",
+  "version": 1,
+  "exam_commit": "26773c597d505524f626d9be737e80f128b68278",
+  "builder": "/root/mcp_learning_builder",
+  "model": "gpt-6.1-sol",
+  "reasoning": "high",
+  "dispatched_at": "2026-10-17T06:17:48.500213+00:00",
+  "D": 0,
+  "A": 0,
+  "phase": "standalone",
+  "activation": "sequential, not dispatched",
+  "contract_sha256": "fec6a107fa746613c49c1a1f9b0359cf5c8cb32b56cf7d443a420e975a3bbdb3"
+}

@@ -1,0 +1,27 @@
+{
+  "at": "2026-10-17T06:39:10.993078+00:00",
+  "contract": "RT-MCP-LEARNING-003",
+  "D": 0,
+  "A": 0,
+  "B": 0,
+  "production_revision": "e1fb2e4ded95a298946cdcd9d26a15d35f07c42a",
+  "exam_commit": "49ea2b608b8a00b9609863b5b4de90333351929b",
+  "tests": 388,
+  "failures": 0,
+  "errors": 0,
+  "skips": 0,
+  "standalone_tests": 372,
+  "shared_nightly_tests": 16,
+  "broader_shared_tree_tests": "not_run_outside_standalone_package_scope",
+  "activation": "five_adapters_applied_next_run_only",
+  "new_service_native_check": "passed",
+  "new_Claude_LLM_turn": "not_run_prior_user_Terminal_chain_passed",
+  "new_S1_model_quality": "not_claimed_training_still_running",
+  "experimental_fast_scorer": "rejected_probability_equivalence_failed",
+  "production_limits": "unchanged",
+  "notes": [
+    "Root production-source review and independent accumulated suites passed",
+    "No automatic promotion from benchmark",
+    "No GPU experiments after observed unified-memory pressure"
+  ]
+}

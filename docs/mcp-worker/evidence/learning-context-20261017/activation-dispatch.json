@@ -1,0 +1,12 @@
+{
+  "contract_id": "RT-MCP-LEARNING-003",
+  "phase": "activation",
+  "builder": "/root/mcp_learning_activation",
+  "model": "gpt-6.1-sol",
+  "dependency": "e1fb2e4ded95a298946cdcd9d26a15d35f07c42a",
+  "exam_commit": "49ea2b608b8a00b9609863b5b4de90333351929b",
+  "D": 0,
+  "A": 0,
+  "dispatched_at": "2026-10-17T06:27:13.889164+00:00",
+  "scratch_root": "/Users/velox/.cortados-builds/mcp-learning-activation"
+}

@@ -1,0 +1,214 @@
+{
+  "at": "2026-10-17T06:34:30.133778+00:00",
+  "release": {
+    "git_sha": "e1fb2e4ded95a298946cdcd9d26a15d35f07c42a",
+    "wheel_sha256": "fb717b214580304b3468d4ee3ccab273887ba14cdf828c28792405829bef2289",
+    "wheel": "/Users/velox/.cortados-builds/mcp-learning-verification/wheels/cortados_router-1.0.0-py3-none-any.whl",
+    "release": "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017",
+    "site_packages": "/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages",
+    "built_at": "2026-10-17T06:28:06.281998+00:00",
+    "dependencies": [
+      {
+        "name": "annotated-types",
+        "version": "0.8.0"
+      },
+      {
+        "name": "anyio",
+        "version": "4.15.1"
+      },
+      {
+        "name": "attrs",
+        "version": "26.1.0"
+      },
+      {
+        "name": "certifi",
+        "version": "2026.7.22"
+      },
+      {
+        "name": "cffi",
+        "version": "2.1.1"
+      },
+      {
+        "name": "click",
+        "version": "8.5.0"
+      },
+      {
+        "name": "cortados-router",
+        "version": "1.0.0"
+      },
+      {
+        "name": "cryptography",
+        "version": "50.0.2"
+      },
+      {
+        "name": "h11",
+        "version": "0.16.0"
+      },
+      {
+        "name": "httpcore",
+        "version": "1.0.9"
+      },
+      {
+        "name": "httpx",
+        "version": "0.28.1"
+      },
+      {
+        "name": "httpx-sse",
+        "version": "0.4.3"
+      },
+      {
+        "name": "idna",
+        "version": "3.20"
+      },
+      {
+        "name": "jsonschema",
+        "version": "4.26.0"
+      },
+      {
+        "name": "jsonschema-specifications",
+        "version": "2025.9.1"
+      },
+      {
+        "name": "mcp",
+        "version": "1.30.0"
+      },
+      {
+        "name": "pip",
+        "version": "26.1.2"
+      },
+      {
+        "name": "pycparser",
+        "version": "3.11"
+      },
+      {
+        "name": "pydantic",
+        "version": "2.14.1"
+      },
+      {
+        "name": "pydantic_core",
+        "version": "2.50.1"
+      },
+      {
+        "name": "pydantic-settings",
+        "version": "2.16.0"
+      },
+      {
+        "name": "PyJWT",
+        "version": "2.15.1"
+      },
+      {
+        "name": "python-dotenv",
+        "version": "1.2.4"
+      },
+      {
+        "name": "python-multipart",
+        "version": "0.0.32"
+      },
+      {
+        "name": "referencing",
+        "version": "0.37.0"
+      },
+      {
+        "name": "rpds-py",
+        "version": "2026.9.1"
+      },
+      {
+        "name": "sse-starlette",
+        "version": "3.5.0"
+      },
+      {
+        "name": "starlette",
+        "version": "1.8.0"
+      },
+      {
+        "name": "typing_extensions",
+        "version": "4.16.0"
+      },
+      {
+        "name": "typing-inspection",
+        "version": "0.4.4"
+      },
+      {
+        "name": "uvicorn",
+        "version": "0.54.0"
+      }
+    ]
+  },
+  "before_processes": [
+    {
+      "pid": 78395,
+      "identity": "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    },
+    {
+      "pid": 78397,
+      "identity": "78397 78395 Sat Oct 17 01:30:04 2026     /bin/bash /Users/velox/cortados/train/nightly.sh",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    },
+    {
+      "pid": 81006,
+      "identity": "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    }
+  ],
+  "files": [
+    {
+      "path": "/Users/velox/cortados/train/dataset.py",
+      "before_sha256": "c01083b619d8275ceedac2043a4167df47d42803aae2958c7b36ee31906ba6b2",
+      "after_sha256": "f4b931e62fc4a741a44c92507d451c4c26730e2d6860008ed911cf184829069c",
+      "before_inode": 300648925,
+      "after_inode": 393262388,
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/label.py",
+      "before_sha256": "05512787997f10d972d89f2366a47369b2fd5a7f445952aecf3cd3e7d471acb2",
+      "after_sha256": "f17dba495203d4d3fde6ef79afe3eb1703c7bd744a1c97b6aece75d072c03fe3",
+      "before_inode": 300635871,
+      "after_inode": 393262390,
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/build_sft.py",
+      "before_sha256": "0b05beeda131c3ff41f519229e8a3911c28bc6342fbc557ddd99287313c07be0",
+      "after_sha256": "5c0d6983d9b15b1b18201b4db6f6349c716cecd9818e71991ee867a361bbc2b3",
+      "before_inode": 299382334,
+      "after_inode": 393262391,
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/evaluate.py",
+      "before_sha256": "cfbe7eca517e21c513b06eac54936f8cb04cd8669caa2fc2ea9bbd8a41f72862",
+      "after_sha256": "d71186982f6669bdf0c3019cad50ea5cda99324d0411dbe86fc2b9154d3f1367",
+      "before_inode": 307718729,
+      "after_inode": 393262392,
+      "mode": "0o644"
+    },
+    {
+      "path": "/Users/velox/cortados/train/nightly.sh",
+      "before_sha256": "8a65386a7b33f860335e54faa7f21f1bec516d20b70bc347c4c5a714a20a6978",
+      "after_sha256": "ae706380433584c8032b184cc890069a6195d9c3258c8f638b7a36372c406613",
+      "before_inode": 375924685,
+      "after_inode": 393262393,
+      "mode": "0o755"
+    }
+  ],
+  "forward_patch_sha256": "b7c01774037b25ff229547bd12e0d634b41fb83c5c783bd56f22b6fde657c19d",
+  "rollback_patch_sha256": "5cdc6c0c53bd2207b819be4e529b391c2f3e4316a2cb5f7004681b5ba784eb67",
+  "process_identities_unchanged": true,
+  "unchanged_live_dependencies": {
+    "common.py": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+    "student.py": "ba8820e625b5f0459c5bdba14c7b2309794714ad4fb3ff6504ecf1c064f1eefb",
+    "current.json": "edd67078ecd05b8b8455cd4db7fabd3821ce9b9b52c51b6660fe43547703c372"
+  },
+  "actual_bash_script_inode": {
+    "pid": 78397,
+    "fd": 255,
+    "open_inode": 375924685,
+    "replacement_inode": 393262393,
+    "retained_old_inode": true
+  }
+}

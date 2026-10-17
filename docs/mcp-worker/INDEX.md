@@ -29,6 +29,7 @@ publication is outside this task.
 | `bin/route-crons.py` | Router; adopted cron outcome collector, occurrence attribution, saved job pins remain inputs; AC-F02/F03 and original cron integration. |
 | `integrations/mcp/native_profile.py` | Router; exact captured-version observation and legacy job provenance; AC-N01–N04. |
 | [LEARNING-CONTEXT.md](LEARNING-CONTEXT.md) | RT-MCP-LEARNING-003; independent context, feedback, learning and activation contract; AC-L01–L12. |
+| [LEARNING-BUILD-REPORT.md](LEARNING-BUILD-REPORT.md) | Root; tested source, complete standalone inventory, context/collection timings, installed release and next-run training activation. |
 | `acceptance/mcp_learning/` | Independent MCP QA; protected context/feedback/collection/pipeline exams and synthetic captures; builder read-only. |
 | `cortados_router/task_evidence.py` | Exact evidence validation, scorer/worker projections, provenance and pure `context_requirements`; route_task/frontend call this owner; no admission or storage; AC-L01–L04. |
 | `integrations/mcp/job_store.py::feedback` | Sole jobs.db feedback writer; append-only assertion transaction, ownership and replay; broker calls it; AC-L05. |
@@ -49,5 +50,6 @@ claims that its live Hermes deployment has been modified.
 The standalone learning implementation exposes installed-owner helpers to the separate activation
 package. Its source reads only accepted SQLite evidence; requests and labels retain immutable revisions,
 and `mcp-observations.jsonl` can be rebuilt by collection. The main-phase protected exam is the five
-modules named in [the exam README](../../acceptance/mcp_learning/README.md); activation remains a
-separate required stage. Root records full-inventory and performance results after independent reruns.
+modules named in [the exam README](../../acceptance/mcp_learning/README.md). The separately tested
+activation stage is installed for the next nightly invocation; the active October 17 run keeps its
+old environment and script inode. The build report records independent verification and limitations.

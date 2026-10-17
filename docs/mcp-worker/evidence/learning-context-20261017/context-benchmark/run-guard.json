@@ -1,0 +1,232 @@
+{
+  "started_at_unix": 1792217069.804342,
+  "pre_memory": {
+    "free_percent": 48,
+    "vm_swapusage": "total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"
+  },
+  "pre_live_identities": [
+    "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors"
+  ],
+  "pre_training_progress": {
+    "run": "2026-10-17-0130",
+    "last_reported_iteration": 90,
+    "last_reported_train_loss": 0.097,
+    "last_reported_iters_per_second": 0.138
+  },
+  "driver_sha256": "6f138d380118445ab549320b728c754a8e8000665efe5a2999f00683e4a3bc47",
+  "wall_limit_seconds": 180,
+  "rss_limit_bytes": 6442450944,
+  "free_floor_percent": 25,
+  "status": "failed_equivalence",
+  "resource_samples": [
+    {
+      "elapsed_s": 0.004422209000040311,
+      "rss_bytes": 147456
+    },
+    {
+      "elapsed_s": 1.0178757920002681,
+      "rss_bytes": 85540864
+    },
+    {
+      "elapsed_s": 2.032158999998501,
+      "rss_bytes": 2577973248
+    },
+    {
+      "elapsed_s": 3.0456434589978016,
+      "rss_bytes": 2584264704
+    },
+    {
+      "elapsed_s": 4.050462125000195,
+      "rss_bytes": 1453506560
+    },
+    {
+      "elapsed_s": 5.063884541999869,
+      "rss_bytes": 1419460608
+    },
+    {
+      "elapsed_s": 6.077366499997879,
+      "rss_bytes": 1422786560
+    },
+    {
+      "elapsed_s": 7.093631584000832,
+      "rss_bytes": 1429340160
+    },
+    {
+      "elapsed_s": 8.109765917000914,
+      "rss_bytes": 1435713536
+    },
+    {
+      "elapsed_s": 9.127101124999172,
+      "rss_bytes": 1444610048
+    },
+    {
+      "elapsed_s": 10.147048083999834,
+      "rss_bytes": 1450295296
+    },
+    {
+      "elapsed_s": 11.169098124999437,
+      "rss_bytes": 1453441024
+    },
+    {
+      "elapsed_s": 12.187960208997538,
+      "rss_bytes": 1454260224
+    },
+    {
+      "elapsed_s": 13.202995666997595,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 14.21622970899989,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 15.229579250000825,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 16.242892124999344,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 17.256363459000568,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 18.26354799999899,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 19.28014445900044,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 20.29907941700003,
+      "rss_bytes": 1453703168
+    },
+    {
+      "elapsed_s": 21.318621333997726,
+      "rss_bytes": 1454309376
+    },
+    {
+      "elapsed_s": 22.330522042000666,
+      "rss_bytes": 1454555136
+    },
+    {
+      "elapsed_s": 23.339809375000186,
+      "rss_bytes": 1454374912
+    },
+    {
+      "elapsed_s": 24.344921333999082,
+      "rss_bytes": 1454571520
+    },
+    {
+      "elapsed_s": 25.35821020900039,
+      "rss_bytes": 1454571520
+    },
+    {
+      "elapsed_s": 26.364136916999996,
+      "rss_bytes": 1452392448
+    },
+    {
+      "elapsed_s": 27.37620812499881,
+      "rss_bytes": 1452392448
+    },
+    {
+      "elapsed_s": 28.380584374997852,
+      "rss_bytes": 1452392448
+    },
+    {
+      "elapsed_s": 29.39051983399986,
+      "rss_bytes": 1452359680
+    },
+    {
+      "elapsed_s": 30.405543791999662,
+      "rss_bytes": 1452359680
+    },
+    {
+      "elapsed_s": 31.417828583998926,
+      "rss_bytes": 1454702592
+    },
+    {
+      "elapsed_s": 32.433139166998444,
+      "rss_bytes": 1455161344
+    },
+    {
+      "elapsed_s": 33.43956804199843,
+      "rss_bytes": 1454260224
+    },
+    {
+      "elapsed_s": 34.453902541998104,
+      "rss_bytes": 1454260224
+    },
+    {
+      "elapsed_s": 35.47293283399995,
+      "rss_bytes": 1454145536
+    },
+    {
+      "elapsed_s": 36.48638329199821,
+      "rss_bytes": 1454145536
+    },
+    {
+      "elapsed_s": 37.49994841700027,
+      "rss_bytes": 1454161920
+    },
+    {
+      "elapsed_s": 38.50862541699826,
+      "rss_bytes": 1454161920
+    },
+    {
+      "elapsed_s": 39.51817354200102,
+      "rss_bytes": 1454161920
+    },
+    {
+      "elapsed_s": 40.536287916998845,
+      "rss_bytes": 1454161920
+    },
+    {
+      "elapsed_s": 41.55490749999808,
+      "rss_bytes": 1454161920
+    },
+    {
+      "elapsed_s": 42.57104279199848,
+      "rss_bytes": 1455046656
+    },
+    {
+      "elapsed_s": 43.58901049999986,
+      "rss_bytes": 1455259648
+    },
+    {
+      "elapsed_s": 44.60269254200102,
+      "rss_bytes": 545161216
+    },
+    {
+      "elapsed_s": 45.62146025000038,
+      "rss_bytes": 545161216
+    },
+    {
+      "elapsed_s": 46.64123991700035,
+      "rss_bytes": 545095680
+    }
+  ],
+  "owned_pid": 83185,
+  "owned_pgid": 83185,
+  "native_exit_code": 2,
+  "elapsed_s": 47.651338749998104,
+  "post_memory": {
+    "free_percent": 46,
+    "vm_swapusage": "total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"
+  },
+  "post_live_identities": [
+    "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors"
+  ],
+  "post_training_progress": {
+    "run": "2026-10-17-0130",
+    "last_reported_iteration": 90,
+    "last_reported_train_loss": 0.097,
+    "last_reported_iters_per_second": 0.138
+  },
+  "same_trainers_observed_after": true,
+  "new_training_progress_observed": false
+}

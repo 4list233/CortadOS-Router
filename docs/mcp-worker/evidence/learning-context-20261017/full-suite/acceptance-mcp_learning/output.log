@@ -1,0 +1,323 @@
+test_l12_disabled_modified_eval_preserves_legacy_inputs_and_outputs (acceptance.mcp_learning.test_activation.Activation.test_l12_disabled_modified_eval_preserves_legacy_inputs_and_outputs) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pty.py:66: DeprecationWarning: This process (pid=2954) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+ok
+test_l12_enabled_collection_teacher_sft_and_eval_use_installed_learning_owner (acceptance.mcp_learning.test_activation.Activation.test_l12_enabled_collection_teacher_sft_and_eval_use_installed_learning_owner) ... ok
+test_l12_only_five_adapters_change_and_next_run_exports_precede_reexec (acceptance.mcp_learning.test_activation.Activation.test_l12_only_five_adapters_change_and_next_run_exports_precede_reexec) ... ok
+test_l01_legacy_normalization_handoff_and_replay_remain_exact (acceptance.mcp_learning.test_context.Context.test_l01_legacy_normalization_handoff_and_replay_remain_exact) ... ok
+test_l02_closed_evidence_and_complete_budget_refuse_before_scoring (acceptance.mcp_learning.test_context.Context.test_l02_closed_evidence_and_complete_budget_refuse_before_scoring) ... Executing <Task finished name='Task-9' coro=<Context.test_l02_closed_evidence_and_complete_budget_refuse_before_scoring() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_context.py:48> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.413 seconds
+ok
+test_l02_scoring_brief_cannot_hide_ordered_evidence_or_reference_boundary (acceptance.mcp_learning.test_context.Context.test_l02_scoring_brief_cannot_hide_ordered_evidence_or_reference_boundary) ... Executing <Task finished name='Task-15' coro=<Context.test_l02_scoring_brief_cannot_hide_ordered_evidence_or_reference_boundary() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_context.py:29> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.438 seconds
+ok
+test_l03_context_dialogue_is_pure_and_missing_is_distinct_from_none (acceptance.mcp_learning.test_context.Context.test_l03_context_dialogue_is_pure_and_missing_is_distinct_from_none) ... Executing <Task finished name='Task-21' coro=<Context.test_l03_context_dialogue_is_pure_and_missing_is_distinct_from_none() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_context.py:66> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.355 seconds
+ok
+test_l03_incomplete_evidence_refuses_without_reserving_identity (acceptance.mcp_learning.test_context.Context.test_l03_incomplete_evidence_refuses_without_reserving_identity) ... Executing <Task finished name='Task-27' coro=<Context.test_l03_incomplete_evidence_refuses_without_reserving_identity() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_context.py:90> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.248 seconds
+ok
+test_l03_over_budget_precedes_missing_fields_and_never_truncates (acceptance.mcp_learning.test_context.Context.test_l03_over_budget_precedes_missing_fields_and_never_truncates) ... ok
+test_l04_explicit_route_logs_context_without_inventing_score (acceptance.mcp_learning.test_context.Context.test_l04_explicit_route_logs_context_without_inventing_score) ... Executing <Task finished name='Task-39' coro=<Context.test_l04_explicit_route_logs_context_without_inventing_score() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_context.py:111> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.248 seconds
+ok
+test_l05_broker_restart_replays_committed_feedback_receipt (acceptance.mcp_learning.test_feedback.Feedback.test_l05_broker_restart_replays_committed_feedback_receipt) ... ok
+test_l05_closed_schema_and_verdict_evidence_rules_refuse (acceptance.mcp_learning.test_feedback.Feedback.test_l05_closed_schema_and_verdict_evidence_rules_refuse) ... ok
+test_l05_feedback_receipt_replay_correction_and_immutable_result (acceptance.mcp_learning.test_feedback.Feedback.test_l05_feedback_receipt_replay_correction_and_immutable_result) ... ok
+test_l05_feedback_rows_cannot_be_updated_or_deleted (acceptance.mcp_learning.test_feedback.Feedback.test_l05_feedback_rows_cannot_be_updated_or_deleted) ... ok
+test_l05_insert_failure_has_one_refusal_no_receipt_and_retry_can_commit (acceptance.mcp_learning.test_feedback.Feedback.test_l05_insert_failure_has_one_refusal_no_receipt_and_retry_can_commit) ... ok
+test_l05_terminal_and_ownership_checks_precede_feedback_insertion (acceptance.mcp_learning.test_feedback.Feedback.test_l05_terminal_and_ownership_checks_precede_feedback_insertion) ... ok
+test_l11_native_training_tokenizer_boundary_includes_complete_answer (acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_native_training_tokenizer_boundary_includes_complete_answer) ... ok
+test_l11_worked_contract_lengths_hashes_and_partitions_are_independent (acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_worked_contract_lengths_hashes_and_partitions_are_independent) ... ok
+test_l06_completed_is_unreviewed_and_collection_only_opens_readonly_snapshots (acceptance.mcp_learning.test_learning.Collection.test_l06_completed_is_unreviewed_and_collection_only_opens_readonly_snapshots) ... ok
+test_l06_pending_and_orphan_routes_remain_explicit_observations (acceptance.mcp_learning.test_learning.Collection.test_l06_pending_and_orphan_routes_remain_explicit_observations) ... /Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/pydantic/main.py:845: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108da7d30>
+  return cls.__pydantic_validator__.validate_json(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/pydantic/main.py:845: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108da6020>
+  return cls.__pydantic_validator__.validate_json(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/pydantic/main.py:845: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108da6890>
+  return cls.__pydantic_validator__.validate_json(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/pydantic/main.py:845: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108d985e0>
+  return cls.__pydantic_validator__.validate_json(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_l07_crash_between_publications_retains_old_snapshot_and_reuses_revision (acceptance.mcp_learning.test_learning.Collection.test_l07_crash_between_publications_retains_old_snapshot_and_reuses_revision) ... ok
+test_l07_late_feedback_appends_revision_preserves_prefix_and_selects_latest (acceptance.mcp_learning.test_learning.Collection.test_l07_late_feedback_appends_revision_preserves_prefix_and_selects_latest) ... ok
+test_l07_lock_corruption_and_missing_sources_keep_published_evidence (acceptance.mcp_learning.test_learning.Collection.test_l07_lock_corruption_and_missing_sources_keep_published_evidence) ... ok
+test_l08_exact_s1_context_and_invalid_digest_or_explicit_oversize_exclusion (acceptance.mcp_learning.test_learning.Collection.test_l08_exact_s1_context_and_invalid_digest_or_explicit_oversize_exclusion) ... /Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/pydantic/main.py:845: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108c6c4f0>
+  return cls.__pydantic_validator__.validate_json(
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+Executing <Task finished name='Task-112' coro=<Collection.test_l08_exact_s1_context_and_invalid_digest_or_explicit_oversize_exclusion() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_learning.py:208> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.404 seconds
+ok
+test_l09_retries_share_group_and_legacy_duplicate_partition_conflicts_quarantine (acceptance.mcp_learning.test_learning.Collection.test_l09_retries_share_group_and_legacy_duplicate_partition_conflicts_quarantine) ... ok
+test_l08_missing_tokenizer_excludes_mcp_sft_without_changing_legacy_examples (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_missing_tokenizer_excludes_mcp_sft_without_changing_legacy_examples) ... ok
+test_l08_sft_token_boundary_preserves_context_and_never_leaks_outcome (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_sft_token_boundary_preserves_context_and_never_leaks_outcome) ... <frozen importlib._bootstrap>:491: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x108da62f0>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_l08_teacher_receives_exact_context_fallible_annotation_and_records_provenance (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_teacher_receives_exact_context_fallible_annotation_and_records_provenance) ... ok
+test_l09_evaluation_receives_exact_request_without_future_outcome (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_evaluation_receives_exact_request_without_future_outcome) ... ok
+test_l09_same_count_incumbent_report_is_not_content_identity (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_same_count_incumbent_report_is_not_content_identity) ... ok
+test_l09_superseded_label_never_substitutes_for_unlabelled_latest_revision (acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_superseded_label_never_substitutes_for_unlabelled_latest_revision) ... {
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+labelled train-split requests 1 · teacher-majority bands {'R0': 1} · sft train 2 examples · valid 0
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+{"code": "training_tokenizer_unavailable", "component": "mcp_learning", "id": "mcp.00000000-0000-4000-8000-000000000001.893de446d2d4cc1c26739cabbdb7da2aa347a805c1719c08fbfa6fa592665449"}
+labelled train-split requests 2 · teacher-majority bands {'R0': 2} · sft train 1 examples · valid 0
+{"code": "training_context_too_large", "component": "mcp_learning", "id": "mcp.00000000-0000-4000-8000-000000000002.e6bde5da5017d0c2ffff8653ea3bf190fca91f5f8c959d100f000a94a0126e3e", "tokens": 1537}
+labelled train-split requests 2 · teacher-majority bands {'R0': 2} · sft train 1 examples · valid 0
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+{
+ "holdout_rows": 0,
+ "teacher_band_mix": {},
+ "candidate": {
+  "n": 0,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 0.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {},
+  "ece": null,
+  "brier": null,
+  "latency_ms_median": null
+ },
+ "promote": false
+}
+1 teacher calls to make (1 request-labels); already done 1
+  1/1 calls · 1 labels · 0 s · claude scarcity 0
+done: 1 labels written
+ok
+
+----------------------------------------------------------------------
+Ran 31 tests in 29.180s
+
+OK

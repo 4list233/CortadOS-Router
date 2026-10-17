@@ -1,0 +1,16 @@
+test_n05_real_profile_corpus_keeps_per_model_boundary_ground_truth (acceptance.native_profile.test_native_profile.NativeCaptureEvidence.test_n05_real_profile_corpus_keeps_per_model_boundary_ground_truth) ... ok
+test_n01_both_captured_profiles_report_observed_success_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n01_both_captured_profiles_report_observed_success_version) ... ok
+test_n02_cancellation_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_cancellation_retains_observed_version) ... ok
+test_n02_native_failure_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_native_failure_retains_observed_version) ... ok
+test_n02_timeout_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_timeout_retains_observed_version) ... ok
+test_n03_old_schema_one_record_keeps_historical_profile (acceptance.native_profile.test_native_profile.NativeProfile.test_n03_old_schema_one_record_keeps_historical_profile) ... Executing <Task pending name='Task-26' coro=<NativeProfile.test_n03_old_schema_one_record_keeps_historical_profile() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py:147> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.152 seconds
+ok
+test_n03_recovery_uses_job_version_after_native_binary_change (acceptance.native_profile.test_native_profile.NativeProfile.test_n03_recovery_uses_job_version_after_native_binary_change) ... Executing <Task pending name='Task-33' coro=<NativeProfile.test_n03_recovery_uses_job_version_after_native_binary_change() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py:144> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.174 seconds
+ok
+test_n04_accepted_profile_change_before_start_refuses_attempt (acceptance.native_profile.test_native_profile.NativeProfile.test_n04_accepted_profile_change_before_start_refuses_attempt) ... ok
+test_n04_unknown_profile_refuses_before_execution (acceptance.native_profile.test_native_profile.NativeProfile.test_n04_unknown_profile_refuses_before_execution) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 14.070s
+
+OK

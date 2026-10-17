@@ -11,8 +11,8 @@ the result. S1 does not itself run the implementation or read quota.
 
 | Boundary | What it receives |
 |---|---|
-| S1 scoring | Exactly `selection.routing_brief`, when supplied; otherwise `task + "\n\nCONTEXT:\n" + context`. Maximum 6,000 Unicode characters; larger inputs refuse rather than silently truncate. |
-| Codex worker | Full `task` and `context`, separately assembled with a reference-data label. Maximum 65,536 UTF-8 bytes in the captured handoff. Later repository reads and tool output belong to the native worker's context. |
+| S1 scoring | `selection.routing_brief`, when supplied; otherwise `task + "\n\nCONTEXT:\n" + context`; followed by the complete structured `task_evidence`, when supplied. Maximum 6,000 Unicode characters for the assembled text; larger inputs refuse rather than silently truncate. |
+| Codex worker | Full `task`, `context` and optional `task_evidence`, separately assembled with reference-data labels. Maximum 65,536 UTF-8 bytes in the captured handoff. Later repository reads and tool output belong to the native worker's context. |
 | Connectors | Only explicitly registered and granted MCP tools. Context text cannot grant permissions. |
 
 S1 has no persistent conversation in this service. It does not automatically receive Claude's
@@ -43,3 +43,27 @@ For a risky task, Claude can supply `constraints.min_band`, restrict `constraint
 select an exact model. A vague brief such as “fix the bug” gives S1 too little evidence to distinguish
 a one-file repair from a cross-service investigation. Improving the brief is the first remedy;
 retraining or changing the scoring model is a separate evaluated change.
+
+The installed [learning/context release](LEARNING-BUILD-REPORT.md) adds `context_requirements`.
+Claude can call it with partial evidence, answer the returned questions about components, dependencies,
+constraints, uncertainties and verification, then submit the complete evidence to `route` or `delegate`.
+This is a deterministic context checklist, not another LLM call: `ready` proves structural completeness
+and budget fit, not semantic sufficiency. It cannot discover a dependency Claude omitted.
+
+The 6,000-character bound is configured service policy, not the base model's physical window.
+The cached Qwen base advertises 262,144 tokens; nightly training still uses 1,536 tokens per complete
+example. Those three limits measure different things. The new training path measures the complete
+MCP example with the selected tokenizer and excludes oversized examples with a diagnostic instead of
+silently clipping them. It does not silently increase the training window.
+
+The October 17 experiment tested 2,048, 4,096 and 8,192 actual prompt tokens while nightly training
+was active. Baseline scores took approximately 11, 17–29 and 31–50 seconds respectively under that
+contention. Two thousand-token optimization pairs were faster but changed probability outputs beyond
+the declared tolerance, so the optimization was rejected. No context ceiling or scorer implementation
+was changed. These measurements establish capacity and contended timing, not long-context accuracy
+or normal idle latency. See the [raw benchmark and limitations](evidence/learning-context-20261017/context-benchmark/REPORT.md).
+
+MCP tasks, native outcomes, observed usage and explicit planner feedback now feed the next nightly
+collection. Completion is not success evidence by itself; planner verdicts remain attributed assertions.
+Teacher labels still use the twelve existing anchors, and only the existing holdout/promotion gate may
+replace the deployed adapter. The new plumbing does not establish an accuracy improvement yet.

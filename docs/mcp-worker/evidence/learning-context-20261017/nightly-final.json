@@ -1,0 +1,19 @@
+{
+  "captured_at": "2026-10-17T06:38:56.895913+00:00",
+  "processes_unchanged": true,
+  "processes": [
+    "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "78397 78395 Sat Oct 17 01:30:04 2026     /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors"
+  ],
+  "recent_iterations": [
+    "Iter 300: Train loss 0.093, Learning Rate 5.000e-05, It/sec 0.136, Tokens/sec 19.053, Trained Tokens 42000, Peak mem 6.821 GB",
+    "Iter 300: Saved adapter weights to runs/2026-10-17-0130/adapter/adapters.safetensors and runs/2026-10-17-0130/adapter/0000300_adapters.safetensors.",
+    "Iter 310: Train loss 0.097, Learning Rate 5.000e-05, It/sec 0.127, Tokens/sec 17.319, Trained Tokens 43365, Peak mem 7.530 GB",
+    "Iter 320: Train loss 0.098, Learning Rate 5.000e-05, It/sec 0.130, Tokens/sec 18.269, Trained Tokens 44765, Peak mem 7.530 GB",
+    "Iter 330: Train loss 0.090, Learning Rate 5.000e-05, It/sec 0.134, Tokens/sec 18.767, Trained Tokens 46165, Peak mem 7.530 GB"
+  ],
+  "current_json_sha256": "edd67078ecd05b8b8455cd4db7fabd3821ce9b9b52c51b6660fe43547703c372",
+  "labels_lines_observed": 11660,
+  "schedule_loaded": true
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "manifest": "acceptance/mcp_learning/SHA256SUMS",
+    "checked": 38,
+    "passed": true
+  },
+  {
+    "manifest": "acceptance/mcp_worker/SHA256SUMS",
+    "checked": 167,
+    "passed": true
+  }
+]

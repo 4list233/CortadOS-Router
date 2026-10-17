@@ -1,0 +1,14 @@
+{
+  "label": "com.cortados.router-nightly",
+  "schedule": {
+    "Hour": 1,
+    "Minute": 30
+  },
+  "disabled_in_file": false,
+  "program_arguments": [
+    "/bin/bash",
+    "/Users/velox/cortados/train/nightly.sh"
+  ],
+  "launchctl_exit": 0,
+  "loaded": true
+}

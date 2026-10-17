@@ -1,0 +1,128 @@
+{
+  "schema": "cortados.s1.context-benchmark.evidence.v1",
+  "created_at_utc": "2026-10-17T06:12:45.371551+00:00",
+  "public_evidence": [
+    {
+      "path": "REPORT.md",
+      "sha256": "93489e0d4dc82cd6b9e05f8ca1fc729169cecbd3bad68d33ee144a73a7a51780",
+      "bytes": 4436
+    },
+    {
+      "path": "SUMMARY.json",
+      "sha256": "ac2efce7e738dec89557e413cef8a2d1b56017151e3dc30f8b3f84c3d3acd86a",
+      "bytes": 4007
+    },
+    {
+      "path": "manifest.json",
+      "sha256": "0869b0d3064de979c68f836f1004de1670b14ccc77062cf80534f9e02acbdca9",
+      "bytes": 4693
+    },
+    {
+      "path": "compare.py",
+      "sha256": "6f138d380118445ab549320b728c754a8e8000665efe5a2999f00683e4a3bc47",
+      "bytes": 15750
+    },
+    {
+      "path": "synthetic-cases.json",
+      "sha256": "5a223ad42595eb3850f45517396e9e41315c64dac26c36bea9f4a9c89388e1d9",
+      "bytes": 134142
+    },
+    {
+      "path": "tokenizer_cases.py",
+      "sha256": "c7547a0ac008adae443201e3f845314045fbeebeba559934f884bb70b8e0826e",
+      "bytes": 5050
+    },
+    {
+      "path": "tokenizer-report.json",
+      "sha256": "fef796f74d2aae91619ef2728a468561edbe844077a873f9b0bd4e6bd8969ce9",
+      "bytes": 6051
+    },
+    {
+      "path": "result.json",
+      "sha256": "c3ea114269363e437a6c3682c346e05a24afd485e7d7d3fde96d5e1f3ecf2e6b",
+      "bytes": 32933
+    },
+    {
+      "path": "run-guard.json",
+      "sha256": "668f5770ccbddd82895b8161cb129a632031835da41f679b8fe805c4fed7d0f5",
+      "bytes": 6586
+    },
+    {
+      "path": "stdout.log",
+      "sha256": "2e63bf29993d9ac2ba68aa005202b0b3fd4a8ce5374a2078e1d9421f583f1412",
+      "bytes": 496
+    },
+    {
+      "path": "stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "cache-hit-microbenchmark.py",
+      "sha256": "0c0231cd612bee4d009edd01fe14cd6eb0b34b031b171ac1e75178381d610e2e",
+      "bytes": 2268
+    },
+    {
+      "path": "cache-hit-microbenchmark.json",
+      "sha256": "0df50cc31b5fc78d6f74835e60089b1e2bd2c4e9b9100f171ea97bd09436d655",
+      "bytes": 36596
+    },
+    {
+      "path": "baseline-capacity/capacity.py",
+      "sha256": "3be4c11401ccea3e86c8a554989e5a7309d8e4939c0f638108d4fd0900a2d4bf",
+      "bytes": 13547
+    },
+    {
+      "path": "baseline-capacity/manifest.json",
+      "sha256": "d212555dac81c0d5b50f3cbecbe4454e41f29f2b67effecce415a5d73d7c9f0f",
+      "bytes": 5169
+    },
+    {
+      "path": "baseline-capacity/result.json",
+      "sha256": "36425e6f8b1fd4607fdf8e6afb94c708e1a87fa120433ff7e998d2c8bd40163a",
+      "bytes": 27291
+    },
+    {
+      "path": "baseline-capacity/run-guard.json",
+      "sha256": "ca0020ca711a2187861916bcdfb85342224f025edfdae3526d1e99de2707dab5",
+      "bytes": 13028
+    },
+    {
+      "path": "baseline-capacity/stdout.log",
+      "sha256": "4ed854a89890c045ed23fe8c5218d09a8855875d5b45f2752ffea51f9e727d6c",
+      "bytes": 369
+    },
+    {
+      "path": "baseline-capacity/stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "tokenizer-training-boundary/capture.py",
+      "sha256": "8e509f6f7518fef898bd8815765abdc210713d015b23ed60b0e7135a0e4a6d11",
+      "bytes": 4846
+    },
+    {
+      "path": "tokenizer-training-boundary/provenance.json",
+      "sha256": "26a012c4c204220f68485371f8b9174b09ffc72da104f8cece457768f44aa150",
+      "bytes": 4772
+    },
+    {
+      "path": "tokenizer-training-boundary/training-1536.json",
+      "sha256": "1d186f7bdfd94895a975ee41f1b4dab87448ff9085591331b1596a94507137f3",
+      "bytes": 38624
+    },
+    {
+      "path": "tokenizer-training-boundary/training-1537.json",
+      "sha256": "8fcc7c2991db26fabbd72619804b34945f4c437d3af96739b8680b6f1c6baad9",
+      "bytes": 38655
+    }
+  ],
+  "private_excluded": [
+    "adapter-snapshot/",
+    "baseline-capacity/adapter-snapshot/",
+    "source-capture/"
+  ],
+  "observer": "/root/native_compatibility",
+  "gpu_work_finished": true
+}

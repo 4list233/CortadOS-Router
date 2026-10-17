@@ -1,0 +1,123 @@
+{
+  "base_snapshot": "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b",
+  "gpu_model_loaded": false,
+  "mlx_core_imported": false,
+  "production_writes": false,
+  "source_hashes": {
+    "/Users/velox/.cortados-builds/mcp-learning-bench/tokenizer-training-boundary/capture.py": "8e509f6f7518fef898bd8815765abdc210713d015b23ed60b0e7135a0e4a6d11",
+    "/Users/velox/.cortados-builds/cortados-router-repo/s1/student.py": "d784bad1f2dcd04034189fa59fd32f23a1dbde89d7bc934a96b4df6a1ab4cc40",
+    "/Users/velox/.cortados-builds/cortados-router-repo/s1/common.py": "fcb075933308fe1a13f088ed5e860613d12ea469cce720346c7f2be8f627abbe",
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/core.py": "763ca14c2c28e4d10bb9caa2eee5ab96b474467db91e16fe5a5ca1ad5cd138b1",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/tokenizer_utils.py": "25784bb03c922d0d7832ce6c66a6cd4eb3a4820b6c5a8e583dedb63a018fb56a",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/tuner/datasets.py": "fa112840e6ea98a4ff18428792fe2ab023999c2da51ea64b3ebdf8657a152f17",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/tuner/trainer.py": "ee33ebdbd20a184108541cb490d08085485e71a82ffd6d68d7d216029ecd28fe",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer_config.json": "4397cc477eb6d79715ccd2000accd6b3531928f30029665832fa1b255f24d2b9",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/config.json": "574349e5a343236546fda55e4744a76e181f534182d7dc60ff1bad7e7a502849"
+  },
+  "training_owner": "Installed mlx_lm.tuner.datasets.ChatDataset.process with actual TokenizerWrapper",
+  "chat_dataset_options": {
+    "tools": null,
+    "return_dict": false,
+    "mask_prompt": true
+  },
+  "wrapper_options": {
+    "tokenize": true,
+    "enable_thinking": true,
+    "return_dict": false
+  },
+  "mask_offset_options": {
+    "messages": "all except final assistant",
+    "add_generation_prompt": true,
+    "tools": null,
+    "return_dict": false
+  },
+  "bos_eos": "ChatDataset adds no extra BOS or EOS. It uses template tokens verbatim; mask offset uses prompt template with generation prefix. TextDataset EOS-appending behavior is not used.",
+  "model_token_ids": {
+    "bos": null,
+    "eos": 151645
+  },
+  "synthetic_not_quality_labels": true,
+  "captures": [
+    {
+      "full_training_token_count": 1536,
+      "mask_prompt_offset": 1467,
+      "supervised_token_count": 69,
+      "answers": {
+        "steps": 1,
+        "ambiguity": 0,
+        "blast_radius": 1,
+        "context_size": 0,
+        "novelty": 0,
+        "parallelizability": 0,
+        "outward": false,
+        "work_kind": "code",
+        "urgency": "today",
+        "needs_clarification": false,
+        "parts": 0,
+        "diversity": false
+      },
+      "input_ids_sha256": "f924ac710452a92662da211a8527cb770266922332780367247752dff612f871",
+      "request_sha256": "698c09158507824f838e7a9cea7fc416e590f02bf1eec895745ed87b8e895948",
+      "fits_1536_without_truncation": true,
+      "first_token": 151644,
+      "last_tokens": [
+        28,
+        15,
+        198,
+        611,
+        388,
+        487,
+        28,
+        15,
+        151645,
+        198
+      ],
+      "native_eos_id_positions": [
+        564,
+        1462,
+        1534
+      ]
+    },
+    {
+      "full_training_token_count": 1537,
+      "mask_prompt_offset": 1468,
+      "supervised_token_count": 69,
+      "answers": {
+        "steps": 1,
+        "ambiguity": 0,
+        "blast_radius": 1,
+        "context_size": 0,
+        "novelty": 0,
+        "parallelizability": 0,
+        "outward": false,
+        "work_kind": "code",
+        "urgency": "today",
+        "needs_clarification": false,
+        "parts": 0,
+        "diversity": false
+      },
+      "input_ids_sha256": "79c045a77775a6ee4ba8e646a69956057144182b89f8a4b27502dece14533833",
+      "request_sha256": "0158adb9ac05eaba31a079aca9a0e1c99175dd6c017e88081caed48072d7b4cf",
+      "fits_1536_without_truncation": false,
+      "first_token": 151644,
+      "last_tokens": [
+        28,
+        15,
+        198,
+        611,
+        388,
+        487,
+        28,
+        15,
+        151645,
+        198
+      ],
+      "native_eos_id_positions": [
+        564,
+        1463,
+        1535
+      ]
+    }
+  ]
+}

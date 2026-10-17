@@ -1,0 +1,556 @@
+{
+  "started_at_unix": 1792217304.323998,
+  "pre_memory": {
+    "free_percent": 45,
+    "vm_swapusage": "total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"
+  },
+  "pre_live_identities": [
+    "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors"
+  ],
+  "pre_training_progress": {
+    "run": "2026-10-17-0130",
+    "last_reported_iteration": 110,
+    "last_reported_train_loss": 0.111,
+    "last_reported_iters_per_second": 0.13
+  },
+  "driver_sha256": "3be4c11401ccea3e86c8a554989e5a7309d8e4939c0f638108d4fd0900a2d4bf",
+  "wall_limit_seconds": 180,
+  "rss_limit_bytes": 6442450944,
+  "free_floor_percent": 25,
+  "status": "completed",
+  "resource_samples": [
+    {
+      "elapsed_s": 0.004174541998509085,
+      "rss_bytes": 655360
+    },
+    {
+      "elapsed_s": 1.0158206669984793,
+      "rss_bytes": 85377024
+    },
+    {
+      "elapsed_s": 2.0216929169982905,
+      "rss_bytes": 1988558848
+    },
+    {
+      "elapsed_s": 3.0369019169993408,
+      "rss_bytes": 260653056
+    },
+    {
+      "elapsed_s": 4.048045249997813,
+      "rss_bytes": 260702208
+    },
+    {
+      "elapsed_s": 5.0615919999982,
+      "rss_bytes": 260784128
+    },
+    {
+      "elapsed_s": 6.0756005000002915,
+      "rss_bytes": 261046272
+    },
+    {
+      "elapsed_s": 7.0852709589998994,
+      "rss_bytes": 261668864
+    },
+    {
+      "elapsed_s": 8.103066833999037,
+      "rss_bytes": 262062080
+    },
+    {
+      "elapsed_s": 9.1169305839976,
+      "rss_bytes": 263716864
+    },
+    {
+      "elapsed_s": 10.133542249997845,
+      "rss_bytes": 267943936
+    },
+    {
+      "elapsed_s": 11.1416766250004,
+      "rss_bytes": 271794176
+    },
+    {
+      "elapsed_s": 12.156885959000647,
+      "rss_bytes": 275693568
+    },
+    {
+      "elapsed_s": 13.174756000000343,
+      "rss_bytes": 279166976
+    },
+    {
+      "elapsed_s": 14.189286708999134,
+      "rss_bytes": 283820032
+    },
+    {
+      "elapsed_s": 15.20321100000001,
+      "rss_bytes": 286572544
+    },
+    {
+      "elapsed_s": 16.217401709000114,
+      "rss_bytes": 290996224
+    },
+    {
+      "elapsed_s": 17.230865334000555,
+      "rss_bytes": 291340288
+    },
+    {
+      "elapsed_s": 18.23827800000072,
+      "rss_bytes": 292012032
+    },
+    {
+      "elapsed_s": 19.24970733399823,
+      "rss_bytes": 296009728
+    },
+    {
+      "elapsed_s": 20.26318999999785,
+      "rss_bytes": 296108032
+    },
+    {
+      "elapsed_s": 21.278887083997688,
+      "rss_bytes": 296140800
+    },
+    {
+      "elapsed_s": 22.28279033400031,
+      "rss_bytes": 296140800
+    },
+    {
+      "elapsed_s": 23.29758654199759,
+      "rss_bytes": 296140800
+    },
+    {
+      "elapsed_s": 24.311555666998174,
+      "rss_bytes": 296157184
+    },
+    {
+      "elapsed_s": 25.326133999999,
+      "rss_bytes": 296222720
+    },
+    {
+      "elapsed_s": 26.34171004199743,
+      "rss_bytes": 296255488
+    },
+    {
+      "elapsed_s": 27.35506933400029,
+      "rss_bytes": 296255488
+    },
+    {
+      "elapsed_s": 28.365387249999912,
+      "rss_bytes": 296255488
+    },
+    {
+      "elapsed_s": 29.38361279200035,
+      "rss_bytes": 296255488
+    },
+    {
+      "elapsed_s": 30.397256249998463,
+      "rss_bytes": 296255488
+    },
+    {
+      "elapsed_s": 31.41653129199767,
+      "rss_bytes": 296828928
+    },
+    {
+      "elapsed_s": 32.43043470900011,
+      "rss_bytes": 296828928
+    },
+    {
+      "elapsed_s": 33.44485845899908,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 34.458482583999285,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 35.47771699999794,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 36.491278416997375,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 37.50530920899837,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 38.51911208399906,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 39.52765020899824,
+      "rss_bytes": 297402368
+    },
+    {
+      "elapsed_s": 40.536404083999514,
+      "rss_bytes": 297418752
+    },
+    {
+      "elapsed_s": 41.54995712500022,
+      "rss_bytes": 297418752
+    },
+    {
+      "elapsed_s": 42.5654804170008,
+      "rss_bytes": 297058304
+    },
+    {
+      "elapsed_s": 43.58074212499923,
+      "rss_bytes": 297058304
+    },
+    {
+      "elapsed_s": 44.586893833999056,
+      "rss_bytes": 297058304
+    },
+    {
+      "elapsed_s": 45.59931808399779,
+      "rss_bytes": 297058304
+    },
+    {
+      "elapsed_s": 46.610206834000564,
+      "rss_bytes": 298139648
+    },
+    {
+      "elapsed_s": 47.62196058399786,
+      "rss_bytes": 298450944
+    },
+    {
+      "elapsed_s": 48.63272824999876,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 49.64618358399821,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 50.65582158399775,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 51.67568641699836,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 52.68899274999785,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 53.702343541997834,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 54.71574150000015,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 55.7291379169983,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 56.744102749999,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 57.75731812500089,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 58.77043162499831,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 59.783848499999294,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 60.79717608400097,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 61.81052162500055,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 62.82328579199748,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 63.836775416999444,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 64.85045066699968,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 65.86384924999948,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 66.8765298340004,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 67.88988699999754,
+      "rss_bytes": 301039616
+    },
+    {
+      "elapsed_s": 68.90920187499796,
+      "rss_bytes": 301056000
+    },
+    {
+      "elapsed_s": 69.92598195900064,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 70.94588662499882,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 71.9598921249999,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 72.9736183749992,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 73.98074787500082,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 74.99416279199795,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 76.00214824999784,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 77.01561175000097,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 78.02030112499779,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 79.041712541999,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 80.05625329199756,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 81.06729649999761,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 82.07726879199981,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 83.09113233400058,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 84.10485004200018,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 85.10959787499814,
+      "rss_bytes": 299679744
+    },
+    {
+      "elapsed_s": 86.12027591700098,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 87.13484337499904,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 88.14279629199882,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 89.1519774169974,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 90.1692672499994,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 91.18407333399955,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 92.19751537499906,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 93.21104995899805,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 94.21786441699805,
+      "rss_bytes": 299614208
+    },
+    {
+      "elapsed_s": 95.22517341699859,
+      "rss_bytes": 300924928
+    },
+    {
+      "elapsed_s": 96.23851933399783,
+      "rss_bytes": 301449216
+    },
+    {
+      "elapsed_s": 97.25836095900013,
+      "rss_bytes": 301481984
+    },
+    {
+      "elapsed_s": 98.27169462500024,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 99.28057633400022,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 100.29410433399971,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 101.3032545419992,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 102.31665670899747,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 103.33271999999852,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 104.352908208999,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 105.36632687499878,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 106.37951629199961,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 107.38939670900072,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 108.40049270899908,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 109.41630341699783,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 110.42968841699985,
+      "rss_bytes": 301957120
+    },
+    {
+      "elapsed_s": 111.44415962499988,
+      "rss_bytes": 291913728
+    },
+    {
+      "elapsed_s": 112.4586612919993,
+      "rss_bytes": 276758528
+    },
+    {
+      "elapsed_s": 113.47294654199868,
+      "rss_bytes": 262111232
+    },
+    {
+      "elapsed_s": 114.4906237920004,
+      "rss_bytes": 261865472
+    },
+    {
+      "elapsed_s": 115.50459487499757,
+      "rss_bytes": 261816320
+    },
+    {
+      "elapsed_s": 116.5201343339977,
+      "rss_bytes": 261832704
+    },
+    {
+      "elapsed_s": 117.53174091699839,
+      "rss_bytes": 261849088
+    },
+    {
+      "elapsed_s": 118.5460452499974,
+      "rss_bytes": 261849088
+    },
+    {
+      "elapsed_s": 119.56019362499865,
+      "rss_bytes": 260358144
+    },
+    {
+      "elapsed_s": 120.57358220899914,
+      "rss_bytes": 260325376
+    },
+    {
+      "elapsed_s": 121.57953712499875,
+      "rss_bytes": 260341760
+    },
+    {
+      "elapsed_s": 122.59317699999883,
+      "rss_bytes": 260341760
+    },
+    {
+      "elapsed_s": 123.60617779200038,
+      "rss_bytes": 260341760
+    },
+    {
+      "elapsed_s": 124.6198184169989,
+      "rss_bytes": 262029312
+    },
+    {
+      "elapsed_s": 125.6333354169983,
+      "rss_bytes": 264765440
+    },
+    {
+      "elapsed_s": 126.64236379199792,
+      "rss_bytes": 265076736
+    },
+    {
+      "elapsed_s": 127.64837487499972,
+      "rss_bytes": 265076736
+    },
+    {
+      "elapsed_s": 128.6619494589977,
+      "rss_bytes": 265060352
+    }
+  ],
+  "owned_pid": 84819,
+  "owned_pgid": 84819,
+  "native_exit_code": 0,
+  "elapsed_s": 129.67211033399872,
+  "post_memory": {
+    "free_percent": 42,
+    "vm_swapusage": "total = 3072.00M  used = 2102.19M  free = 969.81M  (encrypted)"
+  },
+  "post_live_identities": [
+    "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+    "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors"
+  ],
+  "post_training_progress": {
+    "run": "2026-10-17-0130",
+    "last_reported_iteration": 120,
+    "last_reported_train_loss": 0.098,
+    "last_reported_iters_per_second": 0.118
+  },
+  "same_trainers_observed_after": true,
+  "new_training_progress_observed": true
+}

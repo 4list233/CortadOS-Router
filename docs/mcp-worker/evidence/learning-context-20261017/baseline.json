@@ -1,0 +1,38 @@
+{
+  "time_utc": "2026-10-17T05:58:37.565314+00:00",
+  "source_revision": "6a64b77853ca990a5e641918098c55e0976858f3",
+  "live_source": {
+    "train/dataset.py": {
+      "sha256": "c01083b619d8275ceedac2043a4167df47d42803aae2958c7b36ee31906ba6b2",
+      "bytes": 2002
+    },
+    "train/label.py": {
+      "sha256": "05512787997f10d972d89f2366a47369b2fd5a7f445952aecf3cd3e7d471acb2",
+      "bytes": 9185
+    },
+    "train/build_sft.py": {
+      "sha256": "0b05beeda131c3ff41f519229e8a3911c28bc6342fbc557ddd99287313c07be0",
+      "bytes": 3006
+    },
+    "train/evaluate.py": {
+      "sha256": "cfbe7eca517e21c513b06eac54936f8cb04cd8669caa2fc2ea9bbd8a41f72862",
+      "bytes": 13370
+    },
+    "train/nightly.sh": {
+      "sha256": "8a65386a7b33f860335e54faa7f21f1bec516d20b70bc347c4c5a714a20a6978",
+      "bytes": 13014
+    },
+    "train/common.py": {
+      "sha256": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+      "bytes": 2115
+    },
+    "train/student.py": {
+      "sha256": "ba8820e625b5f0459c5bdba14c7b2309794714ad4fb3ff6504ecf1c064f1eefb",
+      "bytes": 5405
+    },
+    "train/current.json": {
+      "sha256": "edd67078ecd05b8b8455cd4db7fabd3821ce9b9b52c51b6660fe43547703c372",
+      "bytes": 693
+    }
+  }
+}

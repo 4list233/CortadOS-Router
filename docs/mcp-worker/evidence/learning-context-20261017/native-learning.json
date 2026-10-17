@@ -1,0 +1,901 @@
+{
+  "started_at_ms": 1792218916643,
+  "pass": true,
+  "checks": [
+    "installed seven-tool catalog",
+    "context questions then complete evidence; pure S1 budget check",
+    "native subscription worker and exact independently read marker",
+    "durable planner assertion and exact idempotent receipt",
+    "real read-only collection: late feedback revision replaces eligibility without moving partition"
+  ],
+  "catalog": [
+    {
+      "name": "route",
+      "title": null,
+      "description": "Advise a native Codex route after quota and permission admission; does not execute. First use context_requirements to fill task_evidence and keep the same task_group_id across retries and revisions.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "minLength": 1
+          },
+          "context": {
+            "type": "string"
+          },
+          "selection": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "explicit"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "mode",
+                  "model"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "s1"
+                  },
+                  "routing_brief": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "constraints": {
+            "type": "object",
+            "properties": {
+              "allowed_models": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "min_band": {
+                "enum": [
+                  "R0",
+                  "R1",
+                  "R2",
+                  "R3",
+                  "R4"
+                ]
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "permissions": {
+            "type": "object",
+            "properties": {
+              "network": {
+                "type": "boolean"
+              },
+              "mcp_servers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "tools": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "uniqueItems": true,
+                      "minItems": 1
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "tools"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "account_ref": {
+            "const": "native-default"
+          },
+          "task_evidence": {
+            "type": "object",
+            "properties": {
+              "schema": {
+                "const": "cortados.mcp-task-evidence.v1"
+              },
+              "task_group_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "components": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "dependencies": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "constraints": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "uncertainties": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "verification": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "references": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "source": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "text"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "schema",
+              "task_group_id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "task",
+          "selection"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "delegate",
+      "title": null,
+      "description": "Accept one native Codex attempt. First call context_requirements, answer its context questions, and pass complete task_evidence with the same task_group_id for this assignment. Review the terminal result and record job_feedback.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "minLength": 1
+          },
+          "context": {
+            "type": "string"
+          },
+          "selection": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "explicit"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "mode",
+                  "model"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "s1"
+                  },
+                  "routing_brief": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "constraints": {
+            "type": "object",
+            "properties": {
+              "allowed_models": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "min_band": {
+                "enum": [
+                  "R0",
+                  "R1",
+                  "R2",
+                  "R3",
+                  "R4"
+                ]
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "permissions": {
+            "type": "object",
+            "properties": {
+              "network": {
+                "type": "boolean"
+              },
+              "mcp_servers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "tools": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "uniqueItems": true,
+                      "minItems": 1
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "tools"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "account_ref": {
+            "const": "native-default"
+          },
+          "task_evidence": {
+            "type": "object",
+            "properties": {
+              "schema": {
+                "const": "cortados.mcp-task-evidence.v1"
+              },
+              "task_group_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "components": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "dependencies": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "constraints": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "uncertainties": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "verification": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "references": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "source": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "text"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "schema",
+              "task_group_id"
+            ],
+            "additionalProperties": false
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "timeout_s": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "task",
+          "selection",
+          "cwd",
+          "request_id",
+          "timeout_s"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "job_status",
+      "title": null,
+      "description": "Read the current durable job snapshot.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "job_result",
+      "title": null,
+      "description": "Read durable terminal evidence when available. Review the actual result, artifacts and checks, then use job_feedback; native completion alone is not correctness.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "job_cancel",
+      "title": null,
+      "description": "Record cancellation intent; completion waits for observed process termination.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "context_requirements",
+      "title": null,
+      "description": "Call before routing or delegation with task, context, selection and available task_evidence. Answer returned questions in your next call; reuse task_group_id across retries/revisions. Reports structural gaps and budgets without inference or admission.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "minLength": 1
+          },
+          "context": {
+            "type": "string"
+          },
+          "selection": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "explicit"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "mode",
+                  "model"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "const": "s1"
+                  },
+                  "routing_brief": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "task_evidence": {
+            "type": "object",
+            "properties": {
+              "schema": {
+                "const": "cortados.mcp-task-evidence.v1"
+              },
+              "task_group_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "components": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "dependencies": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "constraints": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "uncertainties": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "verification": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              },
+              "references": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "source": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "text"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "schema",
+              "task_group_id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "task",
+          "selection"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    },
+    {
+      "name": "job_feedback",
+      "title": null,
+      "description": "After reviewing a terminal job result, append your accepted/rejected/inconclusive verdict with checks and evidence references. Use a new feedback_id for corrections. These are fallible planner assertions, not independent verification.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "feedback_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "verdict": {
+            "enum": [
+              "accepted",
+              "rejected",
+              "inconclusive"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "command",
+                    "artifact",
+                    "review"
+                  ]
+                },
+                "reference": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "claim": {
+                  "enum": [
+                    "passed",
+                    "failed",
+                    "unknown"
+                  ]
+                }
+              },
+              "required": [
+                "kind",
+                "reference",
+                "claim"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "job_id",
+          "feedback_id",
+          "verdict",
+          "summary",
+          "checks"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null,
+      "execution": null
+    }
+  ],
+  "partial_context": {
+    "ok": true,
+    "context_requirements": {
+      "schema": "cortados.mcp-context-requirements.v1",
+      "status": "needs_context",
+      "missing_fields": [
+        "task_group_id",
+        "components",
+        "dependencies",
+        "constraints",
+        "uncertainties",
+        "verification"
+      ],
+      "questions": [
+        {
+          "field": "task_group_id",
+          "prompt": "Reuse one task_group_id for revisions and retries of this assignment."
+        },
+        {
+          "field": "components",
+          "prompt": "Provide components; use [] only when explicitly none."
+        },
+        {
+          "field": "dependencies",
+          "prompt": "Provide dependencies; use [] only when explicitly none."
+        },
+        {
+          "field": "constraints",
+          "prompt": "Provide constraints; use [] only when explicitly none."
+        },
+        {
+          "field": "uncertainties",
+          "prompt": "Provide uncertainties; use [] only when explicitly none."
+        },
+        {
+          "field": "verification",
+          "prompt": "Provide at least one observable verification check."
+        }
+      ],
+      "scorer_chars": 0,
+      "worker_bytes": 315,
+      "scorer_limit_chars": 6000,
+      "worker_limit_bytes": 65536,
+      "scorer_digest": null
+    }
+  },
+  "ready_context": {
+    "ok": true,
+    "context_requirements": {
+      "schema": "cortados.mcp-context-requirements.v1",
+      "status": "ready",
+      "missing_fields": [],
+      "questions": [],
+      "scorer_chars": 0,
+      "worker_bytes": 857,
+      "scorer_limit_chars": 6000,
+      "worker_limit_bytes": 65536,
+      "scorer_digest": null
+    }
+  },
+  "s1_preflight": {
+    "ok": true,
+    "context_requirements": {
+      "schema": "cortados.mcp-context-requirements.v1",
+      "status": "ready",
+      "missing_fields": [],
+      "questions": [],
+      "scorer_chars": 786,
+      "worker_bytes": 857,
+      "scorer_limit_chars": 6000,
+      "worker_limit_bytes": 65536,
+      "scorer_digest": "f8b991304a8e690ab58dc1129ca521cfa8ba82114f7cffac86806e84994c176c"
+    }
+  },
+  "accepted": {
+    "ok": true,
+    "job": {
+      "job_id": "7af76f73-d617-4b05-983e-377e5d0175f2",
+      "route_id": "34315d7b-c8ee-4383-80db-9cf67c5bbbe4",
+      "state": "queued",
+      "cwd": "/Users/velox/.cortados-builds/mcp-learning-verification/native-learning/workspace",
+      "created_at_ms": 1792218918381,
+      "started_at_ms": null,
+      "finished_at_ms": null,
+      "elapsed_ms": 0,
+      "progress": "Worker accepted",
+      "reason": null
+    }
+  },
+  "result": {
+    "ok": true,
+    "job": {
+      "job_id": "7af76f73-d617-4b05-983e-377e5d0175f2",
+      "route_id": "34315d7b-c8ee-4383-80db-9cf67c5bbbe4",
+      "state": "succeeded",
+      "cwd": "/Users/velox/.cortados-builds/mcp-learning-verification/native-learning/workspace",
+      "created_at_ms": 1792218918381,
+      "started_at_ms": 1792218918744,
+      "finished_at_ms": 1792218923086,
+      "elapsed_ms": 4704,
+      "progress": "Worker completed",
+      "reason": null
+    },
+    "result": {
+      "summary": "MCP_LEARNING_NATIVE_OK",
+      "worker": {
+        "provider": "codex-cli",
+        "requested_model": "gpt-6-luna",
+        "reported_model": null,
+        "cli_version": "0.163.0",
+        "account_ref": "native-default"
+      },
+      "usage": {
+        "input_tokens": 28352,
+        "cached_input_tokens": 13952,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 77,
+        "reasoning_output_tokens": 0
+      },
+      "artifacts": {
+        "final_message": "jobs/7af76f73-d617-4b05-983e-377e5d0175f2/final.txt",
+        "events": "jobs/7af76f73-d617-4b05-983e-377e5d0175f2/events.jsonl"
+      },
+      "changed_paths": null,
+      "verification": "planner_review_required",
+      "warnings": [],
+      "error": null
+    }
+  },
+  "before_feedback_collection": {
+    "status": "ok",
+    "added": 2,
+    "observations": 2,
+    "diagnostics": []
+  },
+  "feedback": {
+    "job_id": "7af76f73-d617-4b05-983e-377e5d0175f2",
+    "feedback_id": "afdf8558-e60b-41f5-8239-24170ee1970d",
+    "verdict": "accepted",
+    "summary": "Operator independently read the exact expected marker bytes from the scratch output.",
+    "checks": [
+      {
+        "kind": "artifact",
+        "reference": "/Users/velox/.cortados-builds/mcp-learning-verification/native-learning/workspace/worker-ok.txt#sha256=d14764685b286731da843bfb05189d957016b40971423f11dd78e2ba68f8df20",
+        "claim": "passed"
+      }
+    ]
+  },
+  "receipt": {
+    "ok": true,
+    "feedback": {
+      "job_id": "7af76f73-d617-4b05-983e-377e5d0175f2",
+      "feedback_id": "afdf8558-e60b-41f5-8239-24170ee1970d",
+      "seq": 1,
+      "created_at_ms": 1792218923288,
+      "verdict": "accepted",
+      "verification_status": "planner_asserted"
+    }
+  },
+  "feedback_replay_identical": true,
+  "after_feedback_collection": {
+    "status": "ok",
+    "added": 1,
+    "observations": 2,
+    "diagnostics": [
+      {
+        "component": "mcp_learning",
+        "code": "superseded",
+        "source": null,
+        "id": "mcp.7af76f73-d617-4b05-983e-377e5d0175f2.c9e3c902915ded164a8dd96462497c7ffae73ae67eccae0135b5726cb330ebc9"
+      }
+    ]
+  },
+  "learning_revision": {
+    "before": "mcp.7af76f73-d617-4b05-983e-377e5d0175f2.c9e3c902915ded164a8dd96462497c7ffae73ae67eccae0135b5726cb330ebc9",
+    "after": "mcp.7af76f73-d617-4b05-983e-377e5d0175f2.b44ca92d8e23983b4c4f383924700ec97f9d2a084d947f7359df1abfb0538c6d",
+    "partition_before": "train",
+    "partition_after": "train",
+    "verification_status": "planner_asserted"
+  },
+  "finished_at_ms": 1792218923360
+}

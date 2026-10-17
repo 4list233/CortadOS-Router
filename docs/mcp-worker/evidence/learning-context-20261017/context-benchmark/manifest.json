@@ -1,0 +1,83 @@
+{
+  "created_at_unix": 1792216906.771578,
+  "promoted_record": {
+    "base": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    "adapter": "/Users/velox/cortados/train/runs/2026-10-16-0130/adapter",
+    "temperatures": {
+      "steps": 1.5,
+      "ambiguity": 2.0,
+      "blast_radius": 1.5,
+      "context_size": 1.2,
+      "novelty": 1.5,
+      "parallelizability": 1.5,
+      "outward": 1.2,
+      "work_kind": 1.5,
+      "urgency": 1.2,
+      "needs_clarification": 2.0,
+      "parts": 1.5,
+      "diversity": 1.2
+    },
+    "promoted": "2026-10-16 05:40",
+    "report": "/Users/velox/cortados/train/runs/2026-10-16-0130/report.json",
+    "inference": {
+      "fail_up_below": 0.75,
+      "outward_at": 0.25
+    },
+    "holdout": {
+      "band_accuracy": 0.652,
+      "under_routed": 0.067,
+      "over_routed": 0.281,
+      "outward_recall": 0.881
+    }
+  },
+  "promoted_record_sha256": "edd67078ecd05b8b8455cd4db7fabd3821ce9b9b52c51b6660fe43547703c372",
+  "original_adapter": "/Users/velox/cortados/train/runs/2026-10-16-0130/adapter",
+  "adapter_sha256": {
+    "adapters.safetensors": "0334b9f7ce3f58fa73f259b881f741ceccb4eb2bcad173b97fee79cbcd026056",
+    "adapter_config.json": "faa9c5b3083196d8de9ab2b49ddc169ce075d3a5afdb9975f4c6ee4d479ab912"
+  },
+  "base_snapshot": "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b",
+  "source_sha256": {
+    "/Users/velox/cortados/train/student.py": "ba8820e625b5f0459c5bdba14c7b2309794714ad4fb3ff6504ecf1c064f1eefb",
+    "/Users/velox/cortados/train/common.py": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+    "/Users/velox/cortados/plugins/cortados-router/core.py": "8454018479497287fe9ee3109493a5ffdc7f2e7fe14888e3ca63660107b26532",
+    "/Users/velox/cortados/context/routing.py": "821f0e42c58f7542a8365ad48baa0eda7cd60228364728cd5cb69efa04601021",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/models/qwen3.py": "2284df96ecb669109b281df4534470b18f285aa9a5e41735ad682f601f93c639",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/models/cache.py": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/utils.py": "ba0371e9c88d52b34d71271945c2394005fbcb2bfb2ee9f6f82d627a33b72422",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx_lm/tokenizer_utils.py": "25784bb03c922d0d7832ce6c66a6cd4eb3a4820b6c5a8e583dedb63a018fb56a",
+    "/Users/velox/cortados/.venv-mlx/lib/python3.12/site-packages/mlx/nn/layers/quantized.py": "1797a3571484ad3134224354b7f130c0931f495691aa8e54eb55329d674bb00b",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/config.json": "574349e5a343236546fda55e4744a76e181f534182d7dc60ff1bad7e7a502849",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer_config.json": "4397cc477eb6d79715ccd2000accd6b3531928f30029665832fa1b255f24d2b9",
+    "/Users/velox/.cortados-builds/mcp-learning-bench/compare.py": "6f138d380118445ab549320b728c754a8e8000665efe5a2999f00683e4a3bc47",
+    "/Users/velox/.cortados-builds/mcp-learning-bench/synthetic-cases.json": "5a223ad42595eb3850f45517396e9e41315c64dac26c36bea9f4a9c89388e1d9",
+    "/Users/velox/.cortados-builds/mcp-learning-bench/tokenizer_cases.py": "c7547a0ac008adae443201e3f845314045fbeebeba559934f884bb70b8e0826e",
+    "/Users/velox/cortados/router/routing-table.json": "76c01b0371d8c738a846dff3e195778c9450beb70f5032dbb6b5578adab7bbdd",
+    "/Users/velox/cortados/router/budgets.json": "6ef73bb0d7285892cb3c5d118e13d1d42e0e86154187f40f4f9e64f1f64c4987"
+  },
+  "model_weight_files": [
+    {
+      "name": "model.safetensors",
+      "bytes": 2263022417,
+      "cache_blob": "/Users/velox/.cache/huggingface/hub/blobs/4a/4ae82815c30780b930535c80899215a15651b182544ed87eda312d596abd6983"
+    }
+  ],
+  "source_snapshot_not_modified": true,
+  "runtime": {
+    "python": "3.12.14",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "packages": {
+      "mlx": "0.32.2",
+      "mlx-lm": "0.31.3",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2"
+    }
+  },
+  "hardware": {
+    "chip": "Apple M1 Max",
+    "memory_bytes": 34359738368,
+    "logical_cpu": 10
+  }
+}

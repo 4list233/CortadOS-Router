@@ -1,0 +1,349 @@
+{
+  "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "candidate": true,
+  "public_tools": {
+    "legacy_route": {
+      "first_ms": 155.038708,
+      "warm": {
+        "samples_ms": [
+          2.647,
+          2.053958,
+          2.032584,
+          1.904083,
+          1.986875,
+          1.867333,
+          1.935333,
+          1.886291,
+          2.035333,
+          1.89,
+          1.854291,
+          1.902625,
+          1.831291,
+          1.896708,
+          1.948042,
+          1.988875,
+          1.974542,
+          2.203792,
+          1.936417,
+          1.932041,
+          1.886292,
+          1.834375,
+          1.835959,
+          1.864583,
+          1.917125,
+          1.830042,
+          1.942625,
+          1.941042,
+          1.79475,
+          1.768708
+        ],
+        "median_ms": 1.910604,
+        "max_ms": 2.647,
+        "count": 30
+      }
+    },
+    "rich_route": {
+      "first_ms": 3.361708,
+      "warm": {
+        "samples_ms": [
+          2.957792,
+          2.349583,
+          2.320084,
+          2.794,
+          2.477959,
+          2.173667,
+          2.179416,
+          2.240875,
+          2.054625,
+          2.137834,
+          2.068,
+          2.123792,
+          1.975917,
+          2.076709,
+          2.038459,
+          2.057292,
+          1.979459,
+          2.046542,
+          2.141583,
+          2.144042,
+          2.030083,
+          2.161167,
+          2.432,
+          2.457834,
+          2.180583,
+          2.088959,
+          2.157625,
+          2.268583,
+          2.253875,
+          2.264583
+        ],
+        "median_ms": 2.159396,
+        "max_ms": 2.957792,
+        "count": 30
+      }
+    },
+    "context_questions": {
+      "first_ms": 0.780458,
+      "warm": {
+        "samples_ms": [
+          0.780666,
+          0.702625,
+          0.756958,
+          0.75375,
+          0.765167,
+          0.717959,
+          0.751917,
+          0.69725,
+          0.697959,
+          0.691292,
+          0.84275,
+          0.76775,
+          0.684541,
+          0.712833,
+          0.748,
+          0.684292,
+          0.650666,
+          0.682125,
+          0.697917,
+          0.716875,
+          0.763333,
+          0.767917,
+          0.70375,
+          0.690625,
+          0.710291,
+          0.772584,
+          0.761166,
+          0.730584,
+          0.721084,
+          0.736417
+        ],
+        "median_ms": 0.7195214999999999,
+        "max_ms": 0.84275,
+        "count": 30
+      }
+    },
+    "context_ready": {
+      "first_ms": 0.780792,
+      "warm": {
+        "samples_ms": [
+          0.753167,
+          0.800125,
+          0.762791,
+          0.719,
+          0.747167,
+          0.727208,
+          0.726042,
+          0.752416,
+          0.781584,
+          0.825333,
+          0.9365,
+          0.754333,
+          0.731334,
+          0.737625,
+          0.680333,
+          0.802292,
+          0.778125,
+          0.717167,
+          0.795667,
+          0.723792,
+          0.738875,
+          0.6985,
+          0.714458,
+          0.810208,
+          0.811042,
+          0.735917,
+          0.750792,
+          0.729208,
+          0.714667,
+          0.727125
+        ],
+        "median_ms": 0.7430209999999999,
+        "max_ms": 0.9365,
+        "count": 30
+      }
+    }
+  },
+  "collection": [
+    {
+      "jobs": 0,
+      "source_bytes": 94208,
+      "published_bytes": 0,
+      "raw_sql_read_lower_bound": {
+        "samples_ms": [
+          0.330625,
+          0.257791,
+          0.252375
+        ],
+        "median_ms": 0.257791,
+        "max_ms": 0.330625,
+        "count": 3
+      },
+      "complete_collection": {
+        "samples_ms": [
+          0.98475,
+          0.592458,
+          0.543083
+        ],
+        "median_ms": 0.592458,
+        "max_ms": 0.98475,
+        "count": 3
+      },
+      "results": [
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 0,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 0,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 0,
+          "diagnostics": []
+        }
+      ]
+    },
+    {
+      "jobs": 1,
+      "source_bytes": 94208,
+      "published_bytes": 2236,
+      "raw_sql_read_lower_bound": {
+        "samples_ms": [
+          0.293917,
+          0.270875,
+          0.250416
+        ],
+        "median_ms": 0.270875,
+        "max_ms": 0.293917,
+        "count": 3
+      },
+      "complete_collection": {
+        "samples_ms": [
+          10.91925,
+          0.992458,
+          0.8765
+        ],
+        "median_ms": 0.992458,
+        "max_ms": 10.91925,
+        "count": 3
+      },
+      "results": [
+        {
+          "status": "ok",
+          "added": 1,
+          "observations": 1,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 1,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 1,
+          "diagnostics": []
+        }
+      ]
+    },
+    {
+      "jobs": 100,
+      "source_bytes": 102400,
+      "published_bytes": 223908,
+      "raw_sql_read_lower_bound": {
+        "samples_ms": [
+          1.925583,
+          1.2905,
+          0.8895
+        ],
+        "median_ms": 1.2905,
+        "max_ms": 1.925583,
+        "count": 3
+      },
+      "complete_collection": {
+        "samples_ms": [
+          9.405167,
+          8.167125,
+          8.325334
+        ],
+        "median_ms": 8.325334,
+        "max_ms": 9.405167,
+        "count": 3
+      },
+      "results": [
+        {
+          "status": "ok",
+          "added": 100,
+          "observations": 100,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 100,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 100,
+          "diagnostics": []
+        }
+      ]
+    },
+    {
+      "jobs": 10000,
+      "source_bytes": 47484928,
+      "published_bytes": 22449836,
+      "raw_sql_read_lower_bound": {
+        "samples_ms": [
+          72.379959,
+          73.129458,
+          71.257459
+        ],
+        "median_ms": 72.379959,
+        "max_ms": 73.129458,
+        "count": 3
+      },
+      "complete_collection": {
+        "samples_ms": [
+          914.077875,
+          803.665667,
+          830.202666
+        ],
+        "median_ms": 830.202666,
+        "max_ms": 914.077875,
+        "count": 3
+      },
+      "results": [
+        {
+          "status": "ok",
+          "added": 10000,
+          "observations": 10000,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 10000,
+          "diagnostics": []
+        },
+        {
+          "status": "ok",
+          "added": 0,
+          "observations": 10000,
+          "diagnostics": []
+        }
+      ]
+    }
+  ]
+}

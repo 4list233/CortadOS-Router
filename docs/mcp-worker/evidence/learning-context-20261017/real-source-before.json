@@ -1,0 +1,28 @@
+{
+  "first": {
+    "status": "ok",
+    "added": 1,
+    "observations": 1,
+    "diagnostics": []
+  },
+  "replay": {
+    "status": "ok",
+    "added": 0,
+    "observations": 1,
+    "diagnostics": []
+  },
+  "eligible": 1,
+  "partitions": {
+    "mcp.5e612218-93ea-46dc-8471-fef3acdbb7e8.b934e7ac51f124221d4c385960851ff5764f7f503543e668bc3cc6cb1486aef9": "train"
+  },
+  "excluded": [],
+  "row_summary": [
+    {
+      "id": "mcp.5e612218-93ea-46dc-8471-fef3acdbb7e8.b934e7ac51f124221d4c385960851ff5764f7f503543e668bc3cc6cb1486aef9",
+      "source": "mcp-worker",
+      "native_outcome": "completed",
+      "verification_status": "unreviewed",
+      "feedback_ids": []
+    }
+  ]
+}

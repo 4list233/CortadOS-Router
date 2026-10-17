@@ -1,0 +1,132 @@
+{
+  "reference": "promoted2026-10-16Qwen3-4BInstruct2507LoRA; unmodified liveScorer.score",
+  "hardware": "Apple M1Max32GiB",
+  "measurement_conditions": "Concurrent authorized nightlyGPUtraining/evaluation; instrumented rawdigitlogits; no idle or percentileperformanceclaim",
+  "baseline_capacity_cells_completed": 6,
+  "baseline_measurements": [
+    {
+      "id": "bounded-edit-2048",
+      "total_first_model_input_tokens": 2048,
+      "request_chars": 7518,
+      "wall_ms": 10979.861374999018,
+      "mlx_peak_bytes": 4084898972,
+      "resolved": {
+        "band": "R1",
+        "D": 5
+      },
+      "source": "result.json"
+    },
+    {
+      "id": "production-migration-2048",
+      "total_first_model_input_tokens": 2048,
+      "request_chars": 7539,
+      "wall_ms": 11206.01216599971,
+      "mlx_peak_bytes": 4245331100,
+      "resolved": {
+        "band": "R3",
+        "D": 9
+      },
+      "source": "result.json"
+    },
+    {
+      "id": "bounded-edit-4096",
+      "total_first_model_input_tokens": 4096,
+      "request_chars": 17994,
+      "wall_ms": 16714.034915999946,
+      "mlx_peak_bytes": 4906728582,
+      "resolved": {
+        "band": "R1",
+        "D": 5
+      },
+      "source": "baseline-capacity/result.json"
+    },
+    {
+      "id": "production-migration-4096",
+      "total_first_model_input_tokens": 4096,
+      "request_chars": 18015,
+      "wall_ms": 29171.07583300094,
+      "mlx_peak_bytes": 5066112124,
+      "resolved": {
+        "band": "R3",
+        "D": 9
+      },
+      "source": "baseline-capacity/result.json"
+    },
+    {
+      "id": "bounded-edit-8192",
+      "total_first_model_input_tokens": 8192,
+      "request_chars": 38942,
+      "wall_ms": 49926.09804099993,
+      "mlx_peak_bytes": 7518878840,
+      "resolved": {
+        "band": "R1",
+        "D": 5
+      },
+      "source": "baseline-capacity/result.json"
+    },
+    {
+      "id": "production-migration-8192",
+      "total_first_model_input_tokens": 8192,
+      "request_chars": 38963,
+      "wall_ms": 30822.05149999936,
+      "mlx_peak_bytes": 7518878840,
+      "resolved": {
+        "band": "R3",
+        "D": 9
+      },
+      "source": "baseline-capacity/result.json"
+    }
+  ],
+  "optimization": {
+    "name": "project only final hiddenposition",
+    "status": "rejected_probability_equivalence",
+    "completed_pairs": 2,
+    "planned_pairs": 6,
+    "failed_case": "production-migration-2048",
+    "max_probability_abs_difference": 0.07988287835954738,
+    "answers_and_failup_and_bands_unchanged_in_observed_pairs": true,
+    "remaining_optimization_pairs_not_run": 4
+  },
+  "capacity_run": {
+    "status": "completed",
+    "elapsed_s": 129.67211033399872,
+    "trainer_identity_preserved": true,
+    "training_progress_before": {
+      "run": "2026-10-17-0130",
+      "last_reported_iteration": 110,
+      "last_reported_train_loss": 0.111,
+      "last_reported_iters_per_second": 0.13
+    },
+    "training_progress_after": {
+      "run": "2026-10-17-0130",
+      "last_reported_iteration": 120,
+      "last_reported_train_loss": 0.098,
+      "last_reported_iters_per_second": 0.118
+    },
+    "memory_before": {
+      "free_percent": 45,
+      "vm_swapusage": "total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)"
+    },
+    "memory_after": {
+      "free_percent": 42,
+      "vm_swapusage": "total = 3072.00M  used = 2102.19M  free = 969.81M  (encrypted)"
+    },
+    "memory_guard_finding": "RSS/free-percentage guards and MLXsoftlimit did not contain unifiedGPU memorypressure; swap grew2.1GB. No claim of no impact, no furtherGPUexperiments."
+  },
+  "score_cache_cpu_microbenchmark": {
+    "median_hit_ms": [
+      0.018041,
+      0.018125
+    ],
+    "p95_hit_ms": [
+      0.018375,
+      0.018458
+    ],
+    "scope": "Prototype hashlookup+deepcopy only; no production cache or quota/routing time measured."
+  },
+  "production_changed": false,
+  "live_scorer_or_trainer_signalled": false,
+  "model_downloaded": false,
+  "automatic_promotion": false,
+  "remaining_benchmark_children": 0
+}

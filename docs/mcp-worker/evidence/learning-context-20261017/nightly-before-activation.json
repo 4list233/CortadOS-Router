@@ -1,0 +1,23 @@
+{
+  "captured_at": "2026-10-17T06:07:35.326728+00:00",
+  "processes": [
+    {
+      "pid": 78395,
+      "identity": "78395     1 Sat Oct 17 01:30:03 2026     /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python overnight.py -- /bin/bash /Users/velox/cortados/train/nightly.sh",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    },
+    {
+      "pid": 78397,
+      "identity": "78397 78395 Sat Oct 17 01:30:04 2026     /bin/bash /Users/velox/cortados/train/nightly.sh",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    },
+    {
+      "pid": 81006,
+      "identity": "81006 78397 Sat Oct 17 01:49:47 2026     /opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python -m mlx_lm lora --model mlx-community/Qwen3-4B-Instruct-2507-4bit --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size 2 --iters 1500 --learning-rate 5e-5 --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path runs/2026-10-17-0130/adapter --resume-adapter-file runs/2026-10-17-0130/adapter/resume_0_adapters.safetensors",
+      "mcp_learning_v1_present": false,
+      "mcp_learning_site_packages_present": false
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+test_explicit_init_wins (test_router_nightly_runs.NightlyRetrainsEveryNight.test_explicit_init_wins) ... ok
+test_new_run_warm_starts_from_promoted_adapter_with_a_night_sized_budget (test_router_nightly_runs.NightlyRetrainsEveryNight.test_new_run_warm_starts_from_promoted_adapter_with_a_night_sized_budget) ... ok
+test_ordinary_nights_are_not_labelling_only (test_router_nightly_runs.NightlyRetrainsEveryNight.test_ordinary_nights_are_not_labelling_only) ... ok
+test_pending_run_resumes_without_warm_start (test_router_nightly_runs.NightlyRetrainsEveryNight.test_pending_run_resumes_without_warm_start) ... ok
+test_finished_pin_resumes_newest_unfinished_run (test_router_nightly_runs.NightlyRunSelection.test_finished_pin_resumes_newest_unfinished_run) ... ok
+test_finished_pin_without_unfinished_run_starts_new_folder (test_router_nightly_runs.NightlyRunSelection.test_finished_pin_without_unfinished_run_starts_new_folder) ... ok
+test_unfinished_pin_is_kept_and_promoted_unfinished_run_is_spared (test_router_nightly_runs.NightlyRunSelection.test_unfinished_pin_is_kept_and_promoted_unfinished_run_is_spared) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.183s
+
+OK

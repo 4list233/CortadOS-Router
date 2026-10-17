@@ -1,0 +1,4 @@
+{"id": "bounded-edit-2048", "strategy": "baseline", "wall_ms": 10979.861374999018, "mlx_peak_bytes": 4084898972}
+{"id": "bounded-edit-2048", "strategy": "last_position_projection", "wall_ms": 10219.673250001506, "mlx_peak_bytes": 3840711788}
+{"id": "production-migration-2048", "strategy": "last_position_projection", "wall_ms": 9714.6488340004, "mlx_peak_bytes": 3840711788}
+{"id": "production-migration-2048", "strategy": "baseline", "wall_ms": 11206.01216599971, "mlx_peak_bytes": 4245331100}

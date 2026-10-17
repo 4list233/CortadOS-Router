@@ -1,0 +1,13 @@
+test_f01_pristine_inputs_match_recorded_git_objects (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f01_pristine_inputs_match_recorded_git_objects) ... ok
+test_f01_pristine_installers_keep_original_pending_counts (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f01_pristine_installers_keep_original_pending_counts) ... ok
+test_f02_sampler_attributes_occurrence_and_preserves_saved_pin (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_attributes_occurrence_and_preserves_saved_pin) ... ok
+test_f02_sampler_records_missing_metadata_without_inventing_saved_model (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f02_sampler_records_missing_metadata_without_inventing_saved_model) ... ok
+test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f03_sampler_entrypoint_uses_explicit_home_without_auxiliary_writes) ... ok
+test_f04_roster_contains_exact_approved_opt_in_review_fields (acceptance.router_followup.test_baseline_repairs.BaselineRepairs.test_f04_roster_contains_exact_approved_opt_in_review_fields) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.268s
+
+OK
+outcome exam/job 20261017_100000: openai-codex/observed-worker → CONFIRMED (16 chars)
+outcome exam/job 20261017_100000: None/None → CONFIRMED (16 chars)

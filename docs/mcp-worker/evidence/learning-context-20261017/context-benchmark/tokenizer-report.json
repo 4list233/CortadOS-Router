@@ -1,0 +1,144 @@
+{
+  "model_snapshot": "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b",
+  "tokenizer_load_ms": 192.88075000076788,
+  "gpu_model_loaded": false,
+  "tokenizer_only": true,
+  "total_prompt_tokens_include_system_and_chat_template": true,
+  "total_prompt_tokens_include_first_question_prefix": true,
+  "source_hashes": {
+    "/Users/velox/cortados/train/student.py": "ba8820e625b5f0459c5bdba14c7b2309794714ad4fb3ff6504ecf1c064f1eefb",
+    "/Users/velox/cortados/train/common.py": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+    "/Users/velox/cortados/plugins/cortados-router/core.py": "8454018479497287fe9ee3109493a5ffdc7f2e7fe14888e3ca63660107b26532",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/config.json": "574349e5a343236546fda55e4744a76e181f534182d7dc60ff1bad7e7a502849",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "/Users/velox/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer_config.json": "4397cc477eb6d79715ccd2000accd6b3531928f30029665832fa1b255f24d2b9"
+  },
+  "cases": [
+    {
+      "id": "bounded-edit-2048",
+      "case": "bounded-edit",
+      "budget_total_prompt_tokens": 2048,
+      "request_chars": 7518,
+      "request_utf8_bytes": 7518,
+      "request_token_count": 1465,
+      "total_prompt_tokens": 2048,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "e04670f4d7ae07f17b57110f601a1cd926c23755ba2a458d9e900ea4f24a6da8",
+      "prompt_token_sha256": "cef5d7fbdea0f44707306ea42abd981dcfac5f69471cd5315ea8f9e2bd8c8d69",
+      "tokenization_ms_samples": [
+        2.236625001387438,
+        2.230666999821551,
+        2.1775419991172384,
+        2.1048749986221083,
+        2.2089999984018505
+      ],
+      "tokenization_median_ms": 2.2089999984018505,
+      "reference_not_teacher_labels": true
+    },
+    {
+      "id": "bounded-edit-4096",
+      "case": "bounded-edit",
+      "budget_total_prompt_tokens": 4096,
+      "request_chars": 17994,
+      "request_utf8_bytes": 17994,
+      "request_token_count": 3513,
+      "total_prompt_tokens": 4096,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "80cc5e7a736ac7370e40f8fdfbd760301066e48f06bd2feeed644db51a179f57",
+      "prompt_token_sha256": "d1780596ddf7751d04874e999612527f88de62beaef967e789c73de4a2c5943e",
+      "tokenization_ms_samples": [
+        4.037333001178922,
+        4.093542000191519,
+        4.2208750019199215,
+        4.032417000416899,
+        4.057582998939324
+      ],
+      "tokenization_median_ms": 4.057582998939324,
+      "reference_not_teacher_labels": true
+    },
+    {
+      "id": "bounded-edit-8192",
+      "case": "bounded-edit",
+      "budget_total_prompt_tokens": 8192,
+      "request_chars": 38942,
+      "request_utf8_bytes": 38942,
+      "request_token_count": 7609,
+      "total_prompt_tokens": 8192,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "b72373e5e37962a02ea735ce6863d901eeca3972738e3792ebc4c9d3b625ab9b",
+      "prompt_token_sha256": "b750ce15d71ae7902706c234f3a49bfc253c7d48521c8da003da2fbb6ac64aff",
+      "tokenization_ms_samples": [
+        8.657791000587167,
+        8.553957999538397,
+        8.68024999726913,
+        8.293499999126652,
+        8.46766600079718
+      ],
+      "tokenization_median_ms": 8.553957999538397,
+      "reference_not_teacher_labels": true
+    },
+    {
+      "id": "production-migration-2048",
+      "case": "production-migration",
+      "budget_total_prompt_tokens": 2048,
+      "request_chars": 7539,
+      "request_utf8_bytes": 7539,
+      "request_token_count": 1465,
+      "total_prompt_tokens": 2048,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "ac8b6547fb1073c978319713312fe9df6fd67305886a627f6f27baaa5d07ddf6",
+      "prompt_token_sha256": "f5fd060512b945ba9fd758a8c01204a8e4d10b6620bf66feeffecb53c2daf498",
+      "tokenization_ms_samples": [
+        2.114041999448091,
+        2.1823749993927777,
+        2.090624999254942,
+        2.124167000147281,
+        2.0872499990218785
+      ],
+      "tokenization_median_ms": 2.114041999448091,
+      "reference_not_teacher_labels": true
+    },
+    {
+      "id": "production-migration-4096",
+      "case": "production-migration",
+      "budget_total_prompt_tokens": 4096,
+      "request_chars": 18015,
+      "request_utf8_bytes": 18015,
+      "request_token_count": 3513,
+      "total_prompt_tokens": 4096,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "c56622896021d2e4295ac113828279e2e4739cb5234da5c4bfae7bffc48dd230",
+      "prompt_token_sha256": "7d34b550406f24d3e667086b87dcb88ee62bb3d5e9693bfc2963947dd1e135a1",
+      "tokenization_ms_samples": [
+        4.115416002605343,
+        4.121292000490939,
+        4.119000001082895,
+        4.0749159998085815,
+        3.9495419987360947
+      ],
+      "tokenization_median_ms": 4.115416002605343,
+      "reference_not_teacher_labels": true
+    },
+    {
+      "id": "production-migration-8192",
+      "case": "production-migration",
+      "budget_total_prompt_tokens": 8192,
+      "request_chars": 38963,
+      "request_utf8_bytes": 38963,
+      "request_token_count": 7609,
+      "total_prompt_tokens": 8192,
+      "first_question_prefix_tokens": 2,
+      "request_sha256": "1a3a8bacd35a3798d50fc7d81b3cec301aa3156c1037a83bc0c1476533bc0b3c",
+      "prompt_token_sha256": "c387d912d33456ca6a3b54f2bb865e17c01460dc560d61cfcbc7f92bc3723712",
+      "tokenization_ms_samples": [
+        8.223499997257022,
+        8.249833001173101,
+        8.45320900043589,
+        8.310332999826642,
+        8.5651669978688
+      ],
+      "tokenization_median_ms": 8.310332999826642,
+      "reference_not_teacher_labels": true
+    }
+  ]
+}
