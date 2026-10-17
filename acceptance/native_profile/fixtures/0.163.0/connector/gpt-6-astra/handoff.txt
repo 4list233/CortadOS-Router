@@ -1,0 +1,1 @@
+Call the fixture visible_marker MCP tool exactly once. Do not call shell or any other tool. Reply exactly with the returned marker.

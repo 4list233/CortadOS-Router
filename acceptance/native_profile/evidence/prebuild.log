@@ -1,0 +1,314 @@
+test_n05_real_profile_corpus_keeps_per_model_boundary_ground_truth (acceptance.native_profile.test_native_profile.NativeCaptureEvidence.test_n05_real_profile_corpus_keeps_per_model_boundary_ground_truth) ... ok
+test_n01_both_captured_profiles_report_observed_success_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n01_both_captured_profiles_report_observed_success_version) ... 
+  test_n01_both_captured_profiles_report_observed_success_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n01_both_captured_profiles_report_observed_success_version) (version='0.163.0') ... FAIL
+test_n02_cancellation_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_cancellation_retains_observed_version) ... ERROR
+test_n02_native_failure_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_native_failure_retains_observed_version) ... ERROR
+test_n02_timeout_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_timeout_retains_observed_version) ... ERROR
+test_n03_old_schema_one_record_keeps_historical_profile (acceptance.native_profile.test_native_profile.NativeProfile.test_n03_old_schema_one_record_keeps_historical_profile) ... Executing <Task pending name='Task-32' coro=<NativeProfile.test_n03_old_schema_one_record_keeps_historical_profile() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py:147> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.102 seconds
+Executing <Task pending name='Task-32' coro=<NativeProfile.test_n03_old_schema_one_record_keeps_historical_profile() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py:147> wait_for=<Future pending cb=[Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.185 seconds
+ok
+test_n03_recovery_uses_job_version_after_native_binary_change (acceptance.native_profile.test_native_profile.NativeProfile.test_n03_recovery_uses_job_version_after_native_binary_change) ... ERROR
+test_n04_accepted_profile_change_before_start_refuses_attempt (acceptance.native_profile.test_native_profile.NativeProfile.test_n04_accepted_profile_change_before_start_refuses_attempt) ... ERROR
+test_n04_unknown_profile_refuses_before_execution (acceptance.native_profile.test_native_profile.NativeProfile.test_n04_unknown_profile_refuses_before_execution) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/traceback.py:393: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x10c951b70>
+  frame = frame.f_back
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+
+======================================================================
+ERROR: test_n02_cancellation_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_cancellation_retains_observed_version)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 102, in test_n02_cancellation_retains_observed_version
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 103, in test_n02_cancellation_retains_observed_version
+      |     started = await self.call(client, "delegate", self.request())
+      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+      |     self.assertFalse(result.isError, payload)
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: True is not false : {'ok': False, 'error': {'code': 'native_version_mismatch', 'message': 'Native CLI does not match accepted version 0.162.1'}}
+      +------------------------------------
+
+======================================================================
+ERROR: test_n02_native_failure_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_native_failure_retains_observed_version)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 92, in test_n02_native_failure_retains_observed_version
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 93, in test_n02_native_failure_retains_observed_version
+      |     started = await self.call(client, "delegate", self.request())
+      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+      |     self.assertFalse(result.isError, payload)
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: True is not false : {'ok': False, 'error': {'code': 'native_version_mismatch', 'message': 'Native CLI does not match accepted version 0.162.1'}}
+      +------------------------------------
+
+======================================================================
+ERROR: test_n02_timeout_retains_observed_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n02_timeout_retains_observed_version)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 112, in test_n02_timeout_retains_observed_version
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 113, in test_n02_timeout_retains_observed_version
+      |     started = await self.call(client, "delegate", self.request(timeout_s=1))
+      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+      |     self.assertFalse(result.isError, payload)
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: True is not false : {'ok': False, 'error': {'code': 'native_version_mismatch', 'message': 'Native CLI does not match accepted version 0.162.1'}}
+      +------------------------------------
+
+======================================================================
+ERROR: test_n03_recovery_uses_job_version_after_native_binary_change (acceptance.native_profile.test_native_profile.NativeProfile.test_n03_recovery_uses_job_version_after_native_binary_change)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 144, in test_n03_recovery_uses_job_version_after_native_binary_change
+  |     await self.interrupted("0.163.0")
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 121, in interrupted
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 122, in interrupted
+      |     started = await self.call(client, "delegate", request)
+      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+      |     self.assertFalse(result.isError, payload)
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: True is not false : {'ok': False, 'error': {'code': 'native_version_mismatch', 'message': 'Native CLI does not match accepted version 0.162.1'}}
+      +------------------------------------
+
+======================================================================
+ERROR: test_n04_accepted_profile_change_before_start_refuses_attempt (acceptance.native_profile.test_native_profile.NativeProfile.test_n04_accepted_profile_change_before_start_refuses_attempt)
+----------------------------------------------------------------------
+  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+  |     return self._loop.run_until_complete(task)
+  |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+  |     return future.result()
+  |            ~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 163, in test_n04_accepted_profile_change_before_start_refuses_attempt
+  |     async with self.session() as client:
+  |                ~~~~~~~~~~~~^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 103, in session
+  |     async with stdio_client(parameters, errlog=errors) as streams:
+  |                ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 235, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+  |     raise BaseExceptionGroup(
+  |         "unhandled errors in a TaskGroup", self._exceptions
+  |     ) from None
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 104, in session
+    |     async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=TEST_WAIT_S)) as client:
+    |                ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/Users/velox/.cortados-builds/mcp-worker-qa-env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__
+    |     raise BaseExceptionGroup(
+    |         "unhandled errors in a TaskGroup", self._exceptions
+    |     ) from None
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 106, in session
+      |     yield client
+      |   File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 166, in test_n04_accepted_profile_change_before_start_refuses_attempt
+      |     self.assertEqual(result["job"]["state"], "failed")
+      |     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      | AssertionError: 'succeeded' != 'failed'
+      | - succeeded
+      | + failed
+      | 
+      +------------------------------------
+
+======================================================================
+FAIL: test_n01_both_captured_profiles_report_observed_success_version (acceptance.native_profile.test_native_profile.NativeProfile.test_n01_both_captured_profiles_report_observed_success_version) (version='0.163.0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/native_profile/test_native_profile.py", line 85, in test_n01_both_captured_profiles_report_observed_success_version
+    started = await self.call(client, "delegate", self.request())
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/support.py", line 117, in call
+    self.assertFalse(result.isError, payload)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : {'ok': False, 'error': {'code': 'native_version_mismatch', 'message': 'Native CLI does not match accepted version 0.162.1'}}
+
+----------------------------------------------------------------------
+Ran 9 tests in 10.157s
+
+FAILED (failures=1, errors=5)

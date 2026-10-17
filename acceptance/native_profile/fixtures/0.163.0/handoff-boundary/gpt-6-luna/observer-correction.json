@@ -1,0 +1,9 @@
+{
+  "native_replayed": false,
+  "original_native_bytes_unchanged": true,
+  "error": "First observer expected an unrelated marker rather than the pinned handoff sentinels.",
+  "actual_expected": "FIRST_SENTINEL_9df3 LAST_SENTINEL_a712",
+  "status": "passed",
+  "stdout_sha256": "4ba4607773f2930c1d9e5ad699e4c2f4f1b61f6077caff44724bce068946a35e",
+  "script_sha256": "24645ec29465457c819d7e543286c26c783d0d8f2a6a355008fed356bc0f206c"
+}

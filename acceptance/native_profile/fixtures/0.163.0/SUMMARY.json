@@ -1,0 +1,284 @@
+{
+  "cli_version": "0.163.0",
+  "source_git_revision": "d40803fdf57369c19641e29a8a12ba6a66f3660a",
+  "model_checks": [
+    {
+      "kind": "command-permissions",
+      "model": "gpt-6-luna",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "command_execution"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 28679,
+          "cached_input_tokens": 13952,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 267,
+          "reasoning_output_tokens": 46
+        }
+      ]
+    },
+    {
+      "kind": "command-permissions",
+      "model": "gpt-6.1-sol",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "command_execution"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 30048,
+          "cached_input_tokens": 23808,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 236,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "command-permissions",
+      "model": "gpt-6-astra",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "command_execution"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 29896,
+          "cached_input_tokens": 14592,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 229,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "connector",
+      "model": "gpt-6-luna",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "mcp_tool_call"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 42460,
+          "cached_input_tokens": 27648,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 345,
+          "reasoning_output_tokens": 237
+        }
+      ]
+    },
+    {
+      "kind": "connector",
+      "model": "gpt-6.1-sol",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "mcp_tool_call"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 29478,
+          "cached_input_tokens": 23552,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 77,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "connector",
+      "model": "gpt-6-astra",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "item.started",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message",
+        "mcp_tool_call"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 29337,
+          "cached_input_tokens": 9088,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 80,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "handoff-boundary",
+      "model": "gpt-6-luna",
+      "status": "passed",
+      "original_observer_correction": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 31451,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 18,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "handoff-boundary",
+      "model": "gpt-6.1-sol",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 32151,
+          "cached_input_tokens": 9088,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 18,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "handoff-boundary",
+      "model": "gpt-6-astra",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": [
+        {
+          "input_tokens": 32079,
+          "cached_input_tokens": 9088,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 18,
+          "reasoning_output_tokens": 0
+        }
+      ]
+    },
+    {
+      "kind": "cancellation",
+      "model": "gpt-6-luna",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": []
+    },
+    {
+      "kind": "cancellation",
+      "model": "gpt-6.1-sol",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": []
+    },
+    {
+      "kind": "cancellation",
+      "model": "gpt-6-astra",
+      "status": "passed",
+      "original_observer_correction": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.started"
+      ],
+      "item_types": [
+        "agent_message"
+      ],
+      "usage_frames": []
+    }
+  ],
+  "metadata": "passed; current account/quota/policy accepted unchanged",
+  "proxy": "passed; only visible_marker; hidden tool/refresource/getprompt refuse; catalogs empty",
+  "profile": "existing production native_arguments/environment used without code change",
+  "native_internal_reasoning": "Not exposed or claimed by exec JSONL contract; final and usage are recorded, not hidden reasoning",
+  "observer_errors": "Preserved wrong-marker initial Luna observer and initial empty-catalog proxy observer; corrected according to original protected requests/contracts without changing native bytes or production. See observer-correction files and capture-source-provenance.json."
+}

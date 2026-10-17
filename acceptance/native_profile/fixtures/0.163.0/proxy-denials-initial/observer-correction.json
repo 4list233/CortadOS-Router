@@ -1,0 +1,5 @@
+{
+  "error": "Original scratch observer expected errors for list resources/prompts; contract and existing protected tests specify empty catalogs. Direct reads and get prompts must refuse.",
+  "source_sha256": "32a1e73c234db0156293b778c1333ee05b63591e771d8dd3c8e699e491d752ef",
+  "native_model_call": false
+}

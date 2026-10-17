@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a14842-d22b-7cb0-a15c-5e5df6e267a7"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"FIRST_SENTINEL_9df3 LAST_SENTINEL_a712"}}
+{"type":"turn.completed","usage":{"input_tokens":31451,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":18,"reasoning_output_tokens":0}}

@@ -1,0 +1,68 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/codex",
+    "app-server",
+    "--listen",
+    "stdio://",
+    "--disable",
+    "hooks",
+    "--disable",
+    "plugins",
+    "--disable",
+    "apps",
+    "--disable",
+    "multi_agent"
+  ],
+  "environment_names": [
+    "CODEX_HOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "TMPDIR",
+    "USER"
+  ],
+  "frames": [
+    {
+      "method": "initialize",
+      "raw_sha256": "0bf4b71e0a4f76d7ba358ee78bf1524989e7f8e9de0897cebb7e311972b66326",
+      "redacted_sha256": "f82f0ac5da18bbae6a7d3d17b4e3b6672e4c6388d7c60a2dfb3ab3dcec9e8a5d",
+      "file": "initialize.jsonl"
+    },
+    {
+      "method": "account/read",
+      "raw_sha256": "170c377c7802a3ee5ebd11d99b9c2d826f313bb583fb665d7079f0c188a32599",
+      "redacted_sha256": "e3b625c62f3fe687ab15daf4e0c2a8bf11c8a1e4ef12895f142d81c9c0517f36",
+      "file": "account-read.jsonl"
+    },
+    {
+      "method": "account/rateLimits/read",
+      "raw_sha256": "dac20d21f69e6f3765fb2f0f9c73d86c387b14be463f4b2c1b9da67ae505f773",
+      "redacted_sha256": "90e62e2ad72f737f5fc5cc2884434a845ea34c79958eced528d4fc0bee59d818",
+      "file": "account-rateLimits-read.jsonl"
+    },
+    {
+      "method": "model/list",
+      "raw_sha256": "a01801914272c0c66fc34a6ea3c46e926633f631ef14761c1def95f4da477da4",
+      "redacted_sha256": "a01801914272c0c66fc34a6ea3c46e926633f631ef14761c1def95f4da477da4",
+      "file": "model-list.jsonl"
+    },
+    {
+      "method": "config/read",
+      "raw_sha256": "ce5de2c6e90370fe242eecf2e77e2fac3d41632d79c389f66e87839a2ef02b59",
+      "redacted_sha256": "7377753da1b7b72ab662e8791481463e6c9ff2d5a4dd8f0b145d769a4dcb260a",
+      "file": "config-read.jsonl"
+    },
+    {
+      "method": "configRequirements/read",
+      "raw_sha256": "ba4840590c71c536e9335c88054095e8fea981fe3080ac407016cf8f4ddfc2b9",
+      "redacted_sha256": "ba4840590c71c536e9335c88054095e8fea981fe3080ac407016cf8f4ddfc2b9",
+      "file": "configRequirements-read.jsonl"
+    }
+  ],
+  "redaction": "Only JSON string tokens replaced; other bytes, ordering, whitespace and numbers retained. No raw credentials or configuration persisted.",
+  "stderr_bytes": 0,
+  "script_sha256": "e1fa7413d906b8ce546e78fbbc619d21608dc6c4348b586da088877b75feee13"
+}

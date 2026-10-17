@@ -1,0 +1,1 @@
+Run exactly one command, then wait for it to finish. This is a cancellation boundary test. Do not shorten or replace the sleep. Command: /opt/homebrew/bin/python3.14 -c 'import json,os,time,pathlib;pathlib.Path("child.json").write_text(json.dumps({"pid":os.getpid(),"pgid":os.getpgrp(),"sid":os.getsid(0)}));time.sleep(60)'

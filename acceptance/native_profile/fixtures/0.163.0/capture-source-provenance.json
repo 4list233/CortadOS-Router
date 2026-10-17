@@ -1,0 +1,5 @@
+{
+  "executed_script_sha256": "61b45665d75762c290f914004e91f29ae273a58ebcde4fa8a00ce92c5bfbae26",
+  "transient_disk_script_sha256": "851162199d68451b6ce5cad07e9d50bceac8fcd36c8f1be97f3b76514517f591",
+  "explanation": "The process loaded capture_profiles.py once at start. While it ran the final handoff observer assertion was briefly corrected on disk, then restored. Sol command meta.source_sha256 observed that transient disk hash; executable command/profile code was identical in both. Both source variants are retained. Original Luna handoff observer failure is preserved and corrected against unchanged native bytes by capture_handoff.py."
+}

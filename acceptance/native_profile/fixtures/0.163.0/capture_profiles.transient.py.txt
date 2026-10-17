@@ -1,0 +1,77 @@
+"""Independent native 0.163.0 wire profiles using current service argv/environment owner."""
+import hashlib, json, os, shlex, signal, socket, subprocess, sys, time
+from pathlib import Path
+ROOT=Path(__file__).resolve().parent
+REPO=Path('/Users/velox/.cortados-builds/cortados-router-repo')
+sys.path.insert(0,str(REPO))
+from integrations.mcp.codex import native_arguments,native_environment,EventReader
+from integrations.mcp.grant_proxy import GrantPayloadServer
+MODELS=['gpt-6-luna','gpt-6.1-sol','gpt-6-astra']
+config={'codex_bin':'/opt/homebrew/bin/codex','codex_home':str(Path.home()/'.codex'),'limits':{'startup_timeout_s':30},'connector_registry':{}}
+assert subprocess.check_output([config['codex_bin'],'--version'],text=True).strip()=='codex-cli 0.163.0'
+records=[]
+def run(kind,model,prompt,permissions=None,check=None):
+    directory=ROOT/kind/model; directory.mkdir(parents=True,exist_ok=True)
+    work=directory/'workspace';work.mkdir(exist_ok=True)
+    args={'cwd':str(work),'permissions':permissions or {'network':False,'mcp_servers':[]}}
+    proxy=GrantPayloadServer(config,args['permissions']) if args['permissions']['mcp_servers'] else None
+    argv=native_arguments(config,args,{'chosen':{'model':model}},directory/'final.txt',proxy.path if proxy else None)
+    (directory/'handoff.txt').write_bytes(prompt.encode())
+    start=time.time(); error=None
+    try:
+        with (directory/'stdout.jsonl').open('wb') as out,(directory/'stderr.txt').open('wb') as err:
+            result=subprocess.run(argv,input=prompt.encode(),env=native_environment(config),cwd=work,stdout=out,stderr=err,timeout=120,start_new_session=True)
+        reader=EventReader();reader.feed((directory/'stdout.jsonl').read_bytes());final,usage=reader.completion(result.returncode,directory/'final.txt')
+        if check:check(directory,final)
+        if proxy: assert not proxy.failure,'proxy reported failure'
+        status='passed'
+    except BaseException as exc:
+        status='failed';error=repr(exc);raise
+    finally:
+        if proxy:proxy.close()
+        meta={'kind':kind,'model':model,'cli_version':'0.163.0','argv':argv,'environment_names':sorted(native_environment(config)),
+              'auth_source':'native ChatGPT saved login; credentials not read','native_reasoning_effort':'model default',
+              'started_at_unix':start,'elapsed_s':time.time()-start,'status':status,'error':error,'handoff_utf8_bytes':len(prompt.encode()),
+              'source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              'hashes':{name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in ('stdout.jsonl','stderr.txt','final.txt','handoff.txt') if (directory/name).exists()}}
+        (directory/'meta.json').write_text(json.dumps(meta,indent=2)+'\n');records.append({k:v for k,v in meta.items() if k not in ('argv','hashes')})
+        (ROOT/'profile-summary.json').write_text(json.dumps(records,indent=2)+'\n');print(json.dumps({'kind':kind,'model':model,'status':status,'elapsed_s':meta['elapsed_s']}),flush=True)
+
+def command_case(model):
+    directory=ROOT/'command-permissions'/model
+    outside=directory/'outside';outside.mkdir(parents=True,exist_ok=True)
+    blocked=outside/'blocked.txt'
+    listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(.01)
+    port=listener.getsockname()[1]
+    code=('import pathlib,socket,json\npathlib.Path("inside.txt").write_text("NATIVE_01630_OK")\n'
+          'result={}\ntry:\n pathlib.Path('+repr(str(blocked))+').write_text("OUTSIDE_WRITE")\n result["outside"]="ALLOWED"\nexcept OSError:\n result["outside"]="DENIED"\n'
+          'try:\n socket.create_connection(("127.0.0.1",'+str(port)+'),timeout=3).close()\n result["network"]="ALLOWED"\nexcept OSError:\n result["network"]="DENIED"\n'
+          'print(json.dumps(result,sort_keys=True))')
+    prompt='Run exactly this Python command once to verify local sandbox boundaries, then reply exactly NATIVE_01630_OK. The outside path and loopback socket are owned scratch test fixtures. Never bypass a denied operation. Command: '+shlex.quote('/opt/homebrew/bin/python3.14')+' -c '+shlex.quote(code)
+    def check(path,final):
+        assert (path/'workspace/inside.txt').read_text()=='NATIVE_01630_OK'
+        assert not blocked.exists(),'outside write escaped'
+        assert final=='NATIVE_01630_OK'
+        events=[json.loads(line) for line in (path/'stdout.jsonl').read_text().splitlines()]
+        outputs=[row['item'].get('aggregated_output','') for row in events if row.get('type')=='item.completed' and row.get('item',{}).get('type')=='command_execution']
+        assert any('{"network": "DENIED", "outside": "DENIED"}' in output for output in outputs),outputs
+        try:connection,_=listener.accept();connection.close();raise AssertionError('network escaped')
+        except socket.timeout:pass
+    try:run('command-permissions',model,prompt,check=check)
+    finally:listener.close()
+
+for model in MODELS:command_case(model)
+for model in MODELS:
+    events=ROOT/'connector-events'/f'{model}.jsonl';events.parent.mkdir(exist_ok=True)
+    config['connector_registry']={'fixture':{'transport':'stdio','command':sys.executable,'args':[str(REPO/'acceptance/mcp_worker/fake_mcp_server.py'),str(events)],'env_vars':[],'tools':['visible_marker','hidden_marker']}}
+    def check(path,final):
+        assert final=='GRANTED_TOOL_REACHED',final
+        rows=[json.loads(line) for line in events.read_text().splitlines()]
+        assert [x['kind'] for x in rows if x['kind']!='started']==['visible_tool'],rows
+    run('connector',model,'Call the fixture visible_marker MCP tool exactly once. Do not call shell or any other tool. Reply exactly with the returned marker.',
+        permissions={'network':False,'mcp_servers':[{'name':'fixture','tools':['visible_marker']}]},check=check)
+for model in MODELS:
+    prompt=(REPO/'acceptance/mcp_worker/fixtures/native-boundaries/handoff-boundary/handoff.txt').read_text()
+    assert len(prompt.encode())==65536
+    def check(path,final):assert final=='FIRST_SENTINEL_9df3 LAST_SENTINEL_a712',final
+    run('handoff-boundary',model,prompt,check=check)

@@ -1,0 +1,76 @@
+{
+  "tools": [
+    "visible_marker"
+  ],
+  "hidden_tool": {
+    "returned": {
+      "meta": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"ok\": false, \"error\": {\"code\": \"permission_refused\", \"message\": \"Tool is outside this job grant\"}}",
+          "annotations": null,
+          "meta": null
+        }
+      ],
+      "structuredContent": {
+        "ok": false,
+        "error": {
+          "code": "permission_refused",
+          "message": "Tool is outside this job grant"
+        }
+      },
+      "isError": true
+    }
+  },
+  "resources": {
+    "returned": {
+      "meta": null,
+      "nextCursor": null,
+      "resources": []
+    }
+  },
+  "read_resource": {
+    "error_code": -32001,
+    "message": "permission_refused: operation is outside this tool grant"
+  },
+  "prompts": {
+    "returned": {
+      "meta": null,
+      "nextCursor": null,
+      "prompts": []
+    }
+  },
+  "get_prompt": {
+    "error_code": -32001,
+    "message": "permission_refused: operation is outside this tool grant"
+  },
+  "visible_result": {
+    "meta": null,
+    "content": [
+      {
+        "type": "text",
+        "text": "GRANTED_TOOL_REACHED",
+        "annotations": null,
+        "meta": null
+      }
+    ],
+    "structuredContent": {
+      "result": "GRANTED_TOOL_REACHED"
+    },
+    "isError": false
+  },
+  "status": "passed",
+  "upstream_events": [
+    {
+      "kind": "started",
+      "pid": 72385,
+      "marker_environment": {}
+    },
+    {
+      "kind": "visible_tool",
+      "pid": 72385
+    }
+  ],
+  "script_sha256": "2c789c525919f3a789a84bf0904e3abfcef900150efeb6356b4470dff2558ded"
+}

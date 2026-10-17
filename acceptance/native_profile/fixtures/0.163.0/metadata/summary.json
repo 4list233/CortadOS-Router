@@ -1,0 +1,23 @@
+{
+  "cli_version": "codex-cli 0.163.0",
+  "platform": "macos",
+  "account_type": "chatgpt",
+  "models": [
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna"
+  ],
+  "policy_accepted": true,
+  "quota_accepted": true,
+  "config_layer_types": [
+    "sessionFlags",
+    "user",
+    "system"
+  ],
+  "requirements_null": true,
+  "worker_turn_started": false
+}
