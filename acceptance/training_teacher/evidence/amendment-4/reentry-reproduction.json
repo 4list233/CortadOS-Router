@@ -1,0 +1,11 @@
+{
+  "empty_before": true,
+  "other_invocation_reserved": [
+    "teacher-exam-1",
+    "teacher-exam-10"
+  ],
+  "occupied_after_reentry": false,
+  "published_into_reserved_slots": 2,
+  "labels": 2,
+  "providers_called": 0
+}

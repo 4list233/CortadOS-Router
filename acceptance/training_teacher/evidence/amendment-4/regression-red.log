@@ -1,0 +1,17 @@
+test_reused_writer_never_loses_another_invocations_reserved_slots (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots) ... FAIL
+
+======================================================================
+FAIL: test_reused_writer_never_loses_another_invocations_reserved_slots (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_invocation_cache.py", line 26, in test_reused_writer_never_loses_another_invocations_reserved_slots
+    self.assertTrue(first.occupied(batch[0], 0, 'claude-sonnet-5', self.snapshot),
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    'Reentered writer lost the current reservation index')
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : Reentered writer lost the current reservation index
+
+----------------------------------------------------------------------
+Ran 1 test in 0.022s
+
+FAILED (failures=1)

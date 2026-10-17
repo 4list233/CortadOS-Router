@@ -1,0 +1,90 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "attempt": 2,
+  "status": "design_error",
+  "B": 1,
+  "candidate_sha256": "07cb69f7523a17fdbf54f350fdc2826e0d825018ae4cdf44e7ddd3a6f56b867b",
+  "sources": [
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py",
+      "expected": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb",
+      "actual": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher_attempts.py",
+      "expected": "80a53da7d59804b9246b4a78f9305ea0324fb18b8e1b6c708dce8ca1aa7a89f0",
+      "actual": "80a53da7d59804b9246b4a78f9305ea0324fb18b8e1b6c708dce8ca1aa7a89f0"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/worker_admission.py",
+      "expected": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+      "actual": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/config.py",
+      "expected": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+      "actual": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/cortados-router-repo/s1/label.py",
+      "expected": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38",
+      "actual": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/label.py",
+      "expected": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700",
+      "actual": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700"
+    },
+    {
+      "path": "/Users/velox/.cortados-builds/training-teacher-activation/train/nightly.sh",
+      "expected": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7",
+      "actual": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7"
+    }
+  ],
+  "wheel": {
+    "path": "/Users/velox/.cortados-builds/training-teacher-verification/wheels/cortados_router-1.0.0-py3-none-any.whl",
+    "expected": "74a0931153e15ea6b0896a08005eac87bbd82aa2917d6ccf690a40cdff6368c2",
+    "actual": "74a0931153e15ea6b0896a08005eac87bbd82aa2917d6ccf690a40cdff6368c2"
+  },
+  "exam_amendment_3_sha256": "e8181ca67195a484d116ea51f984a93a2b25941be3d2f0f154bc90e3421fdd4d",
+  "source_review_complete": true,
+  "remaining_findings": [
+    {
+      "id": "B2-01",
+      "file": "cortados_router/teacher_attempts.py",
+      "lines": [
+        98,
+        111,
+        124,
+        323
+      ],
+      "rule": "exclusive invocation must honor all durable reserved slots",
+      "reproduction": "Create ownerA; enter and cache empty occupied index; exit. OwnerB reserves two slots and exits. Reenter ownerA; manifest reloads but _slot_cache remains. occupied=false and publish_claude writes2 into reserved slots.",
+      "evidence": "/private/tmp/training-teacher-B2-reentry-cache.json",
+      "source_sha256": "80a53da7d59804b9246b4a78f9305ea0324fb18b8e1b6c708dce8ca1aa7a89f0"
+    }
+  ],
+  "prior_findings": {
+    "B1-01": "current invocation lock/PID/descriptor checks repaired",
+    "B1-02": "Claude continue/stop error behavior repaired",
+    "B1-03": "Claude independent row/override validation repaired; strict Codex validator retained",
+    "B1-04": "append-derived parse/index cache cost reduced; root independent measurement pending; lifetime defect B2-01 remains"
+  },
+  "proposed_design_review": {
+    "disposition": "extend existing LabelAttempts owner; no second store/cache/lock",
+    "lifetime": "Acquiring a fresh invocation lock starts a fresh derived-cache generation. Persisted manifest and labels are authoritative; object reuse cannot grant continuity.",
+    "entry": "After successfully acquiring/binding the lock and before deriving occupancy, retire all prior parsed-label and slot/reservation indexes; load/validate current manifest and labels. Alternatively refuse every second entry explicitly.",
+    "exit": "Serialize exit with writers; retire invocation token/cache authority; retain current file and PID checks.",
+    "scope": "teacher_attempts.py only for minimal cache-lifetime fix, existing builder tests plus one protected regression; no label policy/budgets/promotion/permissions changes.",
+    "gate": "second valid failure; no automatic third same-design attempt. Await recorded orchestrator design disposition and required escalation; retain007 identity/history."
+  },
+  "operator_guard": {
+    "path": "/private/tmp/activate-training-teacher-007.py",
+    "sha256": "1d06d2f1a051871b821c50d735480c1382dc92bc522a5be57a0dcfc9c599fdd1",
+    "review": "exact installed member set and accepted suite hash/count guards corrected",
+    "activation": "BLOCKED"
+  },
+  "provider_calls": 0,
+  "production_edits": false,
+  "full_suite": "pending root attempt2 run; separate new regression not counted in original inventory"
+}

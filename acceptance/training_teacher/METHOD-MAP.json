@@ -721,6 +721,15 @@
         "AC-T04",
         "AC-T07"
       ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_invocation_cache.py",
+      "class": "InvocationCache",
+      "method": "test_reused_writer_never_loses_another_invocations_reserved_slots",
+      "ac": [
+        "AC-T03",
+        "AC-T04"
+      ]
     }
   ],
   "counts": {
@@ -758,5 +767,16 @@
     "preserved_learning_command": "<new-release-python> -B acceptance/training_teacher/evidence/run-preserved-learning.py",
     "preserved_learning_methods": 31,
     "historical_assertions": "unchanged"
+  },
+  "amendment_4": {
+    "new_methods": 1,
+    "purpose": "writer invocation reservation-cache lifetime",
+    "original_attempt2_inventory": 782,
+    "added_regression_run": {
+      "tests": 1,
+      "failures": 1,
+      "errors": 0,
+      "skips": 0
+    }
   }
 }

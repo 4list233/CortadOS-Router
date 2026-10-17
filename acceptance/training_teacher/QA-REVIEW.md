@@ -61,3 +61,7 @@ the candidate declaration adds only the two reviewed teacher modules, totaling57
 ## B attempt 1 and amendment 3
 
 Candidate attempt 1 fails independent source review: stale writer authority, changed Claude exception handling, and changed Claude row validation. Ten additional protected methods reproduce these boundaries (one positive worker-thread method passes). Efficiency correctness assertions pass, but repeated full-history parse costs remain open. See B1-REVIEW.json and raw evidence. Fixture corrections preserve all installed assertions and all 31 historical learning methods; reruns pass 7/7 and 31/31 respectively. No provider calls or production edits.
+
+## B attempt 2 — design_error
+
+All 782 tests in the pre-amplification inventory passed with zero failures/errors/skips. Independent source review then reproduced a new invocation-cache failure: reusing a LabelAttempts object after another invocation reserves slots admits stale occupancy and permits duplicate teacher publication. The separate additive regression fails (1 test, 1 failure). B=1; this is the second valid failure, so activation and dependent implementation stop under CONVENTIONS §Attempts and escalation. The same007 package and both attempts remain recorded. Proposed design review confines parsed-label/reservation caches to one acquired invocation generation; it changes no user policy. See B2-REVIEW.json.
