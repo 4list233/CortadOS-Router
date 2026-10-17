@@ -1,0 +1,31 @@
+test_missing_native_identity_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_missing_native_identity_contains_probe_and_closes_fd) ... FAIL
+test_native_identity_error_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_native_identity_error_contains_probe_and_closes_fd) ... FAIL
+
+======================================================================
+FAIL: test_missing_native_identity_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_missing_native_identity_contains_probe_and_closes_fd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 61, in test_missing_native_identity_contains_probe_and_closes_fd
+    self._identity_failure(None)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 57, in _identity_failure
+    self.assertFalse(alive, 'Identity failure leaked the freshly forked quota probe')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : Identity failure leaked the freshly forked quota probe
+
+======================================================================
+FAIL: test_native_identity_error_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_native_identity_error_contains_probe_and_closes_fd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 64, in test_native_identity_error_contains_probe_and_closes_fd
+    self._identity_failure(OSError('Synthetic identity unavailable'))
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 57, in _identity_failure
+    self.assertFalse(alive, 'Identity failure leaked the freshly forked quota probe')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : Identity failure leaked the freshly forked quota probe
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.008s
+
+FAILED (failures=2)

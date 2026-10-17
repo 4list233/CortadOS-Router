@@ -1,0 +1,24 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "exam_owner": "/root/quota_evaluation_qa",
+  "candidate_revision": "b0ed0fbe3eb67557603cd48d103aaa4ab57f3107",
+  "AC": [
+    "AC-QS05"
+  ],
+  "methods_added": 2,
+  "methods_total_with_amendments": 83,
+  "old_tests_changed": false,
+  "finding": "scarcity.tui_capture calls newly fallible reaper.track before cleanup try. Native identity missing/error leaves direct child and PTY fd alive.",
+  "command": "python -m unittest -v acceptance.quota_sources.test_probe_start_failure",
+  "red": {
+    "tests": 2,
+    "failures": 2,
+    "errors": 0,
+    "skips": 0
+  },
+  "cleanup": "Independent finally kills/reaps only its unreaped direct fork and closes its recorded fd; no provider calls.",
+  "files": {
+    "acceptance/quota_sources/test_probe_start_failure.py": "97d1657bd921d1f40dbd6e0a21364307ab0369d4acd7c77639d1e7a52bdeeae9",
+    "acceptance/quota_sources/evidence/probe-start-failure-b1-red.log": "890aebe2b741b04d9d77f3bbc1265e7d6ccf84e36b12939dc2733d8d819c053c"
+  }
+}
