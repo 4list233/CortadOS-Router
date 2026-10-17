@@ -89,7 +89,7 @@ def window_view(name: str, used_pct: float, reset_at: float | None, window_s: fl
     # counts linearly against scarcity, reaching its full weight at the reset: a week 3 % used at 70 % elapsed reads ≈ −0.6, at 95 % ≈ −0.9.
     if reset_at and window_s >= 86400 and elapsed > 0.25:
         s = round(max(-1.0, s - (wasted / 100.0) * ((elapsed - 0.25) / 0.75)), 2)
-    return {"window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
+    return {"window_s": window_s, "reset_epoch": reset_at, "window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
             "projected_pct_at_reset": round(projected), "allowance_pct_per_h": round(headroom / max(remaining_s / 3600, 0.25), 2),
             "resets_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(reset_at)) if reset_at else None,
             "resets_in_h": round(remaining_s / 3600, 1) if reset_at else None, "scarcity": round(s, 2),
@@ -294,9 +294,9 @@ def _cli_env() -> dict[str, str]:
     return env
 
 
-def _claude(prev: dict[str, Any] | None = None) -> dict[str, Any]:
+def _claude(prev: dict[str, Any] | None = None, *, environment=None) -> dict[str, Any]:
     # the per-model weeks (Fable, Opus, …) load from a rate-limited endpoint; the screen offers "r to retry". Two gentle presses, never more.
-    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", _cli_env(), run_s=25,
+    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", _cli_env() if environment is None else environment, run_s=25,
                        nudge=(r"Current week \((?!all models)[^)]+\)\D{0,160}?\d+\s*% used", r"breakdown unavailable", b"r", 2, 8.0))
     wins = parse_claude_usage(text)
     if not wins:
@@ -310,8 +310,8 @@ def _claude(prev: dict[str, Any] | None = None) -> dict[str, Any]:
     return {**out, "windows": wins}
 
 
-def _antigravity() -> dict[str, Any]:
-    text = tui_capture(["agy"], "/usage", r"Limit Remaining[\s\S]*Limit Remaining", _cli_env())
+def _antigravity(*, environment=None) -> dict[str, Any]:
+    text = tui_capture(["agy"], "/usage", r"Limit Remaining[\s\S]*Limit Remaining", _cli_env() if environment is None else environment)
     groups = parse_agy_usage(text)
     if not groups:
         raise RuntimeError("no quota groups on the /usage screen: " + text[-200:].replace("\n", " "))
@@ -324,20 +324,28 @@ def _antigravity() -> dict[str, Any]:
 
 def parse_codex_status(text: str) -> list[dict[str, Any]]:
     wins, text = [], re.sub(r"\s+", " ", text)
-    for m in re.finditer(r"((?:[A-Za-z0-9.-]+ ){0,3}?(?:5h|[Ww]eekly)|[A-Za-z0-9.-]+) limit: \[[^\]]*\] (\d{1,3})% left(?: \(resets ([^)]+)\))?", text):
+    for m in re.finditer(r"((?:(?:[Gg][Pp][Tt]-[A-Za-z0-9.-]+|o[1-9][A-Za-z0-9.-]*) )?(?:5h|[Ww]eekly)) limit: \[[^\]]*\] (\d{1,3})% left(?: \(resets ([^)]+)\))?", text):
         label, left, when = m.groups()
         reset = None
-        t = re.search(r"(\d{1,2}):(\d{2})(?: on (\d{1,2}) ([A-Z][a-z]{2}))?", when or "")
+        t = re.fullmatch(r"(\d{1,2}):(\d{2})(?: (AM|PM))?(?: on (\d{1,2}) ([A-Z][a-z]{2}))?", when or "")
         if t:
-            now = datetime.now()
-            reset_dt = now.replace(hour=int(t.group(1)), minute=int(t.group(2)), second=0, microsecond=0)
-            if t.group(3):
-                reset_dt = reset_dt.replace(month=datetime.strptime(t.group(4), "%b").month, day=int(t.group(3)))
-                if reset_dt < now - timedelta(days=1):
-                    reset_dt = reset_dt.replace(year=now.year + 1)
-            elif reset_dt <= now:
-                reset_dt += timedelta(days=1)
-            reset = reset_dt.timestamp()
+            try:
+                now = datetime.now()
+                hour = int(t.group(1))
+                if t.group(3):
+                    if not 1 <= hour <= 12:
+                        raise ValueError("Invalid AM/PM clock")
+                    hour = hour % 12 + (12 if t.group(3) == "PM" else 0)
+                reset_dt = now.replace(hour=hour, minute=int(t.group(2)), second=0, microsecond=0)
+                if t.group(4):
+                    reset_dt = reset_dt.replace(month=datetime.strptime(t.group(5), "%b").month, day=int(t.group(4)))
+                    if reset_dt < now - timedelta(days=1):
+                        reset_dt = reset_dt.replace(year=now.year + 1)
+                elif reset_dt <= now:
+                    reset_dt += timedelta(days=1)
+                reset = reset_dt.timestamp()
+            except ValueError:
+                reset = None
         span = "5-hour" if label.endswith("5h") else "week"
         model = re.sub(r"\s*(5h|[Ww]eekly)$", "", label).strip()
         name = span if not model else f"{span} ({model})"
@@ -404,8 +412,8 @@ def parse_cursor_usage(text: str) -> list[dict[str, Any]]:
     return wins
 
 
-def _cursor() -> dict[str, Any]:
-    env = {**_cli_env(), "AGENT_CLI_CREDENTIAL_STORE": "file"}
+def _cursor(*, environment=None) -> dict[str, Any]:
+    env = {**_cli_env(), "AGENT_CLI_CREDENTIAL_STORE": "file"} if environment is None else environment
     text = tui_capture(["cursor-agent"], "/usage", r"Included \d+% used[\s\S]*Esc to close", env, boot_s=15, ready=r"Cursor Agent")
     wins = parse_cursor_usage(text)
     if not wins:
@@ -463,7 +471,16 @@ def finish(lane: str, rec: dict[str, Any]) -> dict[str, Any]:
         p: {**v, "scarcity": 1.0 if v["spent"] else v["scarcity"]} for p, v in pools.items()}}
 
 
-SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local}
+def _codex_native():
+    from integrations.mcp.config import load_config
+    from cortados_router.quota_observations import observe_lane
+    value = observe_lane("codex", load_config("/Users/velox/.config/cortados-workers/config.json"))
+    if value["error"] is not None:
+        raise RuntimeError(value["error"]["reason"])
+    return value["record"]
+
+
+SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex_native, "cursor": _cursor, "local": _local}
 
 
 def _plans() -> dict[str, str]:

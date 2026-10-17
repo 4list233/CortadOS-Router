@@ -54,3 +54,13 @@ and `mcp-observations.jsonl` can be rebuilt by collection. The main-phase protec
 modules named in [the exam README](../../acceptance/mcp_learning/README.md). The separately tested
 activation stage is installed for the next nightly invocation; the active October 17 run keeps its
 old environment and script inode. The build report records independent verification and limitations.
+
+| Fresh-quota path | RT-FRESH-QUOTA-005 responsibility |
+|---|---|
+| [FRESH-QUOTA-005.md](FRESH-QUOTA-005.md) | Frozen strict fresh quota contract; independent `acceptance/fresh_quota/` exams. |
+| [QUOTA-OPERATIONS.md](QUOTA-OPERATIONS.md) | Root; quota percentages, pace, learned cost, inspection command, dispatch limits and saved-checkpoint result. |
+| `cortados_router/quota_admission.py` | Sole source scope canonicalizer, fresh pool validation, `check`, `source_preflight`, pure `resources` and `current_resources`. |
+| `cortados_router/quota_observations.py` | Bounded per-source process-group collection and ephemeral in-flight/cache owner; no store writes. |
+| `cortados_router/selection_resources.py` | Immutable lanes, health, exact allowed routes and optional learned-cost snapshot; adopts core mapping. |
+| `integrations/mcp/native_metadata.py::observe` | Uncached read-only validated status, preserving spent readings; snapshot remains strict. |
+| `cortados_router/scarcity.py::_codex_native` | Existing inspection source delegates typed native status; TUI parser remains diagnostic only. |

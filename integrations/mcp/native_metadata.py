@@ -23,7 +23,7 @@ READ_CHUNK_BYTES = 65536
 class _Session:
     """One native read-only session and one overall monotonic startup deadline."""
 
-    def __init__(self, config, deadline):
+    def __init__(self, config, deadline, environment=None):
         from .codex import native_environment
         self.config, self.deadline = config, deadline
         self.selector, self.pending, self.number, self.size = selectors.DefaultSelector(), b"", 0, 0
@@ -31,7 +31,7 @@ class _Session:
         for feature in ("hooks", "plugins", "apps", "multi_agent"):
             argv.extend(("--disable", feature))
         try:
-            self.process = subprocess.Popen(argv, cwd=config["state_dir"], env=native_environment(config),
+            self.process = subprocess.Popen(argv, cwd=config["state_dir"], env=native_environment(config) if environment is None else environment,
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, shell=False)
         except OSError as exc:
@@ -127,12 +127,13 @@ class NativeMetadata:
         self.config, self._cached = config, None
         self._lock = threading.RLock()
         self.version = None
+        self.environment = None
 
     def preflight(self):
         with self._lock:
             deadline = time.monotonic() + self.config["limits"]["startup_timeout_s"]
             version = check_version(self.config, deadline)
-            session = _Session(self.config, deadline)
+            session = _Session(self.config, deadline, self.environment)
             try:
                 session.initialize()
                 policy = session.call("config/read", {"includeLayers": True}, "permission_refused")
@@ -142,9 +143,16 @@ class NativeMetadata:
                 session.close()
             self.version = version
 
+    def _fresh(self, snapshot):
+        from cortados_router.quota_admission import _age, _maximum, _number
+        sampled = snapshot.get("sampled_at_ms")
+        row = {"observed_at": sampled / 1000 if _number(sampled) else None,
+               "observed_monotonic": snapshot.get("sampled_monotonic")}
+        return _age(row, time.time(), time.monotonic(), _maximum(self.config)) is not None
+
     def snapshot(self):
         with self._lock:
-            if self._cached is not None and time.monotonic() - self._cached["sampled_monotonic"] <= self.config["limits"]["metadata_max_age_s"]:
+            if self._cached is not None and self._fresh(self._cached):
                 return copy.deepcopy(self._cached)
             self._cached = None
             if self.version is None:
@@ -154,14 +162,27 @@ class NativeMetadata:
             # otherwise a refusal could incorrectly outlive a corrected native read.
             from cortados_router.worker_admission import validate_snapshot
             validate_snapshot(snapshot)
+            if not self._fresh(snapshot):
+                raise WorkerError("quota_unknown", "Native metadata observation exceeded the freshness bound")
             self.version = snapshot["version"]
             self._cached = snapshot
             return copy.deepcopy(snapshot)
 
+    def observe(self):
+        """Uncached status observation: account validated, spent quota retained."""
+        with self._lock:
+            if self.version is None:
+                self.preflight()
+            snapshot = self._collect()
+            from cortados_router.worker_admission import validate_snapshot
+            validate_snapshot(snapshot, admission=False)
+            return copy.deepcopy(snapshot)
+
     def _collect(self):
-        deadline = time.monotonic() + self.config["limits"]["startup_timeout_s"]
+        started_at_ms, started_monotonic = time.time_ns() // 1_000_000, time.monotonic()
+        deadline = started_monotonic + self.config["limits"]["startup_timeout_s"]
         version = check_version(self.config, deadline)
-        session = _Session(self.config, deadline)
+        session = _Session(self.config, deadline, self.environment)
         try:
             session.initialize()
             account = session.call("account/read", {"refreshToken": False}, "account_unavailable")
@@ -183,7 +204,7 @@ class NativeMetadata:
                 seen.add(cursor)
             quota = session.call("account/rateLimits/read", {}, "quota_unknown")
             return {"account": account, "models": sorted(set(models)), "rate_limits": quota,
-                    "sampled_at_ms": time.time_ns() // 1_000_000,
-                    "sampled_monotonic": time.monotonic(), "version": version}
+                    "sampled_at_ms": started_at_ms,
+                    "sampled_monotonic": started_monotonic, "version": version}
         finally:
             session.close()

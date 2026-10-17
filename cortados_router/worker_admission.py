@@ -3,6 +3,8 @@
 # DEPENDS: NativeMetadata observations, native scarcity adapter, immutable resources.
 """Admission facts are observations, never durable authorization tokens."""
 
+import time
+
 from integrations.mcp.schemas import WorkerError
 from .scarcity_codex_native import project
 from .selection_resources import SelectionResources
@@ -13,7 +15,7 @@ from .selection_resources import SelectionResources
 CAPTURED_MODELS = frozenset(("gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"))
 
 
-def validate_snapshot(snapshot):
+def validate_snapshot(snapshot, *, admission=True):
     account_response = snapshot.get("account")
     if not isinstance(account_response, dict):
         raise WorkerError("account_unavailable", "Native account metadata is unavailable")
@@ -24,7 +26,7 @@ def validate_snapshot(snapshot):
         raise WorkerError("subscription_required", "A native ChatGPT subscription login is required")
     if account.get("type") != "chatgpt" or account_response.get("requiresOpenaiAuth") is not True:
         raise WorkerError("account_unavailable", "Native subscription account is unavailable")
-    return project(snapshot.get("rate_limits"))
+    return project(snapshot.get("rate_limits"), admission=admission)
 
 
 def permissions(arguments, config):
@@ -44,7 +46,15 @@ def admit(arguments, config, metadata):
         raise WorkerError("invalid_request", "timeout_s exceeds the operator maximum")
     permissions(arguments, config)
     snapshot = metadata.snapshot()
+    from .quota_admission import _age, _maximum, _number
+    sampled = snapshot.get("sampled_at_ms")
+    row = {"observed_at": sampled / 1000 if _number(sampled) else None,
+           "observed_monotonic": snapshot.get("sampled_monotonic")}
+    if _age(row, time.time(), time.monotonic(), _maximum(config)) is None:
+        raise WorkerError("quota_unknown", "Native quota observation is stale or invalid")
     record = validate_snapshot(snapshot)
+    if any(w["reset_epoch"] > row["observed_at"] + w["window_s"] for w in record["windows"]):
+        raise WorkerError("quota_unknown", "Native quota reset exceeds its observed window")
     models = set(config["model_allowlist"]) & CAPTURED_MODELS & set(snapshot["models"])
     constraints = arguments["constraints"]
     if "allowed_models" in constraints:

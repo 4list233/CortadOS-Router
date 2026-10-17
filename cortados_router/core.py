@@ -318,29 +318,29 @@ def native_lane_for(model_or_family: str) -> str | None:
     return None
 
 
-def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
+def _pool_tokens_per_pct(c: dict[str, Any], *, lanes=None, costs=None) -> float | None:
     """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json; None if unknown."""
     try:
         sc = _scarcity_module()
-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        lane = ((sc.current().get("lanes") or {}) if lanes is None else lanes).get(c["lane"]) or {}
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
                ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
-        uc = (sc.unit_costs() or {}).get(key or "") or {}
+        uc = ((sc.unit_costs() or {}) if costs is None else costs).get(key or "") or {}
         return float(uc["tokens_per_pct"]) if uc.get("tokens_per_pct") else None
     except Exception:
         return None
 
 
-def _tokens_left_for(c: dict[str, Any]) -> float | None:
+def _tokens_left_for(c: dict[str, Any], *, lanes=None, costs=None) -> float | None:
     """Absolute room in the pool this route draws on, from the learned unit cost (None when unknown)."""
     try:
         sc = _scarcity_module()
-        lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        lane = ((sc.current().get("lanes") or {}) if lanes is None else lanes).get(c["lane"]) or {}
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
                ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
-        uc = (sc.unit_costs() or {}).get(key or "") or {}
+        uc = ((sc.unit_costs() or {}) if costs is None else costs).get(key or "") or {}
         return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
     except Exception:
         return None

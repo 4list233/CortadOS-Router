@@ -96,6 +96,10 @@ def route_task(arguments, config, metadata):
     latest = worker_admission.admit(arguments, config, metadata)
     if mode == "s1" and latest["snapshot"]["sampled_at_ms"] != admission["snapshot"]["sampled_at_ms"]:
         resolved = _resolve(decision, arguments, latest, packet)
+        final = worker_admission.admit(arguments, config, metadata)
+        if final["snapshot"]["sampled_at_ms"] != latest["snapshot"]["sampled_at_ms"]:
+            raise WorkerError("quota_unknown", "Quota changed during the final Router resolution")
+        latest = final
     chosen = resolved["chosen"]
     if chosen["model"] not in latest["models"]:
         raise WorkerError("model_unavailable", "The selected model is no longer admitted")

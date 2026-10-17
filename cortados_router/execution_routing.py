@@ -78,8 +78,18 @@ def scoring_input(prompt, task_context=None, recall=''):
 def select(core, *, prompt, session_id='', face='default', platform='', entrypoint='agent',
            turn_id='', api_request_id='', input_fit=None, task_context=None, recall='',
            current_provider='', current_model='', constraints=None, escalate=None,
-           credential_resolver=None, route_id=None, log_platform=None):
+           credential_resolver=None, route_id=None, log_platform=None, quota_config=None):
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
+    from cortados_router import quota_admission
+    if quota_config is None:
+        from integrations.mcp.config import load_config
+        quota_config = load_config('/Users/velox/.config/cortados-workers/config.json')
+    table = core.table()
+    candidates = [r for m in (core.model_scores() or {}).get('models', []) for r in m.get('reach', [])]
+    candidates += [r for rows in table['candidates'].values() for r in rows]
+    candidates += [dict(r, provider='codex-cli') for r in candidates if r.get('provider') == 'openai-codex']
+    resources = quota_admission.current_resources(candidates, config=quota_config)
+    allowed = set(resources.allowed_routes)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
     request, projection = scoring_input(prompt, task_context, recall)
     version = core.S1_CURRENT
@@ -100,11 +110,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                 _scores[key] = (time.monotonic(), dict(decision))
                 while len(_scores) > 256:
                     _scores.popitem(last=False)
-    table = core.table()
-    candidates = [r for m in (core.model_scores() or {}).get('models', []) for r in m.get('reach', [])]
-    candidates += [r for rows in table['candidates'].values() for r in rows]
-    allowed = {(r['provider'], r['model']) for r in candidates if r['provider'] != 'custom'}
-    allowed |= {('codex-cli', m) for p, m in allowed if p == 'openai-codex'}
+    resources = quota_admission.current_resources(candidates, config=quota_config)
+    allowed &= set(resources.allowed_routes)
     capabilities = set((constraints or {}).get('required_capabilities') or [])
     if capabilities - {'vision'}:
         raise ValueError('Unsupported required model capability')
@@ -134,7 +141,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     while allowed:
         route = core.resolve(decision, unit, input_fit=fit, escalate=escalate,
                              allowed_routes=tuple(sorted(allowed)), execution=True,
-                             minimum_band=(constraints or {}).get('min_band'))
+                             minimum_band=(constraints or {}).get('min_band'), resources=resources)
         choice = route.get('chosen')
         if not choice:
             break
@@ -146,7 +153,11 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
             allowed = {p for p in allowed if p[0] != provider}
             continue
         # The resolver must never return a spent candidate as execution advice.
-        if not core.candidate_health(choice, core.lane_health()).get('ok', True):
+        preflight = quota_admission.source_preflight(provider, model, config=quota_config)
+        if preflight['quota']['status'] != 'available':
+            failures.append(f"{provider}/{model}: {preflight['quota']['reason']}")
+            break
+        if not core.candidate_health(choice, resources.health()).get('ok', False):
             allowed.discard((provider, model))
             failures.append(f'{provider}/{model}: capacity unavailable')
             continue
@@ -162,6 +173,6 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         return {'router': ROUTER, 'provider': provider, 'model': model, 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
                 'band': route['band'], 'projection': projection,
-                'decision': decision, 'route': route}
+                'decision': decision, 'route': route, **preflight}
     return {'router': ROUTER, 'error': 'No authenticated, available model fits the assembled request and route constraints. '
             + '; '.join(failures), 'degraded': bool(decision.get('degraded'))}

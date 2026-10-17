@@ -4,19 +4,20 @@
 """Native Codex subscription windows, without PTY probes or live-state reads."""
 
 import time
+import math
 
 from integrations.mcp.schemas import WorkerError
 from . import scarcity
 
 
-def project(value, *, now=None):
+def project(value, *, now=None, admission=True):
     now = time.time() if now is None else now
     if not isinstance(value, dict):
         raise WorkerError("quota_unknown", "Current included usage is unavailable")
     allowed = value.get("ordinaryUsageAllowed")
-    if allowed is False:
+    if allowed is False and admission:
         raise WorkerError("quota_spent", "Included native usage is not permitted")
-    if allowed is not True:
+    if allowed is not True and allowed is not False:
         raise WorkerError("quota_unknown", "Current included usage permission is unavailable")
     buckets = value.get("rateLimitsByLimitId")
     if buckets is not None:
@@ -27,7 +28,8 @@ def project(value, *, now=None):
         bucket = value.get("rateLimits")
     if not isinstance(bucket, dict) or bucket.get("limitId") not in (None, "codex") or bucket.get("normalModelSlug") is not None:
         raise WorkerError("quota_unknown", "Native quota model mapping is not captured")
-    if bucket.get("spendControlReached") is True or bucket.get("rateLimitReachedType") is not None:
+    spent = allowed is False or bucket.get("spendControlReached") is True or bucket.get("rateLimitReachedType") is not None
+    if spent and admission:
         raise WorkerError("quota_spent", "Native subscription reports its usage limit reached")
     windows = []
     for name in ("primary", "secondary"):
@@ -37,13 +39,15 @@ def project(value, *, now=None):
         if not isinstance(window, dict):
             raise WorkerError("quota_unknown", "Native quota window is invalid")
         used, duration, reset = (window.get(key) for key in ("usedPercent", "windowDurationMins", "resetsAt"))
-        if (type(used) is not int or not 0 <= used <= 100 or type(duration) is not int or duration <= 0
-                or type(reset) is not int or not now < reset <= now + duration * 60):
+        if (type(used) not in (int, float) or not math.isfinite(used) or not 0 <= used <= 100 or type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0
+                or type(reset) not in (int, float) or not math.isfinite(reset) or not now < reset <= now + duration * 60):
             raise WorkerError("quota_unknown", "Native quota window geometry is unavailable or invalid")
-        windows.append({**scarcity.window_view(name, used, reset, duration * 60, now=now), "pool": "all"})
-    if not windows:
+        label = "week" if duration == 10080 else "5-hour" if duration == 300 else f"{duration:g}-minute"
+        windows.append({**scarcity.window_view(label, used, reset, duration * 60, now=now), "pool": "all", "native_window": name})
+    if not windows and not (spent and not admission):
         raise WorkerError("quota_unknown", "Native quota contains no complete usage window")
     result = scarcity.finish("codex", {"source": "codex-app-server", "windows": windows})
-    if result["refusing"]:
+    result["refusing"] = result["refusing"] or spent
+    if result["refusing"] and admission:
         raise WorkerError("quota_spent", "Included native usage is spent")
     return result
