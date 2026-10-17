@@ -7,7 +7,6 @@ bar is the stronger teacher; when Forest corrects routes in Discord those rows o
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import statistics
@@ -17,9 +16,21 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
-from student import N_OPTIONS, Scorer, encode
+from student import N_OPTIONS, Scorer, encode, messages
 
 BANDS = ["R0", "R1", "R2", "R3", "R4"]
+
+
+from cortados_router.learning_data import bind_snapshot, evaluation_identity
+
+
+def cache_identity(holdout, fail_up, current, snapshot=None, labels=None):
+    return evaluation_identity(holdout, fail_up=fail_up, outward_at=OUTWARD_AT,
+        adapter=current.get('adapter'), base=current.get('base'),
+        partitions=snapshot['partitions'] if snapshot is not None else None, labels=labels,
+        scorer_path=Path(__file__).resolve().parent / 'student.py', scorer_config=current,
+        scorer_material={'messages': messages('', 'interactive'), 'questions': QUESTIONS,
+                         'options': N_OPTIONS, 'work_kinds': core.WORK_KINDS, 'urgency': core.URGENCY})
 
 
 def band_of(a: dict) -> str:
@@ -107,22 +118,16 @@ def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
             "latency_ms_median": int(statistics.median(lat)) if lat else None}
 
 
-def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, str | None]:
+def promoted_bar_for_laya(holdout: list, fail_up: float, snapshot=None, labels=None) -> tuple[dict | None, str | None]:
     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
-    writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
-    same inference settings. Never loads MLX here (the laya venv has none; only the 8B may sit beside the trainer). Returns (bar, source)."""
+    writes (bar-<run>-<hkey>.json) with matching request, label, partition, model and scorer content identities. Never loads MLX here (the laya venv has none; only the 8B may sit beside the trainer). Returns (bar, source)."""
     cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
     if not cur.get("adapter"):
         return None, None
-    hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+    hkey = cache_identity(holdout, fail_up, cur, snapshot, labels)
     cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
     if cache_p.exists():
         return json.loads(cache_p.read_text()), f"promoted adapter {cur['adapter']} re-graded on this holdout (cached {cache_p.name})"
-    rep_p = Path(cur.get("report") or "")
-    if rep_p.exists():
-        rep = json.loads(rep_p.read_text())
-        if rep.get("holdout_rows") == len(holdout) and rep.get("fail_up_below") == fail_up and rep.get("outward_at") == OUTWARD_AT and rep.get("candidate"):
-            return rep["candidate"], f"promoted adapter's own report {rep_p} (same {len(holdout)} holdout rows, same fail-up/outward settings; not re-graded)"
     raise RuntimeError(f"no cached bar for {cur['adapter']} on this holdout ({cache_p.name}); grade it once with the qwen engine to create the cache")
 
 
@@ -140,12 +145,15 @@ def main() -> int:
     if a.engine == "laya" and not a.checkpoint:
         ap.error("--engine laya requires --checkpoint <dir>")
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+    snapshot = bind_snapshot(DATA)
+    reqs = {r["id"]: r for r in snapshot["rows"]}
+    labels = read_labels()
     samples = defaultdict(list)
-    for l in read_labels():
-        samples[l["id"]].append(l["answers"])
+    for l in labels:
+        if l["id"] in reqs and valid_answers(l["answers"]):
+            samples[l["id"]].append(l["answers"])
     holdout = [(reqs[i], teacher_view(s)) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "holdout"]
-    valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "train" and int(hashlib.sha1(("v" + i).encode()).hexdigest(), 16) % 10 == 0]
+    valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and snapshot["partitions"][i] == "valid"]
     if a.engine == "laya":
         sys.path.insert(0, str(Path(__file__).resolve().parent / "laya"))
         from predict import LayaScorer                    # duck-types Scorer: .T and .score(request, unit_kind) -> answers/probs/confidence/ms
@@ -159,7 +167,7 @@ def main() -> int:
               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
               "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
     if a.baseline:
-        cache_p = DATA / "baseline-incumbent.jsonl"
+        cache_p = DATA / ("baseline-incumbent-" + cache_identity(holdout, a.fail_up, {"base": core.ENGINE_MODEL}, snapshot, labels) + ".jsonl")
         cache = {x["id"]: x for x in read_jsonl(cache_p)}
 
         def incumbent(r):
@@ -183,7 +191,7 @@ def main() -> int:
     bar = None
     if a.engine == "laya":
         try:
-            bar, src = promoted_bar_for_laya(holdout, a.fail_up)
+            bar, src = promoted_bar_for_laya(holdout, a.fail_up, snapshot, labels)
             if src:
                 report["bar_source"] = src
         except Exception as exc:
@@ -192,7 +200,7 @@ def main() -> int:
         try:
             cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
             if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
-                hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+                hkey = cache_identity(holdout, a.fail_up, cur, snapshot, labels)
                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
                 if cache_p.exists():
                     bar = json.loads(cache_p.read_text())

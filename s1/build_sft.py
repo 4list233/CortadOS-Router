@@ -3,13 +3,13 @@ each answer, so plain cross-entropy learns the teacher's distribution (soft labe
 Splits (fixed by id hash): holdout 15% is never written here. Of the rest, 10% = valid (early stopping + temperature calibration)."""
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 import sys
 from collections import Counter, defaultdict
 
-from common import DATA, core, read_jsonl, read_labels
+from common import DATA, core, read_jsonl, read_labels, valid_answers
+from cortados_router.learning_data import bind_snapshot, training_tokenizer, training_context
 from student import messages
 
 
@@ -27,15 +27,22 @@ def band_of(a: dict) -> str:
 
 
 def main() -> int:
-    reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+    snapshot = bind_snapshot(DATA)
+    reqs = {r["id"]: r for r in snapshot["rows"]}
+    tokenizer = None
+    if any(row.get("source") == "mcp-worker" for row in reqs.values()):
+        try:
+            tokenizer = training_tokenizer()
+        except Exception:
+            tokenizer = None
     by_id = defaultdict(list)
     for l in read_labels():
-        if l["id"] in reqs and reqs[l["id"]]["split"] == "train":
+        if l["id"] in reqs and reqs[l["id"]]["split"] == "train" and valid_answers(l["answers"]):
             by_id[l["id"]].append(l["answers"])
     train, valid, bands = [], [], Counter()
     for rid, samples in by_id.items():
         r = reqs[rid]
-        is_valid = int(hashlib.sha1(("v" + rid).encode()).hexdigest(), 16) % 10 == 0
+        is_valid = snapshot["partitions"][rid] == "valid"
         b = Counter(band_of(a) for a in samples).most_common(1)[0][0]
         bands[b] += 1
         # rare bands are the expensive mistakes: repeat them (requests stay real; nothing synthetic is invented here)
@@ -44,6 +51,10 @@ def main() -> int:
         top = max(d_of(a) for a in samples)
         for a in samples:
             ex = {"messages": messages(r["request"], r["unit_kind"], a)}
+            refusal = training_context(r, ex["messages"], tokenizer)
+            if refusal:
+                print(json.dumps(refusal, sort_keys=True))
+                continue
             # Forest 2026-09-24: weight the worst (hardest-reading) answers more — the sample that read the task as hardest
             # counts UPWEIGHT_HIGH times when the samples disagree, so under-estimation is the costlier error in the loss
             k = reps * (UPWEIGHT_HIGH if (not is_valid and len(samples) > 1 and d_of(a) == top and any(d_of(b) < top for b in samples)) else 1)

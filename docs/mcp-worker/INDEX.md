@@ -28,6 +28,15 @@ publication is outside this task.
 | `acceptance/native_profile/` | Independent QA; nine version/capture cases and real per-model 0.163.0 captures. |
 | `bin/route-crons.py` | Router; adopted cron outcome collector, occurrence attribution, saved job pins remain inputs; AC-F02/F03 and original cron integration. |
 | `integrations/mcp/native_profile.py` | Router; exact captured-version observation and legacy job provenance; AC-N01–N04. |
+| [LEARNING-CONTEXT.md](LEARNING-CONTEXT.md) | RT-MCP-LEARNING-003; independent context, feedback, learning and activation contract; AC-L01–L12. |
+| `acceptance/mcp_learning/` | Independent MCP QA; protected context/feedback/collection/pipeline exams and synthetic captures; builder read-only. |
+| `cortados_router/task_evidence.py` | Exact evidence validation, scorer/worker projections, provenance and pure `context_requirements`; route_task/frontend call this owner; no admission or storage; AC-L01–L04. |
+| `integrations/mcp/job_store.py::feedback` | Sole jobs.db feedback writer; append-only assertion transaction, ownership and replay; broker calls it; AC-L05. |
+| `cortados_router/learning_source.py::read_observations` | Read-only jobs/feedback and route snapshots; validates source types and assembles native/planner observations without artifact reads; AC-L06/L07/L10. |
+| `cortados_router/learning_data.py::collect_mcp` | Sole current-observation publisher; locked/fsynced request revisions then projection; dataset calls it; AC-L06–L08. |
+| `cortados_router/learning_data.py::eligible_rows` | Shared revision/group/partition eligibility; `bind_snapshot` binds one phase; label/build_sft/evaluate and later enabled adapters use this owner; AC-L09. |
+| `cortados_router/learning_data.py` | Shared teacher payload/provenance, SFT token measurement and content-sensitive evaluation identity; s1/common re-exports its unchanged `split_of`; AC-L08/L09. |
+| `tests/test_mcp_learning.py` | Builder regressions for source lifetime/containment/WAL visibility, explicit evidence budgets, connected partitions and cache content identity. |
 | `integrations/mcp/` | Scoped production builder after D/A approval; MCP service, lifecycle and native boundary. |
 | `cortados_router/route_task.py` | Scoped production builder; optional scoring and existing resolver integration. |
 | `cortados_router/worker_admission.py` | Scoped production builder; common execution admission. |
@@ -36,3 +45,9 @@ publication is outside this task.
 The [original branch plan](../SUBAGENT-MCP-PLAN.md) remains historical until the reviewed contract
 supersedes its implementation details. No document here changes CortadOS's global decisions log or
 claims that its live Hermes deployment has been modified.
+
+The standalone learning implementation exposes installed-owner helpers to the separate activation
+package. Its source reads only accepted SQLite evidence; requests and labels retain immutable revisions,
+and `mcp-observations.jsonl` can be rebuilt by collection. The main-phase protected exam is the five
+modules named in [the exam README](../../acceptance/mcp_learning/README.md); activation remains a
+separate required stage. Root records full-inventory and performance results after independent reruns.

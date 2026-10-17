@@ -37,6 +37,10 @@ SYSTEM = (core.SYSTEM + "\n\nYou are the TEACHER producing training labels. You 
           "Reply with ONLY a JSON array, one object per request, in the same order, each: {\"i\": <the request's i>, "
           + ", ".join(f'"{q}": …' for q in QUESTIONS) + "}. No prose, no code fence.")
 
+from cortados_router.learning_data import (bind_snapshot, teacher_payload,
+    label_provenance, TEACHER_EVIDENCE_NOTE)
+SYSTEM += '\n\n' + TEACHER_EVIDENCE_NOTE
+
 
 def _env() -> dict[str, str]:
     env = dict(os.environ)
@@ -64,13 +68,13 @@ def system_prompt() -> str:
         return SYSTEM
     return (core.SYSTEM + "\n\nYou are the TEACHER producing training labels for ONLY these questions: " + ", ".join(ONLY) + ". Read each definition "
             "again and apply it literally. Reply with ONLY a JSON array, one object per request, in the same order, each: {\"i\": <the request's i>, "
-            + ", ".join(f'"{q}": …' for q in ONLY) + "}. No prose, no code fence.")
+            + ", ".join(f'"{q}": …' for q in ONLY) + "}. No prose, no code fence." + "\n\n" + TEACHER_EVIDENCE_NOTE)
 
 
 def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
     cwd = STATE / "teacher-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps([{"i": n, "unit_kind": r["unit_kind"], "request": r["request"]} for n, r in enumerate(batch)], ensure_ascii=False)
+    payload = json.dumps(teacher_payload(batch), ensure_ascii=False)
     argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence", "--max-turns", "1", "--tools", "", "--disable-slash-commands",
             "--strict-mcp-config", "--setting-sources", "project", "--model", model, "--system-prompt", system_prompt()]
     p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=_env())
@@ -101,11 +105,11 @@ def work(job: tuple[str, int, list[dict]]) -> int:
             if ONLY:
                 if all(q in a for q in ONLY) and valid_answers({**DEFAULTS, **{q: a[q] for q in ONLY}}):
                     f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()), "override": True,
-                                        "answers": {q: a[q] for q in ONLY}}, ensure_ascii=False) + "\n")
+                                        **label_provenance(batch[a["i"]]), "answers": {q: a[q] for q in ONLY}}, ensure_ascii=False) + "\n")
                     good += 1
             elif valid_answers(a):
                 f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
-                                    "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
+                                    **label_provenance(batch[a["i"]]), "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
                 good += 1
     try:                                                   # the subscription ledger sees teacher work like any other lane use
         # The usage ledger is CortadOS's PTY plugin ($CORTADOS_PTY_PLUGIN, else <CORTADOS_REPO>/plugins/cortados-pty).
@@ -131,7 +135,7 @@ def main() -> int:
     global LABELS
     if ONLY:
         LABELS = DATA / f"labels-override-{'-'.join(ONLY)}.jsonl"
-    rows = [r for r in read_jsonl(DATA / "requests.jsonl") if a.split in ("all", r["split"])]
+    rows = [r for r in bind_snapshot(DATA)["rows"] if a.split in ("all", r["split"])]
     done = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(LABELS)}
     if ONLY:                                             # override rows only make sense where a full label exists
         full = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(DATA / "labels.jsonl")}

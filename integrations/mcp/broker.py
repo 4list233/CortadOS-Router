@@ -137,6 +137,11 @@ class Broker:
         if tool == '__hello':
             return {'ok': True}
         arguments = validate(tool, arguments, self.config)
+        if tool == 'context_requirements':
+            from cortados_router.task_evidence import context_requirements
+            return context_requirements(arguments, self.config)
+        if tool == 'job_feedback':
+            return self.store.feedback(arguments)
         if tool == 'route':
             async with self.admission_lock:
                 route = await asyncio.to_thread(route_task, arguments, self.config, self.metadata)

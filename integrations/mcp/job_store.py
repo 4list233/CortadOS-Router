@@ -66,6 +66,19 @@ class JobStore:
                     CREATE INDEX jobs_active ON jobs(active);
                     PRAGMA user_version=1;
                     COMMIT;''')
+            self.db.executescript("""BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS job_feedback (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL, feedback_id TEXT NOT NULL,
+                    argument_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+                    payload TEXT NOT NULL, UNIQUE(client_id,feedback_id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id));
+                CREATE TRIGGER IF NOT EXISTS job_feedback_no_update BEFORE UPDATE ON job_feedback
+                    BEGIN SELECT RAISE(ABORT,'feedback is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS job_feedback_no_delete BEFORE DELETE ON job_feedback
+                    BEGIN SELECT RAISE(ABORT,'feedback is append-only'); END;
+                COMMIT;""")
+            self.db.execute('PRAGMA foreign_keys=ON')
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA synchronous=FULL')
         except (sqlite3.Error, OSError, WorkerError) as exc:
@@ -135,6 +148,43 @@ class JobStore:
             raise
         self._event(record, None)
         return record, True
+
+    def feedback(self, arguments):
+        from .schemas import validate_feedback
+        arguments = validate_feedback(arguments, self.config)
+        encoded = canonical(arguments)
+        argument_hash = hashlib.sha256(encoded).hexdigest()
+        client = self.config['client_id']
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT client_id,record FROM jobs WHERE job_id=?',
+                                  (arguments['job_id'],)).fetchone()
+            if row is None or row[0] != client:
+                raise WorkerError('job_not_found', 'Job was not found')
+            if json.loads(row[1])['state'] not in TERMINAL:
+                raise WorkerError('job_not_terminal', 'Planner feedback requires a terminal job')
+            previous = self.db.execute(
+                'SELECT argument_hash,seq,created_at_ms,payload FROM job_feedback WHERE client_id=? AND feedback_id=?',
+                (client, arguments['feedback_id'])).fetchone()
+            if previous:
+                if previous[0] != argument_hash:
+                    raise WorkerError('idempotency_conflict', 'Feedback identity has different arguments')
+                seq, created = previous[1:3]
+            else:
+                created = max(0, utc_ms())
+                cursor = self.db.execute(
+                    'INSERT INTO job_feedback(client_id,job_id,feedback_id,argument_hash,created_at_ms,payload) VALUES (?,?,?,?,?,?)',
+                    (client, arguments['job_id'], arguments['feedback_id'], argument_hash, created, encoded.decode('utf-8')))
+                seq = cursor.lastrowid
+            self.db.execute('COMMIT')
+        except (sqlite3.Error, ValueError, KeyError, TypeError, WorkerError) as exc:
+            if self.db.in_transaction:
+                self.db.execute('ROLLBACK')
+            if isinstance(exc, WorkerError):
+                raise
+            raise WorkerError('storage_error', 'Planner feedback did not commit') from exc
+        return {'ok': True, 'feedback': {'job_id': arguments['job_id'], 'feedback_id': arguments['feedback_id'],
+            'seq': seq, 'created_at_ms': created, 'verdict': arguments['verdict'], 'verification_status': 'planner_asserted'}}
 
     def _save(self, record):
         try:

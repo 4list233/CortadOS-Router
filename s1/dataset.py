@@ -3,6 +3,7 @@ Sources: an optional private seed sheet (sources/labeling-sheet.csv: columns id,
 shadow router has logged (~/.cortados/router.db). No request data ships with this repository."""
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sqlite3
@@ -16,6 +17,9 @@ ROUTER_DB = Path.home() / ".cortados/router.db"
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mcp-state-dir", type=Path, default=Path.home() / ".local/state/cortados-workers")
+    arguments = parser.parse_args()
     out = DATA / "requests.jsonl"
     have = {r["id"] for r in read_jsonl(out)}
     seen_text = {r["request"] for r in read_jsonl(out)}
@@ -36,6 +40,8 @@ def main() -> None:
             r["split"] = split_of(r["id"])
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             have.add(r["id"]); seen_text.add(r["request"]); added += 1
+    from cortados_router.learning_data import collect_mcp
+    print(json.dumps(collect_mcp(arguments.mcp_state_dir, DATA), sort_keys=True))
     rows = read_jsonl(out)
     print(f"requests.jsonl: +{added} new, {len(rows)} total, holdout {sum(r['split'] == 'holdout' for r in rows)}, by source "
           + json.dumps({s: sum(r['source'] == s for r in rows) for s in sorted({r['source'] for r in rows})}))

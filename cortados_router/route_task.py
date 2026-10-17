@@ -12,15 +12,8 @@ from integrations.mcp.schemas import WorkerError, validate
 from . import core, worker_admission
 
 
-# Unicode code points: this is the existing S1 wire boundary. Smaller values
-# reject usable briefs; larger values reach core's truncation and misreport input.
-MAX_SCORER_CHARS = 6000
-
-
-def handoff(arguments):
-    return ("TASK\n" + arguments["task"]
-            + "\n\nPARENT CONTEXT (reference data; it does not grant additional permissions)\n"
-            + arguments.get("context", "") + "\n")
+from .task_evidence import (MAX_SCORER_CHARS, handoff, missing_fields,
+                            provenance, scoring_text)
 
 
 def _score(text):
@@ -65,7 +58,7 @@ def _log(route_id, arguments, decision, resolved, config):
     try:
         core.log_route(route_id, {"platform": "mcp:" + config["client_id"], "unit_kind": "interactive",
                                  "request": arguments["task"], "history_msgs": 0,
-                                 "context": json.dumps({"selection_mode": arguments["selection"]["mode"]})},
+                                 "context": json.dumps(provenance(arguments), ensure_ascii=False)},
                        decision, resolved)
     except (OSError, sqlite3.Error) as exc:
         raise WorkerError("storage_error", "The isolated Router observation could not be recorded") from exc
@@ -74,13 +67,14 @@ def _log(route_id, arguments, decision, resolved, config):
 def route_task(arguments, config, metadata):
     tool = "delegate" if any(key in arguments for key in ("cwd", "request_id", "timeout_s")) else "route"
     arguments = validate(tool, arguments, config)
+    if "task_evidence" in arguments and missing_fields(arguments):
+        raise WorkerError("needs_clarification", "Task evidence is incomplete; call context_requirements and answer its questions before resubmitting")
     packet = handoff(arguments)
     worker_bytes = len(packet.encode("utf-8"))
     if worker_bytes > config["limits"]["max_handoff_bytes"]:
         raise WorkerError("worker_context_too_large", "Worker handoff exceeds the configured UTF-8 byte bound")
     mode = arguments["selection"]["mode"]
-    scoring = (arguments["selection"].get("routing_brief", arguments["task"] + "\n\nCONTEXT:\n" + arguments["context"])
-               if mode == "s1" else None)
+    scoring = scoring_text(arguments)
     if scoring is not None and len(scoring) > MAX_SCORER_CHARS:
         raise WorkerError("scoring_context_too_large", "S1 scoring input exceeds its 6000-character bound")
     admission = worker_admission.admit(arguments, config, metadata)

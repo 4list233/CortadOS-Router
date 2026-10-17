@@ -10,9 +10,9 @@ import time
 import uuid
 
 
-ERROR_CODES = frozenset("invalid_request idempotency_conflict model_unavailable account_unavailable subscription_required quota_unknown quota_spent scorer_unavailable scoring_context_too_large worker_context_too_large needs_clarification permission_refused connector_unavailable workspace_busy capacity_exhausted job_not_found storage_error native_version_mismatch native_protocol_error native_failed output_limit timeout cancel_requested broker_interrupted containment_failed".split())
+ERROR_CODES = frozenset("invalid_request idempotency_conflict model_unavailable account_unavailable subscription_required quota_unknown quota_spent scorer_unavailable scoring_context_too_large worker_context_too_large needs_clarification permission_refused connector_unavailable workspace_busy capacity_exhausted job_not_found storage_error native_version_mismatch native_protocol_error native_failed output_limit timeout cancel_requested broker_interrupted containment_failed job_not_terminal".split())
 JOB_STATES = frozenset("queued running cancelling succeeded failed cancelled timed_out interrupted".split())
-TOOLS = ("route", "delegate", "job_status", "job_result", "job_cancel")
+TOOLS = ("route", "delegate", "job_status", "job_result", "job_cancel", "context_requirements", "job_feedback")
 
 
 class WorkerError(Exception):
@@ -103,15 +103,46 @@ def _permissions(value):
     return {"network": network, "mcp_servers": result}
 
 
+def validate_feedback(arguments, config):
+    object_fields(arguments, ('job_id', 'feedback_id', 'verdict', 'summary', 'checks'),
+                  ('job_id', 'feedback_id', 'verdict', 'summary', 'checks'), 'job_feedback')
+    result = {key: uuid4(arguments[key], key) for key in ('job_id', 'feedback_id')}
+    verdict = arguments['verdict']
+    if verdict not in ('accepted', 'rejected', 'inconclusive'):
+        raise WorkerError('invalid_request', 'Invalid planner verdict')
+    summary = text_value(arguments['summary'], 'summary')
+    if not isinstance(arguments['checks'], list):
+        raise WorkerError('invalid_request', 'checks must be an array')
+    checks = []
+    for check in arguments['checks']:
+        object_fields(check, ('kind', 'reference', 'claim'), ('kind', 'reference', 'claim'), 'check')
+        if check['kind'] not in ('command', 'artifact', 'review') or check['claim'] not in ('passed', 'failed', 'unknown'):
+            raise WorkerError('invalid_request', 'Invalid check kind or claim')
+        checks.append(dict(check, reference=text_value(check['reference'], 'reference')))
+    claims = [check['claim'] for check in checks]
+    if (verdict == 'accepted' and (not claims or any(claim != 'passed' for claim in claims))
+            or verdict == 'rejected' and 'failed' not in claims):
+        raise WorkerError('invalid_request', 'Verdict requires supporting planner checks')
+    result.update(verdict=verdict, summary=summary, checks=checks)
+    # Complete UTF-8 feedback bytes share the established private handoff budget:
+    # smaller rejects useful checks, larger permits unbounded persistence/RPC.
+    if len(canonical(result)) > config['limits']['max_handoff_bytes']:
+        raise WorkerError('invalid_request', 'Planner feedback exceeds configured byte bound')
+    return result
+
+
 def validate(tool, arguments, config):
     """Insert only documented defaults; retain all task and array/string bytes."""
     if tool not in TOOLS:
         raise WorkerError("invalid_request", "Unknown worker tool")
+    if tool == "job_feedback":
+        return validate_feedback(arguments, config)
     if tool.startswith("job_"):
         object_fields(arguments, ("job_id",), ("job_id",), tool)
         return {"job_id": uuid4(arguments["job_id"], "job_id")}
     required = ("task", "selection")
-    allowed = required + ("context", "constraints", "permissions", "account_ref")
+    allowed = required + (("context", "task_evidence") if tool == "context_requirements" else
+                          ("context", "constraints", "permissions", "account_ref", "task_evidence"))
     if tool == "delegate":
         required += ("cwd", "request_id", "timeout_s")
         allowed += ("cwd", "request_id", "timeout_s")
@@ -131,6 +162,9 @@ def validate(tool, arguments, config):
               "context": text_value(arguments.get("context", ""), "context", blank=True),
               "selection": selection, "constraints": normalized_constraints,
               "permissions": _permissions(arguments.get("permissions", {})), "account_ref": "native-default"}
+    if "task_evidence" in arguments:
+        from cortados_router.task_evidence import validate_evidence
+        result["task_evidence"] = validate_evidence(arguments["task_evidence"])
     if tool == "delegate":
         cwd = text_value(arguments["cwd"], "cwd")
         if not os.path.isabs(cwd) or not os.path.isdir(cwd):

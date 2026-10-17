@@ -1,7 +1,6 @@
 """Shared pieces of the CortadOS Router S1 pipeline: the question set (imported from the live router so there is ONE definition), text cleaning, splits."""
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import re
@@ -17,9 +16,7 @@ QUESTIONS = core.FEATURES + ["outward", "work_kind", "urgency", "needs_clarifica
 clean_request = core.clean_request   # one definition, shared with the live hook
 
 
-def split_of(row_id: str) -> str:
-    """Fixed by hash, forever: a row never moves between train and holdout, whatever gets added later."""
-    return "holdout" if int(hashlib.sha1(row_id.encode()).hexdigest(), 16) % 100 < 15 else "train"
+from cortados_router.learning_data import split_of
 
 
 def read_jsonl(path: Path) -> list[dict]:
