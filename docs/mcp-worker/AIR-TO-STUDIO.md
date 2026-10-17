@@ -43,6 +43,18 @@ In Claude, `/mcp` should list `cortados-workers`. A useful initial instruction i
 > project path, relevant context and explicit permissions. Retrieve the worker result, review it,
 > and report verified outcomes through job_feedback.
 
+Studio-wide planner instructions are installed in `/Users/velox/.claude/CLAUDE.md`. New Claude
+sessions load this user-level file alongside the project's instructions. It teaches the workflow:
+`context_requirements` → evidence-rich `delegate` → inspect `job_result` → verified `job_feedback`.
+It also records that S1 chooses a worker, paths refer to the Studio, and connectors require explicit
+grants. No credentials or project-specific context are stored in the instructions.
+
+Open a new Claude session after installation. Use `/memory` or the Memory files section of `/context`
+to confirm the file is loaded, and `/mcp` to confirm the server is available. An existing session may
+read `/Users/velox/.claude/CLAUDE.md` explicitly. Instruction loading guides the planner; the MCP
+service still enforces its own quota and permission checks. This follows Claude Code's documented
+[user-level memory behavior](https://code.claude.com/docs/en/memory).
+
 All paths supplied to the workers refer to files on the Studio. A project stored only on the Air
 must first be made available on the Studio through your normal project workflow.
 
