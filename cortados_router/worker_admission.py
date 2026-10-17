@@ -4,6 +4,7 @@
 """Admission facts are observations, never durable authorization tokens."""
 
 import time
+import math
 
 from integrations.mcp.schemas import WorkerError
 from .scarcity_codex_native import project
@@ -63,5 +64,11 @@ def admit(arguments, config, metadata):
         models &= {arguments["selection"]["model"]}
     if not models:
         raise WorkerError("model_unavailable", "No captured native model satisfies the requested constraints")
-    return {"snapshot": snapshot, "models": tuple(sorted(models)),
-            "resources": SelectionResources.from_quota(record)}
+    resources = SelectionResources.from_quota(record)
+    if config.get("teacher_policy") == "training_labels_v1":
+        scarcity = resources.health().get("codex", {}).get("scarcity")
+        if type(scarcity) not in (int, float) or not math.isfinite(scarcity):
+            raise WorkerError("quota_unknown", "Teacher scarcity is unavailable")
+        if scarcity >= config["teacher_max_scarcity"]:
+            raise WorkerError("permission_refused", "Teacher scarcity ceiling reached")
+    return {"snapshot": snapshot, "models": tuple(sorted(models)), "resources": resources}

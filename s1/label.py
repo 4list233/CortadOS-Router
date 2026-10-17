@@ -19,7 +19,38 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# Every label mode enters the same immutable installed interpreter before project imports.
+_TEACHER_RELEASE = "/Users/velox/.local/share/cortados-workers/releases/training-teacher-v1-20261017"
+_TEACHER_PYTHON = _TEACHER_RELEASE + "/venv/bin/python"
+if (os.path.normpath(sys.executable) != _TEACHER_PYTHON
+        or os.path.normpath(sys.prefix) != _TEACHER_RELEASE + "/venv"):
+    if os.environ.get("CORTADOS_TEACHER_REEXEC_V1") == "1":
+        raise RuntimeError("teacher_release_mismatch")
+    if not os.path.isfile(_TEACHER_PYTHON):
+        raise RuntimeError("teacher_release_mismatch: interpreter unavailable")
+    _teacher_environment = dict(os.environ, CORTADOS_TEACHER_REEXEC_V1="1")
+    os.execve(_TEACHER_PYTHON, [_TEACHER_PYTHON, "-B", str(Path(__file__).resolve()), *sys.argv[1:]], _teacher_environment)
+    raise RuntimeError("teacher_release_mismatch: exec returned")
+
+_TEACHER_SITE = _TEACHER_RELEASE + "/venv/lib/python3.14/site-packages"
+sys.path.insert(0, _TEACHER_SITE)
+from cortados_router import teacher as _TEACHER, teacher_attempts as _ATTEMPTS
+from cortados_router import learning_data as _PINNED_LEARNING
+for _owner in (_TEACHER, _ATTEMPTS, _PINNED_LEARNING):
+    if Path(_owner.__file__).resolve() != Path(_TEACHER_SITE) / "cortados_router" / ( _owner.__name__.rsplit(".", 1)[-1] + ".py"):
+        raise RuntimeError("teacher_release_mismatch: owner origin")
+
 from common import DATA, QUESTIONS, REPO, core, read_jsonl, valid_answers
+
+_MCP_LEARNING = None
+if os.environ.get("CORTADOS_MCP_LEARNING_V1") == "1":
+    _INHERITED_SITE = "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages"
+    if os.environ.get("CORTADOS_MCP_LEARNING_SITE_PACKAGES") != _INHERITED_SITE:
+        raise RuntimeError("mcp_learning_release_unavailable: inherited binding differs")
+    _MCP_LEARNING = _PINNED_LEARNING
+if os.environ.get("CORTADOS_TRAINING_TEACHER_V1") == "1" and _MCP_LEARNING is None:
+    raise RuntimeError("mcp_learning_release_unavailable: teacher requires learning")
+
 
 STATE = Path.home() / ".cortados"
 LABELS = DATA / "labels.jsonl"
@@ -74,15 +105,10 @@ def system_prompt() -> str:
 def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
     cwd = STATE / "teacher-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(teacher_payload(batch), ensure_ascii=False)
-    argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence", "--max-turns", "1", "--tools", "", "--disable-slash-commands",
-            "--strict-mcp-config", "--setting-sources", "project", "--model", model, "--system-prompt", system_prompt()]
-    p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=_env())
-    out = json.loads(p.stdout)
-    if out.get("is_error"):
-        raise RuntimeError(str(out.get("result"))[:300])
-    m = re.search(r"\[[\s\S]*\]", out.get("result") or "")
-    return json.loads(m.group(0)) if m else [], out
+    from integrations.mcp.config import load_config
+    config = load_config(Path.home() / ".config/cortados-workers/config.json")
+    return _TEACHER.call_claude(model, batch, system_prompt=system_prompt(), environment=_env(),
+        cwd=str(cwd), config=config, max_scarcity=_MAX_SCARCITY)
 
 
 def work(job: tuple[str, int, list[dict]]) -> int:
@@ -97,45 +123,49 @@ def work(job: tuple[str, int, list[dict]]) -> int:
         if re.search(r"limit|429|quota|overloaded", msg, re.I):
             _stop.set()
         return 0
-    good = 0
-    with _write, LABELS.open("a") as f:
-        for a in answers:
-            if not (isinstance(a, dict) and isinstance(a.get("i"), int) and 0 <= a["i"] < len(batch)):
-                continue
-            if ONLY:
-                if all(q in a for q in ONLY) and valid_answers({**DEFAULTS, **{q: a[q] for q in ONLY}}):
-                    f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()), "override": True,
-                                        **label_provenance(batch[a["i"]]), "answers": {q: a[q] for q in ONLY}}, ensure_ascii=False) + "\n")
-                    good += 1
-            elif valid_answers(a):
-                f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
-                                    **label_provenance(batch[a["i"]]), "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
-                good += 1
-    try:                                                   # the subscription ledger sees teacher work like any other lane use
-        # The usage ledger is CortadOS's PTY plugin ($CORTADOS_PTY_PLUGIN, else <CORTADOS_REPO>/plugins/cortados-pty).
-        sys.path.insert(0, str(os.environ.get("CORTADOS_PTY_PLUGIN") or Path(core.REPO) / "plugins/cortados-pty"))
-        import usage
-        u = meta.get("usage") or {}
-        usage.record({"job_id": f"teacher-{meta.get('session_id', time.time())}", "runtime": "claude", "account": "subscription", "model": model, "session_id": meta.get("session_id"),
-                      "input_tokens": u.get("input_tokens"), "output_tokens": u.get("output_tokens"), "cache_read_tokens": u.get("cache_read_input_tokens"),
-                      "cache_write_tokens": u.get("cache_creation_input_tokens"), "source": "router-teacher", "label": "router-teacher",
-                      "dedup_key": f"teacher:{meta.get('session_id')}"})
-    except Exception as exc:
-        print(f"  ! teacher usage not recorded in the ledger: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
+    if ONLY:
+        good = _STORE.publish_override(batch, model=model, sample=sample, answers=answers,
+            only=ONLY, defaults=DEFAULTS, snapshot=_SNAPSHOT)
+    else:
+        good = _STORE.publish_claude(batch, model=model, sample=sample, answers=answers,
+            meta=meta, snapshot=_SNAPSHOT)
+    _TEACHER.record_claude_usage(model, meta)
     return good
 
 
-def main() -> int:
+def _main_locked() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0); ap.add_argument("--k", type=int, default=3); ap.add_argument("--batch", type=int, default=12)
     ap.add_argument("--workers", type=int, default=3); ap.add_argument("--split", default="all"); ap.add_argument("--only", default=""); ap.add_argument("--max-scarcity", type=float, default=SCARCITY_STOP, help="override the pool gate for an approved pass")
     a = ap.parse_args()
+    if os.environ.get("CORTADOS_TRAINING_TEACHER_V1") == "1" and not a.only:
+        if _MCP_LEARNING is None:
+            raise RuntimeError("mcp_learning_release_unavailable")
+        cwd = STATE / "teacher-cwd"
+        cwd.mkdir(parents=True, exist_ok=True)
+        with _STORE._handoff():
+            summary = _TEACHER.run_labels(data_dir=DATA, snapshot=_MCP_LEARNING.bind_snapshot(DATA),
+                options=vars(a), system_prompt=SYSTEM, claude_environment=_env(), claude_cwd=str(cwd),
+                worker_config_path=Path.home() / ".config/cortados-workers/teacher.json",
+                validate_answers=valid_answers, questions=QUESTIONS)
+        print(json.dumps(summary), flush=True)
+        return 0
+    if a.k < 1 or a.batch < 1 or a.workers < 1 or a.limit < 0 or a.split not in ("all", "train", "holdout"):
+        raise ValueError("Invalid label options")
+    global _MAX_SCARCITY
+    _MAX_SCARCITY = a.max_scarcity
     global ONLY
     ONLY = [q for q in a.only.split(",") if q]
+    if any(q not in QUESTIONS for q in ONLY):
+        raise ValueError("Unknown override question")
     global LABELS
+    LABELS = DATA / "labels.jsonl"
     if ONLY:
         LABELS = DATA / f"labels-override-{'-'.join(ONLY)}.jsonl"
-    rows = [r for r in bind_snapshot(DATA)["rows"] if a.split in ("all", r["split"])]
+    global _SNAPSHOT
+    _SNAPSHOT = _MCP_LEARNING.bind_snapshot(DATA) if _MCP_LEARNING is not None else None
+    rows = [r for r in (_SNAPSHOT["rows"] if _SNAPSHOT is not None else read_jsonl(DATA / "requests.jsonl"))
+            if a.split in ("all", r["split"])]
     done = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(LABELS)}
     if ONLY:                                             # override rows only make sense where a full label exists
         full = {(l["id"], l["teacher"], l["sample"]) for l in read_jsonl(DATA / "labels.jsonl")}
@@ -143,7 +173,8 @@ def main() -> int:
     jobs = []
     for split, model in TEACHER.items():
         for s in range(a.k):
-            todo = [r for r in rows if r["split"] == split and (r["id"], model, s) not in done]
+            todo = [r for r in rows if r["split"] == split and (r["id"], model, s) not in done
+                    and (ONLY or not _STORE.occupied(r, s, model, _SNAPSHOT))]
             random.Random(f"{split}-{s}").shuffle(todo)      # each sample sees different neighbours: no batch-context echo between samples
             jobs += [(model, s, todo[i:i + a.batch]) for i in range(0, len(todo), a.batch)]
     random.Random(7).shuffle(jobs)
@@ -163,6 +194,23 @@ def main() -> int:
                     _stop.set()
     print(f"done: {total} labels written" + (" (stopped early)" if _stop.is_set() else ""), flush=True)
     return 0
+
+
+_STORE = None
+_SNAPSHOT = None
+_MAX_SCARCITY = SCARCITY_STOP
+
+
+def main() -> int:
+    global _STORE
+    sys.path.insert(0, str(os.environ.get("CORTADOS_PTY_PLUGIN") or Path(core.REPO) / "plugins/cortados-pty"))
+    _stop.clear()
+    with _ATTEMPTS.LabelAttempts(DATA, validate_answers=valid_answers, questions=QUESTIONS) as store:
+        _STORE = store
+        try:
+            return _main_locked()
+        finally:
+            _STORE = None
 
 
 if __name__ == "__main__":

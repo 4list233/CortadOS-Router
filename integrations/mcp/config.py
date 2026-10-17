@@ -5,6 +5,7 @@
 
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -111,7 +112,7 @@ def load_config(path, raw=None):
     except (ValueError, UnicodeError) as exc:
         raise WorkerError("invalid_request", "Configuration must be valid UTF-8 JSON") from exc
     required = ("schema", "client_id", "state_dir", "codex_bin", "codex_home", "model_allowlist", "limits")
-    object_fields(config, required + ("allow_network", "connector_registry"), required, "configuration")
+    object_fields(config, required + ("allow_network", "connector_registry", "teacher_policy", "teacher_max_scarcity"), required, "configuration")
     if config["schema"] != "cortados.mcp-worker.config.v1":
         raise WorkerError("invalid_request", "Unsupported configuration schema")
     result = {"schema": config["schema"], "client_id": text_value(config["client_id"], "client_id"),
@@ -139,4 +140,16 @@ def load_config(path, raw=None):
         raise WorkerError("invalid_request", "connector_registry must be an object")
     result.update(allow_network=network, connector_registry={
         text_value(name, "connector name"): _connector(value) for name, value in registry.items()})
+    if "teacher_policy" in config or "teacher_max_scarcity" in config:
+        ceiling = config.get("teacher_max_scarcity")
+        # Scarcity is dimensionless; the inherited 0.7 ceiling conserves label quota.
+        # Lower ceilings defer more work; higher ceilings would broaden spending authority.
+        if (config.get("teacher_policy") != "training_labels_v1"
+                or type(ceiling) not in (int, float) or not math.isfinite(ceiling)
+                or not 0 <= ceiling <= 0.7 or result["model_allowlist"] != ["gpt-6.1-sol"]
+                or network or registry or result["limits"]["max_concurrent_jobs"] != 1
+                or result["limits"]["max_timeout_s"] != 600
+                or result["limits"]["metadata_max_age_s"] != 30):
+            raise WorkerError("invalid_request", "Invalid teacher admission policy")
+        result.update(teacher_policy="training_labels_v1", teacher_max_scarcity=ceiling)
     return result
