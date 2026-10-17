@@ -1,0 +1,86 @@
+{
+  "started_at": 1792270742.9389,
+  "module_origin": "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_admission.py",
+  "worker_turns": 0,
+  "caller_origin": "/Users/velox/.cortados-builds/quota-sources-activation/plugins/cortados-pty/runner.py",
+  "lanes": {
+    "cursor": {
+      "status": "available",
+      "kind": "subscription",
+      "lane": "cursor",
+      "pool": "cursor-models",
+      "observed_at": 1792270743.11879,
+      "age_s": 0.9031200408935547,
+      "source": "cursor native getCurrentPeriodUsage",
+      "reason": "Known fresh configured-source quota"
+    },
+    "claude": {
+      "status": "unknown",
+      "failure_class": "ValueError",
+      "reason": "Actual source could not be proven; worker not started"
+    },
+    "agy": {
+      "status": "unknown",
+      "failure_class": "ValueError",
+      "reason": "Actual source could not be proven; worker not started"
+    }
+  },
+  "cursor_windows": [
+    {
+      "window_s": 2678400.0,
+      "reset_epoch": 1794349955.0,
+      "window": "month (included, both pools)",
+      "used_pct": 100,
+      "elapsed_pct": 22.4,
+      "headroom_pct": 0,
+      "projected_pct_at_reset": 447,
+      "allowance_pct_per_h": 0.0,
+      "resets_at": "2026-11-10 17:32",
+      "resets_in_h": 577.6,
+      "scarcity": 1.0,
+      "expiring_pct": 0,
+      "pool": "info"
+    },
+    {
+      "window_s": 2678400.0,
+      "reset_epoch": 1794349955.0,
+      "window": "month (Cursor models: Grok, Composer, Auto)",
+      "used_pct": 100,
+      "elapsed_pct": 22.4,
+      "headroom_pct": 0,
+      "projected_pct_at_reset": 447,
+      "allowance_pct_per_h": 0.0,
+      "resets_at": "2026-11-10 17:32",
+      "resets_in_h": 577.6,
+      "scarcity": 1.0,
+      "expiring_pct": 0,
+      "pool": "cursor-models"
+    },
+    {
+      "window_s": 2678400.0,
+      "reset_epoch": 1794349955.0,
+      "window": "month (other models: Claude, GPT, Gemini \u2026)",
+      "used_pct": 33.22222222222222,
+      "elapsed_pct": 22.4,
+      "headroom_pct": 66.77777777777777,
+      "projected_pct_at_reset": 149,
+      "allowance_pct_per_h": 0.12,
+      "resets_at": "2026-11-10 17:32",
+      "resets_in_h": 577.6,
+      "scarcity": 0.9,
+      "expiring_pct": 0,
+      "pool": "other-models"
+    }
+  ],
+  "codex": {
+    "status": "available",
+    "kind": "subscription",
+    "lane": "codex",
+    "pool": "all",
+    "observed_at": 1792270744.1149492,
+    "age_s": 2.5721864590013865,
+    "source": "codex-app-server",
+    "reason": "Known fresh configured-source quota"
+  },
+  "completed_at": 1792270746.687188
+}

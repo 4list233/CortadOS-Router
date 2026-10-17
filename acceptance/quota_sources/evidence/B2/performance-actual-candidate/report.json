@@ -1,0 +1,1147 @@
+{
+  "source": "/Users/velox/.cortados-builds/cortados-router-repo",
+  "scope": "New actual-source owner with frozen synthetic child and real pure native file capture; no provider network or S1 inference.",
+  "comparison_limit": "Baseline has no actual-source owner and real Cursor admission fails containment. No successful old/new native latency ratio is claimed.",
+  "source_hashes": {
+    "cortados_router/quota_admission.py": "aae2704833d224a4c3a0f1f13001d82c47c34da34864a4787dcf470e4f710b03",
+    "cortados_router/quota_sources.py": "c61c3d91a950d0310ae5df9223cdb2bae238a44e31d9b5d45e628cdf8f9471cd",
+    "cortados_router/quota_observations.py": "9cd1c459c18d8e452625ab7241c89857dddb4f1cdb868faf4feba3622f0c1fd2"
+  },
+  "workloads": [
+    {
+      "name": "uncached_success",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 39.726625,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 34.681208,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 34.613333,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 34.521292,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 34.570166,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 34.330666,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 34.24,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 34.16675,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 34.545729,
+      "min_ms": 34.16675,
+      "max_ms": 39.726625,
+      "p95_ms": 39.726625
+    },
+    {
+      "name": "cache_hit",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 0.339458,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 0.347708,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 0.348833,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 0.337375,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 0.327417,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 0.344625,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 0.321125,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 0.329917,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 8,
+          "ms": 0.326083,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 9,
+          "ms": 0.331708,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 10,
+          "ms": 0.336541,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 11,
+          "ms": 0.353791,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 12,
+          "ms": 0.362583,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 13,
+          "ms": 0.354834,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 14,
+          "ms": 0.339792,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 15,
+          "ms": 0.377458,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 16,
+          "ms": 0.327167,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 17,
+          "ms": 0.347167,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 18,
+          "ms": 0.324458,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 19,
+          "ms": 0.337291,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 20,
+          "ms": 0.341459,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 21,
+          "ms": 0.344291,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 22,
+          "ms": 0.328791,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 23,
+          "ms": 0.336792,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 24,
+          "ms": 0.3355,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 25,
+          "ms": 0.35425,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 26,
+          "ms": 0.333083,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 27,
+          "ms": 0.330958,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 28,
+          "ms": 0.3505,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 29,
+          "ms": 0.34825,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 30,
+          "ms": 0.335625,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 31,
+          "ms": 0.351042,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 32,
+          "ms": 0.355375,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 33,
+          "ms": 0.335334,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 34,
+          "ms": 0.341167,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 35,
+          "ms": 0.344417,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 36,
+          "ms": 0.34375,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 37,
+          "ms": 0.343541,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 38,
+          "ms": 0.323875,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 39,
+          "ms": 0.3595,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 40,
+          "ms": 0.33675,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 41,
+          "ms": 0.337958,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 42,
+          "ms": 0.325542,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 43,
+          "ms": 0.3605,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 44,
+          "ms": 0.337709,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 45,
+          "ms": 0.339,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 46,
+          "ms": 0.331542,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 47,
+          "ms": 0.347166,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 48,
+          "ms": 0.354833,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 49,
+          "ms": 0.351209,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 50,
+          "ms": 0.350541,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 51,
+          "ms": 0.354,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 52,
+          "ms": 0.359833,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 53,
+          "ms": 0.336917,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 54,
+          "ms": 0.338125,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 55,
+          "ms": 0.346042,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 56,
+          "ms": 0.331125,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 57,
+          "ms": 0.389917,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 58,
+          "ms": 0.339792,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 59,
+          "ms": 0.341875,
+          "source_reads": 0,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 60,
+      "median_ms": 0.3404795,
+      "min_ms": 0.321125,
+      "max_ms": 0.389917,
+      "p95_ms": 0.362583
+    },
+    {
+      "name": "expiry",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 59.961291,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 60.633291,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 59.877583,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 58.019584,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 58.19425,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 58.0245,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 59.756792,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 56.431458,
+          "source_reads": 1,
+          "statuses": [
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 58.975521,
+      "min_ms": 56.431458,
+      "max_ms": 60.633291,
+      "p95_ms": 60.633291
+    },
+    {
+      "name": "unknown_failure",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 34.736083,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 34.626459,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 35.756833,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 33.896125,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 33.70825,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 33.827792,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 35.617,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 33.689917,
+          "source_reads": 1,
+          "statuses": [
+            "unknown"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 34.261292,
+      "min_ms": 33.689917,
+      "max_ms": 35.756833,
+      "p95_ms": 35.756833
+    },
+    {
+      "name": "same_source_concurrency",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 64.165166,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 66.703833,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 66.495958,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 66.438208,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 61.201041,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 64.825166,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 66.877291,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 66.457792,
+          "source_reads": 1,
+          "statuses": [
+            "available",
+            "available"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 66.44800000000001,
+      "min_ms": 61.201041,
+      "max_ms": 66.877291,
+      "p95_ms": 66.877291
+    },
+    {
+      "name": "spent_refusal",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 34.5165,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 34.498917,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 34.405708,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 34.439291,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 35.804166,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 34.094792,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 33.956917,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 34.771666,
+          "source_reads": 1,
+          "statuses": [
+            "spent"
+          ],
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 34.469104,
+      "min_ms": 33.956917,
+      "max_ms": 35.804166,
+      "p95_ms": 35.804166
+    },
+    {
+      "name": "native_file_capture",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 86.752292,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 1,
+          "ms": 87.2185,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 2,
+          "ms": 87.516167,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 3,
+          "ms": 87.594708,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 4,
+          "ms": 87.733875,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 5,
+          "ms": 86.819583,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 6,
+          "ms": 90.604166,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        },
+        {
+          "index": 7,
+          "ms": 91.202125,
+          "files": 33,
+          "provider_requests": 0,
+          "worker_turns": 0
+        }
+      ],
+      "n": 8,
+      "median_ms": 87.5554375,
+      "min_ms": 86.752292,
+      "max_ms": 91.202125,
+      "p95_ms": 91.202125
+    }
+  ],
+  "pass": true
+}

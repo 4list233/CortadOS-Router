@@ -1,0 +1,9 @@
+{
+  "observed_at": 1792270793.029984,
+  "teacher_origin": "/Users/velox/.cortados-builds/quota-sources-activation/train/label.py",
+  "owner_origin": "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_admission.py",
+  "worker_turns": 0,
+  "source_calls": 0,
+  "result": "quota_unknown",
+  "reason": "Claude actual teacher source is not enabled; no process started"
+}
