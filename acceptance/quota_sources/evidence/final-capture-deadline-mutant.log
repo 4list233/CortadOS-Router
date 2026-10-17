@@ -1,0 +1,37 @@
+test_cached_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_cached_observation_expiring_during_final_capture_refuses) ... FAIL
+test_new_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_new_observation_expiring_during_final_capture_refuses) ... FAIL
+
+======================================================================
+FAIL: test_cached_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_cached_observation_expiring_during_final_capture_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_final_capture_deadline.py", line 45, in test_cached_observation_expiring_during_final_capture_refuses
+    self._cross_deadline_during_final_capture(cached=True)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_final_capture_deadline.py", line 38, in _cross_deadline_during_final_capture
+    self.assertEqual(result['status'], 'unknown', 'Final recapture crossed native validity')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'available' != 'unknown'
+- available
++ unknown
+ : Final recapture crossed native validity
+
+======================================================================
+FAIL: test_new_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_new_observation_expiring_during_final_capture_refuses)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_final_capture_deadline.py", line 42, in test_new_observation_expiring_during_final_capture_refuses
+    self._cross_deadline_during_final_capture(cached=False)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_final_capture_deadline.py", line 38, in _cross_deadline_during_final_capture
+    self.assertEqual(result['status'], 'unknown', 'Final recapture crossed native validity')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'available' != 'unknown'
+- available
++ unknown
+ : Final recapture crossed native validity
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.101s
+
+FAILED (failures=2)

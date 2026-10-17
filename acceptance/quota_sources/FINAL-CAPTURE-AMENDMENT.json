@@ -1,0 +1,36 @@
+{
+  "contract": "RT-QUOTA-SOURCES-006",
+  "exam_owner": "/root/quota_evaluation_qa",
+  "base_freeze_commit": "f484e4536662e6466984f9f1c44f64bf375fd8b9",
+  "AC": [
+    "AC-QS04",
+    "AC-QS06"
+  ],
+  "methods_added": 2,
+  "methods_total_with_status_amendment": 81,
+  "old_tests_changed": false,
+  "purpose": "Final recapture crosses private proof deadline minus configured startup allowance on both first read and cache hit; quota remains within 30-second age.",
+  "current_owner_sha256": "2521780d8a98df4990b235f3ba15f9eab5aed5e21a9972e6c31b30394ed6b052",
+  "current_result": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0
+  },
+  "mutation": "Remove exactly the post-recapture _usable guard from check_actual in isolated interpreter memory. No production file edited.",
+  "mutant_result": {
+    "tests": 2,
+    "failures": 2,
+    "errors": 0,
+    "skips": 0
+  },
+  "classification": "Independent amplification; current in-progress builder already repaired guard, not a stable-candidate defect.",
+  "command": "python -m unittest -v acceptance.quota_sources.test_final_capture_deadline",
+  "mutant_command": "PYTHONPATH=. python acceptance/quota_sources/evidence/run-final-capture-mutant.py",
+  "files": {
+    "acceptance/quota_sources/test_final_capture_deadline.py": "81d147fbc7f74adaba36ca32a5eb8e11abaf44eea7716700b74f40e43f48de8a",
+    "acceptance/quota_sources/evidence/final-capture-deadline-current.log": "d95a12fe0c53b8b5f80ab1278e045179d0cece3d2350270987826a1c31a05842",
+    "acceptance/quota_sources/evidence/final-capture-deadline-mutant.log": "31e3ba33b6d45bb3b9f751c6c35c7a951ce7aaee76aac761d1686ea24e5d1981",
+    "acceptance/quota_sources/evidence/run-final-capture-mutant.py": "512239794d217c39587befbc5b54fc072d404829bdac568cda40ed103fde910f"
+  }
+}
