@@ -1,0 +1,134 @@
+test_cached_quota_cannot_outlive_native_validity_startup_allowance (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cached_quota_cannot_outlive_native_validity_startup_allowance) ... ok
+test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_caller_environment_and_argv_mutation_cannot_rebind_captured_transport) ... ok
+test_concurrent_same_source_checks_share_one_inflight_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_concurrent_same_source_checks_share_one_inflight_observation) ... ok
+test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_configured_preflight_uses_proven_native_source_but_public_scope_cannot_dispatch) ... ok
+test_context_of_another_provider_refuses_before_collection (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_of_another_provider_refuses_before_collection) ... ok
+test_context_redacts_repr_and_refuses_pickle_or_json (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_context_redacts_repr_and_refuses_pickle_or_json) ... ok
+test_cursor_status_reuses_actual_collector_with_exact_supplied_environment (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_cursor_status_reuses_actual_collector_with_exact_supplied_environment) ... ok
+test_expired_read_failure_does_not_restore_prior_admission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_expired_read_failure_does_not_restore_prior_admission) ... ok
+test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_failed_cursor_status_has_fixed_unknown_and_no_tui_fallback) ... ok
+test_first_check_proves_without_registry_and_returns_closed_quota (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_first_check_proves_without_registry_and_returns_closed_quota) ... ok
+test_forged_context_and_public_scope_are_never_authority (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_forged_context_and_public_scope_are_never_authority) ... ok
+test_fresh_repeated_check_reuses_one_source_observation (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_fresh_repeated_check_reuses_one_source_observation) ... ok
+test_legacy_check_cannot_authorize_random_native_public_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_legacy_check_cannot_authorize_random_native_public_scope) ... ok
+test_missing_null_nonfinite_or_extra_private_proof_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_missing_null_nonfinite_or_extra_private_proof_refuses) ... ok
+test_native_validity_shorter_than_startup_bound_refuses_initial_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_native_validity_shorter_than_startup_bound_refuses_initial_read) ... ok
+test_nonce_replay_after_expiry_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_nonce_replay_after_expiry_refuses) ... ok
+test_prepare_captures_without_permission_or_child_io (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_prepare_captures_without_permission_or_child_io) ... ok
+test_private_proof_never_enters_public_result_or_scope (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_private_proof_never_enters_public_result_or_scope) ... ok
+test_process_generation_change_retires_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_process_generation_change_retires_context) ... ok
+test_public_scope_is_random_sanitized_copy_and_not_permission (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_public_scope_is_random_sanitized_copy_and_not_permission) ... ok
+test_rotation_during_read_refuses_late_success (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_rotation_during_read_refuses_late_success) ... ok
+test_selection_snapshot_is_frozen_when_new_source_becomes_spent (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_selection_snapshot_is_frozen_when_new_source_becomes_spent) ... ok
+test_source_capture_failure_does_not_echo_private_material (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_capture_failure_does_not_echo_private_material) ... ok
+test_source_file_rotation_invalidates_original_and_new_context_gets_own_read (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_source_file_rotation_invalidates_original_and_new_context_gets_own_read) ... ok
+test_uninitialized_owner_class_instance_is_not_valid_context (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_uninitialized_owner_class_instance_is_not_valid_context) ... ok
+test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses (acceptance.quota_sources.test_actual_protocol.ActualSourceProtocol.test_wrong_nonce_profile_source_extra_field_or_malformed_child_refuses) ... ok
+test_codex_actual_alternate_auth_selector_does_not_gain_native_profile (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_alternate_auth_selector_does_not_gain_native_profile) ... ok
+test_codex_actual_known_spent_still_refuses (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_known_spent_still_refuses) ... ok
+test_codex_actual_nonstrict_argv_refuses_before_collection (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_nonstrict_argv_refuses_before_collection) ... ok
+test_codex_actual_scope_and_existing_collection_remain_compatible (acceptance.quota_sources.test_codex_compatibility.CodexActualCompatibility.test_codex_actual_scope_and_existing_collection_remain_compatible) ... ok
+test_both_exhausted_pools_remain_spent (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_both_exhausted_pools_remain_spent) ... ok
+test_display_and_money_do_not_override_native_pool_percentages (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_display_and_money_do_not_override_native_pool_percentages) ... ok
+test_integral_numeric_epoch_milliseconds_match_native_decimal_strings (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_integral_numeric_epoch_milliseconds_match_native_decimal_strings) ... ok
+test_invalid_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_invalid_cycle_endpoint_refuses) ... ok
+test_missing_cycle_endpoint_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_cycle_endpoint_refuses) ... ok
+test_missing_or_invalid_required_pool_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_invalid_required_pool_usage_refuses) ... ok
+test_missing_or_non_object_plan_usage_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_missing_or_non_object_plan_usage_refuses) ... ok
+test_native_enabled_is_diagnostic_and_never_overrides_allowance (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_enabled_is_diagnostic_and_never_overrides_allowance) ... ok
+test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_epoch_milliseconds_not_local_end_of_day_or_30_4_days) ... ok
+test_native_exact_cycle_and_percentage_fields (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exact_cycle_and_percentage_fields) ... ok
+test_native_exhausted_auto_preserves_existing_other_pool_overflow (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_native_exhausted_auto_preserves_existing_other_pool_overflow) ... ok
+test_nonfinite_or_non_numeric_observation_time_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_nonfinite_or_non_numeric_observation_time_refuses) ... ok
+test_observation_outside_native_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_observation_outside_native_cycle_refuses) ... ok
+test_projection_does_not_mutate_native_payload (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_projection_does_not_mutate_native_payload) ... ok
+test_reversed_or_empty_cycle_refuses (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_reversed_or_empty_cycle_refuses) ... ok
+test_seconds_in_millisecond_fields_refuse (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_seconds_in_millisecond_fields_refuse) ... ok
+test_zero_usage_retains_actual_cycle_not_fabricated_reset (acceptance.quota_sources.test_cursor_projection.CursorNativeProjection.test_zero_usage_retains_actual_cycle_not_fabricated_reset) ... ok
+test_cached_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_cached_observation_expiring_during_final_capture_refuses) ... ok
+test_new_observation_expiring_during_final_capture_refuses (acceptance.quota_sources.test_final_capture_deadline.FinalCaptureDeadline.test_new_observation_expiring_during_final_capture_refuses) ... ok
+test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_native_probe_never_accepts_workspace_trust_or_sends_usage_after_prompt) ... ok
+test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof (acceptance.quota_sources.test_native_containment.NativeProbeContainment.test_nested_pty_cleanup_uses_native_identity_without_ps_or_lsof) ... ok
+test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_auth_endpoint_and_interpreter_overrides_refuse_without_logging_values) ... ok
+test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_claude_and_antigravity_have_no_enabled_native_profile_in_this_slice) ... ok
+test_keychain_or_unknown_credential_backend_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_keychain_or_unknown_credential_backend_refuses) ... ok
+test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_known_native_chain_and_synthetic_file_source_capture_without_io_or_writes) ... ok
+test_new_project_config_or_envrc_is_not_invisible_to_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_new_project_config_or_envrc_is_not_invisible_to_capture) ... ok
+test_private_capture_redacts_and_rejects_serialization (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_private_capture_redacts_and_rejects_serialization) ... ok
+test_prompt_resume_and_force_do_not_change_source_identity (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_prompt_resume_and_force_do_not_change_source_identity) ... ok
+test_settings_rotation_changes_private_capture (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_settings_rotation_changes_private_capture) ... ok
+test_symlink_retarget_changes_source_generation_even_identical_content (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_symlink_retarget_changes_source_generation_even_identical_content) ... ok
+test_token_rotation_changes_private_capture_and_never_public_repr (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_token_rotation_changes_private_capture_and_never_public_repr) ... ok
+test_unknown_duplicate_or_source_selecting_argv_refuses (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unknown_duplicate_or_source_selecting_argv_refuses) ... ok
+test_unreviewed_executable_chain_refuses_without_system_node_fallback (acceptance.quota_sources.test_native_profile.CursorNativeProfile.test_unreviewed_executable_chain_refuses_without_system_node_fallback) ... ok
+test_active_direnv_is_not_disabled_only_for_probe (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_active_direnv_is_not_disabled_only_for_probe) ... ok
+test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_expiring_native_token_is_not_refreshed_and_does_not_reach_dashboard) ... ok
+test_malformed_native_expiry_is_unknown_without_refresh_or_quota (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_malformed_native_expiry_is_unknown_without_refresh_or_quota) ... ok
+test_missing_settings_directory_cannot_be_created_by_native_reader (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_missing_settings_directory_cannot_be_created_by_native_reader) ... ok
+test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_credential_and_full_config_owners_reach_only_stubbed_dashboard) ... ok
+test_native_exact_300_seconds_retains_current_token_without_refresh (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_native_exact_300_seconds_retains_current_token_without_refresh) ... ok
+test_project_override_is_unproven_not_silently_skipped (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_project_override_is_unproven_not_silently_skipped) ... ok
+test_stored_api_key_refuses_without_login_or_api_billing (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_stored_api_key_refuses_without_login_or_api_billing) ... ok
+test_swallowed_native_config_repair_write_refuses_before_quota_call (acceptance.quota_sources.test_native_reader.NativeReaderBoundary.test_swallowed_native_config_repair_write_refuses_before_quota_call) ... ok
+test_missing_native_identity_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_missing_native_identity_contains_probe_and_closes_fd) ... FAIL
+test_native_identity_error_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_native_identity_error_contains_probe_and_closes_fd) ... FAIL
+test_continuation_keeps_original_private_context_when_global_environment_changes (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_continuation_keeps_original_private_context_when_global_environment_changes) ... ok
+test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_final_runner_gate_uses_new_owner_and_keeps_private_context_out_of_metadata) ... ok
+test_installed_owner_missing_new_api_never_falls_back_to_old_check (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_installed_owner_missing_new_api_never_falls_back_to_old_check) ... ok
+test_metadata_only_job_cannot_authorize_continuation (acceptance.quota_sources.test_stage_actual.ActualPtyBoundary.test_metadata_only_job_cannot_authorize_continuation) ... ok
+test_both_learning_modes_bind_exact_teacher_transport_to_new_owner (acceptance.quota_sources.test_stage_actual.ActualTeacherBoundary.test_both_learning_modes_bind_exact_teacher_transport_to_new_owner) ... ok
+test_shared_status_bridge_and_scarcity_use_installed_bounded_owner (acceptance.quota_sources.test_status_delegation.SharedStatusDelegation.test_shared_status_bridge_and_scarcity_use_installed_bounded_owner) ... ok
+test_cursor_status_callsite_passes_exact_environment_to_bounded_owner (acceptance.quota_sources.test_status_delegation.StandaloneStatusDelegation.test_cursor_status_callsite_passes_exact_environment_to_bounded_owner) ... ok
+test_cursor_status_ignores_unrelated_cached_quota_policy (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_cursor_status_ignores_unrelated_cached_quota_policy) ... FAIL
+test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path) ... ERROR
+
+======================================================================
+ERROR: test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_origin.py", line 29, in test_file_loaded_cursor_status_does_not_require_plugin_on_sys_path
+    self.assertEqual(scarcity._cursor(), {'source': 'native fixture', 'windows': []})
+                     ~~~~~~~~~~~~~~~~^^
+  File "/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/fresh-quota-stage-exam-276_z0f9/plugins/cortados-router/scarcity.py", line 418, in _cursor
+    import quota_policy
+ModuleNotFoundError: No module named 'quota_policy'
+
+======================================================================
+FAIL: test_missing_native_identity_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_missing_native_identity_contains_probe_and_closes_fd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 61, in test_missing_native_identity_contains_probe_and_closes_fd
+    self._identity_failure(None)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 57, in _identity_failure
+    self.assertFalse(alive, 'Identity failure leaked the freshly forked quota probe')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : Identity failure leaked the freshly forked quota probe
+
+======================================================================
+FAIL: test_native_identity_error_contains_probe_and_closes_fd (acceptance.quota_sources.test_probe_start_failure.ProbeStartFailure.test_native_identity_error_contains_probe_and_closes_fd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 64, in test_native_identity_error_contains_probe_and_closes_fd
+    self._identity_failure(OSError('Synthetic identity unavailable'))
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_probe_start_failure.py", line 57, in _identity_failure
+    self.assertFalse(alive, 'Identity failure leaked the freshly forked quota probe')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : Identity failure leaked the freshly forked quota probe
+
+======================================================================
+FAIL: test_cursor_status_ignores_unrelated_cached_quota_policy (acceptance.quota_sources.test_status_origin.SharedStatusOrigin.test_cursor_status_ignores_unrelated_cached_quota_policy)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/quota_sources/test_status_origin.py", line 38, in test_cursor_status_ignores_unrelated_cached_quota_policy
+    self.assertEqual(scarcity._cursor(), {'source': 'native fixture', 'windows': []})
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'source': 'unrelated policy', 'windows': []} != {'source': 'native fixture', 'windows': []}
+- {'source': 'unrelated policy', 'windows': []}
++ {'source': 'native fixture', 'windows': []}
+
+----------------------------------------------------------------------
+Ran 83 tests in 16.280s
+
+FAILED (failures=3, errors=1)

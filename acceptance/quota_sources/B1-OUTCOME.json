@@ -1,0 +1,29 @@
+{
+  "attempt": 1,
+  "outcome": "FAILED",
+  "source_review": "acceptance/quota_sources/B1-SOURCE-REVIEW.json",
+  "package_revision": "b0ed0fbe3eb67557603cd48d103aaa4ab57f3107",
+  "totals": {
+    "tests": 693,
+    "failures": 3,
+    "errors": 1,
+    "skipped": 0
+  },
+  "passed_methods": 689,
+  "failed_methods": 4,
+  "confirmed_source_defects": 2,
+  "failed_lanes": [
+    "acceptance-quota_sources"
+  ],
+  "independent_methods": 83,
+  "source_installed_wheel_byte_parity": true,
+  "performance": "pending final candidate; no passing performance claim",
+  "activation": "blocked; grouped attempt2 authorized by root",
+  "inventory_note": "Probe-start amplification was discovered and executed (83 methods) in the quota_sources lane after initial inventory-path enumeration; final retry must freshly enumerate all source/test paths.",
+  "files": {
+    "acceptance/quota_sources/evidence/B1/full-suite-report.json": "95ec8439ec53d5ddaa4f1e071a15a0631ce14efd6c4ac53fabbc53229297609a",
+    "acceptance/quota_sources/evidence/B1/quota-sources-output.log": "d1c16c623c695dda79102ff316259a596d1b28e9f8cd7c5e24cdea4a2bba3a13",
+    "acceptance/quota_sources/evidence/B1/installed-candidate-parity.json": "989231b0cf3814dd91f3d7a8cd83ea452b8f4646ea88a652dafe493af960445e",
+    "acceptance/quota_sources/evidence/B1/learning-parity.json": "73c22e863bc68f8d80756387bd10a167c32c27f1610dfb7a21431487ea973f80"
+  }
+}
