@@ -1,0 +1,57 @@
+{
+  "accepted": {
+    "ok": true,
+    "job": {
+      "job_id": "e14474fe-ffbb-4556-8358-f53dfdef32b6",
+      "route_id": "cbbaf839-825a-445a-851d-bcfa13e6da23",
+      "state": "succeeded",
+      "cwd": "/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/teacher-exam-2vfrop6_/state/teacher-cwd",
+      "created_at_ms": 1000,
+      "started_at_ms": 1001,
+      "finished_at_ms": 1100,
+      "elapsed_ms": 99,
+      "progress": "Synthetic terminal",
+      "reason": null
+    }
+  },
+  "terminal": {
+    "ok": true,
+    "job": {
+      "job_id": "e14474fe-ffbb-4556-8358-f53dfdef32b6",
+      "route_id": "cbbaf839-825a-445a-851d-bcfa13e6da23",
+      "state": "succeeded",
+      "cwd": "/private/var/folders/34/gsbqmj317fg4gk0dpbvn9dbh0000gn/T/teacher-exam-2vfrop6_/state/teacher-cwd",
+      "created_at_ms": 1000,
+      "started_at_ms": 1001,
+      "finished_at_ms": 1100,
+      "elapsed_ms": 99,
+      "progress": "Synthetic terminal",
+      "reason": null
+    },
+    "result": {
+      "summary": "[{\"i\": 0, \"steps\": 1, \"ambiguity\": 1, \"blast_radius\": 1, \"context_size\": 1, \"novelty\": 1, \"parallelizability\": 1, \"outward\": false, \"work_kind\": \"conversation\", \"urgency\": \"now\", \"needs_clarification\": false, \"parts\": 1, \"diversity\": false}, {\"i\": 1, \"steps\": 1, \"ambiguity\": 1, \"blast_radius\": 1, \"context_size\": 1, \"novelty\": 1, \"parallelizability\": 1, \"outward\": false, \"work_kind\": \"conversation\", \"urgency\": \"now\", \"needs_clarification\": false, \"parts\": 1, \"diversity\": false}]",
+      "worker": {
+        "provider": "codex-cli",
+        "requested_model": "gpt-6.1-sol",
+        "reported_model": null,
+        "cli_version": "0.163.0",
+        "account_ref": "native-default"
+      },
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null
+      },
+      "artifacts": {
+        "events": "jobs/e14474fe-ffbb-4556-8358-f53dfdef32b6/events.jsonl",
+        "final_message": "jobs/e14474fe-ffbb-4556-8358-f53dfdef32b6/final.txt"
+      },
+      "changed_paths": null,
+      "verification": "planner_review_required",
+      "warnings": [],
+      "error": null
+    }
+  }
+}

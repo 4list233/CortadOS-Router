@@ -1,0 +1,24 @@
+{
+  "schema": "cortados.teacher-authoring-inputs.v1",
+  "inputs": {
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py": "afccb68597afa01083761a555ced00c0621ec32e19352d0dec0f5fe9e2a23697",
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/worker.py": "bf596478aed116db05e39919132f81c8fd3399f5933a30e46f96c476b127a2e0",
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_metadata.py": "31d76ef12c6f73846175da228b4cf1256808c10b2778f262e51347facff9eb52",
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/codex.py": "34f5ce9ca1838399fbd995ef124b29a40292084cd4bda4d4b43fc702c47c02d1",
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/job_store.py": "07fb691f9916c47da9c42e460e0a0d7631c764bda4c1d5a90f3882b0103d3312",
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/config.py": "b085650e418fbb60d34a2e69940f5dec4674a0fee339788d72d99fb72cdc008d",
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/learning_data.py": "86ac3b448d111b0d31209094ca361a2b2f654e4cf2bceadc7857c2911172da6c",
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/learning_source.py": "a6bf89b541c4b98116aec8073c5063053ece2141bafe4ca16bd9d99ef0501b2f",
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/worker_admission.py": "933b38bdf1292a0265b406c9c8ceb361752fab12c6345a607fb59cc22d323c28",
+    "/Users/velox/.cortados-builds/cortados-router-repo/s1/label.py": "b948285a27ca6fe5c6f6866115b23a14fcdfe62c5a6060ce58dcb4a0b9ff160c",
+    "/Users/velox/.cortados-builds/cortados-router-repo/docs/mcp-worker/LEARNING-CONTEXT.md": "122b8338952fa4ff3228e5f4e4b46f702717c1d001e4e4406f6a4fddfcb42c2c",
+    "/Users/velox/.cortados-builds/cortados-router-repo/docs/mcp-worker/FRESH-QUOTA-SOURCES-006.md": "a33d2916925db67c2894ae14ef942cfeabc96a204402730fb9433ce2ffd0c6f9",
+    "/Users/velox/cortados/train/label.py": "781021a725a8a2ae1e91cd5c72700126908284be1f8a46abc6b771235573de84",
+    "/Users/velox/cortados/train/nightly.sh": "a01a86b212a60344ade3e1f5c5486383c64d63b7980af592b105197a666f7e7f",
+    "/Users/velox/cortados/train/common.py": "e4eb0348b47d2f9efda3a6174418a835148e2612e8fd812b9f28c181e585c4e1",
+    "/Users/velox/cortados/train/build_sft.py": "4ecd8bec81279f0185c47d59d368f33e1b64791ce53c30bb52d6a3fe593f993e",
+    "/Users/velox/cortados/train/evaluate.py": "a35b1f121c2d9ca46b0b5eb725175d8afd10b9bdb15dfc62e8c48c41da3a3935",
+    "/Users/velox/cortados/docs/DECISIONS.md": "f43050869a6319b0390a70b8047ceaa0b51ab63f49bad5394d34bc5a50b7c02c",
+    "/Users/velox/cortados/contracts/CONVENTIONS.md": "0e09b19a664befb03073d9160765340debea72bec6ed6b64344afcb50260afe6"
+  }
+}

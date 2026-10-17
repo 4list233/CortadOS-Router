@@ -1,0 +1,217 @@
+{
+  "rows": [
+    {
+      "id": "teacher-exam-0",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 0",
+      "split": "holdout"
+    },
+    {
+      "id": "teacher-exam-1",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 1",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-10",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 10",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-11",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 11",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-12",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 12",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-13",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 13",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-14",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 14",
+      "split": "holdout"
+    },
+    {
+      "id": "teacher-exam-15",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 15",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-16",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 16",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-17",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 17",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-18",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 18",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-19",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 19",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-2",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 2",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-20",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 20",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-21",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 21",
+      "split": "holdout"
+    },
+    {
+      "id": "teacher-exam-22",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 22",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-23",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 23",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-24",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 24",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-25",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 25",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-26",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 26",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-27",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 27",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-28",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 28",
+      "split": "holdout"
+    },
+    {
+      "id": "teacher-exam-29",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 29",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-3",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 3",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-4",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 4",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-5",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 5",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-6",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 6",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-7",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 7",
+      "split": "holdout"
+    },
+    {
+      "id": "teacher-exam-8",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 8",
+      "split": "train"
+    },
+    {
+      "id": "teacher-exam-9",
+      "unit_kind": "interactive",
+      "request": "Synthetic independent topic number 9",
+      "split": "train"
+    }
+  ],
+  "partitions": {
+    "teacher-exam-0": "holdout",
+    "teacher-exam-1": "train",
+    "teacher-exam-10": "train",
+    "teacher-exam-11": "train",
+    "teacher-exam-12": "train",
+    "teacher-exam-13": "train",
+    "teacher-exam-14": "holdout",
+    "teacher-exam-15": "train",
+    "teacher-exam-16": "train",
+    "teacher-exam-17": "train",
+    "teacher-exam-18": "train",
+    "teacher-exam-19": "train",
+    "teacher-exam-2": "train",
+    "teacher-exam-20": "train",
+    "teacher-exam-21": "holdout",
+    "teacher-exam-22": "train",
+    "teacher-exam-23": "train",
+    "teacher-exam-24": "train",
+    "teacher-exam-25": "train",
+    "teacher-exam-26": "train",
+    "teacher-exam-27": "train",
+    "teacher-exam-28": "holdout",
+    "teacher-exam-29": "valid",
+    "teacher-exam-3": "train",
+    "teacher-exam-4": "train",
+    "teacher-exam-5": "train",
+    "teacher-exam-6": "train",
+    "teacher-exam-7": "holdout",
+    "teacher-exam-8": "train",
+    "teacher-exam-9": "train"
+  },
+  "excluded": []
+}

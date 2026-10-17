@@ -77,3 +77,12 @@ promotion gates. The build reports record independent verification and limitatio
 
 | [FRESH-QUOTA-SOURCES-BUILD-REPORT.md](FRESH-QUOTA-SOURCES-BUILD-REPORT.md) | Root; 695-test source repair, timing, guarded activation and provider blockers. |
 | [CLAUDE-QUOTA-SOURCE-006-ANNEX.md](CLAUDE-QUOTA-SOURCE-006-ANNEX.md) | Disabled evidence draft; no Claude source implementation authority. |
+
+
+| Training teacher path | RT-TRAINING-TEACHER-007 responsibility |
+|---|---|
+| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; independent D/A/B required. |
+| `cortados_router/teacher.py` | Teacher selection and existing broker client adapter; no native harness or split implementation. |
+| `cortados_router/teacher_attempts.py` | Training slots, private fallback attempt mapping and sole label publication owner. |
+| `cortados_router/worker_admission.py` | Existing native admission plus closed teacher-only scarcity ceiling; ordinary worker behavior unchanged. |
+| `acceptance/training_teacher/` | Independent exam owner; split isolation, replay/publication, native parity and installed labeling path. |

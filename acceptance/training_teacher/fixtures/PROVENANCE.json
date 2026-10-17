@@ -1,0 +1,22 @@
+{
+  "schema": "cortados.teacher-exam-fixtures.v1",
+  "synthetic": [
+    "all requests, labels, prompt text, account names, UUIDs and broker outcomes"
+  ],
+  "recorded_shape_owners": {
+    "broker_response": "integrations/mcp/job_store.py:258",
+    "terminal_result": "integrations/mcp/codex.py:133",
+    "answer_validator": "s1/common.py:38",
+    "native_metadata": "acceptance/mcp_worker/fixtures/native-metadata-wire.jsonl"
+  },
+  "native_metadata_sha256": "9093967e2c286d8c5fd4a3063dc40a8d4dd0686e31311b64ea832b93875641a1",
+  "fixture_self_check": {
+    "same_uuid_replay_native_starts": 1,
+    "terminal_artifact_fields": [
+      "events",
+      "final_message"
+    ],
+    "reported_model": null
+  },
+  "providers_called": 0
+}

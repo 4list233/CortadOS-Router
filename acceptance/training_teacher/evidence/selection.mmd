@@ -1,0 +1,13 @@
+flowchart TD
+  A[Pin installed label interpreter] --> B[Acquire sole invocation writer lock]
+  B --> C[Bind eligible current revisions]
+  C --> D[Reconcile reserved Codex attempts]
+  D --> E[Group by final partition and sample]
+  E --> F[Check Claude actual source before start]
+  F -->|Available| G[Run existing Claude teacher]
+  F -->|Typed zero-start refusal| H{Final train and enabled?}
+  H -->|No| I[Report unlabeled exam batch]
+  H -->|Yes| J[Persist UUID and exact batch before delegate]
+  J --> K[Existing broker repeats final admission]
+  K --> L[Publish validated training labels atomically]
+  G --> L

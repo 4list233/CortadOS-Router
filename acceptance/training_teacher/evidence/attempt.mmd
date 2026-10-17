@@ -1,0 +1,9 @@
+stateDiagram-v2
+  [*] --> reserved: Persist exact request and slots
+  reserved --> submitted: Persist send intent before delegate
+  submitted --> reserved: Explicit no-job refusal only
+  submitted --> submitted: Replay same UUID after lost response
+  submitted --> terminal: Record immutable broker terminal
+  terminal --> terminal: Persist publication intent before labels replacement
+  terminal --> published: Verify exact published lines then persist journal
+  published --> [*]: Keep slots occupied without new native attempt
