@@ -1,0 +1,1210 @@
+{
+  "name": "fresh_cache_selection",
+  "samples": [
+    {
+      "index": 0,
+      "ms": 2.335333,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "ms": 1.446833,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "ms": 1.404542,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "ms": 2.22425,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "ms": 1.248542,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "ms": 1.25025,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "ms": 1.283667,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "ms": 1.289791,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "ms": 1.344042,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 9,
+      "ms": 1.317375,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 10,
+      "ms": 1.30275,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 11,
+      "ms": 1.295167,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 12,
+      "ms": 1.325667,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 13,
+      "ms": 1.220792,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 14,
+      "ms": 1.221875,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 15,
+      "ms": 1.248708,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 16,
+      "ms": 1.340916,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 17,
+      "ms": 1.427584,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 18,
+      "ms": 1.262834,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 19,
+      "ms": 1.294125,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 20,
+      "ms": 1.259334,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 21,
+      "ms": 1.21625,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 22,
+      "ms": 1.220417,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 23,
+      "ms": 1.224375,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 24,
+      "ms": 1.227166,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 25,
+      "ms": 1.236875,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 26,
+      "ms": 1.287834,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 27,
+      "ms": 1.249,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 28,
+      "ms": 1.221875,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 29,
+      "ms": 1.220125,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 30,
+      "ms": 1.266208,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 31,
+      "ms": 1.2335,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 32,
+      "ms": 1.21475,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 33,
+      "ms": 1.261917,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 34,
+      "ms": 1.472625,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 35,
+      "ms": 1.289542,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 36,
+      "ms": 1.243709,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 37,
+      "ms": 1.352584,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 38,
+      "ms": 1.280583,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 39,
+      "ms": 1.219083,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 40,
+      "ms": 1.258292,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 41,
+      "ms": 1.365542,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 42,
+      "ms": 1.31075,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 43,
+      "ms": 1.2385,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 44,
+      "ms": 1.221792,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 45,
+      "ms": 1.244042,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 46,
+      "ms": 1.233875,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 47,
+      "ms": 1.223417,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 48,
+      "ms": 1.344,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 49,
+      "ms": 1.271166,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 50,
+      "ms": 1.334709,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 51,
+      "ms": 1.313,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 52,
+      "ms": 1.299333,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 53,
+      "ms": 1.23975,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 54,
+      "ms": 1.423166,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 55,
+      "ms": 1.239583,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 56,
+      "ms": 1.372625,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 57,
+      "ms": 1.520375,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 58,
+      "ms": 1.441208,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    },
+    {
+      "index": 59,
+      "ms": 1.240459,
+      "rpc_methods": [],
+      "quota_reads": 0,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "chosen": {
+            "lane": "codex",
+            "provider": "codex-cli",
+            "model": "gpt-6.1-sol",
+            "account_ref": "native-default"
+          },
+          "band": "R0",
+          "D": 0
+        }
+      ]
+    }
+  ],
+  "n": 60,
+  "median_ms": 1.268687,
+  "min_ms": 1.21475,
+  "max_ms": 2.335333,
+  "p95_ms": 1.520375
+}

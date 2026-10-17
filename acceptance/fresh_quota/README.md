@@ -95,3 +95,8 @@ remain subject to the combined candidate rerun. Two in-memory mutants demonstrat
 that process-group-only cleanup and blocking stdin writes fail at the intended
 assertions, with zero fixture errors/skips. Existing original prebuild results above
 remain historical evidence for the first 116-method freeze.
+
+B2 technical acceptance is complete: 605/605 accumulated tests and an independent 130/130
+rerun, zero failures/errors/skips. All eight B1 findings are closed. See
+`evidence/B2/signoff.json` for exact source/evidence hashes, installed checks, performance
+and the preserved initial cron-fixture failure. Live activation is a separate guarded action.

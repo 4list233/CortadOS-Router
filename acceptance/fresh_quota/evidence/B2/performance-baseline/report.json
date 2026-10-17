@@ -1,0 +1,2296 @@
+{
+  "source": "/Users/velox/.cortados-builds/fresh-quota-verification/baseline-source",
+  "scope": "Synthetic native protocol; no real provider/model inference",
+  "source_sha256": {
+    "integrations/mcp/native_metadata.py": "48988c144b86ef5d225c57fd12668cf354b07b97d6ae181edb2dc021d81deea1",
+    "cortados_router/route_task.py": "7406d9f92fd79ae4f1fb968b565f1cc59adb03d24872fbdda44115ea43f9f8dc",
+    "cortados_router/worker_admission.py": "72282c65ab221ba824b654e13ee48e3b12dda2ad821630de4d57be190e6f9f32",
+    "cortados_router/scarcity_codex_native.py": "e8fd608b717f65aba449c360806bf8e3ae98fdf43c37598db4c3cebdd3dd030e"
+  },
+  "workloads": [
+    {
+      "name": "uncached_success",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 479.734625,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "ms": 282.466875,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "ms": 300.1365,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "ms": 289.032541,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "ms": 292.027625,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "ms": 299.060209,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "ms": 307.016958,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "ms": 292.342958,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        }
+      ],
+      "n": 8,
+      "median_ms": 295.70158349999997,
+      "min_ms": 282.466875,
+      "max_ms": 479.734625,
+      "p95_ms": 479.734625
+    },
+    {
+      "name": "fresh_cache_selection",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 2.077792,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "ms": 1.169541,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "ms": 1.146292,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "ms": 1.199333,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "ms": 1.210333,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "ms": 1.232458,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "ms": 1.154917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "ms": 1.247875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 8,
+          "ms": 1.697042,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 9,
+          "ms": 1.143917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 10,
+          "ms": 1.267417,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 11,
+          "ms": 1.150375,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 12,
+          "ms": 1.228792,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 13,
+          "ms": 1.141292,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 14,
+          "ms": 1.334417,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 15,
+          "ms": 1.544542,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 16,
+          "ms": 1.296834,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 17,
+          "ms": 1.1425,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 18,
+          "ms": 1.170417,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 19,
+          "ms": 1.127917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 20,
+          "ms": 1.135416,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 21,
+          "ms": 1.279541,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 22,
+          "ms": 1.150792,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 23,
+          "ms": 1.142917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 24,
+          "ms": 1.247833,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 25,
+          "ms": 1.190917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 26,
+          "ms": 1.145166,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 27,
+          "ms": 1.124084,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 28,
+          "ms": 1.167625,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 29,
+          "ms": 1.143959,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 30,
+          "ms": 1.139209,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 31,
+          "ms": 1.193583,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 32,
+          "ms": 1.313875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 33,
+          "ms": 1.12675,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 34,
+          "ms": 1.148709,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 35,
+          "ms": 1.132875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 36,
+          "ms": 1.251917,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 37,
+          "ms": 1.183041,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 38,
+          "ms": 1.203667,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 39,
+          "ms": 1.209625,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 40,
+          "ms": 1.22175,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 41,
+          "ms": 1.191792,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 42,
+          "ms": 1.1355,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 43,
+          "ms": 1.142292,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 44,
+          "ms": 1.238375,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 45,
+          "ms": 1.160375,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 46,
+          "ms": 1.239375,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 47,
+          "ms": 1.144083,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 48,
+          "ms": 1.154625,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 49,
+          "ms": 1.135125,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 50,
+          "ms": 1.163416,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 51,
+          "ms": 1.281709,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 52,
+          "ms": 1.16475,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 53,
+          "ms": 1.244166,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 54,
+          "ms": 1.204875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 55,
+          "ms": 1.139459,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 56,
+          "ms": 1.127167,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 57,
+          "ms": 1.37175,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 58,
+          "ms": 1.740875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 59,
+          "ms": 1.28875,
+          "rpc_methods": [],
+          "quota_reads": 0,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        }
+      ],
+      "n": 60,
+      "median_ms": 1.176729,
+      "min_ms": 1.124084,
+      "max_ms": 2.077792,
+      "p95_ms": 1.697042
+    },
+    {
+      "name": "expired_source_refresh",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 155.840416,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "ms": 155.349459,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "ms": 161.78275,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "ms": 160.158583,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "ms": 146.549583,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "ms": 139.405083,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "ms": 141.365542,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "ms": 148.677208,
+          "rpc_methods": [
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "chosen": {
+                "lane": "codex",
+                "provider": "codex-cli",
+                "model": "gpt-6.1-sol",
+                "account_ref": "native-default"
+              },
+              "band": "R0",
+              "D": 0
+            }
+          ]
+        }
+      ],
+      "n": 8,
+      "median_ms": 152.0133335,
+      "min_ms": 139.405083,
+      "max_ms": 161.78275,
+      "p95_ms": 161.78275
+    },
+    {
+      "name": "unknown_failure",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 297.244,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 1,
+          "ms": 295.495625,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 2,
+          "ms": 284.707792,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 3,
+          "ms": 286.577,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 4,
+          "ms": 290.794792,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 5,
+          "ms": 291.991625,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 6,
+          "ms": 298.484666,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        },
+        {
+          "index": 7,
+          "ms": 296.645292,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_unknown",
+          "results": []
+        }
+      ],
+      "n": 8,
+      "median_ms": 293.743625,
+      "min_ms": 284.707792,
+      "max_ms": 298.484666,
+      "p95_ms": 298.484666
+    },
+    {
+      "name": "concurrent_same_source",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 298.8355,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "ms": 285.9065,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "ms": 287.542167,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "ms": 283.252667,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "ms": 283.308,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "ms": 298.282,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "ms": 301.771833,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "ms": 301.415334,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": null,
+          "results": [
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            },
+            {
+              "models": [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol"
+              ]
+            }
+          ]
+        }
+      ],
+      "n": 8,
+      "median_ms": 292.9120835,
+      "min_ms": 283.252667,
+      "max_ms": 301.771833,
+      "p95_ms": 301.771833
+    },
+    {
+      "name": "zero_dispatch_refusal",
+      "samples": [
+        {
+          "index": 0,
+          "ms": 283.098417,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 1,
+          "ms": 284.727,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 2,
+          "ms": 289.271916,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 3,
+          "ms": 289.256,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 4,
+          "ms": 300.745791,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 5,
+          "ms": 296.203208,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 6,
+          "ms": 304.31275,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        },
+        {
+          "index": 7,
+          "ms": 294.441875,
+          "rpc_methods": [
+            "initialize",
+            "config/read",
+            "configRequirements/read",
+            "initialize",
+            "account/read",
+            "model/list",
+            "account/rateLimits/read"
+          ],
+          "quota_reads": 1,
+          "native_turns": 0,
+          "error": "quota_spent",
+          "results": []
+        }
+      ],
+      "n": 8,
+      "median_ms": 291.85689549999995,
+      "min_ms": 283.098417,
+      "max_ms": 304.31275,
+      "p95_ms": 304.31275
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "workloads": [
+    {
+      "workload": "uncached_success",
+      "samples": 8,
+      "baseline_median_ms": 295.70158349999997,
+      "candidate_median_ms": 322.551521,
+      "baseline_p95_ms": 479.734625,
+      "candidate_p95_ms": 485.210667,
+      "behavior_equal": true,
+      "native_turns": 0
+    },
+    {
+      "workload": "fresh_cache_selection",
+      "samples": 60,
+      "baseline_median_ms": 1.176729,
+      "candidate_median_ms": 1.268687,
+      "baseline_p95_ms": 1.697042,
+      "candidate_p95_ms": 1.520375,
+      "behavior_equal": true,
+      "native_turns": 0
+    },
+    {
+      "workload": "expired_source_refresh",
+      "samples": 8,
+      "baseline_median_ms": 152.0133335,
+      "candidate_median_ms": 150.767188,
+      "baseline_p95_ms": 161.78275,
+      "candidate_p95_ms": 160.079792,
+      "behavior_equal": true,
+      "native_turns": 0
+    },
+    {
+      "workload": "unknown_failure",
+      "samples": 8,
+      "baseline_median_ms": 293.743625,
+      "candidate_median_ms": 298.5030205,
+      "baseline_p95_ms": 298.484666,
+      "candidate_p95_ms": 319.199208,
+      "behavior_equal": true,
+      "native_turns": 0
+    },
+    {
+      "workload": "concurrent_same_source",
+      "samples": 8,
+      "baseline_median_ms": 292.9120835,
+      "candidate_median_ms": 293.390542,
+      "baseline_p95_ms": 301.771833,
+      "candidate_p95_ms": 305.734125,
+      "behavior_equal": true,
+      "native_turns": 0
+    },
+    {
+      "workload": "zero_dispatch_refusal",
+      "samples": 8,
+      "baseline_median_ms": 291.85689549999995,
+      "candidate_median_ms": 295.418938,
+      "baseline_p95_ms": 304.31275,
+      "candidate_p95_ms": 306.544875,
+      "behavior_equal": true,
+      "native_turns": 0
+    }
+  ],
+  "scope": "Synthetic native-protocol fixture and mocked S1; not GPU inference or real network performance",
+  "pass": true
+}

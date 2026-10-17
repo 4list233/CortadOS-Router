@@ -1,0 +1,330 @@
+{
+  "name": "concurrent_same_source",
+  "samples": [
+    {
+      "index": 0,
+      "ms": 298.8355,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "ms": 285.9065,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "ms": 287.542167,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "ms": 283.252667,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "ms": 283.308,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "ms": 298.282,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "ms": 301.771833,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "ms": 301.415334,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": null,
+      "results": [
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        },
+        {
+          "models": [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol"
+          ]
+        }
+      ]
+    }
+  ],
+  "n": 8,
+  "median_ms": 292.9120835,
+  "min_ms": 283.252667,
+  "max_ms": 301.771833,
+  "p95_ms": 301.771833
+}

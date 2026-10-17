@@ -1,0 +1,212 @@
+{
+  "reviewer": "/root/quota_evaluation_qa",
+  "D": 0,
+  "A": 0,
+  "B_attempt": 2,
+  "B": 0,
+  "status": "PASSED scoped technical acceptance",
+  "exam_pin": "0d2de57d0cd74839b8185cf076e66d388a929e6d",
+  "final_totals": {
+    "tests": 605,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "independent_focused": {
+    "tests": 130,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0
+  },
+  "closed_findings": [
+    "B1-01",
+    "B1-02",
+    "B1-03",
+    "B1-04",
+    "B1-05",
+    "B1-06",
+    "B1-07",
+    "B1-08"
+  ],
+  "source_hashes": {
+    "cortados_router/core.py": "ebbada91f0be291cb553188c4079661c8a62a53055c1e7b408329a850b08e93f",
+    "cortados_router/execution_routing.py": "445b7d7a49894e30edec2a0c54361fe1044d6da09c5b873a4db557b9dc93b2c4",
+    "cortados_router/route_task.py": "f0e7a2e9be004df03596c9675c8b9972aeb0a68e0880141a5fa53e1affafe671",
+    "cortados_router/scarcity.py": "6229b83ecb56cb6c5865c4c6b802c8cbcd737af84533b15193275d34d3338500",
+    "cortados_router/scarcity_codex_native.py": "17d4e4d660d2824afaab46bacaeb66ced789515c932b3064e1e681a3002d2b41",
+    "cortados_router/selection_resources.py": "6c947a58caa4374e3eba2bc9985064077384b1852674e6b9aff1363bd5d28f33",
+    "cortados_router/worker_admission.py": "933b38bdf1292a0265b406c9c8ceb361752fab12c6345a607fb59cc22d323c28",
+    "integrations/mcp/native_metadata.py": "31d76ef12c6f73846175da228b4cf1256808c10b2778f262e51347facff9eb52",
+    "cortados_router/quota_admission.py": "f6b1ce65605483833ede6f8051858fc0d0ab38225e5a8a9893f241ac051a11ea",
+    "cortados_router/quota_observations.py": "58870f1551af4c1a5196bb53697b997114322a00ca4e667a8df89be133fe41dc",
+    "tests/test_fresh_quota.py": "b01a76fc1f20f45f62dff3d1ac604c31fdd1fa859568ab3f8f2a1901563f3c3d"
+  },
+  "current_index_sha256": "b53da6ab0248830591c9e0a0ebc90e576c5a71e8378693608224a3d44c71294e",
+  "legacy_files": [
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-router/core.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/core.py",
+      "before_sha256": "d951ebbbddadd888c50c1b72fe9269b0009c308457105bd6af94fce6a6150e52",
+      "candidate_sha256": "316aaa9f6c9759783bd16421d8a9321ebe46e549ec2269e2f72a85ec43d03f64",
+      "bytes": 51697,
+      "lines": 793
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-router/execution_routing.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/execution_routing.py",
+      "before_sha256": "bfee5667280b01707f22c8e2b28bb1be9f9d5bafab370e3698279efb82a9a4ae",
+      "candidate_sha256": "8a25e054bacd8b66f786608f392e0c0f1b0e14cf3ef65e32e4894785ac8c0ea5",
+      "bytes": 8954,
+      "lines": 155
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-router/__init__.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/__init__.py",
+      "before_sha256": "7b3582562ec51f02f1bb5dc19c045c9eb04e7159d4ec302714fd21f64851b2a5",
+      "candidate_sha256": "c6dcf90d2dbe44f77d82cb5e105a44751f95cde0975e1c1ccdb1af9ca3188955",
+      "bytes": 64347,
+      "lines": 1062
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-router/scarcity.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/scarcity.py",
+      "before_sha256": "8e6b81d5138cfa3bd6aec84c344243f14d97c9ce060ce14d6dd2b51517cf0115",
+      "candidate_sha256": "188a85d752f91d9921235f72614dcf7bd90c3c39916fa62ec91829fc8b919c4d",
+      "bytes": 36169,
+      "lines": 672
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-pty/model_routing.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-pty/model_routing.py",
+      "before_sha256": "9b0828b71da5701c0fddced79cc0f927d0244861af9c359b03619d21c85b88bc",
+      "candidate_sha256": "4a8341b1b73b2f45a70e2688218b4af97b3db9851e17fdcfd477d583f1e15d9f",
+      "bytes": 8698,
+      "lines": 190
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-pty/runner.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-pty/runner.py",
+      "before_sha256": "30914b03ea989d47df4e35cf84b999abeaa5c8165fa5c756af78d494958d69ad",
+      "candidate_sha256": "c4a41ed67148f7f153d46f4e49edace559a1a212843c1c7fdcdfe63abb6d1e3f",
+      "bytes": 48757,
+      "lines": 945
+    },
+    {
+      "source": "/Users/velox/cortados/patches/auxiliary-routing/auxiliary_model_routing.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/patches/auxiliary-routing/auxiliary_model_routing.py",
+      "before_sha256": "7fbcf664bc66f5786cb0455b28686782edcef9d47b0c07ddcaeeb76372719b83",
+      "candidate_sha256": "f1dcea167fb48fae1d46a6f53fe801ec2eed6d8c2a11888732ed25e4d572f852",
+      "bytes": 20177,
+      "lines": 399
+    },
+    {
+      "source": "/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_model_routing.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/agent/auxiliary_model_routing.py",
+      "before_sha256": "7fbcf664bc66f5786cb0455b28686782edcef9d47b0c07ddcaeeb76372719b83",
+      "candidate_sha256": "f1dcea167fb48fae1d46a6f53fe801ec2eed6d8c2a11888732ed25e4d572f852",
+      "bytes": 20177,
+      "lines": 399
+    },
+    {
+      "source": "/Users/velox/.cortados/hermes/hermes-agent/agent/auxiliary_client.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/agent/auxiliary_client.py",
+      "before_sha256": "923261c9b73f3c43d7923f675c972397e1a6a6d55a0768739d0d806088095d1b",
+      "candidate_sha256": "05952eefbca8f22dd66abb687a2f109d0968156c4a4762c8fd3841d60e003037",
+      "bytes": 400244,
+      "lines": 7772
+    },
+    {
+      "source": "/Users/velox/.cortados/hermes/hermes-agent/hermes_cli/plugins.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/hermes_cli/plugins.py",
+      "before_sha256": "7725d46fc6829393b6b3d7aa6aaf431856126ec600663a56233040f65f23c30e",
+      "candidate_sha256": "e39096d12ef63c4d5cd55b9da25618811278b09b3ba401d35615f3812bff07a5",
+      "bytes": 119846,
+      "lines": 2133
+    },
+    {
+      "source": "/Users/velox/cortados/train/dataset.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/train/dataset.py",
+      "before_sha256": "f4b931e62fc4a741a44c92507d451c4c26730e2d6860008ed911cf184829069c",
+      "candidate_sha256": "5d8255e4d57489ad995266b1e68316af5c36e95642f189db388de7bd20945b98",
+      "bytes": 3247,
+      "lines": 65
+    },
+    {
+      "source": "/Users/velox/cortados/train/label.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/train/label.py",
+      "before_sha256": "f17dba495203d4d3fde6ef79afe3eb1703c7bd744a1c97b6aece75d072c03fe3",
+      "candidate_sha256": "b1655232a7ff54c799af2668b063ca23f16fd08a88aa454c31035346989fa5f4",
+      "bytes": 11654,
+      "lines": 205
+    },
+    {
+      "source": "/Users/velox/cortados/train/build_sft.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/train/build_sft.py",
+      "before_sha256": "5c0d6983d9b15b1b18201b4db6f6349c716cecd9818e71991ee867a361bbc2b3",
+      "candidate_sha256": "983b22139a8c836ae07430ede1ce9e51296dbedec39e1c39d551cb46e459355a",
+      "bytes": 4840,
+      "lines": 95
+    },
+    {
+      "source": "/Users/velox/cortados/train/evaluate.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/train/evaluate.py",
+      "before_sha256": "d71186982f6669bdf0c3019cad50ea5cda99324d0411dbe86fc2b9154d3f1367",
+      "candidate_sha256": "19032becc842cee2baa935136314548bc727104b968bc1123188138e9947f285",
+      "bytes": 15991,
+      "lines": 266
+    },
+    {
+      "source": "/Users/velox/cortados/train/nightly.sh",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/train/nightly.sh",
+      "before_sha256": "ae706380433584c8032b184cc890069a6195d9c3258c8f638b7a36372c406613",
+      "candidate_sha256": "2476cfb97abf79b9b78b927387e9e8c945a56bb986ca267a8ff58b5d3118c2aa",
+      "bytes": 13420,
+      "lines": 185
+    },
+    {
+      "source": "/Users/velox/cortados/plugins/cortados-router/quota_policy.py",
+      "staged": "/Users/velox/.cortados-builds/fresh-quota-activation/plugins/cortados-router/quota_policy.py",
+      "before_sha256": null,
+      "candidate_sha256": "fd0405bb8e09bcd966a6c580713df57cad330fc37f4ab7ad33fe8599bfc1778a",
+      "bytes": 3041,
+      "lines": 72
+    }
+  ],
+  "evidence_sha256": {
+    "independent-B2.json": "2c79b02d3669f6c67c6791897074c1b27074789a0263e16eb3052520f66e31b3",
+    "independent-B2.log": "a24d7cfbe865604e7fd114274caa9313cd9c10f22e8e65a05166bd60b727836b",
+    "full-suite-final/report.json": "ed86a27384b40c1eee95a50960cf7f57cc297fe5e11d49a577b9b82813b678e3",
+    "full-suite/report.json": "7dd19ccab1f9f8abd03c3da36b82051ef0463222e1ba12f30b5282df44edd6be",
+    "full-suite/test_cron_dispatch_routing/output.log": "beac084334fe3be9eea1fb793010d0fb2efb7ca6a85e0a7d284cfc5cabdfc6a0",
+    "full-suite-source-identity.json": "15233e0b0e54988d7d71b5fa9dfd17c27c57e287be08bce65f952a8d3ac60b65",
+    "legacy-candidate-final.json": "1ec18f6221830fe8a81526b169b4b14671e6154ac71262521e8e70686d9a8c18",
+    "learning-parity.json": "a39c56ce0b3ac72c47ddf64b4b9da85f936a22a9212f66967f0c81a4bef677b2",
+    "host-origin-check.json": "d0bd3583a65de4c451e2d0bf0ae9b3ba4db6157cf5ea0da683e5aa3830be8a12",
+    "performance-comparison.json": "9e66958023cb6b9bae322b379b1c010de49e3d2896f6d508d40889d7b4175958",
+    "performance-baseline-source.json": "ee3dc4439aa9a8c7d92370be622575acebb60d7fea3a1dca7aefaba9f740a043",
+    "benchmark-mcp-quota.py": "dbbeb095a53aeb0160f24129b148587533ad4dcff597eb957798beb2d73958ed",
+    "preserved_required_quota.py": "dd61381e4af35bb5b6de358d53a11bfdcd076e2c0a15063b373d13fbb5e91b17",
+    "run-migrated-learning.py": "07399712bf99835b1e5da1da45c1bd2effa2a2962ae375e4ab0a96e8bbd65e59",
+    "run-full-suite.py": "c8e611f0da242bd0dea3a01c454175f8dd4115d8845ee727bab9e29d08db101f",
+    "performance-baseline/concurrent_same_source.json": "287961e0af7bf438b72fe42dfaded4053678f607a74792f2af449f3109ec68b7",
+    "performance-baseline/expired_source_refresh.json": "2c23dc64303d1b0e983c6c79a43d79a8dafd7b9afd83808fb9a3acc670e36a00",
+    "performance-baseline/fresh_cache_selection.json": "07b9391ca8f2f9740a215098bc70cfea807a680efd58776153002cdf57418608",
+    "performance-baseline/report.json": "bb671e1fd71032ff38b81f69a014cf3a0402e9d389181527b6993473f1b75d9b",
+    "performance-baseline/uncached_success.json": "26e32d7f753aa6972b6994b97a92805d40b85e02b46798513edc8936b80d11e9",
+    "performance-baseline/unknown_failure.json": "a2126061d1cb66c6e84322e40a3acda5724da738c1f46b0f06e7a46d4aeb7242",
+    "performance-baseline/zero_dispatch_refusal.json": "cca8cf150f6d51fb88ad46669a3881f2d517bfd23658de649d537dfc30028946",
+    "performance-candidate/concurrent_same_source.json": "053bc2c5282feff869aefc7446bbedc1a06003bf9713428ed330026b707fa796",
+    "performance-candidate/expired_source_refresh.json": "3d9a13ee409db66feb0c0abeda532306389606b0941a1c6fa14c594fa8949624",
+    "performance-candidate/fresh_cache_selection.json": "98f027b6eaed1f32379b306b9491bcf225d9b71bf2be8e0dbc0d0ddd0b89dd78",
+    "performance-candidate/report.json": "092fed9dc885fdb6890f857845502c9588183c50dcb877261bd624ed12cf78e7",
+    "performance-candidate/uncached_success.json": "5f5518791976c500bac33fa32cc79876d91494a3eb93697aad0ab4d7fe446646",
+    "performance-candidate/unknown_failure.json": "e32638ecef227b7300208e40531660a3645fc7b8d7583aa004af0d99f534f1c0",
+    "performance-candidate/zero_dispatch_refusal.json": "764e23ba7e958ed2dfcf4197796436cd218fee444836b2c617424b802d784811"
+  },
+  "preserved_prior_files": 335,
+  "scope": "All maintained standalone/package acceptance, seven host integration modules, shared nightly16, preserved PTY27, staged shared router30, migrated learning3. Unrelated whole-CortadOS inventory remains separately unverified.",
+  "fixture_amendment": "Initial605 run had one cron synthetic-boundary failure. Private pytest fixture now forwards existing mutable health through quota owner; original assertions unchanged. Initial failed report/log preserved. Initial run made read-only native quota query, no model turn. New130 real-policy exams separately enforce refusal.",
+  "performance": "Six synthetic native-protocol workloads with raw samples and source identities; no native model turns. No claimed real-network/GPU performance.",
+  "installed": "Release bytes match reviewed source; preserved learning owners and clean_request unchanged; host Python3.12 imports correct fixed release origins.",
+  "activation": "Technical approval for exact verified source only. Root retains beforehash/state/schedule/no-active-training guards. 004 recovery independently verified610rows,promoteFalse,identical published report,current unchanged. Shared exam amendment is separately guarded QA action."
+}

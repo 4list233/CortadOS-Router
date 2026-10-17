@@ -11,7 +11,7 @@ status: frozen
 implements: [RT-MCP-001]
 depends_on: [RT-QUOTA-EVALUATION-004, RT-MCP-LEARNING-003]
 blocks: []
-attempt_ledger: ["D/A-1: independent review closed", "A2: 130 exams; pool-scope clarification", "B1: eight grouped findings returned; corrected candidate pending"]
+attempt_ledger: ["D/A-1: independent review closed", "A2: 130 exams; pool-scope clarification", "B1: eight grouped findings returned", "B2: all eight closed; 605 tests passed, zero failures/errors/skips"]
 ---
 
 # Fresh quota admission for MCP and the legacy fleet
@@ -740,3 +740,9 @@ fixture lane, migrated learning activation lane, six-workload performance eviden
 learning-byte equivalence before B completion. None is claimed passing by this design freeze.
 The full accumulated candidate package must pass with no empty/missing/skipped lane; unrelated
 whole-CortadOS suites outside this scoped inventory are separately unverified.
+
+Independent B2 technical signoff: **B=0**, `/root/quota_evaluation_qa`. Frozen source passed
+605 accumulated tests, zero failures/errors/skips, including all 130 independent exams.
+Exact source, installed parity/origins, raw performance, fixture provenance and initial cron
+fixture failure are retained in `acceptance/fresh_quota/evidence/B2/signoff.json`. This is the
+scoped package result; unrelated whole-CortadOS suites remain separately unverified.

@@ -1,0 +1,146 @@
+{
+  "name": "unknown_failure",
+  "samples": [
+    {
+      "index": 0,
+      "ms": 297.244,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 1,
+      "ms": 295.495625,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 2,
+      "ms": 284.707792,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 3,
+      "ms": 286.577,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 4,
+      "ms": 290.794792,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 5,
+      "ms": 291.991625,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 6,
+      "ms": 298.484666,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    },
+    {
+      "index": 7,
+      "ms": 296.645292,
+      "rpc_methods": [
+        "initialize",
+        "config/read",
+        "configRequirements/read",
+        "initialize",
+        "account/read",
+        "model/list",
+        "account/rateLimits/read"
+      ],
+      "quota_reads": 1,
+      "native_turns": 0,
+      "error": "quota_unknown",
+      "results": []
+    }
+  ],
+  "n": 8,
+  "median_ms": 293.743625,
+  "min_ms": 284.707792,
+  "max_ms": 298.484666,
+  "p95_ms": 298.484666
+}
