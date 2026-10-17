@@ -1,0 +1,8 @@
+test_l11_native_training_tokenizer_boundary_includes_complete_answer (acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_native_training_tokenizer_boundary_includes_complete_answer) ... ok
+test_l11_worked_contract_lengths_hashes_and_partitions_are_independent (acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_worked_contract_lengths_hashes_and_partitions_are_independent) ... ok
+test_l01_legacy_normalization_handoff_and_replay_remain_exact (acceptance.mcp_learning.test_context.Context.test_l01_legacy_normalization_handoff_and_replay_remain_exact) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 1.650s
+
+OK

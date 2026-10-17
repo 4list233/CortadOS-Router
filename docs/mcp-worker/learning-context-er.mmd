@@ -1,0 +1,16 @@
+erDiagram
+ JOBS ||--o{ JOB_FEEDBACK : "retains planner assertions for an accepted attempt"
+ JOBS {
+  string job_id PK "identifies accepted native attempt"
+  string client_id "binds configured planner ownership"
+  string record "retains immutable arguments and native result"
+ }
+ JOB_FEEDBACK {
+  int seq PK "orders committed assertions"
+  string feedback_id "deduplicates within client_id"
+  string client_id "binds configured planner ownership"
+  string job_id FK "selects terminal accepted attempt"
+  string argument_hash "refuses changed identity replay"
+  int created_at_ms "records committed assertion time"
+  string payload "retains planner claim and references"
+ }

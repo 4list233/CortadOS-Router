@@ -1,0 +1,31 @@
+sequenceDiagram
+ participant C as Claude planner
+ participant F as MCP frontend
+ participant B as MCP broker
+ participant J as JobStore writer
+ participant N as Native worker
+ participant O as Existing nightly owner
+ participant D as Nightly dataset collector
+ participant T as Existing teacher
+ C->>F: context_requirements with partial evidence
+ F-->>C: pure deterministic report before private RPC
+ C->>F: delegate complete task evidence
+ F->>B: validated private delegation RPC
+ B->>J: commit accepted arguments before START
+ B->>N: existing admitted execution
+ N-->>B: native terminal evidence
+ B->>J: commit terminal job
+ C->>F: job_feedback with planner assertions
+ F->>B: validated private feedback RPC
+ B->>J: BEGIN IMMEDIATE validate terminal insert feedback COMMIT
+ J-->>B: committed assertion receipt
+ B-->>F: durable assertion receipt
+ F-->>C: durable assertion receipt
+ O->>D: existing dataset phase
+ D->>J: read-only transaction snapshots jobs and feedback
+ J-->>D: immutable inputs and current outcomes
+ D->>D: atomically publish request additions then projection
+ D-->>O: collection result and diagnostics
+ O->>T: existing label phase binds current revision snapshot
+ T->>T: rate exact request plus attributed outcome annotation
+ T-->>O: append twelve-answer label with provenance

@@ -1,0 +1,138 @@
+{
+  "baseline": "6a64b77853ca990a5e641918098c55e0976858f3",
+  "cases": [
+    {
+      "id": "acceptance.mcp_learning.test_activation.Activation.test_l12_only_five_adapters_change_and_next_run_exports_precede_reexec",
+      "stage": "activation"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_activation.Activation.test_l12_disabled_modified_eval_preserves_legacy_inputs_and_outputs",
+      "stage": "activation"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_activation.Activation.test_l12_enabled_collection_teacher_sft_and_eval_use_installed_learning_owner",
+      "stage": "activation"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l01_legacy_normalization_handoff_and_replay_remain_exact",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l02_scoring_brief_cannot_hide_ordered_evidence_or_reference_boundary",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l02_closed_evidence_and_complete_budget_refuse_before_scoring",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l03_context_dialogue_is_pure_and_missing_is_distinct_from_none",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l03_incomplete_evidence_refuses_without_reserving_identity",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l03_over_budget_precedes_missing_fields_and_never_truncates",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_context.Context.test_l04_explicit_route_logs_context_without_inventing_score",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_feedback_receipt_replay_correction_and_immutable_result",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_terminal_and_ownership_checks_precede_feedback_insertion",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_closed_schema_and_verdict_evidence_rules_refuse",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_feedback_rows_cannot_be_updated_or_deleted",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_insert_failure_has_one_refusal_no_receipt_and_retry_can_commit",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_feedback.Feedback.test_l05_broker_restart_replays_committed_feedback_receipt",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_native_training_tokenizer_boundary_includes_complete_answer",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_ground_truth.GroundTruth.test_l11_worked_contract_lengths_hashes_and_partitions_are_independent",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l06_completed_is_unreviewed_and_collection_only_opens_readonly_snapshots",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l06_pending_and_orphan_routes_remain_explicit_observations",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l07_late_feedback_appends_revision_preserves_prefix_and_selects_latest",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l07_lock_corruption_and_missing_sources_keep_published_evidence",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l07_crash_between_publications_retains_old_snapshot_and_reuses_revision",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l08_exact_s1_context_and_invalid_digest_or_explicit_oversize_exclusion",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_learning.Collection.test_l09_retries_share_group_and_legacy_duplicate_partition_conflicts_quarantine",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_teacher_receives_exact_context_fallible_annotation_and_records_provenance",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_sft_token_boundary_preserves_context_and_never_leaks_outcome",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l08_missing_tokenizer_excludes_mcp_sft_without_changing_legacy_examples",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_superseded_label_never_substitutes_for_unlabelled_latest_revision",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_evaluation_receives_exact_request_without_future_outcome",
+      "stage": "main"
+    },
+    {
+      "id": "acceptance.mcp_learning.test_pipeline.TrainingPipeline.test_l09_same_count_incumbent_report_is_not_content_identity",
+      "stage": "main"
+    }
+  ],
+  "prebuild": {
+    "executed": 31,
+    "passed": 4,
+    "failed": 8,
+    "errors": 19,
+    "skipped": 0
+  },
+  "main_cases": 28,
+  "activation_cases": 3
+}

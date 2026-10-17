@@ -1,0 +1,49 @@
+{
+  "captured_at_unix": 1792216976.0594418,
+  "metadata": {
+    "record": "first nonempty JSON row",
+    "source": "live train/data/labels.jsonl"
+  },
+  "redaction": "Every string value except closed protocol/category enums replaced; keys, arrays, scalars and nulls unchanged.",
+  "sample": {
+    "answers": {
+      "ambiguity": 1,
+      "blast_radius": 2,
+      "context_size": 1,
+      "diversity": false,
+      "needs_clarification": false,
+      "novelty": 1,
+      "outward": true,
+      "parallelizability": 1,
+      "parts": 3,
+      "steps": 2,
+      "urgency": "today",
+      "work_kind": "ops"
+    },
+    "id": "[redacted string]",
+    "sample": 2,
+    "teacher": "[redacted string]",
+    "ts": 1790007452
+  },
+  "shape": {
+    "answers": {
+      "ambiguity": "int",
+      "blast_radius": "int",
+      "context_size": "int",
+      "diversity": "bool",
+      "needs_clarification": "bool",
+      "novelty": "int",
+      "outward": "bool",
+      "parallelizability": "int",
+      "parts": "int",
+      "steps": "int",
+      "urgency": "str",
+      "work_kind": "str"
+    },
+    "id": "str",
+    "sample": "int",
+    "teacher": "str",
+    "ts": "int"
+  },
+  "source_record_sha256": "fe16a1e086f586d2a663aa9c474e8a4d5285c12a535f1f15b8023d01c6373b18"
+}

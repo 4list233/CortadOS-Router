@@ -1,0 +1,385 @@
+{
+  "captured_at_unix": 1792216976.087905,
+  "metadata": {
+    "columns": [
+      [
+        0,
+        "turn_id",
+        "TEXT",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "ts",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        2,
+        "session_id",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        3,
+        "platform",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        4,
+        "unit_kind",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        5,
+        "actual_model",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        6,
+        "request",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        7,
+        "request_chars",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        8,
+        "history_msgs",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        9,
+        "engine",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        10,
+        "engine_ms",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        11,
+        "degraded",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        12,
+        "engine_error",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        13,
+        "answers",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        14,
+        "features",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        15,
+        "D",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        16,
+        "band",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        17,
+        "orchestrator",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        18,
+        "lane",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        19,
+        "provider",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        20,
+        "model",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        21,
+        "runner_up",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        22,
+        "skipped",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        23,
+        "subagents",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        24,
+        "verifier",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        25,
+        "hard_rules",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        26,
+        "table_version",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        27,
+        "table_error",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        28,
+        "response_chars",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        29,
+        "turn_ms",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        30,
+        "forest_correction",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        31,
+        "scarcity",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        32,
+        "context",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        33,
+        "task_context",
+        "TEXT",
+        0,
+        null,
+        0
+      ]
+    ],
+    "source": "live worker state/router/router.db",
+    "user_version": 0
+  },
+  "redaction": "Every string value except closed protocol/category enums replaced; keys, arrays, scalars and nulls unchanged.",
+  "sample": {
+    "D": 3,
+    "actual_model": null,
+    "answers": {
+      "ambiguity": 1,
+      "blast_radius": 1,
+      "context_size": 0,
+      "diversity": false,
+      "needs_clarification": false,
+      "novelty": 0,
+      "outward": false,
+      "parallelizability": 0,
+      "parts": 0,
+      "steps": 1,
+      "urgency": "now",
+      "work_kind": "ops"
+    },
+    "band": "R1",
+    "context": {
+      "selection_mode": "[redacted string]"
+    },
+    "degraded": 0,
+    "engine": "s1 2026-10-16 05:40 (2026-10-16-0130)",
+    "engine_error": null,
+    "engine_ms": 2171,
+    "features": "[redacted string]",
+    "forest_correction": null,
+    "hard_rules": "[redacted string]",
+    "history_msgs": 0,
+    "lane": "[redacted string]",
+    "model": "[redacted string]",
+    "orchestrator": null,
+    "platform": "[redacted string]",
+    "provider": "codex-cli",
+    "request": "[redacted string]",
+    "request_chars": 162,
+    "response_chars": null,
+    "runner_up": "[redacted string]",
+    "scarcity": "[redacted string]",
+    "session_id": null,
+    "skipped": "[redacted string]",
+    "subagents": 0,
+    "table_error": null,
+    "table_version": 17,
+    "task_context": null,
+    "ts": 1792214744.436112,
+    "turn_id": "[redacted string]",
+    "turn_ms": null,
+    "unit_kind": "interactive",
+    "verifier": 0
+  },
+  "shape": {
+    "D": "int",
+    "actual_model": "NoneType",
+    "answers": {
+      "ambiguity": "int",
+      "blast_radius": "int",
+      "context_size": "int",
+      "diversity": "bool",
+      "needs_clarification": "bool",
+      "novelty": "int",
+      "outward": "bool",
+      "parallelizability": "int",
+      "parts": "int",
+      "steps": "int",
+      "urgency": "str",
+      "work_kind": "str"
+    },
+    "band": "str",
+    "context": {
+      "selection_mode": "str"
+    },
+    "degraded": "int",
+    "engine": "str",
+    "engine_error": "NoneType",
+    "engine_ms": "int",
+    "features": "str",
+    "forest_correction": "NoneType",
+    "hard_rules": "str",
+    "history_msgs": "int",
+    "lane": "str",
+    "model": "str",
+    "orchestrator": "NoneType",
+    "platform": "str",
+    "provider": "str",
+    "request": "str",
+    "request_chars": "int",
+    "response_chars": "NoneType",
+    "runner_up": "str",
+    "scarcity": "str",
+    "session_id": "NoneType",
+    "skipped": "str",
+    "subagents": "int",
+    "table_error": "NoneType",
+    "table_version": "int",
+    "task_context": "NoneType",
+    "ts": "float",
+    "turn_id": "str",
+    "turn_ms": "NoneType",
+    "unit_kind": "str",
+    "verifier": "int"
+  },
+  "source_record_sha256": "607e90499dd8f290a679e988d512de950b18da8f0583146f5200b0bbb66ac62b"
+}

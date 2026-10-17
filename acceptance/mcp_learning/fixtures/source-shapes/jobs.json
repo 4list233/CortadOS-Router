@@ -1,0 +1,327 @@
+{
+  "captured_at_unix": 1792216976.087185,
+  "metadata": {
+    "columns": [
+      [
+        0,
+        "job_id",
+        "TEXT",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "client_id",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "request_id",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "argument_hash",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "arguments",
+        "BLOB",
+        1,
+        null,
+        0
+      ],
+      [
+        5,
+        "cwd",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        6,
+        "active",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        7,
+        "record",
+        "TEXT",
+        1,
+        null,
+        0
+      ]
+    ],
+    "source": "live worker state/jobs.db",
+    "user_version": 1
+  },
+  "redaction": "Every string value except closed protocol/category enums replaced; keys, arrays, scalars and nulls unchanged.",
+  "sample": {
+    "active": 0,
+    "argument_hash": "[redacted string]",
+    "arguments": {
+      "account_ref": "native-default",
+      "constraints": {},
+      "context": "[redacted string]",
+      "cwd": "[redacted string]",
+      "permissions": {
+        "mcp_servers": [],
+        "network": false
+      },
+      "selection": {
+        "mode": "s1",
+        "routing_brief": "[redacted string]"
+      },
+      "task": "[redacted string]",
+      "timeout_s": 90
+    },
+    "client_id": "[redacted string]",
+    "cwd": "[redacted string]",
+    "job_id": "[redacted string]",
+    "record": {
+      "accepted_monotonic": 27836.685328833,
+      "argument_hash": "[redacted string]",
+      "arguments": {
+        "account_ref": "native-default",
+        "constraints": {},
+        "context": "[redacted string]",
+        "cwd": "[redacted string]",
+        "permissions": {
+          "mcp_servers": [],
+          "network": false
+        },
+        "request_id": "[redacted string]",
+        "selection": {
+          "mode": "s1",
+          "routing_brief": "[redacted string]"
+        },
+        "task": "[redacted string]",
+        "timeout_s": 90
+      },
+      "cli_version": "0.163.0",
+      "created_at_ms": 1792214744437,
+      "cwd": "[redacted string]",
+      "elapsed_ms": 7785,
+      "finished_at_ms": 1792214752222,
+      "host_boot_id": "[redacted string]",
+      "job_id": "[redacted string]",
+      "launch_nonce": "[redacted string]",
+      "native": {
+        "creation_time_us": 1792214744793420,
+        "pgid": 77243,
+        "pid": 77243
+      },
+      "progress": "[redacted string]",
+      "reason": null,
+      "result": {
+        "artifacts": {
+          "events": "[redacted string]",
+          "final_message": "[redacted string]"
+        },
+        "changed_paths": null,
+        "error": null,
+        "summary": "[redacted string]",
+        "usage": {
+          "cache_write_input_tokens": 0,
+          "cached_input_tokens": 23680,
+          "input_tokens": 29590,
+          "output_tokens": 69,
+          "reasoning_output_tokens": 0
+        },
+        "verification": "planner_review_required",
+        "warnings": [],
+        "worker": {
+          "account_ref": "native-default",
+          "cli_version": "0.163.0",
+          "provider": "codex-cli",
+          "reported_model": null,
+          "requested_model": "[redacted string]"
+        }
+      },
+      "route": {
+        "D": 3,
+        "band": "R1",
+        "chosen": {
+          "account_ref": "native-default",
+          "lane": "[redacted string]",
+          "model": "[redacted string]",
+          "provider": "codex-cli"
+        },
+        "context": {
+          "scorer_chars": 166,
+          "scorer_digest": "[redacted string]",
+          "worker_bytes": 337
+        },
+        "quota": {
+          "sampled_at_ms": 1792214742230,
+          "source": "[redacted string]",
+          "status": "[redacted string]"
+        },
+        "route_id": "[redacted string]",
+        "selection_mode": "[redacted string]",
+        "skipped": [
+          {
+            "model": "[redacted string]",
+            "provider": "codex-cli",
+            "reason": "[redacted string]"
+          }
+        ],
+        "suggested_subagents": 0,
+        "warnings": []
+      },
+      "route_id": "[redacted string]",
+      "started_at_ms": 1792214744799,
+      "state": "succeeded",
+      "state_dir": "[redacted string]",
+      "stop_intent": null,
+      "watchdog": {
+        "creation_time_us": 1792214744438904,
+        "pgid": 77240,
+        "pid": 77240
+      }
+    },
+    "request_id": "[redacted string]"
+  },
+  "shape": {
+    "active": "int",
+    "argument_hash": "str",
+    "arguments": {
+      "account_ref": "str",
+      "constraints": {},
+      "context": "str",
+      "cwd": "str",
+      "permissions": {
+        "mcp_servers": [],
+        "network": "bool"
+      },
+      "selection": {
+        "mode": "str",
+        "routing_brief": "str"
+      },
+      "task": "str",
+      "timeout_s": "int"
+    },
+    "client_id": "str",
+    "cwd": "str",
+    "job_id": "str",
+    "record": {
+      "accepted_monotonic": "float",
+      "argument_hash": "str",
+      "arguments": {
+        "account_ref": "str",
+        "constraints": {},
+        "context": "str",
+        "cwd": "str",
+        "permissions": {
+          "mcp_servers": [],
+          "network": "bool"
+        },
+        "request_id": "str",
+        "selection": {
+          "mode": "str",
+          "routing_brief": "str"
+        },
+        "task": "str",
+        "timeout_s": "int"
+      },
+      "cli_version": "str",
+      "created_at_ms": "int",
+      "cwd": "str",
+      "elapsed_ms": "int",
+      "finished_at_ms": "int",
+      "host_boot_id": "str",
+      "job_id": "str",
+      "launch_nonce": "str",
+      "native": {
+        "creation_time_us": "int",
+        "pgid": "int",
+        "pid": "int"
+      },
+      "progress": "str",
+      "reason": "NoneType",
+      "result": {
+        "artifacts": {
+          "events": "str",
+          "final_message": "str"
+        },
+        "changed_paths": "NoneType",
+        "error": "NoneType",
+        "summary": "str",
+        "usage": {
+          "cache_write_input_tokens": "int",
+          "cached_input_tokens": "int",
+          "input_tokens": "int",
+          "output_tokens": "int",
+          "reasoning_output_tokens": "int"
+        },
+        "verification": "str",
+        "warnings": [],
+        "worker": {
+          "account_ref": "str",
+          "cli_version": "str",
+          "provider": "str",
+          "reported_model": "NoneType",
+          "requested_model": "str"
+        }
+      },
+      "route": {
+        "D": "int",
+        "band": "str",
+        "chosen": {
+          "account_ref": "str",
+          "lane": "str",
+          "model": "str",
+          "provider": "str"
+        },
+        "context": {
+          "scorer_chars": "int",
+          "scorer_digest": "str",
+          "worker_bytes": "int"
+        },
+        "quota": {
+          "sampled_at_ms": "int",
+          "source": "str",
+          "status": "str"
+        },
+        "route_id": "str",
+        "selection_mode": "str",
+        "skipped": [
+          {
+            "model": "str",
+            "provider": "str",
+            "reason": "str"
+          }
+        ],
+        "suggested_subagents": "int",
+        "warnings": []
+      },
+      "route_id": "str",
+      "started_at_ms": "int",
+      "state": "str",
+      "state_dir": "str",
+      "stop_intent": "NoneType",
+      "watchdog": {
+        "creation_time_us": "int",
+        "pgid": "int",
+        "pid": "int"
+      }
+    },
+    "request_id": "str"
+  },
+  "source_record_sha256": "b8d3c2a075442f41ee5656e76bcd525866171179e8b13b990c5cb89b4c84e12b"
+}

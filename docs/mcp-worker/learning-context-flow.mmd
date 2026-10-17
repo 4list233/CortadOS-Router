@@ -1,0 +1,24 @@
+flowchart LR
+ C[Claude supplies task and reviews result] --> E[Evidence owner validates and projects context]
+ E --> S[S1 classifies exact projection]
+ E --> W[Native worker executes admitted task]
+ W --> J[(JobStore retains jobs and planner feedback)]
+ C --> J
+ E --> R[(Core retains route observations)]
+ J --> I[Collector reads source snapshots and groups]
+ R --> I
+ I --> O[(Rebuildable private observation projection)]
+ I --> Q[(Dataset appends immutable request evidence)]
+ O --> T[Teacher rates request with attributed outcome]
+ O --> G
+ Q --> T
+ T --> L[(Existing label writer appends twelve answers)]
+ Q --> G[Eligibility owner excludes split conflicts]
+ L --> G
+ G --> N[Nightly trains on pre-execution requests and gates promotion]
+ classDef canonical fill:#dae8fc,stroke:#6c8ebf
+ classDef evidence fill:#d5e8d4,stroke:#82b366
+ classDef projection fill:#fff2cc,stroke:#d6b656
+ class J canonical
+ class R,Q,L evidence
+ class O projection

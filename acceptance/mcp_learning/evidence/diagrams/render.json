@@ -1,0 +1,62 @@
+[
+  {
+    "command": [
+      "node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "docs/mcp-worker/learning-context-er.mmd",
+      "-o",
+      "acceptance/mcp_learning/evidence/diagrams/learning-context-er.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ],
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "docs/mcp-worker/learning-context-flow.mmd",
+      "-o",
+      "acceptance/mcp_learning/evidence/diagrams/learning-context-flow.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ],
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "docs/mcp-worker/learning-context-sequence.mmd",
+      "-o",
+      "acceptance/mcp_learning/evidence/diagrams/learning-context-sequence.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ],
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "node",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/node_modules/@mermaid-js/mermaid-cli/src/cli.js",
+      "-i",
+      "docs/mcp-worker/learning-context-state.mmd",
+      "-o",
+      "acceptance/mcp_learning/evidence/diagrams/learning-context-state.svg",
+      "-p",
+      "/Users/velox/.cortados-builds/router-l1-qa-tools/puppeteer.json"
+    ],
+    "exit_code": 0,
+    "stdout": "Generating single mermaid chart\n",
+    "stderr": ""
+  }
+]

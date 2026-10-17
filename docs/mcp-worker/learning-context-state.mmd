@@ -1,0 +1,12 @@
+stateDiagram-v2
+ [*] --> NoFeedback: existing or new job
+ NoFeedback --> NoFeedback: active job refuses feedback
+ NoFeedback --> PlannerAsserted: terminal job commits first assertion
+ PlannerAsserted --> PlannerAsserted: same ID exact replay returns receipt
+ PlannerAsserted --> PlannerAsserted: new ID appends correction
+ PlannerAsserted --> PlannerAsserted: reused ID different payload refuses
+ note right of PlannerAsserted
+ Native job state remains unchanged.
+ Assertions never become independent verification.
+ Every correction retains earlier rows.
+ end note

@@ -8,10 +8,10 @@ from .support import WorkerCase
 
 
 class Protocol(WorkerCase):
-    async def test_ac01_exact_five_tools_and_typed_route(self):
+    async def test_ac01_exact_seven_tools_and_typed_route(self):
         async with self.session() as client:
             tools = await client.list_tools()
-            self.assertEqual({tool.name for tool in tools.tools}, {"route", "delegate", "job_status", "job_result", "job_cancel"})
+            self.assertEqual({tool.name for tool in tools.tools}, {"route", "delegate", "job_status", "job_result", "job_cancel", "context_requirements", "job_feedback"})
             value = await self.call(client, "route", self.route_request())
             route = value["route"]
             self.assertEqual(uuid.UUID(route["route_id"]).version, 4)

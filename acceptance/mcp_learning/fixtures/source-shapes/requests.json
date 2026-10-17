@@ -1,0 +1,23 @@
+{
+  "captured_at_unix": 1792216976.058402,
+  "metadata": {
+    "record": "first nonempty JSON row",
+    "source": "live train/data/requests.jsonl"
+  },
+  "redaction": "Every string value except closed protocol/category enums replaced; keys, arrays, scalars and nulls unchanged.",
+  "sample": {
+    "id": "[redacted string]",
+    "request": "[redacted string]",
+    "source": "[redacted string]",
+    "split": "holdout",
+    "unit_kind": "interactive"
+  },
+  "shape": {
+    "id": "str",
+    "request": "str",
+    "source": "str",
+    "split": "str",
+    "unit_kind": "str"
+  },
+  "source_record_sha256": "f6034fff79460bf4b4431a6751833d9586a9e849e3f43cb80002d34ad81f1add"
+}
