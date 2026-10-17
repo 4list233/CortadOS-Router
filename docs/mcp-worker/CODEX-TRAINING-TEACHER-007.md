@@ -2,10 +2,10 @@
      CEILING: Preserve validation/holdout labels, gates, quota, permissions and budgets. -->
 ---
 contract_id: RT-TRAINING-TEACHER-007
-contract_version: 1
+contract_version: 2
 owner: Forest
 author: /root/quota_repair_contract
-status: design_error
+status: revised-design-frozen
 implements: [RT-MCP-LEARNING-003, RT-FRESH-QUOTA-005, RT-QUOTA-SOURCES-006]
 exam_owner: /root/quota_evaluation_qa
 depends_on: [RT-MCP-001, RT-MCP-LEARNING-003, RT-FRESH-QUOTA-005, RT-QUOTA-SOURCES-006]
@@ -13,7 +13,7 @@ blocks: []
 attempt_ledger: [{attempt: 1, result: failed, review: acceptance/training_teacher/B1-REVIEW.json}, {attempt: 2, result: design_error, review: acceptance/training_teacher/B2-REVIEW.json}]
 D: 0
 A: 0
-B: 1
+B: pending-revised-design
 ---
 
 # Codex fallback for new training labels
@@ -206,6 +206,39 @@ matching `(id,teacher,sample)` is retained and is not a fallback input.
 `DATA/.teacher-attempts/lock` for the labeling invocation. All candidate label paths participate;
 thread tasks use its internal serialization. Busy lock refuses without calls. Activation requires
 no old label process, because the old executable does not honor this new lock.
+
+### Revision 2: invocation-lifetime caches (Forest approved after B2)
+
+Forest explicitly approved discarding cached label reservations whenever a new labeling invocation
+acquires its writer lock, reloading current state, and repeating QA before enabling Codex training
+labels. This is a revision of RT-TRAINING-TEACHER-007, not a new package or an attempt-count reset.
+The two prior valid failures remain in `attempt_ledger`; the next implementation review is cumulative
+attempt 3 against revision 2. No held-out exam, promotion, provider, budget or permission rule changes.
+
+A `LabelAttempts` instance remains reusable after a normal context exit. Each successful new
+`__enter__` acquires and binds the existing exclusive flock under the owner's mutex, then retires
+ALL parsed-label and occupied-slot/reservation caches from the previous invocation BEFORE loading
+and validating the current manifest and label files or answering occupancy queries. Derived indexes
+are rebuilt only from that invocation's validated state. Object identity, an unchanged label-file
+signature, or retained cache entries never confer continuity across lock acquisitions. Within one
+invocation, the existing append-derived cache optimization and external-generation checks remain.
+A busy acquisition or simultaneous live reentry still refuses without disrupting an active owner.
+Exit remains serialized with writers; closed or wrong-process contexts and replaced lock inodes
+still refuse. Corrupt state still fails closed; no repair, reservation deletion or new writer exists.
+
+This resumed implementation's writable production scope is ONLY
+`cortados_router/teacher_attempts.py`; optional builder regressions may extend only
+`tests/test_teacher_attempts.py`. Every other candidate production/stage/test file retains the B2
+candidate hash. Protected exams, contract and index remain exam-owner controlled. In particular,
+no adapter, admission, provider execution or live path is writable in this repair.
+
+AC-T03/T04 additionally require sequential reuse after another invocation reserves slots to honor
+those slots, both when the first invocation had an empty label cache and when it had populated
+label/index caches. Reused instances may not evade this acceptance by refusing an otherwise valid
+new invocation. The accumulated 782-test B2 inventory plus these two cache-lifetime methods must
+run (784 methods with the existing builder inventory); additional builder tests accumulate. Repeat
+installed origin/parity, adapter/flag-off/lock/replay checks and the existing synthetic performance
+driver. B0 and guarded operator activation remain required before any real training-label call.
 
 The journal subdirectory is created mode0700; manifest and lock are mode0600, owned by the
 current user and never symlinks. Existing incompatible ownership/mode/symlink or DATA identity

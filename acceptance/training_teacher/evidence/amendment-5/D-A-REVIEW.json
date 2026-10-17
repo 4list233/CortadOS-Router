@@ -1,0 +1,101 @@
+{
+  "contract": "RT-TRAINING-TEACHER-007",
+  "contract_version": 2,
+  "design_review": "invocation-lifetime cache revision",
+  "authority": {
+    "source": "Parent /root relayed Forest explicit approval in current session",
+    "approved": "Discard cached label reservations whenever a new labeling invocation acquires the writer lock; reload current state; repeat QA before enabling Codex training labels; held-out exam and promotion gates unchanged.",
+    "technical_disposition": "Preserve sequential reuse of normally exited instances. Retire parsed-label and slot/reservation caches after exclusive lock acquisition/binding and before durable-state reload/validation or occupancy.",
+    "global_decisions_log_edited": false
+  },
+  "D": 0,
+  "A": 0,
+  "B": "pending cumulative attempt3 under revision2",
+  "prior_valid_attempts": [
+    {
+      "attempt": 1,
+      "result": "failed",
+      "review_sha256": "67406fb73ec20bd4964e33dfe3ac332fd1faea9abfe01f1449e130510491be4f"
+    },
+    {
+      "attempt": 2,
+      "result": "design_error",
+      "review_sha256": "183a5b720c998176cdf9265291061933c073c471b119941895313ae7c0da0a0a"
+    }
+  ],
+  "ledger_interpretation": "Same007 identity. No reset, no relabeling prior failures; explicit user-approved revised design permits a new independently gated candidate. Activation remains blocked until B0.",
+  "owner_disposition": "Extend canonical LabelAttempts; no new writer, lock, cache owner, budget, policy or permission.",
+  "writable_production": [
+    "cortados_router/teacher_attempts.py"
+  ],
+  "optional_builder_test_scope": [
+    "tests/test_teacher_attempts.py"
+  ],
+  "immutable_source_baseline": {
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher.py": {
+      "sha256": "83531e9be01ed4ea86c9c0027f786dc4a519fa4324181f87ae5286aa4d3309cb",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/teacher_attempts.py": {
+      "sha256": "80a53da7d59804b9246b4a78f9305ea0324fb18b8e1b6c708dce8ca1aa7a89f0",
+      "writable_in_revision2": true
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/cortados_router/worker_admission.py": {
+      "sha256": "a75e41a93ae01fa43f0439475b3f28a0d45436a64354e3e893ad3cf79e36bc10",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/config.py": {
+      "sha256": "a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/s1/label.py": {
+      "sha256": "5aba1f7fe97de66dba81015def227dbb348f6432a9418974a5e3cb7afedf5d38",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/training-teacher-activation/train/label.py": {
+      "sha256": "9feef5eca8a26f39bc82c413f599137485b562f4b42fe1df2967152d5224d700",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/training-teacher-activation/train/nightly.sh": {
+      "sha256": "913a59a26687273e6479992221968b8d91e9613710945a0cec780fd296ff5ee7",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_training_teacher.py": {
+      "sha256": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f",
+      "writable_in_revision2": false
+    },
+    "/Users/velox/.cortados-builds/cortados-router-repo/tests/test_teacher_attempts.py": {
+      "sha256": "e9d222036f2f5d197c9e89815451a180e5a4287f6e0874eace27f679ff697759",
+      "writable_in_revision2": true
+    }
+  },
+  "protected_amendment": "Existing reuse test strengthened to require successful sequential reuse; one populated-cache/prefix test added. All prior protected methods and evidence retained.",
+  "prebuild": {
+    "tests": 61,
+    "failures": 2,
+    "errors": 0,
+    "skips": 0,
+    "pass": false,
+    "failure_ids": [
+      "acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_populated_writer_reloads_reservations_without_changing_label_prefix",
+      "acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots"
+    ],
+    "error_ids": []
+  },
+  "prebuild_interpretation": "Expected red against unchanged rejectedB2 bytes; not a new implementation attempt.59 pass;2 intended failures;0 errors/skips.",
+  "acceptance_required": [
+    "complete accumulated784-method inventory plus any builder additions",
+    "exact source/wheel/installed-member parity after inactive rebuild",
+    "installed7 adapter and parity4 unchanged assertions",
+    "same synthetic primary/fallback workloads with raw times/calls/labels/atomic I/O",
+    "independent B source lifecycle review and guarded operator review"
+  ],
+  "commands": {
+    "focused": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest -v acceptance.training_teacher.test_invocation_cache",
+    "all_teacher_exams": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/training_teacher/run_exams.py /private/tmp/training-teacher-attempt3-exams.json",
+    "builder_regressions": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest -v tests.test_teacher_attempts tests.test_training_teacher",
+    "full_inventory": "/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/training_teacher/evidence/run-full-suite.py /Users/velox/.cortados-builds/training-teacher-verification/full-suite-attempt3-revision2"
+  },
+  "provider_calls": 0,
+  "production_changed": false
+}

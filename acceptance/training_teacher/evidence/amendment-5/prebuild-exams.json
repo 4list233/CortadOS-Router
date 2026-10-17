@@ -1,0 +1,12 @@
+{
+  "tests": 61,
+  "failures": 2,
+  "errors": 0,
+  "skips": 0,
+  "pass": false,
+  "failure_ids": [
+    "acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_populated_writer_reloads_reservations_without_changing_label_prefix",
+    "acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots"
+  ],
+  "error_ids": []
+}

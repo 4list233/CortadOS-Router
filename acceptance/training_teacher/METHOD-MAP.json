@@ -730,6 +730,15 @@
         "AC-T03",
         "AC-T04"
       ]
+    },
+    {
+      "file": "acceptance/training_teacher/test_invocation_cache.py",
+      "class": "InvocationCache",
+      "method": "test_reused_populated_writer_reloads_reservations_without_changing_label_prefix",
+      "ac": [
+        "AC-T03",
+        "AC-T04"
+      ]
     }
   ],
   "counts": {
@@ -778,5 +787,13 @@
       "errors": 0,
       "skips": 0
     }
+  },
+  "amendment_5": {
+    "contract_revision": 2,
+    "current_source_methods": 61,
+    "existing_full_inventory": 782,
+    "cache_lifetime_methods": 2,
+    "expected_full_inventory_with_unchanged_builder_tests": 784,
+    "strengthened_existing_method": "sequential reuse must succeed; removed safe-refusal alternative following explicit approved design"
   }
 }

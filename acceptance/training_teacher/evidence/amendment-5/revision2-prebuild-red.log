@@ -1,0 +1,27 @@
+test_reused_populated_writer_reloads_reservations_without_changing_label_prefix (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_populated_writer_reloads_reservations_without_changing_label_prefix) ... FAIL
+test_reused_writer_never_loses_another_invocations_reserved_slots (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots) ... FAIL
+
+======================================================================
+FAIL: test_reused_populated_writer_reloads_reservations_without_changing_label_prefix (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_populated_writer_reloads_reservations_without_changing_label_prefix)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_invocation_cache.py", line 41, in test_reused_populated_writer_reloads_reservations_without_changing_label_prefix
+    self.assertTrue(first.occupied(batch[0], 0, 'claude-sonnet-5', self.snapshot))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_reused_writer_never_loses_another_invocations_reserved_slots (acceptance.training_teacher.test_invocation_cache.InvocationCache.test_reused_writer_never_loses_another_invocations_reserved_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/training_teacher/test_invocation_cache.py", line 20, in test_reused_writer_never_loses_another_invocations_reserved_slots
+    self.assertTrue(first.occupied(batch[0], 0, 'claude-sonnet-5', self.snapshot),
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    'Reentered writer lost the current reservation index')
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : Reentered writer lost the current reservation index
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.026s
+
+FAILED (failures=2)

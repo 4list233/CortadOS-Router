@@ -1,0 +1,89 @@
+<!-- PURPOSE: Map the standalone MCP worker package and its independent evidence owners.
+     CONTRACT: RT-MCP-001. This index does not approve an implementation or live installation.
+     DEPENDS: CONTRACT.md, QA-REVIEW.md, and the frozen acceptance manifest. -->
+# MCP worker package index
+
+Forest requested a Codex-first subscription worker service on `plan/subagent-mcp`. Claude remains the
+planner and reviewer. S1 is optional. On 2026-10-15 Forest required known quota before worker execution
+and designated independent agent `/root/mcp_qa` as this standalone package's contract reviewer and
+acceptance-test owner. On 2026-10-17 Forest authorized the four baseline repairs, full-suite verification,
+and local Claude Code installation using existing subscriptions. Local scoped commits remain authorized;
+publication is outside this task.
+
+| Document or path | Owner and purpose |
+|---|---|
+| [CONTRACT.md](CONTRACT.md) | Contract author; public behavior, lifecycle, permissions and source scope. |
+| [REUSE.md](REUSE.md) | Contract author; existing-owner search and reuse dispositions. |
+| [DECISIONS-PENDING.md](DECISIONS-PENDING.md) | Contract author; resolved user direction and remaining evidence gates. |
+| [QA-REVIEW.md](QA-REVIEW.md) | Independent QA; D/A findings and exact review revisions. |
+| [BUILD-REPORT.md](BUILD-REPORT.md) | Root orchestrator; independent verification, execution ledger, raw evidence and resolved baseline gate. |
+| [FOLLOWUP.md](FOLLOWUP.md) | Independent QA; baseline repair scope, exact review policy and pristine installer inputs. |
+| [NATIVE-PROFILE-002.md](NATIVE-PROFILE-002.md) | Independent QA; captured 0.163.0 extension and immutable job version provenance. |
+| [INSTALLATION.md](INSTALLATION.md) | Root; actual local release, operator limits, Claude registration and activation evidence. |
+| [AIR-TO-STUDIO.md](AIR-TO-STUDIO.md) | Root; existing Tailscale SSH workflow with Claude, S1 and workers on the Studio; actual Air login verification remains an operator check. |
+| [S1-CONTEXT.md](S1-CONTEXT.md) | Root; scoring brief, worker handoff and measured classifier limitations. |
+| [USAGE.md](USAGE.md) | Root orchestrator; standalone setup, Claude handoff and explicit connector grants. |
+| [QA-BASELINE.md](QA-BASELINE.md) | Independent QA; all maintained suites and pre-existing failures. |
+| `acceptance/mcp_worker/` | Independent QA; protected exams, native captures and evidence. Builders may read only. |
+| `acceptance/router_followup/` | Independent QA; six baseline repair cases and pristine Hermes Git source fixtures. |
+| `acceptance/native_profile/` | Independent QA; nine version/capture cases and real per-model 0.163.0 captures. |
+| `bin/route-crons.py` | Router; adopted cron outcome collector, occurrence attribution, saved job pins remain inputs; AC-F02/F03 and original cron integration. |
+| `integrations/mcp/native_profile.py` | Router; exact captured-version observation and legacy job provenance; AC-N01–N04. |
+| [LEARNING-CONTEXT.md](LEARNING-CONTEXT.md) | RT-MCP-LEARNING-003; independent context, feedback, learning and activation contract; AC-L01–L12. |
+| [LEARNING-BUILD-REPORT.md](LEARNING-BUILD-REPORT.md) | Root; tested source, complete standalone inventory, context/collection timings, installed release and next-run training activation. |
+| `acceptance/mcp_learning/` | Independent MCP QA; protected context/feedback/collection/pipeline exams and synthetic captures; builder read-only. |
+| `cortados_router/task_evidence.py` | Exact evidence validation, scorer/worker projections, provenance and pure `context_requirements`; route_task/frontend call this owner; no admission or storage; AC-L01–L04. |
+| `integrations/mcp/job_store.py::feedback` | Sole jobs.db feedback writer; append-only assertion transaction, ownership and replay; broker calls it; AC-L05. |
+| `cortados_router/learning_source.py::read_observations` | Read-only jobs/feedback and route snapshots; validates source types and assembles native/planner observations without artifact reads; AC-L06/L07/L10. |
+| `cortados_router/learning_data.py::collect_mcp` | Sole current-observation publisher; locked/fsynced request revisions then projection; dataset calls it; AC-L06–L08. |
+| `cortados_router/learning_data.py::eligible_rows` | Shared revision/group/partition eligibility; `bind_snapshot` binds one phase; label/build_sft/evaluate and later enabled adapters use this owner; AC-L09. |
+| `cortados_router/learning_data.py` | Shared teacher payload/provenance, SFT token measurement and content-sensitive evaluation identity; s1/common re-exports its unchanged `split_of`; AC-L08/L09. |
+| `tests/test_mcp_learning.py` | Builder regressions for source lifetime/containment/WAL visibility, explicit evidence budgets, connected partitions and cache content identity. |
+| `integrations/mcp/` | Scoped production builder after D/A approval; MCP service, lifecycle and native boundary. |
+| `cortados_router/route_task.py` | Scoped production builder; optional scoring and existing resolver integration. |
+| `cortados_router/worker_admission.py` | Scoped production builder; common execution admission. |
+| `cortados_router/scarcity_codex_native.py` | Scoped production builder; typed native quota input to the existing scarcity owner. |
+| `cortados_router/core.py::resolve` | Existing candidate burn owner; [RT-QUOTA-EVALUATION-004 v1](QUOTA-EVALUATION-004.md) pins one estimate observation per priced candidate; AC-Q01–Q06, protected `acceptance/quota_evaluation/`. |
+
+The [original branch plan](../SUBAGENT-MCP-PLAN.md) remains historical until the reviewed contract
+supersedes its implementation details. No document here changes CortadOS's global decisions log.
+The authorized live Hermes and MCP changes are recorded in [FRESH-QUOTA-BUILD-REPORT.md](FRESH-QUOTA-BUILD-REPORT.md).
+
+The standalone learning implementation exposes installed-owner helpers to the separate activation
+package. Its source reads only accepted SQLite evidence; requests and labels retain immutable revisions,
+and `mcp-observations.jsonl` can be rebuilt by collection. The main-phase protected exam is the five
+modules named in [the exam README](../../acceptance/mcp_learning/README.md). The separately tested
+activation stage is installed for the next nightly invocation. The October 17 run retained its old
+environment/script inode; its saved-checkpoint evaluation is now complete and rejected by the unchanged
+promotion gates. The build reports record independent verification and limitations.
+
+| Fresh-quota path | RT-FRESH-QUOTA-005 responsibility |
+|---|---|
+| [FRESH-QUOTA-005.md](FRESH-QUOTA-005.md) | Frozen strict fresh quota contract; independent `acceptance/fresh_quota/` exams. |
+| [FRESH-QUOTA-BUILD-REPORT.md](FRESH-QUOTA-BUILD-REPORT.md) | Root; final suite, frozen source, performance, guarded live activation and operational limitations. |
+| [QUOTA-OPERATIONS.md](QUOTA-OPERATIONS.md) | Root; quota percentages, pace, learned cost, inspection command, dispatch limits and saved-checkpoint result. |
+| `cortados_router/quota_admission.py` | Sole source scope canonicalizer, fresh pool validation, `check`, `source_preflight`, pure `resources` and `current_resources`. |
+| `cortados_router/quota_observations.py` | Bounded per-source process-group collection and ephemeral in-flight/cache owner; no store writes. |
+| `cortados_router/selection_resources.py` | Immutable lanes, health, exact allowed routes and optional learned-cost snapshot; adopts core mapping. |
+| `integrations/mcp/native_metadata.py::observe` | Uncached read-only validated status, preserving spent readings; snapshot remains strict. |
+| `cortados_router/scarcity.py::_codex_native` | Existing inspection source delegates typed native status; TUI parser remains diagnostic only. |
+
+| Quota-source repair path | RT-QUOTA-SOURCES-006 responsibility |
+|---|---|
+| [FRESH-QUOTA-SOURCES-006.md](FRESH-QUOTA-SOURCES-006.md) | Contract author; native subscription-source repair, private actual-context binding and independent source evidence. Common/Cursor slice D=0/A=0/B=0 and activated; Claude/Antigravity remain unproven. |
+| `cortados_router/quota_sources.py` | Native source selection/read-only projection; existing observation/admission owners remain canonical. |
+| `cortados_router/cursor_quota.cjs` | Version-bound reuse of installed Cursor native credential/configuration/DashboardClient owners; no quota policy or cache. |
+| `acceptance/quota_sources/` | Independent QA; real native shapes, actual-context and staged-boundary exams; builder read-only. |
+
+| [FRESH-QUOTA-SOURCES-BUILD-REPORT.md](FRESH-QUOTA-SOURCES-BUILD-REPORT.md) | Root; 695-test source repair, timing, guarded activation and provider blockers. |
+| [CLAUDE-QUOTA-SOURCE-006-ANNEX.md](CLAUDE-QUOTA-SOURCE-006-ANNEX.md) | Disabled evidence draft; no Claude source implementation authority. |
+
+
+| Training teacher path | RT-TRAINING-TEACHER-007 responsibility |
+|---|---|
+| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; B2 design_error, not activated. |
+| `cortados_router/teacher.py` | Teacher selection and existing broker client adapter; no native harness or split implementation. |
+| `cortados_router/teacher_attempts.py` | Training slots, private fallback attempt mapping and sole label publication owner. |
+| `cortados_router/worker_admission.py` | Existing native admission plus closed teacher-only scarcity ceiling; ordinary worker behavior unchanged. |
+| `acceptance/training_teacher/` | Independent exam owner; split isolation, replay/publication, native parity and installed labeling path. |
+| [CODEX-TRAINING-TEACHER-BUILD-REPORT.md](CODEX-TRAINING-TEACHER-BUILD-REPORT.md) | Root; rejected B2 candidate, 782 passing tests plus one failing regression, preserved live state and proposed cache-lifetime revision. |

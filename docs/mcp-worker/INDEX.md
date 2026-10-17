@@ -81,7 +81,7 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Training teacher path | RT-TRAINING-TEACHER-007 responsibility |
 |---|---|
-| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; B2 design_error, not activated. |
+| [CODEX-TRAINING-TEACHER-007.md](CODEX-TRAINING-TEACHER-007.md) | New final-training label fallback to existing Codex subscription worker; Claude primary, evaluation labels/gates preserved; B1/B2 failures retained; Forest-approved revision2 confines caches to each invocation, frozen for repeated QA, not activated. |
 | `cortados_router/teacher.py` | Teacher selection and existing broker client adapter; no native harness or split implementation. |
 | `cortados_router/teacher_attempts.py` | Training slots, private fallback attempt mapping and sole label publication owner. |
 | `cortados_router/worker_admission.py` | Existing native admission plus closed teacher-only scarcity ceiling; ordinary worker behavior unchanged. |
