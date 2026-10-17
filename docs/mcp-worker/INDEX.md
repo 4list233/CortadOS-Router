@@ -70,7 +70,10 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Quota-source repair path | RT-QUOTA-SOURCES-006 responsibility |
 |---|---|
-| [FRESH-QUOTA-SOURCES-006.md](FRESH-QUOTA-SOURCES-006.md) | Contract author; native subscription-source repair, private actual-context binding and independent source evidence. Common/Cursor slice frozen after independent D=0/A=0; candidate B and activation pending. |
-| `cortados_router/quota_sources.py` (proposed) | Native source selection/read-only projection; existing observation/admission owners remain canonical. |
-| `cortados_router/cursor_quota.cjs` (proposed) | Version-bound reuse of installed Cursor native credential/configuration/DashboardClient owners; no quota policy or cache. |
+| [FRESH-QUOTA-SOURCES-006.md](FRESH-QUOTA-SOURCES-006.md) | Contract author; native subscription-source repair, private actual-context binding and independent source evidence. Common/Cursor slice D=0/A=0/B=0 and activated; Claude/Antigravity remain unproven. |
+| `cortados_router/quota_sources.py` | Native source selection/read-only projection; existing observation/admission owners remain canonical. |
+| `cortados_router/cursor_quota.cjs` | Version-bound reuse of installed Cursor native credential/configuration/DashboardClient owners; no quota policy or cache. |
 | `acceptance/quota_sources/` | Independent QA; real native shapes, actual-context and staged-boundary exams; builder read-only. |
+
+| [FRESH-QUOTA-SOURCES-BUILD-REPORT.md](FRESH-QUOTA-SOURCES-BUILD-REPORT.md) | Root; 695-test source repair, timing, guarded activation and provider blockers. |
+| [CLAUDE-QUOTA-SOURCE-006-ANNEX.md](CLAUDE-QUOTA-SOURCE-006-ANNEX.md) | Disabled evidence draft; no Claude source implementation authority. |

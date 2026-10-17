@@ -79,3 +79,22 @@ was unavailable, Cursor process containment could not be proven, and the local t
 was unproven. These routes refused even where diagnostic status displayed a percentage. Existing
 status stance text describes the scarcity heuristic; final admission overrides it when evidence is
 unknown. Nightly training stays scheduled, but its teacher will pause if its quota cannot be verified.
+
+
+## Source-repair observation, October 17 at 17:05 EDT
+
+The common/Cursor repair is now installed after 695 scoped tests and independent D0/A0/B0.
+Cursor uses the native billing-cycle reader rather than its interactive display. At 16:59 EDT it
+reported 100% used in the Auto/Grok pool and 33.2222% used / 66.7778% left in the other-model pool,
+with 22.4% of the cycle elapsed. The existing applicable overflow rule allows admission; it does not
+authorize on-demand charges. Reset is November 10 at 17:32:35 EST. All balances are timestamped.
+
+Codex strict MCP source was available. Claude actual brain/teacher and Antigravity sources still
+refused as unknown. Claude's normal usage read again returned 429 at 17:00:54 EDT with a one-hour
+Retry-After; no further read is eligible before 18:00:54 EDT. Native managed-policy source binding
+also remains unresolved, independently of that response. Antigravity lacks a proven authenticated
+quota-only source with complete reset data. Cached UI readings never override these refusals.
+
+The 01:30 nightly remains enabled and can use 4,071 existing eligible labeled tasks; new Claude
+teacher labels remain blocked. No new model was promoted. See
+[FRESH-QUOTA-SOURCES-BUILD-REPORT.md](FRESH-QUOTA-SOURCES-BUILD-REPORT.md) for exact evidence and limits.

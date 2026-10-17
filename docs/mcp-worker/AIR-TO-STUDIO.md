@@ -94,5 +94,5 @@ The Studio ED25519 SSH host-key fingerprint observed locally was
 If a previously saved host key changes, investigate it rather than disabling the check.
 
 The active release and quota limitations are recorded in [INSTALLATION.md](INSTALLATION.md) and
-[QUOTA-OPERATIONS.md](QUOTA-OPERATIONS.md). The quota-source repair is still under independent
-contract/QA review; the connectivity checks above do not claim that repair has been installed.
+[QUOTA-OPERATIONS.md](QUOTA-OPERATIONS.md). The common/Cursor quota-source repair is installed with 695 scoped tests passing. Claude and
+Antigravity strict fleet admission remain blocked; Air SSH authentication still needs the checks above.
