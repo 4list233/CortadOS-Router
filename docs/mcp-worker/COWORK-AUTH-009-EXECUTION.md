@@ -1,12 +1,12 @@
 <!-- PURPOSE: Define prospective bounded auth build, exam and activation ownership.
-     CONTRACT: RT-COWORK-AUTH-009 v3; draft, not dispatchable.
+     CONTRACT: RT-COWORK-AUTH-009 v4; draft, not dispatchable.
      DEPENDS: COWORK-AUTH-009.md, accepted RT-COWORK-MCP-008 and independent D/A.
      CEILING: Current turn writes only these two drafts; no code, tests or commit. -->
 # Cowork future authentication execution package
 
 ```yaml
 contract_id: RT-COWORK-AUTH-009
-contract_version: 3
+contract_version: 4
 parent: COWORK-AUTH-009.md
 implements: RT-COWORK-MCP-008 FUTURE AUTH
 owner: Forest
@@ -18,19 +18,168 @@ selection: future S1 after context_requirements; no model call in authoring
 attempt_ledger: inherit 008 assignment and D-008-01/02; do not reset
 ```
 
+
+## E. Atomic execution obligations
+
+The scope tables, fixture recipes, command strings, numerical matrices and handback lists below supply exact parameter data for these obligations. They introduce no second type/API/state registry. R14-E sub-IDs inherit R14 without changing historical AC identity. Parent §R owns runtime requirements; R14-L owns the local listener lane.
+
+R14-E001 [FIXED, AC-008-01/02] Root MUST preserve this assignment's exact two-file write scope. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E002 [FIXED, AC-008-01/02] Root MUST require accepted core B before auth integration dispatch. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E003 [FIXED, AC-008-01/02] Root MUST require independent auth D0 before protected exam authoring. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E004 [FIXED, AC-008-01/02] Root MUST require committed protected exams and A0 before builder dispatch. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E005 [FIXED, AC-008-01/02] Root MUST preserve the existing task_group_id across revisions. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E006 [FIXED, AC-008-01/02] Root MUST use an absolute Studio cwd for future dispatch. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E007 [FIXED, AC-008-01/02] Root MUST use a stable request_id per intended attempt. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E008 [FIXED, AC-008-01/02] Root MUST inspect an existing job before resubmission. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E009 [FIXED, AC-008-01/02] Root MUST call context_requirements before route/delegate. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E010 [FIXED, AC-008-01/02] Root MUST supply the exact scope/dependency/exam evidence in task_evidence. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E011 [FIXED, AC-008-01/02] Root MUST track job_status through completion. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E012 [FIXED, AC-008-01/02] Root MUST retrieve job_result. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E013 [FIXED, AC-008-01/02] Root MUST record evidence-based job_feedback. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E014 [FIXED, AC-008-01/02] Root MUST NOT automatically retry a failed job. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E015 [FIXED, AC-008-01/02] Root MUST NOT turn quota refusal into API-key fallback. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E016 [FIXED, AC-008-01/02] Future source files MUST remain below500 physical lines. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E017 [FIXED, AC-008-01/02] Future source headers MUST state PURPOSE/CONTRACT/DEPENDS/CEILING. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E018 [FIXED, AC-008-01/02] Builders MUST remain inside the exact B1/B2 scope tables. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E019 [FIXED, AC-008-01/02] B1 MUST NOT duplicate OAuth transitions. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E020 [FIXED, AC-008-01/02] Additional source paths MUST return to root before implementation. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E021 [FIXED, AC-008-01/02] B2 MUST NOT edit server.py or __main__.py. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E022 [FIXED, AC-008-01/02] B2 MUST preserve ordinary lazy imports. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E023 [FIXED, AC-008-01/02] Shared core ownership MUST transfer only after accepted core B. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E024 [FIXED, AC-008-01/02] B2 MUST retain existing manager/descriptor/IPC/transfer owners. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E025 [FIXED, AC-008-01/02] B2 MUST NOT alter worker/broker/quota/route/task-store/ticket algorithms. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E026 [FIXED, AC-008-01/02] The check command MUST remain non-listening. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E027 [FIXED, AC-008-01/02] The check command MUST NOT resolve secrets. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E028 [FIXED, AC-008-01/02] The check command MUST NOT register clients. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E029 [FIXED, AC-008-01/02] The check command MUST NOT contact GitHub. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E030 [FIXED, AC-008-01/02] The activation-only serve command MUST enforce the exact CLI refusal predicate. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E031 [FIXED, AC-008-01/02] Q MUST author only its listed prospective acceptance_paths. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E032 [FIXED, AC-008-01/02] Q MUST commit exams with Exam-Owner attribution before dispatch. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E033 [FIXED, AC-008-01/02] Q MUST pin interpreter/source/dependency/fixture hashes in MANIFEST. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E034 [FIXED, AC-008-01/02] Q MUST supply fail-before-build cases for every new path. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E035 [FIXED, AC-008-01/02] Q MUST treat missing exams or zero discovery as BLOCKED. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E036 [FIXED, AC-008-01/02] Q MUST preserve existing core exams unchanged. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E037 [FIXED, AC-008-01/02] Q MUST execute every protected-file scenario in the coverage table. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E038 [FIXED, AC-008-01/02] Q MUST make fixture commands runnable without internet/packages/live credentials. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E039 [FIXED, AC-008-01/02] Q MUST report missing candidate imports as expected-red prebuild checks. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E040 [FIXED, AC-008-01/02] Q MUST exercise actual adapters/entrypoints in candidate mode. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E041 [FIXED, AC-008-01/02] Q MUST inventory all accumulated regression entrypoints at final diff. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E042 [FIXED, AC-008-01/02] Q MUST report discovered/executed/skipped/blocked counts. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E043 [FIXED, AC-008-01/02] Each lane MUST use its pinned interpreter/lock. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E044 [FIXED, AC-008-01/02] Q MUST preserve the original non-green baseline. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E045 [FIXED, AC-008-01/02] Q MUST NOT weaken the historical007 parity exam. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E046 [FIXED, AC-008-01/02] Q MUST preserve ongoing authorized nightly appends. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E047 [FIXED, AC-008-01/02] Q MUST count direct-method operations at the original six PydanticAdapter boundaries. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E048 [FIXED, AC-008-01/02] Q MUST report wrapper work separately. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E049 [FIXED, AC-008-01/02] Q MUST preserve bad-signature zero-store/provider work. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E050 [FIXED, AC-008-01/02] Q MUST report safety/lifecycle deltas against unchanged maintained vectors. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E051 [FIXED, AC-008-01/02] Q MUST remeasure the lifetime-owned identity client. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E052 [FIXED, AC-008-01/02] Before A, Q MUST pin the exact resource fixture matrix and oracles. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E053 [FIXED, AC-008-01/02] Before A, Q MUST record the environment and measurement procedure. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E054 [FIXED, AC-008-01/02] Before B, Q MUST compare accepted core, maintained baseline and actual candidate on their applicable paths. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E055 [FIXED, AC-008-01/02] Q MUST report inclusive totals alongside component costs. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E056 [FIXED, AC-008-01/02] Q MUST NOT fabricate a latency/RSS SLO. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E057 [FIXED, AC-008-01/02] Q MUST block B on missing candidate comparison or unexplained growth. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E058 [FIXED, AC-008-01/02] Root MUST own the exact later documentation paths. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E059 [FIXED, AC-008-01/02] Root MUST update the existing index before integration acceptance. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E060 [FIXED, AC-008-01/02] Activation MUST remain blocked until every listed deployment gate is satisfied. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E061 [FIXED, AC-008-01/02] Future builder handback MUST include the specified diff/hash/AC/measurement evidence. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E062 [FIXED, AC-008-01/02] Root MUST independently review and rerun the future handback. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E063 [FIXED, AC-008-01/02] O7 packaging MUST use optional remote extra fastmcp-slim[server]==3.4.9. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E064 [FIXED, AC-008-01/02] O7 packaging MUST retain Authlib==1.9.1. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E065 [FIXED, AC-008-01/02] O7 packaging MUST preserve base mcp==1.30.0. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E066 [FIXED, AC-008-01/02] The future lock MUST pin versions/artifact hashes/target/index/resolver. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E067 [FIXED, AC-008-01/02] Dependency resolution MUST require separate authorization. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E068 [FIXED, AC-008-01/02] Dependency resolution MUST use a new isolated environment. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E069 [FIXED, AC-008-01/02] Dependency resolution MUST NOT upgrade existing ordinary or research environments. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E070 [FIXED, AC-008-01/02] Ordinary startup MUST work with original base dependencies alone. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E071 [FIXED, AC-008-01/02] A conflicting dependency resolution MUST return O7. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
+R14-E072 [FIXED, AC-008-01/02] Target interpreter/platform compatibility MUST remain a separate qualification gate. Reason: Preserve the existing bounded ownership and independent evidence gates.
+
 ## 1. Current authorization and prerequisites
 
-[FIXED] Current scope_paths are exactly `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009.md` and `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009-EXECUTION.md`. Current acceptance_paths are empty. Only those copied drafts may be edited; original repository is read-only. No implementation, acceptance authoring/execution, package install, network, worker/model invocation, credentials, registration, service changes or commit is authorized. Stop at the two drafts and handback.
+[FIXED] Current scope_paths are exactly `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009.md` and `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009-EXECUTION.md`. Current acceptance_paths are empty. Only those copied drafts may be edited; original repository is read-only. No implementation, acceptance authoring/execution, package install, network, worker/model invocation, credentials, registration, service changes or commit is authorized. The current deliverable ends at the two drafts and handback.
 
-[FIXED] Future dispatch requires accepted core implementation plus auth-specific independent D=0 then A=0, committed protected exams, resolved applicable O rows, approved dependency lock and nonoverlapping scope. Frozen core D0/A0 and committed protected exams do not imply core B acceptance; core B is running separately. Local synthetic auth design and exam specifications can proceed without actual GitHub identity/file-policy choices. Actual live access is never a prerequisite for writing synthetic exams.
+[FIXED] Future dispatch requires accepted core implementation plus auth-specific independent D=0 then A=0, committed protected exams, resolved applicable O rows, approved dependency lock and nonoverlapping scope. Frozen core D0/A0 and committed protected exams do not imply core B acceptance; core implementation is terminal and undergoing host/independent B separately. Local synthetic auth design and exam specifications can proceed without actual GitHub identity/file-policy choices. Actual live access is never a prerequisite for writing synthetic exams.
 
 [FIXED] The parent owns all schemas, API signatures, examples E1–E34, R rules and contradictions. This execution document references them instead of copying nested examples. Any change in observable semantics returns to root for a versioned amendment before build.
 
-Future worker dispatch MUST use the existing group, absolute Studio cwd `/Users/velox/.cortados-builds/cortados-router-repo`, a stable per-attempt request_id and configured timeout. Root MUST inspect an existing job before resubmitting. Root MUST call context_requirements before route/delegate and supply the pinned parent, exact scope, accepted-core hashes, resolved O decisions, exam hashes, constraints and verification in task_evidence. S1 recommendation does not execute; delegate accepts the attempt. No automatic retry/quota fallback. Root tracks job_status/job_result and records evidence-based job_feedback. Worker MCP and permissions are explicit grants, never inherited connectors. No nested workers in this assignment.
+Future worker dispatch is specified to use the existing group, absolute Studio cwd `/Users/velox/.cortados-builds/cortados-router-repo`, a stable per-attempt request_id and configured timeout. Root is specified to inspect an existing job before resubmitting. Root is specified to call context_requirements before route/delegate and supply the pinned parent, exact scope, accepted-core hashes, resolved O decisions, exam hashes, constraints and verification in task_evidence. S1 recommendation does not execute; delegate accepts the attempt. No automatic retry/quota fallback. Root tracks job_status/job_result and records evidence-based job_feedback. Worker MCP and permissions are explicit grants, never inherited connectors. No nested workers in this assignment.
 
 ## 2. Prospective source scopes and ownership
 
-All paths in this section are proposals, NOT current grants. Verified existing parents: `integrations/mcp/`, `docs/mcp-worker/`, repository root, `acceptance/`. `acceptance/cowork_auth/` is a proposed NEW directory. Source MUST remain <500 physical lines per responsibility; no minification/generic utils split. New source headers MUST state PURPOSE/CONTRACT/DEPENDS/CEILING. No broad globs.
+All paths in this section are proposals, NOT current grants. Verified existing parents: `integrations/mcp/`, `docs/mcp-worker/`, repository root, `acceptance/`. `acceptance/cowork_auth/` is a proposed NEW directory. Source is specified to remain <500 physical lines per responsibility; no minification/generic utils split. New source headers are specified to state PURPOSE/CONTRACT/DEPENDS/CEILING. No broad globs.
 
 Package B1 owns thin auth policy/lifetime after its separate gates:
 
@@ -44,7 +193,7 @@ Package B1 owns thin auth policy/lifetime after its separate gates:
 | integrations/mcp/remote_auth_transport.py | NEW; supported real HTTPX/Authlib client construction, endpoint/encoding policy and pre-eager-read body/chunk/header guards, parent §12.1. |
 | integrations/mcp/remote_auth_storage.py | NEW; sole lock/marker/manifest/barrier and strict encrypted/decoded trust owner around maintained storage, parent §§8/12.2. |
 
-B1 MUST NOT duplicate OAuth protocol transitions or maintain token records. Root MUST return a scope amendment before splitting any of these responsibilities into additional paths.
+B1 does not duplicate OAuth protocol transitions or maintain token records. Root is specified to return a scope amendment before splitting any of these responsibilities into additional paths.
 
 Package B2, sequential after accepted core and B1, owns production composition and packaging:
 
@@ -58,7 +207,7 @@ Package B2, sequential after accepted core and B1, owns production composition a
 | pyproject.toml | EXISTING; reviewed optional remote extra only, no implicit ordinary dependency upgrade or default command change. |
 | docs/mcp-worker/cowork-auth-requirements.lock | NEW; exact remote resolved dependencies and artifact hashes after separately authorized resolution. Research freeze alone is not a release lock. |
 
-B2 MUST NOT change server.py or __main__.py. Invoke the separate module explicitly, keeping ordinary stdio lazy imports unchanged. No core file ownership transfers until core acceptance is recorded and no core builder holds it. B2 MUST keep existing managers/descriptors/IPC/byte handlers as their sole owners. It MUST NOT alter worker, broker, quota, route, task store, ticket or file-transfer algorithms. Use parent §12.3 and existing CoreRuntime.disable_owner/Session.closed; do not add a CoreClient disable opcode.
+B2 does not change server.py or __main__.py. The separate explicit module invocation preserves ordinary stdio lazy imports. No core file ownership transfers until core acceptance is recorded and no core builder holds it. B2 is specified to keep existing managers/descriptors/IPC/byte handlers as their sole owners. It does not alter worker, broker, quota, route, task store, ticket or file-transfer algorithms. Parent §12.3 uses existing CoreRuntime.disable_owner/Session.closed; a CoreClient disable opcode is excluded.
 
 Frozen future CLI syntax (Q verifies, never run in this turn):
 
@@ -67,7 +216,7 @@ python -m integrations.mcp.remote_service check --auth-config ABS --core-config 
 python -m integrations.mcp.remote_service serve --auth-config ABS --core-config ABS --base-config ABS --native-manifest ABS --host 127.0.0.1 --port PORT
 ```
 
-[FIXED] `check` is non-listening schema/dependency/seam validation only; it MUST NOT resolve secrets, register clients or contact GitHub. `serve` is activation-only and MUST refuse missing operator settings, non-loopback host, multiple workers, failed root lock or unqualified storage restart. PORT is an operator-approved integer 1..65535 without a default. The eventual release interpreter/paths/service manager remain separately approved; these strings are not deploy commands to execute now. Client provisioning uses maintained register_client offline while stopped; no provisioning CLI is authorized in B1/B2 until root records its exact scope.
+[FIXED] `check` is non-listening schema/dependency/seam validation only; it does not resolve secrets, register clients or contact GitHub. `serve` is activation-only and is specified to refuse missing operator settings, non-loopback host, multiple workers, failed root lock or unqualified storage restart. PORT is an operator-approved integer 1..65535 without a default. The eventual release interpreter/paths/service manager remain separately approved; these strings are not deploy commands to execute now. Client provisioning uses maintained register_client offline while stopped; no provisioning CLI is authorized in B1/B2 until root records its exact scope.
 
 Excluded from B1/B2: every acceptance/test fixture, these contracts, existing global rulings/index, all installed releases, live config/state/keys, ingress/launchd, training/labels, upstream library source, task/file-transfer/queue/quota owners, ordinary server registration and user homes. Dependency changes may not silently broaden FS/network/MCP permissions.
 
@@ -90,7 +239,7 @@ Owner: designated independent MCP QA, never B1/B2. These are prospective accepta
 * `acceptance/cowork_auth/test_compatibility.py`
 * `acceptance/cowork_auth/test_resources.py`
 
-[FIXED] Q MUST commit these exams with Exam-Owner attribution before dispatch. Q MUST pin interpreter/source/dependency/fixture hashes in MANIFEST. Q MUST supply fail-before-build cases for each new path. Existing core QA paths remain read-only dependencies, not 009-owned exams. Missing exam or zero discovery count is BLOCKED, not a pass. Required new paths beyond this list require a recorded amendment.
+[FIXED] Q is specified to commit these exams with Exam-Owner attribution before dispatch. Q is specified to pin interpreter/source/dependency/fixture hashes in MANIFEST. Q is specified to supply fail-before-build cases for each new path. Existing core QA paths remain read-only dependencies, not 009-owned exams. Missing exam or zero discovery count is BLOCKED, not a pass. Required new paths beyond this list require a recorded amendment.
 
 Historical AC text copied byte-for-byte from parent §7, retaining the old split for provenance:
 
@@ -99,15 +248,15 @@ Historical AC text copied byte-for-byte from parent §7, retaining the old split
 | AC-008-01 | Real loopback ASGI discovery/401 challenge, all MCP methods auth, exact port/path/resource; PAT/ID/refresh/wrong issuer/audience/expiry denied | Actual hosted discovery/callback |
 | AC-008-02 | Maintained-provider local fixtures: S256 only, exact redirect, duplicate/resource rejection, no positive cache, bad-secret logs, encrypted restart/unknown-key fail closed | Real GitHub App identity/refresh/rotation; two parallel refreshes and crash windows; client deadlines |
 
-[FIXED O5, ratified at 495973c] R14 supplements the unchanged historical rows: synthetic races, crash/restart and safe failure are LOCAL exams; actual GitHub/Claude observations are additional deployment evidence. Q MUST NOT reset IDs or hide the historical wording. No distinct AC-009 numbering is introduced.
+[FIXED O5, ratified at 495973c] R14 supplements the unchanged historical rows: synthetic races, crash/restart and safe failure are LOCAL exams; actual GitHub/Claude observations are additional deployment evidence. Q does not reset IDs or hide the historical wording. No distinct AC-009 numbering is introduced.
 
 | Protected file | R / AC coverage and required observable ground truth |
 |---|---|
-| test_provider_hooks.py | R1–2, AC02: actual pinned maintained callback, explicit refresh and transparent refresh use both hooks. Reproduce the 26 invalid-shape matrix on all three paths plus E1 valid controls; add duplicate JSON keys, unknown absolute expiry, alias-only valid response, error-status/error-field and oversize cases. Observe parser-entry counts, put/delete interception and encrypted-file hashes; malformed success causes zero parse and zero token writes. Downstream code exchange has no upstream fetch. |
-| test_claims.py | R7–9, AC01: signature verification precedes facts, typed exp/iat/nbf exact boundaries, scalar exact audience/issuer/client; missing/malformed/foreign live subject, raw PAT/ID/refresh all refuse. Verify returned SDK object contains proxy bearer only and IPC Principal contains no token; never accept display login. Two clients with same owner require explicit stopped-service rollover; owner hash stays equal. |
-| test_oauth_http.py | R3,9–11, AC01/02: exercise actual maintained ASGI handlers using in-process HTTPX ASGITransport with all external sockets forbidden. Full authorize/consent/callback/code+S256 verifier exchange, exact state/redirect binding, missing/plain/duplicate/wrong resource, client allowlist, no /register or CIMD fetch, safe metadata and 401 challenge. Test every /mcp method unauthenticated before core 405, no duplicate mount. Synthetic route responses are not actual hosted discovery evidence. Loopback lane is later separately authorized if required by historical AC01. |
+| test_provider_hooks.py | R1–2, AC02: actual pinned maintained callback, explicit refresh and transparent refresh use both hooks. Reproduce the 26 invalid-shape matrix on all three paths plus E1 valid controls; add duplicate JSON keys, unknown absolute expiry, alias-only valid response, hook-clock datetime limits (now1000/duration253402299799 valid, +1 overflow,253402300800 overflow,P−1000 overflow, unrepresentable now_s), error-status/error-field and oversize cases. Observe parser-entry counts, put/delete interception and encrypted-file hashes; malformed success causes zero parse and zero token writes. Downstream code exchange has no upstream fetch. |
+| test_claims.py | R7–9, AC01: signature verification precedes facts, typed exp/iat/nbf exact boundaries, including fake-clock initial999/exp1000 followed by maintained await returning at999 (valid),1000 (refuse),1001 (refuse), with failure-latch inspection before final validate_claims and zero core calls on refusal, scalar exact audience/issuer/client; missing/malformed/foreign live subject, raw PAT/ID/refresh all refuse. Verify returned SDK object contains proxy bearer only and IPC Principal contains no token; never accept display login. Two clients with same owner require explicit stopped-service rollover; owner hash stays equal. |
+| test_oauth_http.py | R3,9–11, AC01/02: exercise actual maintained ASGI handlers using in-process HTTPX ASGITransport with all external sockets forbidden. Full authorize/consent/callback/code+S256 verifier exchange, exact state/redirect binding, missing/plain/duplicate/wrong resource, client allowlist, no /register or CIMD fetch, safe metadata and 401 challenge. Test every /mcp method unauthenticated before core 405, no duplicate mount. Synthetic route responses are not actual hosted discovery evidence. The mandatory real-loopback lane below supplies historical AC01 ground truth in addition to ASGITransport. |
 | test_auth_lifetime.py | R3–6,13, AC02: barriers before credential get prove one outer gate; two HTTP code redemptions produce one success, second invalid_grant; two refresh redemptions produce one rotation; explicit versus transparent and callback replay serialize. Trace lock enter/read/write/delete/exit; no nested acquisition; gate released before CoreClient. Independent processes prove second lifetime owner refuses before store access. |
-| test_auth_lifetime.py (fault lanes) | Kill isolated synthetic subprocess at every observed multiwrite await boundary (callback code put/transaction delete; code delete/upstream/JTI/refresh puts; explicit upstream/new JTI/old JTI/metadata changes; transparent upstream put). Restart outcomes must match parent §8 kill-point table, including its final-barrier/all-process-loss limitation; corrupt ciphertext/wrong key/missing reference/invalid stored schema cannot authenticate. Cancellation during upstream exchange/store fails lifetime, no retry; gate wait cancellation never starts exchange. Preserve files and distinguish process kill from untested power loss. |
+| test_auth_lifetime.py (fault lanes) | Kill isolated synthetic subprocess at every observed multiwrite await boundary (callback code put/transaction delete; code delete/upstream/JTI/refresh puts; explicit upstream/new JTI/old JTI/metadata changes; transparent upstream put). Restart outcomes must match parent §8 kill-point table, including its final-barrier/all-process-loss limitation; corrupt ciphertext/wrong key/missing reference/invalid stored schema cannot authenticate. Cancellation during upstream exchange/store fails lifetime, no retry; gate wait cancellation never starts exchange. Preserve files and distinguish process kill from untested power loss. Cover live storage clock separately from injected hook now_s: put/put_many type/finite/positive TTL checks, every bulk addition validated before first write, live-time rollover after a valid hook, and later library overflow after prevalidation; observe fixed storage_unavailable, failure latch and preserved partial bytes. |
 | test_safe_errors.py | R12, AC01/02: inject unique secret sentinel in token/code/refresh/error body/exception/request URL/HTML/redirect/cookie and dependency traceback. Capture log records before handlers, stdout/stderr and every ASGI output byte/header. No sentinel escapes. Validate E7 fixed body, safe challenge, no partial success sent on overflow. Debug-off alone is a negative control. |
 | test_core_composition.py | R4,11,13 / O2, AC01/02: accepted CoreRuntime and CoreClient over inherited socketpair; actual manager initialized once, exact 12 descriptors and unchanged transfer route. No broker call before auth; no secret over IPC; no auth gate held during call. Disable closes tickets/streams through core, does not cancel accepted jobs; disconnect/expiry never resubmits. Local_test loader still rejects service mode; no startup DB effect on malformed auth config. |
 | test_compatibility.py | AC01/02 integration regressions: stdio startup without remote extra, ordinary argv/schema/result bytes and training unchanged. Existing subscription/quota refusals start zero native jobs and no API fallback. Historical 007 and current training integrity remain distinct lanes. |
@@ -119,11 +268,86 @@ Q's prebuild command proposal, after independent exam authoring in the pinned ex
 /Users/velox/.cortados-builds/cowork-mcp-verification/auth-research-venv/bin/python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_*.py'
 ```
 
-Q MUST make the command runnable without internet, packages, real credentials or live files. In prebuild mode it proves maintained seams and exam integrity; missing future production imports remain explicit expected-red build checks, not full acceptance. Candidate mode MUST exercise the actual future adapters/entrypoint, with no substitute implementation. No “probe passed” converts to candidate B pass.
+Q is specified to make the command runnable without internet, packages, real credentials or live files. In prebuild mode it proves maintained seams and exam integrity; missing future production imports remain explicit expected-red build checks, not full acceptance. Candidate mode is specified to exercise the actual future adapters/entrypoint, with no substitute implementation. No “probe passed” converts to candidate B pass.
+
+
+### Mandatory bounded real-loopback lane (C5)
+
+Root84a25ff authorizes this local synthetic lane in the existing proposed test_oauth_http.py scope; it is an unconditional AC-008-01 criterion. It is separate from in-process ASGITransport and from activation-only serve. No public listener or provider access follows.
+
+| Stable sub-ID | Atomic obligation | Reason |
+|---|---|---|
+| R14-L01 [FIXED, AC-008-01] | Q MUST run the command below from the candidate repository root with the pinned research interpreter and package-aware -t . discovery. | Reproducible actual local HTTP ground truth. |
+| R14-L02 [FIXED, AC-008-01] | The fixture MUST bind an AF_INET socket to 127.0.0.1 port0. | OS assignment avoids a fixed service port. |
+| R14-L03 [FIXED, AC-008-01] | The fixture MUST pass the bound socket to the pinned maintained uvicorn.Server serving the actual ASGI app. | A real server supplies the historical criterion. |
+| R14-L04 [FIXED, AC-008-01] | The fixture MUST use the getsockname port as its sole client destination. | Local permission is endpoint-specific. |
+| R14-L05 [FIXED, AC-008-01/02] | The fixture MUST provision only private synthetic state/credentials through the maintained setup. | No live credential dependency. |
+| R14-L06 [FIXED, AC-008-01/02] | The fixture MUST deny every provider/external connection in every fixture process. | Local HTTP permission does not authorize GitHub. |
+| R14-L07 [FIXED, AC-008-01] | The fixture MUST enforce exact destination checks on connect/connect_ex and async connection paths. | Alternative client paths cannot escape the fixture. |
+| R14-L08 [FIXED, AC-008-01] | The HTTP client MUST disable environment proxy lookup. | Proxy state cannot redirect local traffic. |
+| R14-L09 [FIXED, AC-008-01] | The HTTP client MUST disable redirect following. | A response cannot widen destination authority. |
+| R14-L10 [FIXED, AC-008-01] | Q MUST assert discovery bytes through the real socket. | ASGITransport alone is insufficient. |
+| R14-L11 [FIXED, AC-008-01] | Q MUST assert unauthenticated MCP401 challenge bytes through the real socket. | Historical admission ground truth. |
+| R14-L12 [FIXED, AC-008-01] | Q MUST assert no core work from the denied request. | Refusal precedes dispatch. |
+| R14-L13 [FIXED, AC-008-01/02] | The fixture MUST run cleanup in finally for every outcome. | Failed assertions cannot leave listeners. |
+| R14-L14 [FIXED, AC-008-01/02] | The fixture MUST await server lifespan shutdown. | Storage and manager settlement are observable. |
+| R14-L15 [FIXED, AC-008-01] | Q MUST prove the listening socket closed after cleanup. | No persistent listener is authorized. |
+| R14-L16 [FIXED, AC-008-01] | Q MUST prove every fixture child was joined after cleanup. | Process lifetime is bounded. |
+
+
+R14-L17 [FIXED, AC-008-01/02] The fixture MUST use the exact single-process server settings specified below. Reason: Avoids reload/worker lifetime ambiguity.
+
+R14-L18 [FIXED, AC-008-01/02] The fixture MUST retain synthetic Host/Origin/resource policy on the real local transport. Reason: Local transport is not an identity-policy bypass.
+
+R14-L19 [FIXED, AC-008-01/02] The fixture MUST NOT follow advertised synthetic HTTPS endpoints. Reason: Discovery bytes do not authorize a destination.
+
+R14-L20 [FIXED, AC-008-01/02] The parent watchdog MUST use the fixed fixture-only deadline table below. Reason: A hung fixture cannot become a persistent listener.
+
+R14-L21 [FIXED, AC-008-01/02] The ready signal MUST follow server/lifespan readiness. Reason: Spawn alone proves no service readiness.
+
+R14-L22 [FIXED, AC-008-01/02] Graceful cleanup MUST set server.should_exit. Reason: The maintained server owns normal shutdown.
+
+R14-L23 [FIXED, AC-008-01/02] Cleanup MUST close the HTTP client. Reason: No retained local connection survives.
+
+R14-L24 [FIXED, AC-008-01/02] Cleanup MUST close the bound listener socket. Reason: The listener is fixture-lifetime only.
+
+R14-L25 [FIXED, AC-008-01/02] The parent MUST escalate timeout through terminate/join then kill/join using the specified fixture intervals. Reason: Hung child settlement remains bounded.
+
+R14-L26 [FIXED, AC-008-01/02] Unproven child death MUST fail the lane. Reason: Missing cleanup evidence is not success.
+
+R14-L27 [FIXED, AC-008-01/02] The child MUST report socket fileno=-1 after close. Reason: Socket closure has concrete evidence.
+
+R14-L28 [FIXED, AC-008-01/02] The parent MUST check process exit after joining. Reason: A signal is not death proof.
+
+R14-L29 [FIXED, AC-008-01/02] The parent MUST observe refusal from the formerly bound exact endpoint after teardown. Reason: No persistent listener remains.
+
+R14-L30 [FIXED, AC-008-01/02] Port reuse ambiguity MUST make teardown evidence inconclusive. Reason: Another listener cannot be misidentified as this fixture.
+
+R14-L31 [FIXED, AC-008-01/02] Q MUST record bind/accept/destination counts. Reason: Connection authority is auditable.
+
+R14-L32 [FIXED, AC-008-01/02] Q MUST record denied external attempts. Reason: External traffic remains excluded.
+
+R14-L33 [FIXED, AC-008-01/02] Q MUST preserve ready/shutdown/exit traces. Reason: Lifetime evidence survives failure.
+
+R14-L34 [FIXED, AC-008-01/02] Q MUST retain the private fixture directory as failure evidence. Reason: Failure does not erase state.
+
+R14-L35 [FIXED, AC-008-01/02] Q MUST run this lane in maintained-seam prebuild mode. Reason: The retained local criterion is unconditional.
+
+R14-L36 [FIXED, AC-008-01/02] Q MUST rerun this lane against actual final candidate entrypoints. Reason: A maintained-only probe is not candidate acceptance.
+
+Fixture mechanics are fixed: one isolated subprocess owns one uvicorn.Server and one prebound socket, workers=1/reload=False/access_log=False; its synthetic app retains exact configured Host/Origin/issuer/resource policy. Local client transport uses http://127.0.0.1:<assigned> with the exact synthetic Host and Origin headers, so no test bypass of host policy is needed; advertised synthetic HTTPS metadata is asserted without following it. Socket objects/control pipe are inherited privately, never public control endpoints. Provider-free discovery/401 needs no upstream HTTP mock response.
+
+The parent watchdog uses monotonic deadlines: 10 seconds for startup-ready, 5 seconds per local request, 5 seconds for graceful shutdown, then 5 seconds for terminate/join, then kill/join bounded by 5 seconds. These are exam-only bounds, independent of E9 auth operation clocks and unset live configuration. Ready means server/lifespan active, not merely spawned. A shutdown signal sets server.should_exit; finally closes client, awaits server task/lifespan, closes bound socket and reports teardown before child exit. The parent joins on every outcome, escalates on timeout, and records failure if death is unproven. The child reports socket fileno=-1; parent verifies process exit and a refused connection to the formerly bound endpoint while its exact-endpoint guard still applies. Port reuse by another process is an inconclusive teardown observation, never a pass. The private fixture directory is retained as failure evidence per existing Q ownership. No other child/server task may survive.
+
+```sh
+/Users/velox/.cortados-builds/cowork-mcp-verification/auth-research-venv/bin/python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_oauth_http.py'
+```
+
+Q records destination/bind/accept counts, denied external attempts, ready/shutdown/exit traces and socket closure. The lane is mandatory in prebuild maintained-seam mode and final actual-candidate mode; expected-red candidate imports do not count as candidate success. No lane is executed by this contract-only revision.
 
 ## 4. Gates and dispatch order
 
-1. [FIXED] Root pins 5d98d77 and parent v3 semantics; proposes section6 amendments only after accepted core B and before dependent B2. Forest's deployed O1 remains separate, never filled with synthetic values. Parent/contract amendment precedes dependent code.
+1. [FIXED] Root pins 84a25ff and parent v4 semantics; proposes section6 amendments only after accepted core B and before dependent B2. Forest's deployed O1 remains separate, never filled with synthetic values. Parent/contract amendment precedes dependent code.
 2. [FIXED] Q performs independent auth D. D0 requires exact callable/schema/ownership closure and rendered diagrams; this author asserts no rubric score.
 3. [FIXED] Q freezes and commits synthetic exams, including D-008-01/02 regressions, and performs A. Missing local fixtures, source qualification or finite cap/call-budget oracles block A. Postbuild candidate latency/RSS is not a prebuild prerequisite; candidate imports are explicitly expected red.
 4. [FIXED] Root waits for accepted core B and releases its shared-file ownership. Core D0/A0 alone does not authorize auth integration.
@@ -131,7 +355,7 @@ Q MUST make the command runnable without internet, packages, real credentials or
 6. [FIXED] Q/root rerun the actual final candidate plus full accumulated system inventory. Builder success narration is insufficient. Root records accepted/rejected/inconclusive feedback against stable job/group and AC IDs.
 7. [FIXED] Activation remains blocked until §6 gates. Local acceptance never proves live GitHub refresh, Claude OAuth, native tools or binary materialization.
 
-Full regression requirement: adopt the actual 26-lane accumulated runner described in 008 EXECUTION and `V/provider-preflight.md`, then add core/auth lanes. Q MUST inventory maintained unittest/pytest/standalone/native/plugin/adapter entrypoints and report discovered/executed/skipped/blocked counts at final diff. Starting references, not permission to run:
+Full regression requirement: adopt the actual 26-lane accumulated runner described in 008 EXECUTION and `V/provider-preflight.md`, then add core/auth lanes. Q is specified to inventory maintained unittest/pytest/standalone/native/plugin/adapter entrypoints and report discovered/executed/skipped/blocked counts at final diff. Starting references, not permission to run:
 
 ```text
 /Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/training_teacher/evidence/run-full-suite.py ISOLATED_EVIDENCE_DIR
@@ -139,7 +363,7 @@ python -B -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py'
 python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_*.py'
 ```
 
-The pinned environment for each lane must match its dependency lock, not the shell's incidental python. The original baseline remains 785 tests / 784 pass / 1 fail, not green. The live whole-label-hash parity failure is retained; historical-007 separately passed 4/4 after three literal path relocations and equal normalized AST. Do not weaken that exam or freeze authorized nightly appends. Candidate verifies ordinary profile equality plus existing label prefix, exam provenance and final live partition checks.
+The pinned environment for each lane must match its dependency lock, not the shell's incidental python. The original baseline remains 785 tests / 784 pass / 1 fail, not green. The live whole-label-hash parity failure is retained; historical-007 separately passed 4/4 after three literal path relocations and equal normalized AST. Weakening that exam or freezing authorized nightly appends is excluded. Candidate verifies ordinary profile equality plus existing label prefix, exam provenance and final live partition checks.
 
 ## 5. Resource measurement plan
 
@@ -155,9 +379,9 @@ The pinned environment for each lane must match its dependency lock, not the she
 | transparent_refused | 4/0/0 | 1 | 3 | 1/0 | 7.188521 |
 | bad_signature | 0/0/0 | 0 | 0 | 0/0 | 0.011604 |
 
-Count at the same six provider PydanticAdapter method boundaries as the pinned baseline script. Do not count nested FileTree calls as additional logical provider queries or hide added wrapper work. Preserve zero store/provider work for bad signatures. The original direct fixture uses the maintained upstream-client fallback; it excludes registered downstream-client HTTP authentication, consent, PKCE, gate/strict claims/projection/trust wrappers/barriers/shutdown. New synthetic HTTP exams provision E19 through maintained register_client and separately report static-client lookup. transparent_refused historically performs later fallback reads after the rejected hook; candidate failure must latch before success output. If fail-stop safety stops that measured path early, report the exact reduced trace as a safety delta alongside the unchanged maintained comparison, never add calls or pretend it reproduced the full vector.
+The counter boundary is the same six provider PydanticAdapter methods as the pinned baseline script. Nested FileTree calls are not additional logical provider queries; wrapper work is separately visible. The bad-signature vector has zero store/provider work. The original direct fixture uses the maintained upstream-client fallback; it excludes registered downstream-client HTTP authentication, consent, PKCE, gate/strict claims/projection/trust wrappers/barriers/shutdown. New synthetic HTTP exams provision E19 through maintained register_client and separately report static-client lookup. transparent_refused historically performs later fallback reads after the rejected hook; candidate failure must latch before success output. If fail-stop safety stops that measured path early, report the exact reduced trace as a safety delta alongside the unchanged maintained comparison, never add calls or pretend it reproduced the full vector.
 
-Original run3 constructs fresh verifier clients. Candidate §12.1 deliberately uses one real lifetime-owned client with keepalive disabled. Remeasure this lifecycle; do not label baseline as already using it or silently substitute preliminary run1. Baseline timings include the maintained hook only; Darwin cumulative high-water RSS126337024→127303680 includes imports/setup/retained samples, not per-call allocation.
+Original run3 constructs fresh verifier clients. Candidate §12.1 deliberately uses one real lifetime-owned client with keepalive disabled. This lifecycle has separate candidate measurements; baseline does not already use it and preliminary run1 is not a substitute. Baseline timings include the maintained hook only; Darwin cumulative high-water RSS126337024→127303680 includes imports/setup/retained samples, not per-call allocation.
 
 ### Fixed synthetic caps and prebuild/postbuild split
 
@@ -181,11 +405,11 @@ After implementation, before B acceptance, run the same fixtures on (1) accepted
 
 Independent B reviews raw memory scaling against max_waiters×bounded retained input plus one active guarded response/chunk, fixed server/TLS/parser overhead, storage preflight and manifest size. Report tracemalloc and process RSS separately (high-water is cumulative), per-file scanning versus namespace manifest growth, bytes/files/operations, CPU/wall p50/p95/max and refused counts. Memory must plateau with waiter cap under sustained excess arrivals; no hidden queue or whole transfer copy. Finite configured caps are correctness requirements, not an RSS SLO. Unexplained growth, extra method calls, omitted overhead or missing raw candidate comparison block B; do not mark efficiency accepted merely because tests exit0. A newly proposed latency/RSS threshold needs measured root approval, not author invention.
 
-Live upstream latency and actual Claude10s/30s deadlines remain separate activation evidence. v3 replaces the maintained30s OAuth/10s identity defaults with explicit remaining operation deadline on both clients; synthetic deadlines do not prove live sufficiency. Model/provider inference, network connects and cost remain zero in local fixture lanes. No subscription price/quota expiry is invented.
+Live upstream latency and actual Claude10s/30s deadlines remain separate activation evidence. The inherited v3 client profile replaces the maintained30s OAuth/10s identity defaults with explicit remaining operation deadline on both clients; synthetic deadlines do not prove live sufficiency. Model/provider inference, provider/external network connects and cost remain zero in local fixture lanes. The mandatory bounded loopback lane permits only its exact ephemeral local endpoint connections. No subscription price/quota expiry is invented.
 
 ## 6. Activation and documentation package (root only)
 
-No live path is granted here. Later root documentation ownership is exact `docs/mcp-worker/INDEX.md`, `docs/mcp-worker/INSTALLATION.md`, `docs/mcp-worker/USAGE.md`, `docs/mcp-worker/CLAUDE-APP-CONNECTOR-PLAN.md`; these are existing files excluded from this author turn. Root must update the single existing map before integration acceptance, not add a rival index.
+No live path is granted here. Later root documentation ownership is exact `docs/mcp-worker/INDEX.md`, `docs/mcp-worker/INSTALLATION.md`, `docs/mcp-worker/USAGE.md`, `docs/mcp-worker/CLAUDE-APP-CONNECTOR-PLAN.md`; these are existing files excluded from this author turn. R14-E requires the single existing map update before integration acceptance; no rival index is included.
 
 Deployment checklist is a gate specification, not instructions to act now:
 
@@ -203,7 +427,7 @@ Failure of any deployment-only lane leaves activation BLOCKED while preserving i
 
 ## 7. Handback and unresolved decisions
 
-Future builder handback MUST include confined diff, per-source physical line counts, exact dependency/source/fixture hashes, per-AC returned response/store/event evidence, gate/crash traces, full-suite membership, baseline/candidate measurements, selected bounded choices, deviations and unresolved risks. Root independently reviews and reruns; completion alone is not correctness. No commit/install/push follows automatically.
+Future builder handback is specified to include confined diff, per-source physical line counts, exact dependency/source/fixture hashes, per-AC returned response/store/event evidence, gate/crash traces, full-suite membership, baseline/candidate measurements, selected bounded choices, deviations and unresolved risks. Root independently reviews and reruns; completion alone is not correctness. No commit/install/push follows automatically.
 
 Current author handback is only these two draft documents. Historical core D21→D3→D0 and auth D-008-01/02 remain recorded in parent §1. No tests or production acceptance are claimed.
 
@@ -221,7 +445,7 @@ No row selects a product, permission, retention or identity alternative. Parent 
 
 ## 8. Revision-specific ownership and verification obligations
 
-Root authority is Router commit5d98d77, technical closure after the independent maintained baseline. The current user explicitly prohibits nested workers; the general worker workflow applies only to a separately authorized future dispatch. This authoring does not start an attempt or alter the inherited group/ledger. Prior auth author job20d04076-54f8-46a1-b527-4597ca5ad88c and draft feedback23b83eaa-1170-4288-92c7-87da03b6b853 remain draft-only history.
+Root authority is Router commit84a25ff, adopting exact independent auth-v3-D C1–C5; 5d98d77 technical closure remains historical. The current user explicitly prohibits nested workers; the general worker workflow applies only to a separately authorized future dispatch. This authoring does not start an attempt or alter the inherited group/ledger. Prior auth author job20d04076-54f8-46a1-b527-4597ca5ad88c and draft feedback23b83eaa-1170-4288-92c7-87da03b6b853 remain draft-only history.
 
 B1 owns exactly seven files in §2: config, provider, claims, runtime, errors, transport and storage. Storage exclusively owns lock/marker/manifest/barrier/envelope/decoded trust; runtime exclusively owns admission and settlement and the identity client lifetime; transport owns guarded real client construction/reads. B2 adds supervisor to its exact prior integration/package paths; supervisor exclusively owns parent CoreRuntime and child/control lifetime, service owns CLI/routes/metadata, remote_http retains the single manager/transfer composition. No duplicate marker, broker or token owner. Every source remains strictly below500 physical lines including comments/blanks; docs have no cap. A needed extra source path returns to root before implementation.
 Additional mandatory protected scenarios, in already listed Q-owned files:
@@ -239,3 +463,5 @@ O7 exact future packaging boundary: add optional project extra named remote, wit
 Current handback checks are document-only: confined files, preserved historical AC/defect/history/group IDs, JSON block syntax and source hashes. No auth/core acceptance, tests, worker, installation, commit, activation or D/A self-score is claimed. Root reviews the isolated diff and technical gaps before copying; independent QA remains the only D/A authority.
 
 Root O7 mechanical correction at a93f48b: the server extra above is required; plain slim failed actual provider import. Isolated auth-dependency-lock/REPORT.json records65 packages with exact research-version equality and successful provider/storage imports on CPython3.14.6/macOS arm64. Candidate hash lock6099038ad1842f32dd9e4b54946dd3494cb97027851d71c8a066abc6f784cb88 is dependency evidence only; ordinary environments were not modified. Independent D/A/B and final lock incorporation remain required.
+
+V4 source/history ledger is canonical in parent §13. Independent auth-v3-D D=11/33 and A unrun remain history; C1–C5 amendment is not a self D/A score. The v4 canonical D0 registry precedes all parent requirement consumers; R1–R14 aliases expand to stable atomic sub-IDs, with this document owning R14-E execution and R14-L fixture obligations. Old diagram3 render failure remains in V/auth-v3-D/render.json.
