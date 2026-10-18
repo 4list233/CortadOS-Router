@@ -1619,7 +1619,7 @@ immediate upstream session revocation or refresh-family reuse revocation without
 These gaps can block auth activation without blocking deterministic task work.
 
 
-## 10. Revision-2 source grounding and evidence precedence
+## 11. Revision-2 source grounding and evidence precedence
 
 The original repository is read-only for this author. Current code claims in this section refer to /Users/velox/.cortados-builds/cortados-router-repo at the frozen candidate2 identities in /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/root-freeze.json. All 18 source hashes were rechecked with zero mismatches during this revision. Earlier section9 prebuild anchors remain historical; they do not imply that the candidate's existing owners are absent.
 

@@ -237,7 +237,7 @@ Approval chronology: proposal v2 at7e8b1cd, SHA256 a4fa9ebfac15604d5d516c25dadf3
 | IPC primary/fallback one deadline, validation deducted, lease bound, no second frame | Parent response-write definition, R046/R090; AC05/10/11 | test_schemas.py actual AF_UNIX backpressure and partial-frame evidence |
 | Exact capacity table; inspect accepted outcomes; idempotent cancel; deny replay/new authority | Parent/EXECUTION identical table, R019/R091; AC03/06/07/16 | test_tasks.py and test_recovery.py |
 | Fatal/disabled override; containment/cleanup; no automatic reopening/relaunch | Parent table and R066/R092; AC06/15/16 | test_recovery.py plus full table negatives |
-| Existing sole owners, no new policy/default, subscription quota/job lifetime/integrity preserved | Unchanged API copy, parent section10 source grounding; retained18-path future ceiling | Renewed independent D/A then full B/inventory/measurements |
+| Existing sole owners, no new policy/default, subscription quota/job lifetime/integrity preserved | Unchanged API copy, parent section11 source grounding; retained18-path future ceiling | Renewed independent D/A then full B/inventory/measurements |
 
 ### Exact exam authority and remaining gates
 
