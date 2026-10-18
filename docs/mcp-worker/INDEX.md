@@ -107,3 +107,10 @@ promotion gates. The build reports record independent verification and limitatio
 | `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
 | `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
 | `acceptance/cowork_mcp/` (future exact grants in EXECUTION) | Independent QA owns core exams, manifest, complete-suite inventory and baseline/candidate measurements; builder read-only. |
+
+| Future authentication draft | RT-COWORK-AUTH-009 responsibility |
+|---|---|
+| [COWORK-AUTH-009.md](COWORK-AUTH-009.md) | Subordinate draft for inherited AC-008-01/02; maintained OAuth provider, strict identity/lifetime checks and credential-operation serialization. Separate D/A/B pending. |
+| [COWORK-AUTH-009-EXECUTION.md](COWORK-AUTH-009-EXECUTION.md) | Prospective nonoverlapping auth/production composition/exam paths; no source grant until accepted core and independent auth gates. |
+
+RT008/009 retain the existing standalone Router naming/location convention rather than the CortadOS structural engine CTX prefix. No global contract or rulings-log migration follows. The optional remote dependency proposal is isolated from ordinary stdio dependencies; implementation and its lock require their separate reviewed package.
