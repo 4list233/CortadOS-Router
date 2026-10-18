@@ -1,6 +1,6 @@
 # Cowork connector build status — 2026-10-18
 
-**Not installed or connected.** The second local-core candidate failed independent review. The assignment is in `design_error`; another implementation attempt and dependent OAuth source work await Forest's decision on the [bounded revision proposal](COWORK-MCP-008-REVISION-2-PROPOSAL.md). Existing subscriptions, ordinary MCP, private Studio HTTPS443→8432 and nightly training remain unchanged. No public listener, OAuth application, secret, Funnel route or launchd service has been created.
+**Not installed or connected.** The second local-core candidate failed independent review. Forest approved the [bounded revision proposal](COWORK-MCP-008-REVISION-2-PROPOSAL.md) on2026-10-18. The two failed attempts remain recorded; revised contracts, independent D/A and committed regressions must pass before the next build. Existing subscriptions, ordinary MCP, private Studio HTTPS443→8432 and nightly training remain unchanged. No public listener, OAuth application, secret, Funnel route or launchd service has been created.
 
 ## What exists
 
@@ -52,7 +52,7 @@ Observed retained traced allocations range 131,244–542,483 bytes; peaks 283,82
 
 ## Remaining gates
 
-Forest's revision decision is pending. Live identity/application selection and file-size/retention choices also remain unanswered; elapsed time is not consent. Auth acceptance/implementation, reviewed initial provisioning and secret custody, installed/native-tool confinement, public ingress qualification, actual Cowork OAuth and exact binary materialization remain incomplete. Only a fully reviewed service and concrete activation configuration will be presented for final activation approval.
+Forest approved the core revision. Renewed contract/exam gates are in progress. Live identity/application selection and file-size/retention choices remain unanswered; elapsed time is not consent. Auth acceptance/implementation, reviewed initial provisioning and secret custody, installed/native-tool confinement, public ingress qualification, actual Cowork OAuth and exact binary materialization remain incomplete. Only a fully reviewed service and concrete activation configuration will be presented for final activation approval.
 
 ## Final independent measurement closeout
 
@@ -70,4 +70,9 @@ The unchanged direct-owner driver uses synthetic quota/scorer inputs; process/ne
 
 Actual core supplemental medians: task create 15.09 ms, replay 3.47 ms, get 3.14 ms and delete 23.36 ms across 100 cycles; ASGI plus actual IPC task_get 3.86 ms across 100 calls. Four concurrent 1 MiB streams completed in 0.597 s. A 16 MiB PUT/GET measured 1,105/729 ms without the matrix's tracing overhead. Wrong-hash, idle, headroom and ENOSPC fault workloads completed with expected refusal; zero external connections were attempted. The previously approved private measurement fixture correction is explicitly recorded, not a product-timeout amendment.
 
-Completed measurements do not grant efficiency acceptance to an incorrect candidate. Final status remains B failure / design_error, two valid failed builds and no same-design retry. The revised-design approval question is pending; no approval is inferred from elapsed time.
+Completed measurements do not grant efficiency acceptance to an incorrect candidate. Final status remains B failure / design_error, two valid failed builds and no same-design retry. Forest subsequently approved the bounded design revision; this does not retroactively accept either failed candidate.
+
+
+## Approved revision in progress
+
+Approval recorded in18e4a7f, with all680 prior identities matching. Astra contract-only job906dba4c-1f06-4e5b-ab58-60cd5a9ae5b8 is revising the three copied008 contracts in an isolated directory using native Codex subscription admission. Independent QA prepared22 additive methods; actual final count remains pending. The sole identified existing assertion conflict is unconditional408 after deadline exhaustion. Its explicit independent amendment preserves original source/history and timing/cleanup checks, while adding a positive-budget408 control. No production files have changed during this revision preparation.
