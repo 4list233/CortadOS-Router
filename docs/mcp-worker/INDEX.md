@@ -87,3 +87,10 @@ promotion gates. The build reports record independent verification and limitatio
 | `cortados_router/worker_admission.py` | Existing native admission plus closed teacher-only scarcity ceiling; ordinary worker behavior unchanged. |
 | `acceptance/training_teacher/` | Independent exam owner; split isolation, replay/publication, native parity and installed labeling path. |
 | [CODEX-TRAINING-TEACHER-BUILD-REPORT.md](CODEX-TRAINING-TEACHER-BUILD-REPORT.md) | Root; accepted revision 2, 785 passing tests, guarded activation, 12 verified training labels, preserved exam and operating limits. |
+
+| Cowork connector path | RT-COWORK-MCP-008 responsibility |
+|---|---|
+| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Contract author; draft OAuth remote transport, generated task folders, confined native execution and exact binary transfer. Not dispatchable yet. |
+| [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
+| [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
+| [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
