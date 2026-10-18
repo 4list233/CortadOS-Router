@@ -90,7 +90,7 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Cowork connector path | RT-COWORK-MCP-008 responsibility |
 |---|---|
-| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Contract author; draft OAuth remote transport, generated task folders, confined native execution and exact binary transfer. Not dispatchable yet. |
+| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent D0/A0, protected exams committed; implementation/B review in progress. OAuth and activation are separate. |
 | [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
 | [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
 | [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
@@ -106,7 +106,7 @@ promotion gates. The build reports record independent verification and limitatio
 | `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (new, proposed) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
 | `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
 | `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
-| `acceptance/cowork_mcp/` (future exact grants in EXECUTION) | Independent QA owns core exams, manifest, complete-suite inventory and baseline/candidate measurements; builder read-only. |
+| `acceptance/cowork_mcp/` | Independent QA owns 72 protected core methods, manifest, complete-suite inventory and baseline/candidate measurements; committed at1037b52, builder read-only. |
 
 | Future authentication draft | RT-COWORK-AUTH-009 responsibility |
 |---|---|
@@ -114,3 +114,17 @@ promotion gates. The build reports record independent verification and limitatio
 | [COWORK-AUTH-009-EXECUTION.md](COWORK-AUTH-009-EXECUTION.md) | Prospective nonoverlapping auth/production composition/exam paths; no source grant until accepted core and independent auth gates. |
 
 RT008/009 retain the existing standalone Router naming/location convention rather than the CortadOS structural engine CTX prefix. No global contract or rulings-log migration follows. The optional remote dependency proposal is isolated from ordinary stdio dependencies; implementation and its lock require their separate reviewed package.
+
+| Authentication ownership being frozen before D/A | Proposed responsibility; no source grant yet |
+|---|---|
+| `integrations/mcp/remote_auth_config.py` | Pure closed authentication configuration and private record validation. |
+| `integrations/mcp/remote_auth_provider.py` | Maintained provider/client hooks and strict upstream response projection; no independent token engine. |
+| `integrations/mcp/remote_auth_claims.py` | Strict proxy claims and live owner facts; no duplicate identity request. |
+| `integrations/mcp/remote_auth_runtime.py` | Single finite credential-operation admission gate, lifecycle settlement and verification orchestration. |
+| `integrations/mcp/remote_auth_storage.py` | Sole authentication lock/marker/manifest/barrier and maintained-store trust guards. |
+| `integrations/mcp/remote_auth_transport.py` | Bounded upstream HTTP reads for maintained OAuth and identity clients. |
+| `integrations/mcp/remote_auth_errors.py` | Fixed safe errors/events and dependency diagnostic containment. |
+| `integrations/mcp/remote_supervisor.py` | Trusted parent core and spawned frontend lifetime; private lifecycle control, no task queue. |
+| `integrations/mcp/remote_service.py` | Authentication HTTP route/metadata adaptation and service entrypoint after accepted core. |
+
+The isolated optional dependency qualification requires `fastmcp-slim[server]==3.4.9`, `Authlib==1.9.1` and unchanged `mcp==1.30.0`; plain slim omits required server dependencies. The corrected65-package graph/imports have been tested only on CPython3.14.6/macOS arm64 in a new private environment. This is dependency evidence, not authentication acceptance or installation. Root technical directions and exact evidence are in ROOT-REVIEW at5d98d77/a93f48b.
