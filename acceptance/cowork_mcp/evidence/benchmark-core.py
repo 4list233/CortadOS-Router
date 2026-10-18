@@ -60,6 +60,10 @@ async def transfer_case(size,chunk,streams):
             case.ok((await case.stream('close',{'lease_id':lease,'reason':'complete'},client=client))['result']);await client.close()
         await asyncio.gather(*(upload(t) for t in tasks))
         current,peak=tracemalloc.get_traced_memory();tracemalloc.stop()
+        # Transfer clients remain active, but the initial control client may correctly
+        # expire after120s idle during traced large transfers. Bind a fresh client for
+        # post-transfer selector timing; do not extend the IPC expiry policy.
+        await case.client.close();case.client=await case.connect()
         timing=[]
         for _ in range(50):
             now=time.perf_counter_ns();case.ok(await case.call('task_get',{'task_id':tasks[0]['task_id']}));timing.append((time.perf_counter_ns()-now)/1e6)

@@ -823,7 +823,7 @@
     "README.md": "1c7cd9a3259a3c334cb38b3ad74e59315ce2733272f10cb5170be6ef0904e8cc",
     "__init__.py": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
     "evidence/baseline-ordinary.json": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
-    "evidence/benchmark-core.py": "853450d7308ea6548777f7936f989c4aad4c022ee76706fdf7f188e5f5c23ba7",
+    "evidence/benchmark-core.py": "88b7ef0ac73e30aca3a3bb69c73e62c491fdc5fe0f3c82650dd5a6c348b95fb4",
     "evidence/historical-007-parity.py": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
     "evidence/run-full-suite.py": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
     "evidence/suite-inventory.json": "7efe645532a7388c4a3ac9dc3969a70c995ccd1e36aee897366fd135a410a3cf",
@@ -901,6 +901,16 @@
         "skips": 0,
         "passing_controls": 2
       }
+    },
+    {
+      "authority": "Root approved measurement-only fresh control client after traced transfers; IPC idle stays120000ms",
+      "prior_exam_commit": "153f73027e8d58d4e1c51853e85d504d3fc1bc5c",
+      "prior_driver_sha256": "853450d7308ea6548777f7936f989c4aad4c022ee76706fdf7f188e5f5c23ba7",
+      "preserved_driver": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-1/benchmark-core-before-idle-client-correction.py",
+      "traceback": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-1/core-performance-amended.log",
+      "measurement_change": "Post-transfer task_get timings use a newly bound client. Transfer workloads and memory collection unchanged; five completed cases retained, seven measured separately.",
+      "deadline_assertions_changed": false,
+      "test_methods_changed": false
     }
   ]
 }
