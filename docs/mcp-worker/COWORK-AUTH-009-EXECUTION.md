@@ -1,12 +1,12 @@
 <!-- PURPOSE: Define prospective bounded auth build, exam and activation ownership.
-     CONTRACT: RT-COWORK-AUTH-009 v4; draft, not dispatchable.
+     CONTRACT: RT-COWORK-AUTH-009 v5; draft, not dispatchable.
      DEPENDS: COWORK-AUTH-009.md, accepted RT-COWORK-MCP-008 and independent D/A.
      CEILING: Current turn writes only these two drafts; no code, tests or commit. -->
 # Cowork future authentication execution package
 
 ```yaml
 contract_id: RT-COWORK-AUTH-009
-contract_version: 4
+contract_version: 5
 parent: COWORK-AUTH-009.md
 implements: RT-COWORK-MCP-008 FUTURE AUTH
 owner: Forest
@@ -252,7 +252,7 @@ Historical AC text copied byte-for-byte from parent §7, retaining the old split
 
 | Protected file | R / AC coverage and required observable ground truth |
 |---|---|
-| test_provider_hooks.py | R1–2, AC02: actual pinned maintained callback, explicit refresh and transparent refresh use both hooks. Reproduce the 26 invalid-shape matrix on all three paths plus E1 valid controls; add duplicate JSON keys, unknown absolute expiry, alias-only valid response, hook-clock datetime limits (now1000/duration253402299799 valid, +1 overflow,253402300800 overflow,P−1000 overflow, unrepresentable now_s), error-status/error-field and oversize cases. Observe parser-entry counts, put/delete interception and encrypted-file hashes; malformed success causes zero parse and zero token writes. Downstream code exchange has no upstream fetch. |
+| test_provider_hooks.py | R1–2, AC02: actual pinned maintained callback, explicit refresh and transparent refresh use both hooks. Reproduce the 26 invalid-shape matrix on all three paths plus E1 valid controls; add duplicate JSON keys, unknown absolute expiry, alias-only valid response, hook-clock datetime limits (now1000/duration253402299799 valid, +1 overflow,253402300800 overflow,MAX_INTEGER−1000 overflow, unrepresentable now_s), error-status/error-field and oversize cases. Observe parser-entry counts, put/delete interception and encrypted-file hashes; malformed success causes zero parse and zero token writes. Downstream code exchange has no upstream fetch. |
 | test_claims.py | R7–9, AC01: signature verification precedes facts, typed exp/iat/nbf exact boundaries, including fake-clock initial999/exp1000 followed by maintained await returning at999 (valid),1000 (refuse),1001 (refuse), with failure-latch inspection before final validate_claims and zero core calls on refusal, scalar exact audience/issuer/client; missing/malformed/foreign live subject, raw PAT/ID/refresh all refuse. Verify returned SDK object contains proxy bearer only and IPC Principal contains no token; never accept display login. Two clients with same owner require explicit stopped-service rollover; owner hash stays equal. |
 | test_oauth_http.py | R3,9–11, AC01/02: exercise actual maintained ASGI handlers using in-process HTTPX ASGITransport with all external sockets forbidden. Full authorize/consent/callback/code+S256 verifier exchange, exact state/redirect binding, missing/plain/duplicate/wrong resource, client allowlist, no /register or CIMD fetch, safe metadata and 401 challenge. Test every /mcp method unauthenticated before core 405, no duplicate mount. Synthetic route responses are not actual hosted discovery evidence. The mandatory real-loopback lane below supplies historical AC01 ground truth in addition to ASGITransport. |
 | test_auth_lifetime.py | R3–6,13, AC02: barriers before credential get prove one outer gate; two HTTP code redemptions produce one success, second invalid_grant; two refresh redemptions produce one rotation; explicit versus transparent and callback replay serialize. Trace lock enter/read/write/delete/exit; no nested acquisition; gate released before CoreClient. Independent processes prove second lifetime owner refuses before store access. |
