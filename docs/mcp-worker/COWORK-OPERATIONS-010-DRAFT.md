@@ -1,12 +1,12 @@
 <!-- PURPOSE: Propose the remaining offline operator boundary for Cowork.
-     CONTRACT: RT-COWORK-OPERATIONS-010 v1; proposal only.
-     DEPENDS: Frozen008 and proposed009v4; independent review and explicit activation.
+     CONTRACT: RT-COWORK-OPERATIONS-010 v2; proposal only.
+     DEPENDS: Frozen008v5 and current009v5; independent review and explicit activation.
      CEILING: No source, secret, service, permission or frozen-contract changes. -->
 # Cowork operator setup — bounded proposal
 
 ```yaml
 contract_id: RT-COWORK-OPERATIONS-010
-contract_version: 1
+contract_version: 2
 status: draft
 owner: Forest
 orchestrator: root
@@ -17,7 +17,7 @@ execution_proposal: COWORK-OPERATIONS-010-EXECUTION-DRAFT.md
 attempt_ledger: inherited; no reset or new source attempt
 ```
 
-This isolated proposal closes only secret resolution, first offline provisioning, and parameterized service preparation. LOCAL CORE008 has a rejected valid C1–C10 source attempt and an authorized correction in progress. Normative008 remains frozen. Auth009v4 is under independent D; its source has not started. Nothing here accepts either implementation, dispatches a builder, or authorizes activation. The user's explicit two-document scope overrides the general worker workflow; no nested worker is used.
+This isolated revision covers only secret resolution, first offline provisioning, and parameterized service preparation. Core008 v5 candidate3 is frozen under independent B and the current full host runner; the supplied current status identifies two source causes still to correct, with no core acceptance. Both prior valid failed implementations and all QA history remain. Auth009 v5 has independent D=0/33 at the exact O0 pins, but no A or source acceptance. Operator010/110 D/A/B all remain pending. Nothing here dispatches a builder or authorizes activation. The direct contract-author role and two-document scope govern; no nested worker is used.
 
 The conventions at `/Users/velox/cortados/contracts/CONVENTIONS.md` and their local standard, RUBRIC, ORCHESTRATION and PLAYBOOK govern future gates. These files are review inputs in the isolated author cwd, not a second canonical contract home. Root decides incorporation and index ownership after review. No self D/A score is assigned.
 
@@ -33,8 +33,8 @@ Reviewed bytes (SHA256, not an assertion of source acceptance):
 
 | Reference | SHA256 |
 |---|---|
-| R/docs/mcp-worker/COWORK-AUTH-009.md | 5bdd0a9a6d9f0ca9b8383c3e7d9d8adaf2048802e7f63f012e6ce11dcd32da0a |
-| R/docs/mcp-worker/COWORK-AUTH-009-EXECUTION.md | e7139a46f855aff9e1ee47afd02601e1524bd227178673cf963b95ef54a1bdfa |
+| R/docs/mcp-worker/COWORK-AUTH-009.md (v5) | e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174 |
+| R/docs/mcp-worker/COWORK-AUTH-009-EXECUTION.md (v5) | 83052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b |
 | F/server/auth/oauth_proxy/proxy.py | 58f13a58bd31373c13ee166f94bf3726dadd6bb86a6c8da89de3b09a627d26f0 |
 | F/server/auth/oauth_proxy/models.py | b2f45bc919484355f89ad10bf06d84cf45ebf5ed9af51b932ea0800c665242f8 |
 | F/server/auth/providers/github.py | 13a89114465210ba0fcce39b4ff3e7acb09a699a8a5de0e97223c419f53141ba |
@@ -44,11 +44,40 @@ Reviewed bytes (SHA256, not an assertion of source acceptance):
 | R/integrations/mcp/config.py | a70778abefc0c1b2563c21b0f5ead6f85885ef0094ed55f5364b8e59730bb778 |
 | R/pyproject.toml | f7516262d17c7ddb3f19ba0b1e6e4ac3c99067244c95795a07e16a9b28e3fa7d |
 
-Final-check dependency drift: both supplied009 hashes matched at initial inspection, but a concurrent root v5 precision amendment changed the current parent to `e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174` and execution to `83052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b`. Its appended ledger reports v4 independent D4/33 and a precision amendment concerning integer notation, HTTP/1 class/version names and header accounting; a full independent rescore remains pending. Those appended statements are observed concurrent evidence, not this author's acceptance or a complete diff review. This010 proposal remains pinned to the supplied reviewed v4 interfaces. O010-01 now explicitly includes root reconciliation against v5 before any integration; no original file was written here.
+Historical dependency drift (preserved): the prior author initially reviewed v4 parent `5bdd0a9a6d9f0ca9b8383c3e7d9d8adaf2048802e7f63f012e6ce11dcd32da0a` and execution `e7139a46f855aff9e1ee47afd02601e1524bd227178673cf963b95ef54a1bdfa`; its final unchanged-hash check failed when root amended v5. That was not a passing check or a source attempt. This revision now pins the actual v5 bytes above. V/auth-v5-D/FULL-D-REVIEW.md and readiness.json record independent D=0 across33 rows for exactly those bytes; A is NOT_RUN_PENDING_RUNNER_SCOPE_AND_EXAMS. V3 D11/33, v4 D4/33, D-008-01/02 and the original v3 diagram3 render failure remain history. V5 distinguishes inherited P from numeric MAX_INTEGER, names httpcore._async.http11.AsyncHTTP11Connection, enumerates HTTP/1.0 and HTTP/1.1 byte values, and defines normalized header accounting separately from allocation floors. O2/O9 preserve those definitions; they propose only the operator deltas enumerated there.
 
-The corrected dependency lock qualifies imports on CPython3.14.6/macOS arm64 only. `fastmcp-slim[server]==3.4.9`, `Authlib==1.9.1`, and unchanged `mcp==1.30.0` remain the proposed optional remote graph. The plain slim package failed provider import. Release wheel/interpreter/install-tree hashes remain future evidence. Current core source is mutable work in progress, not a pinned accepted dependency.
+Core history remains authoritative in R/docs/mcp-worker/COWORK-MCP-008-DECISIONS.md and COWORK-MCP-008-ROOT-REVIEW.md: D21→D3→D0, both setup-only blocks, original785/784/1 baseline and separate007 relocated4/4, first valid failure job87c9ffee-4119-4301-bafc-4668d8dbf8ca (B3 at B1/B6/B7;857 methods,856 pass/1 failure;26/28 lanes), and second valid failure jobd37a73fb-aa46-491f-9a5d-98fa60c682e8 (B3 at B1/B5/B7;874 methods,873 pass/1 failure;27/28 lanes). Preserve C1–C10, original transfer-matrix timeout, measurement-client idle error, completed measurement continuations, later observational capacity pass and IPC diagnostic/fixture failures separately. The v5 D1 reference correction and renewed independent D0/A0 precede revised attempt3 (111 core/896 accumulated methods expected in28 lanes); neither those gates nor frozen candidate3 imply B acceptance. No history is reset or regraded here. The current two-cause report comes from the supplied parent context, not a fresh candidate run by this author.
+
+Current read-only evidence pins supplement the maintained-source table:
+
+| Reference | SHA256 |
+|---|---|
+| R/docs/mcp-worker/COWORK-MCP-008.md | 0fe7b4f3d139436eb9b0b0bdcbc8e0d4e442e8340d560b8abdd0f20cf2332a63 |
+| R/docs/mcp-worker/COWORK-MCP-008-EXECUTION.md | e104c7548883318cb6fd80ac58814e1c9d5a217b8d2e6d1ffac56d732bdd1b40 |
+| R/docs/mcp-worker/COWORK-MCP-008-DECISIONS.md | e93ffd915392e082fc426932e0252729376f3d77b029b2e5a067390e549eeb4d |
+| R/docs/mcp-worker/COWORK-MCP-008-ROOT-REVIEW.md (inspected at62fcd07) | 12e95d86bb4a5fee6da654af70854a634fa99c3c0e25a7811684f011205b8dce |
+| V/auth-v5-D/readiness.json | fd8299597e1ec049d13d35583679c8c462ab2f6cc8fc57d2ca65420e86242ae0 |
+| V/auth-v5-D/MANIFEST.json | 6a0e4a4f764df8e8d5d85c2955cb1236ed116c2a73ddadfc5d08038d3204b2ff |
+| V/auth-v5-D/FULL-D-REVIEW.md | ae2930565069b66014825df7172853e98eb56718afe4328c9cc71dcfe641f394 |
+| V/core-revision-2/USER-LIVE-POLICY-APPROVAL.json | d6b813fe0e9a151f5ab3ac2dc55f86916aa4e0fd0e66e199b6d7e41e0b25d477 |
+| V/core-revision-2/OFFICIAL-OAUTH-EXPIRY-CHECK.md | 31a9f6468fd674b0cb70cff26c6146486b97506facc0d63fb35a68326b8ec1a3 |
+| /Users/velox/.cortados-builds/cowork-retention-proposal/ACTIVATION-CHOICES.md | 8cdffb7d4275be88d20bf41590beeb1b567152378608281ed07da0dd1598990d |
+| /Users/velox/.cortados-builds/cowork-retention-proposal/RETENTION-PROPOSAL.md | e99e002d890b4446b3d1be0dc058725a49ca3b86fa3b51671f0166abcbd54ba1 |
+| /Users/velox/cortados/contracts/CONVENTIONS.md | 0e09b19a664befb03073d9160765340debea72bec6ed6b64344afcb50260afe6 |
+| /Users/velox/cortados/docs/DECISIONS.md | f43050869a6319b0390a70b8047ceaa0b51ab63f49bad5394d34bc5a50b7c02c |
+| /Users/velox/cortados/context-staging/research/ai-coding-std-workflow/CONVENTIONS.md | 2d8a2c18fbce516b4749d77a5e5771e31751ee7c17160cc0c9afcdbffa2b2132 |
+| /Users/velox/cortados/context-staging/research/ai-coding-std-workflow/RUBRIC.md | cccae8d0e13997e4a639d846a0f771ef15ed1017bcf0b4def24963298a9cf404 |
+| /Users/velox/cortados/context-staging/research/ai-coding-std-workflow/ORCHESTRATION.md | 077ba776ba250d4af88455f59b7bdfb42f34e734f4389090eec9f6f1466a5673 |
+| /Users/velox/cortados/context-staging/research/ai-coding-std-workflow/PLAYBOOK.md | 0dbbb7436bdbc72ed190be199d62a59c07d71a4baa9ed64021aedc2dc6781664 |
+| /Users/velox/cortados/context-staging/research/ai-coding-std-workflow/standards/00-ENGINEERING-STANDARD.md | d55295920cd6492759611e9177c52e4f08e151da88355b8f78ff1cf4e6d79b94 |
+
+Authority: the present direct user instruction and V/core-revision-2/USER-LIVE-POLICY-APPROVAL.json settle the deployment policies below. Older pending text in008/009/DECISIONS is historical; root records/reconciles those approvals through the canonical owner before integration, without reopening them or editing those sources in this assignment. This does not waive independent gates.
+
+The corrected dependency lock qualifies imports on CPython3.14.6/macOS arm64 only. `fastmcp-slim[server]==3.4.9`, `Authlib==1.9.1`, and unchanged `mcp==1.30.0` remain the proposed optional remote graph. The plain slim package failed provider import. Release wheel/interpreter/install-tree hashes remain future evidence. Current candidate3 is frozen for independent review, not an accepted dependency.
 
 ### O1. Configuration and private layout
+
+Conditional private-file profile: O1–O8 specify a reviewable technical proposal, not approved custody. O010-04 requires Forest's later concrete final setup review (account, exact paths, backup and crash policy); no secret access or provisioning is authorized now.
 
 New closed immutable local record `OperatorConfig` belongs to `integrations.mcp.remote_auth_config`. Constructor convention and strict JSON rejection are 009 D0.1/D0.3. Every field is required; no environment expansion, discovery or default path.
 
@@ -81,8 +110,8 @@ These are proposed changes to future owners, not observed imports. Python types 
 | remote_auth_config | `load_operator_config(raw:bytes,*,auth_config:AuthConfig)->OperatorConfig` — pure schema/cross-reference validation |
 | remote_service | `validate_operator_setup(*,operator:OperatorConfig,base_raw:bytes,core_raw:bytes,manifest_raw:bytes,auth_config:AuthConfig)->None` — nonsecret release/filesystem/config/dependency/native-manifest validation only; no runtime enter, state mutation, secret read, network or listener |
 | remote_service | `resolve_private_secrets(*,operator:OperatorConfig,auth_config:AuthConfig)->ResolvedAuthSecrets` — trusted module-level function; only invoked in spawned auth/provision child after AuthStorage lock acquisition; fixed-safe exceptions |
-| remote_auth_storage | Replace `secrets` constructor operand with `resolve_secrets:Callable[[],ResolvedAuthSecrets]`; add `purpose:Literal['restart','initial']='restart'`; retain config/dependency_sha256/on_failure and all existing methods. Add read-only `resolved_secrets:ResolvedAuthSecrets`, accessible only by entered owner while lock held; no serialization. `client_storage` remains inaccessible before the dirty barrier. |
-| remote_auth_runtime | Replace AuthRuntime constructor `secrets` operand with `resolve_secrets:Callable[[],ResolvedAuthSecrets]`; runtime always constructs AuthStorage with purpose='restart'; provider receives storage.resolved_secrets only after enter. |
+| remote_auth_storage | `AuthStorage(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None],purpose:Literal['restart','initial']='restart')` replaces D0.13's secrets operand; all existing methods remain. Add read-only `resolved_secrets:ResolvedAuthSecrets`, accessible only by entered owner while lock held; no serialization. `client_storage` remains inaccessible before the dirty barrier. |
+| remote_auth_runtime | `AuthRuntime(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None])` replaces D0.10's secrets operand; runtime always constructs AuthStorage with purpose='restart'; provider receives storage.resolved_secrets only after enter. |
 | remote_auth_provider | `make_provider(*,config:AuthConfig,secrets:ResolvedAuthSecrets,client_storage:AsyncKeyValue,identity_client:httpx.AsyncClient,on_failure:Callable[[],None])->StrictGitHubProvider` — single extraction of 009 D0.16 constructor wiring; no routes/enter/network/registration; no second issuer |
 | remote_auth_runtime | `async provision_initial(*,config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` — offline composition using AuthStorage purpose='initial', make_provider and maintained register_client; no AuthRuntime enter, core, listener or token flow |
 | remote_supervisor | `run_initial_provision(*,auth_config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` — top-level synchronous multiprocessing spawn target calling asyncio.run(provision_initial(...)); no CoreRuntime or RemoteSupervisor instance |
@@ -97,14 +126,21 @@ Owner searches: `rg -n 'secret|keyring|keychain|launchd|LaunchAgent|KeepAlive|re
 
 | Concern | Disposition and source-qualified reason |
 |---|---|
-| Base configuration | Adopt R/integrations/mcp/config.py:136 load_config; credential-free closed configuration, existing native environment/permissions owners remain unchanged. Its connector environment-token references are not suitable for the no-secret-environment requirement. |
+| Base configuration | Adopt R/integrations/mcp/config.py:109 load_config(None,raw=base_raw); credential-free closed configuration, existing native environment/permissions owners remain unchanged. Its connector environment-token references are not suitable for the no-secret-environment requirement. |
 | Authentication store | Extend proposed009 remote_auth_storage; sole lock/marker/barrier/trust owner already specified. Creating an operator marker writer would duplicate its invariant. |
 | Serialization/collections | Adopt S/key_value/aio/stores/base.py:175 `async setup_collection(self,*,collection:str)->None`; FileTreeStore inherits it. S/.../filetree/store.py:533 prepares directories and :353 DiskCollectionInfo.create_or_get_info writes maintained metadata. No handwritten metadata/credential JSON. |
-| Registration | Adopt F/.../proxy.py:838 `async register_client(self,client_info:OAuthClientInformationFull)->None`; :780 `async get_client(self,client_id:str)->OAuthClientInformationFull|None`. Registration uses `_client_store.put`, not an insert-only transaction, so the empty-state predicate belongs before it. |
-| Provider construction | Extend proposed remote_auth_provider by extracting existing009 wiring into make_provider; both runtime and initial composition reuse it. F/.../proxy.py:485–548 defaults derive keys/store paths and tolerate decrypt misses; explicit independent keys/store prevent those unwanted defaults. |
+| Registration | Adopt F/.../proxy.py:838 `async register_client(self,client_info:OAuthClientInformationFull)->None`; :782 `async get_client(self,client_id:str)->OAuthClientInformationFull|None`. Registration uses `_client_store.put`, not an insert-only transaction, so the empty-state predicate belongs before it. |
+| Provider construction | Extend proposed remote_auth_provider by extracting existing009v5 D0.16 wiring into make_provider; both runtime and initial composition reuse it. F/.../proxy.py:485–548 defaults derive keys/store paths and tolerate decrypt misses; explicit independent keys/store prevent those unwanted defaults. |
 | Launch/CLI | Extend proposed remote_service/remote_supervisor; one live RemoteSupervisor, no new broker or daemon. R/INSTALLATION.md:121 reports no launchd job installed; ordinary stdio release is separate. |
 | Resolver | Build-new bounded function inside proposed remote_service; stdlib filesystem reads reuse existing configuration conventions, not a new credential DB or source module. |
 | Packaging | Adopt non-editable release pattern from INSTALLATION and009 optional remote extra/lock; no new dependency or ordinary-package change in010. |
+
+
+Canonical composition disposition (009v5 D0.11/D0.17 and EXECUTION B2): adopt `remote_config.load_service_core_config`, `remote_runtime.CoreRuntime(trusted_service_principal=...)` and `remote_http.compose_http_app` only after accepted core B and separately reviewed009 B2 integration. They are dependency owners, not additional010 writable paths. `validate_operator_setup` calls `load_config(None,raw=base_raw)`, constructs the trusted Principal from AuthConfig, uses the canonical service loader, and verifies core principal/installation and transfer_origin equality before effects; it never converts oauth_service to local_test. BaseConfig is the validated dict semantic alias, not an importable Config class. Records/imports follow009 D0.1–D0.3; P stays a type and MAX_INTEGER stays the bound. HTTP composition stays in remote_http; supervisor owns one CoreRuntime and one frontend lifetime, while AuthStorage is the sole auth lock/marker/store owner.
+
+Factory disposition: `make_provider` forwards all009v5 D0.16 operands unchanged, including `config=config`, `on_response_failure=on_failure`, `http_client=identity_client`, `required_scopes=[]`, explicit signing key/encrypted client_storage, no fallback expiry, no cache and disabled CIMD. It sets client_registration_options.enabled=False before return. Runtime and initial composition both use remote_auth_transport.make_identity_client; no fresh unguarded client or new transport owner. Initial composition owns a synchronous irreversible failure latch supplied to storage, transport and factory; any latched failure prohibits a clean seal. It installs009 logging suppression before constructing dependencies and restores it only after settlement/close. Registration/get_client use the entered storage guards under the sole exclusive lock, without entering AuthRuntime or acquiring a second request gate; no network operation is performed.
+
+Retention disposition: adopt the existing core task_store/job_store transaction, remote_runtime publication/lifetime, remote_dispatch delete orchestration and task_workspace remover as the separately reviewed extension's candidate owners, as grounded in RETENTION-PROPOSAL.md. No retention field, callback, writer, timer or remover is added to010, AuthStorage, provider TTLs or launchd. Frozen008 retains explicit_delete semantics until that separate extension is accepted.
 
 Resolver options: (a) environment variables violate the boundary and are rejected; (b) a parent-read pipe violates child-only resolution and is rejected; (c) macOS Keychain could avoid plaintext secret files but no reviewed project owner/API, noninteractive access qualification or approved entitlement exists, so return it to root if desired rather than invoking `security` or introducing a dependency; (d) private operator-provisioned separate files allow a bounded stdlib implementation with no subprocess or new credential service and are recommended, subject to Forest's permission/backup decision. The function does not generate, migrate, rotate or search for credentials. Python cannot promise zeroization of immutable strings/bytes, privileged-process memory secrecy, or exclusion of a malicious same-UID reader. Disable core dumps for this process before resolution; inherited crash-report/debug policy remains a deployment qualification.
 
@@ -176,13 +212,15 @@ Invalid provisioning trace: credentials directory with missing marker → refuse
 
 Resolver success is an in-memory ResolvedAuthSecrets with009 exact types; its representation is redacted. Synthetic tests create fixture values only under separately authorized exam roots; none are embedded here. Invalid resolution includes32-byte storage key rather than44-byte canonical Fernet encoding, 33-byte signing file, invalid UTF-8 upstream value, aliased inode, file swap during bounded read or unavailable root. Failures expose only the fixed result profile.
 
-### O9. Explicit009 amendment packet — not applied
+### O9. Explicit009v5 amendment packet — not applied
 
 Amend D0.10 and D0.13 with O2's replacement constructor operands and initial-purpose extension; amend D0.14's child sentence so resolution occurs through AuthStorage after lock, rather than before AuthRuntime enter. Update D0.18 to require the pre-existing lock and define initial dirty0/clean0 as O4, with the initial-only auto_create=True exception. Add O2 make_provider extraction to the existing provider owner and O2 initial composition/entry to runtime/supervisor. Add O6 mandatory operator-config CLI operand and provision-initial subcommand to009 EXECUTION scope only after independent review. Preserve normal FileTree auto_create=False and unchanged marker/control schemas. Add O1 config type to the existing config owner; no new module.
 
 Reason for amendment:009 currently requires a lock before secret-store access in D0.18 yet resolves secrets before AuthRuntime enter in D0.14, and its storage constructor receives already-resolved secrets. A real resolver makes that ordering conflict material. Passing an unresolved callable to the same lock owner closes it without a second lock owner. The initial-only mode is absent from009; it cannot be inferred as implementation latitude. Changes to strict <500-source-line budgets or source ownership require root disposition, not splitting into an unapproved utility file.
 
-Until root adopts and re-reviews these exact amendments,010 cannot be built against009. If009 D changes interfaces meanwhile, report the dependency diff and re-review010 under the same group/attempt history.
+Proposal scope is exactly the six O2/O3 operator owners;009 remote_auth_transport/errors/claims and D0.11 core owners remain read-only dependencies for010. Mirror accepted changes into009 D0.9/10/13/14/18/21b, affected R6/R13 obligations, examples and EXECUTION B1/B2/CLI through the canonical owner before dispatch; no patch to009 is made here. Initial registration does not change token schemas, scopes, TTLs, control frames or normal restart behavior. Independent009 D0 applies to the unmodified pins, not to this amendment.
+
+Until root adopts and independently re-reviews these exact amendments,010 cannot be built against009. If009 D changes interfaces meanwhile, report the dependency diff and re-review010 under the same group/attempt history.
 
 ## 1. Atomic obligation and acceptance registry
 
@@ -280,13 +318,28 @@ sequenceDiagram
   C-->>P: Exit status only
 ```
 
-## 3. Open decisions returned to root
+## 3. Settled policy and remaining decisions
+
+| Classification | Current disposition |
+|---|---|
+| Already approved — identity | Existing GitHub account **4list233**, dedicated **CortadOS Studio Workers OAuth App**, **no repository permissions**, allow only the approved account; Claude/Codex subscription credentials stay on Studio. Explicit identity_scopes=[] and provider required_scopes=[]; no broad default user scope. |
+| Already approved — payload limits | Exactly **100000000 bytes/file**, **1000000000 bytes/task**, **10000000000 bytes/installation**, decimal integers, not binary MiB/GiB. These bind later live core configuration; remaining numerical budgets require qualification. |
+| Already approved — retention direction | Automatically delete completed-task files after **7 days**. This requires a separate retention extension; it is not implemented or granted by008/009/010. |
+| Awaiting user choice — completion semantics | Root's completion-trigger question remains pending. ACTIVATION-CHOICES C1–C3 are proposal data, not answers: automatic settlement versus explicit completion, treatment of failed/cancelled/interrupted attempts and payload versus content-bearing history boundary remain unapproved where unresolved. No new question or default is selected here; root reconciles the pending answer into the separate extension. Historical enrollment likewise is not silently authorized. |
+| Required qualification — OAuth | Actual app existence/configuration, consent/no-repo permissions, finite token fields on fresh authorization and explicit/transparent refresh, issuer and numeric subject remain unverified. Candidate subject237812476 must be reverified; username is not immutable authority. |
+| Required qualification — delivery | Actual Cowork none/S256 public-client flow and hosted callback, raw binary upload/download/hash materialization and all native-tool confinement remain gates. No API-key, confidential-client or DCR fallback. |
+
+Expiry feasibility: the pinned OFFICIAL-OAUTH-EXPIRY-CHECK.md records documented OAuth App expiring-token setting (eight-hour access; refresh expires after six months without use), alternative offline_access opt-in and unaffected old long-lived tokens. These are feasibility facts, never locally minted TTLs or actual flow evidence. Current009v5 retains its copied-transaction offline_access hook. No hook/permission change is authorized by this reconciliation. If root selects the documented app-setting route instead, the precise additional proposal is to remove only that scope injection from StrictGitHubProvider.authorize (009 D0.8/E27 and affected obligations/examples), retain downstream empty scopes and every guarded response/refresh/storage predicate, require fresh authorization with verified finite access/refresh fields and amend/re-review009 before use. No GitHub App migration is implied. The maintained /user/repos probe and fallback projected user scope (github.py:118–145) confer no repository permission; actual consent and response behavior require qualification.
+
+Seven-day task retention cannot be implemented with auth credential TTLs, token culling, an operator script, launchd schedule, task-file timestamps, disconnect or a successful clean auth seal. Completion/expiry, migration, races and cleanup belong to the separate existing-owner extension; no new store, queue, scheduler or dependency is authorized. Technical API naming, composition and source-scope details within approved behavior belong to root; they do not reopen settled policy.
+
+Remaining gates (already-approved policy is not an unanswered choice):
 
 | ID | Pending decision/gate | Blocks |
 |---|---|---|
-| O010-01 [ESCALATE] | Accept/review009 amendments, accepted008 correction,009 D/A/B and exclusive source ownership. No amendment is applied here. | Dispatch/integration |
-| O010-02 [ESCALATE] | Forest's GitHub app/identity and downstream client choice. Proposed4list233 / numeric subject237812476 with no repo scopes is unanswered, not a default. | Live configuration/provisioning |
-| O010-03 [ESCALATE] | Forest's file/task/total limits and retention. Decimal100MB/file,1GB/task,10GB total and explicit-delete versus7-day retention are proposals only. | Live core configuration |
+| O010-01 [ESCALATE] | Accept/review O9 against009v5 D0; accepted008 B,009 A/source/B and operator D/A/B plus exclusive source ownership remain pending. No amendment is applied here. | Dispatch/integration |
+| O010-02 [QUALIFICATION] | Account4list233/dedicated OAuth App/no repo permissions are approved. Actual app configuration, reverified numeric subject and downstream public-client compatibility remain qualification gates. | Live configuration/provisioning |
+| O010-03 [APPROVED / SEPARATE EXTENSION] | Decimal100000000/1000000000/10000000000 limits and automatic7-day completed-task cleanup are approved. Completion semantics remain pending; separate retention design/exams/acceptance required, with frozen explicit_delete unchanged. | Live core configuration |
 | O010-04 [ESCALATE] | Private-file resolver approval, separately provisioned independent keys/root/lock, upstream_secret_bytes, ACL/coredump/backup custody and service account. Keychain alternative needs a new qualified proposal. | Secret access/provisioning |
 | O010-05 [ESCALATE] | Exact immutable release/interpreter/roots, optional launchd-manual versus foreground, label, loopback port and measured server/ingress budgets. | Launch |
 | O010-06 [ESCALATE] | Qualified target filesystem barriers, failure ordering, clean restart and separate operator-reviewed recovery/rotation/restore/reset/deletion policy. Initial flow does not grant those operations. | Provisioning/release; recovery remains excluded |
@@ -295,3 +348,8 @@ sequenceDiagram
 | O010-09 [ESCALATE] | Explicit final activation approval after root presents reviewed local results and exact networking/service changes preserving private443. | Any live app, listener, route or service changes |
 
 Air Claude Cowork custom connector URL+OAuth remains the selected experience. Studio native Codex subscription remains the worker backend; S1 is optional. No SSH/companion substitution, API-key fallback, or automatic file/connector/history inheritance follows from this proposal.
+
+
+## Root incorporation note — document proposal only
+
+The authoring-time core status above is historical. Candidate3 host896methods/10failureevents/1error/0skips and independent11-row B have completed: four failed rows, two product causes. Root recorded rejection and narrow exam-owner correction authority at0ae0cf4; source remains unaccepted. No010 D/A/B or009 amendment is accepted. The ROOT-REVIEW hash in O0 identifies the inspected62fcd07 bytes, verified with git show; root subsequently appended the final rejection/exam grant. All other27 cited source/evidence hashes still match. This annotation changes provenance/current status only, not the proposed API, AC or deployment behavior.
