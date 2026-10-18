@@ -1,21 +1,21 @@
 <!-- PURPOSE: Allocate nonoverlapping future execution responsibilities and independent gates.
-     CONTRACT: RT-COWORK-MCP-008 v2; draft, not a dispatch authorization.
+     CONTRACT: RT-COWORK-MCP-008 v3; draft, not a dispatch authorization.
      DEPENDS: Parent contract, recorded root policies, independent protected fixtures.
      CEILING: This session writes documents only; no production, exams, commits or live actions. -->
 # Cowork 008 execution packages
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 2
+contract_version: 3
 task_group_id: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1
 status: draft
 dispatchable: false
 owner: Forest
 parent: COWORK-MCP-008.md
-attempt_ledger: []
+attempt_ledger: inherited; see DECISIONS evidence ledger (never reset)
 ```
 
-This is one coherent integration build, not overlapping task/auth/native builders. The named module
+This is one coherent LOCAL CORE build; FUTURE AUTH and public activation are excluded. The named module
 responsibilities below are internal implementation boundaries, not permission for different workers
 to edit the same seams. Package labels retain parent/group identity; never reset failed-attempt count
 by renaming package/model. Current task author writes only these three documents. The proposed future
@@ -30,19 +30,19 @@ Current exact scope_paths:
 - docs/mcp-worker/COWORK-MCP-008-DECISIONS.md
 - docs/mcp-worker/COWORK-MCP-008-EXECUTION.md
 
-Required inputs before dispatch: recorded O1 registration choice/identity and O5 file policy, reviewed
-maintained-auth dependency choice (or explicit auth-package block), pinned parent hashes, protected exam
-commit/manifest and independent D=0 then A=0. No actual Cowork connection is needed for these local
-fixtures. If provider source qualification fails, root may approve a narrowed local task/native build
-with auth activation blocked only by amending and independently reviewing this package first; builder
-must not privately reinterpret scope.
+Required inputs before LOCAL CORE dispatch: pinned v3 parent/source hashes, exact reviewed scopes,
+synthetic mandatory config fixtures, protected exam commit/manifest, independent D then A and root
+package approval. No D/A pass is declared. O1 actual registration/identity and O5 deployed limits/
+retention remain pending activation choices; they MUST NOT block parameterized local enforcement.
+Auth implementation needs its own future reviewed package; it MUST NOT be smuggled into core scope.
+No actual Cowork connection is required for local fixtures.
 
 Standards/rubric and governing file paths are in parent §1. Source checkout is absolute
 /Users/velox/.cortados-builds/cortados-router-repo, inspected HEAD
-4ed7508fa15acf66ece3f100510728b76f1966ce. Before dispatch root records current per-file SHA-256 and
+d4c99dbfb065813e61cdaed6c4a86e9edce73ca6. Historical source anchors remain in parent. Before dispatch root records current per-file SHA-256 and
 working diff, since HEAD alone cannot identify concurrent edits.
 
-## Package B — single integration builder
+## Package B — one independently gateable LOCAL CORE builder
 
 One accountable builder owns ALL source changes below, including shared seams. Suggested selection:
 S1 with full contract/evidence, or explicit supported integration model per project routing policy.
@@ -54,9 +54,6 @@ state access. Inspect job_status before resubmission; no automatic failed-job re
 review diff/evidence and record job_feedback accepted/rejected/inconclusive. Worker completion is not QA.
 
 Exact future scope_paths (existing unless marked NEW):
-- pyproject.toml
-- integrations/mcp/__main__.py
-- integrations/mcp/server.py
 - integrations/mcp/broker.py
 - integrations/mcp/job_store.py
 - integrations/mcp/codex.py
@@ -65,7 +62,6 @@ Exact future scope_paths (existing unless marked NEW):
 - integrations/mcp/remote_schemas.py — NEW
 - integrations/mcp/remote_dispatch.py — NEW
 - integrations/mcp/remote_http.py — NEW
-- integrations/mcp/remote_auth.py — NEW
 - integrations/mcp/task_store.py — NEW
 - integrations/mcp/task_workspace.py — NEW
 - integrations/mcp/artifact_store.py — NEW
@@ -83,33 +79,36 @@ extend through explicit remote composition, not changing local schemas or fresh-
 
 | Responsibility / sole module owner | Interface and consumers | Disposition / forbidden duplication |
 |---|---|---|
-| remote_config.py | load_remote_config(path) → startup-only validated remote settings plus existing validated base config | Separate remote settings; call existing config loader, not modify it. Require policy and private roots. |
+| remote_config.py | load_core_config(raw,base) → CoreConfig (§8) | Closed mandatory config; no environment or implicit defaults. |
 | remote_schemas.py | validate_remote(tool,args,limits); remote_tool_schema(tool); project_remote_result(record) | Own parent schemas/errors/projections; reuse local evidence/selection validators where behavior agrees. No storage/routing. |
 | remote_dispatch.py | dispatch_remote(principal,tool,args) through broker-owned instance | Authorize, lock/replay, invoke task store and existing broker routing/stop/feedback; never another queue. |
 | task_store.py | transaction-scoped task/operation/binding/publication mutations on JobStore.db | No independent connection/commit; migration SQL applied once by JobStore. All owner predicates central here. |
 | task_workspace.py | prepare/reconcile/remove generated workspace by broker intent and trusted descriptors | Folder identity and safe filesystem traversal owner; no caller-selected path. |
-| artifact_store.py | stage/seal/snapshot/reconcile immutable blobs from broker intents | Hash/fsync/inode rules; descriptor capability passed to file mover; no metadata commits. |
+| artifact_store.py | stage/seal/snapshot/reconcile immutable blobs from broker intents | Hash/fsync/inode rules; broker-local fd passed to file mover; no metadata commits. |
 | transfer_tickets.py | mint/replay/claim/revoke/authorize using task_store transaction context | Capability construction and lease transitions; no OAuth or byte mover. |
-| file_transfer.py | ASGI PUT/GET handlers, streamed byte copies through artifact_store | No SQL writer; broker RPC for claims/finalization; no full-body buffering. |
-| remote_auth.py | create maintained provider, strict resource/claims adapter and principal extraction | No handwritten code/token issuance, GitHub client, refresh store or OAuth replacement. |
-| remote_http.py | create lowlevel remote server, auth routes, SDK manager/lifespan and ingress checks | Remote tool registry; existing stdio remains separate; no accepted-job lifetime in HTTP. |
+| file_transfer.py | Broker-side §8 framed stream operations through artifact_store | Broker owns all descriptors; raw bytes cross socketpair; no FD-ID handoff. |
+| remote_http.py | create_test_app with trusted explicit synthetic principal (§8) | No auth adapter, listener, CLI or global ASGI app. Reuse installed MCP SDK; no FastMCP dependency in core. |
 | remote_native.py | verify persisted manifest; construct remote argv/manifest handoff from trusted binding | Complete remote-only policy template; reuse TOML encoder/feature constants, no ordinary argv changes. |
 | job_store.py / broker.py | additive transaction/binding seam, remote IPC dispatch, policy bootstrap | One integration owner; existing acceptance and fresh START admission retained. |
 | codex.py / worker.py | branch only on trusted persisted policy; pass/check bootstrap identity | Ordinary branch byte-identical; missing remote identity fails closed. |
-| server.py / __main__.py | optional shared registration seam and explicit remote entrypoint | No FastMCP import at stdio import/startup; remote extra missing produces actionable refusal only in remote mode. |
-| pyproject.toml | optional remote extra exact fastmcp-slim[server]==3.4.9 | Base MCP1.30 unchanged; no tasks extra, auth fork or provider SDK expansion. |
 
-Required internal trust seam: broker IPC carries a distinct closed remote envelope with keys
-config_digest, channel="cowork-remote-v1", owner_id (trusted serialized canonical owner tuple),
-tool, arguments. Channel/owner are server-produced, never tool fields. Only isolated remote broker
-accepts it after digest/installation match; local broker rejects channel. Existing stdio envelope and
-dispatch stay unchanged. Broker validates remote schemas before using generated cwd. Byte movers
-receive descriptor IDs/leases by private IPC, not a public "open path" RPC. Private transitions are
-enumerated in code from task_store intents; no arbitrary method dispatch. Fresh quota remains checked
-at both route acceptance and native START.
+[FIXED] Exact scope rationale: broker.py:133–189 owns dispatch/admission/IPC;
+job_store.py:26–162 owns DB version and acceptance transaction; worker.py:31,91 and
+codex.py:42 own bootstrap/argv. These are extended only at parent §8's typed seams.
+server.py:20,58 and __main__.py:16 are read-only reuse evidence: core consumes schema/SDK patterns,
+but MUST NOT change stdio registration or add a remote entrypoint. pyproject.toml stays read-only:
+core uses existing dependencies, no auth extra. New modules' parent integrations/mcp exists.
+No alternate route/queue/schema owner is authorized. All new interface records are defined in parent
+§8; any missing observable semantic MUST return to root for amendment, never builder discretion.
+Contracts have no line cap under current project AGENTS; each source module MUST remain <500 lines.
+
+Private transport MUST use parent §8's closed operation table and trusted socketpair construction.
+It MUST NOT extend stdio's JSON protocol with a caller-selected owner/channel. No listener or socket
+path is installed. The broker owns every staging/blob descriptor across the entire lease; HTTP
+receives bounded raw bytes, never an integer pretending to transfer an FD across processes.
 
 Execution order inside B: schemas/config → additive store/atomic acceptance → generated workspace/
-immutable artifacts/tickets → native policy bootstrap → HTTP/auth composition → compatibility review.
+immutable artifacts/tickets → native policy bootstrap → synthetic ASGI/private IPC composition → compatibility review.
 Do not commit intermediate protocol assumptions; any contradiction returns to root and independent QA.
 B's excluded paths: all tests/acceptance/exam fixtures, this contract, rulings, model catalogs, nightly
 training, installed runtime, user homes/credentials, other worktrees, ingress/launchd/activation.
@@ -122,12 +121,11 @@ baseline/candidate measurements, residual risks. No live install or commit impli
 ## Package Q — independent designated QA
 
 Owner: designated independent MCP QA session, not B or this author. QA owns D/A/B and protected exams,
-including provider qualification already underway. No exam files authored in this session.
-Planned exact acceptance_paths, all NEW, under verified parent acceptance/:
+including separately blocked future-auth qualification already underway. No exam files authored in this session.
+Planned exact acceptance_paths, all NEW, under verified parent acceptance/ (cowork_mcp directory is NEW):
 - acceptance/cowork_mcp/README.md
 - acceptance/cowork_mcp/MANIFEST.json
 - acceptance/cowork_mcp/test_schemas.py
-- acceptance/cowork_mcp/test_auth.py
 - acceptance/cowork_mcp/test_tasks.py
 - acceptance/cowork_mcp/test_transfer.py
 - acceptance/cowork_mcp/test_recovery.py
@@ -146,10 +144,10 @@ QA authors deterministic fake-native cases independently; actual native/tool lan
 
 | AC | Deterministic/captured local ground truth for Q | Later gated evidence |
 |---|---|---|
-| 008-01 | Real loopback ASGI discovery/401 challenge, all MCP methods auth, exact port/path/resource; PAT/ID/refresh/wrong issuer/audience/expiry denied | Actual hosted discovery/callback |
-| 008-02 | Maintained-provider local fixtures: S256 only, exact redirect, duplicate/resource rejection, no positive cache, bad-secret logs, encrypted restart/unknown-key fail closed | Real GitHub App identity/refresh/rotation; two parallel refreshes and crash windows; client deadlines |
-| 008-03 | Numeric Forest ID mapped to same installation across client rollover; second principal denied; expired/unknown/spent quota refuses explicit and S1 without native/API fallback | Root owner/client registration evidence |
-| 008-04 | HTTP disconnect/DELETE cannot kill/retry accepted job; no SDK/FastMCP dependency in stdio startup without extra | Preserve existing private 443→8432 while public candidate disabled/enabled |
+| 008-01 | FUTURE AUTH only; no auth fixture or implementation in LOCAL CORE | Independent future-auth D/A includes discovery/challenges/claims tests; then actual hosted callback |
+| 008-02 | FUTURE AUTH only; private review D-008-01/02 remain blockers | Preparse initial/explicit/transparent refresh, full credential-load lock, synthetic concurrency/crash and sentinel exams MUST precede future-auth dispatch; live rotation/deadlines follow |
+| 008-03 | Synthetic trusted principal mapped to owner; second principal/client denied; expired/unknown/spent quota refuses explicit and S1 without native/API fallback | Root owner/client registration evidence |
+| 008-04 | ASGI disconnect/transport DELETE cannot kill/retry accepted job; no new stdio imports/entrypoints; identity injection possible only through Python constructor | Preserve existing private 443→8432 while public candidate disabled/enabled |
 | 008-05 | Closed schemas for every request/result/error; UUID spelling, unknown fields, cwd, title/name/media boundaries, non-UTF8 JSON rejected; repo-free task | Actual Cowork tool-call payload |
 | 008-06 | Local stdio job ID, foreign task/job/artifact/status/cancel/feedback all refused with identical not-found response | Single-owner operator mapping |
 | 008-07 | Concurrent identical create/upload/delegate/feedback returns one identity; changed text/order conflicts; replay before scorer and quota; no new attempt after lost ACK | None needed to build |
@@ -161,7 +159,7 @@ QA authors deterministic fake-native cases independently; actual native/tool lan
 | 008-13 | Native terminal differs from publication failure; all-or-none manifest; failed output partial flag; future workspace mutation leaves old blob unchanged | Planner review/feedback in actual Cowork |
 | 008-14 | Repeated full GET exact bytes, Range refusal, delete/disable closes stream, opened expiry behavior; foreign capability denied | Cowork materialization, not merely HTTP 200 |
 | 008-15 | Crash injection before/after mkdir/fsync/rename/commit/association/delete; one accepted job; corrupt DB/blob fail closed; restore disabled first | Auth-store restart/crash qualification |
-| 008-16 | Decimal budget boundaries, copy/staging reservation counted once, count/deadline/backpressure exhaustion, active/uncertain never swept, tombstones retained | Root retention decision, native disk-growth overshoot/headroom qualification |
+| 008-16 | Decimal budget boundaries, copy/staging reservation counted once, count/deadline/backpressure exhaustion, no scheduled sweep exists; active/uncertain never deleted, tombstones retained | Live retention freeze, native disk-growth overshoot/headroom qualification |
 
 Commands below are FUTURE QA instructions, not a record of runs. QA must pin the interpreter/venv and
 fixtures before using them. Use a temporary isolated state directory under an authorized build tree;
@@ -198,7 +196,7 @@ quota captures (100 repetitions each), replay/status (1000 stored jobs, 1000 loo
 (100 tasks), 0/1 KiB/1 MiB/approved max file PUT and GET (10 samples each), concurrent transfer at limit,
 wrong hash/slow peer/disk-full scenarios. Report p50/p95/max, RSS growth, bytes and SQLite query count.
 Assert no model/provider calls on replay/refusal; transfer memory must scale with chunk×active streams,
-not file size. Measure auth/HTTP loopback overhead separately with captured auth transport.
+not file size. Measure synthetic ASGI/private IPC overhead without a listener; future-auth overhead is separate.
 Measure live GitHub/network/model latency separately and never subtract it into a fake local pass.
 No performance threshold invented here: root/QA pins measured latency/RSS/disk-headroom budgets before
 B acceptance; unmeasured is pending, not a pass. Client 10s/30s constraints remain external deadlines.
@@ -216,7 +214,7 @@ cannot edit those files. Live service/ingress/credential paths are intentionally
 root records exact activation/rollback scope from operator evidence in a separately approved package.
 Never infer private 443 replacement from candidate public 8443.
 
-Activation prerequisites: independently accepted local implementation, complete suite inventory,
+Activation prerequisites: independently accepted LOCAL CORE and separately reviewed FUTURE AUTH, complete suite inventory,
 captured actual native exec policy, qualified maintained auth/refresh and committed registration/file
 policy records; resolved package/dependency lock and disk/headroom budgets. Then root owns public route,
 callback registration and real Cowork binary journey. If Cowork cannot send ticket headers or materialize
@@ -244,3 +242,42 @@ Do not edit protected 007 tests, freeze live training or relabel the failure as 
 ordinary-profile equality plus separate original-label-prefix/exam-provenance/live partition checks.
 Use the actual 26-lane runner inventory and its environment bindings alongside new 008 lane commands;
 the generic discovery list above alone is insufficient. Missing/unexecuted suites remain BLOCKED.
+
+## v3 package-specific D/A inputs and AC mapping
+
+[FIXED] Q MUST freeze runnable isolated commands/fixtures before A; this is a draft inventory, not exams.
+Q owns the exact acceptance paths listed above; test_auth.py is reserved for a later scope amendment,
+not this package. No current turn may create/run tests. Future Q command:
+`python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'`
+MUST run every new core lane with zero unexpected skips. Existing accumulated runner remains required.
+
+| Exact Q file | Additional v3 obligations / ground truth |
+|---|---|
+| test_schemas.py | AC-008-03,05: every config key absent/unknown/type error refuses before side effects; every §3 success/error example validates; no caller identity/path; complete config snapshot retained |
+| test_tasks.py | AC-008-06–08: two synthetic principals and clients; SQL ownership/FKs/unique active reservation; atomic job acceptance rollback; explicit delete tombstone/evidence preserved |
+| test_transfer.py | AC-008-10–14: separate frontend/broker processes over socketpair; NUL/non-UTF8/empty bytes; exact offsets and frame lengths; foreign lease, disconnect, backpressure and revoke; inspect broker descriptor close and hash-equal sealed files |
+| test_recovery.py | AC-008-07,08,13,15: crash before/after intent/fsync/rename/commit; no relaunch; restart revokes leases; corrupt remote schema refuses; stdio schema unchanged; publication all-or-none |
+| test_native_policy.py | AC-008-09,16: fake-native bootstrap/policy identity and watchdog stop on measured overrun; no actual model call in deterministic lane; missing policy refuses START |
+| test_compatibility.py | AC-008-04,09,15: ordinary argv/bootstrap/results/hashes unchanged; no remote CLI/global app/listener/auth dependency; no training modification; historical/live checks distinct |
+| test_performance.py | AC-008-10,11,14,16: bounded chunk/stream memory, deadline/backpressure, disk accounting/reservation copies, measured poll overshoot; explicit fixture budgets |
+| README.md / MANIFEST.json | Q-owned exact fixture/source hashes, commands, suite inventory, independent D/A record and missing lanes; no author pass |
+| fixtures/wire.json / binary.bin / native_capture.json | Closed valid/invalid examples, raw synthetic bytes, attributed native evidence and unresolved actual-tool negatives; no credentials |
+
+Independent core acceptance MUST NOT claim AC-008-01/02 or public activation passed. Core AC-008-03/04
+covers ownership/lifetime/composition only; future auth still owns real identity/credential checks.
+Exact future-auth source candidates (NOT core grants): integrations/mcp/remote_auth.py,
+integrations/mcp/remote_http.py, integrations/mcp/__main__.py, integrations/mcp/server.py, pyproject.toml.
+Shared remote_http ownership MUST transfer only after core acceptance and a separately approved scope;
+no simultaneous builders. No future-auth path may be written under this core package.
+
+No-public-activation gates remain: Forest identity/provider/client decision; concrete deployed limits
+and retention (payload, prompt/history, tombstones, backups); independent auth D/A with qualified
+Authlib hooks/locking; dependency lock; actual native tool confinement; measured disk/headroom;
+exact ingress/callback/rollback scope preserving private 443→8432; actual Cowork byte access,
+Authorization-header egress, approved destination and materialized PDF/DOCX/XLSX/non-UTF8 hashes.
+No listener, auth registration or live storage may activate until all relevant gates are recorded.
+
+Latest evidence read during v3: native-exec-capture-v2/independent-adjudication.json qualifies thirteen
+synthetic shell outcomes for job ba4c3e14-c1f7-47fb-93b6-d703a98a6db7 with a recorded unused dot argument.
+The strict exact-command comparison remains false. Parent §9 records hashes/limits; Q MUST preserve
+that deviation and original capture, not require a redundant model run or call this full native approval.

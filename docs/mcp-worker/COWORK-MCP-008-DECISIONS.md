@@ -1,10 +1,10 @@
 <!-- PURPOSE: Record remaining policy/evidence gates without author rulings.
-     CONTRACT: RT-COWORK-MCP-008 v2 draft; same assignment, no self-approval.
+     CONTRACT: RT-COWORK-MCP-008 v3 draft; same assignment, no self-approval.
      DEPENDS: Parent source inspection and independent root/QA evidence.
      CEILING: No global decisions, production, tests, registration or activation edits. -->
 # Cowork 008 decision and gate record
 
-Contract: RT-COWORK-MCP-008 v2. Group: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1.
+Contract: RT-COWORK-MCP-008 v3. Group: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1.
 Status: **draft; dispatchable=false**. Existing broad OAuth/tasks/file-transfer scope is authorized;
 do not ask for it again. This document records technical proposals and honest unresolved evidence,
 not Forest rulings. No provider registration/file-policy approval arrived in recorded docs during
@@ -14,11 +14,11 @@ evidence, NOT D/A or product approval. Root/contract owner must record any later
 
 | ID | Current disposition | Owner / evidence needed | Gate location |
 |---|---|---|---|
-| O1 maintained auth | Candidate changed from tsidp to FastMCP3.4.9 GitHubProvider/OAuthProxy. Pinned composition and narrow resource/identity policy adapter specified in parent §2. No bespoke OAuth server. | Root selects/records GitHub registration and downstream client; independent QA qualifies actual supported flow, refresh, concurrency/restart, safe logs and identity-only permissions. | Registration choice and dependency review before package approval; live OAuth success before activation, not before deterministic task fixtures. |
+| O1 maintained auth | Candidate changed from tsidp to FastMCP3.4.9 GitHubProvider/OAuthProxy. Pinned composition and narrow resource/identity policy adapter specified in parent §2. No bespoke OAuth server. | Root selects/records GitHub registration and downstream client; independent QA qualifies actual supported flow, refresh, concurrency/restart, safe logs and identity-only permissions. | FUTURE AUTH blocked separately; independent future-auth D/A and live OAuth before activation. Not a core prebuild prerequisite. |
 | O2 native isolation | Concrete remote-only cowork-task-v1 profile proposed; persisted policy digest/CLI version required at job acceptance/bootstrap. Ordinary argv byte-for-byte unchanged. Shell capability review 13/13 passes only its bounded shell lane. | QA actual Codex exec model/tool capture: positive task work; denied credential/broker/sibling/tmp/symlink/network; native auth/quota and termination still work. :minimal runtime surface must be reported. | Local native acceptance before enabling remote execution; NOT a prerequisite to schema/store implementation. |
 | O3 binary transport | Technical protocol fixed: raw PUT/GET with header-only capability, immutable content identity, no URL fetching; exact requests/results/errors/recovery in parent. | QA local binary hash/transaction exams; root actual Cowork header egress and download materialization. No query-ticket fallback or silent companion. | Deterministic local build/acceptance first, actual Cowork journey later. |
 | O4 technical contract | RESOLVED AS DRAFT DESIGN: closed schemas, result projection, one owner, additive same-transaction task/job binding, canonical replay, recovery, source scopes and remote-policy identity specified. No dependency on live Cowork connection for local builder start after gates. | Independent D then A still required; author resolution is not approval. Any real source seam contradiction returns to root, never private builder change. | Technical freeze proposal ready for review; not dispatchable. |
-| O5 size/retention | Pending user policy, already requested by root: 100000000 bytes/file, 1000000000/task, 10000000000/installation (decimal). Recommend keep until explicit delete; optional seven-day cleanup only if recorded approved. No 24-hour idle sweep. | Root records Forest response, backup/payload versus prompt/history distinction; QA pins technical budgets and measures disk-growth overshoot/headroom. | Policy record before approval; no unapproved cleanup or implicit startup defaults. |
+| O5 size/retention | Pending user policy, already requested by root: 100000000 bytes/file, 1000000000/task, 10000000000/installation (decimal). Live choice remains pending. LOCAL CORE implements explicit task_delete only, no scheduler/automatic cleanup, and makes no retention recommendation or selection. | Root records Forest response, backup/payload versus prompt/history distinction; QA pins technical budgets and measures disk-growth overshoot/headroom. | Mandatory synthetic config before core D/A; live policy record before activation. No implicit defaults or unapproved cleanup. |
 
 ## O1 facts and qualification boundary
 
@@ -49,13 +49,14 @@ logging gaps. This is not permission to patch tsidp, deploy a proxy workaround o
 If GitHubProvider qualification fails, root records factual blockers and separately reviewed maintained
 alternative; task/file schemas and ownership remain independent of provider choice.
 
-## O5 policy choices versus technical guard proposals
+## O5 pending live policy versus mandatory local parameters
 
 File policy candidates above replace v1 MiB/GiB values. Effective limits are copied into each task's
 canonical record and returned by API. No automatic policy change on replay or restart.
-The 100-artifact, 300-second ticket, 65536-byte control/chunk, one upload/download per task, four stream
-installation, 30-second idle/600-second total bounds are explicit proposals with two-sided reasons in
-parent §6. They must be pinned by root/QA, not treated as performance measurements.
+Historical proposed technical values in parent §6 are NOT defaults or approved deployment values.
+Parent §8 owns the closed required config. Every byte/count/time/policy/principal/client input MUST
+be explicit; absent/unknown MUST refuse before side effects. QA pins synthetic fixtures and measures
+local bounds. Actual operator values remain a separate activation record.
 
 Stored accounting includes staging, input copies and mutable workspaces. Byte transfer reservations
 can refuse exactly at their boundary. Worker filesystem growth monitoring is NOT a hard disk quota;
@@ -69,15 +70,18 @@ erasure or backup TTL is required, root must freeze a separate policy before cla
 
 ## Required recorded evidence, in order
 
-1. Root provider-registration decision and file-policy response; dependency/source pins and package
-   scopes reviewed. No need to repeat approval for general OAuth/tasks/files.
-2. Designated independent QA authors/commits protected local fixtures and D=0 then A=0; root records
-   approval for bounded implementation. Current three docs do not contain that approval.
-3. One builder implements local deterministic seams; QA verifies all accumulated 001–007 suites and
-   new fixtures, raw baseline/performance evidence, actual native exec profile and Rubric B.
-4. Root handles qualified provider registration/activation with exact live scope and rollback, keeping
-   private 443→8432. Cowork control calls plus PDF/DOCX/XLSX/non-UTF8 source and materialized output
-   hash evidence complete the end-to-end gate. HTTP success or shell sandbox capture alone cannot pass it.
+1. Root reviews the exact LOCAL CORE package, source pins, closed config/IPC/DB and synthetic-only
+   constraints. Actual provider identity and deployed limits/retention remain visibly pending.
+2. Designated independent QA freezes protected local fixtures and reviews D then A; root records
+   bounded build approval. This draft claims neither pass nor dispatch permission.
+3. One core builder implements only EXECUTION's exact source scope. QA checks accumulated 001–007,
+   new core exams, baseline/performance and native integration. Actual model-tool confinement remains
+   a separately authorized activation evidence gate; synthetic tests do not replace it.
+4. Future auth requires its own scope freeze and independent D/A, including preparse token checks,
+   safe errors and concurrency/crash fixtures. No actual auth adapter or deployable listener is core delivery.
+5. Root records Forest's identity/provider/client and concrete storage/retention answers, qualified
+   auth and native evidence, exact live scope/rollback, and actual Cowork file materialization before
+   activation. Preserve private 443→8432 and training. No automatic cleanup is authorized by core.
 
 Current author evidence: local source/document reads and contract self-check only; no production/test
 files, exams, provider calls, native canary, installation, credentials, commits or live routes changed.
@@ -89,3 +93,57 @@ one historical 007 parity failure, not green; execution package records preserva
 Candidate downstream client profile now explicitly disables public DCR/CIMD and uses maintained
 public-PKCE pre-registration. Root must confirm actual Cowork registration UI compatibility; never
 supply the GitHub upstream secret as a downstream secret.
+
+## v3 amendment and retained attempt/evidence ledger
+
+[FIXED] Contract RT-COWORK-MCP-008, group 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1, version 3.
+Package narrowing MUST NOT reset failed-attempt history, create a replacement group or count author
+completion as acceptance. Full existing root/worker evidence remains authoritative, not truncated
+to the entries below. Root MUST import any additional job/failure records before dispatch.
+
+| Existing evidence | Disposition preserved |
+|---|---|
+| a21a86cf-d936-4be9-af76-ddec5048e479; feedback 11947912-9f05-4687-92da-ceb9703fa959 | Initial draft accepted as documents only |
+| 5c236b3c-ffc4-4526-ad03-dbf5da0ac957; feedback 3f278224-bfa1-49c5-a3f2-318485c8ba0f | v2 draft-only acceptance; no D/A or build approval |
+| Historical bounded fallback delegation | Failed before start; exact job identity unavailable in supplied evidence; do not erase or invent it, automatically retry, or infer a zero-failure ledger |
+| Private 008-v2-technical-review.md | Reviewed d4c99db, parent SHA256 1bfb6e6e2a162415c53811187a85ca9a22099a4189c6d73c67e9c23e0e0661d8; D NOT READY, A BLOCKED/not run |
+| Native 97417125-08c6-4df8-b916-5edac704a359 | Actual task read/write/network evidence only; ten filesystem-denial claims unverified |
+| Direct shell 13/13 and separate Unix socket denial | Bounded evidence retained; not substituted for actual model-tool proof |
+| Live baseline 784/785; historical 007 4/4 | Different evidence lanes; live baseline not relabeled green |
+
+The current session has no cortados-workers tools/resources exposed. No route/delegate/model fallback
+or new worker job was started. v3 author edits are confined to the three documents. Concurrent root
+review changes belong to their author and are not part of this handback's write scope.
+
+### Explicit unresolved future-auth defects
+
+D-008-01: _extract_upstream_claims is too late (parsing/storage precede it) and absent on transparent
+refresh. Candidate Authlib access_token_response/refresh_token_response hooks installed through
+_create_upstream_oauth_client require independent qualification of initial, explicit and transparent
+refresh. GitHub refresh_token_expires_in normalization and conflicting aliases need frozen exams.
+D-008-02: one process does not serialize requests. Candidate gate must encompass credential loading
+through exchange/store/delete plus transparent verification, acquire once, and release before broker
+locks. Synthetic redemption races/restart/crash are future-auth prebuild A requirements.
+Neither candidate is declared qualified or a D pass. Auth issuance/storage stay with maintained owner.
+
+### Pending user questions remain pending
+
+[ESCALATE: activation only] GitHub identity/provider/application and downstream client registration.
+Publicly observed 4list233 / 237812476 MUST NOT become enabled configuration without recorded choice.
+[ESCALATE: activation only] Actual file/task/installation byte values and retention semantics.
+Root's question offered 100000000/1000000000/10000000000 decimal bytes and explicit deletion versus
+seven-day cleanup. No answer is inferred. No seven-day mechanism is built here.
+Synthetic explicit_delete fixtures exercise already authorized task_delete, not a selection of live
+payload/history/tombstone/backup policy. Activation MUST freeze each of those semantics concretely.
+If the live choice requires behavior outside core, root MUST amend scope and get independent review;
+production author MUST NOT choose missing semantics.
+
+LOCAL CORE can be gated independently only against the explicit package, not against an assumed
+future login or deployment. No unauthenticated deployable remote entrypoint is an acceptable handback.
+
+Latest supplement: independent-adjudication.json for native job ba4c3e14-c1f7-47fb-93b6-d703a98a6db7
+accepts the bounded thirteen-case shell evidence with recorded deviation; strict_exact_command_pass=false
+remains unchanged. Parent §9 retains exact hashes and exclusions. This closes that shell-negative gap,
+not the complete native/activation gate, and does not rewrite first-capture unverified claims.
+Root records revision job 0cf07890-97dd-401c-86ac-cd8bf976a01d under the existing group; no nested
+worker dispatch was made by this author.

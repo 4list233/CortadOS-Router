@@ -51,6 +51,59 @@ runtime was qualified. This evidence is separate from the direct sandbox thirtee
 No failed job was automatically retried. Raw capture is under
 `/Users/velox/.cortados-builds/cowork-mcp-verification/native-exec-capture/`.
 
+A distinct planned v2 experiment (not a retry of a failed job) used one immutable task-local shell
+probe so all OS outcomes appear inside one native command event. Root reviewed the independent
+driver/probe/profile and ran it once with the same accepted interpreter and ordinary config.
+Capture job `ba4c3e14-c1f7-47fb-93b6-d703a98a6db7` records all thirteen outcomes: two task operations
+exit0, ten file-boundary operations exit1 with OS permission errors, and loopback exit7. Canaries
+and probe hashes are intact, outside writes absent, zero sandbox TCP connections, termination contained.
+Raw events SHA-256: `262b41aed6988fa954284093377de928e593a1286c062b046a13dffb56617010`.
+
+The exact-invocation check did not pass: the model included the prompt's trailing period as a single
+unused `.` script argument. Root preserved that failed comparison in `native-exec-capture-v2/root-review.json`
+and requested independent adjudication; no third invocation or silent test change follows. The immutable
+script does not consume outer positional arguments. Native file-read APIs, document runtimes and Cowork
+transport remain outside this experiment. Evidence root:
+`/Users/velox/.cortados-builds/cowork-mcp-verification/native-exec-capture-v2/`.
+
+Independent QA accepted the bounded thirteen-case evidence **with the recorded deviation** after
+checking shell argument semantics, immutable script, raw outputs, all hashes and containment. The strict
+comparison remains false and its file is unchanged (SHA-256
+`aa0f29a7e58e525a9bfb8190be2c63e8e017875f58bf96d591a49da1745fef88`).
+`independent-adjudication.json` SHA-256:
+`4e3e350867f48ad50dab64a5cbea5a39af38b780ddc0250accb58e6d8ebc9444`.
+This closes the missing shell-negative evidence gap only; it is not a full native or activation pass.
+
+## Local core versus activation
+
+Independent v2 review at draft commit `d4c99db` found two auth design defects, recorded in private
+`008-v2-technical-review.md` (SHA-256 `849b5f4d625f51926bc3ffb85a200822363b546f6de1e89741888154da31b56e`).
+The proposed upstream lifetime hook was too late and missed transparent refresh; one ASGI process
+also does not serialize concurrent redemption. D is not ready; A was blocked/not run. This is not
+a production build failure or a completed zero-defect review of the remaining contract.
+
+QA confirmed that mandatory parameterized enforcement can be built locally without choosing live
+identity/limits/retention. Root dispatched contract-only revision job
+`0cf07890-97dd-401c-86ac-cd8bf976a01d` under the same group completed draft v3 defining an independently
+gateable local core and a separate future auth/activation package. It changed only the same three
+contract docs. Root read its configuration/IPC/migration/interfaces and parsed sixteen JSON blocks;
+draft-only acceptance feedback is `4735cd80-17de-4b5c-b4b8-3098edbf3bdd`. All user choices remain pending.
+No implicit policy, automatic cleanup, unauthenticated public entrypoint, provider registration or
+live activation is authorized by that narrowed draft. Core D/A and committed exams still precede code.
+
+Before independent v3 freeze, root clarified three technical requirements: preserve ordinary Unicode
+and punctuation in filenames with safe UTF-8 HTTP encoding instead of the draft's unnecessarily narrow
+ASCII allowlist; bound the four-byte header size to its representable range; and bind base/broker state
+to the isolated core state before migration. These do not select live account/storage policy. Parent
+hash after these amendments: `f6ed8f473e720cef5345350bdaf97898d77a2c54468af199a4b27e6b069b1363`.
+
+A separate exposed file-edit-tool capture used job `e9ecb003-9ec6-4e2a-aece-ff0f7c7bbe18`. Actual
+inside apply_patch and its expected hash are verified. The outside file is unchanged, but native exec
+again omits the reported refused call from raw events. Independent QA records the negative as
+inconclusive, not passing, in `native-apply-patch-capture/independent-review.json` (SHA-256
+`120c1cd026884ab01eda68d8c21741e7fe7682e52924135be8ddb0e2757456a8`). No rerun followed. This remains
+a later native activation qualification gap and does not change the bounded shell proof.
+
 ## Authentication qualification
 
 Tailscale tsidp v0.0.17 at `972d97d49b6e44d2baf4786def7485f55a7b09c1` was examined and a
