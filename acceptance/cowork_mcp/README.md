@@ -158,3 +158,38 @@ AC-008-01/02 belong only to future auth. The following maps existing stable IDs 
 Prebuild syntax, discovery, independent fixture oracles and historical assertion identity have been checked. The immutable exam commit plus private all-row A record are the readiness evidence; root alone records dispatch approval. Builder must not edit these files, infer missing behavior, suppress a failing assertion, or reset earlier design-review history. Any fixture disagreement returns to this exam owner before a repair.
 
 B requires exact source/diff, all accumulated lanes, source confinement, unmodified protected hashes, no missing suites, raw performance/memory review, lifecycle/containment source review and truthful limitations. All operator activation, real authentication, remote delivery, runtime inventory and exposed native-tool qualification remain outside LOCAL CORE.
+
+## Attempt1 independent regression amendment
+
+Original exam commit1037b52 and its19 files are preserved byte-for-byte in private
+`core-candidate-attempt-1/original-protected-exams`; original MANIFEST SHA256
+e0680bf5687e46b339fcea469663a17595c5bad08e1897149b2af45f2aaf2852.
+Root rejected the first valid candidate under d846d54. Its original host inventory
+remains857 tests,1failure,0errors,0skips;26/28 lanes pass. The failing test is output
+manifest ordering. The separate benchmark's original120s total lease expired at
+2×16MiB/4KiB under tracing; this raw failure is retained and is not relabeled green.
+
+The independent exam owner added17 methods in existing acceptance files, covering
+C1 ordered committed results; C2 queued disable; C3 cancelled IPC response mixing;
+C4 unpublished output download; C5 PUT receive and GET send backpressure; C6 corrupt
+binding indexes at restart; C7 fatal audit latching and runtime transitions; C8 missed
+monitor deadline; C9 private record array bounds; C10 cleanup despite another inode
+failure. Every original method/assertion remains unchanged. Core discovery is now89
+methods; unchanged prior785 plus89 gives874 methods across the same28 lanes.
+
+The negative additions reproduce red on the frozen first candidate; acceptance-audit
+and timely-monitor controls pass. Final isolated run:17 methods,20 failure events,
+1 TimeoutError,0skips (subtest events overlap method counts). Raw failure event totals
+include constructor subtests; they are not disjoint method counts. These are one
+attempt's regression amplification, not additional builder attempts or a gate reset.
+No extra connection count policy, live storage choice, provider call or native
+qualification is introduced. IPC cancellation retires a connection, never accepted
+job lifetime. C8's deliberately250ms scheduler stall is five50ms deadlines; it does
+not authorize any jitter allowance or require an exact asyncio wakeup instant.
+
+The matrix-only total lease changes120000→600000ms under root approval d846d54.
+Observed2×8MiB traced transfer took95.89s, making120s inadequate for2×16MiB. The larger
+fixture allows measurement; idle/IPC/ticket values and all deadline assertions stay
+unchanged. No deployment default or latency acceptance budget changes. Original
+benchmark bytes and raw reports remain preserved. Independent correctness/memory
+review is still required; the amendment does not approve efficiency or the candidate.

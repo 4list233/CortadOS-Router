@@ -102,3 +102,15 @@ class SchemaExam(unittest.TestCase):
         for name in ('remote_config','remote_schemas','remote_native','remote_runtime','remote_dispatch','remote_ipc',
                      'remote_http','task_store','task_workspace','artifact_store','transfer_tickets','file_transfer','remote_capacity'):
             with self.subTest(owner=name):self.assertIsNotNone(mod(name))
+
+
+class BuildClosedShapeRegressionExam(unittest.TestCase):
+    def test_native_private_record_array_constraints_match_frozen_schema(self):
+        api=mod('remote_schemas')
+        changes=[('NativeTemplate','mcp_servers',['injected']),
+                 ('NativeManifest','captures',[{'name':str(i),'sha256':'a'*64,'kind':'synthetic'} for i in range(101)]),
+                 ('NativeManifest','disabled_features',['x']*101),('NativeManifest','environment_names',['X']*101)]
+        for name,field,value in changes:
+            with self.subTest(name=name,field=field):
+                fields=copy.deepcopy(FIXTURE['private_examples'][name]['valid']);fields[field]=value
+                with self.assertRaises(api.RemoteError):getattr(api,name)(**fields)

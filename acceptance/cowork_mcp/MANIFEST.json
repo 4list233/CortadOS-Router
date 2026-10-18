@@ -21,7 +21,9 @@
       "test_handoff_override_reaches_existing_s1_fit_and_default_is_unchanged",
       "test_live_training_prefix_exam_rows_and_protected_model_inputs",
       "test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator",
-      "test_ordinary_native_argv_and_environment_are_unchanged"
+      "test_ordinary_native_argv_and_environment_are_unchanged",
+      "test_stalled_http_put_receive_terminates_at_idle_deadline",
+      "test_stalled_http_get_send_aborts_after_headers_at_idle_deadline"
     ],
     "test_native_policy.py": [
       "test_native_argv_uses_complete_remote_template_and_full_input_packet",
@@ -31,7 +33,10 @@
       "test_failed_native_retains_only_explicit_partial_output",
       "test_full_handoff_byte_limit_is_enforced_before_acceptance",
       "test_route_only_does_not_prepare_workspace",
-      "test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade"
+      "test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade",
+      "test_committed_manifest_order_survives_reverse_artifact_query_order",
+      "test_sealed_output_is_not_downloadable_after_publication_failure",
+      "test_unpublished_output_rejects_existing_ticket_replay_and_claim"
     ],
     "test_performance.py": [
       "test_file_exact_bound_allowed_one_over_refused_without_intent",
@@ -51,7 +56,16 @@
       "test_missing_sealed_blob_quarantines_instead_of_serving_stale_success",
       "test_crash_before_mkdir_retires_intent_and_allows_explicit_retry",
       "test_crash_after_mkdir_before_inode_record_quarantines_never_infers",
-      "test_sealed_blob_symlink_swap_never_reads_outside_bytes"
+      "test_sealed_blob_symlink_swap_never_reads_outside_bytes",
+      "test_binding_derived_task_index_must_equal_immutable_seed",
+      "test_remote_job_audit_failure_latches_admission_and_emits_fatal_signal",
+      "test_runtime_ready_and_disable_each_have_one_durable_transition",
+      "test_missed_monitor_deadline_closes_admission_after_scheduler_stall",
+      "test_one_cleanup_integrity_failure_cannot_leave_another_descriptor_open",
+      "test_acceptance_audit_failure_is_fatal_without_job",
+      "test_lease_audit_failure_is_fatal_without_descriptor",
+      "test_malformed_frame_audit_failure_closes_endpoint_and_latches",
+      "test_timely_monitor_control_preserves_admission"
     ],
     "test_schemas.py": [
       "test_every_config_key_required_and_unknown_refuses",
@@ -66,7 +80,8 @@
       "test_projected_variants_and_unknown_cross_fields",
       "test_request_unknown_identity_paths_and_filename_boundaries",
       "test_nested_inputs_are_copied_and_immutable_without_implementation_requirement",
-      "test_every_new_owner_module_has_a_real_importable_boundary"
+      "test_every_new_owner_module_has_a_real_importable_boundary",
+      "test_native_private_record_array_constraints_match_frozen_schema"
     ],
     "test_tasks.py": [
       "test_create_replay_keeps_identity_and_current_projection",
@@ -79,7 +94,9 @@
       "test_busy_task_blocks_delete_and_second_delegate",
       "test_disable_latches_without_cancelling_job",
       "test_transition_audit_has_one_creation_event_and_no_payload_secrets",
-      "test_foreign_trusted_principal_refuses_attach"
+      "test_foreign_trusted_principal_refuses_attach",
+      "test_disable_ahead_of_queued_create_rechecks_authority_after_lock",
+      "test_cancelled_ipc_call_cannot_deliver_predecessor_response"
     ],
     "test_transfer.py": [
       "test_zero_and_non_utf8_bytes_roundtrip_hash_exact",
@@ -98,7 +115,7 @@
       "test_delete_revokes_existing_get_before_next_chunk"
     ]
   },
-  "test_method_count": 72,
+  "test_method_count": 89,
   "ac_files": {
     "03": [
       "test_schemas.py",
@@ -803,23 +820,23 @@
     "tests/test_training_teacher.py": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f"
   },
   "fixture_files_sha256": {
-    "README.md": "a23cb3f5bb8f0100bfad98370f7ec8a06b19878e6bd779ab4e7fea539c2edea7",
+    "README.md": "1c7cd9a3259a3c334cb38b3ad74e59315ce2733272f10cb5170be6ef0904e8cc",
     "__init__.py": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
     "evidence/baseline-ordinary.json": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
-    "evidence/benchmark-core.py": "8c381b2ab2978008a9890d58c08db3be5a3fb3012feedf9dbe8e66d86c52bf7d",
+    "evidence/benchmark-core.py": "853450d7308ea6548777f7936f989c4aad4c022ee76706fdf7f188e5f5c23ba7",
     "evidence/historical-007-parity.py": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
     "evidence/run-full-suite.py": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
-    "evidence/suite-inventory.json": "0c9c51770833de815fbfaa811f31f1ff25460dff32540b9fffdab2b91f6378c6",
+    "evidence/suite-inventory.json": "7efe645532a7388c4a3ac9dc3969a70c995ccd1e36aee897366fd135a410a3cf",
     "fixtures/binary.bin": "eca7a2fd17bcc909b49d0bf0c90c5fa1d026696c632e76f760ad73c1c3c5b5ea",
     "fixtures/native_capture.json": "2d7deb538ccfba4c1435289336e05d6b7110d6bac17ca08d7916c413ce55d8e2",
     "fixtures/wire.json": "fc6b6435801ffe581028d4688ff72e8a8eff0f32c02ef8ad74e9283302b74970",
     "support.py": "cba3aa9320e351ae7f4262883e6a4693e5b44c273bce265d64d52cc0d7487c21",
-    "test_compatibility.py": "65e9eeba0613d9cb9169722a7ba093be89acbc62475b137fcc34c90c4f151106",
-    "test_native_policy.py": "755c62349aa46ef904d5769c84726f451d7860e901756183622bcac19b4960f4",
+    "test_compatibility.py": "6e9c9ea7bbe459e57b7f8288cca7e503199f2b07a289a115454fa5a7b59de06e",
+    "test_native_policy.py": "e515bf2e3f13321c8545ee666a514ae1f9741a1d4d38267fc8b4318cbccc4767",
     "test_performance.py": "4c885e044424e53e767c4ef4f7afd20babef26061f2a2edf5765bf9d03f2c56e",
-    "test_recovery.py": "fee0b94094e33776c82b6c2a0cdaaa3c3ac94555f32728d875100848716bcff9",
-    "test_schemas.py": "e033ea2a0b3f5074ab254ec992f353953b1368f191a365dde2a9964b08d440dc",
-    "test_tasks.py": "fdd59fd0b43c4206631ea7ef78df74ac1d893da0f3fe628baacdc6a68c314afd",
+    "test_recovery.py": "f5457eb7cd0b5614ed43d3bfd672fe18db0db30a7873873ba09b6320910b0eb6",
+    "test_schemas.py": "9dbd8c95e3f19bb1928499cddf1cfc669a7a0537c8c4e0057b2b3de9137dd269",
+    "test_tasks.py": "e6f023f83251e44d8a365bd8f8602535a3d63554cb1e63b493386a368dd914f7",
     "test_transfer.py": "7211a3455a18cf0e83274af359d90faf2a41c557a01a1ca85acc9747a7839bfd"
   },
   "private_evidence": {
@@ -844,8 +861,46 @@
     "Public Cowork binary transfer",
     "Activation"
   ],
-  "ledger": "Prior D21 and D3 preserved; D0 closure plus constructor/command deltas; no implementation attempt yet.",
+  "ledger": "Original D21/D3 and D0/A0 retained. First stable core build rejected (857 original methods;1failure; separate matrix fixture exhaustion).17 additive regressions and approved matrix-only600s measurement fixture; one remaining same-design retry, no reset.",
   "historical_review_docs_sha256": {
     "docs/mcp-worker/COWORK-MCP-008-ROOT-REVIEW.md": "88495028f797c33566d0e9a6c4f45dd1c4f1b6700dc31bfcd043879f126dbc8a"
-  }
+  },
+  "exam_owner_amendments": [
+    {
+      "authority": "d846d54",
+      "original_exam_commit": "1037b52db9732a10e1c7b0ce86f5fb22ad1d0c29",
+      "original_manifest_sha256": "e0680bf5687e46b339fcea469663a17595c5bad08e1897149b2af45f2aaf2852",
+      "preserved_original": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-1/original-protected-exams",
+      "original_methods": 72,
+      "added_methods": 17,
+      "findings": [
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+        "C5",
+        "C6",
+        "C7",
+        "C8",
+        "C9",
+        "C10"
+      ],
+      "matrix_total_ms": 600000,
+      "baseline_failure_preserved": true,
+      "source_policy_changed": false,
+      "valid_builder_failures": 1,
+      "remaining_same_design_retry": 1,
+      "current_methods": 89,
+      "expected_full_methods": 874,
+      "red_evidence": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-1/amplification-final-red.log",
+        "sha256": "edfb6f272ef293f5002c72c5ce0de8e356f5abb84b27fbb3242ae02a74dd44fd",
+        "methods": 17,
+        "failure_events": 20,
+        "error_events": 1,
+        "skips": 0,
+        "passing_controls": 2
+      }
+    }
+  ]
 }

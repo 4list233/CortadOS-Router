@@ -89,3 +89,36 @@ class TaskExam(CoreCase):
         from .support import mod
         await self.start();principal=dict(self.fixture.principal,subject='synthetic:other')
         with self.assertRaises(mod('remote_schemas').RemoteError):await self.connect(principal)
+
+
+from .support import mod
+
+class BuildLifecycleRegressionExam(CoreCase):
+    async def test_disable_ahead_of_queued_create_rechecks_authority_after_lock(self):
+        import asyncio
+        from .support import owner
+        await self.start();lock=self.runtime.broker.admission_lock
+        await lock.acquire()
+        disable=asyncio.create_task(self.runtime.disable_owner(owner(self.fixture.principal)))
+        await asyncio.sleep(.01)
+        request=asyncio.create_task(self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'queued'}))
+        await asyncio.sleep(.01);lock.release();await disable
+        self.error(await request,'permission_refused')
+        self.assertEqual(self.fixture.sql('SELECT count(*) FROM remote_tasks')[0][0],0)
+        self.assertFalse(self.runtime.enabled)
+
+    async def test_cancelled_ipc_call_cannot_deliver_predecessor_response(self):
+        import asyncio
+        await self.start();lock=self.runtime.broker.admission_lock;await lock.acquire()
+        pending=asyncio.create_task(self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'first'}))
+        await asyncio.sleep(.03);pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):await pending
+        lock.release()
+        try:
+            response=await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'second'})
+        except mod('remote_schemas').RemoteError:
+            response=None
+        self.assertTrue(self.client.closed,'Cancelled indeterminate frame must retire its endpoint')
+        self.assertIsNone(response,'A later call must not consume the predecessor response')
+        other=await self.connect()
+        self.ok(await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'fresh endpoint'},other))

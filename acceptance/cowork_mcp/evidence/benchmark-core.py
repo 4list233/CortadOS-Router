@@ -23,11 +23,13 @@ OUT=Path(sys.argv[1]);report={'scope':'Actual local core with prior protected fa
 
 async def transfer_case(size,chunk,streams):
     case=CoreCase();await case.asyncSetUp();f=case.fixture
-    # Synthetic MiB sizes exercise scaling. 120s prevents benchmarking overhead expiring leases;
-    # it is not a deployed timeout choice. Each case owns fresh private state.
+    # Synthetic MiB sizes exercise scaling. 600000ms total allows traced2x16MiB completion
+    # after the original120000ms fixture expired (2x8MiB took95.89s). Smaller masks
+    # memory measurements with expiry; larger prolongs failed tests. No live timeout
+    # or latency SLO changes; idle/IPC deadlines and separate expiry exams stay fixed.
     f.core['limits'].update(file_bytes=16*1048576,task_bytes=64*1048576,installation_bytes=256*1048576,
         chunk_bytes=chunk,control_bytes=max(65536,chunk),uploads_per_task=2,downloads_per_task=2,
-        ticket_ttl_s=120,transfer_idle_ms=120000,transfer_total_ms=120000,ipc_idle_ms=120000)
+        ticket_ttl_s=120,transfer_idle_ms=120000,transfer_total_ms=600000,ipc_idle_ms=120000)
     sql=Counter();original=sqlite3.connect
     def connect(*a,**kw):
         db=original(*a,**kw);db.set_trace_callback(lambda q:sql.update([q.split()[0].upper()]));return db

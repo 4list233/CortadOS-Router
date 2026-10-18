@@ -95,3 +95,134 @@ class RecoveryExam(CoreCase):
             ticket=result['ticket'];frame=await self.stream('open_get',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:]})
             self.assertEqual(frame['body'],b'');result=frame['result']
         self.assertFalse(result['ok']);self.assertEqual(outside.read_bytes(),b'SENTINEL-OUTSIDE')
+
+
+class BuildIntegrityRegressionExam(CoreCase):
+    async def test_binding_derived_task_index_must_equal_immutable_seed(self):
+        await self.start();first=await self.task();other=await self.task()
+        job=self.ok(await self.call('delegate',self.args(first)))['job']['job_id']
+        await self.terminal(first['task_id'],job)
+        self.runtime.broker.store.db.execute('UPDATE remote_job_bindings SET task_id=? WHERE job_id=?',(other['task_id'],job))
+        await self.stack.aclose()
+        f=self.fixture
+        with self.assertRaises(mod('remote_schemas').RemoteError) as caught:
+            async with mod('remote_runtime').CoreRuntime(base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)):
+                pass
+        self.assertEqual(caught.exception.code,'policy_unavailable')
+
+    async def test_remote_job_audit_failure_latches_admission_and_emits_fatal_signal(self):
+        import asyncio,contextlib,io,sqlite3
+        from unittest.mock import patch
+        from .support import uid
+        from integrations.mcp.schemas import WorkerError
+        await self.start();task=await self.task()
+        async def no_native(record):pass
+        with patch.object(self.runtime.broker,'run_worker',new=no_native):
+            job=self.ok(await self.call('delegate',self.args(task)))['job']['job_id']
+            await asyncio.sleep(.01)
+        stderr=io.StringIO();api=mod('remote_schemas');original=api.emit_remote_event
+        def failing(tx,event):
+            if tx is not None and event.entity=='job':raise sqlite3.OperationalError('SENTINEL audit unavailable')
+            return original(tx,event)
+        with contextlib.redirect_stderr(stderr),patch.object(api,'emit_remote_event',new=failing):
+            with self.assertRaises(WorkerError):self.runtime.broker.store.transition(job,'failed',reason='native_failed')
+        response=await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'must refuse'})
+        self.error(response,'storage_error')
+        self.assertTrue(self.runtime.admission_failed or self.runtime.broker.store.admission_closed)
+        self.assertEqual(self.runtime.broker.store.get(job)['state'],'queued')
+        events=[json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith('{')]
+        failures=[event for event in events if event.get('schema')=='cortados.cowork-event.v1' and event.get('reason')=='storage_error']
+        self.assertEqual(len(failures),1,'One fixed fatal audit signal belongs to the failed transition')
+        self.assertNotIn('SENTINEL',stderr.getvalue())
+
+    async def test_runtime_ready_and_disable_each_have_one_durable_transition(self):
+        from .support import owner
+        await self.start();await self.runtime.disable_owner(owner(self.fixture.principal))
+        events=[json.loads(row[0]) for row in self.fixture.sql('SELECT event_json FROM remote_audit')]
+        for state in ('ready','disabled'):
+            self.assertEqual(sum(event['entity']=='runtime' and event['event']=='transition' and event['state']==state for event in events),1,state)
+
+    async def test_missed_monitor_deadline_closes_admission_after_scheduler_stall(self):
+        import asyncio,time
+        self.fixture.core['limits']['workspace_poll_ms']=50
+        await self.start();await asyncio.sleep(.06)
+        # Milliseconds: 250ms deliberately spans five50ms deadlines; this is a
+        # synthetic scheduler stall, not an allowed jitter or production default.
+        time.sleep(.25);await asyncio.sleep(.03)
+        self.assertTrue(self.runtime.admission_failed,'Elapsed gap must be checked from prior sample start')
+
+    async def test_one_cleanup_integrity_failure_cannot_leave_another_descriptor_open(self):
+        import os,asyncio
+        await self.start();opened=[]
+        try:
+            for index in range(2):
+                task=await self.task();ticket=await self.ticket(task['task_id'],b'x')
+                result=await self.stream('open_put',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:],'content_length':1})
+                lease=self.ok(result['result'])['lease_id'];opened.append((task,ticket,lease,self.runtime.descriptors[lease]))
+            task,ticket,lease,_=opened[0];path=self.fixture.path/'staging'/task['task_id']/ticket['artifact_id']
+            path.rename(path.with_suffix('.original'));path.write_bytes(b'unknown replacement')
+            import contextlib,io
+            signal=io.StringIO();terminal_error=None
+            with contextlib.redirect_stderr(signal):
+                try:await self.stack.aclose()
+                except mod('remote_schemas').RemoteError as error:terminal_error=error
+            # A failed cleanup must surface even when all descriptors were retired.
+            events=[json.loads(line) for line in signal.getvalue().splitlines() if line.startswith('{')]
+            fatal=terminal_error is not None or any(event.get('schema')=='cortados.cowork-event.v1' and event.get('reason') in ('storage_error','task_quarantined','artifact_corrupt') for event in events)
+
+            live=[]
+            for _,_,lease,fd in opened:
+                try:os.fstat(fd);live.append(lease)
+                except OSError:pass
+            self.assertEqual(live,[],'All owned descriptors close even after another inode refusal')
+            self.assertEqual(path.read_bytes(),b'unknown replacement')
+            self.assertTrue(fatal,'Cleanup integrity failure cannot be silently swallowed')
+        finally:
+            # Private fixture safety on the red candidate only, never product bypass.
+            for fd in tuple(self.runtime.descriptors.values()):
+                try:os.close(fd)
+                except OSError:pass
+            for timer in tuple(self.runtime.lease_timers.values()):timer.cancel()
+
+    async def _audit_boundary(self,kind):
+        import contextlib,io
+        from .support import raw_send,raw_read
+        await self.start();task=await self.task();ticket=None
+        if kind=='lease':ticket=await self.ticket(task['task_id'],b'x')
+        api=mod('remote_schemas');original=api.emit_remote_event;stderr=io.StringIO();hits=[]
+        def failing(tx,event):
+            selected=((kind=='acceptance' and event.entity=='job' and event.state=='queued') or
+                      (kind=='lease' and event.entity=='lease' and event.state=='open') or
+                      (kind=='frame' and event.entity=='runtime' and event.event=='refusal'))
+            if tx is not None and selected:
+                hits.append(event.entity);raise sqlite3.OperationalError('SENTINEL audit unavailable')
+            return original(tx,event)
+        with contextlib.redirect_stderr(stderr),patch.object(api,'emit_remote_event',new=failing):
+            if kind=='acceptance':self.assertFalse((await self.call('delegate',self.args(task)))['ok'])
+            elif kind=='lease':
+                result=await self.stream('open_put',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:],'content_length':1})
+                self.assertFalse(result['result']['ok'])
+            else:
+                await raw_send(self.client.socket,{'v':1,'seq':self.client.seq,'op':'unknown','body_bytes':0,'args':{}})
+                try:
+                    async with asyncio.timeout(.5):await raw_read(self.client.socket)
+                except EOFError:pass
+        self.assertTrue(hits,'Fault must reach the actual audit persistence boundary')
+        self.assertTrue(self.runtime.admission_failed or self.runtime.broker.store.admission_closed)
+        events=[json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith('{')]
+        self.assertEqual(sum(event.get('schema')=='cortados.cowork-event.v1' and event.get('reason')=='storage_error' for event in events),1)
+        self.assertNotIn('SENTINEL',stderr.getvalue());self.assertFalse(self.runtime.descriptors)
+        if kind=='acceptance':self.assertEqual(self.fixture.sql('SELECT count(*) FROM jobs')[0][0],0)
+
+    async def test_acceptance_audit_failure_is_fatal_without_job(self):await self._audit_boundary('acceptance')
+    async def test_lease_audit_failure_is_fatal_without_descriptor(self):await self._audit_boundary('lease')
+    async def test_malformed_frame_audit_failure_closes_endpoint_and_latches(self):await self._audit_boundary('frame')
+
+    async def test_timely_monitor_control_preserves_admission(self):
+        self.fixture.core['limits']['workspace_poll_ms']=1000
+        await self.start()
+        # Bounded work well before the next1s deadline proves not always-failed;
+        # it does not assert exact wakeup timing or create a jitter allowance.
+        await asyncio.sleep(.01)
+        self.assertFalse(self.runtime.admission_failed)
+        self.ok(await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'timely control'}))

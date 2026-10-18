@@ -149,3 +149,52 @@ class CompatibilityExam(CoreCase):
         self.assertEqual(actual,FIXTURE['ordinary_native_argv'])
         with patch.dict(os.environ,{'HOME':'/synthetic/home','PATH':'/synthetic/bin','OPENAI_API_KEY':'NEVER-PASS','CORTADOS_TOKEN':'NEVER-PASS'},clear=True):
             self.assertEqual(native_environment(bootstrap['config']),{'HOME':'/synthetic/home','PATH':'/synthetic/bin','CODEX_HOME':bootstrap['config']['codex_home']})
+
+
+class BuildHttpDeadlineRegressionExam(CoreCase):
+    async def test_stalled_http_put_receive_terminates_at_idle_deadline(self):
+        import asyncio
+        self.fixture.core['limits'].update(transfer_idle_ms=100,transfer_total_ms=5000,ipc_idle_ms=5000)
+        await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'x')
+        api=mod('remote_schemas');config=api.FrontendConfig(config_digest=self.fixture.digest(),limits=self.fixture.core['limits'],transfer_origin='https://cowork.invalid')
+        app=mod('remote_http').create_test_app(core_client=self.client,principal=self.runtime.config.principal,config=config)
+        entered=asyncio.Event();never=asyncio.Event();sent=[]
+        async def receive():entered.set();await never.wait()
+        async def send(message):sent.append(message)
+        scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'PUT','headers':[(b'authorization',ticket['authorization'].encode()),(b'content-length',b'1'),(b'content-type',b'application/octet-stream')]}
+        await self.stack.enter_async_context(lifespan(app))
+        pending=asyncio.create_task(app(scope,receive,send))
+        try:
+            await entered.wait()
+            # 500ms observation window comfortably exceeds100ms synthetic idle;
+            # it is only test completion slack, never a transport jitter allowance.
+            await asyncio.wait_for(asyncio.shield(pending),.5)
+            self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[408])
+            self.assertFalse(self.runtime.leases)
+        finally:
+            if not pending.done():pending.cancel()
+            try:await pending
+            except asyncio.CancelledError:pass
+
+    async def test_stalled_http_get_send_aborts_after_headers_at_idle_deadline(self):
+        import asyncio
+        self.fixture.core['limits'].update(transfer_idle_ms=100,transfer_total_ms=5000,ipc_idle_ms=5000)
+        await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'x')
+        ticket=self.ok(await self.call('file_download_ticket',{'task_id':task['task_id'],'request_id':uid(),'artifact_id':artifact['artifact_id']}))['ticket']
+        api=mod('remote_schemas');config=api.FrontendConfig(config_digest=self.fixture.digest(),limits=self.fixture.core['limits'],transfer_origin='https://cowork.invalid')
+        app=mod('remote_http').create_test_app(core_client=self.client,principal=self.runtime.config.principal,config=config)
+        entered=asyncio.Event();never=asyncio.Event();headers=[]
+        async def receive():return {'type':'http.request','body':b'','more_body':False}
+        async def send(message):
+            if message['type']=='http.response.start':headers.append(message['status']);return
+            entered.set();await never.wait()
+        scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'GET','headers':[(b'authorization',ticket['authorization'].encode())]}
+        await self.stack.enter_async_context(lifespan(app));pending=asyncio.create_task(app(scope,receive,send))
+        try:
+            await entered.wait();await asyncio.wait({pending},timeout=.5)
+            self.assertTrue(pending.done(),'Backpressure must not outlive the100ms idle lease indefinitely')
+            self.assertEqual(headers,[200]);self.assertFalse(self.runtime.leases)
+        finally:
+            if not pending.done():pending.cancel()
+            try:await pending
+            except (asyncio.CancelledError,Exception):pass # An abort after headers is the required disposition.

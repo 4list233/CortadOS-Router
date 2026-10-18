@@ -86,3 +86,64 @@ class NativePolicyExam(CoreCase):
                 self.assertNotIn(b'"event": "ready"',stdout)
                 self.assertFalse((self.fixture.path/'state/jobs'/bootstrap['job_id']).exists())
         self.assertFalse([row for row in self.fixture.calls() if row['kind']=='exec'])
+
+
+class BuildPublicationRegressionExam(CoreCase):
+    async def test_committed_manifest_order_survives_reverse_artifact_query_order(self):
+        self.fixture.control(output_hex={'a.bin':'00','z.bin':'ff'})
+        await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']['job_id']
+        await self.terminal(task['task_id'],job)
+        store=mod('task_store');original=store.rows
+        def reversed_rows(tx,table,where='',parameters=(),order=''):
+            result=original(tx,table,where,parameters,order)
+            if table=='remote_artifacts' and 'job_id' in where:
+                return sorted(result,key=lambda row:row.filename.encode('utf-8'),reverse=True)
+            return result
+        with patch.object(store,'rows',new=reversed_rows):
+            result=self.ok(await self.call('job_result',{'task_id':task['task_id'],'job_id':job}))
+        self.assertEqual([row['filename'] for row in result['result']['artifacts']],['a.bin','z.bin'])
+
+    async def test_sealed_output_is_not_downloadable_after_publication_failure(self):
+        from .support import uid
+        self.fixture.control(output_hex={'private.bin':'00ff'})
+        await self.start();task=await self.task();artifacts=mod('artifact_store');original=artifacts.snapshot
+        def sealed_then_fail(binding):
+            original(binding)
+            raise mod('remote_schemas').RemoteError('publication_failed')
+        with patch.object(artifacts,'snapshot',new=sealed_then_fail):
+            job=self.ok(await self.call('delegate',self.args(task)))['job']['job_id']
+            result=await self.terminal(task['task_id'],job)
+        self.assertEqual(result['job']['publication'],'failed')
+        self.assertEqual(result['result']['artifacts'],[])
+        rows=mod('task_store').rows(self.runtime.broker.store.db,'remote_artifacts','job_id=?',(job,))
+        self.assertTrue(rows,'Real snapshot reached its private sealed extent before injected failure')
+        for row in rows:
+            response=await self.call('file_download_ticket',{'task_id':task['task_id'],'request_id':uid(),'artifact_id':row.artifact_id})
+            self.assertFalse(response['ok'],'An uncommitted output cannot become a capability')
+        self.assertEqual(self.fixture.sql("SELECT count(*) FROM remote_tickets WHERE direction='get'")[0][0],0)
+
+    async def test_unpublished_output_rejects_existing_ticket_replay_and_claim(self):
+        from .support import uid
+        self.fixture.control(output_hex={'private.bin':'00ff'})
+        await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']['job_id']
+        result=await self.terminal(task['task_id'],job);artifact=result['result']['artifacts'][0]
+        args={'task_id':task['task_id'],'request_id':uid(),'artifact_id':artifact['artifact_id']}
+        ticket=self.ok(await self.call('file_download_ticket',args))['ticket'];store=mod('task_store')
+        # Persisted-state fault at the same visibility boundary as recovery:
+        # prior capability cannot override a noncomplete current publication.
+        for state in ('pending','failed'):
+            with self.subTest(state=state):
+                with self.runtime.broker.store.transaction() as tx:
+                    row=store.rows(tx,'remote_publications','job_id=?',(job,))[0]
+                    error=None if state=='pending' else mod('remote_schemas').RemoteError('publication_failed').payload()['error']
+                    store.save(tx,'remote_publications',store.changed(row,state=state,manifest=(),error=error))
+                with self.subTest(boundary='replay'):
+                    self.assertFalse((await self.call('file_download_ticket',args))['ok'])
+                with self.subTest(boundary='claim'):
+                    opened=await self.stream('open_get',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:]})
+                    try:
+                        self.assertFalse(opened['result']['ok']);self.assertEqual(opened['body'],b'')
+                    finally:
+                        if opened['result']['ok']:
+                            await self.stream('close',{'lease_id':opened['result']['lease_id'],'reason':'complete'})
+                self.assertFalse(self.runtime.leases)

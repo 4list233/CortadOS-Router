@@ -1218,5 +1218,28 @@
     "historical-007-parity": "Same four original assertions; only three fixture path literals relocated, preserving original red live baseline separately.",
     "acceptance-cowork_mcp": "New protected exams auto-discovered by the same inventory runner",
     "core-performance": "New actual-core synthetic measurements; baseline is existing-owner measurement, not a prior remote implementation."
+  },
+  "exam_owner_amendment": {
+    "authority": "d846d54",
+    "original_core_methods": 72,
+    "added_methods": 17,
+    "current_core_methods": 89,
+    "expected_full_methods": 874,
+    "full_lanes": 28,
+    "prior_methods": 785,
+    "original_host_attempt1": {
+      "methods": 857,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0,
+      "pass_lanes": 26,
+      "report_sha256": "32111c97256707c86b072665260f69f58db7554f635a4bc5dfa77934b204e38e"
+    },
+    "matrix_total_ms": {
+      "before": 120000,
+      "after": 600000,
+      "other_deadlines": "unchanged"
+    },
+    "interpretation": "Independent exam amplification of same frozen design; one valid rejected builder attempt remains recorded."
   }
 }
