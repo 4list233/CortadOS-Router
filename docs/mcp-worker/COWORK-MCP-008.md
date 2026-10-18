@@ -949,6 +949,376 @@ Synthetic ticket vector (all-zero 32-byte key, not a credential):
 {"key_hex":"0000000000000000000000000000000000000000000000000000000000000000","fields":["fixture-1","10000000-0000-4000-8000-000000000001","[\"urn:cortados:synthetic\",\"synthetic:forest\",\"10000000-0000-4000-8000-000000000001\"]","10000000-0000-4000-8000-000000000001","file_upload_ticket","10000000-0000-4000-8000-000000000001","10000000-0000-4000-8000-000000000001","put",0,"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",30000],"message_hex":"636f727461646f732e636f776f726b2d7469636b65742e7631005b22666978747572652d31222c2231303030303030302d303030302d343030302d383030302d303030303030303030303031222c225b5c2275726e3a636f727461646f733a73796e7468657469635c222c5c2273796e7468657469633a666f726573745c222c5c2231303030303030302d303030302d343030302d383030302d3030303030303030303030315c225d222c2231303030303030302d303030302d343030302d383030302d303030303030303030303031222c2266696c655f75706c6f61645f7469636b6574222c2231303030303030302d303030302d343030302d383030302d303030303030303030303031222c2231303030303030302d303030302d343030302d383030302d303030303030303030303031222c22707574222c302c2265336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535222c33303030305d","token":"0Ia58GVmWgpxhehp0DBKEuklpwKTB6q6j1VXqXY23Os","capability_hash":"f41c6bc9f502d41ae7f80752107c482a653e7c8840a4d24f05d504ffb29003bf"}
 ```
 
+### Compact union and transport examples (nonnormative)
+
+The example-only reference notation here expands mechanically; it is not an accepted wire/private record field. `private:<Name>` is the `valid` value of the uniquely named closed diagnostic example above. `wire:<Name>` is the JSON value under that exact named wire example above. A slash suffix selects that object's field (one component per slash). `capture:JobRecord` is the actual ordinary synthetic accepted record at `/Users/velox/.cortados-builds/cowork-mcp-verification/ordinary-bootstrap/synthetic-accepted-record.json`, SHA256 25bee0bf1e43078c47049dafb25ae71dfdce322bc244bcbd54d2d5af016be975. `patch` is a shallow key replacement after deep-copy expansion. Expansion recursively replaces an object containing only example_ref and optional patch; it preserves all other objects and list order. No executable code, URL fetch or environment substitution occurs. QA copies and pins these constituents in its protected fixture before A. Runtime records never accept example_ref or patch.
+
+These are shape examples, separate from filesystem/cross-row runtime fixtures. Job/result examples select a queued accepted record, so result projection has result=null. Full native identity/input/task predicate exams use independently consistent bound fixtures. Diagnostic FrameResult.body is hexadecimal under the existing bytes-diagnostic rule; actual IPC sends four raw bytes 00 FF 41 A0. For each StreamSuccess entry, adding an unknown field or replacing ok with a string is an invalid example. Each ProjectionInput invalid case adds a forbidden cross-variant field. A queued projection is not evidence of a completed native task.
+
+```json
+{
+  "Failure": {
+    "valid": {
+      "ok": false,
+      "error": {
+        "code": "invalid_request",
+        "message": "Remote operation refused: invalid_request"
+      }
+    },
+    "invalid": {
+      "ok": false,
+      "error": {
+        "code": "invalid_request",
+        "message": "Remote operation refused: invalid_request",
+        "token": "SYNTHETIC-FORBIDDEN"
+      }
+    }
+  },
+  "ConnectionResult": {
+    "valid": {
+      "ok": true,
+      "connection_id": "10000000-0000-4000-8000-000000000001"
+    },
+    "invalid": {
+      "ok": true,
+      "connection_id": 7
+    }
+  },
+  "StreamSuccess": {
+    "bind": {
+      "ok": true,
+      "connection_id": "10000000-0000-4000-8000-000000000001"
+    },
+    "tool": {
+      "example_ref": "wire:TaskSuccess"
+    },
+    "open_put": {
+      "ok": true,
+      "lease_id": "10000000-0000-4000-8000-000000000001",
+      "offset": 0
+    },
+    "put_chunk": {
+      "ok": true,
+      "offset": 4
+    },
+    "finish_put": {
+      "example_ref": "wire:Receipt"
+    },
+    "open_get": {
+      "ok": true,
+      "lease_id": "10000000-0000-4000-8000-000000000001",
+      "artifact": {
+        "example_ref": "wire:Receipt/artifact"
+      }
+    },
+    "read_chunk": {
+      "ok": true,
+      "offset": 4,
+      "eof": true
+    },
+    "close": {
+      "ok": true
+    }
+  },
+  "FrameResult": {
+    "valid": {
+      "result": {
+        "ok": true,
+        "offset": 4,
+        "eof": true
+      },
+      "body": "00ff41a0"
+    },
+    "invalid": {
+      "result": {
+        "ok": true,
+        "offset": 4,
+        "eof": true
+      },
+      "body": "not-hex"
+    }
+  },
+  "ProjectionInput": {
+    "task": {
+      "valid": {
+        "kind": "task",
+        "task": {
+          "example_ref": "private:TaskRow"
+        },
+        "artifacts": [
+          {
+            "example_ref": "private:ArtifactRow"
+          }
+        ]
+      },
+      "invalid": {
+        "kind": "task",
+        "task": {
+          "example_ref": "private:TaskRow"
+        },
+        "artifacts": [
+          {
+            "example_ref": "private:ArtifactRow"
+          }
+        ],
+        "unrelated_field": "forbidden"
+      }
+    },
+    "job": {
+      "valid": {
+        "kind": "job",
+        "job": {
+          "example_ref": "capture:JobRecord",
+          "patch": {
+            "execution_kind": "cowork_remote_v1"
+          }
+        },
+        "binding": {
+          "example_ref": "private:RemoteBinding",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "publication": {
+          "example_ref": "private:PublicationRow",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        }
+      },
+      "invalid": {
+        "kind": "job",
+        "job": {
+          "example_ref": "capture:JobRecord",
+          "patch": {
+            "execution_kind": "cowork_remote_v1"
+          }
+        },
+        "binding": {
+          "example_ref": "private:RemoteBinding",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "publication": {
+          "example_ref": "private:PublicationRow",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "unrelated_field": "forbidden"
+      }
+    },
+    "result": {
+      "valid": {
+        "kind": "result",
+        "job": {
+          "example_ref": "capture:JobRecord",
+          "patch": {
+            "execution_kind": "cowork_remote_v1"
+          }
+        },
+        "binding": {
+          "example_ref": "private:RemoteBinding",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "publication": {
+          "example_ref": "private:PublicationRow",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "artifacts": []
+      },
+      "invalid": {
+        "kind": "result",
+        "job": {
+          "example_ref": "capture:JobRecord",
+          "patch": {
+            "execution_kind": "cowork_remote_v1"
+          }
+        },
+        "binding": {
+          "example_ref": "private:RemoteBinding",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "publication": {
+          "example_ref": "private:PublicationRow",
+          "patch": {
+            "job_id": "53a1f88b-ccb0-46fc-b512-d425162ca380"
+          }
+        },
+        "artifacts": [],
+        "unrelated_field": "forbidden"
+      }
+    },
+    "ticket": {
+      "valid": {
+        "kind": "ticket",
+        "ticket": {
+          "example_ref": "private:TicketRow"
+        },
+        "authorization": "Bearer SYNTHETIC-NOT-A-CREDENTIAL",
+        "transfer_origin": "https://cowork.invalid",
+        "media_type": "application/octet-stream"
+      },
+      "invalid": {
+        "kind": "ticket",
+        "ticket": {
+          "example_ref": "private:TicketRow"
+        },
+        "authorization": "Bearer SYNTHETIC-NOT-A-CREDENTIAL",
+        "transfer_origin": "https://cowork.invalid",
+        "media_type": "application/octet-stream",
+        "unrelated_field": "forbidden"
+      }
+    },
+    "receipt": {
+      "valid": {
+        "kind": "receipt",
+        "task_id": "10000000-0000-4000-8000-000000000001",
+        "artifact": {
+          "example_ref": "private:ArtifactRow"
+        }
+      },
+      "invalid": {
+        "kind": "receipt",
+        "task_id": "10000000-0000-4000-8000-000000000001",
+        "artifact": {
+          "example_ref": "private:ArtifactRow"
+        },
+        "unrelated_field": "forbidden"
+      }
+    },
+    "route": {
+      "valid": {
+        "kind": "route",
+        "route": {
+          "example_ref": "capture:JobRecord/route"
+        }
+      },
+      "invalid": {
+        "kind": "route",
+        "route": {
+          "example_ref": "capture:JobRecord/route"
+        },
+        "unrelated_field": "forbidden"
+      }
+    },
+    "context": {
+      "valid": {
+        "kind": "context",
+        "value": {
+          "example_ref": "wire:ContextSuccess"
+        }
+      },
+      "invalid": {
+        "kind": "context",
+        "value": {
+          "example_ref": "wire:ContextSuccess"
+        },
+        "unrelated_field": "forbidden"
+      }
+    },
+    "feedback": {
+      "valid": {
+        "kind": "feedback",
+        "value": {
+          "example_ref": "wire:FeedbackSuccess"
+        }
+      },
+      "invalid": {
+        "kind": "feedback",
+        "value": {
+          "example_ref": "wire:FeedbackSuccess"
+        },
+        "unrelated_field": "forbidden"
+      }
+    },
+    "failure": {
+      "valid": {
+        "kind": "failure",
+        "error": {
+          "code": "invalid_request",
+          "message": "Remote operation refused: invalid_request"
+        }
+      },
+      "invalid": {
+        "kind": "failure",
+        "error": {
+          "code": "invalid_request",
+          "message": "Remote operation refused: invalid_request"
+        },
+        "unrelated_field": "forbidden"
+      }
+    }
+  },
+  "frames": {
+    "valid_request": {
+      "v": 1,
+      "seq": 1,
+      "op": "put_chunk",
+      "body_bytes": 4,
+      "args": {
+        "lease_id": "10000000-0000-4000-8000-000000000001",
+        "offset": 0
+      }
+    },
+    "valid_response": {
+      "v": 1,
+      "seq": 1,
+      "op": "read_chunk",
+      "body_bytes": 4,
+      "result": {
+        "ok": true,
+        "offset": 4,
+        "eof": true
+      }
+    },
+    "raw_body_hex": "00ff41a0",
+    "invalid_request_seq": {
+      "expected_seq": 1,
+      "patch": {
+        "seq": 2
+      },
+      "error": "invalid_request",
+      "connection_closed": true
+    },
+    "invalid_response_op": {
+      "pending_op": "read_chunk",
+      "patch": {
+        "op": "put_chunk"
+      },
+      "error": "storage_error",
+      "connection_closed": true
+    },
+    "invalid_put_body": {
+      "patch": {
+        "body_bytes": 3
+      },
+      "provided_raw_bytes": 4,
+      "outcome": "trailing byte cannot be accepted into this frame; subsequent framing refuses and closes; lease aborts"
+    },
+    "invalid_cross_variant_args": {
+      "op": "open_get",
+      "args": {
+        "ticket_id": "10000000-0000-4000-8000-000000000001",
+        "capability": "SYNTHETIC",
+        "offset": 0
+      },
+      "error": "invalid_request",
+      "connection_closed": true
+    }
+  }
+}
+```
+
+The response frame's valid context is a pending read_chunk request with seq1; the request frame's context is an open PUT lease after bind seq0. Prefix each general-canonical header with its computed four-byte big-endian length; append the exact raw body. A stream does not carry an out-of-band per-frame body boundary: declaring3 bytes makes only the first3 part of that frame and leaves the fourth in the next header. The parser never treats that byte as legitimate undeclared body; EOF/deadline/framing failure aborts the connection and active lease. Changing read_chunk reply op while awaiting read_chunk refuses before delivering its bytes. These negatives distinguish framing from object-schema validation.
+
 ## 9. Nonnormative source evidence and history
 
 ### Governing authority and retained source evidence
