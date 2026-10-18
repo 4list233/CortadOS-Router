@@ -258,3 +258,15 @@ async def capacity_fault(case):
         async with asyncio.timeout(3):await event.wait()
         # Let the monitor finish the caught failure before the public operation.
         await asyncio.sleep(.03)
+
+async def observe_endpoint_cleanup(case, session):
+    # One second is test-only EOF observation slack, after frontend deadline/header
+    # assertions. Too short makes scheduler-only failures; too long hides hangs.
+    # No RPC, server cancellation or product grace is introduced by this barrier.
+    case.assertTrue(case.client.closed)
+    await asyncio.wait_for(asyncio.shield(session.closed), 1)
+    case.assertTrue(session.task.done())
+    case.assertFalse(session.task.cancelled(), 'EOF cleanup must complete without forced cancellation')
+    case.assertIsNone(session.task.exception())
+    case.assertFalse(case.runtime.leases)
+    case.assertFalse(case.runtime.descriptors)

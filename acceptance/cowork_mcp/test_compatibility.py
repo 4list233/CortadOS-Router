@@ -7,7 +7,7 @@ import socket
 from pathlib import Path
 from unittest.mock import patch
 import httpx
-from .support import CoreCase,TOOLS,canon,mod,uid
+from .support import CoreCase,TOOLS,canon,mod,uid,observe_endpoint_cleanup
 
 @asynccontextmanager
 async def lifespan(app):
@@ -163,18 +163,25 @@ class BuildHttpDeadlineRegressionExam(CoreCase):
         async def send(message):sent.append(message)
         scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'PUT','headers':[(b'authorization',ticket['authorization'].encode()),(b'content-length',b'1'),(b'content-type',b'application/octet-stream')]}
         await self.stack.enter_async_context(lifespan(app))
+        session=self.runtime.sessions[self.client.connection_id]
         pending=asyncio.create_task(app(scope,receive,send))
         try:
             await entered.wait()
             # 500ms observation window comfortably exceeds100ms synthetic idle;
             # it is only test completion slack, never a transport jitter allowance.
-            await asyncio.wait_for(asyncio.shield(pending),.5)
+            try:await asyncio.wait_for(asyncio.shield(pending),.5)
+            except mod('remote_schemas').RemoteError as error:
+                self.assertEqual((error.code,error.message),('timeout','Remote operation refused: timeout'))
+            self.assertTrue(pending.done())
             self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[])
+            await observe_endpoint_cleanup(self,session)
             self.assertFalse(self.runtime.leases)
         finally:
             if not pending.done():pending.cancel()
             try:await pending
             except asyncio.CancelledError:pass
+            except mod('remote_schemas').RemoteError as error:
+                self.assertEqual((error.code,error.message),('timeout','Remote operation refused: timeout'))
 
     async def test_stalled_http_get_send_aborts_after_headers_at_idle_deadline(self):
         import asyncio
@@ -189,11 +196,14 @@ class BuildHttpDeadlineRegressionExam(CoreCase):
             if message['type']=='http.response.start':headers.append(message['status']);return
             entered.set();await never.wait()
         scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'GET','headers':[(b'authorization',ticket['authorization'].encode())]}
-        await self.stack.enter_async_context(lifespan(app));pending=asyncio.create_task(app(scope,receive,send))
+        await self.stack.enter_async_context(lifespan(app));session=self.runtime.sessions[self.client.connection_id]
+        pending=asyncio.create_task(app(scope,receive,send))
         try:
             await entered.wait();await asyncio.wait({pending},timeout=.5)
             self.assertTrue(pending.done(),'Backpressure must not outlive the100ms idle lease indefinitely')
-            self.assertEqual(headers,[200]);self.assertFalse(self.runtime.leases)
+            self.assertEqual(headers,[200])
+            await observe_endpoint_cleanup(self,session)
+            self.assertFalse(self.runtime.leases)
         finally:
             if not pending.done():pending.cancel()
             try:await pending
@@ -238,10 +248,12 @@ class Revision2HttpExam(CoreCase):
                         sent.append(message)
                         if message['type']==stage:await never.wait()
                     async def refuse(*args,**kwargs):return {'result':mod('remote_schemas').RemoteError(code).payload(),'body':b''}
+                    session=self.runtime.sessions[self.client.connection_id]
                     with patch.object(self.client,'stream',refuse) if code else contextlib.nullcontext():
                         done,error=await observe_asgi(app,scope,receive,send)
                     self.assertTrue(done,'Response backpressure exceeded original idle deadline')
                     self.assertEqual(sum(m['type']=='http.response.start' for m in sent),1)
+                    await observe_endpoint_cleanup(self,session)
                     self.assertFalse(self.runtime.leases)
 
     async def test_header_attempt_failure_cannot_emit_replacement_start(self):

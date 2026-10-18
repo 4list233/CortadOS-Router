@@ -137,29 +137,35 @@ class Revision2TransferLifetimeExam(CoreCase):
         await self.start()
 
     async def test_exhausted_total_idle_budget_has_no_error_delivery_grace(self):
-        from .support import revision_http,observe_asgi
+        from .support import revision_http,observe_asgi,observe_endpoint_cleanup
         app,scope,_,_,_=await revision_http(self,'put');sent=[];never=asyncio.Event()
         async def receive():await never.wait()
         async def send(message):sent.append(message);await never.wait()
+        session=self.runtime.sessions[self.client.connection_id]
         done,error=await observe_asgi(app,scope,receive,send,window=.16)
         self.assertTrue(done,'No second100ms error-delivery allowance is available')
-        self.assertEqual(sent,[]);self.assertFalse(self.runtime.leases)
+        self.assertEqual(sent,[])
+        await observe_endpoint_cleanup(self,session)
+        self.assertFalse(self.runtime.leases)
 
     async def test_empty_chunks_do_not_renew_idle(self):
-        from .support import revision_http,observe_asgi
+        from .support import revision_http,observe_asgi,observe_endpoint_cleanup
         app,scope,_,_,_=await revision_http(self,'put');count=0;sent=[]
         async def receive():
             nonlocal count
             count+=1;await asyncio.sleep(.02)
             return {'type':'http.request','body':b'','more_body':True}
         async def send(message):sent.append(message)
+        session=self.runtime.sessions[self.client.connection_id]
         done,error=await observe_asgi(app,scope,receive,send)
         self.assertTrue(done);self.assertGreater(count,1);self.assertLess(count,12)
-        self.assertEqual(sent,[]);self.assertFalse(self.runtime.leases)
+        self.assertEqual(sent,[])
+        await observe_endpoint_cleanup(self,session)
+        self.assertFalse(self.runtime.leases)
 
     async def test_acknowledged_nonempty_progress_renews_idle_not_total(self):
         from .test_compatibility import lifespan
-        from .support import observe_asgi
+        from .support import observe_asgi,observe_endpoint_cleanup
         # Three80ms chunks span150ms idle.1000ms permits success;200ms total
         # must expire despite acknowledged progress. These are fixture milliseconds.
         for total,expected in ((1000,[201]),(200,[])):
@@ -177,10 +183,12 @@ class Revision2TransferLifetimeExam(CoreCase):
                 async def send(message):sent.append(message)
                 scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'PUT',
                     'headers':[(b'authorization',ticket['authorization'].encode()),(b'content-length',b'3'),(b'content-type',b'application/octet-stream')]}
+                session=self.runtime.sessions[self.client.connection_id]
                 done,error=await observe_asgi(app,scope,receive,send,window=.7)
                 self.assertTrue(done)
                 self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],expected)
                 if expected:self.assertIsNone(error)
+                else:await observe_endpoint_cleanup(self,session)
                 self.assertFalse(self.runtime.leases)
 
     async def test_lost_http_put_receipt_exposes_seal_without_second_put(self):

@@ -258,10 +258,33 @@ class Revision2CapacityRecoveryExam(CoreCase):
         self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
 
     async def test_capacity_existing_job_cancel_is_idempotent_and_owned(self):
-        task,job,_=await self.stopped_by_capacity();key={'task_id':task['task_id'],'job_id':job}
-        first=self.ok(await self.call('job_cancel',key));second=self.ok(await self.call('job_cancel',key))
-        self.assertEqual(first,second);self.error(await self.call('job_cancel',dict(key,task_id=uid())),'job_not_found')
-        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+        entered=asyncio.Event();release=asyncio.Event();finished=asyncio.Event()
+        original=self.runtime.publish
+        async def controlled_publish(job_id):
+            entered.set();await release.wait()
+            try:return await original(job_id)
+            finally:finished.set()
+        with patch.object(self.runtime,'publish',controlled_publish):
+            try:
+                task,job,_=await self.stopped_by_capacity();key={'task_id':task['task_id'],'job_id':job}
+                # Five seconds observes private native terminal/publication scheduling;
+                # no product wait is added, and a missing transition fails this fixture.
+                async with asyncio.timeout(5):await entered.wait()
+                fields=('job_id','launch_nonce','stop_intent','state','reason')
+                before={name:self.runtime.broker.store.get(job)[name] for name in fields}
+                pending=self.ok(await self.call('job_cancel',key))
+                self.assertEqual(pending['job']['publication'],'pending')
+                self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+                release.set()
+                async with asyncio.timeout(5):await finished.wait()
+                complete=self.ok(await self.call('job_cancel',key))
+                self.assertEqual(complete['job']['publication'],'complete')
+                self.assertEqual({name:self.runtime.broker.store.get(job)[name] for name in fields},before)
+                self.assertEqual(self.fixture.sql('SELECT count(*) FROM jobs')[0][0],1)
+                first=self.ok(await self.call('job_cancel',key));second=self.ok(await self.call('job_cancel',key))
+                self.assertEqual(first,second);self.error(await self.call('job_cancel',dict(key,task_id=uid())),'job_not_found')
+                self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+            finally:release.set()
 
     async def test_capacity_latch_never_reopens_after_good_sample_or_restart_relaunches(self):
         task,job,arguments=await self.stopped_by_capacity()
@@ -309,3 +332,91 @@ class Revision2CapacityRecoveryExam(CoreCase):
             self.error(await self.call('job_result',{'task_id':task['task_id'],'job_id':job}),'storage_error')
         self.assertTrue(hits,'Allowed capacity observation must still validate the real binding')
         self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+
+class CapacityTransitionAuditExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        # 200ms samples give the no-worker fixture a short repeat window. Five-second
+        # observers below bound fixture failure, not a product lateness allowance.
+        self.fixture.core['limits']['workspace_poll_ms']=200
+        await self.start()
+
+    def capacity_events(self):
+        events=[json.loads(row[0]) for row in self.fixture.sql('SELECT event_json FROM remote_audit')]
+        return [event for event in events if event['entity']=='runtime' and
+                event['event']=='transition' and event['reason']=='capacity_exhausted']
+
+    async def samples(self, queue, count):
+        async with asyncio.timeout(5):
+            for _ in range(count):await queue.get()
+
+    async def test_first_capacity_latch_persists_one_closed_runtime_transition(self):
+        queue=asyncio.Queue();api=mod('remote_schemas')
+        before=self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0]
+        def unreadable():
+            queue.put_nowait(None);raise api.RemoteError('capacity_exhausted')
+        with patch.object(self.runtime.capacity,'measure',unreadable):
+            await self.samples(queue,1)
+            self.assertTrue(self.runtime.capacity_failed)
+            self.assertFalse(self.runtime.fatal_failed)
+            events=self.capacity_events();self.assertEqual(len(events),1)
+            event=events[0];api.RemoteEvent(**event)
+            self.assertIn(event['from_state'],('starting','ready','disabled','stopping','failed','closed'))
+            self.assertIn(event['state'],('starting','ready','disabled','stopping','failed','closed'))
+            self.assertNotEqual(event['from_state'],event['state'])
+            self.assertEqual(self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0],before+1)
+            self.assertEqual(self.fixture.sql('SELECT count(*) FROM jobs')[0][0],0)
+            self.assertFalse(any(call.get('kind')=='exec' for call in self.fixture.calls()))
+
+    async def test_repeated_bad_then_good_samples_never_duplicate_or_reopen(self):
+        queue=asyncio.Queue();bad=True;original=self.runtime.capacity.measure
+        def measured():
+            queue.put_nowait(None)
+            if bad:raise mod('remote_schemas').RemoteError('capacity_exhausted')
+            return original()
+        with patch.object(self.runtime.capacity,'measure',measured):
+            await self.samples(queue,3)
+            first=self.capacity_events();self.assertEqual(len(first),1)
+            bad=False
+            await self.samples(queue,3)
+            self.assertEqual(self.capacity_events(),first)
+            self.assertTrue(self.runtime.capacity_failed)
+            self.assertFalse(self.runtime.fatal_failed)
+            before=self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0]
+            self.error(await self.call('task_create',{'request_id':uid(),'task_group_id':uid()}),'capacity_exhausted')
+            after=[json.loads(row[0]) for row in self.fixture.sql('SELECT event_json FROM remote_audit')]
+            self.assertEqual(len(after),before+1)
+            refusal=after[-1];self.assertEqual(refusal['event'],'refusal');self.assertEqual(refusal['reason'],'capacity_exhausted')
+            self.assertEqual(self.capacity_events(),first)
+
+    async def test_capacity_transition_audit_failure_is_fatal_and_signals_once(self):
+        import contextlib,io
+        queue=asyncio.Queue();api=mod('remote_schemas');original=api.emit_remote_event
+        stderr=io.StringIO();attempts=[]
+        before=self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0]
+        def unreadable():
+            queue.put_nowait(None);raise api.RemoteError('capacity_exhausted')
+        def failing(tx,event):
+            if tx is not None and event.entity=='runtime' and event.reason=='capacity_exhausted':
+                attempts.append(event);raise sqlite3.OperationalError('SENTINEL capacity audit unavailable')
+            return original(tx,event)
+        with contextlib.redirect_stderr(stderr),patch.object(api,'emit_remote_event',failing),patch.object(self.runtime.capacity,'measure',unreadable):
+            await self.samples(queue,1)
+            self.assertEqual(len(attempts),1,'First capacity latch must reach the durable audit owner')
+            self.assertTrue(self.runtime.fatal_failed)
+            self.assertTrue(self.runtime.broker.store.admission_closed)
+            self.assertEqual(self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0],before)
+            self.assertFalse(self.capacity_events())
+            # Re-entering the existing fatal primitive cannot retry the failed audit.
+            self.runtime.fatal();self.runtime.fatal()
+            # 250ms observes more than one200ms monitor interval after fatal state;
+            # it cannot prolong the failed operation or grant a persistence retry.
+            await asyncio.sleep(.25)
+            self.assertEqual(len(attempts),1)
+            with self.assertRaises(api.RemoteError) as error:await self.connect()
+            self.assertEqual(error.exception.code,'storage_error')
+        events=[json.loads(line) for line in stderr.getvalue().splitlines() if line.startswith('{')]
+        self.assertEqual(len(events),1);api.RemoteEvent(**events[0])
+        self.assertEqual((events[0]['entity'],events[0]['event'],events[0]['reason']),('runtime','refusal','storage_error'))
+        self.assertNotIn('SENTINEL',stderr.getvalue())
+        self.assertFalse(self.runtime.descriptors);self.assertFalse(self.runtime.leases)

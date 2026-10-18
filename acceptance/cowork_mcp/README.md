@@ -194,7 +194,7 @@ unchanged. No deployment default or latency acceptance budget changes. Original
 benchmark bytes and raw reports remain preserved. Independent correctness/memory
 review is still required; the amendment does not approve efficiency or the candidate.
 
-## Current v5 revision-2 freeze
+## Historical v5 revision-2 initial freeze
 
 Forest approved the revised response-deadline and capacity-only admission design; root authority18e4a7f and frozen c61e6a0. Both rejected implementation attempts remain in the ledger. This is a design revision, not a reset or another same-design retry.
 
@@ -207,3 +207,38 @@ Final focused prebuild runs exercise23 methods (22new plus the amended old asser
 The full unchanged28-lane driver is expected to account for896 methods (785prior+111core), with actual collection/result authoritative. No new full run or ten-minute matrix is claimed at prebuild. All accumulated lanes, original785 baseline red, historical007 assertions, current live-prefix/exam guard, ordinary compatibility and measured efficiency obligations remain separate and mandatory for candidate B. No runner or benchmark code changed.
 
 Post-run cleanup evidence reports no remaining synthetic-marker processes, but residual private temp roots containing router/router.db remain and are not removed. Failing product assertions may precede lease/socket cleanup checks; no blanket containment or filesystem-cleanup pass is inferred. Exact observations and historical fixture errors are retained in private preparation evidence.
+
+## Current candidate3 exam-only correction and amplification
+
+Authority0ae0cf4 grants exactly seven existing exam/metadata paths. The v5 normative
+bytes and D0 remain unchanged. All111 original methods and every existing assertion
+AST are retained. Seven method bodies change only under E3-01/02/03: observe actual
+server Session.closed after frontend deadline/header/local-close checks; accept only
+exact safe timeout abort in stalled PUT; control real pending-to-complete publication
+and compare cancellation identity, then whole snapshots at stable publication.
+The separately explained one-second EOF observer is not production grace, a cleanup
+RPC or cancellation. Timely cleanup assertions remain immediate. Original bytes/ASTs
+and raw896-method/10failure-event/1error result remain archived under private
+core-candidate-attempt-3/exam-amendment/original and independent/.
+
+Three added CapacityTransitionAuditExam methods exercise the actual monitor and
+existing event owner: one schema-valid first runtime transition with capacity reason,
+no duplicate/reopen after bad or good samples, separate later invocation refusal,
+and failed audit persistence with fatal precedence and one safe stderr signal.
+No new event state, wire field, policy, source owner or runtime timeout is introduced.
+Native-generation policy refusal and definitive acceptance rollback assertions remain
+unchanged; their product failures must be repaired, not recategorized as fixtures.
+
+Discovery is114core methods; prior785 plus114 gives899expected methods across the
+same28lanes. Actual full-run counts remain authoritative. The corrected focused run
+has15methods/3expected audit failures/0errors/0skips; all12 correction/control methods
+pass on unchanged rejected candidate3. Complete core expected-red results and exact
+hashes are in MANIFEST.json and private amendment evidence. No new full28-lane or
+matrix pass is claimed before the next frozen source handback. All641priorprotected
+paths,18source hashes,3normative documents, runner and benchmark remain unchanged.
+
+Ledger: two rejected v4 builds, followed by approved revision2 and its first rejected
+valid build (cumulative3). These independent exam checks are not another builder
+attempt or a reset. Root must grant any bounded correction separately after immutable
+exam commit and renewed37-row A0. Auth, retention/operator work and live activation
+remain outside this package; the new user choices do not alter this frozen contract.

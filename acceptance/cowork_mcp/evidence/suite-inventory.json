@@ -1204,7 +1204,7 @@
     "installed-teacher-parity": "Retain original failed baseline evidence; execute all four original assertions with three literal path relocations to frozen historical007 source/data. Report separately from candidate compatibility and current training invariants.",
     "current-label-guard": "Separate read-only original-prefix and exam-row invariant check; do not demand unchanged entire file after authorized training appends.",
     "candidate-ordinary-compatibility": "Run actual candidate ordinary paths with existing accumulated assertions and separate candidate installed source parity; do not substitute historical source for candidate tests.",
-    "new-core": "Pending v4 D/A and protected exams; no current pass."
+    "new-core": "Frozen v5 candidate3 rejected;114 protected core methods now prepared for separately authorized correction. Original failed result remains unchanged."
   },
   "approved_future_paths": [
     "acceptance/cowork_mcp/evidence/run-full-suite.py",
@@ -1243,6 +1243,28 @@
     "interpretation": "Independent exam amplification of same frozen design; one valid rejected builder attempt remains recorded."
   },
   "exam_owner_amendment": {
+    "authority": "0ae0cf4",
+    "revision": 2,
+    "cumulative_rejected_valid_builds": 3,
+    "current_design_valid_failures": 1,
+    "previous_core_methods": 111,
+    "added_methods": 3,
+    "current_core_methods": 114,
+    "expected_full_methods": 899,
+    "full_lanes": 28,
+    "prior_methods": 785,
+    "source_correction_grant": "pending separate root authority",
+    "scope": "E3-01/02/03 fixture synchronization and additive first-capacity-transition audit exams only; no runner or benchmark changes",
+    "original_host_report": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/full-suite/report.json",
+    "original_host_totals": {
+      "tests": 896,
+      "failures": 10,
+      "errors": 1,
+      "skipped": 0
+    },
+    "interpretation": "Original raw failure unchanged. All111 methods/assertions preserved, seven method ASTs amended by specific authority; three audit methods added."
+  },
+  "historical_revision2_initial_amendment": {
     "authority": "18e4a7f; v5 c61e6a0",
     "revision": 2,
     "historical_valid_builder_failures": 2,
