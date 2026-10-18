@@ -110,7 +110,7 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Future authentication draft | RT-COWORK-AUTH-009 responsibility |
 |---|---|
-| [COWORK-AUTH-009.md](COWORK-AUTH-009.md) | Subordinate draft for inherited AC-008-01/02; maintained OAuth provider, strict identity/lifetime checks and credential-operation serialization. Version6 at9bf0a5d is under fresh independent D review after initial-lifecycle reconciliation; prior v5 D0 is historical only. A/B pending; shared-runner interpreter amendment still proposed. |
+| [COWORK-AUTH-009.md](COWORK-AUTH-009.md) | Subordinate draft for inherited AC-008-01/02; maintained OAuth provider, strict identity/lifetime checks and credential-operation serialization. Version6 at9bf0a5d passes all33 independent technical D rows after initial-lifecycle reconciliation; prior v5 evidence remains historical. A/B pending; shared-runner interpreter amendment still proposed. |
 | [COWORK-AUTH-009-EXECUTION.md](COWORK-AUTH-009-EXECUTION.md) | Prospective nonoverlapping auth/production composition/exam paths; no source grant until accepted core and independent auth gates. |
 
 RT008/009 retain the existing standalone Router naming/location convention rather than the CortadOS structural engine CTX prefix. No global contract or rulings-log migration follows. The optional remote dependency proposal is isolated from ordinary stdio dependencies; implementation and its lock require their separate reviewed package.
@@ -131,7 +131,7 @@ The isolated optional dependency qualification requires `fastmcp-slim[server]==3
 
 | Operator setup proposal | RT-COWORK-OPERATIONS-010 /110; no implementation or activation grant |
 |---|---|
-| [COWORK-OPERATIONS-010-DRAFT.md](COWORK-OPERATIONS-010-DRAFT.md) | Draft-only extension of existing AuthStorage/provider/runtime/service owners for child-only secret resolution and initial offline provisioning. Version3 at9bf0a5d reconciles009v6 under ab4aff9; fresh independent D review is running. Approved GitHub/limits/retention direction is retained. Secret custody and activation remain separate. |
+| [COWORK-OPERATIONS-010-DRAFT.md](COWORK-OPERATIONS-010-DRAFT.md) | Draft-only extension of existing AuthStorage/provider/runtime/service owners for child-only secret resolution and initial offline provisioning. Version3 at9bf0a5d reconciles009v6 under ab4aff9 and passes all33 independent technical D rows; A/source remain blocked. Approved GitHub/limits/retention direction is retained. Secret custody and activation remain separate. |
 | [COWORK-OPERATIONS-010-EXECUTION-DRAFT.md](COWORK-OPERATIONS-010-EXECUTION-DRAFT.md) | Proposed exact six-owner extension and independent exams; no new issuer, store, supervisor, scheduler or module. Local and activation gates remain separate. |
 
 | Status and revision | Root-owned evidence and decision |
