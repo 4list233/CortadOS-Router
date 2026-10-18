@@ -170,3 +170,37 @@ OAuth/binary transfer is an activation-completion gate after implementation and 
 requiring that finished connection before implementation would be circular. No public endpoint,
 auth service, task store or connector has been installed by this review. The existing private
 Studio HTTPS443 route and active nightly remain separate.
+
+## Full v3 design review and lifecycle amendment
+
+Independent QA reviewed the complete LOCAL CORE package at e055c51, parent SHA256
+f6ed8f473e720cef5345350bdaf97898d77a2c54468af199a4b27e6b069b1363. Rubric D has
+21 noncompliant checks across eight grouped amendments; A was not run. This is a contract
+readiness result, not 21 separate product bugs or a failed production build. The preserved report is
+`/Users/velox/.cortados-builds/cowork-mcp-verification/core-v3-D/FULL-D-REVIEW.md`, SHA256
+d02aca81063b06a599726f3a9b7248a9c8c563e1cdad63071fb81bab6063cb1d.
+
+Root accepts the cluster diagnosis: CoreRuntime ownership of construction, recovery, IPC sessions,
+accounting observations and shutdown was missing. The next contract amendment may add the exact
+future source paths remote_runtime.py, remote_ipc.py and remote_capacity.py under integrations/mcp.
+Existing job storage, native process control, routing and quota owners remain authoritative.
+Root also authorizes the designated exam owner to add acceptance/cowork_mcp/__init__.py and
+acceptance/cowork_mcp/support.py after D0. This record grants no builder dispatch or source edits.
+
+Contract-only Astra revision job 162d277f-c2dd-48e8-b1ed-f663af7caa22 uses unchanged group
+53f0ea39-a61e-4307-9c2c-466c1b4b0bd1 and request1d94027e-9e3b-4ef8-8a0f-94dc49c362f0.
+It may edit only the parent, DECISIONS and EXECUTION documents. The MCP context check returned
+ready; native fresh quota admission remains mandatory. No retry of an accepted failed job occurred.
+Independent QA is separately measuring existing-owner baselines and inventory without model calls.
+
+## Additional synthetic authentication boundary evidence
+
+Root ran the private auth-hook-boundary-probe.py with the isolated auth-research-venv interpreter.
+Twenty synthetic Authlib1.9.1 cases passed: both code exchange and refresh execute their compliance
+hook before token parsing, accept normalized positive lifetimes and reject missing/invalid lifetimes
+or conflicting aliases before parsing. External request count is zero. This qualifies only that
+dependency boundary; no OAuthProxy storage, callback, crash, concurrency or real GitHub flow was run.
+The probe is not production implementation or a protected exam and grants no auth acceptance.
+Source SHA256:173459206b8f4491de7742a84632958fd74a0bd9524f6552771428e7ed2a504c.
+Result SHA256:c4a4db7ebe7a62eb47ba493a61bd6c89bffc7a2d657e3ce0159ec5d1d3bf7603.
+Both files remain in the private cowork-mcp-verification directory.

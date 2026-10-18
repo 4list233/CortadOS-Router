@@ -94,3 +94,6 @@ promotion gates. The build reports record independent verification and limitatio
 | [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
 | [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
 | [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
+| `integrations/mcp/remote_runtime.py` (new, proposed) | CoreRuntime composes the existing broker under its exclusive state lock; no-listener startup, recovery, IPC session and monitor lifetime. No second job queue. |
+| `integrations/mcp/remote_ipc.py` (new, proposed) | One bounded framed socketpair codec and CoreClient/server connection lifecycle; no descriptor-number handoff. |
+| `integrations/mcp/remote_capacity.py` (new, proposed) | Task/installation file accounting and reservation measurements; existing JobStore owns writes and Broker owns worker stop. |
