@@ -1,4 +1,4 @@
-# Proposed bounded core revision after second valid failure
+# Proposed bounded core revision after second valid failure — proposal v2
 
 Proposal only, for Forest's decision. No contract, source or protected exam change is made. Retain both failed build attempts, all raw host/probe results and the original reviewed design. No third same-design retry or auth integration is authorized by this document.
 
@@ -15,6 +15,16 @@ Explicit observable clarification needed: a strict expired deadline leaves no ti
 On exhausted frontend budget, close the indeterminate CoreClient endpoint rather than issue an unbounded close RPC. Broker endpoint teardown/timers remain responsible for descriptor retirement; never cancel/retry accepted model jobs as a side effect. Shared-client users receive the existing closed-connection refusal and must reconnect explicitly. Define and test an in-flight accepted PUT whose receipt was lost: task_get reports its committed seal, no retry of consumed bytes.
 
 Required independent revision exams: timely PUT201/GET200/Range416/error controls; stalled receive and send at response.start and body for each response family; no second start after attempted headers; total/idle exact deadline and exhausted-budget cases; no progress renewal on empty chunks; close-path exhaustion; a concurrent MCP/transfer client sees endpoint retirement without wrong sequence/response or job cancellation. These amplify existing assertions, not replace them.
+
+## IPC response lifetime: primary and fallback share the existing deadline
+
+Extend the same response-deadline cluster to the existing `remote_ipc` codec/session owner; retain `remote_http` as frontend transfer owner and `file_transfer` as descriptor owner. No new policy owner or timeout is introduced.
+
+Capture the effective response-write deadline once from the existing IPC idle allowance, bounded by any applicable lease total/idle deadlines. The primary frame and output_limit validation fallback use that same remaining allowance. Validation before any write may select the bounded fallback, but an exception branch never starts a new clock. If frame bytes may already have been emitted, or remaining time is exhausted, close the indeterminate endpoint; never append another response frame or retry. Preserve lease cleanup and the rule that endpoint retirement does not cancel or resend an accepted job.
+
+Independent actual AF_UNIX backpressure evidence, with only the domain dispatch return instrumented, confirmed the current unbounded fallback. At ipc_idle_ms=100 the ordinary response control closed; the oversized-response fallback remained pending with an open endpoint at361.115ms. The corrected probe has1pass/1failure; its initial expected-BrokenPipe fixture error remains preserved separately. See [the IPC fallback review](COWORK-MCP-008-IPC-FALLBACK-REVIEW.md); its exact evidence manifest remains in the private core-candidate-attempt-2 directory.
+
+Required additive exams: actual socket backpressure for primary/fallback, time spent validating deducted from the same deadline, lease-bound fallback where applicable, partial/indeterminate frame retirement, and endpoint/lease cleanup without accepted-job cancellation or resend. This is proposed clarification of the existing bounded IPC obligation, not authorization for implementation.
 
 ## Capacity-only admission latch: exact operation table
 
