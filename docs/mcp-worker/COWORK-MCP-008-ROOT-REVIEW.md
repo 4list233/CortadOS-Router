@@ -204,3 +204,29 @@ The probe is not production implementation or a protected exam and grants no aut
 Source SHA256:173459206b8f4491de7742a84632958fd74a0bd9524f6552771428e7ed2a504c.
 Result SHA256:c4a4db7ebe7a62eb47ba493a61bd6c89bffc7a2d657e3ce0159ec5d1d3bf7603.
 Both files remain in the private cowork-mcp-verification directory.
+
+## Root technical scope decisions for v4 review
+
+Root authorizes one additional future source path, `cortados_router/route_task.py`, solely for the
+keyword-only `handoff_packet: str | None = None` seam proposed by the author. The existing route owner
+must use that complete trusted packet for its current byte budget and every resolver input-fit call.
+None preserves the original packet and ordinary results. No task/context mutation, duplicate routing
+logic or new quota policy follows. This is a technical amendment inside the accepted Router scope;
+independent ordinary/full-remote input-fit exams and D/A remain prerequisites to implementation.
+
+Root authorizes these additional future protected exam-owner paths under acceptance/cowork_mcp/evidence:
+run-full-suite.py, benchmark-core.py, suite-inventory.json, baseline-ordinary.json and historical-007-parity.py.
+They are QA-owned, not builder-writable. No repository exam files have been created at this point.
+
+The measured ordinary baseline is frozen under private cowork-mcp-verification/core-baseline.
+Report SHA256:6e487a4a0ebd45ceef9b98e2fadd6a14e71c0e3739a29057240e0dbe9235deef.
+Inventory SHA256:c6b9fc5b4bc2a93cf4cc7ae9d154ae0a3239b520d75bfd7f6b6f0dd2afbfb077.
+Seven source/fixture hashes equal4ed7508. Each indexed get/replay uses one SELECT;6,000 total lookups
+were measured over1,000 real synthetic JobStore rows. Median milliseconds: get0.027042,
+replay0.057417, explicit route0.096188, synthetic-S1 route0.615167, context0.004375.
+These are existing-owner measurements with zero provider/process/network calls, not new-core latency,
+transfer-memory or universal performance thresholds. All75 current test files are inventoried.
+
+## Root v4 completion before independent review
+
+Root reviewed the completed document-only worker result and granted the exact full-packet route seam. A private preparation journal now precedes workspace mkdir and is adopted in the existing acceptance transaction; unknown crash-created inode ownership quarantines rather than being inferred. This is a technical recovery correction within the authorized boundary, not a policy selection. The real ordinary bootstrap envelope is captured under private ordinary-bootstrap with hashes in the parent. No production files changed. All remaining gates stay explicit: independent D/A, committed exams, implementation/full-suite verification, then separately qualified OAuth and live user choices.

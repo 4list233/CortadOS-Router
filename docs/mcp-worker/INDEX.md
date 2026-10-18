@@ -97,3 +97,13 @@ promotion gates. The build reports record independent verification and limitatio
 | `integrations/mcp/remote_runtime.py` (new, proposed) | CoreRuntime composes the existing broker under its exclusive state lock; no-listener startup, recovery, IPC session and monitor lifetime. No second job queue. |
 | `integrations/mcp/remote_ipc.py` (new, proposed) | One bounded framed socketpair codec and CoreClient/server connection lifecycle; no descriptor-number handoff. |
 | `integrations/mcp/remote_capacity.py` (new, proposed) | Task/installation file accounting and reservation measurements; existing JobStore owns writes and Broker owns worker stop. |
+
+| `cortados_router/route_task.py::route_task` | RT008 extends the existing route owner with keyword-only trusted full-handoff input for byte bounds and all resolver input-fit calls; None preserves ordinary behavior. |
+| `integrations/mcp/task_store.py` (new, proposed) | RT008 remote SQL record/ownership statements, including private workspace preparation; transactions remain owned by JobStore. |
+| `integrations/mcp/task_workspace.py` (new, proposed) | RT008 descriptor-anchored empty preparation, accepted input copies and proven cleanup. |
+| `integrations/mcp/remote_config.py` and `remote_schemas.py` (new, proposed) | RT008 closed configuration, private/wire records, safe errors and audit encoding. |
+| `integrations/mcp/remote_dispatch.py` and `remote_http.py` (new, proposed) | RT008 owner-scoped core operations and listener-free synthetic ASGI composition; auth is excluded. |
+| `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (new, proposed) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
+| `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
+| `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
+| `acceptance/cowork_mcp/` (future exact grants in EXECUTION) | Independent QA owns core exams, manifest, complete-suite inventory and baseline/candidate measurements; builder read-only. |

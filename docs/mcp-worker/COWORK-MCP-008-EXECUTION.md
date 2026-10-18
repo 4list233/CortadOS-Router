@@ -1,12 +1,12 @@
 <!-- PURPOSE: Allocate nonoverlapping future execution responsibilities and independent gates.
-     CONTRACT: RT-COWORK-MCP-008 v3; draft, not a dispatch authorization.
+     CONTRACT: RT-COWORK-MCP-008 v4; draft, not a dispatch authorization.
      DEPENDS: Parent contract, recorded root policies, independent protected fixtures.
      CEILING: This session writes documents only; no production, exams, commits or live actions. -->
 # Cowork 008 execution packages
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 3
+contract_version: 4
 task_group_id: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1
 status: draft
 dispatchable: false
@@ -30,16 +30,16 @@ Current exact scope_paths:
 - docs/mcp-worker/COWORK-MCP-008-DECISIONS.md
 - docs/mcp-worker/COWORK-MCP-008-EXECUTION.md
 
-Required inputs before LOCAL CORE dispatch: pinned v3 parent/source hashes, exact reviewed scopes,
+Required inputs before LOCAL CORE dispatch: pinned v4 parent/source hashes, exact reviewed scopes,
 synthetic mandatory config fixtures, protected exam commit/manifest, independent D then A and root
 package approval. No D/A pass is declared. O1 actual registration/identity and O5 deployed limits/
 retention remain pending activation choices; they MUST NOT block parameterized local enforcement.
 Auth implementation needs its own future reviewed package; it MUST NOT be smuggled into core scope.
 No actual Cowork connection is required for local fixtures.
 
-Standards/rubric and governing file paths are in parent §1. Source checkout is absolute
+Standards/rubric and governing file paths are in parent section 9. Source checkout is absolute
 /Users/velox/.cortados-builds/cortados-router-repo, inspected HEAD
-d4c99dbfb065813e61cdaed6c4a86e9edce73ca6. Historical source anchors remain in parent. Before dispatch root records current per-file SHA-256 and
+e055c51 (full v3 review pin). Historical source anchors remain in parent. Before dispatch root records current per-file SHA-256 and
 working diff, since HEAD alone cannot identify concurrent edits.
 
 ## Package B — one independently gateable LOCAL CORE builder
@@ -54,6 +54,7 @@ state access. Inspect job_status before resubmission; no automatic failed-job re
 review diff/evidence and record job_feedback accepted/rejected/inconclusive. Worker completion is not QA.
 
 Exact future scope_paths (existing unless marked NEW):
+- cortados_router/route_task.py — keyword-only full-handoff seam only
 - integrations/mcp/broker.py
 - integrations/mcp/job_store.py
 - integrations/mcp/codex.py
@@ -68,6 +69,9 @@ Exact future scope_paths (existing unless marked NEW):
 - integrations/mcp/file_transfer.py — NEW
 - integrations/mcp/transfer_tickets.py — NEW
 - integrations/mcp/remote_native.py — NEW
+- integrations/mcp/remote_runtime.py — NEW
+- integrations/mcp/remote_ipc.py — NEW
+- integrations/mcp/remote_capacity.py — NEW
 
 No wildcard scopes. Parents integrations/mcp and docs/mcp-worker exist; new modules above are planned,
 not already implemented. Every new source file MUST stay below 500 physical lines and have
@@ -77,38 +81,43 @@ QA rechecks scope before builder writes it. No unreviewed utilities module or co
 Existing config.py/schemas.py/native_profile.py/native_process.py/router/quota code are read-only;
 extend through explicit remote composition, not changing local schemas or fresh-quota algorithms.
 
-| Responsibility / sole module owner | Interface and consumers | Disposition / forbidden duplication |
-|---|---|---|
-| remote_config.py | load_core_config(raw,base) → CoreConfig (§8) | Closed mandatory config; no environment or implicit defaults. |
-| remote_schemas.py | validate_remote(tool,args,limits); remote_tool_schema(tool); project_remote_result(record) | Own parent schemas/errors/projections; reuse local evidence/selection validators where behavior agrees. No storage/routing. |
-| remote_dispatch.py | dispatch_remote(principal,tool,args) through broker-owned instance | Authorize, lock/replay, invoke task store and existing broker routing/stop/feedback; never another queue. |
-| task_store.py | transaction-scoped task/operation/binding/publication mutations on JobStore.db | No independent connection/commit; migration SQL applied once by JobStore. All owner predicates central here. |
-| task_workspace.py | prepare/reconcile/remove generated workspace by broker intent and trusted descriptors | Folder identity and safe filesystem traversal owner; no caller-selected path. |
-| artifact_store.py | stage/seal/snapshot/reconcile immutable blobs from broker intents | Hash/fsync/inode rules; broker-local fd passed to file mover; no metadata commits. |
-| transfer_tickets.py | mint/replay/claim/revoke/authorize using task_store transaction context | Capability construction and lease transitions; no OAuth or byte mover. |
-| file_transfer.py | Broker-side §8 framed stream operations through artifact_store | Broker owns all descriptors; raw bytes cross socketpair; no FD-ID handoff. |
-| remote_http.py | create_test_app with trusted explicit synthetic principal (§8) | No auth adapter, listener, CLI or global ASGI app. Reuse installed MCP SDK; no FastMCP dependency in core. |
-| remote_native.py | verify persisted manifest; construct remote argv/manifest handoff from trusted binding | Complete remote-only policy template; reuse TOML encoder/feature constants, no ordinary argv changes. |
-| job_store.py / broker.py | additive transaction/binding seam, remote IPC dispatch, policy bootstrap | One integration owner; existing acceptance and fresh START admission retained. |
-| codex.py / worker.py | branch only on trusted persisted policy; pass/check bootstrap identity | Ordinary branch byte-identical; missing remote identity fails closed. |
+<!-- API-BEGIN -->
+| Sole owner | Exact callable / return |
+|---|---|
+| remote_config | load_core_config(raw:bytes,base:BaseConfig)->CoreConfig |
+| remote_schemas | validate_remote(tool:str,args:object,config:CoreConfig)->RemoteArgs; remote_tool_schema(tool:str)->JSONSchema; project_remote_result(record:ProjectionInput)->WireResult; RemoteError(code:ErrorCode,message:str); from_worker_error(error:WorkerError)->RemoteError; emit_remote_event(tx:Transaction-or-None,event:RemoteEvent)->None |
+| remote_native | load_manifest(raw:bytes,base:BaseConfig,policy:Policy)->NativeManifest; build_handoff(arguments:LocalArgs,inputs:tuple[InputEntry,...],limit_bytes:int)->Handoff; verify_binding(binding:WorkerBinding,manifest:NativeManifest)->None; native_arguments(binding:WorkerBinding,base_args:tuple[str,...])->tuple[str,...] |
+| remote_runtime | CoreRuntime(*,base_raw:bytes,core_raw:bytes,manifest_raw:bytes); async __aenter__()->CoreRuntime; async __aexit__(exc_type,exc,tb)->None; async attach(server_socket:socket.socket,principal:Principal)->Session; async disable_owner(owner_id:str)->None |
+| broker | Broker(config:BaseConfig,digest:str,*,core_runtime:CoreRuntime-or-None=None); async run_worker(accepted:JobRecord)->None; async stop(job_id:str,reason:str)->JobRecord |
+| remote_dispatch | CoreBroker(runtime:CoreRuntime); async dispatch_remote(principal:Principal,tool:str,args:object)->WireResult |
+| remote_ipc | CoreClient(socket:socket.socket,*,principal:Principal,config_digest:str,limits:CoreLimits); async bind()->ConnectionResult; async call(tool:str,args:RemoteArgs)->WireResult; async stream(op:str,args:StreamArgs,body:bytes=b'')->FrameResult; async close()->None; async serve_endpoint(socket:socket.socket,core:CoreBroker,principal:Principal)->None |
+| remote_http | create_test_app(*,core_client:CoreClient,principal:Principal,config:FrontendConfig)->ASGIApp |
+| route_task | route_task(arguments:LocalArgs,config:BaseConfig,metadata:NativeMetadata,*,handoff_packet:str-or-None=None)->LocalRoute |
+| JobStore | transaction()->ContextManager[Transaction]; accept(arguments:LocalArgs,route:LocalRoute,*,cli_version:str,acceptance_seed:AcceptanceSeed-or-None=None)->tuple[JobRecord,bool] |
+| task_store | migrate(db:Connection)->None; create_intent(tx:Transaction,principal:Principal,args:Create,snapshot:PolicySnapshot)->TaskRow; get_owned(tx:Transaction,owner_id:str,task_id:str)->TaskRow; operation(tx:Transaction,owner_id:str,operation:str,request_id:str,argument_hash:str)->OperationRow-or-None; preparation_intent(tx:Transaction,task:TaskRow,request_id:str,argument_hash:str)->PreparationRow; preparation_transition(tx:Transaction,preparation_id:str,expected_phase:str,next_phase:str,*,workspace_identity:WorkspaceIdentity-or-None=None,job_id:str-or-None=None)->PreparationRow; accept_binding(tx:Transaction,job_id:str,seed:AcceptanceSeed)->RemoteBinding; transition(tx:Transaction,owner_id:str,task_id:str,expected_version:int,next_state:str)->TaskRow |
+| task_workspace | prepare_empty(task:TaskRow,intent:PreparationRow)->WorkspaceIdentity; remove_preparation(task:TaskRow,intent:PreparationRow)->None; prepare(task:TaskRow,binding:RemoteBinding)->WorkspaceIdentity; remove(task:TaskRow)->DeleteProgress; reconcile(intent:OperationRow)->RecoveryResult |
+| artifact_store | open_stage(intent:ArtifactRow)->int; seal(fd:int,intent:ArtifactRow)->BlobIdentity; open_blob(row:ArtifactRow)->int; snapshot(binding:RemoteBinding)->tuple[OutputEntry,...] |
+| transfer_tickets | issue(tx:Transaction,principal:Principal,args:Upload-or-Download,direction:str)->TicketRow; claim(tx:Transaction,ticket_id:str,capability:str,direction:str,connection_id:str)->Lease; revoke(tx:Transaction,owner_id:str,task_id:str-or-None)->tuple[str,...] |
+| file_transfer | put_chunk(lease:Lease,offset:int,body:bytes)->int; finish_put(lease:Lease)->Receipt; read_chunk(lease:Lease,offset:int,max_bytes:int)->ReadResult; close(lease:Lease,reason:str)->None |
+| remote_capacity | CapacityMonitor(runtime:CoreRuntime); measure()->CapacityUsage; reserve(tx:Transaction,owner_id:str,task_id:str,operation:str,request_id:str,kind:str,bytes:int)->ReservationRow; async run()->None; async close()->None |
+<!-- API-END -->
 
 [FIXED] Exact scope rationale: broker.py:133–189 owns dispatch/admission/IPC;
 job_store.py:26–162 owns DB version and acceptance transaction; worker.py:31,91 and
-codex.py:42 own bootstrap/argv. These are extended only at parent §8's typed seams.
+codex.py:42 own bootstrap/argv. These are extended only at parent sections 2–4's typed seams.
 server.py:20,58 and __main__.py:16 are read-only reuse evidence: core consumes schema/SDK patterns,
 but MUST NOT change stdio registration or add a remote entrypoint. pyproject.toml stays read-only:
 core uses existing dependencies, no auth extra. New modules' parent integrations/mcp exists.
 No alternate route/queue/schema owner is authorized. All new interface records are defined in parent
-§8; any missing observable semantic MUST return to root for amendment, never builder discretion.
+sections 2–4; any missing observable semantic MUST return to root for amendment, never builder discretion.
 Contracts have no line cap under current project AGENTS; each source module MUST remain <500 lines.
 
-Private transport MUST use parent §8's closed operation table and trusted socketpair construction.
+Private transport MUST use parent sections 2–4's closed operation table and trusted socketpair construction.
 It MUST NOT extend stdio's JSON protocol with a caller-selected owner/channel. No listener or socket
 path is installed. The broker owns every staging/blob descriptor across the entire lease; HTTP
 receives bounded raw bytes, never an integer pretending to transfer an FD across processes.
 
-Execution order inside B: schemas/config → additive store/atomic acceptance → generated workspace/
-immutable artifacts/tickets → native policy bootstrap → synthetic ASGI/private IPC composition → compatibility review.
+Execution order inside B: independent gates → definitions/config → CoreRuntime lock/recovery → additive store/atomic acceptance → workspace/artifact/ticket/capacity owners → native bootstrap → CoreClient/ASGI composition → compatibility review.
 Do not commit intermediate protocol assumptions; any contradiction returns to root and independent QA.
 B's excluded paths: all tests/acceptance/exam fixtures, this contract, rulings, model catalogs, nightly
 training, installed runtime, user homes/credentials, other worktrees, ingress/launchd/activation.
@@ -123,6 +132,8 @@ baseline/candidate measurements, residual risks. No live install or commit impli
 Owner: designated independent MCP QA session, not B or this author. QA owns D/A/B and protected exams,
 including separately blocked future-auth qualification already underway. No exam files authored in this session.
 Planned exact acceptance_paths, all NEW, under verified parent acceptance/ (cowork_mcp directory is NEW):
+- acceptance/cowork_mcp/__init__.py
+- acceptance/cowork_mcp/support.py
 - acceptance/cowork_mcp/README.md
 - acceptance/cowork_mcp/MANIFEST.json
 - acceptance/cowork_mcp/test_schemas.py
@@ -135,6 +146,11 @@ Planned exact acceptance_paths, all NEW, under verified parent acceptance/ (cowo
 - acceptance/cowork_mcp/fixtures/wire.json
 - acceptance/cowork_mcp/fixtures/binary.bin
 - acceptance/cowork_mcp/fixtures/native_capture.json
+- acceptance/cowork_mcp/evidence/run-full-suite.py
+- acceptance/cowork_mcp/evidence/benchmark-core.py
+- acceptance/cowork_mcp/evidence/suite-inventory.json
+- acceptance/cowork_mcp/evidence/baseline-ordinary.json
+- acceptance/cowork_mcp/evidence/historical-007-parity.py
 
 These exact new paths are candidates for QA's independent fixture design; missing directory/fixtures
 remain explicit blockers, not passed tests. QA commits with Exam-Owner attribution and pins hashes
@@ -142,24 +158,24 @@ BEFORE B dispatch. Any needed additional fixture path requires recorded scope am
 file is initially captured shell evidence plus explicit actual-exec pending marker, never synthetic proof.
 QA authors deterministic fake-native cases independently; actual native/tool lane is gated separately.
 
-| AC | Deterministic/captured local ground truth for Q | Later gated evidence |
-|---|---|---|
-| 008-01 | FUTURE AUTH only; no auth fixture or implementation in LOCAL CORE | Independent future-auth D/A includes discovery/challenges/claims tests; then actual hosted callback |
-| 008-02 | FUTURE AUTH only; private review D-008-01/02 remain blockers | Preparse initial/explicit/transparent refresh, full credential-load lock, synthetic concurrency/crash and sentinel exams MUST precede future-auth dispatch; live rotation/deadlines follow |
-| 008-03 | Synthetic trusted principal mapped to owner; second principal/client denied; expired/unknown/spent quota refuses explicit and S1 without native/API fallback | Root owner/client registration evidence |
-| 008-04 | ASGI disconnect/transport DELETE cannot kill/retry accepted job; no new stdio imports/entrypoints; identity injection possible only through Python constructor | Preserve existing private 443→8432 while public candidate disabled/enabled |
-| 008-05 | Closed schemas for every request/result/error; UUID spelling, unknown fields, cwd, title/name/media boundaries, non-UTF8 JSON rejected; repo-free task | Actual Cowork tool-call payload |
-| 008-06 | Local stdio job ID, foreign task/job/artifact/status/cancel/feedback all refused with identical not-found response | Single-owner operator mapping |
-| 008-07 | Concurrent identical create/upload/delegate/feedback returns one identity; changed text/order conflicts; replay before scorer and quota; no new attempt after lost ACK | None needed to build |
-| 008-08 | Delete/upload/delegate/publication races; no overlapping job; incomplete/foreign inputs refuse; clean attempt workspace contains only named inputs | None needed to build |
-| 008-09 | Ordinary argv golden byte comparison; policy persisted across restart/replay/config changes; missing policy denies START; shell review 13/13 remains accurately labeled | Actual Codex exec tool canary: positive task use, negative credential/broker/sibling/tmp/symlink/network, native auth/quota/termination succeeds |
-| 008-10 | Byte-equal binary PUT/GET, zero bytes, no text decoding, archives opaque, no URL fetch/base64 API | Actual Cowork PDF/DOCX/XLSX/non-UTF8 local hash→upload→worker output→download→materialized file hash |
-| 008-11 | Content-Length absent/false, chunked/encoding, early EOF/extra byte/hash mismatch, concurrent PUT, expired/spent ticket, key rotation/restart revoke, lost ACK | Header-capability support in Cowork actual egress |
-| 008-12 | fd-anchored symlink/hardlink/rename/FIFO/device/traversal cases, no events/auth/log export, forbidden output directory fails publication | OS/runtime capture on target Studio |
-| 008-13 | Native terminal differs from publication failure; all-or-none manifest; failed output partial flag; future workspace mutation leaves old blob unchanged | Planner review/feedback in actual Cowork |
-| 008-14 | Repeated full GET exact bytes, Range refusal, delete/disable closes stream, opened expiry behavior; foreign capability denied | Cowork materialization, not merely HTTP 200 |
-| 008-15 | Crash injection before/after mkdir/fsync/rename/commit/association/delete; one accepted job; corrupt DB/blob fail closed; restore disabled first | Auth-store restart/crash qualification |
-| 008-16 | Decimal budget boundaries, copy/staging reservation counted once, count/deadline/backpressure exhaustion, no scheduled sweep exists; active/uncertain never deleted, tombstones retained | Live retention freeze, native disk-growth overshoot/headroom qualification |
+<!-- AC-BEGIN -->
+| ID | Canonical acceptance text |
+|---|---|
+| AC-008-03 | Synthetic config/principal admission refuses absent, foreign, disabled and invalid policy inputs before effects; existing explicit/S1 fresh quota refusals cause zero native starts. |
+| AC-008-04 | Socketpair-only construction creates no listener/auth/entrypoint; frontend loss leaves one accepted job; ordinary001–007 bytes and history remain unchanged. |
+| AC-008-05 | Every closed wire/private record accepts its valid example and rejects its invalid example; safe Error/audit and full-header overflow preserve canonical rows. |
+| AC-008-06 | Owner/task predicates reject foreign and ordinary stdio IDs identically to unknown IDs across status, result, cancel, feedback and transfer. |
+| AC-008-07 | Concurrent replay returns one immutable identity with current projection; changed arguments conflict; job, binding, operation and reservation either all commit or all roll back. |
+| AC-008-08 | Create/delete/delegate/upload/publication races preserve one active task job and exact selected input copies; creating-delete and failed preparation have observable rows. |
+| AC-008-09 | Bound manifest, triple discriminator and complete handoff bytes agree at route, acceptance and START; deletion or mutation refuses launch; ordinary argv/bootstrap remain byte-identical. |
+| AC-008-10 | Separate frontend/broker processes transfer zero, NUL and non-UTF8 bytes with matching hashes and chunk-bounded memory through the exact CoreClient API. |
+| AC-008-11 | Independent ticket encoding, frame lengths, offsets, length/hash checks, renewal, expiry, key rotation and lost ACK produce the specified row, lease and descriptor outcomes. |
+| AC-008-12 | Descriptor-relative traversal rejects links, rename races, directories and nonregular outputs without leaking broker/native evidence or exporting mutable files. |
+| AC-008-13 | Ordered all-or-none publication preserves native outcome, partial flags and immutable blob hashes through crashes and later workspace mutation. |
+| AC-008-14 | Full GET retries preserve bytes; Range refuses; trusted active disable/delete closes open leases; expiry affects new opens only; no accepted job is implicitly cancelled. |
+| AC-008-15 | Lock-before-DB construction, second-owner refusal, one ordered recovery, corruption refusal and crash boundaries preserve rows, tombstones and containment without relaunch. |
+| AC-008-16 | st_size, promised-write and free-space equalities pass at the boundary and refuse beyond it; monitor overrun retains reservations until proof; no retention scheduler exists. |
+<!-- AC-END -->
 
 Commands below are FUTURE QA instructions, not a record of runs. QA must pin the interpreter/venv and
 fixtures before using them. Use a temporary isolated state directory under an authorized build tree;
@@ -243,7 +259,7 @@ ordinary-profile equality plus separate original-label-prefix/exam-provenance/li
 Use the actual 26-lane runner inventory and its environment bindings alongside new 008 lane commands;
 the generic discovery list above alone is insufficient. Missing/unexecuted suites remain BLOCKED.
 
-## v3 package-specific D/A inputs and AC mapping
+## v4 package-specific D/A inputs and AC mapping
 
 [FIXED] Q MUST freeze runnable isolated commands/fixtures before A; this is a draft inventory, not exams.
 Q owns the exact acceptance paths listed above; test_auth.py is reserved for a later scope amendment,
@@ -251,9 +267,9 @@ not this package. No current turn may create/run tests. Future Q command:
 `python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'`
 MUST run every new core lane with zero unexpected skips. Existing accumulated runner remains required.
 
-| Exact Q file | Additional v3 obligations / ground truth |
+| Exact Q file | Additional v4 obligations / ground truth |
 |---|---|
-| test_schemas.py | AC-008-03,05: every config key absent/unknown/type error refuses before side effects; every §3 success/error example validates; no caller identity/path; complete config snapshot retained |
+| test_schemas.py | AC-008-03,05: every config key absent/unknown/type error refuses before side effects; every section 8 success/error example validates; no caller identity/path; complete config snapshot retained |
 | test_tasks.py | AC-008-06–08: two synthetic principals and clients; SQL ownership/FKs/unique active reservation; atomic job acceptance rollback; explicit delete tombstone/evidence preserved |
 | test_transfer.py | AC-008-10–14: separate frontend/broker processes over socketpair; NUL/non-UTF8/empty bytes; exact offsets and frame lengths; foreign lease, disconnect, backpressure and revoke; inspect broker descriptor close and hash-equal sealed files |
 | test_recovery.py | AC-008-07,08,13,15: crash before/after intent/fsync/rename/commit; no relaunch; restart revokes leases; corrupt remote schema refuses; stdio schema unchanged; publication all-or-none |
@@ -281,3 +297,19 @@ Latest evidence read during v3: native-exec-capture-v2/independent-adjudication.
 synthetic shell outcomes for job ba4c3e14-c1f7-47fb-93b6-d703a98a6db7 with a recorded unused dot argument.
 The strict exact-command comparison remains false. Parent §9 records hashes/limits; Q MUST preserve
 that deviation and original capture, not require a redundant model run or call this full native approval.
+
+## v4 technical scope and stop condition
+
+Root authorized the three NEW source modules remote_runtime.py, remote_ipc.py and remote_capacity.py and the two NEW exam helper paths __init__.py and support.py as future grants only. Current author scope remains three docs. remote_runtime owns lifetime; remote_ipc owns the only frame codec; remote_capacity owns usage observations/reservation arithmetic, never another DB writer. file_transfer owns descriptors/bytes, not framing. remote_dispatch consumes runtime services, not an already-open external broker.
+
+Root grants the exact keyword-only handoff_packet seam in cortados_router/route_task.py. Existing route_task owns the complete-packet budget and all input-fit calls, preserving ordinary None behavior. Independent QA pins ordinary and full-remote fixtures before B. schemas.py and task_evidence.py remain read-only. No output-counter patch, duplicate resolver or task/context rewrite substitutes for this seam. The preparation journal and JobStore.transaction extension in parent sections 2–4 belong to this same future source scope.
+
+AC-008-03 through AC-008-16 all run through the pinned future command: python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'. The file mapping above allocates lanes; it is not a second AC wording authority. Missing fixtures/commands with zero tests remain pending A. AC-008-01/02 are excluded future-auth gates.
+
+Root's deferred INDEX.md ownership update is required before integration acceptance. This author does not edit it. Authoring is not a valid production build attempt; the existing ledger is unchanged.
+
+Author evidence/closure map and full self-rubric are in DECISIONS v4. Current author ran document JSON/schema/API/AC/diff checks only, not acceptance tests. The ordinary bootstrap capture is now recorded in parent section 9. Independent diagrams/fixtures/new-core measurement gates remain open.
+
+## Root pre-review amendment evidence
+
+Root approved the full-packet seam and private workspace-preparation journal without choosing live identity/storage policy. The independent ordinary-bootstrap capture closes only the old envelope-sample gap. Existing-owner baseline at 4ed7508: 1000 stored jobs, 3000 get and 3000 replay lookups, each one indexed SELECT; median get 0.027042 ms and replay 0.057417 ms. Explicit route median 0.096188 ms, synthetic S1 route 0.615167 ms and context 0.004375 ms. Report SHA256 6e487a4a0ebd45ceef9b98e2fadd6a14e71c0e3739a29057240e0dbe9235deef; 75-file inventory SHA256 c6b9fc5b4bc2a93cf4cc7ae9d154ae0a3239b520d75bfd7f6b6f0dd2afbfb077. Both are under private cowork-mcp-verification/core-baseline. These measurements do not assert new-core or transfer memory/overshoot performance. Historical-007 unchanged assertions pass 4/4 with three recorded literal path relocations and equal normalized AST; original live baseline remains 784/785. Q must preserve the distinction and separately test candidate compatibility and live label-prefix/exam/provenance.
