@@ -1,14 +1,14 @@
 {
   "contract": "RT-COWORK-MCP-008",
-  "contract_version": 4,
+  "contract_version": 5,
   "scope": "LOCAL CORE only",
   "exam_owner": "quota_evaluation_qa (/root/quota_evaluation_qa)",
-  "parent_review_commit": "888c677",
-  "execution_command_commit": "282dc1a",
+  "parent_review_commit": "c61e6a0",
+  "execution_command_commit": "c61e6a0",
   "contracts_sha256": {
-    "docs/mcp-worker/COWORK-MCP-008.md": "5b9527ac2e71f8ef6bd345031a9dbfe68f0b743d6b004bf7e8db853b923cfc1a",
-    "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "41de4dc4023a69100eb504c1fcc099fa36f0b0d7b0050c43942ef4107d2754eb",
-    "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "92760ded3f365f7e92074d7b2dd248660ea4b6a6435549acb57978a41f663096"
+    "docs/mcp-worker/COWORK-MCP-008.md": "0fe7b4f3d139436eb9b0b0bdcbc8e0d4e442e8340d560b8abdd0f20cf2332a63",
+    "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "e93ffd915392e082fc426932e0252729376f3d77b029b2e5a067390e549eeb4d",
+    "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "e104c7548883318cb6fd80ac58814e1c9d5a217b8d2e6d1ffac56d732bdd1b40"
   },
   "test_methods": {
     "test_compatibility.py": [
@@ -23,7 +23,11 @@
       "test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator",
       "test_ordinary_native_argv_and_environment_are_unchanged",
       "test_stalled_http_put_receive_terminates_at_idle_deadline",
-      "test_stalled_http_get_send_aborts_after_headers_at_idle_deadline"
+      "test_stalled_http_get_send_aborts_after_headers_at_idle_deadline",
+      "test_all_response_families_timely_status_controls",
+      "test_all_response_families_stalled_start_or_body_abort_once",
+      "test_header_attempt_failure_cannot_emit_replacement_start",
+      "test_timely_preheader_timeout_uses_positive_remaining_budget"
     ],
     "test_native_policy.py": [
       "test_native_argv_uses_complete_remote_template_and_full_input_packet",
@@ -65,7 +69,13 @@
       "test_acceptance_audit_failure_is_fatal_without_job",
       "test_lease_audit_failure_is_fatal_without_descriptor",
       "test_malformed_frame_audit_failure_closes_endpoint_and_latches",
-      "test_timely_monitor_control_preserves_admission"
+      "test_timely_monitor_control_preserves_admission",
+      "test_controlled_missed_sample_preserves_terminal_task_status_result",
+      "test_capacity_existing_job_cancel_is_idempotent_and_owned",
+      "test_capacity_latch_never_reopens_after_good_sample_or_restart_relaunches",
+      "test_capacity_cleanup_and_disabled_override_retire_owned_resources",
+      "test_fatal_integrity_and_audit_override_capacity_observation",
+      "test_capacity_observation_keeps_binding_corruption_refusal"
     ],
     "test_schemas.py": [
       "test_every_config_key_required_and_unknown_refuses",
@@ -81,7 +91,11 @@
       "test_request_unknown_identity_paths_and_filename_boundaries",
       "test_nested_inputs_are_copied_and_immutable_without_implementation_requirement",
       "test_every_new_owner_module_has_a_real_importable_boundary",
-      "test_native_private_record_array_constraints_match_frozen_schema"
+      "test_native_private_record_array_constraints_match_frozen_schema",
+      "test_actual_socket_primary_and_fallback_backpressure",
+      "test_encoding_and_fallback_consume_original_deadline",
+      "test_partial_ipc_frame_cannot_append_fallback",
+      "test_applicable_lease_deadline_bounds_response_fallback"
     ],
     "test_tasks.py": [
       "test_create_replay_keeps_identity_and_current_projection",
@@ -96,7 +110,10 @@
       "test_transition_audit_has_one_creation_event_and_no_payload_secrets",
       "test_foreign_trusted_principal_refuses_attach",
       "test_disable_ahead_of_queued_create_rechecks_authority_after_lock",
-      "test_cancelled_ipc_call_cannot_deliver_predecessor_response"
+      "test_cancelled_ipc_call_cannot_deliver_predecessor_response",
+      "test_capacity_only_denied_tool_table_preserves_rows_and_authority",
+      "test_capacity_reconnect_inspects_owned_task_and_rejects_foreign_binding",
+      "test_capacity_only_stream_table_refuses_effects_and_retires_leases"
     ],
     "test_transfer.py": [
       "test_zero_and_non_utf8_bytes_roundtrip_hash_exact",
@@ -112,10 +129,15 @@
       "test_unsealed_renewal_requires_stopped_writer_and_exact_metadata",
       "test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put",
       "test_key_rotation_restart_invalidates_prior_capability",
-      "test_delete_revokes_existing_get_before_next_chunk"
+      "test_delete_revokes_existing_get_before_next_chunk",
+      "test_exhausted_total_idle_budget_has_no_error_delivery_grace",
+      "test_empty_chunks_do_not_renew_idle",
+      "test_acknowledged_nonempty_progress_renews_idle_not_total",
+      "test_lost_http_put_receipt_exposes_seal_without_second_put",
+      "test_shared_client_expiry_does_not_cancel_accepted_worker"
     ]
   },
-  "test_method_count": 89,
+  "test_method_count": 111,
   "ac_files": {
     "03": [
       "test_schemas.py",
@@ -820,24 +842,24 @@
     "tests/test_training_teacher.py": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f"
   },
   "fixture_files_sha256": {
-    "README.md": "1c7cd9a3259a3c334cb38b3ad74e59315ce2733272f10cb5170be6ef0904e8cc",
+    "README.md": "89ee88e62e7ef8cf74046a56b9ebb049dd0366ef7d37a017b65ee8ad34fb99d9",
     "__init__.py": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
     "evidence/baseline-ordinary.json": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
     "evidence/benchmark-core.py": "88b7ef0ac73e30aca3a3bb69c73e62c491fdc5fe0f3c82650dd5a6c348b95fb4",
     "evidence/historical-007-parity.py": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
     "evidence/run-full-suite.py": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
-    "evidence/suite-inventory.json": "7efe645532a7388c4a3ac9dc3969a70c995ccd1e36aee897366fd135a410a3cf",
+    "evidence/suite-inventory.json": "122c05488283ec5412272c2948920d873ee1939a31f046b8ed3f12e4ea19a769",
     "fixtures/binary.bin": "eca7a2fd17bcc909b49d0bf0c90c5fa1d026696c632e76f760ad73c1c3c5b5ea",
     "fixtures/native_capture.json": "2d7deb538ccfba4c1435289336e05d6b7110d6bac17ca08d7916c413ce55d8e2",
     "fixtures/wire.json": "fc6b6435801ffe581028d4688ff72e8a8eff0f32c02ef8ad74e9283302b74970",
-    "support.py": "cba3aa9320e351ae7f4262883e6a4693e5b44c273bce265d64d52cc0d7487c21",
-    "test_compatibility.py": "6e9c9ea7bbe459e57b7f8288cca7e503199f2b07a289a115454fa5a7b59de06e",
+    "support.py": "28e92e4426669c200bece2148ba9392fa38509f2ac6b8f5d7a0617be1960d5d7",
+    "test_compatibility.py": "ef87f01e635a396c2e59d09e4851df8255530d67be1564f1477e9331df921ea3",
     "test_native_policy.py": "e515bf2e3f13321c8545ee666a514ae1f9741a1d4d38267fc8b4318cbccc4767",
     "test_performance.py": "4c885e044424e53e767c4ef4f7afd20babef26061f2a2edf5765bf9d03f2c56e",
-    "test_recovery.py": "f5457eb7cd0b5614ed43d3bfd672fe18db0db30a7873873ba09b6320910b0eb6",
-    "test_schemas.py": "9dbd8c95e3f19bb1928499cddf1cfc669a7a0537c8c4e0057b2b3de9137dd269",
-    "test_tasks.py": "e6f023f83251e44d8a365bd8f8602535a3d63554cb1e63b493386a368dd914f7",
-    "test_transfer.py": "7211a3455a18cf0e83274af359d90faf2a41c557a01a1ca85acc9747a7839bfd"
+    "test_recovery.py": "3dfcfdcc9dcbeeacd226bf65640b2bd3f2ee4f45d80a3aad421679b8631b2e4e",
+    "test_schemas.py": "d9c6939d85863db215568816d022d11bc71a44317df7072bb8f500adb24dac8c",
+    "test_tasks.py": "5fc25093b2004167e31d4eb3f3be7c2c6d27897d2bf8349ae5f897d00a265d9d",
+    "test_transfer.py": "a067559b82868341a3089c09747490f5ddb47e2d1a89114169ea0aa2406ae786"
   },
   "private_evidence": {
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-exam-prebuild/final-output.log": "067f41cf3f442f20740e96f74d5474b67bc14fe0343baf0e4b071ad7583f776a",
@@ -846,12 +868,41 @@
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v4-D-closure/readiness.json": "89eb16bf23e6bb620a2da555769c8adb7e9d8e35ec5c490bdbad06df85634999"
   },
   "prebuild": {
-    "methods": 72,
-    "failures": 3,
-    "errors": 162,
-    "skipped": 0,
+    "methods": 23,
+    "failure_events": 42,
+    "errors": 0,
+    "skips": 0,
     "expected_red": true,
-    "valid_builder_attempt": false
+    "valid_builder_attempt": false,
+    "core_discovered": 111,
+    "expected_full_methods": 896,
+    "full_candidate_run": "pending",
+    "evidence": {
+      "final-focused.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/final-focused.json",
+        "sha256": "5c204cc2b2526e3ba8fb58f73376ef4398144211774c3524d3abf2986a6265ed"
+      },
+      "final-focused.log": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/final-focused.log",
+        "sha256": "ac5307df3b140d043f3f2c01cef9d82bcf4896c3f48d0c31a89cb549e7bc4de1"
+      },
+      "preservation.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/preservation.json",
+        "sha256": "0bde694baa5353ae96e0733f60298293765f3658cd1622c8cdf0e9de752c714d"
+      },
+      "discovery.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/discovery.json",
+        "sha256": "00b68aef302cc5d1c46528c5cfc17c8d0b15e82baa6795908baa87d3d9d6c686"
+      },
+      "queued-control.log": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/queued-control.log",
+        "sha256": "c4892c9061c596475f43274fd9113257ea78a48367b596780580541bacdde55f"
+      },
+      "post-run-cleanup.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/post-run-cleanup.json",
+        "sha256": "1c83b0fba50cd8e7376dd11d4002f9180e1bda94013bd5ca39266ed3c8a9e6da"
+      }
+    }
   },
   "future_gates": [
     "Authentication",
@@ -861,7 +912,7 @@
     "Public Cowork binary transfer",
     "Activation"
   ],
-  "ledger": "Original D21/D3 and D0/A0 retained. First stable core build rejected (857 original methods;1failure; separate matrix fixture exhaustion).17 additive regressions and approved matrix-only600s measurement fixture; one remaining same-design retry, no reset.",
+  "ledger": "Two valid rejected core builds retained; design_error followed by explicit Forest-approved revision2. Current v5 D0, independent revised exam freeze; renewed A and root source grant required. No same-design retry count reset.",
   "historical_review_docs_sha256": {
     "docs/mcp-worker/COWORK-MCP-008-ROOT-REVIEW.md": "88495028f797c33566d0e9a6c4f45dd1c4f1b6700dc31bfcd043879f126dbc8a"
   },
@@ -911,6 +962,40 @@
       "measurement_change": "Post-transfer task_get timings use a newly bound client. Transfer workloads and memory collection unchanged; five completed cases retained, seven measured separately.",
       "deadline_assertions_changed": false,
       "test_methods_changed": false
+    },
+    {
+      "authority": "18e4a7f; c61e6a0",
+      "revision": 2,
+      "original_manifest_sha256": "03589f6ad5394e4c5d3c29f37979f349f7fb4b1c7cd8b6671b0c55f94da49959",
+      "preserved_original": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation/original-exams",
+      "previous_methods": 89,
+      "added_methods": 22,
+      "current_methods": 111,
+      "expected_full_methods": 896,
+      "historical_valid_failures": 2,
+      "original_AST_amendment": "Only BuildHttpDeadlineRegressionExam.test_stalled_http_put_receive_terminates_at_idle_deadline expected [408] -> []; all other ASTs identical",
+      "private_evidence": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-2-QA-preparation",
+      "prior_source_hashes_unchanged": true,
+      "benchmark_and_runner_unchanged": true
     }
-  ]
+  ],
+  "historical_v4_pins": {
+    "contract_version": 4,
+    "parent_review_commit": "888c677",
+    "execution_command_commit": "282dc1a",
+    "contracts_sha256": {
+      "docs/mcp-worker/COWORK-MCP-008.md": "5b9527ac2e71f8ef6bd345031a9dbfe68f0b743d6b004bf7e8db853b923cfc1a",
+      "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "41de4dc4023a69100eb504c1fcc099fa36f0b0d7b0050c43942ef4107d2754eb",
+      "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "92760ded3f365f7e92074d7b2dd248660ea4b6a6435549acb57978a41f663096"
+    },
+    "prebuild": {
+      "methods": 72,
+      "failures": 3,
+      "errors": 162,
+      "skipped": 0,
+      "expected_red": true,
+      "valid_builder_attempt": false
+    },
+    "ledger": "Original D21/D3 and D0/A0 retained. First stable core build rejected (857 original methods;1failure; separate matrix fixture exhaustion).17 additive regressions and approved matrix-only600s measurement fixture; one remaining same-design retry, no reset."
+  }
 }

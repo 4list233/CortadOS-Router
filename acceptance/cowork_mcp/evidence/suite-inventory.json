@@ -1219,7 +1219,7 @@
     "acceptance-cowork_mcp": "New protected exams auto-discovered by the same inventory runner",
     "core-performance": "New actual-core synthetic measurements; baseline is existing-owner measurement, not a prior remote implementation."
   },
-  "exam_owner_amendment": {
+  "historical_exam_owner_amendment": {
     "authority": "d846d54",
     "original_core_methods": 72,
     "added_methods": 17,
@@ -1241,5 +1241,27 @@
       "other_deadlines": "unchanged"
     },
     "interpretation": "Independent exam amplification of same frozen design; one valid rejected builder attempt remains recorded."
+  },
+  "exam_owner_amendment": {
+    "authority": "18e4a7f; v5 c61e6a0",
+    "revision": 2,
+    "historical_valid_builder_failures": 2,
+    "previous_core_methods": 89,
+    "added_methods": 22,
+    "current_core_methods": 111,
+    "expected_full_methods": 896,
+    "full_lanes": 28,
+    "prior_methods": 785,
+    "source_execution_pending": true,
+    "sole_old_assertion_amendment": "stalled PUT exhausted budget: [408] -> []",
+    "prior_host_report": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/full-suite/report.json",
+    "prior_host_report_sha256": "756c7221d561f42e6b3265f4807e68e51beb66968b8f599b6546c19502160ce0",
+    "prior_host_totals": {
+      "tests": 874,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0
+    },
+    "interpretation": "Approved revised design; two valid rejected builds retained. No same-design retry reset."
   }
 }

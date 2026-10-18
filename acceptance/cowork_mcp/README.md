@@ -4,7 +4,7 @@ Exam owner: quota_evaluation_qa (/root/quota_evaluation_qa). These paths are rea
 No production implementation, installed release, listener, provider account or live policy is delivered here.
 The constructor convention tests read-only attributes, closed validation and immutable copies; it does not require dataclasses or a serializer.
 
-The parent is pinned at888c677; EXECUTION command correction at282dc1a is included in MANIFEST.json.
+Current parent/EXECUTION/DECISIONS are v5 at c61e6a0, pinned in MANIFEST.json. The original v4 pins remain in the archived original manifest.
 The D0 closure retains prior v3 D21 and v4 D3 findings. The root approval record may bind these immutable bytes without rewriting the normative documents.
 `implements: CLAUDE-APP-CONNECTOR-PLAN.md` is informational provenance under root's explicit A1.4 disposition; RT-MCP-001 is the normative contract dependency.
 
@@ -25,7 +25,7 @@ The original26-lane785-test baseline has784passes/1failure/0errors/0skips. Its i
 
 historical-007-parity.py executes the original four007 assertions against exact frozen007 source/data and installed release; only three literal fixture paths changed, with AST identity checked. The new test_live_training_prefix_exam_rows_and_protected_model_inputs separately verifies the current original11660-line prefix,2663 exam rows and immutable model/evaluation/override inputs. Candidate ordinary argv, environment, bootstrap and routing assertions run against current source. Historical parity does not attest new008 source parity.
 
-The prebuild72-method run is expected RED:3 failing assertions,162 subtest-errors,0skips.161 errors are absent new modules; one is the absent handoff_packet argument. Two failures expose baseline discriminator downgrade; the third is absent child-runtime startup. Four independent/original-boundary methods pass. Error totals include subtests and cannot be subtracted from72 to derive method counts. This is not a valid builder attempt. Python emitted a finalization BufferError diagnostic after the failed prebuild run; raw output is retained without deleting it.
+The historical original prebuild72-method run was expected RED:3 failing assertions,162 subtest-errors,0skips.161 errors are absent new modules; one is the absent handoff_packet argument. Two failures expose baseline discriminator downgrade; the third is absent child-runtime startup. Four independent/original-boundary methods pass. Error totals include subtests and cannot be subtracted from72 to derive method counts. This is not a valid builder attempt. Python emitted a finalization BufferError diagnostic after the failed prebuild run; raw output is retained without deleting it.
 
 Fixtures use private0700 resolved temporary roots, the unchanged prior fake_codex composed by an exam-only wrapper, invented principal/key, socketpair and synthetic binary bytes. Metadata fixture preflight was independently exercised:version0.163.0,7fake metadata calls,0native execs. Discriminator tests launch only the existing Python watchdog with EOF before START, never a model.
 
@@ -193,3 +193,17 @@ fixture allows measurement; idle/IPC/ticket values and all deadline assertions s
 unchanged. No deployment default or latency acceptance budget changes. Original
 benchmark bytes and raw reports remain preserved. Independent correctness/memory
 review is still required; the amendment does not approve efficiency or the candidate.
+
+## Current v5 revision-2 freeze
+
+Forest approved the revised response-deadline and capacity-only admission design; root authority18e4a7f and frozen c61e6a0. Both rejected implementation attempts remain in the ledger. This is a design revision, not a reset or another same-design retry.
+
+The111-method core inventory contains all89 prior methods and22 new methods. The only old AST change is the authorized stalled-PUT exhausted-budget assertion [408]→[]; its deadline and cleanup assertions remain intact. Every other old method is AST-identical. Original bytes/results are archived at private core-revision-2-QA-preparation/original-exams. All641 other protected paths and18 rejected-candidate source hashes remain unchanged.
+
+The mapped new exams pin HTTP success/refusal/Range sends at start/body, attempted-header uncertainty, timely positive-budget408 and exhausted abort; progress and shared-client retirement without accepted-job cancellation; actual AF_UNIX primary/fallback pressure, validation time, a100ms lease versus500ms IPC control and partial-frame retirement; the exact capacity-only operation table, actual missed sample and proven fake-worker stop, reconnect/ownership/corruption/fatal/disabled precedence. Existing performance/ordinary/native-policy suites remain unchanged.
+
+Final focused prebuild runs exercise23 methods (22new plus the amended old assertion), with42 failure events,0errors,0skips against the frozen rejected implementation; subtest events are not disjoint methods. A separate real queued-client positive control is recorded. These are expected revision regressions, not a third valid builder submission or a candidate pass. Source-backed fault seams and synthetic timings are test operands, not deployment defaults.
+
+The full unchanged28-lane driver is expected to account for896 methods (785prior+111core), with actual collection/result authoritative. No new full run or ten-minute matrix is claimed at prebuild. All accumulated lanes, original785 baseline red, historical007 assertions, current live-prefix/exam guard, ordinary compatibility and measured efficiency obligations remain separate and mandatory for candidate B. No runner or benchmark code changed.
+
+Post-run cleanup evidence reports no remaining synthetic-marker processes, but residual private temp roots containing router/router.db remain and are not removed. Failing product assertions may precede lease/socket cleanup checks; no blanket containment or filesystem-cleanup pass is inferred. Exact observations and historical fixture errors are retained in private preparation evidence.

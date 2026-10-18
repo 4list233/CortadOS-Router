@@ -114,3 +114,106 @@ class BuildClosedShapeRegressionExam(unittest.TestCase):
             with self.subTest(name=name,field=field):
                 fields=copy.deepcopy(FIXTURE['private_examples'][name]['valid']);fields[field]=value
                 with self.assertRaises(api.RemoteError):getattr(api,name)(**fields)
+
+from .support import CoreCase
+class Revision2IpcDeadlineExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.fixture.core['limits'].update(ipc_idle_ms=100,transfer_idle_ms=100,transfer_total_ms=500)
+        await self.start()
+
+    async def endpoint(self):
+        import socket
+        from .support import raw_send,raw_read
+        left,right=socket.socketpair();left.setblocking(False);right.setblocking(False)
+        left.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,4096)
+        self.addCleanup(left.close);self.addCleanup(right.close)
+        session=await self.runtime.attach(left,self.runtime.config.principal)
+        await raw_send(right,dict(v=1,seq=0,op='bind',body_bytes=0,args={'principal':self.fixture.principal,'config_digest':self.fixture.digest()}))
+        self.assertTrue((await raw_read(right))[0]['result']['ok'])
+        return left,right,session
+
+    async def test_actual_socket_primary_and_fallback_backpressure(self):
+        import asyncio,struct
+        for oversized in (False,True):
+            with self.subTest(oversized=oversized):
+                left,right,session=await self.endpoint();calls=0
+                async def result(*args):
+                    nonlocal calls
+                    calls+=1;return {'ok':True,'padding':'x'*(70000 if oversized else 512)}
+                frames=[]
+                for seq in range(1,101):
+                    b=canon(dict(v=1,seq=seq,op='tool',body_bytes=0,args={'tool':'task_get','arguments':{}}))
+                    frames.append(struct.pack('!I',len(b))+b)
+                with patch.object(self.runtime.core,'dispatch_remote',result):
+                    try:
+                        try:await asyncio.wait_for(asyncio.get_running_loop().sock_sendall(right,b''.join(frames)),1)
+                        except (BrokenPipeError,ConnectionResetError):pass
+                        await asyncio.wait({session.task},timeout=.35)
+                        self.assertGreater(calls,1);self.assertTrue(session.task.done(),'Fallback socket write exceeded100ms original IPC budget')
+                        self.assertEqual(left.fileno(),-1)
+                    finally:
+                        session.task.cancel();await asyncio.gather(session.task,return_exceptions=True)
+
+    async def test_encoding_and_fallback_consume_original_deadline(self):
+        import asyncio,time
+        from .support import raw_send,raw_read
+        for oversized in (False,True):
+            with self.subTest(oversized=oversized):
+                left,right,session=await self.endpoint();api=mod('remote_schemas');original=api.json_bytes
+                async def result(*args):return {'ok':True,'padding':'x'*(70000 if oversized else 1)}
+                def slow_encode(value):
+                    data=original(value)
+                    if isinstance(value,dict) and 'padding' in value.get('result',{}):time.sleep(.15)
+                    return data
+                with patch.object(self.runtime.core,'dispatch_remote',result),patch.object(api,'json_bytes',slow_encode):
+                    await raw_send(right,dict(v=1,seq=1,op='tool',body_bytes=0,args={'tool':'task_get','arguments':{}}))
+                    with self.assertRaises(EOFError):
+                        async with asyncio.timeout(.5):await raw_read(right)
+                self.assertTrue(session.task.done());self.assertEqual(left.fileno(),-1)
+
+    async def test_partial_ipc_frame_cannot_append_fallback(self):
+        import asyncio
+        from .support import raw_send
+        left,right,session=await self.endpoint();loop=asyncio.get_running_loop();original=loop.sock_sendall;writes=[]
+        async def result(*args):return {'ok':True}
+        async def partial(sock,data):
+            if sock is left:
+                writes.append(bytes(data))
+                if len(writes)==1:
+                    await original(sock,data[:8]);raise mod('remote_schemas').RemoteError('output_limit')
+            return await original(sock,data)
+        with patch.object(self.runtime.core,'dispatch_remote',result),patch.object(loop,'sock_sendall',partial):
+            await raw_send(right,dict(v=1,seq=1,op='tool',body_bytes=0,args={'tool':'task_get','arguments':{}}))
+            await asyncio.wait({session.task},timeout=.3)
+            self.assertEqual(len(writes),1,'Indeterminate partial frame cannot be followed by another frame')
+            self.assertTrue(session.task.done());self.assertEqual(left.fileno(),-1)
+
+    async def test_applicable_lease_deadline_bounds_response_fallback(self):
+        import asyncio,time
+        from .support import raw_send,raw_read
+        # Lease100ms is deliberately shorter than IPC500ms;150ms encoding is
+        # beyond the lease but inside IPC. A timely normal open is the control.
+        await self.stack.aclose()
+        self.fixture.core['limits']['ipc_idle_ms']=500
+        await self.start()
+        control_task=await self.task();control_ticket=await self.ticket(control_task['task_id'],b'x')
+        control=self.ok((await self.stream('open_put',{'ticket_id':control_ticket['ticket_id'],
+            'capability':control_ticket['authorization'][7:],'content_length':1}))['result'])
+        self.ok((await self.stream('close',{'lease_id':control['lease_id'],'reason':'abort'}))['result'])
+        task=await self.task();ticket=await self.ticket(task['task_id'],b'x')
+        left,right,session=await self.endpoint();ipc=mod('remote_ipc');api=mod('remote_schemas');original=ipc._stream;encode=api.json_bytes
+        async def oversized(*args):
+            result,body=await original(*args)
+            if args[2]=='open_put':return dict(result,padding='x'*70000),body
+            return result,body
+        def late(value):
+            data=encode(value)
+            if isinstance(value,dict) and 'padding' in value.get('result',{}):time.sleep(.15)
+            return data
+        with patch.object(ipc,'_stream',oversized),patch.object(api,'json_bytes',late):
+            await raw_send(right,dict(v=1,seq=1,op='open_put',body_bytes=0,args={'ticket_id':ticket['ticket_id'],
+                'capability':ticket['authorization'][7:],'content_length':1}))
+            with self.assertRaises(EOFError):
+                async with asyncio.timeout(.5):await raw_read(right)
+        self.assertFalse(self.runtime.leases);self.assertFalse(self.runtime.descriptors)

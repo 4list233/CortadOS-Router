@@ -217,3 +217,44 @@ def runtime_child(base,config,manifest,sock,control,fault=None):
             os._exit(73)  # Intentional fixture process crash; never a real worker process.
         with patch.object(module,'prepare_empty',new=injected):asyncio.run(run())
     else:asyncio.run(run())
+
+# Revision2 fixture helpers compose existing owners; they grant no policy bypass.
+async def revision_http(case, family='get'):
+    from .test_compatibility import lifespan
+    case.client=await case.connect()
+    task=await case.task()
+    if family=='put':
+        ticket=await case.ticket(task['task_id'],b'x');method='PUT'
+    else:
+        artifact,_=await case.upload(task['task_id'],b'x')
+        ticket=case.ok(await case.call('file_download_ticket',{'task_id':task['task_id'],
+            'request_id':uid(),'artifact_id':artifact['artifact_id']}))['ticket'];method='GET'
+    headers=[(b'authorization',ticket['authorization'].encode())]
+    if family=='put':headers += [(b'content-length',b'1'),(b'content-type',b'application/octet-stream')]
+    if family=='range':headers.append((b'range',b'bytes=0-0'))
+    f=case.fixture
+    app=mod('remote_http').create_test_app(core_client=case.client,principal=f.typed('Principal',f.principal),
+        config=f.typed('FrontendConfig',{'config_digest':f.digest(),'limits':f.core['limits'],'transfer_origin':f.core['transfer_origin']}))
+    await case.stack.enter_async_context(lifespan(app))
+    scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':method,'headers':headers}
+    async def receive():return {'type':'http.request','body':b'x' if method=='PUT' else b'','more_body':False}
+    return app,scope,receive,task,ticket
+
+async def observe_asgi(app,scope,receive,send,window=.35):
+    # Seconds: observer slack detects an unbounded task; it grants no transport grace.
+    pending=asyncio.create_task(app(scope,receive,send));error=None
+    await asyncio.wait({pending},timeout=window);done=pending.done()
+    if not done:pending.cancel()
+    try:await pending
+    except BaseException as exc:error=exc
+    return done,error
+
+async def capacity_fault(case):
+    # Exercise actual monitor error classification, not a fabricated authorization flag.
+    event=asyncio.Event()
+    def failed_measure():
+        event.set();raise mod('remote_schemas').RemoteError('capacity_exhausted')
+    with patch.object(case.runtime.capacity,'measure',failed_measure):
+        async with asyncio.timeout(3):await event.wait()
+        # Let the monitor finish the caught failure before the public operation.
+        await asyncio.sleep(.03)

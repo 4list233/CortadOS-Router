@@ -122,3 +122,70 @@ class BuildLifecycleRegressionExam(CoreCase):
         self.assertIsNone(response,'A later call must not consume the predecessor response')
         other=await self.connect()
         self.ok(await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'fresh endpoint'},other))
+
+class Revision2CapacityTableExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp();self.fixture.core['limits']['workspace_poll_ms']=100
+        await self.start()
+
+    async def test_capacity_only_denied_tool_table_preserves_rows_and_authority(self):
+        from .support import capacity_fault,sha
+        task_args={'request_id':uid(),'task_group_id':uid(),'title':'retained'}
+        task=self.ok(await self.call('task_create',task_args))['task']
+        artifact,ticket=await self.upload(task['task_id'],b'x')
+        download_args={'task_id':task['task_id'],'request_id':uid(),'artifact_id':artifact['artifact_id']}
+        self.ok(await self.call('file_download_ticket',download_args))
+        upload_args={'task_id':task['task_id'],'request_id':uid(),'artifact_id':None,'filename':'pending',
+            'bytes':1,'sha256':sha(b'x'),'media_type':'application/octet-stream'}
+        pending=self.ok(await self.call('file_upload_ticket',upload_args))['ticket']
+        args=self.args(task);route=dict(args)
+        for k in ('request_id','timeout_s'):route.pop(k)
+        await capacity_fault(self)
+        before={t:self.fixture.sql('SELECT count(*) FROM '+t)[0][0] for t in ('remote_tasks','jobs','remote_tickets','remote_reservations','job_feedback')}
+        calls=[('task_create',task_args),('task_create',dict(task_args,request_id=uid())),('route',route),('delegate',args),
+            ('context_requirements',{'task':'test','context':'','selection':args['selection'],'task_evidence':args['task_evidence']}),
+            ('task_delete',{'task_id':task['task_id'],'request_id':uid()}),
+            ('job_feedback',{'task_id':task['task_id'],'job_id':uid(),'feedback_id':uid(),'verdict':'inconclusive','summary':'held','checks':[]}),
+            ('file_download_ticket',download_args),('file_download_ticket',dict(download_args,request_id=uid())),
+            ('file_upload_ticket',upload_args),
+            ('file_upload_ticket',dict(upload_args,request_id=uid(),artifact_id=pending['artifact_id'])),
+            ('file_upload_ticket',{'task_id':task['task_id'],'request_id':uid(),'artifact_id':None,'filename':'denied','bytes':1,'sha256':sha(b'x'),'media_type':'application/octet-stream'})]
+        for tool,arguments in calls:
+            with self.subTest(tool=tool):
+                audit=self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0]
+                self.error(await self.call(tool,arguments),'capacity_exhausted')
+                self.assertEqual(self.fixture.sql('SELECT count(*) FROM remote_audit')[0][0],audit+1)
+                self.assertEqual(before,{t:self.fixture.sql('SELECT count(*) FROM '+t)[0][0] for t in before})
+        self.assertFalse([c for c in self.fixture.calls() if c['kind']=='exec'])
+
+    async def test_capacity_reconnect_inspects_owned_task_and_rejects_foreign_binding(self):
+        from .support import capacity_fault,mod
+        task=await self.task();await capacity_fault(self)
+        self.client=await self.connect();self.assertEqual(self.ok(await self.call('task_get',{'task_id':task['task_id']}))['task']['task_id'],task['task_id'])
+        foreign=dict(self.fixture.principal,subject='another')
+        with self.assertRaises(mod('remote_schemas').RemoteError):await self.connect(foreign)
+        self.error(await self.call('task_get',{'task_id':uid()}),'task_not_found')
+        import socket
+        from .support import raw_send,raw_read
+        left,right=socket.socketpair();left.setblocking(False);right.setblocking(False)
+        self.addCleanup(left.close);self.addCleanup(right.close)
+        await self.runtime.attach(left,self.runtime.config.principal)
+        await raw_send(right,dict(v=1,seq=0,op='bind',body_bytes=0,args={
+            'principal':self.fixture.principal,'config_digest':'f'*64}))
+        self.error((await raw_read(right))[0]['result'],'permission_refused')
+
+    async def test_capacity_only_stream_table_refuses_effects_and_retires_leases(self):
+        from .support import capacity_fault
+        put_task=await self.task();put_ticket=await self.ticket(put_task['task_id'],b'x')
+        get_task=await self.task();artifact,_=await self.upload(get_task['task_id'],b'x')
+        get_ticket=self.ok(await self.call('file_download_ticket',{'task_id':get_task['task_id'],'request_id':uid(),'artifact_id':artifact['artifact_id']}))['ticket']
+        put_args={'ticket_id':put_ticket['ticket_id'],'capability':put_ticket['authorization'][7:],'content_length':1}
+        get_args={'ticket_id':get_ticket['ticket_id'],'capability':get_ticket['authorization'][7:]}
+        put_lease=self.ok((await self.stream('open_put',put_args))['result'])['lease_id']
+        get_lease=self.ok((await self.stream('open_get',get_args))['result'])['lease_id']
+        await capacity_fault(self)
+        for op,args,body in [('open_put',put_args,b''),('open_get',get_args,b''),('put_chunk',{'lease_id':put_lease,'offset':0},b'x'),
+                             ('finish_put',{'lease_id':put_lease},b''),('read_chunk',{'lease_id':get_lease,'offset':0,'max_bytes':1},b'')]:
+            with self.subTest(op=op):self.error((await self.stream(op,args,body))['result'],'capacity_exhausted')
+        self.assertFalse(self.runtime.leases);self.assertFalse(self.runtime.descriptors)
+        self.assertEqual(self.fixture.sql("SELECT count(*) FROM remote_artifacts WHERE origin='input' AND state='sealed'")[0][0],1)

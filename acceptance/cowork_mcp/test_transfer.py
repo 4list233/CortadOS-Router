@@ -129,3 +129,101 @@ class TransferExam(CoreCase):
         lease=self.ok((await self.stream('open_get',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:]}))['result'])['lease_id']
         self.ok(await self.call('task_delete',{'task_id':task['task_id'],'request_id':uid()}))
         self.assertFalse((await self.stream('read_chunk',{'lease_id':lease,'offset':0,'max_bytes':3}))['result']['ok'])
+
+class Revision2TransferLifetimeExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.fixture.core['limits'].update(transfer_idle_ms=100,transfer_total_ms=100,ipc_idle_ms=100)
+        await self.start()
+
+    async def test_exhausted_total_idle_budget_has_no_error_delivery_grace(self):
+        from .support import revision_http,observe_asgi
+        app,scope,_,_,_=await revision_http(self,'put');sent=[];never=asyncio.Event()
+        async def receive():await never.wait()
+        async def send(message):sent.append(message);await never.wait()
+        done,error=await observe_asgi(app,scope,receive,send,window=.16)
+        self.assertTrue(done,'No second100ms error-delivery allowance is available')
+        self.assertEqual(sent,[]);self.assertFalse(self.runtime.leases)
+
+    async def test_empty_chunks_do_not_renew_idle(self):
+        from .support import revision_http,observe_asgi
+        app,scope,_,_,_=await revision_http(self,'put');count=0;sent=[]
+        async def receive():
+            nonlocal count
+            count+=1;await asyncio.sleep(.02)
+            return {'type':'http.request','body':b'','more_body':True}
+        async def send(message):sent.append(message)
+        done,error=await observe_asgi(app,scope,receive,send)
+        self.assertTrue(done);self.assertGreater(count,1);self.assertLess(count,12)
+        self.assertEqual(sent,[]);self.assertFalse(self.runtime.leases)
+
+    async def test_acknowledged_nonempty_progress_renews_idle_not_total(self):
+        from .test_compatibility import lifespan
+        from .support import observe_asgi
+        # Three80ms chunks span150ms idle.1000ms permits success;200ms total
+        # must expire despite acknowledged progress. These are fixture milliseconds.
+        for total,expected in ((1000,[201]),(200,[])):
+            with self.subTest(total_ms=total):
+                await self.stack.aclose()
+                self.fixture.core['limits'].update(transfer_idle_ms=150,transfer_total_ms=total,ipc_idle_ms=total)
+                await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'abc')
+                f=self.fixture;app=mod('remote_http').create_test_app(core_client=self.client,principal=self.runtime.config.principal,
+                    config=f.typed('FrontendConfig',{'config_digest':f.digest(),'limits':f.core['limits'],'transfer_origin':f.core['transfer_origin']}))
+                await self.stack.enter_async_context(lifespan(app));chunks=iter((b'a',b'b',b'c'));sent=[];index=0
+                async def receive():
+                    nonlocal index
+                    await asyncio.sleep(.08);index+=1
+                    return {'type':'http.request','body':next(chunks),'more_body':index<3}
+                async def send(message):sent.append(message)
+                scope={'type':'http','path':'/transfers/'+ticket['ticket_id'],'query_string':b'','method':'PUT',
+                    'headers':[(b'authorization',ticket['authorization'].encode()),(b'content-length',b'3'),(b'content-type',b'application/octet-stream')]}
+                done,error=await observe_asgi(app,scope,receive,send,window=.7)
+                self.assertTrue(done)
+                self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],expected)
+                if expected:self.assertIsNone(error)
+                self.assertFalse(self.runtime.leases)
+
+    async def test_lost_http_put_receipt_exposes_seal_without_second_put(self):
+        from .support import revision_http,observe_asgi
+        app,scope,receive,task,ticket=await revision_http(self,'put');starts=[];never=asyncio.Event()
+        async def send(message):
+            if message['type']=='http.response.start':starts.append(message['status'])
+            else:await never.wait()
+        done,error=await observe_asgi(app,scope,receive,send)
+        self.assertTrue(done);self.assertEqual(starts,[201])
+        self.assertTrue(self.client.closed,'Exhausted receipt retires indeterminate shared endpoint')
+        self.client=await self.connect()
+        artifacts=self.ok(await self.call('task_get',{'task_id':task['task_id']}))['task']['artifacts']
+        self.assertEqual([(x['artifact_id'],x['state']) for x in artifacts],[(ticket['artifact_id'],'sealed')])
+        self.error((await self.stream('open_put',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:],'content_length':1}))['result'],'ticket_consumed')
+
+    async def test_shared_client_expiry_does_not_cancel_accepted_worker(self):
+        from .support import revision_http,observe_asgi
+        # IPC includes synthetic native preflight;5s permits startup while HTTP idle stays100ms.
+        await self.stack.aclose();self.fixture.core['limits'].update(ipc_idle_ms=5000,transfer_total_ms=5000)
+        await self.start()
+        # Keep the worker alive independently of the expiring frontend operation.
+        self.fixture.control(hang=True)
+        task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']['job_id']
+        async with asyncio.timeout(5):
+            while not any(c.get('kind')=='exec' for c in self.fixture.calls()):await asyncio.sleep(.01)
+        app,scope,receive,_,_=await revision_http(self,'get');never=asyncio.Event();headers=asyncio.Event()
+        async def send(message):
+            if message['type']=='http.response.start':headers.set();return
+            await never.wait()
+        operation=asyncio.create_task(observe_asgi(app,scope,receive,send))
+        await headers.wait()
+        # Hold the existing serialization primitive so the concurrent MCP call is
+        # genuinely queued when the HTTP lifetime expires; no fake response codec.
+        await self.client.lock.acquire()
+        other=asyncio.create_task(self.client.call('job_status',{'task_id':task['task_id'],'job_id':job}))
+        await asyncio.sleep(0);self.assertFalse(other.done())
+        try:done,error=await operation
+        finally:self.client.lock.release()
+        self.assertTrue(done)
+        with self.assertRaises(mod('remote_schemas').RemoteError):await other
+        self.client=await self.connect()
+        state=self.ok(await self.call('job_status',{'task_id':task['task_id'],'job_id':job}))['job']['state']
+        self.assertNotIn(state,('cancelled','interrupted','failed','timed_out'))
+        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+        self.ok(await self.call('job_cancel',{'task_id':task['task_id'],'job_id':job}))

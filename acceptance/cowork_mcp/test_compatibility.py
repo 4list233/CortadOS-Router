@@ -169,7 +169,7 @@ class BuildHttpDeadlineRegressionExam(CoreCase):
             # 500ms observation window comfortably exceeds100ms synthetic idle;
             # it is only test completion slack, never a transport jitter allowance.
             await asyncio.wait_for(asyncio.shield(pending),.5)
-            self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[408])
+            self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[])
             self.assertFalse(self.runtime.leases)
         finally:
             if not pending.done():pending.cancel()
@@ -198,3 +198,69 @@ class BuildHttpDeadlineRegressionExam(CoreCase):
             if not pending.done():pending.cancel()
             try:await pending
             except (asyncio.CancelledError,Exception):pass # An abort after headers is the required disposition.
+
+class Revision2HttpExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.fixture.core['limits'].update(transfer_idle_ms=100,transfer_total_ms=500,ipc_idle_ms=500)
+        await self.start()
+
+    async def test_all_response_families_timely_status_controls(self):
+        from .support import revision_http,observe_asgi
+        for family,status in [('put',201),('get',200),('range',416)]:
+            with self.subTest(family=family):
+                app,scope,receive,_,_=await revision_http(self,family);sent=[]
+                async def send(message):sent.append(message)
+                done,error=await observe_asgi(app,scope,receive,send)
+                self.assertTrue(done);self.assertIsNone(error)
+                self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[status])
+        for code,status in [('invalid_request',400),('ticket_invalid',401),('permission_refused',403),
+                            ('artifact_not_found',404),('transfer_busy',409),('output_limit',413),
+                            ('capacity_exhausted',507),('storage_error',503)]:
+            with self.subTest(code=code):
+                app,scope,receive,_,_=await revision_http(self);sent=[]
+                async def send(message):sent.append(message)
+                async def refuse(*args,**kwargs):return {'result':mod('remote_schemas').RemoteError(code).payload(),'body':b''}
+                with patch.object(self.client,'stream',refuse):done,error=await observe_asgi(app,scope,receive,send)
+                self.assertTrue(done);self.assertIsNone(error)
+                self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[status])
+
+    async def test_all_response_families_stalled_start_or_body_abort_once(self):
+        from .support import revision_http,observe_asgi
+        import contextlib
+        cases=[('put',None),('get',None),('range',None)]+[('get',c) for c in
+            ('invalid_request','ticket_invalid','permission_refused','artifact_not_found','transfer_busy','output_limit','capacity_exhausted','storage_error')]
+        for family,code in cases:
+            for stage in ('http.response.start','http.response.body'):
+                with self.subTest(family=family,code=code,stage=stage):
+                    app,scope,receive,_,_=await revision_http(self,family);sent=[];never=asyncio.Event()
+                    async def send(message):
+                        sent.append(message)
+                        if message['type']==stage:await never.wait()
+                    async def refuse(*args,**kwargs):return {'result':mod('remote_schemas').RemoteError(code).payload(),'body':b''}
+                    with patch.object(self.client,'stream',refuse) if code else contextlib.nullcontext():
+                        done,error=await observe_asgi(app,scope,receive,send)
+                    self.assertTrue(done,'Response backpressure exceeded original idle deadline')
+                    self.assertEqual(sum(m['type']=='http.response.start' for m in sent),1)
+                    self.assertFalse(self.runtime.leases)
+
+    async def test_header_attempt_failure_cannot_emit_replacement_start(self):
+        from .support import revision_http,observe_asgi
+        for family in ('put','get','range'):
+            with self.subTest(family=family):
+                app,scope,receive,_,_=await revision_http(self,family);sent=[]
+                async def send(message):
+                    sent.append(message)
+                    if message['type']=='http.response.start':raise TimeoutError('synthetic partial headers')
+                done,error=await observe_asgi(app,scope,receive,send)
+                self.assertTrue(done);self.assertEqual(sum(m['type']=='http.response.start' for m in sent),1)
+
+    async def test_timely_preheader_timeout_uses_positive_remaining_budget(self):
+        from .support import revision_http,observe_asgi
+        app,scope,_,_,_=await revision_http(self,'put');sent=[]
+        async def early_timeout():raise TimeoutError('synthetic upstream wait failed before local deadline')
+        async def send(message):sent.append(message)
+        done,error=await observe_asgi(app,scope,early_timeout,send)
+        self.assertTrue(done);self.assertIsNone(error)
+        self.assertEqual([m['status'] for m in sent if m['type']=='http.response.start'],[408])
+        self.assertFalse(self.runtime.leases)

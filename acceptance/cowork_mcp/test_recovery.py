@@ -226,3 +226,86 @@ class BuildIntegrityRegressionExam(CoreCase):
         await asyncio.sleep(.01)
         self.assertFalse(self.runtime.admission_failed)
         self.ok(await self.call('task_create',{'request_id':uid(),'task_group_id':uid(),'title':'timely control'}))
+
+class Revision2CapacityRecoveryExam(CoreCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp();self.fixture.core['limits']['workspace_poll_ms']=1000
+        self.fixture.control(hang=True);await self.start()
+
+    async def stopped_by_capacity(self):
+        import time
+        task=await self.task();arguments=self.args(task)
+        job=self.ok(await self.call('delegate',arguments))['job']['job_id']
+        async with asyncio.timeout(5):
+            while not any(c.get('kind')=='exec' for c in self.fixture.calls()):await asyncio.sleep(.01)
+        # A deliberate1250ms stall exceeds the1000ms sample-start deadline; no jitter allowance.
+        # One second permits fake-native startup before this deliberate fault injection.
+        time.sleep(1.25);await asyncio.sleep(.03)
+        async with asyncio.timeout(5):
+            while self.runtime.broker.store.get(job)['state'] not in ('cancelled','failed','timed_out','interrupted','succeeded'):await asyncio.sleep(.02)
+        row=self.runtime.broker.store.get(job)
+        self.assertTrue(self.runtime.broker.receipt(row));self.assertEqual(row['state'],'cancelled');self.assertEqual(row['reason'],'capacity_exhausted')
+        return task,job,arguments
+
+    async def test_controlled_missed_sample_preserves_terminal_task_status_result(self):
+        task,job,arguments=await self.stopped_by_capacity();self.assertFalse(self.runtime.broker.store.admission_closed)
+        self.client=await self.connect()
+        self.ok(await self.call('task_get',{'task_id':task['task_id']}))
+        for op in ('job_status','job_result'):
+            result=self.ok(await self.call(op,{'task_id':task['task_id'],'job_id':job}))
+            self.assertEqual(result['job']['state'],'cancelled');self.assertEqual(result['job']['reason'],'capacity_exhausted')
+        self.error(await self.call('delegate',arguments),'capacity_exhausted')
+        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+
+    async def test_capacity_existing_job_cancel_is_idempotent_and_owned(self):
+        task,job,_=await self.stopped_by_capacity();key={'task_id':task['task_id'],'job_id':job}
+        first=self.ok(await self.call('job_cancel',key));second=self.ok(await self.call('job_cancel',key))
+        self.assertEqual(first,second);self.error(await self.call('job_cancel',dict(key,task_id=uid())),'job_not_found')
+        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+
+    async def test_capacity_latch_never_reopens_after_good_sample_or_restart_relaunches(self):
+        task,job,arguments=await self.stopped_by_capacity()
+        self.runtime.capacity.measure();await asyncio.sleep(.15)
+        self.error(await self.call('delegate',arguments),'capacity_exhausted')
+        await self.stack.aclose();await self.start()
+        result=self.ok(await self.call('job_result',{'task_id':task['task_id'],'job_id':job}))
+        self.assertEqual(result['job']['state'],'cancelled')
+        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
+
+    async def test_capacity_cleanup_and_disabled_override_retire_owned_resources(self):
+        from .support import capacity_fault,owner
+        task=await self.task();ticket=await self.ticket(task['task_id'],b'x')
+        lease=self.ok((await self.stream('open_put',{'ticket_id':ticket['ticket_id'],'capability':ticket['authorization'][7:],'content_length':1}))['result'])['lease_id']
+        await capacity_fault(self)
+        self.ok((await self.stream('close',{'lease_id':lease,'reason':'abort'}))['result'])
+        self.ok((await self.stream('close',{'lease_id':lease,'reason':'abort'}))['result'])
+        self.assertFalse(self.runtime.descriptors)
+        await self.runtime.disable_owner(owner(self.fixture.principal));await self.runtime.disable_owner(owner(self.fixture.principal))
+        self.error(await self.call('task_get',{'task_id':task['task_id']}),'permission_refused')
+        with self.assertRaises(mod('remote_schemas').RemoteError):await self.connect()
+
+    async def test_fatal_integrity_and_audit_override_capacity_observation(self):
+        from .support import capacity_fault
+        import contextlib,io
+        task=await self.task();await capacity_fault(self)
+        # Existing runtime fatal primitive is the named integrity/audit boundary.
+        with contextlib.redirect_stderr(io.StringIO()):self.runtime.fatal()
+        for op,args in [('task_get',{'task_id':task['task_id']}),('job_status',{'task_id':task['task_id'],'job_id':uid()})]:
+            self.error(await self.call(op,args),'storage_error')
+        self.assertTrue(self.runtime.broker.store.admission_closed)
+        self.assertFalse(self.runtime.descriptors)
+
+    async def test_capacity_observation_keeps_binding_corruption_refusal(self):
+        from unittest.mock import patch
+        task,job,_=await self.stopped_by_capacity()
+        # Corrupt the actual read projection seam, without mutating the persisted evidence.
+        from .support import mod
+        store=mod('task_store');original=store.rows;hits=[]
+        def corrupt(db,table,*args,**kwargs):
+            if table=='remote_job_bindings':
+                hits.append(table);raise mod('remote_schemas').RemoteError('storage_error')
+            return original(db,table,*args,**kwargs)
+        with patch.object(store,'rows',corrupt):
+            self.error(await self.call('job_result',{'task_id':task['task_id'],'job_id':job}),'storage_error')
+        self.assertTrue(hits,'Allowed capacity observation must still validate the real binding')
+        self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
