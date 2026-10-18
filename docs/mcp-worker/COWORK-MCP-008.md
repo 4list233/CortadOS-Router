@@ -1,12 +1,12 @@
 <!-- PURPOSE: Specify the remote Cowork boundary without authorizing implementation or activation.
-     CONTRACT: RT-COWORK-MCP-008 v4, draft; same assignment and independent gates.
+     CONTRACT: RT-COWORK-MCP-008 v5, draft; same assignment and independent gates.
      DEPENDS: RT-MCP-001–007; maintained FastMCP 3.4.9 auth and MCP 1.30.0.
      CEILING: Contract authoring only. No production, exams, credentials, commits or live changes. -->
 # Cowork remote MCP implementation contract
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 4
+contract_version: 5
 status: draft
 owner: Forest
 author_role: contract author
@@ -18,7 +18,7 @@ independent_review: pending designated QA D then A
 attempt_ledger: inherited; see DECISIONS evidence ledger (never reset)
 ```
 
-[FIXED] v4 defines one independently gateable **LOCAL CORE** package: closed schemas, mandatory
+[FIXED] v5 defines one independently gateable **LOCAL CORE** package: closed schemas, mandatory
 configuration, synthetic-principal composition, task ownership/folders, immutable artifacts, raw binary
 transfer, durable replay and existing broker/native seams. OAuth, general tasks without repositories,
 automatic folders, binary transfer and existing subscription workers remain authorized scope.
@@ -42,7 +42,7 @@ No independent D0/A0 is claimed. AC-008-01/02 remain exclusively future-auth.
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:cortados:RT-COWORK-MCP-008:v4",
+  "$id": "urn:cortados:RT-COWORK-MCP-008:v5",
   "$defs": {
     "ID": {"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
     "Hash": {"type":"string","pattern":"^[0-9a-f]{64}$"},
@@ -149,7 +149,7 @@ HTTPSOrigin is scheme https plus hostname and optional port, with no userinfo/pa
 
 ### Storage definitions
 
-All remote tables are additive in jobs.db. Existing PRAGMA user_version=1, jobs/job_feedback columns, triggers and ordinary hashes are unchanged. remote_schema has singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL CHECK(version=1). No v3 source was implemented; this v4 draft layout replaces the unbuilt v3 layout.
+All remote tables are additive in jobs.db. Existing PRAGMA user_version=1, jobs/job_feedback columns, triggers and ordinary hashes are unchanged. remote_schema has singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL CHECK(version=1). The v4 layout replaced the unbuilt v3 layout; v5 retains that layout and the two rejected implementation records.
 
 Scalar record fields map to same-name TEXT/INTEGER columns. Nested fields map to <field>_json TEXT using general canonical JSON; nullable record fields alone permit SQL NULL. Enum/range/boolean constraints apply to columns and nested validation on write/read. RemoteBinding seed maps to seed_json; bindings add derived owner_id/task_id/active columns. Operations add derived task_id equal to object_ids.task_id. Audit has event_id TEXT PRIMARY KEY,event_json TEXT NOT NULL. There is no receipt_json duplicating live state.
 
@@ -217,7 +217,7 @@ Under the lock: open/integrity-check ordinary JobStore → apply remote migratio
 
 ### Process and client lifetime
 
-Trusted fixture code creates socket.socketpair(AF_UNIX,SOCK_STREAM) before process startup. Spawn passes the actual socket object using Python multiprocessing's socket reduction, not a serialized integer. Each process closes its unused endpoint; the parent closes child-end copies after transfer. Broker process enters CoreRuntime and calls await runtime.attach(server_socket,principal). Attach verifies ready state and exact trusted principal, adopts the endpoint and starts remote_ipc.serve_endpoint; only runtime constructs CoreBroker. Frontend constructs CoreClient with its endpoint and FrontendConfig and awaits bind before create_test_app. CoreClient owns only its endpoint; runtime owns server endpoints and leases. No socket path is created. disable_owner rejects an unknown owner_id with permission_refused; repeating disable for the configured owner is idempotent after awaiting outstanding closes. Config/principal snapshots remain immutable; the runtime owns the separate mutable enabled latch.
+Trusted fixture code creates socket.socketpair(AF_UNIX,SOCK_STREAM) before process startup. Spawn passes the actual socket object using Python multiprocessing's socket reduction, not a serialized integer. Each process closes its unused endpoint; the parent closes child-end copies after transfer. Broker process enters CoreRuntime and calls await runtime.attach(server_socket,principal). Attach verifies ready state, exact trusted principal and the capacity-only operation table, adopts the endpoint and starts remote_ipc.serve_endpoint; only runtime constructs CoreBroker. Frontend constructs CoreClient with its endpoint and FrontendConfig and awaits bind before create_test_app. CoreClient owns only its endpoint; runtime owns server endpoints and leases. No socket path is created. disable_owner rejects an unknown owner_id with permission_refused; repeating disable for the configured owner is idempotent after awaiting outstanding closes. Config/principal snapshots remain immutable; the runtime owns the separate mutable enabled latch.
 
 CoreClient.call maps to tool. CoreClient.stream maps only to open_put/put_chunk/finish_put/open_get/read_chunk/close. Each awaits one request/response under the client's serialization lock. CoreClient.close is idempotent, shuts down/closes the endpoint, and aborts its local awaits; server EOF closes all connection leases. It does not cancel accepted jobs. EOF/framing/timeout becomes RemoteError(storage_error,"Private core connection unavailable") with uncertain mutation outcome; no automatic resend. Domain Failure is returned unchanged. Body is bytes in FrameResult; no text decoding.
 
@@ -238,7 +238,40 @@ Only put_chunk request and read_chunk success carry bodies. bind is first/once/e
 
 put_chunk requires nonempty body and offset equal to current offset. read_chunk requires exact current offset and max_bytes≤chunk_bytes; it returns next offset and eof iff next offset equals declared length. At EOF, another read is length_mismatch. Zero-length GET has one read returning empty/eof=true. Either direction's offset mismatch returns length_mismatch, closes the lease and revokes that ticket. Other framing violations abort all connection leases. A complete GET close releases the lease but keeps ticket issued for another full GET until expiry. An incomplete PUT close revokes its ticket; only finish_put can consume it. Deadlines are UTC in durable records, with monotonic timers derived once on open for total/idle time; progress renews idle only.
 
-Control overflow is measured on encoded full header/result before writing. An oversized tool result becomes Failure(output_limit,"Control response exceeds configured bound") in the same seq/op, empty body; committed state is unchanged. This fallback is bounded by requiring control_bytes≥512; 512 is a protocol envelope floor allowing all op names and maximum seq, not a deployment throughput choice. Any larger error message is replaced by this fixed message. A raw read body is already chunk-bounded. A successful open lease whose response overflows is closed/revoked before the error; no orphan lease survives. A post-commit overflow uses inspection/replay, never a new acceptance. No record truncation.
+Control overflow is measured on encoded full header/result before writing. Before any write and while remaining response budget is positive, an oversized tool result becomes Failure(output_limit,"Control response exceeds configured bound") in the same seq/op, empty body; committed state is unchanged. This fallback is bounded by requiring control_bytes≥512; 512 is a protocol envelope floor allowing all op names and maximum seq, not a deployment throughput choice. Any larger error message is replaced by this fixed message. A raw read body is already chunk-bounded. A successful open lease whose response overflows is closed/revoked before the error; no orphan lease survives. A post-commit overflow uses inspection or replay where the operation table permits it, never a new acceptance. No record truncation.
+
+### Revision-2 response lifetime and operation admission — [FIXED]
+
+Forest approved proposal v2 (SHA256 a4fa9ebfac15604d5d516c25dadf3c87ff690ec4305a8c24b0c634a011b34bbf) at root approval commit 18e4a7f. This v5 amendment retains the contract/group and two valid failures. Historical v4 D0/A0 do not apply to these changed bytes. Renewed independent D0, committed independent exams, A0 and explicit revised build grant remain prerequisites; this author has no production or exam write authority.
+
+remote_http owns one frontend lifetime from transfer entry, including all success, Range416 and refusal response paths. It captures total_deadline=entry_monotonic+transfer_total_ms and idle_deadline=entry_monotonic+transfer_idle_ms once. Remaining budget is min(total_deadline,idle_deadline)-monotonic_now, using monotonic milliseconds for all operands. Only acknowledged nonempty byte progress renews idle; empty chunks, header sends, validation, errors and cleanup never renew it. Every awaited receive, send, IPC step and bounded cleanup uses this remaining minimum, including time waiting on the shared client lock. No new timer policy, grace interval, timeout default or response retry is introduced.
+
+The shared response state is enum[not_attempted,headers_attempted,headers_complete,finished], initially not_attempted. Set headers_attempted before awaiting response.start; successful return sets headers_complete; successful final body return sets finished. JSON PUT201/errors, Range416 and binary GET200 use the same guarded emitter and state. Any error or timeout from headers_attempted onward aborts without another response.start. In not_attempted a timeout may emit408 only with positive remaining budget; otherwise abort without headers. A refusal send remains subject to the same budget and state. No exception handler obtains a new idle interval. Successful statuses, binary bytes, Content-Disposition and sealed artifact semantics are unchanged.
+
+At frontend budget exhaustion, retire the indeterminate CoreClient endpoint through existing idempotent local close, not an unbounded close RPC. file_transfer remains descriptor owner; broker endpoint teardown and existing lease timers retire its descriptors. Shared MCP/transfer users receive existing closed-connection storage_error and reconnect explicitly. No accepted job is cancelled or resent. If finish_put committed but its receipt was lost, task_get exposes the committed seal; consumed bytes are never retried.
+
+remote_ipc owns one response-write deadline captured before primary encoding/validation from existing ipc_idle_ms and bounded by applicable lease total/idle deadlines. Encoding/validation time consumes that allowance. A validation failure before any write may select the existing output_limit fallback only within the same remaining deadline. The fallback never starts a fresh clock. Once frame bytes may have been emitted, or remaining time is exhausted, retire the endpoint without another frame or retry. Preserve seq/op, committed state, lease cleanup and accepted job lifetime. No public callable or wire shape changes.
+
+CoreRuntime owns distinct capacity-only and fatal integrity/audit/storage admission reasons; store.admission_closed remains fatal, never capacity-only. Capacity failure still invokes existing Broker.stop/Watchdog containment. No automatic reopening or resampling reset is allowed. The exact approved table is normative for attach/bind, CoreBroker tool dispatch and remote_ipc/file_transfer stream admission, including post-wait checks before effects. Cleanup remains mandatory in all states. Exact trusted principal/config and enabled state are checked; fatal checks cannot be bypassed by limited observation. A detected ownership/projection/audit failure on an otherwise permitted observation escalates to fatal refusal. Capacity diagnostics remain distinguishable from storage corruption.
+
+<!-- ADMISSION-BEGIN -->
+| Operation | Capacity-only latch | Fatal integrity/audit/storage latch | Disabled owner |
+|---|---|---|---|
+| attach/bind of exact trusted principal/config | Allow endpoint for limited operations below; no new authority | Refuse ordinary tool/stream authority; cleanup still mandatory | Refuse |
+| task_get | Allow ordinary owned-task projection; no transfer capability and no mutation/repair | Refuse storage_error | Refuse permission_refused |
+| job_status / job_result | Allow only after normal owner/task/job/binding/publication validation; expose actual durable native state/reason | Refuse storage_error | Refuse permission_refused |
+| job_cancel | Allow existing owned job only, normal idempotent stop intent and existing containment; never create/restart | Refuse public call; internal shutdown/containment must still attempt cleanup | Refuse public call; existing internal lifetime rules unchanged |
+| job_feedback | Refuse capacity_exhausted; append-only feedback may be submitted after explicit qualified restart | Refuse storage_error | Refuse permission_refused |
+| task_delete | Refuse capacity_exhausted; no speculative cleanup when usage sample is untrusted | Refuse storage_error | Refuse permission_refused |
+| context_requirements | Refuse capacity_exhausted; not required for existing-attempt inspection | Refuse storage_error | Refuse permission_refused |
+| task_create / route / delegate | Refuse capacity_exhausted, including replay invocation through these methods; inspect accepted identity with task_get/job methods | Refuse storage_error | Refuse permission_refused |
+| file_upload_ticket / file_download_ticket | Refuse capacity_exhausted, including ticket replay/renewal | Refuse storage_error | Refuse permission_refused |
+| open_put / open_get / put_chunk / finish_put / read_chunk | Refuse capacity_exhausted; retire the connection's affected existing lease before any further byte effect; no new stream | Refuse storage_error and retire owned descriptors | Refuse permission_refused and revoke/retire |
+| close / endpoint teardown / internal lease timer | Cleanup-only, idempotent existing owned lease; no new authority or resource promises | Cleanup still runs without treating corrupt metadata as permission to delete unknown files | Cleanup still runs |
+| trusted disable / runtime shutdown | Preserve existing control/lifetime ownership; no admission reopening | Preserve fail-stop/containment and fixed fatal signaling | Same-state disable remains no-op |
+<!-- ADMISSION-END -->
+
+Limited observation validates ordinary principal/task ownership, execution discriminator, binding agreement, output publication and response schema. It performs no routing/scoring/quota/model calls, ticket minting, repair or worker allocation. Ordinary integrity/audit validation is retained; observation is not a repair path. Explicit qualified restart uses existing recovery; it neither relaunches accepted work nor changes subscription/fresh-quota admission for later new work.
 
 ### Synthetic ASGI composition
 
@@ -248,7 +281,7 @@ The app creates the existing SDK1.30 lowlevel Server named cortados-studio-worke
 
 Exact route dispatch (raw path match, no redirects): POST /mcp invokes manager.handle_request; every other /mcp method returns405 with Allow: POST. GET/DELETE event streams and transport session termination are not exposed by this stateless profile. The SDK may return its normal202 for a notification and JSON200 for a request; no Mcp-Session-Id is issued. /mcp/ is unmatched. /transfers/<ticket_id> matches only one canonical UUID4 path segment and admits PUT/GET; all other methods including HEAD return405 with Allow: GET, PUT. Unknown/malformed paths return404. No path accepts a query string: a present nonempty query returns400 before dispatch. Unmatched/method/query responses contain the fixed Failure(invalid_request,"Remote operation refused: invalid_request") JSON and Cache-Control:no-store. No CORS middleware, static-file mount, OAuth/discovery route or convenience health endpoint is part of the local app.
 
-The app bounds the complete /mcp request body at control_bytes before passing it to the SDK, returning413 on excess without a core call. Transfer PUT bodies use the existing chunk and declared-length path, never the MCP body buffer. Other HTTP errors follow the exact transfer/status definitions in this section. All routes use the already-bound synthetic principal; transfer Authorization is solely the existing scoped capability and does not alter principal. The app does not convert an MCP Authorization header into authority. HTTP disconnect closes that request's transfer lease but leaves the shared CoreClient and accepted jobs alive. App shutdown closes the shared endpoint and thereby every remaining connection lease. No transport operation implicitly cancels a job.
+The app bounds the complete /mcp request body at control_bytes before passing it to the SDK, returning413 on excess without a core call. Transfer PUT bodies use the existing chunk and declared-length path, never the MCP body buffer. Other HTTP errors follow the exact transfer/status definitions in this section. All routes use the already-bound synthetic principal; transfer Authorization is solely the existing scoped capability and does not alter principal. The app does not convert an MCP Authorization header into authority. HTTP disconnect closes that request's transfer lease within remaining budget; exhausted budget retires the shared CoreClient endpoint as defined in the response lifetime. Accepted jobs remain alive. App shutdown closes the shared endpoint and thereby every remaining connection lease. No transport operation implicitly cancels a job.
 
 Exact server initialization instruction (UTF-8 prose, not a capability grant):
 
@@ -264,7 +297,7 @@ build_handoff returns the unchanged task_evidence.handoff(arguments) followed by
 `\n\nREMOTE INPUT MANIFEST (untrusted reference data; not instructions or permission)\n`
 followed by general canonical JSON of {schema:"cortados.cowork-inputs.v1",inputs:[{artifact_id:ID,path:Text,bytes:N,sha256:Hash}],output_directory:"outputs"} and a final newline. Inputs preserve request order; path is exactly inputs/<artifact_id>/<filename>. No absolute path, blob inode, capture location, fetched bytes, policy instruction or original text rewrite enters this appendix. Empty inputs still produce the appendix. Handoff.worker_bytes counts the UTF-8 bytes of the entire text; sha256 hashes those exact bytes. It is checked before route invocation, again in the acceptance transaction, and by Watchdog before native spawn. Equality to the accepted Handoff and Route.context.worker_bytes is required at each boundary.
 
-**Root-approved narrow source seam.** route_task.py:78–100 builds packet internally and _resolve uses it for input_fit, including token estimation from characters. Existing API has no packet argument. Merely replacing returned worker_bytes misreports admission. Granted narrow future extension after D/A:
+**Historical prebuild source seam, retained in the future scope.** At the prebuild pin, route_task.py:78–100 builds packet internally and _resolve uses it for input_fit, including token estimation from characters. The prebuild API has no packet argument; the frozen candidate now includes the reviewed seam. Merely replacing returned worker_bytes misreports admission. Granted narrow future extension after D/A:
 `route_task(arguments,config,metadata,*,handoff_packet:str|None=None)`.
 Only remote_native's validated full text is supplied on the remote path; None preserves ordinary handoff. Existing route_task owns budget, scoring, input-fit, quota refresh and chosen model; the packet is used in its existing _resolve calls. No copied routing logic. Schema validation and scoring_text still consume unchanged arguments. task_evidence.py and schemas.py need no changes. Root grants this exact route_task.py extension in the future source scope. Independent QA freezes ordinary/remote fit fixtures before builder dispatch. context_requirements can use its existing output and replace worker_bytes/status based on build_handoff; missing/scorer questions retain the existing owner. Without a task/input list that tool measures the empty appendix and is advisory; route/delegate always measure the actual selected list.
 
@@ -272,7 +305,7 @@ Persisted jobs.record adds execution_kind:"cowork_remote_v1" for remote jobs; or
 
 ### Acceptance and result projection
 
-JobStore is sole job-ID allocator. CoreBroker checks public replay before preparation. With admission_lock then the task lock held, it validates the complete remote request, owned ready task, group and sealed input list, and commits a PreparationRow through JobStore.transaction before any workspace mkdir. The private preparation ID is a new UUID4 allocated by task_store; it is neither a job ID nor public accepted-operation identity. Its relative_name is exactly <task_id>/runs/<request_id>. Task version and canonical remote argument hash are recorded. No OperationRow is inserted for this provisional step.
+JobStore is sole job-ID allocator. CoreBroker applies the capacity-only operation table before public replay, then checks public replay before preparation. With admission_lock then the task lock held, it validates the complete remote request, owned ready task, group and sealed input list, and commits a PreparationRow through JobStore.transaction before any workspace mkdir. The private preparation ID is a new UUID4 allocated by task_store; it is neither a job ID nor public accepted-operation identity. Its relative_name is exactly <task_id>/runs/<request_id>. Task version and canonical remote argument hash are recorded. No OperationRow is inserted for this provisional step.
 
 prepare_empty opens paths relative to verified task-root descriptors, creates the request directory containing only outputs/, fsyncs the directories and returns its device/inode. task_store changes intent→prepared with that identity in a separate JobStore transaction. Only then may existing LocalArgs validation and route_task run with that existing cwd. The locks remain held across routing, but no SQLite transaction does. A route-only recommendation performs no workspace preparation. Parallel delete or another delegate waits for the same task lock and then reevaluates the durable rows.
 
@@ -286,7 +319,7 @@ Startup reconciles all intent/prepared rows before admission. It performs no rou
 
 Remote route requires the same explicit input_artifact_ids list as delegate; an empty list is explicit. Both resolve sealed owned InputEntry records before build_handoff. context_requirements has no input list and reports the empty-appendix estimate only.
 
-Task create identity consists of task_id, group/title, creation time and snapshot. Operation rows retain identity, argument hash and phase, not a frozen response. Identical replay returns current authorized projection of those same identities; it never redoes scoring, acceptance or ticket issuance. Changed normalized caller args conflict. Replayed create/delete can return creating/deleting/quarantined/deleted; failure after durable create intent returns the task with cleanup_error and quarantined state. Uncommitted refusal claims no request_id. Ticket replay reconstructs the same token/expiry only under matching key_version; revoked key returns ticket_invalid. Delegate replay returns same job with live state/publication/result. Feedback remains existing immutable feedback receipt; cancel remains job-id idempotent.
+Task create identity consists of task_id, group/title, creation time and snapshot. Operation rows retain identity, argument hash and phase, not a frozen response. After the operation table permits the invocation, identical replay returns current authorized projection of those same identities; it never redoes scoring, acceptance or ticket issuance. Changed normalized caller args conflict. Replayed create/delete can return creating/deleting/quarantined/deleted; failure after durable create intent returns the task with cleanup_error and quarantined state. Uncommitted refusal claims no request_id. Ticket replay reconstructs the same token/expiry only under matching key_version; revoked key returns ticket_invalid. Delegate replay returns same job with live state/publication/result. Feedback remains existing immutable feedback receipt; cancel remains job-id idempotent.
 
 Route/delegate evidence requires all five existing evidence arrays with nonempty verification; references remain data, never fetched URLs. min_band is valid only for S1; timeout_s is bounded by existing max_timeout_s. Permission/selection/evidence validation adopts existing validators after removing remote-only fields and supplying only broker-derived cwd for delegate. No route result is a caller-selected policy.
 
@@ -298,7 +331,7 @@ CapacityMonitor is broker-owned, runtime-scoped, and the only usage/reservation 
 
 M_i is total payload-tree measured bytes; DB/WAL/audit/native evidence metadata is excluded from M_i but included in filesystem free-space pressure. All roots are on one filesystem. F=statvfs.f_bavail*statvfs.f_frsize, available to service uid, sampled before each reservation. R_t/R_i=sum(max(0,bytes-materialized_bytes)) for held reservations. Credit materialized_bytes advances only after durable file growth is measured against the reservation's intent/inode, capped at bytes; no optimistic ACK credit. Renames preserve inode/accounting. Copies reserve a separate destination amount. A fresh reservation n is allowed iff M_t+R_t+n≤task limit, M_i+R_i+n≤current installation limit, and F≥R_i+n+disk_headroom_bytes. Equal boundaries pass. File/count/stream limits are checked independently. Upload reserves one staging extent; same-filesystem rename adds zero. Input-copy and output-snapshot each reserve all destination bytes before copy; source remains measured. Released reservations require proof no writer plus reconciled deletion/rename; unknown ownership retains full promise.
 
-Monitor samples before each reservation and every workspace_poll_ms from prior sample start. Missed poll deadline or unmeasurable usage closes admission and stops affected active remote jobs with capacity_exhausted; an installation failure stops all active remote jobs. M+R exceeding limits, F<R_i+headroom, artifact slot excess or individual workspace regular file >file_bytes triggers the same stop path. Existing Broker.stop and Watchdog termination own containment. Capacity stop uses ordinary code capacity_exhausted; remote projection records reason capacity_exhausted and cancelled native state after proven stop, publication pending/failed as applicable. No hard OS quota is claimed. Overshoot is measured as max observed usage minus limit from detection through proven termination; QA records sample intervals, stop latency, peak bytes and raw traces for synthetic writer rates. Live headroom/poll approval remains an activation gate.
+Monitor samples before each reservation and every workspace_poll_ms from prior sample start. Missed poll deadline or unmeasurable usage latches capacity-only new-work refusal under the operation table and stops affected active remote jobs with capacity_exhausted; an installation failure stops all active remote jobs. M+R exceeding limits, F<R_i+headroom, artifact slot excess or individual workspace regular file >file_bytes triggers the same stop path. Existing Broker.stop and Watchdog termination own containment. Capacity stop uses ordinary code capacity_exhausted; remote projection records reason capacity_exhausted and cancelled native state after proven stop, publication pending/failed as applicable. No hard OS quota is claimed. Overshoot is measured as max observed usage minus limit from detection through proven termination; QA records sample intervals, stop latency, peak bytes and raw traces for synthetic writer rates. Live headroom/poll approval remains an activation gate.
 
 Ticket MAC format identity is "cortados.cowork-ticket.v1". Message is ASCII bytes `cortados.cowork-ticket.v1\x00` followed by general canonical UTF-8 JSON array:
 [key_version,ticket_id,owner_id,task_id,operation,request_id,artifact_id,direction,bytes,sha256,expires_at_ms].
@@ -312,7 +345,7 @@ Broker.run_worker catches RemoteError only on the independently classified remot
 
 emit_remote_event writes one immutable remote_audit row in the caller's JobStore transaction. Its explicit tx=None branch writes canonical RemoteEvent JSON once to stderr only for pre-DB or fatal audit failure; that branch never claims durable audit. Runtime/task_store own committed transitions; CoreBroker owns invocation refusals; remote_ipc owns malformed-frame refusals before dispatch; file_transfer reports lease transitions through task_store. These boundaries do not duplicate each other's event. Same-state replay emits no new transition; a new refused invocation emits one refusal. For validation/lock failures before DB ownership, runtime emits the same closed event once to stderr rather than opening a competing DB. Audit write failure rolls back the state change, closes admission and emits one fixed storage_error RemoteEvent to stderr; stderr failure propagates fatal startup/runtime failure. No swallowed audit exception or recursive audit retry.
 
-Exact transfer HTTP statuses: invalid_request/length_mismatch/hash_mismatch→400; ticket_invalid/ticket_expired→401; permission_refused→403; artifact_not_found→404; transfer_busy/ticket_consumed/task_deleted/task_quarantined/upload_incomplete→409; output_limit→413; capacity_exhausted→507; storage_error/artifact_corrupt/policy_unavailable→503; timeout→408 before headers and connection abort after headers. Range GET→416 invalid_request; unsupported method→405 invalid_request. Authentication/capability checks precede object-existence checks. PUT success is 201 Receipt. MCP Failure uses isError=true and matching structuredContent/JSON text; invalid JSON-RPC uses existing SDK errors, oversized ingress body is 413. Synthetic disabled owner gives 403. No bearer verifier or OAuth challenge is installed by LOCAL CORE.
+Exact transfer HTTP statuses: invalid_request/length_mismatch/hash_mismatch→400; ticket_invalid/ticket_expired→401; permission_refused→403; artifact_not_found→404; transfer_busy/ticket_consumed/task_deleted/task_quarantined/upload_incomplete→409; output_limit→413; capacity_exhausted→507; storage_error/artifact_corrupt/policy_unavailable→503; timeout→408 only before any header attempt while positive remaining transfer budget exists; exhausted budget aborts without headers, and any timeout after a header attempt aborts. Range GET→416 invalid_request; unsupported method→405 invalid_request. Authentication/capability checks precede object-existence checks. PUT success is 201 Receipt. MCP Failure uses isError=true and matching structuredContent/JSON text; invalid JSON-RPC uses existing SDK errors, oversized ingress body is 413. Synthetic disabled owner gives 403. No bearer verifier or OAuth challenge is installed by LOCAL CORE.
 
 GET success is HTTP 200 with Content-Type application/octet-stream, exact Content-Length, quoted SHA256 ETag, X-Content-Type-Options nosniff and Cache-Control no-store. Content-Disposition is attachment; ASCII fallback filename="artifact-<artifact_id>"; filename*=UTF-8'' plus urllib.parse.quote(filename,safe=""). Descriptor filename remains exact Unicode. First post-restart blob open rechecks fstat/size/hash before serving; mismatch or missing blob quarantines with artifact_corrupt. No native event/final-message path becomes a downloadable artifact.
 
@@ -358,7 +391,7 @@ Each entry has one enforceable rule, FIXED latitude, AC and a load-bearing reaso
 16. **R016 [FIXED; AC-008-14]** CoreRuntime.disable_owner MUST atomically mark the owner disabled and revoke all its tickets/leases before returning after in-flight chunk completion and descriptor close. Reason: admission-only checks cannot revoke an already open stream.
 17. **R017 [FIXED; AC-008-14]** disable_owner MUST leave accepted job lifetime unchanged. Reason: revoking downloads is not authorization to cancel work.
 18. **R018 [FIXED; AC-008-14]** Runtime owner disable MUST remain latched until runtime destruction. Reason: caller traffic must not reenable authority; a new explicit configuration is the only local reset.
-19. **R019 [FIXED; AC-008-07]** CoreBroker MUST check durable replay before route/scoring/admission. Reason: a lost ACK must not spend another native attempt.
+19. **R019 [FIXED; AC-008-07]** CoreBroker MUST check durable replay after operation permission/latch checks but before route/scoring/new-work admission. Reason: a lost ACK must not spend another native attempt.
 20. **R020 [FIXED; AC-008-07]** task_store.operation MUST compare canonical caller argument hashes under owner/operation/request_id. Reason: reusing identity for changed content would return another operation's receipt.
 21. **R021 [FIXED; AC-008-07]** Replay MUST use the specified immutable identities with live projections. Reason: a frozen creating response would prevent a client from observing completion.
 22. **R022 [FIXED; AC-008-08]** Delegate MUST require ready task, matching group, no active job/upload/stream, and owned sealed inputs before routing. Reason: concurrent mutations would invalidate accepted input identity.
@@ -385,7 +418,7 @@ Each entry has one enforceable rule, FIXED latitude, AC and a load-bearing reaso
 43. **R043 [FIXED; AC-008-10]** remote_ipc MUST be the sole framed codec implementing the operation table. Reason: two codecs would disagree on body boundaries across processes.
 44. **R044 [FIXED; AC-008-11]** Framing validation MUST reject lengths before allocation. Reason: a peer-supplied length could exhaust broker memory.
 45. **R045 [FIXED; AC-008-11]** File transfer MUST enforce the specified offset, sequence and lease error dispositions. Reason: rewinding or cross-connection chunks could corrupt immutable content.
-46. **R046 [FIXED; AC-008-05]** Response overflow MUST use the specified bounded output_limit response. Reason: truncating a record would destroy evidence or mislead replay clients.
+46. **R046 [FIXED; AC-008-05]** Response overflow MUST follow the shared response deadline and pre-write-only output_limit fallback disposition. Reason: truncating a record would destroy evidence or mislead replay clients.
 47. **R047 [FIXED; AC-008-10]** Byte transfer MUST carry raw bounded bytes without base64, text decoding, URL fetching, redirects, multipart or archive execution. Reason: these transformations would change opaque user files or add network authority.
 48. **R048 [FIXED; AC-008-11]** transfer_tickets MUST implement the exact versioned HMAC encoding. Reason: unspecified serialization makes capability verification nonportable and independent mutation exams circular.
 49. **R049 [FIXED; AC-008-11]** Tickets MUST appear only in Authorization Bearer headers. Reason: query URLs would leak capabilities into request logs.
@@ -427,26 +460,31 @@ Each entry has one enforceable rule, FIXED latitude, AC and a load-bearing reaso
 85. **R085 [FIXED; AC-008-15]** JobStore.transaction MUST reject nested transactions. Reason: independent commits would expose half-owned workspace or transfer state.
 86. **R086 [FIXED; AC-008-04,10]** create_test_app MUST implement the exact synthetic ASGI composition. Reason: unspecified routes or session lifetime would make callers and independent transfer exams choose incompatible behavior.
 87. **R087 [FIXED; AC-008-04]** The MCP server MUST publish the specified initialization instruction. Reason: the Air app does not load Studio shell instructions and would otherwise lack the delegation/review sequence.
+88. **R088 [FIXED; AC-008-10,11,14]** remote_http MUST enforce the shared lifetime and conservative response state for every transfer response. Reason: Partially visible headers cannot be safely retried.
+89. **R089 [FIXED; AC-008-11,14]** remote_http MUST retire the endpoint on exhausted frontend budget. Reason: An unbounded close RPC would extend the lifetime.
+90. **R090 [FIXED; AC-008-05,10,11]** remote_ipc MUST share the original response-write deadline between primary and pre-write fallback. Reason: A fallback cannot acquire fresh time.
+91. **R091 [FIXED; AC-008-03,06,16]** CoreRuntime MUST enforce the exact capacity-only operation table at all tool and stream entrypoints. Reason: Capacity refusal must not erase durable accepted outcomes.
+92. **R092 [FIXED; AC-008-06,15,16]** CoreRuntime MUST retain fatal integrity/audit/storage refusal independently of capacity-only admission. Reason: Limited observation cannot bypass corruption checks.
 
 ## 6. Canonical acceptance registry
 
 <!-- AC-BEGIN -->
 | ID | Canonical acceptance text |
 |---|---|
-| AC-008-03 | Synthetic config/principal admission refuses absent, foreign, disabled and invalid policy inputs before effects; existing explicit/S1 fresh quota refusals cause zero native starts. |
+| AC-008-03 | Synthetic config/principal admission refuses absent, foreign, disabled and invalid policy inputs before effects; existing explicit/S1 fresh quota refusals cause zero native starts. Capacity-only attach/bind accepts only the exact enabled trusted principal/config for the operation table; denied new work/replays have zero new admission/resource effect. |
 | AC-008-04 | Socketpair-only construction creates no listener/auth/entrypoint; frontend loss leaves one accepted job; ordinary001–007 bytes and history remain unchanged. |
-| AC-008-05 | Every closed wire/private record accepts its valid example and rejects its invalid example; safe Error/audit and full-header overflow preserve canonical rows. |
+| AC-008-05 | Every closed wire/private record accepts its valid example and rejects its invalid example; safe Error/audit and full-header overflow preserve canonical rows. Primary/fallback socket backpressure and validation consume one IPC deadline; partial frames retire the endpoint without a second frame. |
 | AC-008-06 | Owner/task predicates reject foreign and ordinary stdio IDs identically to unknown IDs across status, result, cancel, feedback and transfer. |
-| AC-008-07 | Concurrent replay returns one immutable identity with current projection; changed arguments conflict; job, binding, operation and reservation either all commit or all roll back. |
+| AC-008-07 | When operation admission permits replay, concurrent replay returns one immutable identity with current projection; changed arguments conflict; job, binding, operation and reservation either all commit or all roll back. Replay through denied capacity-only methods returns capacity_exhausted; permitted task/job inspection retains accepted identity. |
 | AC-008-08 | Create/delete/delegate/upload/publication races preserve one active task job and exact selected input copies; creating-delete and failed preparation have observable rows. |
 | AC-008-09 | Bound manifest, triple discriminator and complete handoff bytes agree at route, acceptance and START; deletion or mutation refuses launch; ordinary argv/bootstrap remain byte-identical. |
 | AC-008-10 | Separate frontend/broker processes transfer zero, NUL and non-UTF8 bytes with matching hashes and chunk-bounded memory through the exact CoreClient API. |
-| AC-008-11 | Independent ticket encoding, frame lengths, offsets, length/hash checks, renewal, expiry, key rotation and lost ACK produce the specified row, lease and descriptor outcomes. |
+| AC-008-11 | Independent ticket encoding, frame lengths, offsets, length/hash checks, renewal, expiry, key rotation and lost ACK produce the specified row, lease and descriptor outcomes. Lost committed PUT receipt is recovered by task_get without consumed-byte retry; empty chunks never renew idle. |
 | AC-008-12 | Descriptor-relative traversal rejects links, rename races, directories and nonregular outputs without leaking broker/native evidence or exporting mutable files. |
 | AC-008-13 | Ordered all-or-none publication preserves native outcome, partial flags and immutable blob hashes through crashes and later workspace mutation. |
-| AC-008-14 | Full GET retries preserve bytes; Range refuses; trusted active disable/delete closes open leases; expiry affects new opens only; no accepted job is implicitly cancelled. |
+| AC-008-14 | Full GET retries preserve bytes; Range refuses; trusted active disable/delete closes open leases; expiry affects new opens only; no accepted job is implicitly cancelled. Timely PUT201/GET200/Range416/error controls pass; stalled start/body across every response family obey one total/idle budget, no second start, positive-budget-only408 and exhausted-budget abort without headers. Exhausted close retires the shared endpoint without sequence confusion or job cancellation. |
 | AC-008-15 | Lock-before-DB construction, second-owner refusal, one ordered recovery, corruption refusal and crash boundaries preserve rows, tombstones and containment without relaunch. |
-| AC-008-16 | st_size, promised-write and free-space equalities pass at the boundary and refuse beyond it; monitor overrun retains reservations until proof; no retention scheduler exists. |
+| AC-008-16 | st_size, promised-write and free-space equalities pass at the boundary and refuse beyond it; monitor overrun retains reservations until proof; no retention scheduler exists. Controlled missed sampling with a fake worker proves stop and durable cancelled/capacity_exhausted inspection through task_get/job_status/job_result; job_cancel stays idempotent. Every denied table operation has zero new task/job/ticket/reservation row or admission/resource effect; close cleans up; fatal corruption/audit and disabled owner override limited access; no automatic reopening/relaunch occurs. |
 <!-- AC-END -->
 
 ## 7. Lifecycle diagrams — explanatory views of R rules
@@ -465,7 +503,8 @@ sequenceDiagram
   R->>R: Reconcile remote intents and start monitor
   F->>R: Attach socketpair and bind
   F->>B: Delegate with original request ID
-  B->>B: Replay and validate owned ready task
+  B->>R: Check operation permission and latch
+  B->>B: If admitted, replay and validate owned ready task
   B->>J: Commit private workspace preparation intent
   B->>B: Create empty cwd and verify inode
   B->>J: Commit prepared identity
@@ -658,7 +697,7 @@ This schema is a mechanical serialization of the private record table. Bytes in 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:cortados:RT-COWORK-MCP-008:v4:private-diagnostics",
+  "$id": "urn:cortados:RT-COWORK-MCP-008:v5:private-diagnostics",
   "$defs": {
     "ID": {"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
     "Hash": {"type":"string","pattern":"^[0-9a-f]{64}$"},
@@ -1578,3 +1617,28 @@ fail-closed loss behavior. No replacement refresh engine. GitHubProvider lacks a
 timeout argument; qualify inherited HTTP calls against Claude's 30-second deadline. No claim of
 immediate upstream session revocation or refresh-family reuse revocation without evidence.
 These gaps can block auth activation without blocking deterministic task work.
+
+
+## 10. Revision-2 source grounding and evidence precedence
+
+The original repository is read-only for this author. Current code claims in this section refer to /Users/velox/.cortados-builds/cortados-router-repo at the frozen candidate2 identities in /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/root-freeze.json. All 18 source hashes were rechecked with zero mismatches during this revision. Earlier section9 prebuild anchors remain historical; they do not imply that the candidate's existing owners are absent.
+
+| Existing owner / disposition | Frozen callsite and conflict resolved in v5 |
+|---|---|
+| remote_http / extend | transfer :134–229 bounds main transfer but Range416 :186–190 is unguarded; started becomes true only after GET headers :198; timeout/error branches :211–221 allocate new idle waits. Extend its sole lifetime, not a wrapper. |
+| remote_ipc / extend | serve_endpoint :166–251; primary write :217–226 has a lease-bounded timeout, output_limit fallback :227–233 writes outside it. Keep one captured response deadline across both. |
+| CoreRuntime / extend | remote_runtime.authorize :44–48 merges admission_failed and store.admission_closed; attach :178 and binding :216 remain the ownership seams. Separate capacity reason from fatal reason in this owner. |
+| CoreBroker / adopt and extend callsite | remote_dispatch.dispatch_remote :56–85 blanket-refuses storage_error, then rechecks authorize after lock. Both checks consume the runtime's operation-specific disposition; projection :37–54 retains binding/publication validation. |
+| CapacityMonitor / adopt | remote_capacity.run :106–137 sets admission_failed at :131 and invokes existing stop. Retain measurement and containment owner; do not create a second policy or reset latch by resampling. |
+| file_transfer / adopt and extend callsite | _check :73–84 and existing close/timer own descriptor lifetime. Apply runtime stream disposition before byte effects, retiring affected owned leases. |
+
+| Grounded candidate file | SHA256 |
+|---|---|
+| integrations/mcp/remote_http.py | ffffe86c00e47bdb00238705de853eed573255aabd06ba6bf0efbfd2e5150d66 |
+| integrations/mcp/remote_ipc.py | 8e7785993e0a719f446184880f96aa5df4803e83a5ca1247f8c0d23ca3a486c8 |
+| integrations/mcp/remote_runtime.py | cf34ed42e06a3803a32e906356f3b042a09a7b91beb95a3ef9540c8b280b9d16 |
+| integrations/mcp/remote_dispatch.py | 54f46c93ec8fdfda66bc2fb57f38f5fedb00cfe6a960388134756cd2e9b073e8 |
+| integrations/mcp/remote_capacity.py | ae7ae42bd6428de088596c462a5c360b7a1ee155b5662d96cd43b4949826467e |
+| integrations/mcp/file_transfer.py | d027cb889f5bf61cd447fa18ee10772e15e3f07cab5e3ac23cddb1de87f8cda3 |
+
+The exact approved operation table is copied in EXECUTION; its independent exam matrix maps all revision rules to existing protected paths. DECISIONS owns the preserved two-failure ledger and approval chronology. No live identity, storage, retention or operator default is selected.

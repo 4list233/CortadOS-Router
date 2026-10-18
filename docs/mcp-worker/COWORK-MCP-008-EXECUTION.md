@@ -1,12 +1,12 @@
 <!-- PURPOSE: Allocate nonoverlapping future execution responsibilities and independent gates.
-     CONTRACT: RT-COWORK-MCP-008 v4; draft, not a dispatch authorization.
+     CONTRACT: RT-COWORK-MCP-008 v5; draft, not a dispatch authorization.
      DEPENDS: Parent contract, recorded root policies, independent protected fixtures.
      CEILING: This session writes documents only; no production, exams, commits or live actions. -->
 # Cowork 008 execution packages
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 4
+contract_version: 5
 task_group_id: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1
 status: draft
 dispatchable: false
@@ -26,11 +26,11 @@ local implementation; they are not prebuild requirements.
 
 Owner: root orchestrator with Forest for policies; author role produces proposals, never self-approval.
 Current exact scope_paths:
-- docs/mcp-worker/COWORK-MCP-008.md
-- docs/mcp-worker/COWORK-MCP-008-DECISIONS.md
-- docs/mcp-worker/COWORK-MCP-008-EXECUTION.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008-DECISIONS.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008-EXECUTION.md
 
-Required inputs before LOCAL CORE dispatch: pinned v4 parent/source hashes, exact reviewed scopes,
+Required inputs before LOCAL CORE dispatch: pinned v5 parent/source hashes, exact reviewed scopes,
 synthetic mandatory config fixtures, protected exam commit/manifest, independent D then A and root
 package approval. No D/A pass is declared. O1 actual registration/identity and O5 deployed limits/
 retention remain pending activation choices; they MUST NOT block parameterized local enforcement.
@@ -53,29 +53,28 @@ No network permission, MCP grants, API billing fallback, provider registration, 
 state access. Inspect job_status before resubmission; no automatic failed-job retry. Retrieve job_result,
 review diff/evidence and record job_feedback accepted/rejected/inconclusive. Worker completion is not QA.
 
-Exact future scope_paths (existing unless marked NEW):
+Retained exact future scope_paths (all existing in candidate2):
 - cortados_router/route_task.py — keyword-only full-handoff seam only
 - integrations/mcp/broker.py
 - integrations/mcp/job_store.py
 - integrations/mcp/codex.py
 - integrations/mcp/worker.py
-- integrations/mcp/remote_config.py — NEW
-- integrations/mcp/remote_schemas.py — NEW
-- integrations/mcp/remote_dispatch.py — NEW
-- integrations/mcp/remote_http.py — NEW
-- integrations/mcp/task_store.py — NEW
-- integrations/mcp/task_workspace.py — NEW
-- integrations/mcp/artifact_store.py — NEW
-- integrations/mcp/file_transfer.py — NEW
-- integrations/mcp/transfer_tickets.py — NEW
-- integrations/mcp/remote_native.py — NEW
-- integrations/mcp/remote_runtime.py — NEW
-- integrations/mcp/remote_ipc.py — NEW
-- integrations/mcp/remote_capacity.py — NEW
+- integrations/mcp/remote_config.py — existing candidate owner
+- integrations/mcp/remote_schemas.py — existing candidate owner
+- integrations/mcp/remote_dispatch.py — existing candidate owner
+- integrations/mcp/remote_http.py — existing candidate owner
+- integrations/mcp/task_store.py — existing candidate owner
+- integrations/mcp/task_workspace.py — existing candidate owner
+- integrations/mcp/artifact_store.py — existing candidate owner
+- integrations/mcp/file_transfer.py — existing candidate owner
+- integrations/mcp/transfer_tickets.py — existing candidate owner
+- integrations/mcp/remote_native.py — existing candidate owner
+- integrations/mcp/remote_runtime.py — existing candidate owner
+- integrations/mcp/remote_ipc.py — existing candidate owner
+- integrations/mcp/remote_capacity.py — existing candidate owner
 
-No wildcard scopes. Parents integrations/mcp and docs/mcp-worker exist; new modules above are planned,
-not already implemented. Every new source file MUST stay below 500 physical lines and have
-PURPOSE/CONTRACT/DEPENDS/CEILING headers. Current broker/job_store/worker are 342/265/262 lines;
+No wildcard scopes. Parents integrations/mcp and docs/mcp-worker exist; all 18 source paths now exist in the frozen rejected candidate. This is the retained exact future source ceiling, not an author write grant. Every new source file MUST stay below 500 physical lines and have
+PURPOSE/CONTRACT/DEPENDS/CEILING headers. Historical prebuild broker/job_store/worker counts were 342/265/262 lines;
 keep integration there to seams, not new complete owners. If split needs another path, root amends and
 QA rechecks scope before builder writes it. No unreviewed utilities module or copied business rules.
 Existing config.py/schemas.py/native_profile.py/native_process.py/router/quota code are read-only;
@@ -131,7 +130,7 @@ baseline/candidate measurements, residual risks. No live install or commit impli
 
 Owner: designated independent MCP QA session, not B or this author. QA owns D/A/B and protected exams,
 including separately blocked future-auth qualification already underway. No exam files authored in this session.
-Planned exact acceptance_paths, all NEW, under verified parent acceptance/ (cowork_mcp directory is NEW):
+Retained exact acceptance_paths under existing acceptance/cowork_mcp (current 89-method inventory is historical baseline, not v5 acceptance):
 - acceptance/cowork_mcp/__init__.py
 - acceptance/cowork_mcp/support.py
 - acceptance/cowork_mcp/README.md
@@ -152,8 +151,7 @@ Planned exact acceptance_paths, all NEW, under verified parent acceptance/ (cowo
 - acceptance/cowork_mcp/evidence/baseline-ordinary.json
 - acceptance/cowork_mcp/evidence/historical-007-parity.py
 
-These exact new paths are candidates for QA's independent fixture design; missing directory/fixtures
-remain explicit blockers, not passed tests. QA commits with Exam-Owner attribution and pins hashes
+These paths are independently owned protected evidence; required revision-2 exam amendments remain pending, not passed tests. QA commits with Exam-Owner attribution and pins hashes
 BEFORE B dispatch. Any needed additional fixture path requires recorded scope amendment. Native capture
 file is initially captured shell evidence plus explicit actual-exec pending marker, never synthetic proof.
 QA authors deterministic fake-native cases independently; actual native/tool lane is gated separately.
@@ -161,20 +159,20 @@ QA authors deterministic fake-native cases independently; actual native/tool lan
 <!-- AC-BEGIN -->
 | ID | Canonical acceptance text |
 |---|---|
-| AC-008-03 | Synthetic config/principal admission refuses absent, foreign, disabled and invalid policy inputs before effects; existing explicit/S1 fresh quota refusals cause zero native starts. |
+| AC-008-03 | Synthetic config/principal admission refuses absent, foreign, disabled and invalid policy inputs before effects; existing explicit/S1 fresh quota refusals cause zero native starts. Capacity-only attach/bind accepts only the exact enabled trusted principal/config for the operation table; denied new work/replays have zero new admission/resource effect. |
 | AC-008-04 | Socketpair-only construction creates no listener/auth/entrypoint; frontend loss leaves one accepted job; ordinary001–007 bytes and history remain unchanged. |
-| AC-008-05 | Every closed wire/private record accepts its valid example and rejects its invalid example; safe Error/audit and full-header overflow preserve canonical rows. |
+| AC-008-05 | Every closed wire/private record accepts its valid example and rejects its invalid example; safe Error/audit and full-header overflow preserve canonical rows. Primary/fallback socket backpressure and validation consume one IPC deadline; partial frames retire the endpoint without a second frame. |
 | AC-008-06 | Owner/task predicates reject foreign and ordinary stdio IDs identically to unknown IDs across status, result, cancel, feedback and transfer. |
-| AC-008-07 | Concurrent replay returns one immutable identity with current projection; changed arguments conflict; job, binding, operation and reservation either all commit or all roll back. |
+| AC-008-07 | When operation admission permits replay, concurrent replay returns one immutable identity with current projection; changed arguments conflict; job, binding, operation and reservation either all commit or all roll back. Replay through denied capacity-only methods returns capacity_exhausted; permitted task/job inspection retains accepted identity. |
 | AC-008-08 | Create/delete/delegate/upload/publication races preserve one active task job and exact selected input copies; creating-delete and failed preparation have observable rows. |
 | AC-008-09 | Bound manifest, triple discriminator and complete handoff bytes agree at route, acceptance and START; deletion or mutation refuses launch; ordinary argv/bootstrap remain byte-identical. |
 | AC-008-10 | Separate frontend/broker processes transfer zero, NUL and non-UTF8 bytes with matching hashes and chunk-bounded memory through the exact CoreClient API. |
-| AC-008-11 | Independent ticket encoding, frame lengths, offsets, length/hash checks, renewal, expiry, key rotation and lost ACK produce the specified row, lease and descriptor outcomes. |
+| AC-008-11 | Independent ticket encoding, frame lengths, offsets, length/hash checks, renewal, expiry, key rotation and lost ACK produce the specified row, lease and descriptor outcomes. Lost committed PUT receipt is recovered by task_get without consumed-byte retry; empty chunks never renew idle. |
 | AC-008-12 | Descriptor-relative traversal rejects links, rename races, directories and nonregular outputs without leaking broker/native evidence or exporting mutable files. |
 | AC-008-13 | Ordered all-or-none publication preserves native outcome, partial flags and immutable blob hashes through crashes and later workspace mutation. |
-| AC-008-14 | Full GET retries preserve bytes; Range refuses; trusted active disable/delete closes open leases; expiry affects new opens only; no accepted job is implicitly cancelled. |
+| AC-008-14 | Full GET retries preserve bytes; Range refuses; trusted active disable/delete closes open leases; expiry affects new opens only; no accepted job is implicitly cancelled. Timely PUT201/GET200/Range416/error controls pass; stalled start/body across every response family obey one total/idle budget, no second start, positive-budget-only408 and exhausted-budget abort without headers. Exhausted close retires the shared endpoint without sequence confusion or job cancellation. |
 | AC-008-15 | Lock-before-DB construction, second-owner refusal, one ordered recovery, corruption refusal and crash boundaries preserve rows, tombstones and containment without relaunch. |
-| AC-008-16 | st_size, promised-write and free-space equalities pass at the boundary and refuse beyond it; monitor overrun retains reservations until proof; no retention scheduler exists. |
+| AC-008-16 | st_size, promised-write and free-space equalities pass at the boundary and refuse beyond it; monitor overrun retains reservations until proof; no retention scheduler exists. Controlled missed sampling with a fake worker proves stop and durable cancelled/capacity_exhausted inspection through task_get/job_status/job_result; job_cancel stays idempotent. Every denied table operation has zero new task/job/ticket/reservation row or admission/resource effect; close cleans up; fatal corruption/audit and disabled owner override limited access; no automatic reopening/relaunch occurs. |
 <!-- AC-END -->
 
 Commands below are FUTURE QA instructions, not a record of runs. QA must pin the interpreter/venv and
@@ -298,9 +296,9 @@ synthetic shell outcomes for job ba4c3e14-c1f7-47fb-93b6-d703a98a6db7 with a rec
 The strict exact-command comparison remains false. Parent §9 records hashes/limits; Q MUST preserve
 that deviation and original capture, not require a redundant model run or call this full native approval.
 
-## v4 technical scope and stop condition
+## Historical v4 technical scope and stop condition
 
-Root authorized the three NEW source modules remote_runtime.py, remote_ipc.py and remote_capacity.py and the two NEW exam helper paths __init__.py and support.py as future grants only. Current author scope remains three docs. remote_runtime owns lifetime; remote_ipc owns the only frame codec; remote_capacity owns usage observations/reservation arithmetic, never another DB writer. file_transfer owns descriptors/bytes, not framing. remote_dispatch consumes runtime services, not an already-open external broker.
+Historically, root authorized the three then-NEW source modules remote_runtime.py, remote_ipc.py and remote_capacity.py and the two then-NEW exam helper paths __init__.py and support.py as future grants only. Current author scope remains three docs. remote_runtime owns lifetime; remote_ipc owns the only frame codec; remote_capacity owns usage observations/reservation arithmetic, never another DB writer. file_transfer owns descriptors/bytes, not framing. remote_dispatch consumes runtime services, not an already-open external broker.
 
 Root grants the exact keyword-only handoff_packet seam in cortados_router/route_task.py. Existing route_task owns the complete-packet budget and all input-fit calls, preserving ordinary None behavior. Independent QA pins ordinary and full-remote fixtures before B. schemas.py and task_evidence.py remain read-only. No output-counter patch, duplicate resolver or task/context rewrite substitutes for this seam. The preparation journal and JobStore.transaction extension in parent sections 2–4 belong to this same future source scope.
 
@@ -308,10 +306,56 @@ AC-008-03 through AC-008-16 all run through the pinned future command: python3 -
 
 Root's deferred INDEX.md ownership update is required before integration acceptance. This author does not edit it. Authoring is not a valid production build attempt; the existing ledger is unchanged.
 
-Author evidence/closure map and full self-rubric are in DECISIONS v4. Current author ran document JSON/schema/API/AC/diff checks only, not acceptance tests. The ordinary bootstrap capture is now recorded in parent section 9. Independent diagrams/fixtures/new-core measurement gates remain open.
+Historical v4 author evidence/closure map and self-rubric remain in DECISIONS. That author ran document JSON/schema/API/AC/diff checks only, not acceptance tests. The ordinary bootstrap capture is now recorded in parent section 9. Independent diagrams/fixtures/new-core measurement gates remain open.
 
 ## Root pre-review amendment evidence
 
 Root approved the full-packet seam and private workspace-preparation journal without choosing live identity/storage policy. The independent ordinary-bootstrap capture closes only the old envelope-sample gap. Existing-owner baseline at 4ed7508: 1000 stored jobs, 3000 get and 3000 replay lookups, each one indexed SELECT; median get 0.027042 ms and replay 0.057417 ms. Explicit route median 0.096188 ms, synthetic S1 route 0.615167 ms and context 0.004375 ms. Report SHA256 6e487a4a0ebd45ceef9b98e2fadd6a14e71c0e3739a29057240e0dbe9235deef; 75-file inventory SHA256 c6b9fc5b4bc2a93cf4cc7ae9d154ae0a3239b520d75bfd7f6b6f0dd2afbfb077. Both are under private cowork-mcp-verification/core-baseline. These measurements do not assert new-core or transfer memory/overshoot performance. Historical-007 unchanged assertions pass 4/4 with three recorded literal path relocations and equal normalized AST; original live baseline remains 784/785. Q must preserve the distinction and separately test candidate compatibility and live label-prefix/exam/provenance.
 
 Independent QA command correction: relative package imports require `-t .`. The authoritative core command is `/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py' -v`. This changes invocation only; AC text and production semantics remain unchanged. The measured 100-artifact listing bound is the representative fixture size, not a production cap; each task retains its mandatory configured artifacts_per_task.
+
+## v5 revision-2 execution boundary — [FIXED]
+
+Parent section 4 owns response lifetimes and capacity admission. Callable signatures and wire schemas remain unchanged; all existing entrypoints apply its exact table. For reviewer parity the table is copied verbatim:
+
+<!-- ADMISSION-BEGIN -->
+| Operation | Capacity-only latch | Fatal integrity/audit/storage latch | Disabled owner |
+|---|---|---|---|
+| attach/bind of exact trusted principal/config | Allow endpoint for limited operations below; no new authority | Refuse ordinary tool/stream authority; cleanup still mandatory | Refuse |
+| task_get | Allow ordinary owned-task projection; no transfer capability and no mutation/repair | Refuse storage_error | Refuse permission_refused |
+| job_status / job_result | Allow only after normal owner/task/job/binding/publication validation; expose actual durable native state/reason | Refuse storage_error | Refuse permission_refused |
+| job_cancel | Allow existing owned job only, normal idempotent stop intent and existing containment; never create/restart | Refuse public call; internal shutdown/containment must still attempt cleanup | Refuse public call; existing internal lifetime rules unchanged |
+| job_feedback | Refuse capacity_exhausted; append-only feedback may be submitted after explicit qualified restart | Refuse storage_error | Refuse permission_refused |
+| task_delete | Refuse capacity_exhausted; no speculative cleanup when usage sample is untrusted | Refuse storage_error | Refuse permission_refused |
+| context_requirements | Refuse capacity_exhausted; not required for existing-attempt inspection | Refuse storage_error | Refuse permission_refused |
+| task_create / route / delegate | Refuse capacity_exhausted, including replay invocation through these methods; inspect accepted identity with task_get/job methods | Refuse storage_error | Refuse permission_refused |
+| file_upload_ticket / file_download_ticket | Refuse capacity_exhausted, including ticket replay/renewal | Refuse storage_error | Refuse permission_refused |
+| open_put / open_get / put_chunk / finish_put / read_chunk | Refuse capacity_exhausted; retire the connection's affected existing lease before any further byte effect; no new stream | Refuse storage_error and retire owned descriptors | Refuse permission_refused and revoke/retire |
+| close / endpoint teardown / internal lease timer | Cleanup-only, idempotent existing owned lease; no new authority or resource promises | Cleanup still runs without treating corrupt metadata as permission to delete unknown files | Cleanup still runs |
+| trusted disable / runtime shutdown | Preserve existing control/lifetime ownership; no admission reopening | Preserve fail-stop/containment and fixed fatal signaling | Same-state disable remains no-op |
+<!-- ADMISSION-END -->
+
+
+### Independent revision-2 exams and narrow semantic amendment — [FIXED]
+
+Owner: /root/quota_evaluation_qa, the independent MCP exam/review owner. This author and the eventual source builder MUST NOT edit protected exams. After renewed D0, QA MUST preserve historical exam bytes, hashes and raw results before committing the revision exams with Exam-Owner attribution and a new MANIFEST.json/inventory. Renewed A0 and root's explicit revised source grant follow that commit. Existing 89 core / 874 accumulated methods and 28 lanes are the frozen attempt-2 baseline, not the future count or a v5 pass.
+
+The sole identified incompatible assertion is acceptance/cowork_mcp/test_compatibility.py::BuildHttpDeadlineRegressionExam.test_stalled_http_put_receive_terminates_at_idle_deadline, line172 in the frozen candidate: response.start statuses equal [408] after exhausted idle budget. The independent exam owner MUST amend only that incompatible expected response to no headers (empty start list), preserving its nonconflicting deadline, cleanup and other assertions. QA MUST add a timely positive-remaining-budget timeout control that delivers408. This is the exact narrow semantic authority from approved revision2; it does not claim every previous assertion stays byte-identical. Historical bytes/results remain historical, not rewritten to pass. Any additional observable conflict MUST return to root/Forest rather than being selected by author, builder or QA.
+
+| Existing protected path (relative to acceptance/cowork_mcp) | Required revision-2 ground truth | Parent ACs |
+|---|---|---|
+| test_compatibility.py | Narrow stalled-PUT amendment above plus positive-budget408; timely PUT201, GET200, Range416 and each refusal family; blocked response.start/body, including partial header visibility, have at most one start; no error allocates fresh time | 04,11,14 |
+| test_transfer.py | Exact total/idle boundary and exhausted-budget abort; acknowledged nonempty progress only; exhausted close retires endpoint; accepted PUT with lost receipt exposes committed seal via task_get without byte retry; concurrent MCP/transfer caller gets closed-connection refusal, never wrong seq/response | 10,11,14 |
+| test_schemas.py | Actual AF_UNIX backpressure on primary and output_limit fallback with only domain dispatch return instrumented; validation time deducted; applicable lease bounds; partial/indeterminate frame retirement and unchanged committed rows | 05,10,11 |
+| test_tasks.py | Parameterized exact operation table: trusted attach/bind; task_get/job_status/job_result projection; idempotent owned job_cancel; every denied operation including replay/renewal causes no new task/job/ticket/reservation/worker/byte authority; normal refusal audit remains required | 03,06,07,16 |
+| test_recovery.py | Controlled missed sample with actual fake worker and proven stop; durable cancelled/capacity_exhausted inspection; close/endpoint/timer cleanup; fatal audit/integrity/projection corruption and disabled overrides; explicit qualified restart without automatic relaunch | 06,15,16 |
+| test_performance.py | Retain measured transfer/memory/monitor and ordinary comparison lanes, record revised candidate evidence without inventing latency, grace, jitter or memory defaults | 10,11,14,16 |
+
+No new production or exam path is needed by this amendment. QA records any missing fixture as pending A; the concrete paths above are independent exam work, not permission for this author to implement them. Execute the pinned QA interpreter with -B and an independently authorized temporary tree, from /Users/velox/.cortados-builds/cortados-router-repo. QA sets COWORK_REVISION_QA_OUTPUT to a newly authorized evidence directory so the full-suite driver cannot overwrite historical output:
+
+```sh
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest acceptance.cowork_mcp.test_compatibility acceptance.cowork_mcp.test_transfer acceptance.cowork_mcp.test_schemas acceptance.cowork_mcp.test_tasks acceptance.cowork_mcp.test_recovery acceptance.cowork_mcp.test_performance -v
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py "$COWORK_REVISION_QA_OUTPUT"
+```
+
+The full inventory/manifest and existing benchmark-core.py remain independently owned. QA pins any driver operands from its maintained README before execution; zero discovered tests is blocked. Production/native/provider calls are excluded from synthetic revision exams. Full B, accumulated regressions and measurements remain necessary after a revised candidate; earlier completed measurements do not accept either failed candidate.
