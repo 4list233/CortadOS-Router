@@ -106,11 +106,11 @@ promotion gates. The build reports record independent verification and limitatio
 | `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (new, proposed) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
 | `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
 | `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
-| `acceptance/cowork_mcp/` | Independent QA owns 72 protected core methods, manifest, complete-suite inventory and baseline/candidate measurements; committed at1037b52, builder read-only. |
+| `acceptance/cowork_mcp/` | Independent QA owns 89 protected core methods after additive regression commits153f730/f5be56a; original72 methods at1037b52 are preserved. Manifest, full-suite inventory and measurements remain builder read-only; corrected candidate is under B review. |
 
 | Future authentication draft | RT-COWORK-AUTH-009 responsibility |
 |---|---|
-| [COWORK-AUTH-009.md](COWORK-AUTH-009.md) | Subordinate draft for inherited AC-008-01/02; maintained OAuth provider, strict identity/lifetime checks and credential-operation serialization. Separate D/A/B pending. |
+| [COWORK-AUTH-009.md](COWORK-AUTH-009.md) | Subordinate draft for inherited AC-008-01/02; maintained OAuth provider, strict identity/lifetime checks and credential-operation serialization. Independent33-row D0 atd96dc1c; A/B pending, with shared-runner interpreter amendment still proposed. |
 | [COWORK-AUTH-009-EXECUTION.md](COWORK-AUTH-009-EXECUTION.md) | Prospective nonoverlapping auth/production composition/exam paths; no source grant until accepted core and independent auth gates. |
 
 RT008/009 retain the existing standalone Router naming/location convention rather than the CortadOS structural engine CTX prefix. No global contract or rulings-log migration follows. The optional remote dependency proposal is isolated from ordinary stdio dependencies; implementation and its lock require their separate reviewed package.
@@ -128,3 +128,8 @@ RT008/009 retain the existing standalone Router naming/location convention rathe
 | `integrations/mcp/remote_service.py` | Authentication HTTP route/metadata adaptation and service entrypoint after accepted core. |
 
 The isolated optional dependency qualification requires `fastmcp-slim[server]==3.4.9`, `Authlib==1.9.1` and unchanged `mcp==1.30.0`; plain slim omits required server dependencies. The corrected65-package graph/imports have been tested only on CPython3.14.6/macOS arm64 in a new private environment. This is dependency evidence, not authentication acceptance or installation. Root technical directions and exact evidence are in ROOT-REVIEW at5d98d77/a93f48b.
+
+| Operator setup proposal | RT-COWORK-OPERATIONS-010 /110; no implementation or activation grant |
+|---|---|
+| [COWORK-OPERATIONS-010-DRAFT.md](COWORK-OPERATIONS-010-DRAFT.md) | Draft-only extension of existing AuthStorage/provider/runtime/service owners for child-only secret resolution and initial offline provisioning. Source-qualified proposal requires reconciliation against009v5, independent review and unresolved live choices. |
+| [COWORK-OPERATIONS-010-EXECUTION-DRAFT.md](COWORK-OPERATIONS-010-EXECUTION-DRAFT.md) | Proposed exact six-owner extension and independent exams; no new issuer, store, supervisor, scheduler or module. Local and activation gates remain separate. |
