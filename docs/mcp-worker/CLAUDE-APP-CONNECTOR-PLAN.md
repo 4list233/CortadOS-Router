@@ -1,5 +1,5 @@
 <!-- PURPOSE: Define the requested Air Claude app connection and remaining prerequisites.
-     STATUS: Proposal only; not a signed contract or an installed remote service.
+     STATUS: Authorized build in preimplementation QA; no installed remote service.
      DEPENDS: Existing RT-MCP-001 broker, explicit access scope and Claude authentication UI. -->
 # Claude app on Air → Studio workers
 
@@ -70,8 +70,8 @@ own explicit contract and real Cowork verification; text context alone does not 
 
 ## Proposed ownership and boundaries
 
-- Extend the existing MCP registration so stdio and HTTP share the same validated tool definitions.
-  Use the maintained SDK transport; keep execution, idempotency, quota and feedback in existing owners.
+- Compose the maintained SDK remote transport with the reviewed remote task/file schemas. Ordinary
+  stdio schemas remain unchanged. Keep execution, routing, quota and feedback in their existing owners.
 - Authenticate before handling any MCP request. Use a dedicated connector identity and isolated broker
   state; enforce that identity on job reads, cancellation and feedback as well as delegation.
 - Replace the remote repository-selection proposal with gateway-owned task workspaces. This is a
@@ -88,9 +88,11 @@ own explicit contract and real Cowork verification; text context alone does not 
 
 ## Build and activation gates
 
-The OAuth provider and task-input/output permissions must be resolved before freezing the observable contract.
-The designated independent MCP QA owner then reviews the contract and owns committed acceptance tests
-before a builder starts. The builder must use `cortados-workers` with that contract and bounded evidence.
+The [current RT008 core contract](COWORK-MCP-008.md) defines parameterized task folders, file transfer,
+identity isolation and durable execution. The designated independent MCP QA owner reviews D, authors
+and commits protected exams, then reviews A before a core builder starts through `cortados-workers`.
+OAuth composition has a separate qualification gate. Live identity, limits and retention remain pending
+operator choices; these do not block testing local parameterized enforcement.
 
 Acceptance must cover unauthenticated and wrong-identity rejection, path/symlink containment, existing
 tool schemas and limits, durable jobs across HTTP disconnects, quota refusal, connector grants and
@@ -103,8 +105,8 @@ Tailscale routing is unchanged, verify public requests without credentials are r
 the Air app connection. No endpoint, authentication secret, launchd service or public sharing was
 created by this planning step.
 
-OAuth and the general-task interface are the next design scope. No implementation or deployment is
-claimed by this proposal. Full Cowork tool inheritance is not supported by the current service.
+The core contract is frozen for independent review at commit65e2dbb. No implementation or deployment is
+claimed by this planning record. Full Cowork tool inheritance is not supported by the current service.
 
 Source review confirmed that `integrations/mcp/codex.py` already uses `--skip-git-repo-check`: a
 repository is unnecessary. `schemas.py` currently requires an existing absolute working directory;
@@ -113,3 +115,37 @@ not arbitrary generated files. The existing `workspace-write` profile limits wri
 does not establish that reads are confined to the task folder. Read-only MCP investigation job
 `c6a63857-22d3-47d6-816b-d0a794ce5603` was independently checked by the planner and accepted; it is
 source evidence, not an end-to-end Cowork test.
+
+## How Cowork will use the connector after activation
+
+The connector will advertise its tools and delegation instructions through MCP initialization and
+tool descriptions. A task in the Air app does not load Studio shell instruction files automatically.
+The following planner instruction can also be added to a Claude project after the connector is verified:
+
+> Use CortadOS Studio Workers for bounded delegated work. Keep planning and final review in this
+> conversation. Call context_requirements before route or delegate and answer its questions with
+> relevant evidence. Reuse one task_group_id across revisions. Create a task folder through task_create;
+> do not supply Studio paths. Upload only the selected input files using the returned transfer ticket,
+> then include their sealed artifact IDs in the assignment. Use S1 when available or an explicit
+> configured model; respect every fresh-quota refusal. Save the returned job_id and inspect that job
+> after reconnecting instead of starting another attempt. Retrieve and inspect the result and output
+> files, verify their hashes, and record honest job_feedback. Ask for missing context instead of
+> assuming Studio workers inherit this conversation or its connectors. Delete task payloads only when
+> requested.
+
+Expected file journey: Cowork reads the selected local/cloud input through its authorized tools,
+computes its byte count and SHA256, requests an upload ticket, and sends the raw bytes with the ticket
+in the Authorization header. After the worker finishes, Cowork requests download tickets for the
+published artifact IDs, downloads the bytes, verifies length/hash and materializes the files for review.
+Ticket credentials are scoped temporary transfer authority; they are not Codex login credentials or
+Claude's OAuth connector token. Keep them out of command traces and saved documents.
+
+Actual upload/download from this account remains a release test. Official
+[custom-connector guidance](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+confirms that MCP calls originate in Anthropic's cloud. The separate
+[Cowork architecture guide](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview)
+states that code execution egress follows network policy and that connector OAuth tokens do not enter
+the execution sandbox. Therefore successful MCP login alone does not prove raw file transfer works.
+Verify destination access, ticket-header egress and exact binary materialization in Cowork before
+claiming the connection complete. No SSH, copied subscription credentials, or hidden companion is
+part of this intended user flow.
