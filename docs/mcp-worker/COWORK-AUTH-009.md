@@ -1,12 +1,12 @@
 <!-- PURPOSE: Bound the future authentication package without authorizing execution.
-     CONTRACT: RT-COWORK-AUTH-009 v5, subordinate to RT-COWORK-MCP-008.
+     CONTRACT: RT-COWORK-AUTH-009 v6, subordinate to RT-COWORK-MCP-008.
      DEPENDS: Accepted local core; maintained FastMCP/Authlib/MCP; separate D/A.
      CEILING: Draft design only; no implementation, exams, registration or activation. -->
 # Cowork future authentication contract
 
 ```yaml
 contract_id: RT-COWORK-AUTH-009
-contract_version: 5
+contract_version: 6
 status: draft
 owner: Forest
 implements: RT-COWORK-MCP-008 section 10 FUTURE AUTH
@@ -17,11 +17,15 @@ attempt_ledger: inherited, never reset by this subordinate ID
 execution_contract: COWORK-AUTH-009-EXECUTION.md
 ```
 
+Current authority: root ab4aff9 direction SHA256 b42cc158f031035a289e95c32d85fca2b8f26520c84cf904f2b7976c9885be0d adopts O9 and independent IC-01/02 before any auth build. Core candidate4 remains frozen under host/independent B. Auth v5 D=0/33 applies only to old bytes; v6 full independent D and committed exams/A are NOT RUN. No auth source exists. Earlier review/failure history remains evidence.
+
+Current write scope is exactly COWORK-AUTH-009.md, COWORK-AUTH-009-EXECUTION.md, COWORK-OPERATIONS-010-DRAFT.md and COWORK-OPERATIONS-010-EXECUTION-DRAFT.md in /Users/velox/.cortados-builds/cowork-auth-operator-reconciliation. Originals, source and exams remain read-only. No helper/report files, nested workers, commits, credentials, provider calls, listeners or live activity.
+
 ## 0. Canonical glossary, type, API and state registry
 
 All definitions below are [FIXED] specification data. D0.1–D0.22 are the sole definition registry; their parameter profiles describe values, predicates, ordering and exclusions. §R is the sole runtime obligation registry: each modal sentence has its own stable sub-ID, inherited AC mapping and reason. Profile clauses are definition data referenced by those sentences, not additional unmapped build instructions. Examples instantiate these definitions; they do not redeclare APIs. The old section numbers remain locality aliases, so prior references retain meaning.
 
-Evidence aliases: **V** = /Users/velox/.cortados-builds/cowork-mcp-verification; **F** = /Users/velox/.cortados-builds/cowork-mcp-research/fastmcp/fastmcp_slim/fastmcp; **S** = V/auth-research-venv/lib/python3.14/site-packages. All are read-only evidence. **Router** = /Users/velox/.cortados-builds/cortados-router-repo (read-only in this assignment). N/P/ID/Hash/Principal/CoreLimits/Owner retain exactly frozen008 §2 definitions; MAX_INTEGER=9007199254740991 is the numeric upper bound. P remains the inherited positive-integer type. UTC epoch seconds govern auth timestamps; monotonic seconds govern waits. UTC/datetime/timedelta are stdlib datetime symbols. A lifetime is one entered AuthRuntime/AuthStorage ownership interval. A failure latch is irreversible within that interval. A clean image means the exact marker/manifest predicate in D0.18, not proof of unobservable barrier history.
+Evidence aliases: **V** = /Users/velox/.cortados-builds/cowork-mcp-verification; **F** = /Users/velox/.cortados-builds/cowork-mcp-research/fastmcp/fastmcp_slim/fastmcp; **S** = V/auth-research-venv/lib/python3.14/site-packages. All are read-only evidence. **Router** = /Users/velox/.cortados-builds/cortados-router-repo (read-only in this assignment). N/P/ID/Hash/Principal/CoreLimits/Owner retain exactly frozen008 §2 definitions; MAX_INTEGER=9007199254740991 is the numeric upper bound. P remains the inherited positive-integer type. UTC epoch seconds govern auth timestamps; monotonic seconds govern waits. UTC/datetime/timedelta are stdlib datetime symbols. A lifetime is one entered AuthStorage interval: restart is composed by AuthRuntime; initial by the single offline provision_initial caller without AuthRuntime. A failure latch is irreversible within that interval. A clean image means the exact marker/manifest predicate in D0.18, not proof of unobservable barrier history.
 
 ### D0.1 Local constructors and errors
 
@@ -78,7 +82,7 @@ ResolvedAuthSecrets field constraints: upstream_secret is nonblank UTF-8 str; si
 
 Closed AuthMarker fields, all required:
 schema literal cortados.cowork-auth-lifetime.v1; state enum[clean,dirty]; generation:N; run_id:ID; config_sha256:Hash; signing_key_sha256:Hash; upstream_secret_sha256:Hash; dependency_sha256:Hash; store_sha256:Hash|null.
-clean requires non-null store_sha256; dirty requires null. Config digest is SHA256 of UTF-8 task_evidence.canonical of all AuthConfig serialized fields (including root, references, enabled and budgets). Signing digest uses actual resolved signing bytes; upstream digest uses actual UTF-8 secret bytes. These digests are INSIDE Fernet ciphertext, never logs. Storage-key identity is proven by successful Fernet decryption; changing any actual key/config/dependency identity refuses. dependency_sha256 is SHA256 of reviewed lock file bytes supplied by trusted launcher, not an incidental pip freeze. Generation increments once on startup; overflow refuses without mutation; run_id is fresh UUID4 per lifetime. It is diagnostic ordering, not an external anti-rollback counter.
+clean requires non-null store_sha256; dirty requires null. Config digest is SHA256 of UTF-8 task_evidence.canonical of all AuthConfig serialized fields (including root, references, enabled and budgets). Signing digest uses actual resolved signing bytes; upstream digest uses actual UTF-8 secret bytes. These digests are INSIDE Fernet ciphertext, never logs. Storage-key identity is proven by successful Fernet decryption; changing any actual key/config/dependency identity refuses. dependency_sha256 is SHA256 of reviewed lock file bytes supplied by trusted launcher, not an incidental pip freeze. Generation is0 for initial purpose and increments once on restart; overflow refuses without mutation; run_id is fresh UUID4 per lifetime. It is diagnostic ordering, not an external anti-rollback counter.
 
 ### D0.5 Maintained record ownership and lifetime constants
 
@@ -128,6 +132,8 @@ The following are observed signatures, not reconstructed SDK APIs. Types retain 
 | github.py:206 GitHubProvider | Keyword-only `client_id:str, client_secret:str, base_url:AnyHttpUrl\|str, resource_base_url:AnyHttpUrl\|str\|None=None, issuer_url:AnyHttpUrl\|str\|None=None, redirect_path:str\|None=None, required_scopes:list[str]\|None=None, timeout_seconds:int=10, cache_ttl_seconds:int\|None=None, max_cache_size:int\|None=None, allowed_client_redirect_uris:list[str]\|None=None, client_storage:AsyncKeyValue\|None=None, jwt_signing_key:str\|bytes\|None=None, require_authorization_consent:bool\|Literal['remember','external']=True, consent_csp_policy:str\|None=None, forward_resource:bool=True, fallback_refresh_token_expiry_seconds:int\|None=None, fastmcp_access_token_expiry_seconds:int\|None=None, token_expiry_threshold_seconds:int=0, http_client:httpx.AsyncClient\|None=None, enable_cimd:bool=True`. |
 | proxy.py:719 | `_create_upstream_oauth_client()->authlib.integrations.httpx_client.AsyncOAuth2Client`; is defined to construct the maintained client through §12.1, then register both compliance hooks before returning; the v2 super-only construction is superseded to set supported HTTPX constructor policy. No constructor extra_authorize_params on GitHubProvider. |
 | consent.py:277 | `_build_upstream_authorize_url(txn_id:str, transaction:dict[str,Any])->str`; is defined to copy transaction, replace copied scopes with identity scopes plus offline_access, then call super. |
+| S/key_value/aio/stores/base.py:175 | `async setup_collection(*,collection:str)->None`; inherited by FileTreeStore; initial AuthStorage calls it once per canonical collection. |
+| proxy.py:782 | `async get_client(client_id:str)->OAuthClientInformationFull\|None`; initial persisted-row readback, distinct downstream ID excludes upstream fallback. |
 | proxy.py:838 | `async register_client(client_info:mcp.shared.auth.OAuthClientInformationFull)->None`; persists public ProxyDCRClient, not confidential client credentials. |
 | proxy.py:1027,1075 | `async load_authorization_code(client:OAuthClientInformationFull,authorization_code:str)->AuthorizationCode\|None`; `async exchange_authorization_code(client:OAuthClientInformationFull,authorization_code:AuthorizationCode)->OAuthToken`. |
 | proxy.py:1384,1420 | `async load_refresh_token(client:OAuthClientInformationFull,refresh_token:str)->RefreshToken\|None`; `async exchange_refresh_token(client:OAuthClientInformationFull,refresh_token:RefreshToken,scopes:list[str])->OAuthToken`. |
@@ -155,11 +161,14 @@ Prospective APIs (new local APIs, not claims that files exist):
 
 Additional exact callable registry (all prospective; no implicit imports):
 
-- remote_auth_runtime.AuthRuntime(*,config:AuthConfig,secrets:ResolvedAuthSecrets,dependency_sha256:str,on_failure:Callable[[],None]); async __aenter__()->AuthRuntime; async __aexit__(exc_type:type[BaseException]|None,exc:BaseException|None,tb:TracebackType|None)->None; async verify_token(token:str)->AccessToken|None; wrap_oauth(endpoint:ASGIApp)->ASGIApp. Constructor validates in-memory types only. enter delegates §8 to AuthStorage; exit proves drain and delegates seal or failed preservation. Runtime never writes a marker. wrap_oauth returns an ASGI callable and acquires only at request entry, not wrapper creation.
+- remote_auth_runtime.AuthRuntime(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None]); async __aenter__()->AuthRuntime; async __aexit__(exc_type:type[BaseException]|None,exc:BaseException|None,tb:TracebackType|None)->None; async verify_token(token:str)->AccessToken|None; wrap_oauth(endpoint:ASGIApp)->ASGIApp. Constructor validates in-memory types only. enter forwards the unresolved callable to AuthStorage purpose='restart' and delegates §8; only AuthStorage invokes it under the lifetime lock; exit proves drain and delegates seal or failed preservation. Runtime never writes a marker. wrap_oauth returns an ASGI callable and acquires only at request entry, not wrapper creation.
 - remote_auth_runtime.wrap_mcp(endpoint:ASGIApp)->ASGIApp is an AuthRuntime method. It composes AuthenticationMiddleware(backend=BearerAuthBackend(self)) then AuthContextMiddleware, requires authenticated context, and checks projected Principal equality with construction principal before calling endpoint. AuthenticationMiddleware is outermost. It does not acquire another gate after verify_token. Invalid tokens return None to maintained backend; fixed outage failure is handled by the guard. No secret enters scope beyond the maintained authentication object needed for this request. AuthRuntime's on_failure synchronously invokes the child supervisor's once-only admission latch/Event; one existing control coroutine sends failure(auth). It does not create a task per failure or retain exception/token text. Transport and storage invoke runtime's latch, which propagates even if a provider catches the error.
 - remote_service.create_remote_app(*,core_client:CoreClient,principal:Principal,frontend:FrontendConfig,auth:AuthRuntime)->ASGIApp requires entered/ready auth and bound client; validates equality then calls the one composition owner. It does not enter auth a second time. remote_service.project_metadata(metadata:OAuthMetadata)->OAuthMetadata is a pure copy/update as section9, never a protocol issuer.
 - remote_auth_errors.safe_oauth_app(app:ASGIApp,*,config:AuthConfig)->ASGIApp buffers only OAuth/discovery responses; emit_auth_event(event:AuthEvent)->None emits canonical fixed event once. safe_oauth_app wraps the gated endpoint so no exception bytes precede filtering.
 - D0.9 owns validate_claims/project_facts/load_auth_config. Pure project_facts rejects missing claims, wrong live sub or disabled config; it never contacts GitHub. StrictGitHubProvider inherits the maintained keyword-only constructor with the additional mandatory local keywords config:AuthConfig and runtime-owned on_response_failure:Callable[[],None]; these are consumed locally, never passed to super. Its two override signatures stay exactly section2; closures bind local operands, including config.response_bytes; §12.1 owns real client construction.
+
+- remote_auth_provider.make_provider(*,config:AuthConfig,secrets:ResolvedAuthSecrets,client_storage:AsyncKeyValue,identity_client:httpx.AsyncClient,on_failure:Callable[[],None])->StrictGitHubProvider is the sole extraction of D0.16 wiring; no routes/enter/network/registration.
+- remote_auth_runtime.provision_initial(*,config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None is async offline composition using AuthStorage purpose='initial', make_provider and maintained register_client/readback; D0.18 defines its lifetime. No AuthRuntime enter, request gate, core, listener or token flow.
 
 ### D0.11 Accepted-core proposed API seam
 
@@ -176,14 +185,14 @@ Exact new APIs (all constructors effect-free; types from httpx/collections.abc):
 - `make_oauth_client(*,client_id:str,client_secret:str|None,token_endpoint_auth_method:str|None,config:AuthConfig,on_failure:Callable[[],None])->AsyncOAuth2Client`.
 - `make_identity_client(*,config:AuthConfig,on_failure:Callable[[],None])->httpx.AsyncClient`.
 - `install_guards(client:httpx.AsyncClient,*,kind:Literal["oauth","identity"],config:AuthConfig,on_failure:Callable[[],None])->None`; called once before first send; appends async request/response hooks, refuses a non-fresh client. Literal imports typing.
-- `deadline_scope(deadline:float)->ContextManager[None]` binds a finite monotonic absolute operation deadline in a ContextVar and restores its token in finally; imports contextlib/contextvars/time. Runtime enters it exactly once after gate acquisition and retains it through settlement. Request hook outside that scope refuses; no implicit default. E9 at monotonic100.0 binds deadline105.0; at105.0 a new send refuses before transport.
+- `deadline_scope(deadline:float)->ContextManager[None]` binds a finite monotonic absolute operation deadline in a ContextVar and restores its token in finally; imports contextlib/contextvars/time. Restart runtime enters it once after gate acquisition through settlement. Initial composition enters it once before storage enter under D0.18 initial-budget mapping, without a request gate. Request hook outside that scope refuses; no implicit default. E9 at monotonic100.0 binds deadline105.0; at105.0 a new send refuses before transport.
 - `GuardedStream(stream:httpx.AsyncByteStream,*,body_bytes:int,chunk_bytes:int,expected_length:int|None,on_failure:Callable[[],None])`; `__aiter__()->AsyncIterator[bytes]`, `async aclose()->None`. Single consumption, idempotent close, no background reader.
 
 ### D0.13 Storage API
 
 Exact new APIs:
 
-- `AuthStorage(*,config:AuthConfig,secrets:ResolvedAuthSecrets,dependency_sha256:str,on_failure:Callable[[],None])`; `async __aenter__()->AuthStorage`; immutable `client_storage:AsyncKeyValue` available only after dirty barrier; `async finish(*,settled:bool,failed:bool)->None`; `async __aexit__(exc_type,exc,tb)->None` refuses implicit clean sealing unless finish succeeded. finish is once-only/idempotent after terminal success; any failure permanently prevents clean sealing. Runtime supplies truthful settlement and invokes no writes itself.
+- `AuthStorage(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None],purpose:Literal['restart','initial']='restart')`; `async __aenter__()->AuthStorage`; immutable `client_storage:AsyncKeyValue` available only after dirty barrier; `async finish(*,settled:bool,failed:bool)->None`; `async __aexit__(exc_type,exc,tb)->None` refuses implicit clean sealing unless finish succeeded. finish is once-only/idempotent after terminal success; any failure permanently prevents clean sealing. The purpose-specific caller supplies truthful settlement and invokes no marker writes. Read-only resolved_secrets:ResolvedAuthSecrets is available only to the entered owner while locked, never serialized. Construction validates callable/type/purpose without resolution or I/O. AuthStorage alone invokes the callable once under its lock and validates the resulting record.
 - `validate_stored(collection:str,value:dict[str,object],*,config:AuthConfig)->None` and `validate_envelope(value:dict[str,object],*,limit_bytes:int)->None` are pure, fixed-error validators.
 - `async preflight_entry(*,collection:str,key:str)->None` is private to the storage handle: validates metadata/path and bounded raw bytes as below before a maintained method can coerce, expire or delete them.
 - `EnvelopeGuard(key_value:AsyncKeyValue,*,owner:AuthStorage)` and `DecodedGuard(key_value:AsyncKeyValue,*,owner:AuthStorage)` retain that single owner, perform no constructor I/O and expose the maintained signatures `async get(key:str,*,collection:str|None=None)->dict|None`, `get_many(keys:Sequence[str],*,collection:str|None=None)->list[dict|None]`, `ttl(key:str,*,collection:str|None=None)->tuple[dict|None,float|None]`, `ttl_many(keys:Sequence[str],*,collection:str|None=None)->list[tuple[dict|None,float|None]]`, `put(key:str,value:Mapping[str,Any],*,collection:str|None=None,ttl:SupportsFloat|None=None)->None`, `put_many(keys:Sequence[str],values:Sequence[Mapping[str,Any]],*,collection:str|None=None,ttl:SupportsFloat|None=None)->None`, `delete(key:str,*,collection:str|None=None)->bool`, `delete_many(keys:Sequence[str],*,collection:str|None=None)->int`. All are async, including abbreviated names. Exactly six named collections; None/unknown collection refuses. Bulk inputs is defined to have matching lengths and bounded total input <=storage_record_bytes; no unbounded materialization. Any other store entrypoint is unavailable to the provider; added dependency use requires an amendment.
@@ -192,7 +201,9 @@ Exact new APIs:
 
 Exact new parent API: `RemoteSupervisor(*,base_raw:bytes,core_raw:bytes,manifest_raw:bytes,auth_config:AuthConfig,dependency_sha256:str,host:Literal["127.0.0.1"],port:int,resolve_secrets:Callable[[],ResolvedAuthSecrets])`; `async __aenter__()->RemoteSupervisor`; `async disable()->None`; `async shutdown()->None`; `async __aexit__(exc_type,exc,tb)->None`. Construction is effect-free, validates the trusted Principal/config equality in §6, and owns no second Broker. Enter owns the single CoreRuntime and creates one spawned frontend via multiprocessing spawn, the existing core socketpair and a separate inherited AF_UNIX SOCK_STREAM lifecycle socketpair. Parent CoreRuntime owns the server/core endpoint; supervisor owns only its control endpoint; child owns the frontend/core endpoint and its control endpoint; both close all unused endpoint copies immediately. Actual socket objects are transferred with the existing reduction convention. No named socket/path/public listener for control; no credentials/jobs/tasks over it. Secret resolution remains an explicit activation dependency in frontend startup, with Q supplying the explicit synthetic resolver callable.
 
-remote_service remains CLI/config and app composition; it delegates parent lifetime to RemoteSupervisor and child HTTP/auth lifetime to `async run_frontend(*,core_socket:socket.socket,control_socket:socket.socket,frontend:FrontendConfig,auth_config:AuthConfig,dependency_sha256:str,host:Literal["127.0.0.1"],port:int,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` in remote_supervisor. This is a trusted spawn entry coroutine, not lifecycle control data. Port is strict int1..65535, host exactly127.0.0.1; no defaults. The spawn-safe resolver is a trusted top-level callable, invoked only in the child before AuthRuntime enter; no secret bytes enter control messages. Q supplies a top-level synthetic resolver. Real resolver implementation/provisioning remains an explicit activation dependency. dependency_sha256 is the reviewed lock byte digest and is supplied unchanged to AuthRuntime. The single HTTP server admits only after admit, with one worker and no reload/access logs; no alternate application instance. The frontend app adopts/closes CoreClient once, enters AuthRuntime then the existing manager, and owns server admission. The parent is the only CoreRuntime shutdown owner. §6 core amendments are proposed only after accepted008 B and exclusive scope transfer; frozen current008 and exams are not modified here.
+remote_service remains CLI/config and app composition; it delegates parent lifetime to RemoteSupervisor and child HTTP/auth lifetime to `async run_frontend(*,core_socket:socket.socket,control_socket:socket.socket,frontend:FrontendConfig,auth_config:AuthConfig,dependency_sha256:str,host:Literal["127.0.0.1"],port:int,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` in remote_supervisor. This is a trusted spawn entry coroutine, not lifecycle control data. Port is strict int1..65535, host exactly127.0.0.1; no defaults. The spawn-safe resolver is a trusted top-level callable, forwarded unresolved through AuthRuntime and invoked only by AuthStorage in the child after lock acquisition; no secret bytes enter control messages. Q supplies a top-level synthetic resolver. Real resolver implementation/provisioning remains an explicit activation dependency. dependency_sha256 is the reviewed lock byte digest and is supplied unchanged to AuthRuntime. The single HTTP server admits only after admit, with one worker and no reload/access logs; no alternate application instance. The frontend app adopts/closes CoreClient once, enters AuthRuntime then the existing manager, and owns server admission. The parent is the only CoreRuntime shutdown owner. §6 core amendments are proposed only after accepted008 B and exclusive scope transfer; frozen current008 and exams are not modified here.
+
+The initial-only remote_supervisor entry is synchronous run_initial_provision(*,auth_config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None; it calls asyncio.run(provision_initial(...)). The trusted parent spawns exactly one child using multiprocessing spawn with immutable nonsecret operands; no CoreRuntime/RemoteSupervisor instance or frontend control frames. An importable top-level resolver, optionally functools.partial with immutable nonsecret operands, crosses unresolved. D0.18 owns parent deadline/exit/containment. Real custody and CLI remain conditional010; synthetic Q uses the same seam.
 
 ### D0.15 Credential/storage policy
 
@@ -206,13 +217,13 @@ The auth-wait profile excludes held core/task/DB locks. Resource verification is
 
 A cancelled/timed-out operation after credential access, uncertain upstream effect, storage error or partial mutation is defined to transition AuthRuntime to failed before gate release. New protected requests is defined to refuse until explicit operator recovery. In-flight operation settlement is defined to precede releasing the exclusive root lock. A process crash or unproven settlement is defined to never be described as a completed rollback or refresh-family revocation. Root at 5d98d77 narrowed the lifetime-marker guarantee in §8: exact clean-state/manifest restart is supported; observed uncertainty fails the live supervisor and suppresses relaunch. This does not detect all unobservable failed barriers after all-process loss. No reset/re-registration/recovery ritual is authorized here.
 
-Exact maintained FileTree/Fernet/Pydantic construction and guards are §12.2. AuthStorage alone constructs/closes the underlying FileTreeStore, owns its exclusive lock, and seals the lifetime after AuthRuntime proves settlement. There is no provider.close API. Per-call Authlib clients retain maintained `_upstream_oauth_client` finally/aclose ownership; the real identity AsyncClient is entered once and awaited closed by AuthRuntime after active operations settle. No implicit default store or plaintext fallback is allowed.
+Exact maintained FileTree/Fernet/Pydantic construction and guards are §12.2. AuthStorage alone constructs/closes the underlying FileTreeStore, owns its exclusive lock, and seals the lifetime after the purpose-specific caller proves settlement. There is no provider.close API. Per-call Authlib clients retain maintained `_upstream_oauth_client` finally/aclose ownership; the real identity AsyncClient is entered once and awaited closed by AuthRuntime after active operations settle. No implicit default store or plaintext fallback is allowed.
 
 | Store aspect | Contract |
 |---|---|
 | Class | Provider auth records are Canonical; loss requires reauthentication, not projection rebuild. Immutable synthetic captures are Evidence. Human reports are Views, never runtime input. No new token projection. |
 | Write | OAuthProxy alone owns six PydanticAdapter collections; adapter supplies serialization/lifetime only. FileTree writes are multi-record, not a transaction. Its writer fsyncs each temporary file before rename; directory and multi-record durability require section 8 qualification. |
-| Query | Maintained keyed get/put/delete under gate. The seven direct-method call budgets are frozen in EXECUTION §5; wrapper and barrier costs are separately measured after build. No live latency/RSS SLO is inferred. |
+| Query | Maintained keyed get/put/delete under the restart gate or single initial offline caller and lifetime lock. The seven direct-method call budgets are frozen in EXECUTION §5; wrapper and barrier costs are separately measured after build. No live latency/RSS SLO is inferred. |
 | Mutability | Provider rotates/upserts/deletes credentials with its TTLs. Operator disable is a service policy latch; no local token-family mutation. No automatic purge/repair on corruption. |
 | Identity | Maintained random txn/code/upstream/JTI keys; refresh metadata keyed by maintained SHA256(token). Owner identity uses existing canonical([issuer,subject,installation_id]); no new owner algorithm. |
 | Rebuild | n/a—canonical. Backup only with service stopped and exclusive lock, entire auth directory + separately secured matching keys + config/dependency identity. Restore remains disabled until canary/integrity/old-token refusal requirements pass; stale-backup restore is excluded by section8, not an ordinary restart. |
@@ -228,9 +239,9 @@ AuthRuntime is defined to first verify the proxy JWT signature with maintained J
 
 The SDK-facing AccessToken is defined to be newly projected with token equal to the incoming proxy bearer, client_id from verified claims, scopes=[], expires_at=proxy exp, resource=exact resource, subject=live subject and claims containing only canonical iss/sub/installation_id. It does not copy the upstream token or user JSON. AuthorizationFacts alone cross the trusted composition boundary; core receives its existing Principal, not any bearer. Owner rollover retains issuer/subject/installation; client change requires stopped-service reconfiguration/rebind, never a caller-selected owner.
 
-Construction is defined to use required_scopes=[], cache_ttl_seconds=None, consent=True, forward_resource=False, enable_cimd=False, exact callback allowlist and explicit encrypted store. get_routes('/mcp') is defined to run once before JWT verification. Registration enabled is defined to be set false before routes are made; `/register` is defined to be absent. The synthetic upstream-ID client is defined to be denied by the distinct downstream client allowlist. offline_access is an upstream authorize hint only, not an API scope requirement or a repository grant. `/user/repos` is a maintained verification call, not a request for repo permission. A live failure with minimal permissions is an activation blocker, not permission to broaden scopes.
+Both restart and initial composition call make_provider; its construction is defined to use required_scopes=[], cache_ttl_seconds=None, consent=True, forward_resource=False, enable_cimd=False, exact callback allowlist and explicit encrypted store. Restart get_routes('/mcp') runs once before JWT verification; initial constructs no routes. Registration enabled is defined to be set false before routes are made; `/register` is defined to be absent. The synthetic upstream-ID client is defined to be denied by the distinct downstream client allowlist. offline_access is an upstream authorize hint only, not an API scope requirement or a repository grant. `/user/repos` is a maintained verification call, not a request for repo permission. A live failure with minimal permissions is an activation blocker, not permission to broaden scopes.
 
-Exact remaining constructor operands: base_url=origin, resource_base_url=origin, issuer_url=origin, redirect_path='/auth/callback', client_id=upstream_client_id, client_secret=resolved upstream secret, jwt_signing_key=resolved signing bytes, client_storage=explicit encrypted wrapper, allowed_client_redirect_uris=[config.redirect_uri], require_authorization_consent=True, fastmcp_access_token_expiry_seconds=None, token_expiry_threshold_seconds=0. `provider.client_registration_options.enabled=False` precedes get_routes. No fallback expiry is deliberately selected; R1 makes missing duration unreachable as success. The specified operation is to pass the runtime-owned guarded real identity_client as http_client; v2's None/fresh-client clause is superseded. fallback_refresh_token_expiry_seconds=None, required_scopes=[], cache_ttl_seconds=None and enable_cimd=False are explicit. Provider timeout_seconds=10 is an unused maintained fresh-client default when http_client is supplied; actual client timeouts follow §12.1 and is defined to be remeasured.
+Exact remaining constructor operands: base_url=origin, resource_base_url=origin, issuer_url=origin, redirect_path='/auth/callback', client_id=upstream_client_id, client_secret=resolved upstream secret, jwt_signing_key=resolved signing bytes, client_storage=explicit encrypted wrapper, allowed_client_redirect_uris=[config.redirect_uri], require_authorization_consent=True, fastmcp_access_token_expiry_seconds=None, token_expiry_threshold_seconds=0. `provider.client_registration_options.enabled=False` precedes get_routes. No fallback expiry is deliberately selected; R1 makes missing duration unreachable as success. The specified operation is to pass the purpose-specific caller-owned guarded real identity_client as http_client; v2's None/fresh-client clause is superseded. fallback_refresh_token_expiry_seconds=None, required_scopes=[], cache_ttl_seconds=None and enable_cimd=False are explicit. make_provider passes config=config and on_response_failure=on_failure and sets client_registration_options.enabled=False before return. Initial composition supplies its synchronous irreversible failure latch to storage, transport and factory, with log suppression before dependency construction through settlement/close. Provider timeout_seconds=10 is an unused maintained fresh-client default when http_client is supplied; actual client timeouts follow §12.1 and is defined to be remeasured.
 
 Ingress is defined to reject duplicate authorize/token fields before maintained parsing. Authorize requires exactly one resource equal byte-for-byte to config.resource, response_type=code, the configured client_id and redirect_uri, code_challenge_method=S256 and 43-character base64url SHA256 challenge. Token code grant requires exact client/resource/redirect and verifier; refresh grant requires exact client/resource and refresh_token. Maintained handlers are defined to still verify client binding, code, redirect, verifier and scopes. URL normalization is not an authority-broadening operation; `/mcp/`, changed port/query/fragment and array audiences deny. The adapter is defined to bound form/body bytes using configured control_bytes before parsing. Root at 495973c approved the section 9 correction to advertise none and S256 only.
 
@@ -252,13 +263,13 @@ The trusted launcher constructs Principal from validated AuthConfig (issuer, git
 
 compose_http_app is the sole lowlevel server, manager, descriptor and transfer composition owner. It adopts one already-bound CoreClient exactly once. create_test_app delegates with identity guard and empty routes, preserving every local_test byte/route behavior. create_remote_app delegates with section 9 routes and the MCP guard. Guard wraps the complete /mcp method dispatcher, including 405; it never wraps /transfers. Extra route paths is defined to be unique and cannot collide with /mcp or /transfers namespaces. OAuth query validation belongs to its route before the core's no-query rejection; core paths retain that rejection. No catch-all bypass or second server is allowed.
 
-remote_supervisor preserves inherited socketpair process construction: broker enters CoreRuntime, attaches server endpoint; frontend constructs CoreClient and awaits bind; then app construction. AuthRuntime enters before app admission; app lifespan enters the one manager.run(), then awaits parent admit before admitting requests. Shutdown stops admission, drains auth, exits manager, closes frontend CoreClient and finally exits AuthRuntime. Failed start unwinds acquired owners in reverse order, never marks auth clean after an uncertain operation. Frontend loss does not invoke broker shutdown or cancel accepted jobs. remote_supervisor alone owns CoreRuntime shutdown; §12.3 freezes its private lifecycle channel.
+For restart service composition, remote_supervisor preserves inherited socketpair process construction: broker enters CoreRuntime, attaches server endpoint; frontend constructs CoreClient and awaits bind; then app construction. AuthRuntime enters before app admission; app lifespan enters the one manager.run(), then awaits parent admit before admitting requests. Shutdown stops admission, drains auth, exits manager, closes frontend CoreClient and finally exits AuthRuntime. Failed start unwinds acquired owners in reverse order, never marks auth clean after an uncertain operation. Frontend loss does not invoke broker shutdown or cancel accepted jobs. remote_supervisor alone owns CoreRuntime shutdown; §12.3 freezes its private lifecycle channel.
 
 CoreRuntime.disable_owner(owner_id) remains the only ticket/stream disable owner. Auth marks disabled before the trusted supervisor awaits that call; no new public tool, transfer route or CoreClient opcode is added. The private §12.3 lifecycle channel carries this instruction; core IPC remains unchanged.
 
 ### D0.18 Durable lifetime protocol
 
-[FIXED] remote_auth_storage owns one lifetime lock, one encrypted marker, stored-data trust and durability barriers, not token transitions. All following paths are beneath the operator-provisioned auth_root: auth.lock (0600 stable regular inode, never replace/unlink), lifetime.fernet (0600), lifetime.pending (0600 temporary replacement), and credentials/ (0700). FileTreeStore data_directory and both sanitization strategies use auth_root/credentials, with auto_create=False for that existing root. Its collection children remain library-owned; because auto_create=False also prevents missing collection directories, offline provisioning is defined to prepare all six maintained collections before sealing, not just the client collection. This is a future storage-layout amendment to retained 008 section 10, not migration of any live namespace.
+[FIXED] remote_auth_storage owns one lifetime lock, one encrypted marker, stored-data trust and durability barriers, not token transitions. All following paths are beneath the operator-provisioned auth_root: auth.lock (0600 stable regular inode, never replace/unlink), lifetime.fernet (0600), lifetime.pending (0600 temporary replacement), and credentials/ (0700). FileTreeStore data_directory and both sanitization strategies use auth_root/credentials, with auto_create=False for the validated restart root; initial alone uses auto_create=True after dirty0. Its collection children remain library-owned; because auto_create=False also prevents missing collection directories, offline provisioning is defined to prepare all six maintained collections before sealing, not just the client collection. This is a future storage-layout amendment to retained 008 section 10, not migration of any live namespace.
 
 Only AuthStorage writes the marker. Provider alone writes/deletes token collections. No cull/cleanup scheduler, repair, token index, journal of token transitions or extra token database is introduced. Marker is Canonical control state; a manifest digest is an integrity projection, never sufficient authority to rebuild credentials.
 
@@ -268,19 +279,37 @@ Store manifest algorithm: under exclusive ownership, traverse credentials withou
 
 Atomic marker replacement: create lifetime.pending with O_CREAT|O_EXCL|O_NOFOLLOW, mode0600; encrypt canonical AuthMarker using maintained Fernet(storage_key); write complete ciphertext, flush userspace, fsync file; os.replace pending onto lifetime.fernet on same filesystem; fsync auth_root directory. No admission/provider construction until the dirty replacement's directory barrier succeeds. A pending file on startup causes refusal even if another marker is clean. Excluded operation: delete it automatically. The qualified target profile uses fsync on files/directories and, on Darwin, fcntl F_FULLFSYNC on regular files after fsync; directory fsync is defined to succeed. Q pins OS/filesystem/mount and validates support before B acceptance. Unsupported required barriers refuse startup; even successful calls are qualified platform evidence, not a universal power-loss guarantee.
 
-Startup order:
+Restart startup order:
 
 1. Pure config/core/lock identity preflight; no listener. The specified operation is to open/validate existing private root and acquire nonblocking exclusive no-follow auth.lock before marker, secret-store or provider access. Failures release only owned handles and preserve bytes.
-2. The specified operation is to validate the already supplied in-memory secrets; their resolution belongs to the trusted external provisioning boundary before enter, never path discovery inside AuthRuntime. The specified operation is to verify marker ciphertext/schema/bindings and absence of pending artifacts. The specified operation is to require clean and matching manifest before constructing FileTreeStore/provider. Dirty/corrupt/unknown-key/missing marker on populated credentials refuses without a write.
-3. Atomically persist dirty marker (generation+1, new run_id, null store hash) and complete barriers. Only then construct maintained store/provider, register hook closures, set registration disabled, call get_routes once and verify the pre-provisioned downstream public-client record under the gate. Constructor/startup failure after this point leaves dirty. Fresh empty roots have no implicit initialization: offline provisioning is defined to create the initial clean generation0 marker after registration under the same protocol. Future Q synthetic provisioning uses maintained register_client and is sufficient for local exams; production provisioning remains a separate activation dependency.
+2. AuthStorage invokes the trusted unresolved resolver once while locked and validates its result; AuthRuntime neither resolves nor discovers secret paths. Validate marker ciphertext/schema/bindings and absence of pending artifacts. Require clean marker, complete namespace and matching manifest before FileTreeStore/provider construction. Dirty/corrupt/unknown-key/missing marker refuses without mutation.
+3. Atomically persist dirty marker (generation+1, new run_id, null store hash) and complete barriers. Only then construct maintained store and make_provider, register hook closures, set revocation disabled, call get_routes once and verify the pre-provisioned downstream public-client record under the runtime gate. Later failure leaves dirty. Restart never initializes an empty root; initial below is the only generation0 composition.
 4. The specified operation is to mark AuthRuntime ready after auth validation so create_remote_app can consume it. Service admission remains closed until core bind and ASGI manager lifespan readiness also hold. Marker remains dirty throughout the entire admitted lifetime, including idle periods; it is never cleaned between requests.
 
-Clean close order:
+Purpose-qualified close order:
 
-1. The specified operation is to stop all OAuth/MCP admission, refuse queued waiters, wait for the active gate owner and all maintained child operations/clients to settle. R5 uncertainty permanently latches failed for this lifetime; it cannot be cleared by later success.
-2. With exclusive gate and AuthStorage's root lock and no possible writer remaining, validate referenced records through maintained schemas while still dirty, close maintained resources, then flush/fsync every surviving credential file, then each credentials directory deepest-first, then credentials root and auth_root. Directory barriers account for deletions as well as renames. The specified operation is to compute the manifest after those barriers; any error before clean replacement leaves dirty. Observed errors at/after clean replacement follow step4.
-3. The specified operation is to persist clean marker with same generation/run_id and current manifest using the exact atomic-replace/barrier sequence. Only a ready-to-stopping, certainly settled lifetime may do this. The specified operation is to release gate then root lock. Credential access after clean sealing is outside the closed-state profile.
-4. On failure, retain all remaining bytes, pending files and fixed failure evidence; notify the parent with §12.3 failure. Excluded operation: attempt a second dirty overwrite to conceal an uncertain clean rename. The live supervisor remains failed with admission closed and no automatic relaunch; explicit operator review is required. It does not claim successful drain or clean-close acknowledgment. Only proven process/operation death permits release of owned handles; no later callback can write after lock release.
+1. Restart stops OAuth/MCP admission, refuses waiters and awaits the active gate owner. Initial has no admission, waiters or gate; its sole offline caller awaits all maintained operations/clients. Both prove settlement before lock release. R5 uncertainty permanently latches failed for this lifetime; it cannot be cleared by later success.
+2. With the restart exclusive gate or single initial offline caller, and in both cases AuthStorage's root lock with no possible writer remaining, validate referenced records through maintained schemas while still dirty, close maintained resources, then flush/fsync every surviving credential file, then each credentials directory deepest-first, then credentials root and auth_root. Directory barriers account for deletions as well as renames. The specified operation is to compute the manifest after those barriers; any error before clean replacement leaves dirty. Observed errors at/after clean replacement follow step4.
+3. The specified operation is to persist clean marker with same generation/run_id and current manifest using the exact atomic-replace/barrier sequence. Restart requires a certainly settled ready-to-stopping lifetime; initial requires the stronger verified predicate below with no failure latch. Restart releases gate then root lock; initial releases only the root lock after proven settlement and terminal preservation/seal. Credential access after clean sealing is outside the closed-state profile.
+4. On failure, retain all remaining bytes, pending files and fixed failure evidence; notify the restart parent with §12.3 failure or return initial nonzero exit under the bounded parent observation below. Excluded operation: attempt a second dirty overwrite to conceal an uncertain clean rename. The restart supervisor remains failed with admission closed; the initial parent latches failure refusing further provisioning. Neither automatically relaunches; explicit operator review is required. It does not claim successful drain or clean-close acknowledgment. Only proven process/operation death permits release of owned handles; no later callback can write after lock release.
+
+#### Initial purpose and existing-budget mapping
+
+Initial admissible root is existing private0700 auth_root containing only an existing zero-length0600 regular single-link auth.lock; no credentials directory, marker, pending file or other object. Restart also requires the preexisting stable lock. No command creates root or lock. AuthStorage validates descriptor/entry identity under its nonblocking exclusive lock, then rechecks the lock-only predicate before resolution; refusal preserves bytes without reading extra objects' contents. Sealed or partial roots refuse initial; no idempotent registration.
+
+Initial invocation states are preflight, locked, resolved, dirty_initial, registered, sealed, refused, uncertain. Refused precedes mutation; uncertain preserves partial bytes. Exactly one offline caller retains the lock, without requests/waiters, AuthRuntime enter, request gate, CoreRuntime, listener, external network or retry. No interleaving provider operation is possible because of that single caller, not an absent gate.
+
+AuthStorage resolves once while locked, validates secrets, then writes dirty generation0 with fresh run_id, exact bindings and null store hash through the same marker primitive. All dirty barriers precede credential construction. It creates credentials0700 under umask077 and constructs maintained FileTreeStore with explicit data/metadata directory and both FileTreeV1 strategies, initial-only auto_create=True. AuthStorage awaits setup_collection(collection=name) for each of the six canonical names in order, then validates the six directories/metadata and snapshots identities. setup_collection is internal to storage, not a new provider-guard entrypoint. No dummy tokens, handwritten metadata or cull task.
+
+provision_initial constructs the guarded identity client without a request and uses make_provider. No get_routes or provider.close. It calls maintained register_client exactly once with E19 adapted to configured distinct downstream ID/redirect, then get_client once with strict persisted preflight; upstream-ID fallback is not persisted-row proof. Initial finish(settled=True,failed=False) requires exactly one verified configured E18 persisted public-client row, no rows in the other five collections, exact six metadata/directory pairs, completed once-only registration, no failed latch/pending artifact/open writer, and awaited identity-client close. AuthStorage verifies persisted facts itself, not merely caller booleans. It holds the root lock through maintained-write settlement, credential/deepest-directory barriers, manifest and clean0 replacement with the same run_id; no later credential access.
+
+Failure before dirty0 preserves original bytes; failure/cancellation thereafter preserves partial bytes without rollback, deletion, re-registration, repair or retry. Failed final barrier remains failure even if disk looks clean. Async deadlines do not make synchronous OS I/O cancellable; parent containment and unproven-death disposition remain essential. Existing all-process-loss/stale-image limitations apply to initial seal too.
+
+Root ab4aff9 adopts IC-02 verbatim (normative profile; atomic consumers R6-I/R13-I):
+
+Initial provisioning is one bounded offline operation. The child captures one monotonic deadline at entry to provision_initial, before AuthStorage enter: deadline = monotonic() + config.operation_ms / 1000. It retains that same deadline through resolver, storage enter, six setup calls, provider registration/readback, client close and initial finish. No step resets it, no request gate is acquired, and no network request is permitted. The operation context uses the existing deadline_scope owner. Deadline/cancellation/failure sets the irreversible initial failure latch before cleanup. After such failure the caller must not request a clean finish; it preserves the namespace, closes clients and proves maintained-write settlement before releasing the root lock. A delayed settled write is not a successful rollback or permission to seal.
+
+The trusted parent bounds its single spawned child's completion from successful start() return using the same operation_ms; this is a watchdog for child/event-loop blocking, not a second usable provisioning budget. Only an exit0 observed before that parent deadline is success. On timeout, cancellation, nonzero exit or missing terminal proof, the parent latches failure and performs the existing remote_supervisor terminate/join escalation with its existing additional operation_ms termination grace, then kill/join if required. That interval is process containment only: no new attempt, registration, sealing permission or successful late completion. Failure to prove child death retains a failed parent process handle and refuses further provisioning; it cannot report cleanup/lock release as proven. The parent does not unlock a child's file descriptor or mutate the auth namespace. Parent loss remains uncertain. No automatic retry or relaunch follows.
 
 Supported restart validates the exact clean marker, configuration/key/dependency bindings, complete current manifest, strict record/layout checks and absence of pending artifacts under the exclusive lock on the qualified filesystem. It does **not** prove the previous process observed the last barrier succeeding. After all-process loss, an unobservable failed final barrier may leave the same bytes as a successful close; a complete stale restored image can do the same. Both histories are outside this local detection guarantee. No external fence, silent rollback, reauthentication, deletion, new namespace or recovery is authorized.
 
@@ -316,7 +345,7 @@ Only these paths mount. Capacity reservation in §10 precedes retained ingress d
 
 Metadata construction uses mcp.server.auth.routes.build_metadata(base_url, service_documentation_url, client_registration_options, revocation_options), then changes only token_endpoint_auth_methods_supported to ["none"], code_challenge_methods_supported to ["S256"], client_id_metadata_document_supported to False, and leaves registration_endpoint/revocation_endpoint absent (None excluded in serialization). issuer, authorization_endpoint, token_endpoint and grant/response types retain maintained construction. MetadataHandler and cors_middleware serve that value. Protected-resource metadata remains maintained and resource equals origin+"/mcp"; its authorization_servers uses canonical issuer. R9 requires both registration and revocation options disabled before get_routes. The adapter asserts actual returned paths/methods against this table; source drift refuses construction. No custom token issuance, discovery engine or dynamic client fetch.
 
-Pre-provisioned client is defined to have configured downstream client_id, client_secret=None, token_endpoint_auth_method="none", exactly one hosted redirect, grant_types=["authorization_code","refresh_token"], response_types=["code"], scope="" with no requested API scopes, and allow_unregistered_redirect_uris=False. No HTTP Basic, client_secret, client_assertion or alternate client ID accepted. Maintained register_client is used for future isolated synthetic Q provisioning and separately specified operator offline provisioning; startup does not register or overwrite it. Live Claude inability to use the pre-provisioned public profile returns O4, never enables DCR.
+Pre-provisioned client is defined to have configured downstream client_id, client_secret=None, token_endpoint_auth_method="none", exactly one hosted redirect, grant_types=["authorization_code","refresh_token"], response_types=["code"], scope="" with no requested API scopes, and allow_unregistered_redirect_uris=False. No HTTP Basic, client_secret, client_assertion or alternate client ID accepted. Maintained register_client is used for future isolated synthetic Q provisioning and separately specified operator offline provisioning; restart startup does not register or overwrite it. Live Claude inability to use the pre-provisioned public profile returns O4, never enables DCR.
 
 Form/query decoder preserves key multiplicity before parsing; duplicate keys in any source or merged query/body refuse. UTF-8/form decoding errors refuse. Required fields are R10. Authorize additionally permits optional state and scope (empty only); token authorization_code permits grant_type, client_id, resource, code, redirect_uri, code_verifier; refresh permits grant_type, client_id, resource, refresh_token, optional empty scope. Unknown fields refuse. Code verifier is 43..128 ASCII characters from ALPHA/DIGIT/-._~; challenge is 43 base64url characters and decodes to exactly32 bytes. Callback/consent retain maintained state/CSRF/cookie schemas; adapter bounds bytes and rejects duplicate inputs but does not reimplement those schemas. Authorization query is permitted only on protocol routes; transfer/MCP query policy remains core-owned.
 
@@ -358,15 +387,15 @@ E31 header metric fixture: returned pairs (b"Content-Length", b"2") and (b"Conte
 
 Storage callable definitions are canonical in §0 D0.13.
 
-Construction (outer to inner) is provider-owned PydanticAdapters → DecodedGuard → maintained FernetEncryptionWrapper(raise_on_decryption_error=True,fernet=Fernet(storage_key)) → EnvelopeGuard → maintained FileTreeStore. FileTree uses data_directory=auth_root+"/credentials", metadata_directory equal to that directory, both maintained FileTreeV1 sanitization strategies on the same directory, auto_create=False, default BasicSerializationAdapter. No replacement serializer, database, token index or monkeypatch. The guards forward writes to those owners; they do not generate token records. EnvelopeGuard rejects plaintext dicts **before** Fernet sees them, including get/ttl/bulk paths. Exact envelope keys are __encrypted_data__ (nonempty ASCII standard base64 string, validate=True and roundtrip-canonical, length<=storage_record_bytes) and __encryption_version__ (type exactly int, value1). No missing/extra key, bool version, empty payload or wrong encryption version. Fernet's own URL-safe token is the bytes inside this outer standard base64; do not confuse the two encodings.
+Construction (outer to inner) is provider-owned PydanticAdapters → DecodedGuard → maintained FernetEncryptionWrapper(raise_on_decryption_error=True,fernet=Fernet(storage_key)) → EnvelopeGuard → maintained FileTreeStore. FileTree uses data_directory=auth_root+"/credentials", metadata_directory equal to that directory, both maintained FileTreeV1 sanitization strategies on the same directory, auto_create=False for restart or initial-only auto_create=True after dirty0, default BasicSerializationAdapter. No replacement serializer, database, token index or monkeypatch. The guards forward writes to those owners; they do not generate token records. EnvelopeGuard rejects plaintext dicts **before** Fernet sees them, including get/ttl/bulk paths. Exact envelope keys are __encrypted_data__ (nonempty ASCII standard base64 string, validate=True and roundtrip-canonical, length<=storage_record_bytes) and __encryption_version__ (type exactly int, value1). No missing/extra key, bool version, empty payload or wrong encryption version. Fernet's own URL-safe token is the bytes inside this outer standard base64; do not confuse the two encodings.
 
 All methods validate collection, key and path first. Before reads/deletes/overwrites, preflight any existing entry (including expired records), so malformed present data cannot become an innocent miss through TTL culling. A genuinely missing entry remains None/False; a missing referenced row subsequently refuses authentication. Reads validate envelopes then decoded records before provider Pydantic. Writes validate decoded dict and finite TTL plus the actual live-time datetime.now(UTC) + timedelta(seconds=float(ttl)) storage addition, then Fernet generates the envelope, then EnvelopeGuard validates it and requires the maintained JSON-encoded envelope size plus512 bytes of fixed FileTree version/date/key-syntax allowance <=storage_record_bytes before the maintained writer runs. This allowance bounds the selected version1/aware-ISO-date metadata shape; it is a serialization safety margin, not a deployment record-size default. The specified operation is to bound decoded input to storage_record_bytes before encryption as well. Bulk prevalidates every element and every requested live-time float-TTL addition before first write; partial I/O failure still fails the lifetime, not rollback. Each subsequent forwarding boundary also checks its actual live-time addition. A later maintained clock sample can still overflow after prevalidation; this late-time limitation is failure-contained, not a preparse guarantee for all future times. Overflow invokes on_failure and fixed storage_unavailable while preserving partial evidence. No clamp, arbitrary maximum, expiry substitution or fallback is allowed. ttl/ttl_many is defined to validate the value as strictly as get and preserve the maintained remaining TTL result, including None. TTL input is None or finite positive int/float excluding bool, passed unchanged; no local rounding/new expiry. Unknown/malformed present data latches on_failure and raises fixed storage_unavailable, never logs raw bytes or returns None. Wrapper preflight costs are separate from the seven maintained call budgets.
 
-Byte-level duplicate rejection is explicit preflight, not a claim about FileTree's ordinary json.loads. Under the lifetime lock and the private/no-concurrent-writer assumption, preflight opens each touched regular file with O_NOFOLLOW, checks uid/mode/nlink=1, reads at most storage_record_bytes+1, rejects excess before unbounded library read, checks pre/post fstat identity and parses strict UTF-8 with object_pairs_hook rejecting duplicates at every depth, parse_constant rejection and recursive surrogate validation. It validates the entire FileTree JSON entry and envelope, uses the same maintained Fernet instance to decrypt the bounded ciphertext, then strict-decodes/validates the resulting JSON bytes before the library subsequently reads/decrypts those unchanged bytes normally. This deliberate duplicate read/decrypt is a trust preflight, never an alternate serializer or returned token source. No await permits another provider operation between preflight and maintained call because the outer gate owns all operations. A hostile concurrent same-UID writer is **outside** the guarantee; path-based FileTree I/O cannot exclude one. No dict wrapper alone proves byte uniqueness.
+Byte-level duplicate rejection is explicit preflight, not a claim about FileTree's ordinary json.loads. Under the lifetime lock and the private/no-concurrent-writer assumption, preflight opens each touched regular file with O_NOFOLLOW, checks uid/mode/nlink=1, reads at most storage_record_bytes+1, rejects excess before unbounded library read, checks pre/post fstat identity and parses strict UTF-8 with object_pairs_hook rejecting duplicates at every depth, parse_constant rejection and recursive surrogate validation. It validates the entire FileTree JSON entry and envelope, uses the same maintained Fernet instance to decrypt the bounded ciphertext, then strict-decodes/validates the resulting JSON bytes before the library subsequently reads/decrypts those unchanged bytes normally. This deliberate duplicate read/decrypt is a trust preflight, never an alternate serializer or returned token source. No await permits another provider operation between preflight and maintained call because the restart outer gate owns all operations; initial has exactly one offline caller under the lifetime lock with no competing operation or gate. A hostile concurrent same-UID writer is **outside** the guarantee; path-based FileTree I/O cannot exclude one. No dict wrapper alone proves byte uniqueness.
 
 FileTree entry shape from BasicSerializationAdapter is exactly version=1, value=the encrypted envelope, created_at=ISO datetime string; expires_at is an ISO datetime string when TTL is present and is **absent**, not null, for no TTL. Dates is defined to parse as aware finite timestamps. No extra fields in this selected writer profile (key/collection are not emitted by DiskCollection.put_entry). E32 structural entry at synthetic epoch1000: {"version":1,"value":{"__encrypted_data__":"<standard-base64-of-maintained-Fernet-token>","__encryption_version__":1},"created_at":"1970-01-01T00:16:40+00:00","expires_at":"1970-01-01T00:31:40+00:00"}. The angle-bracket string is explicitly a construction notation, not valid ciphertext: the executable fixture derives it with base64.b64encode(Fernet(E10.storage_key).encrypt(maintained_serialized_record_bytes)).decode("ascii"), preserving maintained serialization. Mutations version=true, plaintext value, duplicate raw value key, expires_at=null or ciphertext flip refuse.
 
-At startup/seal enumerate all six collection directories and their six *-info.json metadata files using maintained sanitizers. Each metadata file is defined to have exactly version=1, collection=the exact logical name, directory=the exact canonical child directory, created_at=aware ISO datetime. No extra/missing metadata, foreign child, link, temporary artifact or path outside root. The specified operation is to preflight metadata bytes before FileTree._load_collection_infos/any from_file call; metadata remains immutable for the lifetime. On each entry preflight recheck metadata identity/size/hash against that validated snapshot before path-based library access. All files bounded by storage_record_bytes; scan/hash incrementally and keep only manifest entry metadata, not all token contents. Full namespace integrity scan at startup and clean seal includes expired entries before maintained TTL logic. Missing metadata never triggers implicit library recreation. Initial Q fixture setup creates directories/metadata through maintained setup, registers E19, then seals generation0 under isolated exclusive ownership; runtime never provisions.
+At restart startup and both-purpose seal enumerate all six collection directories and their six *-info.json metadata files using maintained sanitizers. Each metadata file is defined to have exactly version=1, collection=the exact logical name, directory=the exact canonical child directory, created_at=aware ISO datetime. No extra/missing metadata, foreign child, link, temporary artifact or path outside root. The specified operation is to preflight metadata bytes before FileTree._load_collection_infos/any from_file call; metadata remains immutable after restart validation or initial maintained setup/snapshot. On each entry preflight recheck metadata identity/size/hash against that purpose-specific validated snapshot before path-based library access. All files bounded by storage_record_bytes; scan/hash incrementally and keep only manifest entry metadata, not all token contents. Full namespace integrity scan at restart startup and both-purpose clean seal includes expired entries before maintained TTL logic. Missing restart metadata never triggers implicit recreation. Initial Q fixtures use provision_initial and the D0.18 setup/register/readback/clean0 protocol; AuthRuntime never provisions.
 
 Stored record schemas are canonical in §0 D0.6.
 
@@ -388,9 +417,9 @@ shutdown() first runs the disable/drain sequence where possible, then invokes th
 
 #### D0.21d Remaining gates
 
-The technical choices remain fixed from v3, with only root84a25ff C1–C5 corrections in v4. Independent D may find defects; this author assigns no D/A score. Local acceptance still requires committed protected exams, accepted core B before integration, source-qualified transport/storage/control fault lanes, reviewed dependency lock and candidate resource comparison. No missing live identity is a reason to block synthetic D/A.
+The technical choices include v3, root84a25ff C1–C5, v5 precision corrections and root ab4aff9 O9/IC-01/02. Independent D may find defects; this author assigns no D/A score. Local acceptance still requires committed protected exams, accepted core B before integration, source-qualified transport/storage/control fault lanes, reviewed dependency lock and candidate resource comparison. No missing live identity is a reason to block synthetic D/A.
 
-Activation separately requires Forest's identity/app/client and numeric deployment/file/retention policy, qualified filesystem and provisioning/secret resolver/service-manager configuration, exact ingress/server limits, real provider and Claude OAuth/deadline/file-materialization/native-tool evidence. Empty identity scopes only; read:user requires a later explicit source-qualified amendment. Operator recovery remains unimplemented and unauthorized. All-process-loss/stale-image histories in §8 are excluded guarantees, not errors that QA may relabel solved.
+Approved: GitHub account4list233, dedicated identity-only OAuth App, no repository permissions; decimal100000000 bytes/file,1000000000 bytes/task,10000000000 bytes total;7-day completed-file cleanup direction. Actual app/numeric subject/client qualification and separate retention completion trigger remain pending. Activation separately requires concrete custody and deployment qualification, qualified filesystem and provisioning/secret resolver/service-manager configuration, exact ingress/server limits, real provider and Claude OAuth/deadline/file-materialization/native-tool evidence. Empty identity scopes only; read:user requires a later explicit source-qualified amendment. Operator recovery remains unimplemented and unauthorized. All-process-loss/stale-image histories in §8 are excluded guarantees, not errors that QA may relabel solved.
 
 ### D0.22 Canonical examples and document operators
 
@@ -483,7 +512,7 @@ E11 AuthMarker plaintext before Fernet. This is a valid structural empty-store s
 
 Invalid: state=dirty with non-null store_sha256; omitted dependency_sha256; generation=true; decrypt under different key. A valid dirty variant is replace(replace(replace(E11,state,'dirty'),generation,1),store_sha256,null); use a new UUID4 run_id in a real startup.
 
-E12 AuthRuntime constructor: AuthRuntime(config=AuthConfig(**ref(E9)),secrets=ref(E10),dependency_sha256=ref(E11).dependency_sha256,on_failure=lambda: None). The explicit no-op callback is synthetic-only and never a production default. Valid construction has state starting and no open fd/provider/gate operation; it is not ready. Invalid: raw mapping in secrets, unknown argument, reused/entered runtime or invalid dependency hash. Entering E11's empty fixture refuses missing registered client and preserves dirty; only independently provisioned fixtures reach ready. This is a lifecycle example, not serialized state.
+E12 AuthRuntime constructor: AuthRuntime(config=AuthConfig(**ref(E9)),resolve_secrets=synthetic_resolver,dependency_sha256=ref(E11).dependency_sha256,on_failure=lambda: None). The explicit no-op callback is synthetic-only and never a production default. Valid construction has state starting and no open fd/provider/gate operation; it is not ready. synthetic_resolver is an importable top-level zero-argument function returning ref(E10) only when invoked under the storage lock. Invalid: a resolved record or raw mapping in resolve_secrets, unknown argument, reused/entered runtime or invalid dependency hash. Entering E11's empty fixture refuses missing namespace/client in restart preflight without mutation; only independently provisioned fixtures reach ready. This is a lifecycle example, not serialized state.
 
 E13 maintained OAuthTransaction constructor input at now=1000.
 
@@ -705,7 +734,7 @@ Invalid: duplicate/unsorted relative path, ../ escape, absolute path, directory 
 
 ## R. Atomic normative registry and finite coverage map
 
-R1–R14 retain their v3 group identities as stable aliases. An alias expands to all numbered rows in its group, including R2-T transport rows and EXECUTION R14-E gate/R14-L loopback rows. No new AC identity is introduced. Each line below is one obligation; its referenced profile supplies exact operands/predicates. Definitions precede these consumers. Reasons are stated per row, not inferred from an unlabelled paragraph.
+R1–R14 retain their v3 group identities as stable aliases. An alias expands to all numbered rows in its group, including R6-I initial storage/composition and R13-I initial parent rows, R2-T transport rows and EXECUTION R14-E gate/R14-L loopback rows. No new AC identity is introduced. Each line below is one obligation; its referenced profile supplies exact operands/predicates. Definitions precede these consumers. Reasons are stated per row, not inferred from an unlabelled paragraph.
 
 | Finite concern | Sole definition | Stable requirements |
 |---|---|---|
@@ -722,6 +751,7 @@ R1–R14 retain their v3 group identities as stable aliases. An alias expands to
 | HTTP route/Host/Origin and core composition | D0.11, D0.17, D0.19 | R11 |
 | Fixed errors, logging and safe output | D0.1, D0.16, D0.20 | R12 |
 | Supervisor/control state, deadlines, EOF and shutdown | D0.7, D0.14, D0.21 supervisor | R13 |
+| Initial offline lifecycle and existing budget | D0.10/13/14/18 | R6-I, R13-I |
 | Historical AC, independent gates, resource exams and loopback | §7 and EXECUTION | R14, R14-E, R14-L |
 
 
@@ -938,13 +968,13 @@ R3-002 [FIXED, AC-008-02] OAuth wrappers MUST acquire at endpoint entry before S
 
 R3-003 [FIXED, AC-008-02] Resource verification MUST acquire before JWT/store lookup. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
-R3-004 [FIXED, AC-008-02] The gate MUST cover every maintained credential read. Reason: One outer gate prevents D-008-02 load-before-lock races.
+R3-004 [FIXED, AC-008-02] The restart request gate MUST cover every maintained credential read. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
-R3-005 [FIXED, AC-008-02] The gate MUST cover every maintained credential exchange. Reason: One outer gate prevents D-008-02 load-before-lock races.
+R3-005 [FIXED, AC-008-02] The restart request gate MUST cover every maintained credential exchange. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
-R3-006 [FIXED, AC-008-02] The gate MUST cover every maintained credential write. Reason: One outer gate prevents D-008-02 load-before-lock races.
+R3-006 [FIXED, AC-008-02] The restart request gate MUST cover every maintained credential write. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
-R3-007 [FIXED, AC-008-02] The gate MUST cover every maintained credential delete. Reason: One outer gate prevents D-008-02 load-before-lock races.
+R3-007 [FIXED, AC-008-02] The restart request gate MUST cover every maintained credential delete. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
 R3-008 [FIXED, AC-008-02] The gate MUST remain owned through failure settlement. Reason: One outer gate prevents D-008-02 load-before-lock races.
 
@@ -1009,12 +1039,14 @@ R4-008 [FIXED, AC-008-01/02] Runtime MUST enter deadline_scope once at active ac
 
 R4-009 [FIXED, AC-008-01/02] Runtime MUST retain deadline_scope through settlement. Reason: Auth waits cannot become core job/transfer ownership.
 
-R4-010 [FIXED, AC-008-01/02] operation_ms MUST cover active acquisition through safe-output completion. Reason: Auth waits cannot become core job/transfer ownership.
+R4-010 [FIXED, AC-008-01/02] For restart requests, operation_ms MUST cover active acquisition through safe-output completion. Reason: Auth waits cannot become core job/transfer ownership.
 
 R4-011 [FIXED, AC-008-01/02] Q MUST report server-owned buffers separately from auth admission memory. Reason: Auth waits cannot become core job/transfer ownership.
 
 
 ### R5 group
+
+Restart request/runtime settlement obligations; the initial-only deadline/failure mapping is R6-I/R13-I under D0.18.
 
 R5-001 [FIXED, AC-008-02] AuthRuntime MUST latch failed on timeout/cancellation after credential access. Reason: Unsettled credential effects cannot be released as clean.
 
@@ -1177,55 +1209,55 @@ R6-058 [FIXED, AC-008-02] Preflight MUST NOT supply an alternate token serialize
 
 R6-059 [FIXED, AC-008-02] Preflight MUST NOT claim protection from a hostile concurrent same-UID writer. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-060 [FIXED, AC-008-02] Startup MUST enumerate all six collection directories. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-060 [FIXED, AC-008-02] Restart startup MUST enumerate all six collection directories. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-061 [FIXED, AC-008-02] Startup MUST preflight all six metadata files before FileTree metadata loading. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-061 [FIXED, AC-008-02] Restart startup MUST preflight all six metadata files before FileTree metadata loading. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-062 [FIXED, AC-008-02] Metadata validation MUST enforce the D0.21 exact metadata schema. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-063 [FIXED, AC-008-02] Namespace validation MUST reject foreign children/links/temp artifacts. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-064 [FIXED, AC-008-02] Entry preflight MUST recheck metadata identity/size/hash against the startup snapshot. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-064 [FIXED, AC-008-02] Entry preflight MUST recheck metadata identity/size/hash against the purpose-specific validated snapshot. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-065 [FIXED, AC-008-02] Metadata MUST remain immutable throughout the lifetime. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-065 [FIXED, AC-008-02] Metadata MUST remain immutable after the purpose-specific snapshot. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-066 [FIXED, AC-008-02] Scanning MUST bound each file by storage_record_bytes. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-067 [FIXED, AC-008-02] Scanning MUST retain only manifest metadata rather than all token contents. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-068 [FIXED, AC-008-02] Startup MUST scan expired entries before maintained TTL logic. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-068 [FIXED, AC-008-02] Restart startup MUST scan expired entries before maintained TTL logic. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-069 [FIXED, AC-008-02] Clean seal MUST scan the full namespace including expired entries. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-070 [FIXED, AC-008-02] Missing metadata MUST NOT trigger implicit recreation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-070 [FIXED, AC-008-02] Missing restart metadata MUST NOT trigger implicit recreation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-071 [FIXED, AC-008-02] Startup MUST NOT provision a missing client or store. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-071 [FIXED, AC-008-02] Restart startup MUST NOT provision a missing client or store. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-072 [FIXED, AC-008-02] Provisioning fixtures MUST create all six maintained collections before generation0 seal. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-072 [FIXED, AC-008-02] Initial AuthStorage MUST create all six collections through maintained setup_collection before generation0 seal. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-073 [FIXED, AC-008-02] Startup MUST validate supplied in-memory secrets. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-073 [FIXED, AC-008-02] AuthStorage MUST invoke and validate the unresolved resolver exactly once after lock acquisition and purpose-specific root validation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-074 [FIXED, AC-008-02] Runtime MUST NOT discover secret paths. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-075 [FIXED, AC-008-02] Startup MUST validate marker ciphertext/schema/bindings under the lock. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-075 [FIXED, AC-008-02] Restart startup MUST validate marker ciphertext/schema/bindings under the lock. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-076 [FIXED, AC-008-02] Startup MUST refuse pending artifacts. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-077 [FIXED, AC-008-02] Startup MUST require a matching clean manifest before FileTree/provider construction. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-077 [FIXED, AC-008-02] Restart startup MUST require a matching clean manifest before FileTree/provider construction. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-078 [FIXED, AC-008-02] Startup refusal MUST preserve credential bytes. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-079 [FIXED, AC-008-02] Generation overflow MUST refuse without mutation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-080 [FIXED, AC-008-02] Startup MUST create the dirty marker with generation+1 and fresh run_id. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-080 [FIXED, AC-008-02] Restart startup MUST create the dirty marker with generation+1 and fresh run_id. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-081 [FIXED, AC-008-02] Dirty replacement MUST complete its directory barrier before provider construction. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-082 [FIXED, AC-008-02] The marker MUST remain dirty for the admitted lifetime. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-083 [FIXED, AC-008-02] Startup MUST verify the pre-provisioned client under the gate. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-083 [FIXED, AC-008-02] Restart startup MUST verify the pre-provisioned client under the gate. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-084 [FIXED, AC-008-02] Startup MUST set runtime ready only after auth validation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-084 [FIXED, AC-008-02] Restart startup MUST set runtime ready only after auth validation. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-085 [FIXED, AC-008-02] Service admission MUST await core bind and manager readiness. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
@@ -1249,9 +1281,9 @@ R6-094 [FIXED, AC-008-02] Unsupported required barriers MUST refuse startup. Rea
 
 R6-095 [FIXED, AC-008-02] Startup MUST NOT delete a pending artifact automatically. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-096 [FIXED, AC-008-02] Clean close MUST stop OAuth/MCP admission. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-096 [FIXED, AC-008-02] Restart clean close MUST stop OAuth/MCP admission. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-097 [FIXED, AC-008-02] Clean close MUST refuse queued waiters. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-097 [FIXED, AC-008-02] Restart clean close MUST refuse queued waiters. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-098 [FIXED, AC-008-02] Clean close MUST await every active maintained operation/client. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
@@ -1275,19 +1307,19 @@ R6-107 [FIXED, AC-008-02] Manifest generation MUST NOT persist another credentia
 
 R6-108 [FIXED, AC-008-02] Clean seal MUST preserve generation/run_id. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-109 [FIXED, AC-008-02] AuthStorage MUST refuse clean sealing unless the lifetime is certainly settled and transitioning ready-to-stopping. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-109 [FIXED, AC-008-02] AuthStorage MUST refuse clean sealing unless the certainly settled lifetime satisfies its D0.18 restart ready-to-stopping or stronger initial predicate. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-110 [FIXED, AC-008-02] Clean close MUST release the gate before the root lock. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-110 [FIXED, AC-008-02] Restart clean close MUST release the gate before the root lock. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-111 [FIXED, AC-008-02] Operations MUST NOT touch credentials after clean sealing. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-112 [FIXED, AC-008-02] Failure during close MUST preserve remaining bytes/pending evidence. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-113 [FIXED, AC-008-02] Failure during close MUST notify the parent. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-113 [FIXED, AC-008-02] Failure during close MUST notify the parent through its purpose-specific D0.18 outcome. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-114 [FIXED, AC-008-02] Uncertain clean replacement MUST NOT be concealed by a second dirty overwrite. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
-R6-115 [FIXED, AC-008-02] An observed uncertain close MUST leave the surviving supervisor failed. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
+R6-115 [FIXED, AC-008-02] An observed uncertain close MUST leave the surviving purpose-specific parent failed. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
 R6-116 [FIXED, AC-008-02] An observed uncertain close MUST NOT produce clean-close acknowledgment. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
@@ -1303,6 +1335,54 @@ R6-121 [FIXED, AC-008-02] Q MUST NOT claim stale-image rollback detection. Reaso
 
 R6-122 [FIXED, AC-008-02] Q MUST distinguish process-kill evidence from power-loss evidence. Reason: Exclusive trusted storage prevents corrupt/partial state from acquiring authority.
 
+
+R6-I001 [FIXED, AC-008-01/02] AuthStorage MUST enforce D0.18 initial lock-only root validation before resolution. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I002 [FIXED, AC-008-01/02] Initial AuthStorage MUST persist dirty0 through the existing marker primitive before credential construction. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I003 [FIXED, AC-008-01/02] Initial construction MUST use only the D0.18 maintained auto_create=True profile. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I004 [FIXED, AC-008-01/02] Initial AuthStorage MUST validate and snapshot metadata after all six maintained setup calls. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I005 [FIXED, AC-008-01/02] provision_initial MUST use exactly one offline caller under the lifetime lock. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I006 [FIXED, AC-008-01/02] provision_initial MUST NOT enter AuthRuntime or acquire a request gate. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I007 [FIXED, AC-008-01/02] provision_initial MUST NOT construct CoreRuntime or a listener. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I008 [FIXED, AC-008-01/02] provision_initial MUST NOT perform any network request. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I009 [FIXED, AC-008-01/02] provision_initial MUST call register_client exactly once with configured E19. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I010 [FIXED, AC-008-01/02] provision_initial MUST read back through maintained get_client. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I011 [FIXED, AC-008-01/02] AuthStorage MUST enforce the complete D0.18 persisted initial seal predicate itself. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I012 [FIXED, AC-008-01/02] Initial clean sealing MUST retain generation0 and initial run_id. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I013 [FIXED, AC-008-01/02] provision_initial MUST capture its absolute monotonic deadline before AuthStorage enter. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I014 [FIXED, AC-008-01/02] provision_initial MUST retain that deadline_scope through resolution, setup, registration/readback, client close and finish. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I015 [FIXED, AC-008-01/02] Initial steps MUST NOT reset the operation deadline. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I016 [FIXED, AC-008-01/02] Initial deadline/cancellation/failure MUST latch irreversible failure before cleanup. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I017 [FIXED, AC-008-01/02] A failed initial caller MUST NOT request clean finish. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I018 [FIXED, AC-008-01/02] Initial cleanup MUST prove maintained-write settlement before root lock release. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I019 [FIXED, AC-008-01/02] Initial failure MUST preserve the namespace without retry or rollback. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I020 [FIXED, AC-008-01/02] Initial composition MUST install log suppression before dependency construction. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I021 [FIXED, AC-008-01/02] Initial composition MUST retain log suppression through settlement and close. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I022 [FIXED, AC-008-01/02] Initial composition MUST await identity-client close before successful finish. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I023 [FIXED, AC-008-01/02] AuthRuntime MUST forward the resolver unresolved to AuthStorage purpose='restart'. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R6-I024 [FIXED, AC-008-01/02] Initial root-lock release MUST follow terminal preservation/seal without a request gate. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
 
 ### R7 group
 
@@ -1364,9 +1444,9 @@ R8-013 [FIXED, AC-008-01] project_facts MUST NOT contact GitHub. Reason: Project
 
 ### R9 group
 
-R9-001 [FIXED, AC-008-01/02] Provider construction MUST use the exact D0.16 constructor operands. Reason: Fixed provider/client construction excludes alternate authority paths.
+R9-001 [FIXED, AC-008-01/02] Restart and initial provider construction MUST share make_provider with the exact D0.16 operands. Reason: Fixed provider/client construction excludes alternate authority paths.
 
-R9-002 [FIXED, AC-008-01/02] Runtime MUST set registration disabled before route construction. Reason: Fixed provider/client construction excludes alternate authority paths.
+R9-002 [FIXED, AC-008-01/02] make_provider MUST set registration disabled before return. Reason: Fixed provider/client construction excludes alternate authority paths.
 
 R9-003 [FIXED, AC-008-01/02] Runtime MUST set revocation disabled before route construction. Reason: Fixed provider/client construction excludes alternate authority paths.
 
@@ -1402,7 +1482,7 @@ R9-018 [FIXED, AC-008-01/02] Metadata serving MUST use maintained MetadataHandle
 
 R9-019 [FIXED, AC-008-01/02] Client validation MUST enforce the D0.19 pre-provisioned none/S256 profile. Reason: Fixed provider/client construction excludes alternate authority paths.
 
-R9-020 [FIXED, AC-008-01/02] Startup MUST NOT register or overwrite that client. Reason: Fixed provider/client construction excludes alternate authority paths.
+R9-020 [FIXED, AC-008-01/02] Restart startup MUST NOT register or overwrite that client. Reason: Fixed provider/client construction excludes alternate authority paths.
 
 
 ### R10 group
@@ -1544,6 +1624,8 @@ R12-018 [FIXED, AC-008-01/02] Q MUST capture sentinel leakage across logs/stderr
 
 ### R13 group
 
+R13-001–070 apply to the restart service supervisor/frontend lifetime. Initial process ownership without a live supervisor/core is exclusively R13-I under D0.18.
+
 R13-001 [FIXED, AC-008-01/02] Owner disable MUST close new authenticated admission. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
 
 R13-002 [FIXED, AC-008-01/02] Owner disable MUST await CoreRuntime.disable_owner for ticket/stream revocation. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
@@ -1576,7 +1658,7 @@ R13-015 [FIXED, AC-008-01/02] Control transport MUST NOT use a named/public list
 
 R13-016 [FIXED, AC-008-01/02] Control transport MUST NOT carry credentials/jobs/tasks. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
 
-R13-017 [FIXED, AC-008-01/02] The frontend MUST invoke the trusted spawn-safe resolver only in the child before auth enter. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
+R13-017 [FIXED, AC-008-01/02] The frontend MUST forward the trusted spawn-safe resolver unresolved through AuthRuntime to AuthStorage for sole child invocation under its lock. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
 
 R13-018 [FIXED, AC-008-01/02] The frontend MUST supply the unchanged reviewed-lock digest to AuthRuntime. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
 
@@ -1685,6 +1767,24 @@ R13-069 [FIXED, AC-008-01/02] Explicit shutdown MUST invoke CoreRuntime exit onc
 R13-070 [FIXED, AC-008-01/02] Frontend loss/disable/auth failure MUST NOT implicitly invoke core shutdown. Reason: Lifecycle failure cannot cancel or duplicate accepted jobs.
 
 
+R13-I001 [FIXED, AC-008-01/02] The trusted initial parent MUST observe exactly one spawned child from successful start() return with D0.18 operation_ms cutoff. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I002 [FIXED, AC-008-01/02] The initial parent MUST accept only exit0 observed before its deadline as success. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I003 [FIXED, AC-008-01/02] The initial parent MUST latch failure on timeout/cancellation/nonzero exit/missing terminal proof. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I004 [FIXED, AC-008-01/02] The initial parent MUST use existing terminate/join with operation_ms grace then kill/join containment. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I005 [FIXED, AC-008-01/02] The initial parent MUST treat late exit0 as failure. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I006 [FIXED, AC-008-01/02] Unproven child death MUST retain a failed parent process handle refusing further provisioning. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I007 [FIXED, AC-008-01/02] The initial parent MUST NOT unlock the child descriptor or mutate the auth namespace. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I008 [FIXED, AC-008-01/02] The initial parent MUST NOT retry or relaunch. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
+R13-I009 [FIXED, AC-008-01/02] Initial containment MUST NOT construct live RemoteSupervisor/CoreRuntime or send frontend control frames. Reason: Initial provisioning cannot certify partial state or outlive exclusive ownership.
+
 ### R14 group
 
 R14-001 [FIXED, AC-008-01/02] Q MUST retain the historical AC rows verbatim. Reason: Historical identity and independent gates prevent synthetic evidence from becoming deployment approval.
@@ -1717,13 +1817,13 @@ R14-014 [FIXED, AC-008-01/02] The author MUST NOT assign a self D/A score. Reaso
 
 R14-015 [FIXED, AC-008-01/02] The author MUST NOT edit source/exams in this revision. Reason: Historical identity and independent gates prevent synthetic evidence from becoming deployment approval.
 
-The current writable scope is exactly these two draft documents. §R obligations are prospective and grant no implementation or deployment permission. Contracts are uncapped; R14 retains the prospective source ceiling. Independent review remains pending.
+The current writable scope is exactly the four copied documents named at the top. §R obligations are prospective and grant no implementation or deployment permission. Contracts are uncapped; R14 retains the prospective source ceiling. Independent review remains pending.
 
 ## 1. Authority, status and evidence
 
 Governing inputs read: `/Users/velox/cortados/contracts/CONVENTIONS.md`; `CONVENTIONS.md`, `RUBRIC.md`, `ORCHESTRATION.md`, `PLAYBOOK.md`, and `standards/00-ENGINEERING-STANDARD.md` beneath `/Users/velox/cortados/context-staging/research/ai-coding-std-workflow/` (governing revision `ab1b521047dcabc1b610caa157e5dfbd544f589b`). Project-local parent: [008](COWORK-MCP-008.md) §§2–4 and 10, [execution](COWORK-MCP-008-EXECUTION.md), [decisions](COWORK-MCP-008-DECISIONS.md), [root review](COWORK-MCP-008-ROOT-REVIEW.md). The explicit user-selected ID/location override generic CTX/1NN/single-contract-home naming; they do not waive gates.
 
-Evidence aliases are defined once in §0. Revision authority is Router commit 84a25ff, final “Auth v3 independent D11 amendment authority” section; 5d98d77 and 495973c remain history where consistent with v4. No original repo edits or workers are authorized.
+Evidence aliases are defined once in §0. Historical v4 revision authority was Router commit 84a25ff, final “Auth v3 independent D11 amendment authority” section; 5d98d77 and 495973c remain history where consistent with v4. No original repo edits or workers are authorized.
 
 | Evidence | Meaning retained |
 |---|---|
@@ -1738,7 +1838,7 @@ Evidence aliases are defined once in §0. Revision authority is Router commit 84
 
 Assignment history remains group `53f0ea39-a61e-4307-9c2c-466c1b4b0bd1`: author jobs `a21a86cf-d936-4be9-af76-ddec5048e479`, `5c236b3c-ffc4-4526-ad03-dbf5da0ac957`, `0cf07890-97dd-401c-86ac-cd8bf976a01d`, `162d277f-c2dd-48e8-b1ed-f663af7caa22`. Root-review feedback records draft acceptance only. This authoring is not a valid production attempt. Missing fixtures/environment are blocked, not failed builds. A second valid failure of the same design still triggers design_error; changing package/model never resets it.
 
-This v4 revision is directed by root commit 84a25ff and the exact independent auth-v3-D C1–C5 packet. The explicit current prohibition on workers overrides the general delegation workflow; no worker was launched. Only the two isolated copied drafts are writable; all original-repository references are read-only. No delegation, network, installs, model calls, credential reads, probes, acceptance tests or commits were performed. Existing concurrent `acceptance/cowork_mcp/` work is outside scope.
+Historical v4 authoring was directed by root commit 84a25ff and the exact independent auth-v3-D C1–C5 packet. The explicit current prohibition on workers overrides the general delegation workflow; no worker was launched. In that historical v4 assignment only the two isolated copied drafts were writable; all original-repository references are read-only. No delegation, network, installs, model calls, credential reads, probes, acceptance tests or commits were performed. Existing concurrent `acceptance/cowork_mcp/` work is outside scope.
 
 ## 2. Maintained owners and pins
 
@@ -1816,7 +1916,7 @@ flowchart LR
 ```mermaid
 stateDiagram-v2
   [*] --> Starting: validate config and exclusive ownership
-  Starting --> Ready: verified clean store then durable dirty marker
+  Starting --> Ready: restart clean validation then durable dirty marker
   Starting --> Failed: dirty missing corrupt or mismatched marker
   Ready --> Ready: serialized operation fully settles
   Ready --> Failed: partial write or uncertain cancellation
@@ -1850,6 +1950,24 @@ sequenceDiagram
   Note over A,B: No auth lock across broker work and no token over IPC
 ```
 
+```mermaid
+stateDiagram-v2
+  [*] --> Preflight
+  Preflight --> Locked: validate preexisting root and acquire lock
+  Preflight --> Refused: preserve unchanged bytes
+  Locked --> Resolved: lock-only predicate then resolve once
+  Locked --> Refused: invalid root or resolver failure
+  Resolved --> DirtyInitial: durable dirty0 before store construction
+  Resolved --> Uncertain: marker or barrier failure
+  DirtyInitial --> Registered: six maintained setups then register and read back
+  DirtyInitial --> Uncertain: failure or cancellation
+  Registered --> Sealed: settled exact persisted predicate and clean0 barriers
+  Registered --> Uncertain: failure cancellation or deadline
+  Sealed --> [*]: release lock and timely child exit
+  Refused --> [*]: release only owned settled resources
+  Uncertain --> [*]: preserve bytes and prove settlement or process death
+```
+
 ## 5. Identity and safe-output policy
 
 Canonical parameter profile: §0 D0.16. Atomic obligations: §R (coverage map).
@@ -1867,13 +1985,13 @@ Historical source `git show d4c99db:docs/mcp-worker/COWORK-MCP-008-EXECUTION.md`
 | AC-008-01 | Real loopback ASGI discovery/401 challenge, all MCP methods auth, exact port/path/resource; PAT/ID/refresh/wrong issuer/audience/expiry denied | Actual hosted discovery/callback |
 | AC-008-02 | Maintained-provider local fixtures: S256 only, exact redirect, duplicate/resource rejection, no positive cache, bad-secret logs, encrypted restart/unknown-key fail closed | Real GitHub App identity/refresh/rotation; two parallel refreshes and crash windows; client deadlines |
 
-R14 is the stable alias for §R and EXECUTION R14-L; historical identities and defect evidence remain unchanged. Root at 495973c ratified the supplemental LOCAL race/crash/hook requirements R1–R6; moving them out of activation is the D-008-02 correction, not a new AC or erased failure. Actual provider may be OAuth App or GitHub App after Forest's choice. The historical “Real GitHub App” wording is not a mandate to register one now.
+R14 is the stable alias for §R and EXECUTION R14-L; historical identities and defect evidence remain unchanged. Root at 495973c ratified the supplemental LOCAL race/crash/hook requirements R1–R6; moving them out of activation is the D-008-02 correction, not a new AC or erased failure. The approved current choice is the dedicated identity-only OAuth App for4list233. The historical “Real GitHub App” wording is not a mandate to register one now.
 
 Every normative row maps to its inherited AC in §R. Execution defines protected exams, resource measurements and deployment gates. No authored example or probe is independent acceptance. Mermaid rendering and complete document schema checks remain QA gates; no renderer was installed or invoked here.
 
 | Stable decision | Resolution / remaining gate |
 |---|---|
-| O1 | Unanswered Forest choice: deployed subject/provider/app/client and file/retention policy. Synthetic examples are not defaults. |
+| O1 | Approved: GitHub account4list233, dedicated identity-only OAuth App, no repository permissions; decimal100000000 bytes/file,1000000000 bytes/task,10000000000 bytes total;7-day completed-file cleanup direction. Actual app/numeric subject/client qualification and separate retention completion trigger remain pending. Synthetic values are not live defaults. |
 | O2 | Approved section 6 seam; accepted-core amendment and shared-file ownership transfer remain prerequisites to B2. |
 | O3 | Approved durable lifetime marker; section 8 fixes protocol. Independent kill-point/filesystem qualification and separately authorized recovery remain gates. |
 | O4 | Approved none/S256 metadata projection in section 9; live Claude compatibility remains unqualified. |
@@ -2024,3 +2142,15 @@ These are structural/document checks, not an independent D/A result or a claim o
 ### V5 root precision amendment
 
 Independent v4 full D review scored4/33 at D1.2, D1.3, D2.4 and D4.1; report SHA2569abec5fb30c0a6be2a19962103472c83202cd685297e3ecd71456c42dc4d3e1a is preserved at V/auth-v4-D/FULL-D-REVIEW.md. Root applies only V4-01/02: distinguish imported P from numeric MAX_INTEGER, name the pinned AsyncHTTP11Connection, enumerate the existing HTTP/1 versions, and define normalized header accounting separately from the preparse allocation floor. All16 JSON examples and historical AC rows remain unchanged. This revision assigns no D/A score, grants no source build, and changes no live policy, scope or dependency. Independent full-row rescore remains required.
+
+### V6 root O9 / IC-01 / IC-02 reconciliation ledger
+
+Input parent v5 SHA256 e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174; execution v5 SHA256 83052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b. V5 independent D=0/33 is historical for those bytes only; A/source absent. V6 requires fresh full independent D, committed exams/A and accepted core B before source dispatch. No self-score.
+
+Root ab4aff9 adopts V/operator-v2-review/REVIEW.md SHA256 2cc50003774eae1bb2030cfe725a7e393d1ee5e94dd40326a5efd5375c835aea; feasibility is not D0. IC-01 reconciles D0.10/13/14/16/18/21b, E12, R6-060–084/096–117, R9-001/002/020 and R13-017. R6-I/R13-I enumerate initial composition and IC-02. Marker/control/stored schemas, maintained serializers and inherited008 AC text remain unchanged. D11/D4, D-008-01/02, diagram failure and core failure history remain.
+
+Future runner scope is only EXECUTION §3/§4, based on V/auth-v5-D/RUNNER-AMENDMENT-PROPOSAL.md SHA256 4abf889d73698e306246451901dd74fa492dd8bd261abf85ba69b1c47b246173. No core runner/fixture/source changes now. Real resolver/custody remains conditional010. Existing seven B1/seven B2 paths and strict source-size limits remain.
+
+Residual qualification: synchronous blocking is not made cancellable by async deadlines; parent loss/unproven child death remain uncertain. Local hashes cannot detect every all-process-loss failed barrier or stale restored image. Custody/ACL/crash policy, filesystem barriers, real provider/Claude/binary/native confinement and retention trigger remain separately gated. Full diagram rendering remains independent D work.
+
+V6 bounded source readback confirms pinned proxy.py:485–548 explicit key/store branches, :782–884 maintained readback/registration, BaseStore:175–199 setup_collection and FileTreeStore:456–510/533–566 initial auto_create behavior. No imports or calls were made; source feasibility remains distinct from executable qualification.

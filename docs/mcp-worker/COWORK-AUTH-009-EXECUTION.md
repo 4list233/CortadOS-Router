@@ -1,12 +1,12 @@
 <!-- PURPOSE: Define prospective bounded auth build, exam and activation ownership.
-     CONTRACT: RT-COWORK-AUTH-009 v5; draft, not dispatchable.
+     CONTRACT: RT-COWORK-AUTH-009 v6; draft, not dispatchable.
      DEPENDS: COWORK-AUTH-009.md, accepted RT-COWORK-MCP-008 and independent D/A.
-     CEILING: Current turn writes only these two drafts; no code, tests or commit. -->
+     CEILING: Current turn writes only four copied auth/operator drafts; no code, tests or commit. -->
 # Cowork future authentication execution package
 
 ```yaml
 contract_id: RT-COWORK-AUTH-009
-contract_version: 5
+contract_version: 6
 parent: COWORK-AUTH-009.md
 implements: RT-COWORK-MCP-008 FUTURE AUTH
 owner: Forest
@@ -23,7 +23,7 @@ attempt_ledger: inherit 008 assignment and D-008-01/02; do not reset
 
 The scope tables, fixture recipes, command strings, numerical matrices and handback lists below supply exact parameter data for these obligations. They introduce no second type/API/state registry. R14-E sub-IDs inherit R14 without changing historical AC identity. Parent §R owns runtime requirements; R14-L owns the local listener lane.
 
-R14-E001 [FIXED, AC-008-01/02] Root MUST preserve this assignment's exact two-file write scope. Reason: Preserve the existing bounded ownership and independent evidence gates.
+R14-E001 [FIXED, AC-008-01/02] Root MUST preserve this assignment's exact four-document write scope. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
 R14-E002 [FIXED, AC-008-01/02] Root MUST require accepted core B before auth integration dispatch. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
@@ -93,7 +93,7 @@ R14-E034 [FIXED, AC-008-01/02] Q MUST supply fail-before-build cases for every n
 
 R14-E035 [FIXED, AC-008-01/02] Q MUST treat missing exams or zero discovery as BLOCKED. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
-R14-E036 [FIXED, AC-008-01/02] Q MUST preserve existing core exams unchanged. Reason: Preserve the existing bounded ownership and independent evidence gates.
+R14-E036 [FIXED, AC-008-01/02] Q MUST preserve every core test assertion/fixture unchanged; only the three future exam-owner metadata paths in §3 may be amended after the stated gates. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
 R14-E037 [FIXED, AC-008-01/02] Q MUST execute every protected-file scenario in the coverage table. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
@@ -167,11 +167,31 @@ R14-E071 [FIXED, AC-008-01/02] A conflicting dependency resolution MUST return O
 
 R14-E072 [FIXED, AC-008-01/02] Target interpreter/platform compatibility MUST remain a separate qualification gate. Reason: Preserve the existing bounded ownership and independent evidence gates.
 
+R14-E073 [FIXED, AC-008-01/02] Q MUST restrict future shared metadata edits to the three exact §3 paths after accepted core B and explicit exam-owner grant. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E074 [FIXED, AC-008-01/02] Q MUST execute auth loopback methods once in auth discovery, without a duplicate full-suite lane. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E075 [FIXED, AC-008-01/02] Q MUST report a separate mandatory auth-performance lane using the pinned auth interpreter. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E076 [FIXED, AC-008-01/02] Q MUST refuse missing auth directory/interpreter/source/dependencies, zero methods or any skipped/failed/errored auth method. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E077 [FIXED, AC-008-01/02] Q MUST NOT fall back to an incidental interpreter. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E078 [FIXED, AC-008-01/02] Q MUST preserve the full old core manifest/runner/inventory and every existing lane/assertion/fixture/outcome. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E079 [FIXED, AC-008-01/02] Q MUST cross-pin amended shared bytes, old manifest, both auth contracts, source/dependencies and all exams in auth MANIFEST. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E080 [FIXED, AC-008-01/02] Q MUST measure actual new counts at A without inventing an auth method count. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E081 [FIXED, AC-008-01/02] Q MUST preserve ordinary base-only startup tests in a fresh original-environment process. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
+R14-E082 [FIXED, AC-008-01/02] Q MUST exercise the initial IC-01/02 scenarios in test_auth_lifetime.py before candidate acceptance. Reason: Future auth coverage must not erase core evidence or certify an unbounded initial operation.
+
 ## 1. Current authorization and prerequisites
 
-[FIXED] Current scope_paths are exactly `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009.md` and `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009-EXECUTION.md`. Current acceptance_paths are empty. Only those copied drafts may be edited; original repository is read-only. No implementation, acceptance authoring/execution, package install, network, worker/model invocation, credentials, registration, service changes or commit is authorized. The current deliverable ends at the two drafts and handback.
+[FIXED] Current scope_paths are exactly COWORK-AUTH-009.md, COWORK-AUTH-009-EXECUTION.md, COWORK-OPERATIONS-010-DRAFT.md and COWORK-OPERATIONS-010-EXECUTION-DRAFT.md under /Users/velox/.cortados-builds/cowork-auth-operator-reconciliation. Current acceptance_paths are empty. Originals/source/exams/private evidence stay read-only. No additional script/report file, nested worker, source/test change, install, network, credential access, provider call, listener or commit. Root ab4aff9 authorizes document reconciliation only. Core candidate4 is frozen under host/B QA. V5 D=0/33 is historical for its old bytes; v6 D/A are NOT RUN, and auth source does not exist.
 
-[FIXED] Future dispatch requires accepted core implementation plus auth-specific independent D=0 then A=0, committed protected exams, resolved applicable O rows, approved dependency lock and nonoverlapping scope. Frozen core D0/A0 and committed protected exams do not imply core B acceptance; core implementation is terminal and undergoing host/independent B separately. Local synthetic auth design and exam specifications can proceed without actual GitHub identity/file-policy choices. Actual live access is never a prerequisite for writing synthetic exams.
+[FIXED] Future dispatch requires accepted core implementation plus auth-specific independent D=0 then A=0, committed protected exams, resolved applicable O rows, approved dependency lock and nonoverlapping scope. Frozen core D0/A0 and committed protected exams do not imply core B acceptance; current core candidate4 is frozen under host/independent B separately. Local synthetic auth design and exam specifications can proceed without actual GitHub identity/file-policy choices. Actual live access is never a prerequisite for writing synthetic exams.
 
 [FIXED] The parent owns all schemas, API signatures, examples E1–E34, R rules and contradictions. This execution document references them instead of copying nested examples. Any change in observable semantics returns to root for a versioned amendment before build.
 
@@ -186,12 +206,12 @@ Package B1 owns thin auth policy/lifetime after its separate gates:
 | Exact prospective scope_path | Status / single responsibility |
 |---|---|
 | integrations/mcp/remote_auth_config.py | NEW; closed AuthConfig validation; no secret resolution effects. |
-| integrations/mcp/remote_auth_provider.py | NEW; StrictGitHubProvider's two maintained hooks and response validation. |
+| integrations/mcp/remote_auth_provider.py | NEW; StrictGitHubProvider hooks/response validation and shared make_provider with exact D0.16 wiring. |
 | integrations/mcp/remote_auth_claims.py | NEW; strict claims and credential-free facts projection. |
-| integrations/mcp/remote_auth_runtime.py | NEW; one process admission gate, bounded waiter accounting, operation settlement/failure latch and identity-client lifetime; delegates all storage trust/lock/marker/barriers to remote_auth_storage. |
+| integrations/mcp/remote_auth_runtime.py | NEW; one process admission gate, bounded waiter accounting, operation settlement/failure latch and identity-client lifetime; delegates all storage trust/lock/marker/barriers to remote_auth_storage; forwards unresolved callable, and owns the separate single-caller provision_initial composition/deadline/failure latch without AuthRuntime enter. |
 | integrations/mcp/remote_auth_errors.py | NEW; dependency-log suppression, bounded safe OAuth response filtering and AuthEvent emission. |
 | integrations/mcp/remote_auth_transport.py | NEW; supported real HTTPX/Authlib client construction, endpoint/encoding policy and pre-eager-read body/chunk/header guards, parent §12.1. |
-| integrations/mcp/remote_auth_storage.py | NEW; sole lock/marker/manifest/barrier and strict encrypted/decoded trust owner around maintained storage, parent §§8/12.2. |
+| integrations/mcp/remote_auth_storage.py | NEW; sole lock/marker/manifest/barrier and strict encrypted/decoded trust owner around maintained storage, parent §§8/12.2; sole callable-under-lock resolution, purpose-qualified restart/initial setup and verified initial seal. |
 
 B1 does not duplicate OAuth protocol transitions or maintain token records. Root is specified to return a scope amendment before splitting any of these responsibilities into additional paths.
 
@@ -203,7 +223,7 @@ Package B2, sequential after accepted core and B1, owns production composition a
 | integrations/mcp/remote_runtime.py | FUTURE core file; only approved O2 trusted constructor selection. Existing recovery/locks/job lifetime preserved. |
 | integrations/mcp/remote_http.py | FUTURE core file; one HTTP composition owner and guarded MCP entry; preserve exact core ticket transfer route. |
 | integrations/mcp/remote_service.py | NEW; config/CLI and app/metadata composition; delegates trusted process lifetime to remote_supervisor, no transport/transfer reimplementation. |
-| integrations/mcp/remote_supervisor.py | NEW; sole parent CoreRuntime/spawned frontend owner and exact private lifecycle channel, parent §12.3; no job or token protocol. |
+| integrations/mcp/remote_supervisor.py | NEW; sole parent CoreRuntime/spawned frontend owner and exact private lifecycle channel, parent §12.3; initial spawn target and existing process containment reused without live CoreRuntime/RemoteSupervisor/control frames; no job or token protocol. |
 | pyproject.toml | EXISTING; reviewed optional remote extra only, no implicit ordinary dependency upgrade or default command change. |
 | docs/mcp-worker/cowork-auth-requirements.lock | NEW; exact remote resolved dependencies and artifact hashes after separately authorized resolution. Research freeze alone is not a release lock. |
 
@@ -216,7 +236,7 @@ python -m integrations.mcp.remote_service check --auth-config ABS --core-config 
 python -m integrations.mcp.remote_service serve --auth-config ABS --core-config ABS --base-config ABS --native-manifest ABS --host 127.0.0.1 --port PORT
 ```
 
-[FIXED] `check` is non-listening schema/dependency/seam validation only; it does not resolve secrets, register clients or contact GitHub. `serve` is activation-only and is specified to refuse missing operator settings, non-loopback host, multiple workers, failed root lock or unqualified storage restart. PORT is an operator-approved integer 1..65535 without a default. The eventual release interpreter/paths/service manager remain separately approved; these strings are not deploy commands to execute now. Client provisioning uses maintained register_client offline while stopped; no provisioning CLI is authorized in B1/B2 until root records its exact scope.
+[FIXED] `check` is non-listening schema/dependency/seam validation only; it does not resolve secrets, register clients or contact GitHub. `serve` is activation-only and is specified to refuse missing operator settings, non-loopback host, multiple workers, failed root lock or unqualified storage restart. PORT is an operator-approved integer 1..65535 without a default. The eventual release interpreter/paths/service manager remain separately approved; these strings are not deploy commands to execute now. Generic provision_initial/run_initial_provision are in B1/B2 now as prospective contracts with synthetic Q callers; real operator-config/provision-initial CLI and private-file resolver remain conditional010. No real provisioning is authorized.
 
 Excluded from B1/B2: every acceptance/test fixture, these contracts, existing global rulings/index, all installed releases, live config/state/keys, ingress/launchd, training/labels, upstream library source, task/file-transfer/queue/quota owners, ordinary server registration and user homes. Dependency changes may not silently broaden FS/network/MCP permissions.
 
@@ -238,8 +258,40 @@ Owner: designated independent MCP QA, never B1/B2. These are prospective accepta
 * `acceptance/cowork_auth/test_core_composition.py`
 * `acceptance/cowork_auth/test_compatibility.py`
 * `acceptance/cowork_auth/test_resources.py`
+* `acceptance/cowork_auth/evidence/benchmark-auth.py`
+* `acceptance/cowork_auth/evidence/baseline-auth.json`
 
-[FIXED] Q is specified to commit these exams with Exam-Owner attribution before dispatch. Q is specified to pin interpreter/source/dependency/fixture hashes in MANIFEST. Q is specified to supply fail-before-build cases for each new path. Existing core QA paths remain read-only dependencies, not 009-owned exams. Missing exam or zero discovery count is BLOCKED, not a pass. Required new paths beyond this list require a recorded amendment.
+[FIXED] Q is specified to commit these exams with Exam-Owner attribution before dispatch. Q is specified to pin interpreter/source/dependency/fixture hashes in MANIFEST. Q is specified to supply fail-before-build cases for each new path. Existing core QA assertions/fixtures remain read-only; the exact future exam-owner metadata exception below is the only shared-file amendment scope. Missing exam or zero discovery count is BLOCKED, not a pass. Required new paths beyond this list require a recorded amendment.
+
+### Future shared-runner amendment — independent exam owner only
+
+1. `acceptance/cowork_mcp/evidence/run-full-suite.py`
+2. `acceptance/cowork_mcp/evidence/suite-inventory.json`
+3. `acceptance/cowork_mcp/MANIFEST.json`
+
+Only after accepted core B, root release of the protected observation boundary and explicit exam-owner grant, the first change is an explicit interpreter branch in the existing acceptance-directory loop: when `path.name == 'cowork_auth'`, execute the same package-aware unittest discovery arguments with `/Users/velox/.cortados-builds/cowork-mcp-verification/auth-research-venv/bin/python`. Preserve the existing mcp_learning installed-interpreter branch, default base-QA branch, seven host integration lanes, all existing standalone/shared/preserved/installed/historical lanes and core/teacher benchmarks unchanged. No test assertions, skip handling, count parsing or pass calculation change. Missing interpreter, dependency/source mismatch, missing auth directory, zero methods or any skipped/failed/errored auth method must block acceptance. No fallback to an incidental Python. Add an explicit auth-directory existence check once the auth package is frozen, rather than silently depending on optional dynamic discovery.
+
+The second runner change adds one separately reported `auth-performance` benchmark lane using that same auth interpreter and the new benchmark path below. It does not replace the auth unittest lane. Every mandatory local HTTP loopback test belongs to `test_oauth_http.py` and is discovered once with the rest of auth; do not add another whole-file lane that double-counts it. Standalone invocation remains available for focused evidence, reported outside full-suite totals.
+
+Inventory records interpreter path, platform, dependency-lock and source hashes, auth method/file discovery, benchmark inputs, prior 874-method/28-lane core inventory as history, and the exact new counts measured at A. Expected lane addition is two (auth assertions and auth benchmark); do not invent an auth method count before collection. Candidate source-unit additions are also discovered and counted by the existing standalone lane. Original live-baseline red result, exact historical007 assertion replay, current prefix/exam guards and candidate ordinary compatibility remain separate and unchanged.
+
+The core MANIFEST updates hashes only for the runner/inventory and adds an explicit exam-owner amendment record with old hashes/authority and core assertions unchanged. The new auth MANIFEST cross-pins these shared runner bytes, the full old manifest, both auth contract bytes, locked dependency/source inputs and all auth exam files. It must not rewrite the old core outcome or falsely update its reviewed normative pins to009.
+
+
+The two additional auth evidence paths listed above to make the contract's reproducible measurements explicit:
+
+- `acceptance/cowork_auth/evidence/benchmark-auth.py`: standalone QA driver, synthetic providers and private roots only; fixed approved workload matrix, maintained method vectors, complete candidate flows, streaming/gate/storage/lifecycle costs and JSON report. It emits no pass until required assertions and every workload complete; absent candidate is expected prebuild red. It retains source/fixture/dependency identities and raw timings, allocations and call/I/O counts, not an invented speed SLO. Avoid duplicating assertions/fixtures by adopting support.py and exact frozen examples. The unchanged maintained baseline script is pinned by source-pins and retained private evidence, not silently rewritten to candidate behavior.
+- `acceptance/cowork_auth/evidence/baseline-auth.json`: exact observed maintained baseline report plus provenance references/hash metadata; no fabricated accepted-core/auth endpoint baseline. Original private baseline bytes remain unchanged. Accepted core common-operation measurements will be separate tagged pre-auth evidence after core B, not guessed now.
+
+This authorizes no production wrapper, provider implementation, install or live activity. Fixtures use actual maintained owners, mock transport and external socket denial; the mandated bounded loopback exception is explicit and isolated. Store fixtures are synthetic and never borrow live credentials. Any further helper path or excessive source size returns for scope review rather than hidden scripts.
+
+
+### Compatibility and environment obligations
+
+`test_compatibility.py` will invoke the ordinary base-only QA interpreter in a fresh process to prove existing ordinary startup/profile/stdio behavior does not import or require the remote extra. Existing core/ordinary suites continue in that base environment. Auth-specific imports and measurements use only the pinned auth interpreter; source origins and exact dependency versions/artifact lock are checked. Do not install FastMCP into ordinary environments to make discovery pass. Installed release qualification, if later required, is separately reported and cannot substitute checkout tests for installed origins.
+
+
+This scope is FUTURE only, from runner proposal SHA256 4abf889d73698e306246451901dd74fa492dd8bd261abf85ba69b1c47b246173. Current core candidate4 and all core files remain frozen. Preserve the full pre-amendment runner, inventory and core MANIFEST privately before future changes. No core outcome/failure count reset, normative repinning to009, extra helper, source implementation or new current write permission follows.
 
 Historical AC text copied byte-for-byte from parent §7, retaining the old split for provenance:
 
@@ -255,7 +307,7 @@ Historical AC text copied byte-for-byte from parent §7, retaining the old split
 | test_provider_hooks.py | R1–2, AC02: actual pinned maintained callback, explicit refresh and transparent refresh use both hooks. Reproduce the 26 invalid-shape matrix on all three paths plus E1 valid controls; add duplicate JSON keys, unknown absolute expiry, alias-only valid response, hook-clock datetime limits (now1000/duration253402299799 valid, +1 overflow,253402300800 overflow,MAX_INTEGER−1000 overflow, unrepresentable now_s), error-status/error-field and oversize cases. Observe parser-entry counts, put/delete interception and encrypted-file hashes; malformed success causes zero parse and zero token writes. Downstream code exchange has no upstream fetch. |
 | test_claims.py | R7–9, AC01: signature verification precedes facts, typed exp/iat/nbf exact boundaries, including fake-clock initial999/exp1000 followed by maintained await returning at999 (valid),1000 (refuse),1001 (refuse), with failure-latch inspection before final validate_claims and zero core calls on refusal, scalar exact audience/issuer/client; missing/malformed/foreign live subject, raw PAT/ID/refresh all refuse. Verify returned SDK object contains proxy bearer only and IPC Principal contains no token; never accept display login. Two clients with same owner require explicit stopped-service rollover; owner hash stays equal. |
 | test_oauth_http.py | R3,9–11, AC01/02: exercise actual maintained ASGI handlers using in-process HTTPX ASGITransport with all external sockets forbidden. Full authorize/consent/callback/code+S256 verifier exchange, exact state/redirect binding, missing/plain/duplicate/wrong resource, client allowlist, no /register or CIMD fetch, safe metadata and 401 challenge. Test every /mcp method unauthenticated before core 405, no duplicate mount. Synthetic route responses are not actual hosted discovery evidence. The mandatory real-loopback lane below supplies historical AC01 ground truth in addition to ASGITransport. |
-| test_auth_lifetime.py | R3–6,13, AC02: barriers before credential get prove one outer gate; two HTTP code redemptions produce one success, second invalid_grant; two refresh redemptions produce one rotation; explicit versus transparent and callback replay serialize. Trace lock enter/read/write/delete/exit; no nested acquisition; gate released before CoreClient. Independent processes prove second lifetime owner refuses before store access. |
+| test_auth_lifetime.py | R3–6,13, AC02: restart request barriers before credential get prove one outer gate; two HTTP code redemptions produce one success, second invalid_grant; two refresh redemptions produce one rotation; explicit versus transparent and callback replay serialize. Trace lock enter/read/write/delete/exit; no nested acquisition; gate released before CoreClient. Independent processes prove second lifetime owner refuses before store access. |
 | test_auth_lifetime.py (fault lanes) | Kill isolated synthetic subprocess at every observed multiwrite await boundary (callback code put/transaction delete; code delete/upstream/JTI/refresh puts; explicit upstream/new JTI/old JTI/metadata changes; transparent upstream put). Restart outcomes must match parent §8 kill-point table, including its final-barrier/all-process-loss limitation; corrupt ciphertext/wrong key/missing reference/invalid stored schema cannot authenticate. Cancellation during upstream exchange/store fails lifetime, no retry; gate wait cancellation never starts exchange. Preserve files and distinguish process kill from untested power loss. Cover live storage clock separately from injected hook now_s: put/put_many type/finite/positive TTL checks, every bulk addition validated before first write, live-time rollover after a valid hook, and later library overflow after prevalidation; observe fixed storage_unavailable, failure latch and preserved partial bytes. |
 | test_safe_errors.py | R12, AC01/02: inject unique secret sentinel in token/code/refresh/error body/exception/request URL/HTML/redirect/cookie and dependency traceback. Capture log records before handlers, stdout/stderr and every ASGI output byte/header. No sentinel escapes. Validate E7 fixed body, safe challenge, no partial success sent on overflow. Debug-off alone is a negative control. |
 | test_core_composition.py | R4,11,13 / O2, AC01/02: accepted CoreRuntime and CoreClient over inherited socketpair; actual manager initialized once, exact 12 descriptors and unchanged transfer route. No broker call before auth; no secret over IPC; no auth gate held during call. Disable closes tickets/streams through core, does not cancel accepted jobs; disconnect/expiry never resubmits. Local_test loader still rejects service mode; no startup DB effect on malformed auth config. |
@@ -277,7 +329,7 @@ Root84a25ff authorizes this local synthetic lane in the existing proposed test_o
 
 | Stable sub-ID | Atomic obligation | Reason |
 |---|---|---|
-| R14-L01 [FIXED, AC-008-01] | Q MUST run the command below from the candidate repository root with the pinned research interpreter and package-aware -t . discovery. | Reproducible actual local HTTP ground truth. |
+| R14-L01 [FIXED, AC-008-01] | Q MUST execute these assertions once within full auth discovery from repository root with the pinned auth interpreter and package-aware -t . discovery. | Reproducible actual local HTTP ground truth. |
 | R14-L02 [FIXED, AC-008-01] | The fixture MUST bind an AF_INET socket to 127.0.0.1 port0. | OS assignment avoids a fixed service port. |
 | R14-L03 [FIXED, AC-008-01] | The fixture MUST pass the bound socket to the pinned maintained uvicorn.Server serving the actual ASGI app. | A real server supplies the historical criterion. |
 | R14-L04 [FIXED, AC-008-01] | The fixture MUST use the getsockname port as its sole client destination. | Local permission is endpoint-specific. |
@@ -343,11 +395,11 @@ The parent watchdog uses monotonic deadlines: 10 seconds for startup-ready, 5 se
 /Users/velox/.cortados-builds/cowork-mcp-verification/auth-research-venv/bin/python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_oauth_http.py'
 ```
 
-Q records destination/bind/accept counts, denied external attempts, ready/shutdown/exit traces and socket closure. The lane is mandatory in prebuild maintained-seam mode and final actual-candidate mode; expected-red candidate imports do not count as candidate success. No lane is executed by this contract-only revision.
+Q records destination/bind/accept counts, denied external attempts, ready/shutdown/exit traces and socket closure. The focused command is available outside full-suite totals; full-suite executes these methods once inside auth discovery, with auth-performance separate. The lane is mandatory in prebuild maintained-seam mode and final actual-candidate mode; expected-red candidate imports do not count as candidate success. No lane is executed by this contract-only revision.
 
 ## 4. Gates and dispatch order
 
-1. [FIXED] Root pins 84a25ff and parent v4 semantics; proposes section6 amendments only after accepted core B and before dependent B2. Forest's deployed O1 remains separate, never filled with synthetic values. Parent/contract amendment precedes dependent code.
+1. [FIXED] Root pins ab4aff9 and parent v6 O9/IC-01/02 semantics; proposes section6 amendments only after accepted core B and before dependent B2. Settled O1 account/file/7-day direction is retained; actual qualification and retention completion trigger remain separate. Parent/contract amendment precedes dependent code.
 2. [FIXED] Q performs independent auth D. D0 requires exact callable/schema/ownership closure and rendered diagrams; this author asserts no rubric score.
 3. [FIXED] Q freezes and commits synthetic exams, including D-008-01/02 regressions, and performs A. Missing local fixtures, source qualification or finite cap/call-budget oracles block A. Postbuild candidate latency/RSS is not a prebuild prerequisite; candidate imports are explicitly expected red.
 4. [FIXED] Root waits for accepted core B and releases its shared-file ownership. Core D0/A0 alone does not authorize auth integration.
@@ -355,12 +407,11 @@ Q records destination/bind/accept counts, denied external attempts, ready/shutdo
 6. [FIXED] Q/root rerun the actual final candidate plus full accumulated system inventory. Builder success narration is insufficient. Root records accepted/rejected/inconclusive feedback against stable job/group and AC IDs.
 7. [FIXED] Activation remains blocked until §6 gates. Local acceptance never proves live GitHub refresh, Claude OAuth, native tools or binary materialization.
 
-Full regression requirement: adopt the actual 26-lane accumulated runner described in 008 EXECUTION and `V/provider-preflight.md`, then add core/auth lanes. Q is specified to inventory maintained unittest/pytest/standalone/native/plugin/adapter entrypoints and report discovered/executed/skipped/blocked counts at final diff. Starting references, not permission to run:
+Full regression requirement: use the current authoritative core-inclusive runner after its gated exam-owner amendment, preserving all existing lanes. Historical core inventory874 methods/28 lanes remains history; measure actual new counts at A. Expected additions are auth discovery and auth-performance, not a guessed method count. Candidate source-unit additions use existing standalone discovery. Commands are prospective only:
 
 ```text
-/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/training_teacher/evidence/run-full-suite.py ISOLATED_EVIDENCE_DIR
-python -B -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py'
-python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_*.py'
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py ISOLATED_EVIDENCE_DIR
+/Users/velox/.cortados-builds/cowork-mcp-verification/auth-research-venv/bin/python -B -m unittest discover -s acceptance/cowork_auth -t . -p 'test_*.py'
 ```
 
 The pinned environment for each lane must match its dependency lock, not the shell's incidental python. The original baseline remains 785 tests / 784 pass / 1 fail, not green. The live whole-label-hash parity failure is retained; historical-007 separately passed 4/4 after three literal path relocations and equal normalized AST. Weakening that exam or freezing authorized nightly appends is excluded. Candidate verifies ordinary profile equality plus existing label prefix, exam provenance and final live partition checks.
@@ -414,8 +465,8 @@ No live path is granted here. Later root documentation ownership is exact `docs/
 Deployment checklist is a gate specification, not instructions to act now:
 
 * Accepted core and auth B, complete accumulated regressions, resolved release dependency lock and measured budgets.
-* Forest's deployed GitHub subject/application choice and downstream client profile; no repo permissions. Actual upstream finite lifetimes, expiry aliases, offline_access or App behavior and rotation captured without token-bearing logs. No invented refresh/fallback TTL.
-* Approved numeric file limits and retention for payload/history/tombstones/backups; any mismatch with core schema amended first. Auth backup/key/recovery policy O3 independently qualified.
+* Approved GitHub account4list233, dedicated identity-only OAuth App and no repository permissions; actual numeric subject/app/client profile still requires qualification. Actual upstream finite lifetimes, expiry aliases, offline_access or App behavior and rotation captured without token-bearing logs. No invented refresh/fallback TTL.
+* Approved decimal100000000 bytes/file,1000000000 bytes/task,10000000000 bytes total and7-day completed-file cleanup direction; completion trigger and retention extension remain separate, with no invented history/backup semantics. Any mismatch with core schema is amended first. Auth backup/key/recovery policy O3 independently qualified.
 * Exact HTTPS origin/issuer/resource/host/origin allowlists, callback registration and rollback scope recorded by root. Candidate `https://forests-mac-studio.tailb38028.ts.net:8443/mcp` stays inactive; preserve private `443 → 127.0.0.1:8432`. No default port/route, no takeover of existing service.
 * Stable independent secrets and private store provisioning approved separately; client registration uses maintained public-client API, never upstream secret in Claude. Authentication through Claude app custom connector URL+OAuth, no fixed headers, SSH or companion substitution.
 * Actual Claude discovery/S256/callback/token/refresh sequence and deadline behavior; no claims from direct provider-method or in-process HTTP tests. If metadata/client profile fails, return O4 rather than enable arbitrary DCR.
@@ -423,17 +474,17 @@ Deployment checklist is a gate specification, not instructions to act now:
 * Actual Cowork raw PUT Authorization-capability egress and GET materialization: PDF/DOCX/XLSX/non-UTF8 source→upload→worker output→download→local hash equality. HTTP200 or a URL alone is not success. No new transfer implementation to conceal a client limitation.
 * Explicit operator disable/rollback rehearsal: stop public admission, revoke/close through core, retain jobs/evidence and private route/training. No automatic job cancel, state deletion or retry.
 
-Failure of any deployment-only lane leaves activation BLOCKED while preserving independently accepted local work. App creation, secret provisioning, registration and live default selection remain unanswered user actions outside this assignment.
+Failure of any deployment-only lane leaves activation BLOCKED while preserving independently accepted local work. App creation, concrete custody/provisioning, registration and live changes remain outside this assignment; the already approved account/file/7-day direction is not reopened.
 
 ## 7. Handback and unresolved decisions
 
 Future builder handback is specified to include confined diff, per-source physical line counts, exact dependency/source/fixture hashes, per-AC returned response/store/event evidence, gate/crash traces, full-suite membership, baseline/candidate measurements, selected bounded choices, deviations and unresolved risks. Root independently reviews and reruns; completion alone is not correctness. No commit/install/push follows automatically.
 
-Current author handback is only these two draft documents. Historical core D21→D3→D0 and auth D-008-01/02 remain recorded in parent §1. No tests or production acceptance are claimed.
+Current author handback is only the four copied auth/operator documents. Historical core D21→D3→D0 and auth D-008-01/02 remain recorded in parent §1. No tests or production acceptance are claimed.
 
 | Stable decision | Remaining owner / gate |
 |---|---|
-| O1 | Forest/root: deployed subject/app/client and file/retention choices unanswered. |
+| O1 | Approved4list233 identity-only dedicated OAuth App/no repo permissions, decimal100MB/file1GB/task10GB total and7-day completed-file cleanup direction; actual qualification and separate completion trigger remain pending. |
 | O2 | Root: matching accepted-core amendment and exclusive shared-file ownership release. |
 | O3 | Q/root: independent marker/barrier/kill-point qualification; separate provisioning/recovery authority. |
 | O4 | Q: exact none/S256 metadata and full local ASGI profile; live Claude compatibility remains additional. |
@@ -445,9 +496,9 @@ No row selects a product, permission, retention or identity alternative. Parent 
 
 ## 8. Revision-specific ownership and verification obligations
 
-Root authority is Router commit84a25ff, adopting exact independent auth-v3-D C1–C5; 5d98d77 technical closure remains historical. The current user explicitly prohibits nested workers; the general worker workflow applies only to a separately authorized future dispatch. This authoring does not start an attempt or alter the inherited group/ledger. Prior auth author job20d04076-54f8-46a1-b527-4597ca5ad88c and draft feedback23b83eaa-1170-4288-92c7-87da03b6b853 remain draft-only history.
+Current authority is Router ab4aff9 O9/IC-01/02; historical84a25ff adopted auth-v3-D C1–C5; 5d98d77 technical closure remains historical. The current user explicitly prohibits nested workers; the general worker workflow applies only to a separately authorized future dispatch. This authoring does not start an attempt or alter the inherited group/ledger. Prior auth author job20d04076-54f8-46a1-b527-4597ca5ad88c and draft feedback23b83eaa-1170-4288-92c7-87da03b6b853 remain draft-only history.
 
-B1 owns exactly seven files in §2: config, provider, claims, runtime, errors, transport and storage. Storage exclusively owns lock/marker/manifest/barrier/envelope/decoded trust; runtime exclusively owns admission and settlement and the identity client lifetime; transport owns guarded real client construction/reads. B2 adds supervisor to its exact prior integration/package paths; supervisor exclusively owns parent CoreRuntime and child/control lifetime, service owns CLI/routes/metadata, remote_http retains the single manager/transfer composition. No duplicate marker, broker or token owner. Every source remains strictly below500 physical lines including comments/blanks; docs have no cap. A needed extra source path returns to root before implementation.
+B1 owns exactly seven files in §2: config, provider, claims, runtime, errors, transport and storage. Storage exclusively owns lock/marker/manifest/barrier/envelope/decoded trust; runtime exclusively owns admission and settlement and the identity client lifetime; transport owns guarded real client construction/reads. B2 adds supervisor to its exact prior integration/package paths; supervisor owns restart parent CoreRuntime and child/control lifetime plus initial-only spawned process containment without CoreRuntime, service owns CLI/routes/metadata, remote_http retains the single manager/transfer composition. No duplicate marker, broker or token owner. Every source remains strictly below500 physical lines including comments/blanks; docs have no cap. A needed extra source path returns to root before implementation.
 Additional mandatory protected scenarios, in already listed Q-owned files:
 
 - test_auth_lifetime.py: clean provisioned generation0 -> dirty1 -> clean1 -> dirty2; unchanged pre-provisioned client and still-valid credentials across clean restart. Kill before/after every marker write/flush/rename/directory barrier and every provider multiwrite await; assert exact allowed restart outcome and byte preservation on refusal. Include missing marker with populated namespace, pending file, wrong encryption/signing/upstream key, changed config/lock digest, generation overflow, second process and symlink/hardlink substitution. An auth-failed lifetime never becomes clean; observed final-barrier uncertainty fails the supervisor. All-process-loss outcomes are exactly the parent §8 table, not universal uncertain-history detection. Trace store file and directory barriers before clean seal. Keep process-kill and actual power-loss guarantees separate.
@@ -457,7 +508,7 @@ Additional mandatory protected scenarios, in already listed Q-owned files:
 - test_safe_errors.py: do not treat intended successful synthetic token/code/state fields as leakage; inject separate sentinels in error-only inputs and assert zero diagnostic/reflected output. Check response_bytes at bound/+1, no partial response, no plaintext marker/key digests in events.
 - test_resources.py: distinguish hook acceptance-size bound from network allocation bound; measure waiter growth, active operation, frozen failed-settlement memory and disk flush/manifest work. Verify parent §12.1 source read/header floors and mandatory waiter caps; no slicing huge allocated chunks as an allocation proof.
 
-Before A, Q freezes the §5 fixture matrix/counters and source-qualified oracles; after implementation Q/root performs the mandatory actual-candidate comparison before B. Gate/trust/barrier costs remain explicit. Prebuild harnesses establish maintained seams and exam integrity only; they never substitute for candidate adapters. Protected core README pins parent888c677, execution command correction282dc1a and its MANIFEST; package-relative imports require unittest discover -t . from repository root. Reuse its immutable-copy constructors, socketpair/Session.closed lifetime, original ordinary baseline and expected-red prebuild conventions; do not change protected exams or currently building core source. Auth integration amendments wait for accepted008 B.
+Before A, Q freezes the §5 fixture matrix/counters and source-qualified oracles; after implementation Q/root performs the mandatory actual-candidate comparison before B. Gate/trust/barrier costs remain explicit. Prebuild harnesses establish maintained seams and exam integrity only; they never substitute for candidate adapters. Protected core README pins parent888c677, execution command correction282dc1a and its MANIFEST; package-relative imports require unittest discover -t . from repository root. Reuse its immutable-copy constructors, socketpair/Session.closed lifetime, original ordinary baseline and expected-red prebuild conventions; do not change protected assertions/fixtures or frozen core source; future metadata-only amendment is exactly §3. Auth integration amendments wait for accepted008 B.
 O7 exact future packaging boundary: add optional project extra named remote, with fastmcp-slim[server]==3.4.9 and Authlib==1.9.1 while preserving base dependency mcp==1.30.0 and the ordinary package entrypoints. The reviewed lock at docs/mcp-worker/cowork-auth-requirements.lock must pin all transitive versions/artifact hashes, target Python/platform, source indexes and resolver command. Resolve into a new isolated environment only under later authorization; never update installed releases, default interpreter or research venv. Ordinary startup must work with only the original base dependencies. A conflicting resolution returns O7, never relaxes pins or silently upgrades MCP. Research Python3.14 captures do not establish compatibility with every Python>=3.12 supported by the project; target interpreter is a lock/QA gate.
 
 Current handback checks are document-only: confined files, preserved historical AC/defect/history/group IDs, JSON block syntax and source hashes. No auth/core acceptance, tests, worker, installation, commit, activation or D/A self-score is claimed. Root reviews the isolated diff and technical gaps before copying; independent QA remains the only D/A authority.
@@ -465,3 +516,14 @@ Current handback checks are document-only: confined files, preserved historical 
 Root O7 mechanical correction at a93f48b: the server extra above is required; plain slim failed actual provider import. Isolated auth-dependency-lock/REPORT.json records65 packages with exact research-version equality and successful provider/storage imports on CPython3.14.6/macOS arm64. Candidate hash lock6099038ad1842f32dd9e4b54946dd3494cb97027851d71c8a066abc6f784cb88 is dependency evidence only; ordinary environments were not modified. Independent D/A/B and final lock incorporation remain required.
 
 V4 source/history ledger is canonical in parent §13. Independent auth-v3-D D=11/33 and A unrun remain history; C1–C5 amendment is not a self D/A score. The v4 canonical D0 registry precedes all parent requirement consumers; R1–R14 aliases expand to stable atomic sub-IDs, with this document owning R14-E execution and R14-L fixture obligations. Old diagram3 render failure remains in V/auth-v3-D/render.json.
+
+
+### V6 initial lifecycle verification selectors
+
+Parent D0.10/13/14/16/18/21b remain the canonical signatures; O2 in010 mirrors their five generic API rows and adds only three conditional operator rows. AuthRuntime accepts resolve_secrets, never secrets; AuthStorage alone resolves under lock with explicit restart/initial purpose. E12 is the synthetic callable constructor example. No second marker, serializer, provider factory or timeout owner.
+
+test_auth_lifetime.py covers R6-I001–024 and R13-I001–009 (inherited AC-008-01/02) with source-backed maintained setup/register/get_client and synthetic spawn operands: effect-free construction; losing lock causes zero resolver calls; restart forwards without resolution; initial lock-only predicate; six setup calls in order; dirty0 before construction; one register/readback; exact persisted E18 and empty other collections; identity close/settlement before clean0; no gate, network, CoreRuntime or frontend control frames. Both purposes use make_provider's unchanged D0.16 operands; runtime restart remains auto_create=False. Fault every await/barrier and preserve partial bytes, no repair/retry.
+
+IC-02 controlled-clock/process cases are separately named: timely success; cancellation during resolver/setup/registration/readback/close/finish; blocked child/event loop; failed maintained-write settlement; late exit0; unproven death; parent loss uncertainty; no retry. Capture one child absolute deadline before enter, unchanged through finish, and parent deadline from successful start() return. Trace failure latch before cleanup, no clean request after failure, lock held until settlement, existing operation_ms termination grace then kill/join, failed retained handle on unproven death. A delayed settled write is never permission to seal. These are future exams, not executed now.
+
+Input execution v5 SHA25683052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b and parent v5 SHA256e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174 retain historical D=0/33 only. V6 independent full D/A and source remain unrun/absent. Read-only source feasibility review SHA2562cc50003774eae1bb2030cfe725a7e393d1ee5e94dd40326a5efd5375c835aea is not an acceptance result. IC-02 is adopted verbatim in parent D0.18. No source/exam/live operation occurred in this revision.

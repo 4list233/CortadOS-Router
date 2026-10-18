@@ -1,12 +1,12 @@
 <!-- PURPOSE: Bound a future implementation/exam package for operator setup.
-     CONTRACT: RT-COWORK-OPERATIONS-110 v2, implementing proposed010.
+     CONTRACT: RT-COWORK-OPERATIONS-110 v3, implementing proposed010.
      DEPENDS: Accepted amended009 interfaces and accepted008, independently frozen exams.
-     CEILING: This authoring grants only two new documents; no dispatch or activation. -->
+     CEILING: This authoring grants only four copied documents; no dispatch or activation. -->
 # Cowork operator setup — execution proposal
 
 ```yaml
 contract_id: RT-COWORK-OPERATIONS-110
-contract_version: 2
+contract_version: 3
 status: draft
 owner: Forest
 orchestrator: root
@@ -21,48 +21,50 @@ The parent `COWORK-OPERATIONS-010-DRAFT.md` owns the only type/API/state registr
 
 ## 1. Current author scope and evidence
 
-Current scope_paths, two existing isolated copies only:
+Current scope is exactly four copied files under /Users/velox/.cortados-builds/cowork-auth-operator-reconciliation: COWORK-AUTH-009.md, COWORK-AUTH-009-EXECUTION.md, COWORK-OPERATIONS-010-DRAFT.md, COWORK-OPERATIONS-010-EXECUTION-DRAFT.md. No extra script/report file, source/tests, secrets, network, provider/live activity, nested workers or commits. All original repository and private evidence remain read-only. Current core candidate4 is frozen under host/B QA; no acceptance is inferred. Auth009v6 and operator010/110v3 require full independent D then committed exams/A; no auth source or A exists. Old auth009v5 D=0/33 remains historical only.
 
-```text
-/Users/velox/.cortados-builds/cowork-operations-contract-revision/COWORK-OPERATIONS-010-DRAFT.md
-/Users/velox/.cortados-builds/cowork-operations-contract-revision/COWORK-OPERATIONS-010-EXECUTION-DRAFT.md
-```
-
-Current acceptance_paths: empty. Everything else is read-only, including Router source,008/009, exams and evidence. No test/helper source, temp evidence file, network, install, secret read/generation, registration, service/listener/plist activation, permissions change, worker/model/provider call or git mutation is authorized. Reading dependency source is not importing or executing it. The current cwd contains the two copied drafts; their original author history is retained. No attempt ledger is reset.
-
-Parent O0 pins actual009v5 parent e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174 and execution 83052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b, with independent auth D=0/33 evidence and no A/source acceptance. The prior author's initially matched v4 hashes and failed final unchanged-hash check remain historical in O0. This revision reconciles v5 rather than retaining the obsolete v4 pin. Core008 v5 candidate3 is frozen under independent B/current full host runner; two reported source causes remain to correct, no core acceptance. Both valid failed implementations, setup blocks, C1–C10, host/measurement/IPC failures and later observations remain in the unchanged ledger. Operator010/110 D/A/B remain pending. No protected exam was changed or run.
+Current acceptance_paths are empty. Root ab4aff9 adopts the generic O9/IC-01/02 document reconciliation only. Parent O0 preserves v5 evidence/history; the reconciliation ledger pins the resulting009v6 copies. V5 D=0/33 is not current D0. Prior v4 concurrent-drift check failure, both valid core failures, candidate3 rejection, setup blocks, C1–C10 and all host/measurement/IPC history remain. No exam changed or ran.
 
 Governing paths read for authoring: `/Users/velox/cortados/contracts/CONVENTIONS.md` and `/Users/velox/cortados/context-staging/research/ai-coding-std-workflow/CONVENTIONS.md`, `RUBRIC.md`, `ORCHESTRATION.md`, `PLAYBOOK.md`, `standards/00-ENGINEERING-STANDARD.md`; Router `docs/mcp-worker/COWORK-MCP-008.md`, `COWORK-MCP-008-EXECUTION.md`, `COWORK-MCP-008-DECISIONS.md`, `COWORK-MCP-008-ROOT-REVIEW.md`, `COWORK-AUTH-009.md`, `COWORK-AUTH-009-EXECUTION.md`, `CLAUDE-APP-CONNECTOR-PLAN.md`, `INSTALLATION.md`, `INDEX.md`, `USAGE.md`; V/auth-dependency-lock/README.md and bounded maintained source excerpts. Parent O3 records repeatable owner searches and observed callable signatures. Current evidence additionally includes project docs/DECISIONS.md, V/auth-v5-D review/manifest/readiness, USER-LIVE-POLICY-APPROVAL.json, OFFICIAL-OAUTH-EXPIRY-CHECK.md and the retention proposal/activation choices; exact hashes are in O0.
 
+Current dependency bytes are the revised local009v6 copies under /Users/velox/.cortados-builds/cowork-auth-operator-reconciliation, not the unchanged repository originals. Independent v6 D/A are NOT RUN.
+
+| Reconciled009v6 dependency | SHA256 |
+|---|---|
+| COWORK-AUTH-009.md | 4b8374bfcc9a3c4562ee0f587e099fc020dc46a2aaf1de5dafefff5c3990a855 |
+| COWORK-AUTH-009-EXECUTION.md | b865125b89da7a3ec6113931d5ecf03299468ec8cb49da36aacb3924e2df4b01 |
+
+Historical009v5 parent SHA256 e9b2c0d1c22954da894643b8638ab9e43aa22f2b7e9fef03df2f10087f022174; execution SHA256 83052dcde6977750ee633d5a6fb7c179e30f466c75181981ed442eaec94d142b. The old D0 applies only to those bytes.
+
 ## 2. Future ownership proposal — not current writable scope
 
-All paths in this section are relative to R, the absolute Studio checkout in parent O0. Parent directories `integrations/mcp`, `docs/mcp-worker` and `acceptance` exist. The new operations acceptance subtree does not exist and has no committed fixtures; that is an explicit A blocker. The proposed009 source files are not accepted implementations today. Root first accepts008, amends/reviews009 as necessary, and transfers these exact owners exclusively. No overlapping concurrent source dispatch is permitted.
+All paths in this section are relative to R, the absolute Studio checkout in parent O0. Parent directories `integrations/mcp`, `docs/mcp-worker` and `acceptance` exist. The new operations acceptance subtree does not exist and has no committed fixtures; that is an explicit A blocker. The proposed009 source files are not accepted implementations today. Root first accepts008, independently reviews009v6, and transfers these exact owners exclusively. No overlapping concurrent source dispatch is permitted.
 
 One bounded implementation assignment can extend the six existing proposed009 owners, in this dependency order:
 
 | Exact future source path | Proposed ownership delta |
 |---|---|
 | integrations/mcp/remote_auth_config.py | OperatorConfig validation; no file/secret read effects. |
-| integrations/mcp/remote_auth_storage.py | Callable-under-lock constructor, initial purpose, six maintained setup calls and initial seal predicate; sole marker/lock/barrier owner. |
-| integrations/mcp/remote_auth_provider.py | Extract make_provider from009 constructor wiring; no new issuance/serialization. |
-| integrations/mcp/remote_auth_runtime.py | Pass unresolved callable to storage; initial-only offline composition using same provider factory. |
-| integrations/mcp/remote_supervisor.py | Existing child startup passes unresolved callable through runtime; top-level initial spawn target only; no new supervisor/control protocol. |
+| integrations/mcp/remote_auth_storage.py | Adopt accepted009v6 callable/purpose/setup/seal owner unchanged; real resolver operands only, no second marker/lock owner. |
+| integrations/mcp/remote_auth_provider.py | Adopt accepted009v6 make_provider unchanged; no duplicate constructor, issuance or serialization. |
+| integrations/mcp/remote_auth_runtime.py | Adopt009v6 callable forwarding and initial composition/deadline unchanged; operator inputs only. |
+| integrations/mcp/remote_supervisor.py | Adopt009v6 child target and bounded parent containment unchanged; no new supervisor/control protocol. |
 | integrations/mcp/remote_service.py | Pure/nonsecret check, bounded top-level resolver, CLI parsing and one-shot provisioning spawn. |
 
-The following is a verbatim mirror of parent O2 for review; O2 remains the sole canonical API registry. All signatures are proposals requiring O9 adoption, not existing imports.
+The following is a verbatim mirror of parent O2 for review; O2 remains the sole canonical API registry. Five generic signatures are reconciled009v6 definitions; three operator signatures remain conditional proposals. None is an implemented import.
 
 | Owner | Exact proposed callable/config shape |
 |---|---|
 | remote_auth_config | `load_operator_config(raw:bytes,*,auth_config:AuthConfig)->OperatorConfig` — pure schema/cross-reference validation |
 | remote_service | `validate_operator_setup(*,operator:OperatorConfig,base_raw:bytes,core_raw:bytes,manifest_raw:bytes,auth_config:AuthConfig)->None` — nonsecret release/filesystem/config/dependency/native-manifest validation only; no runtime enter, state mutation, secret read, network or listener |
 | remote_service | `resolve_private_secrets(*,operator:OperatorConfig,auth_config:AuthConfig)->ResolvedAuthSecrets` — trusted module-level function; only invoked in spawned auth/provision child after AuthStorage lock acquisition; fixed-safe exceptions |
-| remote_auth_storage | `AuthStorage(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None],purpose:Literal['restart','initial']='restart')` replaces D0.13's secrets operand; all existing methods remain. Add read-only `resolved_secrets:ResolvedAuthSecrets`, accessible only by entered owner while lock held; no serialization. `client_storage` remains inaccessible before the dirty barrier. |
-| remote_auth_runtime | `AuthRuntime(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None])` replaces D0.10's secrets operand; runtime always constructs AuthStorage with purpose='restart'; provider receives storage.resolved_secrets only after enter. |
-| remote_auth_provider | `make_provider(*,config:AuthConfig,secrets:ResolvedAuthSecrets,client_storage:AsyncKeyValue,identity_client:httpx.AsyncClient,on_failure:Callable[[],None])->StrictGitHubProvider` — single extraction of 009 D0.16 constructor wiring; no routes/enter/network/registration; no second issuer |
+| remote_auth_storage | `AuthStorage(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None],purpose:Literal['restart','initial']='restart')` is inherited from009v6 D0.13; all existing methods remain. Read-only `resolved_secrets:ResolvedAuthSecrets`, accessible only by entered owner while lock held; no serialization. `client_storage` remains inaccessible before the dirty barrier. |
+| remote_auth_runtime | `AuthRuntime(*,config:AuthConfig,resolve_secrets:Callable[[],ResolvedAuthSecrets],dependency_sha256:str,on_failure:Callable[[],None])` is inherited from009v6 D0.10; runtime always constructs AuthStorage with purpose='restart'; provider receives storage.resolved_secrets only after enter. |
+| remote_auth_provider | `make_provider(*,config:AuthConfig,secrets:ResolvedAuthSecrets,client_storage:AsyncKeyValue,identity_client:httpx.AsyncClient,on_failure:Callable[[],None])->StrictGitHubProvider` — shared009v6 extraction of D0.16 constructor wiring; no routes/enter/network/registration; no second issuer |
 | remote_auth_runtime | `async provision_initial(*,config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` — offline composition using AuthStorage purpose='initial', make_provider and maintained register_client; no AuthRuntime enter, core, listener or token flow |
 | remote_supervisor | `run_initial_provision(*,auth_config:AuthConfig,dependency_sha256:str,resolve_secrets:Callable[[],ResolvedAuthSecrets])->None` — top-level synchronous multiprocessing spawn target calling asyncio.run(provision_initial(...)); no CoreRuntime or RemoteSupervisor instance |
 
-Adopt009v5 D0.11/D0.17 service-core seams in remote_config/remote_runtime/remote_http only through separately gated009 B2. Those files are dependencies, not additional010 scope. validate_operator_setup delegates to their validators; no oauth_service-to-local_test translation or second HTTP composition. The factory forwards D0.16 exactly, including config/on_response_failure and the canonical guarded identity client. Private-file custody is conditional on O010-04 final setup review. Retention belongs to the separate existing-core-owner extension and adds no010 source path.
+Adopt009v6 D0.11/D0.17 service-core seams in remote_config/remote_runtime/remote_http only through separately gated009 B2. Those files are dependencies, not additional010 scope. validate_operator_setup delegates to their validators; no oauth_service-to-local_test translation or second HTTP composition. The factory forwards D0.16 exactly, including config/on_response_failure and the canonical guarded identity client. Private-file custody is conditional on O010-04 final setup review. Retention belongs to the separate existing-core-owner extension and adds no010 source path.
 
 No new source module, source utility file, dependency, pyproject change, shell wrapper, plist installer or retry scheduler is included. If accepted009 owners cannot remain strictly below500 physical source lines including blanks/comments, the builder returns the exact seam/line inventory to root; it does not split files privately. In particular, do not move marker work into remote_service to meet a line ceiling.
 
@@ -92,7 +94,7 @@ Q creates/commits these only in a separately authorized exam assignment. Fixture
 
 ## 3. Gate sequence and amendment review
 
-1. Root reviews parent O9 exact API changes, initial-only auto_create exception, lock preprovision requirement and resolver choice. Any disagreement stays [ESCALATE];010 does not silently amend009. Independent D reviews the complete resulting010/110 and affected009 dependency text.
+1. Root reviews reconciled009v6/010v3 under ab4aff9, including exact IC-01 qualification and IC-02 child/parent budget mapping. Full independent D then committed exams/A precedes source. Conditional real custody remains [ESCALATE]; generic adoption does not approve the private-file profile.
 2. Root supplies accepted source/version hashes and exclusive source ownership. Q freezes maintained source/lock hashes, exact synthetic captures, expected-red new imports/CLI flags, fixture hashes and failure oracles. Missing credentials or unqualified filesystem are blocked prerequisites, not valid failed builds.
 3. Independent A verifies the full runnable package, all paths and protected exams, actual target interpreter/lock/barrier qualification, and no unresolved build decisions. Synthetic policy parameters suffice for local implementation; no invented live policy defaults unblock A.
 4. A future authorized source builder implements only the six listed owners. No installed environment edits or live secret use. It returns a confined diff, per-AC evidence, source line inventory, source/lock/fixture hashes and measurements.
@@ -144,7 +146,7 @@ Existing accumulated Router/MCP/training suites use their accepted inventory and
 | test_operator_config /02 | O8 valid object and every single-field invalid mutation; unknown/duplicate keys, bool integers, missing fields, path overlap, reference collisions, hash/path/CLI mismatch, unqualified interpreter symlink or writable release; secret open/provider/core/listener counters all zero for check and validation failures. Check success remains nonsecret only. |
 | test_secret_spawn /03 | Actual multiprocessing spawn from installed module; parent never invokes resolver; child PID and lock-owner PID equal; second concurrent child refuses before resolver. Bind a top-level partial without secret operands and inspect its pickle and all control frames. Synthetic files with exact/+1 lengths, invalid encodings, wrong uid/mode/ACL, symlink ancestor, hardlink, special file, pre/post stat race, missing/replaced file and identical decoded signing/storage key. Record process-visible argv/env, intercepted parent objects/buffers, raw LogRecords/stdout/stderr and task-tree scan for unique sentinels. Parent fixture writer retains no secret literals; use a separately isolated fixture process and one-way digest comparison for scans. This is instrumented evidence plus source review, not proof against all memory/privileged inspection. |
 | test_initial_provision /04,05 | Real maintained FileTree/Fernet/Pydantic stack, all six directories and six metadata files captured through maintained setup; exactly one persisted public client, no other rows, correct excluded-field/default behavior. Instrument one register_client call, one readback and zero OAuth/identity requests. Refuse lockless root, populated/empty credentials directory, pending file, clean/dirty/corrupt marker, unknown file, symlink or second invocation; compare before/after bytes, inodes and directory entries, zero writes/registration on preexisting refusal. No hand-serialized token fixture as success oracle. |
-| test_initial_faults /06 | Inject before/after every marker write/flush/full-flush/rename/dir barrier, collection setup await, registration await, readback, identity close, file flush/deepest-directory flush, manifest scan and final seal. Kill actual child at those boundaries. Preserve exact leftover bytes; no retry and no cleanup. Initial clean0 only after verified row/settlement/barriers. A final-barrier error returns failure even if the final disk image looks clean. QA accepts009's enumerated possible all-process-loss disk outcomes; never requires impossible universal uncertainty detection. |
+| test_initial_faults /06 | Inject before/after every marker write/flush/full-flush/rename/dir barrier, collection setup await, registration await, readback, identity close, file flush/deepest-directory flush, manifest scan and final seal. Kill actual child at those boundaries. Preserve exact leftover bytes; no retry and no cleanup. Initial clean0 only after verified row/settlement/barriers within the unchanged child deadline. Separate cases: timely success, cooperative cancellation, blocked resolver/event loop, failed settlement, late exit0, unproven child death and no retry. Assert latch before cleanup, no failed clean request, lock through settlement, parent cutoff from successful start() return and existing operation_ms terminate/join grace then kill/join; failed retained handle refuses further provisioning. No frontend frames, live CoreRuntime or request gate. A final-barrier error returns failure even if the final disk image looks clean. QA accepts009's enumerated possible all-process-loss disk outcomes; never requires impossible universal uncertainty detection. |
 | test_service_lifetime /07,08 | Initial clean0→dirty1→clean1→dirty2; client ciphertext/registration unchanged across restarts; wrong keys/config/lock digest and generation overflow refuse. Delete collection metadata under a stopped synthetic root and prove no lazy setup repair. Bad secret fails before provider/admission. Child death, control EOF, disable, auth failure, unproven close, SIGTERM and parent shutdown preserve009 job ownership/control ordering; kill/join only through supervisor. Parse plist and reject KeepAlive/RunAtLoad true or any scheduling/watch/socket key. No restart loop; no parent CoreRuntime shutdown inferred from frontend exit. |
 | test_installed_compatibility /09 | New isolated wheel/venv import with -I from immutable release, base-only ordinary package still imports/works without remote extra; pinned dependencies/file hashes and no source-cwd imports. Compare ordinary entry/config/state/tool schema and training ownership against root's read-only baseline. Compare private route configuration through supplied sanitized baseline/candidate records; no route mutation or live networking in this local exam. Actual host unchanged-route observation is later root release evidence. |
 | test_resources /10 | Actual candidate measurements specified in section5; every sample has counter/timing/raw-error evidence and no hidden setup excluded from totals. |
@@ -185,9 +187,9 @@ The semantic bound on resolved secret memory is one upstream file <=configured b
 
 ## 7. Document-only checks and handback
 
-Current authorized checks: ensure the cwd contains exactly the two requested files; UTF-8/Markdown fence balance; parse embedded JSON with duplicate/nonfinite rejection; compare AC rows byte-for-byte; map every R010 ID to an AC; check whitespace and hash both outputs; recheck009 source hashes. No secret or source execution is needed. These are author hygiene checks, not D/A or implementation validation.
+Current authorized checks: ensure the cwd contains exactly the four requested files; UTF-8/Markdown fence balance; parse embedded JSON with duplicate/nonfinite rejection; compare AC rows byte-for-byte; map every R010 ID to an AC; check whitespace and hash both outputs; recheck009 source hashes. No secret or source execution is needed. These are author hygiene checks, not D/A or implementation validation.
 
-Revision2 author checks: the workspace contains only the two requested Markdown files; all28 O0 source/evidence hash rows match the read-only bytes, including actual009v5. The11 AC rows and O2 API mirror match byte-for-byte; all18 R010 obligations map to ACs. The one embedded JSON example parses with duplicate/nonfinite rejection; fences and whitespace check cleanly. The six proposed operator source paths are absent beneath the verified integrations/mcp parent, so none is described as an implemented import. No tests, diagrams, imports, provider calls or state operations were run. Operator D/A/B remain pending.
+Historical revision2 author checks (not a current claim): the workspace contains only the two requested Markdown files; all28 O0 source/evidence hash rows match the read-only bytes, including actual009v5. The11 AC rows and O2 API mirror match byte-for-byte; all18 R010 obligations map to ACs. The one embedded JSON example parses with duplicate/nonfinite rejection; fences and whitespace check cleanly. The six proposed operator source paths are absent beneath the verified integrations/mcp parent, so none is described as an implemented import. No tests, diagrams, imports, provider calls or state operations were run. Operator D/A/B remain pending.
 
 Prospective diagram rendering uses an already authorized local Mermaid CLI with no install/network, after Q extracts diagrams into its authorized evidence root. Example command shape: `mmdc -i /ABS/Q/diagram-1.mmd -o /ABS/Q/diagram-1.svg`. This turn does not create those files or claim rendered diagrams. Rendering remains an independent D check.
 
@@ -197,7 +199,7 @@ Future builder handback includes exact confined diff, per-file physical line cou
 
 | Decision | Owner / status |
 |---|---|
-| Parent O010-01 | Root/Q: accepted008 B,009v5 O9 amendment review plus A/source/B, operator D/A/B and exclusive source ownership; [ESCALATE]. Existing009v5 D0 is evidence only for its unmodified pins. |
+| Parent O010-01 | Root/Q: accepted008 B,009v6 full independent D/A/source/B, operator D/A/B and exclusive source ownership; [ESCALATE]. Existing009v5 D0 is evidence only for its unmodified pins. |
 | Parent O010-02/03 | Already approved:4list233 dedicated OAuth App/no repository permissions; decimal100000000/1000000000/10000000000 bytes; automatic7-day completed-task cleanup. Required qualification: actual app/subject/client. Awaiting user choice: completion semantics; separate retention extension, no auth/operator TTL substitute. |
 | Parent O010-04/06 | Forest/root/Q: concrete final setup review for private-file versus qualified alternative custody remains unapproved; resolver/secret custody/root/lock permission, ACL/crash policy, target barriers and independently reviewed recovery/rotation/restore/reset/deletion; [ESCALATE]. |
 | Parent O010-05 | Forest/root: release paths/interpreter, service mode/label/port and server ingress measurements; [ESCALATE]. |
@@ -207,6 +209,23 @@ Future builder handback includes exact confined diff, per-file physical line cou
 No app creation, permission expansion, secret provisioning, registration, live configuration, listener, launchd job, networking change or candidate8443 activation is performed or approved by this package. Ordinary MCP, training, native subscription ownership and private443→127.0.0.1:8432 remain unchanged. Cowork URL+OAuth is still the intended experience; SSH, companions, API-key fallback and automatic connector/file/history inheritance are not substitutes.
 
 
-## Root incorporation note — document proposal only
+## Historical root incorporation note — v2 document proposal only
 
-The authoring-time core status above is historical. Candidate3 host896methods/10failureevents/1error/0skips and independent11-row B have completed: four failed rows, two product causes. Root recorded rejection and narrow exam-owner correction authority at0ae0cf4; source remains unaccepted. No010 D/A/B or009 amendment is accepted. The ROOT-REVIEW hash in O0 identifies the inspected62fcd07 bytes, verified with git show; root subsequently appended the final rejection/exam grant. All other27 cited source/evidence hashes still match. This annotation changes provenance/current status only, not the proposed API, AC or deployment behavior.
+The authoring-time core status above is historical. Candidate3 host896methods/10failureevents/1error/0skips and independent11-row B have completed: four failed rows, two product causes. Root recorded rejection and narrow exam-owner correction authority at0ae0cf4; source remains unaccepted. At that v2 point, no010 D/A/B or009 amendment was accepted. The ROOT-REVIEW hash in O0 identifies the inspected62fcd07 bytes, verified with git show; root subsequently appended the final rejection/exam grant. All other27 cited source/evidence hashes still match. This annotation changes provenance/current status only, not the proposed API, AC or deployment behavior.
+
+
+## V3 reconciliation and initial-budget verification
+
+Root ab4aff9 adopts generic O9 and IC-01/02 into copied009v6; the private-file resolver remains conditional on final custody review. Parent O2 owns the operator mirror;009 D0.10/13/14/16/18/21b own generic definitions. AC010-06 maps R010-11/12 to initial child deadline, parent cutoff/containment and no-retry proof; all11 AC sentences and eight O2 API rows remain verbatim between parent/execution. The original18 R010 IDs remain stable.
+
+Inherited IC-02 text, verbatim for the future bounded operator assignment:
+
+Initial provisioning is one bounded offline operation. The child captures one monotonic deadline at entry to provision_initial, before AuthStorage enter: deadline = monotonic() + config.operation_ms / 1000. It retains that same deadline through resolver, storage enter, six setup calls, provider registration/readback, client close and initial finish. No step resets it, no request gate is acquired, and no network request is permitted. The operation context uses the existing deadline_scope owner. Deadline/cancellation/failure sets the irreversible initial failure latch before cleanup. After such failure the caller must not request a clean finish; it preserves the namespace, closes clients and proves maintained-write settlement before releasing the root lock. A delayed settled write is not a successful rollback or permission to seal.
+
+The trusted parent bounds its single spawned child's completion from successful start() return using the same operation_ms; this is a watchdog for child/event-loop blocking, not a second usable provisioning budget. Only an exit0 observed before that parent deadline is success. On timeout, cancellation, nonzero exit or missing terminal proof, the parent latches failure and performs the existing remote_supervisor terminate/join escalation with its existing additional operation_ms termination grace, then kill/join if required. That interval is process containment only: no new attempt, registration, sealing permission or successful late completion. Failure to prove child death retains a failed parent process handle and refuses further provisioning; it cannot report cleanup/lock release as proven. The parent does not unlock a child's file descriptor or mutate the auth namespace. Parent loss remains uncertain. No automatic retry or relaunch follows.
+
+No current runner/exam amendment is authorized. Future auth QA scope is009 EXECUTION §3/§4: only three existing core metadata files plus two auth benchmark/baseline paths beyond the original14 auth paths, after accepted core B and explicit exam-owner grant. Auth loopback runs once in discovery; benchmark is separately mandatory. Ordinary base-only environment and every core assertion/fixture/outcome remain intact.
+
+Input operator parent SHA25601ed6cdbefb2f5542cee4f41db59b3113ba9f0068a2374a308f2d7bbd0578adc; execution SHA256e17dfcccb70a6fa65a75895c96534d617dd168cc078ee46f6ea17f71e23682d7. Source-backed review SHA2562cc50003774eae1bb2030cfe725a7e393d1ee5e94dd40326a5efd5375c835aea is feasibility only. Existing65-package lock6099038ad1842f32dd9e4b54946dd3494cb97027851d71c8a066abc6f784cb88 and maintained FastMCP3.4.9/MCP1.30/Authlib1.9.1 remain unchanged. Current v3 D/A/B are unrun.
+
+V3 author hygiene passes for four-file scope, UTF-8/fence/whitespace, unchanged strict JSON blocks, exact API/AC mirrors, stable atomic IDs and unchanged original input/source pins. No runtime tests, Mermaid render, D/A score, source implementation or live activity is claimed. Final output hashes belong to the prose handback to avoid circular self-pins.
