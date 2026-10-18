@@ -1,78 +1,55 @@
 # Cowork connector build status — 2026-10-18
 
-**Not installed or connected.** The second local-core candidate failed independent review. Forest approved the [bounded revision proposal](COWORK-MCP-008-REVISION-2-PROPOSAL.md) on2026-10-18. The two failed attempts remain recorded; revised contracts, independent D/A and committed regressions must pass before the next build. Existing subscriptions, ordinary MCP, private Studio HTTPS443→8432 and nightly training remain unchanged. No public listener, OAuth application, secret, Funnel route or launchd service has been created.
+**Not installed or connected.** The first implementation of Forest's approved core revision2 failed independent QA. Two code causes need correction; three separately evidenced fixture synchronization issues need independent exam-owner amendments. Existing ordinary MCP, subscriptions, private Studio HTTPS443→8432 and nightly schedule remain unchanged.
 
-## What exists
+## Current evidence
 
-The local candidate implements automatic task workspaces, task/job ownership, sealed input/output artifacts, raw binary transfer tickets, the existing subscription worker broker and optional S1 handoff. It is a reviewed candidate, not an accepted release. Source changes span18 authorized paths, maximum 414 physical lines. All protected tests and frozen008 contract bytes remain unchanged by the builders.
+- Branch: plan/subagent-mcp; terminal source observed at62fcd07. All18source files frozen; maximum414physical lines. The six revised owners implement strict HTTP/IPC deadlines and separate capacity-only from fatal admission.
+- Worker67c23260-0c1d-4de8-b72d-178e39c5a82d used native Codex subscription, gpt-6.1-sol, networkfalse and no MCP grants. Source remains uncommitted pending acceptance.
+- Full host inventory: **896 methods,10 failure events,1 error,0 skips;27/28 lanes passed**. Event counts may overlap test methods. All785methods outside new Cowork core pass. This is the standalone Router/MCP inventory and its declared shared-router compatibility lanes, not unrelated CortadOS workstreams.
+- Independent B: all11rows reviewed; B1/B5/B6/B7 fail, two underlying product causes. Final rejection feedback7aecbc5e-c556-47e9-8a0c-2ea256cce84a/sequence25.
+- All680source/normative/fixture/prior-protected identities unchanged. Manifest585527a2aaca7780d0ca9509b92e466e7d891147d9866d13be01809643fc8967 pins111core methods; no builder edited exams.
 
-OAuth 009 v5 passed all 33 independent design checks at commit d96dc1c. Authentication source and its protected exams have not been built. The optional 65-package dependency profile was qualified separately; it was not installed into ordinary MCP. The operator setup 010/110 documents are nonbinding proposals for existing auth/service owners; their initial provisioning and secret-resolver amendments are not accepted implementation authority.
-
-Cowork remains the planner in the Air app/cloud session. Native workers, saved subscription credentials and S1 remain on the Studio. The connector will advertise delegation instructions. It does not automatically share Cowork's conversation, connectors, skills or filesystem. Actual hosted OAuth and binary upload/download in this account remain completion gates.
-
-## Frozen candidate and verification
-
-- Branch: `plan/subagent-mcp`; source baseline 4ed7508, terminal observation HEAD d96dc1cf08c9e32c1da7cabc7f47f358d8dd697e. Later commits change documents only.
-- Corrective worker: d37a73fb-aa46-491f-9a5d-98fa60c682e8; same assignment group 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1. Native Codex subscription, explicit gpt-6.1-sol, shell network disabled and no MCP grants.
-- Root cumulative source patch SHA256 634cce15a58df7f94512a9402cb2d22dfc26ec582ce55a2ae7f98b3409227394; source map in [root-freeze.json](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/root-freeze.json).
-- Independent identity checks: 18 sources, 3 normative documents, 18 core fixture files and 641 prior protected files match. Current core manifest 03589f6ad5394e4c5d3c29f37979f349f7fb4b1c7cd8b6671b0c55f94da49959.
-- Full standalone Router/MCP inventory, including its maintained shared-router compatibility lanes: **874 methods: 873 passing, 1 failure, 0 errors, 0 skips; 27 of 28 lanes passed.** This is not a claim that unrelated CortadOS workstreams were tested.
-
-Exact command from the standalone checkout:
+Exact host command, from /Users/velox/.cortados-builds/cortados-router-repo:
 
 ```sh
 umask 022
-/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/full-suite
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/full-suite
 ```
 
-Exit 1. [Full report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/full-suite/report.json) SHA256 756c7221d561f42e6b3265f4807e68e51beb66968b8f599b6546c19502160ce0. The sole failing method is `CapacityExam.test_workspace_file_overrun_stops_actual_fake_worker`; job_result returns storage_error instead of the contained cancelled/capacity_exhausted outcome. A separate observational rerun passed; it does not erase the original failure or establish its exact scheduling cause. A deterministic missed-cadence probe reproduces the observation-policy conflict with a verified termination receipt.
+Exit1. [Full report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/full-suite/report.json), SHA2768296b0701e059f8f1d381f0eca8268098993108281ea31a7108989d9c4a13. [Independent review](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/independent/B-FINAL.md), SHA6dd939710aec63cf32997c6b41374ed13233f19199a698136ba6dabd6b26bcc6. [Source freeze](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/root-freeze.json), SHA22768e54f69096bf8d499a2024517d775d0dd944cb39e22710ce886961334bb7. Cumulative patchSHA3bfce1b8bfdfa0f02f4dc7df1d3bef6196c1a38fbf077adfde1076fefdda088d. Final27-artifact manifest62c244bb8584a419633bf494d011d51aab65a087805a1d7554a02ec7ef2ab9f1 independently verified by root.
 
-The original 785-method baseline was784 pass / 1 failure while authorized training appended labels. Its red report remains intact. The declared inventory separately preserves exact historical 007 assertions/data, current immutable-prefix/exam guards and candidate ordinary compatibility; no test was weakened or silently skipped. Worker sandbox-blocked sysctl/process observations are retained separately and are not substituted for the host run.
+## Required corrections
 
-## Independent rejection and proposed correction
+1. Capacity-only monitor stop needs one first-transition audit event. It currently remains silent until a later invocation is refused. Repeated samples must not duplicate the event; audit failure must retain fatal precedence.
+2. Public error code alone must not trigger fatal storage state. Current broad promotion replaces the specified native-generation policy_unavailable refusal with storage_error and blocks task inspection after a definitive acceptance rollback. Existing corruption, audit and indeterminate-store checks must remain fatal.
 
-Full 11-row source/correctness B review scores 3, at B1/B5/B7. This is the second valid failed source attempt; earlier preflight-only environment blocks are separate. Feedback 52cbfe2a-6eb5-4bea-90b6-9ea0fe162ec3 / sequence 19 records rejection; final closeout 854778c2-cdfb-4e40-b675-2114ffe64050 / sequence 20 retains rejection after all measurements and identity checks completed. Changing worker/model/ID cannot reset that history.
+The independent fixture proposal records server EOF completion after the already-asserted frontend deadline, recognizes only the specified safe timeout abort, and distinguishes idempotent cancellation effects from permitted publication pending→complete. Original bytes/ASTs/results remain preserved. These are technical observation corrections, not permission to weaken code regressions or add transport grace. Exact exam-only authority is in [ROOT-REVIEW](COWORK-MCP-008-ROOT-REVIEW.md); independent committed exams and renewed A precede a separate bounded source-correction grant.
 
-1. Response lifetime: Range 416 can stall beyond the deadline; a stalled PUT 201 response produced a second 408 response start; timeout error delivery acquired a fresh idle interval. A related actual AF_UNIX probe confirms that the oversized-response IPC fallback writes without the original deadline. The [IPC review](COWORK-MCP-008-IPC-FALLBACK-REVIEW.md) distinguishes real transport evidence from its synthetic domain-result selector.
-2. Capacity inspection: the monitor correctly detects a missed sample and stops the worker, but its admission latch also blocks the required saved-result inspection. This differs from fatal storage/audit corruption, which must continue to refuse authority.
-
-The proposed revision keeps one deadline per existing HTTP/IPC owner, tracks header/frame emission before an awaited send, aborts when no budget remains, and defines a narrow capacity-only inspection/cancellation surface. New work and transfers remain blocked; integrity failure and disabled identity override the inspection exception. The proposal changes no source, frozen contract or exam until approved. Independent additive tests and renewed design/acceptance gates precede any revised builder.
+Two failed v4 builds remain historical; candidate3 is the first failed build of approved revision2. The [prior final review](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/FINAL-MEASUREMENT-REVIEW.md) and original874-method failure remain intact. A second valid revised-design failure returns to design review. Earlier preflight-only environment blocks do not count as code attempts. Worker Seatbelt sysctl/ps failures remain blocked evidence; host results are authoritative.
 
 ## Measurements
 
-The unchanged protected transfer matrix completed all 12 cases and its monitor scenario in 511.93 seconds. This is completed measurement, not correctness acceptance. [Raw matrix](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/full-suite/core-performance.json) SHA256 2ce47c0abd4855673cc5c581224f186ad1504d0b549f4e5bb1a1e6a45d844fae. Tracemalloc is enabled, so these are instrumented local-core timings, not hosted network or model latency.
+All12instrumented transfer cases and monitor completed in516.240seconds; ordinary and four supplemental workload groups completed afterward. No additional efficiency defect was identified; measurements do not accept incorrect code. [Raw comparison](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/independent/performance-comparison.json) retains every sample and limitation.
 
-| Payload per stream |4KiB chunks,1stream|4KiB chunks,2streams|64KiB chunks,1stream|64KiB chunks,2streams|
-|---|---:|---:|---:|---:|
-|1MiB|6.53s|13.10s|0.72s|1.33s|
-|8MiB|50.24s|102.45s|3.49s|7.18s|
-|16MiB|98.84s|202.54s|6.82s|13.79s|
-
-Observed retained traced allocations range 131,244–542,483 bytes; peaks 283,827–1,122,840 bytes. These values alone do not prove total-process memory bounds. The monitor saw a synthetic 8,192-byte burst against 4,096 bytes, with 4,096 bytes overshoot; it is not an OS hard quota. Ordinary matched comparison and all four supplemental workloads also completed; final independent measurement review is recorded below.
-
-## Remaining gates
-
-Forest approved the core revision. Renewed contract/exam gates are in progress. Live identity/application selection and file-size/retention choices remain unanswered; elapsed time is not consent. Auth acceptance/implementation, reviewed initial provisioning and secret custody, installed/native-tool confinement, public ingress qualification, actual Cowork OAuth and exact binary materialization remain incomplete. Only a fully reviewed service and concrete activation configuration will be presented for final activation approval.
-
-## Final independent measurement closeout
-
-[Final measurement review](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/FINAL-MEASUREMENT-REVIEW.md) SHA256 0ad6ad01896961c875e4634a101a6f0946b35b93ac65b7866dcd719a5627477c; final readiness f3400cca106486da66bdcdae29721a95ac64417a35e83c9f10611ef62866c560; final manifest c8de880246b75efff27dd54e4f544015096e1ccfd9b13d2d10508279b421a3fd. All source and protected identities were rechecked unchanged after measurement.
-
-| Ordinary workload | Original baseline median | Corrected candidate median |
+| Operation | Baseline median | Candidate3 median |
 |---|---:|---:|
-| Explicit route | 0.096188 ms | 0.100125 ms |
-| Synthetic S1 route | 0.615167 ms | 0.618875 ms |
-| Context requirements | 0.004375 ms | 0.004292 ms |
-| Job get | 0.027042 ms | 0.027291 ms |
-| Job replay | 0.057417 ms | 0.055125 ms |
+| Explicit route |0.096188ms|0.100000ms|
+| Synthetic S1 route |0.615167ms|0.645667ms|
+| Context requirements |0.004375ms|0.004667ms|
+| Job get |0.027042ms|0.030125ms|
+| Job replay |0.057417ms|0.059833ms|
 
-The unchanged direct-owner driver uses synthetic quota/scorer inputs; process/network calls remain zero and all counted calls match the baseline. These numbers do not measure real S1 inference. Historical prebuild labels in raw driver metadata are retained and explicitly qualified by the candidate source hashes.
+These ordinary measurements use deterministic scorer/quota captures; they are not real S1 inference latency. Actual core supplemental medians: task create15.143ms, replay3.452ms, get3.121ms, delete23.381ms; ASGI+IPC get3.997ms. Four1MiBstreams completed0.583s. Untraced16MiB PUT/GET medians1075/712ms. Zero external connections in the synthetic measurements.
 
-Actual core supplemental medians: task create 15.09 ms, replay 3.47 ms, get 3.14 ms and delete 23.36 ms across 100 cycles; ASGI plus actual IPC task_get 3.86 ms across 100 calls. Four concurrent 1 MiB streams completed in 0.597 s. A 16 MiB PUT/GET measured 1,105/729 ms without the matrix's tracing overhead. Wrong-hash, idle, headroom and ENOSPC fault workloads completed with expected refusal; zero external connections were attempted. The previously approved private measurement fixture correction is explicitly recorded, not a product-timeout amendment.
+Instrumented1/8/16MiB cases use4/64KiBchunks and1/2streams. Traced peaks295766–1162998bytes are consistent with bounded buffering under these finite workloads, not universal RSS proof. Two16MiBstreams took203.569s at4KiB versus14.647s at64KiB under tracing. Existing600s fixture budget is not a live default. The approved100MB maximum still needs deployment-profile qualification. Monitor overshoot4096bytes at4096-byte synthetic file bound demonstrates containment, not an OS hard quota.
 
-Completed measurements do not grant efficiency acceptance to an incorrect candidate. Final status remains B failure / design_error, two valid failed builds and no same-design retry. Forest subsequently approved the bounded design revision; this does not retroactively accept either failed candidate.
+## Approved deployment policy and remaining work
 
+Forest approved100MB/file,1GB/task,10GBinstallation (decimalbytes), seven-day automatic completed-task payload cleanup and existing GitHub4list233 sign-in through a dedicated login app with no repository permissions. Those choices are settled. Root asked one remaining completion-trigger question; its answer is pending. Cleanup extends existing deletion/lifetime owners in a separate reviewed package. Existing job/audit history remains; all-content erasure is not promised.
 
-## Approved revision in progress
+Auth009v5 has33-row D0 atd96dc1c; independent auth exams/A/source remain unbuilt. Optional65-package dependency profile is separately qualified and absent from ordinary MCP. Operator010/110 is a nonbinding proposal being reconciled to009v5 and new approvals. Initial secret custody/provisioning remains a later concrete operator decision.
 
-Approval recorded in18e4a7f, with all680 prior identities matching. Astra contract-only job906dba4c-1f06-4e5b-ab58-60cd5a9ae5b8 is revising the three copied008 contracts in an isolated directory using native Codex subscription admission. Independent QA prepared22 additive methods; actual final count remains pending. The sole identified existing assertion conflict is unconditional408 after deadline exhaustion. Its explicit independent amendment preserves original source/history and timing/cleanup checks, while adding a positive-budget408 control. No production files have changed during this revision preparation.
+Still required: corrected accepted core, separately gated auth/operator/retention code, qualified installed/native-tool confinement and live budgets, actual GitHub finite-token/refresh flow and numeric subject, hosted Cowork callback and raw binary materialization, then concrete service/ingress activation. No public listener, OAuth app, secret, Funnel route or launchd service exists. Preserve private443→8432.
+
+Cowork remains the planner in the Air app/cloud session. Native workers, saved subscription credentials and optional S1 stay on Studio. Workers receive explicit task evidence and selected files; they do not inherit Cowork's conversation, connectors or filesystem. The original785-method live baseline red result remains separately retained alongside exact historical007 replay and current training-prefix/exam guards.
