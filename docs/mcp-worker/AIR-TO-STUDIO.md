@@ -3,7 +3,12 @@
      DEPENDS: Studio user-scoped Claude MCP registration, Tailscale and macOS SSH. -->
 # Use the Studio from the MacBook Air
 
-Forest selected this arrangement on 2026-10-17: Claude Code, the MCP worker service, S1 and native
+**Updated request, 2026-10-17:** Forest now wants to work in the Air's Claude app through a custom
+connector. That remote connection is not installed yet; see
+[the Claude app connection plan](CLAUDE-APP-CONNECTOR-PLAN.md) for its verified requirements and
+pending authentication/access choices. The instructions below describe the existing SSH option.
+
+Forest initially selected this arrangement on 2026-10-17: Claude Code, the MCP worker service, S1 and native
 workers run on the Mac Studio. The Air is the terminal. Forest already connects with
 `ssh velox@forests-mac-studio` over Tailscale. The existing Studio user-scoped MCP registration is
 available to Claude in that SSH session; a separate MCP installation on the Air is unnecessary.
