@@ -185,16 +185,16 @@ never production state. No live credentials are needed for deterministic lanes.
 git rev-parse HEAD
 git diff --stat
 rg --files tests acceptance
-python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'
+python3 -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py'
 python3 -m unittest discover -s tests -p 'test_*.py'
-python3 -m unittest discover -s acceptance/mcp_worker -p 'test_*.py'
-python3 -m unittest discover -s acceptance/native_profile -p 'test_*.py'
-python3 -m unittest discover -s acceptance/mcp_learning -p 'test_*.py'
-python3 -m unittest discover -s acceptance/quota_evaluation -p 'test_*.py'
-python3 -m unittest discover -s acceptance/fresh_quota -p 'test_*.py'
-python3 -m unittest discover -s acceptance/quota_sources -p 'test_*.py'
-python3 -m unittest discover -s acceptance/training_teacher -p 'test_*.py'
-python3 -m unittest discover -s acceptance/router_followup -p 'test_*.py'
+python3 -m unittest discover -s acceptance/mcp_worker -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/native_profile -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/mcp_learning -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/quota_evaluation -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/fresh_quota -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/quota_sources -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/training_teacher -t . -p 'test_*.py'
+python3 -m unittest discover -s acceptance/router_followup -t . -p 'test_*.py'
 ```
 
 This command inventory is a starting point, not proof that unittest discovers every maintained test.
@@ -264,7 +264,7 @@ the generic discovery list above alone is insufficient. Missing/unexecuted suite
 [FIXED] Q MUST freeze runnable isolated commands/fixtures before A; this is a draft inventory, not exams.
 Q owns the exact acceptance paths listed above; test_auth.py is reserved for a later scope amendment,
 not this package. No current turn may create/run tests. Future Q command:
-`python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'`
+`python3 -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py'`
 MUST run every new core lane with zero unexpected skips. Existing accumulated runner remains required.
 
 | Exact Q file | Additional v4 obligations / ground truth |
@@ -304,7 +304,7 @@ Root authorized the three NEW source modules remote_runtime.py, remote_ipc.py an
 
 Root grants the exact keyword-only handoff_packet seam in cortados_router/route_task.py. Existing route_task owns the complete-packet budget and all input-fit calls, preserving ordinary None behavior. Independent QA pins ordinary and full-remote fixtures before B. schemas.py and task_evidence.py remain read-only. No output-counter patch, duplicate resolver or task/context rewrite substitutes for this seam. The preparation journal and JobStore.transaction extension in parent sections 2–4 belong to this same future source scope.
 
-AC-008-03 through AC-008-16 all run through the pinned future command: python3 -m unittest discover -s acceptance/cowork_mcp -p 'test_*.py'. The file mapping above allocates lanes; it is not a second AC wording authority. Missing fixtures/commands with zero tests remain pending A. AC-008-01/02 are excluded future-auth gates.
+AC-008-03 through AC-008-16 all run through the pinned future command: python3 -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py'. The file mapping above allocates lanes; it is not a second AC wording authority. Missing fixtures/commands with zero tests remain pending A. AC-008-01/02 are excluded future-auth gates.
 
 Root's deferred INDEX.md ownership update is required before integration acceptance. This author does not edit it. Authoring is not a valid production build attempt; the existing ledger is unchanged.
 
@@ -313,3 +313,5 @@ Author evidence/closure map and full self-rubric are in DECISIONS v4. Current au
 ## Root pre-review amendment evidence
 
 Root approved the full-packet seam and private workspace-preparation journal without choosing live identity/storage policy. The independent ordinary-bootstrap capture closes only the old envelope-sample gap. Existing-owner baseline at 4ed7508: 1000 stored jobs, 3000 get and 3000 replay lookups, each one indexed SELECT; median get 0.027042 ms and replay 0.057417 ms. Explicit route median 0.096188 ms, synthetic S1 route 0.615167 ms and context 0.004375 ms. Report SHA256 6e487a4a0ebd45ceef9b98e2fadd6a14e71c0e3739a29057240e0dbe9235deef; 75-file inventory SHA256 c6b9fc5b4bc2a93cf4cc7ae9d154ae0a3239b520d75bfd7f6b6f0dd2afbfb077. Both are under private cowork-mcp-verification/core-baseline. These measurements do not assert new-core or transfer memory/overshoot performance. Historical-007 unchanged assertions pass 4/4 with three recorded literal path relocations and equal normalized AST; original live baseline remains 784/785. Q must preserve the distinction and separately test candidate compatibility and live label-prefix/exam/provenance.
+
+Independent QA command correction: relative package imports require `-t .`. The authoritative core command is `/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py' -v`. This changes invocation only; AC text and production semantics remain unchanged. The measured 100-artifact listing bound is the representative fixture size, not a production cap; each task retains its mandatory configured artifacts_per_task.
