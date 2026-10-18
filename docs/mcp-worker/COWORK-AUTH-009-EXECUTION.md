@@ -1,12 +1,12 @@
 <!-- PURPOSE: Define prospective bounded auth build, exam and activation ownership.
-     CONTRACT: RT-COWORK-AUTH-009 v1; draft, not dispatchable.
+     CONTRACT: RT-COWORK-AUTH-009 v2; draft, not dispatchable.
      DEPENDS: COWORK-AUTH-009.md, accepted RT-COWORK-MCP-008 and independent D/A.
      CEILING: Current turn writes only these two drafts; no code, tests or commit. -->
 # Cowork future authentication execution package
 
 ```yaml
 contract_id: RT-COWORK-AUTH-009
-contract_version: 1
+contract_version: 2
 parent: COWORK-AUTH-009.md
 implements: RT-COWORK-MCP-008 FUTURE AUTH
 owner: Forest
@@ -20,11 +20,11 @@ attempt_ledger: inherit 008 assignment and D-008-01/02; do not reset
 
 ## 1. Current authorization and prerequisites
 
-[FIXED] Current scope_paths are exactly NEW `docs/mcp-worker/COWORK-AUTH-009.md` and NEW `docs/mcp-worker/COWORK-AUTH-009-EXECUTION.md`. Current acceptance_paths are empty. No existing file may be edited. No implementation, acceptance authoring/execution, package install, network, worker/model invocation, credentials, registration, service changes or commit is authorized. Stop at the two drafts and handback.
+[FIXED] Current scope_paths are exactly `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009.md` and `/Users/velox/.cortados-builds/cowork-auth-contract-revision/COWORK-AUTH-009-EXECUTION.md`. Current acceptance_paths are empty. Only those copied drafts may be edited; original repository is read-only. No implementation, acceptance authoring/execution, package install, network, worker/model invocation, credentials, registration, service changes or commit is authorized. Stop at the two drafts and handback.
 
 [FIXED] Future dispatch requires accepted core implementation plus auth-specific independent D=0 then A=0, committed protected exams, resolved applicable O rows, approved dependency lock and nonoverlapping scope. Core D0 at 1637088 is not accepted production; QA is still authoring core exams. Local synthetic auth design and exam specifications can proceed without actual GitHub identity/file-policy choices. Actual live access is never a prerequisite for writing synthetic exams.
 
-[FIXED] The parent owns all schemas, API signatures, examples E1–E9, R rules and contradictions. This execution document references them instead of copying nested examples. Any change in observable semantics returns to root for a versioned amendment before build.
+[FIXED] The parent owns all schemas, API signatures, examples E1–E30, R rules and contradictions. This execution document references them instead of copying nested examples. Any change in observable semantics returns to root for a versioned amendment before build.
 
 Future worker dispatch MUST use the existing group, absolute Studio cwd `/Users/velox/.cortados-builds/cortados-router-repo`, a stable per-attempt request_id and configured timeout. Root MUST inspect an existing job before resubmitting. Root MUST call context_requirements before route/delegate and supply the pinned parent, exact scope, accepted-core hashes, resolved O decisions, exam hashes, constraints and verification in task_evidence. S1 recommendation does not execute; delegate accepts the attempt. No automatic retry/quota fallback. Root tracks job_status/job_result and records evidence-based job_feedback. Worker MCP and permissions are explicit grants, never inherited connectors. No nested workers in this assignment.
 
@@ -39,7 +39,7 @@ Package B1 owns thin auth policy/lifetime after its separate gates:
 | integrations/mcp/remote_auth_config.py | NEW; closed AuthConfig validation; no secret resolution effects. |
 | integrations/mcp/remote_auth_provider.py | NEW; StrictGitHubProvider's two maintained hooks and response validation. |
 | integrations/mcp/remote_auth_claims.py | NEW; strict claims and credential-free facts projection. |
-| integrations/mcp/remote_auth_runtime.py | NEW; one process gate, private store/key lifetime, exclusive lock and fail-closed state. O3 blocks final recovery semantics. |
+| integrations/mcp/remote_auth_runtime.py | NEW; one process gate, private store/key lifetime, exclusive lock and fail-closed state. Owns section 8 lifetime marker/barriers, subject to independent qualification. |
 | integrations/mcp/remote_auth_errors.py | NEW; dependency-log suppression, bounded safe OAuth response filtering and AuthEvent emission. |
 
 B1 MUST NOT duplicate OAuth protocol transitions or maintain token records. Root MUST return a scope amendment before splitting any of these responsibilities into additional paths.
@@ -96,7 +96,7 @@ Historical AC text copied byte-for-byte from parent §7, retaining the old split
 | AC-008-01 | Real loopback ASGI discovery/401 challenge, all MCP methods auth, exact port/path/resource; PAT/ID/refresh/wrong issuer/audience/expiry denied | Actual hosted discovery/callback |
 | AC-008-02 | Maintained-provider local fixtures: S256 only, exact redirect, duplicate/resource rejection, no positive cache, bad-secret logs, encrypted restart/unknown-key fail closed | Real GitHub App identity/refresh/rotation; two parallel refreshes and crash windows; client deadlines |
 
-[ESCALATE O5] Root must ratify R14's supplemental interpretation before A: synthetic races, crash/restart and safe failure are LOCAL exams; actual GitHub/Claude observations are additional deployment evidence. Q MUST NOT reset IDs or hide the historical wording. No distinct AC-009 numbering is introduced.
+[FIXED O5, ratified at 495973c] R14 supplements the unchanged historical rows: synthetic races, crash/restart and safe failure are LOCAL exams; actual GitHub/Claude observations are additional deployment evidence. Q MUST NOT reset IDs or hide the historical wording. No distinct AC-009 numbering is introduced.
 
 | Protected file | R / AC coverage and required observable ground truth |
 |---|---|
@@ -120,7 +120,7 @@ Q MUST make the command runnable without internet, packages, real credentials or
 
 ## 4. Gates and dispatch order
 
-1. [FIXED] Root records O2/O3/O4/O5/O6 technical decisions and approved scope/dependencies. Forest's deployed O1 remains separate, never filled with synthetic values. Parent/contract amendment precedes dependent code.
+1. [FIXED] Root pins O2–O7 decisions at 495973c and the parent v2 semantics; copies section6 into accepted core before B2. Forest's deployed O1 remains separate, never filled with synthetic values. Parent/contract amendment precedes dependent code.
 2. [FIXED] Q performs independent auth D. D0 requires exact callable/schema/ownership closure and rendered diagrams; this author asserts no rubric score.
 3. [FIXED] Q freezes and commits synthetic exams, including D-008-01/02 regressions, and performs A. Missing local fixtures, unresolved recovery semantics or unmeasured required budgets block A.
 4. [FIXED] Root waits for accepted core B and releases its shared-file ownership. Core D0/A0 alone does not authorize auth integration.
@@ -180,14 +180,35 @@ Future builder handback MUST include confined diff, per-source physical line cou
 
 Current author handback is only these two draft documents. Historical core D21→D3→D0 and auth D-008-01/02 remain recorded in parent §1. No tests or production acceptance are claimed.
 
-| Open decision | Owner / blocked scope |
+| Stable decision | Remaining owner / gate |
 |---|---|
-| O1 deployed subject/app and file/retention choices | Forest through root; activation, not synthetic parameterization. |
-| O2 exact trusted service-mode/runtime/HTTP seam | Root + independent QA; B2; parent §6 offers explicit amendment or separate trusted interface. |
-| O3 multiwrite crash/restart/backup policy | Root/Forest; D/A and B1 recovery; refuse on uncertainty until reset ritual or proven durable-marker design is ratified. |
-| O4 public-PKCE metadata discrepancy | Root + QA; profile/metadata implementation and live Claude qualification. |
-| O5 historical AC wording/local versus activation relocation | Root; A; ratify supplement or version canonical wording without changing IDs. |
-| O6 strict response projection and measured timeout/resource budgets | Root + QA; A/B and live deadline claim. |
-| O7 naming/location/dependency approval and later index update | Root; integration/release; no index edit in this turn. |
+| O1 | Forest/root: deployed subject/app/client and file/retention choices unanswered. |
+| O2 | Root: matching accepted-core amendment and exclusive shared-file ownership release. |
+| O3 | Q/root: independent marker/barrier/kill-point qualification; separate provisioning/recovery authority. |
+| O4 | Q: exact none/S256 metadata and full local ASGI profile; live Claude compatibility remains additional. |
+| O5 | Ratified 495973c; preserve historical rows and supplemental local R14 tests. |
+| O6 | Q/root: numeric measured bounds before A; final candidate comparison before B; live deadlines at activation. |
+| O7 | B2/root: isolated reviewed lock, ordinary parity and existing-index update before integration acceptance. |
 
-[FIXED] The concrete alternatives in parent §7 MUST return to root rather than be privately selected. No outstanding question grants an app, credential, registration, default, new OAuth engine, token protocol, queue, quota owner or file-transfer implementation.
+No row selects a product, permission, retention or identity alternative. Parent section12 lists technical contradictions requiring root response.
+
+## 8. Revision-specific ownership and verification obligations
+
+Root authority is standalone Router commit495973c. The current user explicitly prohibits nested workers; the general worker workflow applies only to a separately authorized future dispatch. This authoring does not start an attempt or alter the inherited group/ledger. Prior auth author job20d04076-54f8-46a1-b527-4597ca5ad88c and draft feedback23b83eaa-1170-4288-92c7-87da03b6b853 remain draft-only history.
+
+B1 owns the section11 local constructors in its existing five proposed files. remote_auth_runtime owns marker/gate/settlement and no token serialization. remote_auth_config owns pure config/marker/secret record validation. remote_auth_claims owns strict claims/facts. remote_auth_provider owns only maintained factory/authorize hooks and response projection. remote_auth_errors owns fixed errors/events/log suppression. B2's remote_service owns metadata/route adaptation and trusted launch; remote_http alone owns ASGI server/manager/transfer composition. Each source file must remain strictly below500 physical lines including comments/blanks. If this partition cannot meet that ceiling, return a concrete scope amendment before implementation; no generic utils file or second engine.
+
+Additional mandatory protected scenarios, in already listed Q-owned files:
+
+- test_auth_lifetime.py: clean provisioned generation0 -> dirty1 -> clean1 -> dirty2; unchanged pre-provisioned client and still-valid credentials across clean restart. Kill before/after every marker write/flush/rename/directory barrier and every provider multiwrite await; assert exact allowed restart outcome and byte preservation on refusal. Include missing marker with populated namespace, pending file, wrong encryption/signing/upstream key, changed config/lock digest, generation overflow, second process and symlink/hardlink substitution. Failed lifetime never becomes clean. Trace store file and directory barriers before clean seal. Keep process-kill and actual power-loss guarantees separate.
+- test_provider_hooks.py: pure projection returns a new response containing only allowed fields, strips all supplied absolute expiry/id_token/headers, validates aliases and now+duration bound. Instrument all maintained paths, including swallowed exceptions and zero-parse malformed replies. A malformed response after an upstream call must latch failed even when local token writes are zero.
+- test_oauth_http.py: exact section9 path/method table including automatic HEAD, no DCR/CIMD/revoke, metadata none/S256 only, exact challenge resource, duplicate/unknown ingress refusal, actual maintained consent/code/refresh flow. Verify guarded /mcp405 and capability-only transfer route.
+- test_core_composition.py: original loader refuses oauth_service, service loader refuses local_test; trusted Principal/core/AuthConfig equality and base-state mismatch reject before effects. One manager and one adopted CoreClient, no auth gate held during broker/transfer work. Preserve local_test descriptors/results/route bytes.
+- test_safe_errors.py: do not treat intended successful synthetic token/code/state fields as leakage; inject separate sentinels in error-only inputs and assert zero diagnostic/reflected output. Check response_bytes at bound/+1, no partial response, no plaintext marker/key digests in events.
+- test_resources.py: distinguish hook acceptance-size bound from network allocation bound; measure waiter growth, active operation, frozen failed-settlement memory and disk flush/manifest work. Missing bounded-network seam or finite waiter cap is blocked A, never a pass.
+
+Before A, Q records an isolated baseline manifest with hardware/OS/filesystem, Python/lock/source/fixture hashes, fixture sizes/concurrency, exact command, warmup/sample counts and raw measurements. EXECUTION section5 is the reproducible sampling protocol. For prebuild, maintained methods plus independent exam-owned harness characterize seams; they do not substitute for candidate adapters. Q/root must freeze numeric budgets and cap semantics in a versioned amendment before A. After B implementation, rerun same fixture matrix on actual candidate and compare to accepted core without auth. Report p50/p95/max, RSS peak and growth, bytes/operations, upstream mock calls, wait/hold/settlement time, refused counts and total SQL separately. Baseline measurements do not prove candidate compliance.
+
+O7 exact future packaging boundary: add optional project extra named remote, with fastmcp-slim==3.4.9 and Authlib==1.9.1 while preserving base dependency mcp==1.30.0 and the ordinary package entrypoints. The reviewed lock at docs/mcp-worker/cowork-auth-requirements.lock must pin all transitive versions/artifact hashes, target Python/platform, source indexes and resolver command. Resolve into a new isolated environment only under later authorization; never update installed releases, default interpreter or research venv. Ordinary startup must work with only the original base dependencies. A conflicting resolution returns O7, never relaxes pins or silently upgrades MCP. Research Python3.14 captures do not establish compatibility with every Python>=3.12 supported by the project; target interpreter is a lock/QA gate.
+
+Current handback checks are document-only: confined files, preserved historical AC/defect/history/group IDs, JSON block syntax and source hashes. No auth/core acceptance, tests, worker, installation, commit, activation or D/A self-score is claimed. Root reviews the isolated diff and technical gaps before copying; independent QA remains the only D/A authority.
