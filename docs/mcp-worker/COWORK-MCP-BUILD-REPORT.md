@@ -1,8 +1,8 @@
 # Cowork connector build status — 2026-10-18
 
-**Not installed or connected.** The first implementation of Forest's approved core revision2 failed independent QA. Two code causes need correction; three separately evidenced fixture synchronization issues need independent exam-owner amendments. Existing ordinary MCP, subscriptions, private Studio HTTPS443→8432 and nightly schedule remain unchanged.
+**Not installed or connected.** The bounded v5 core correction is running through Codex subscription jobd583bbd4-061b-45ec-a4a9-db5a1ee5a2c8, authorized at9eac6e3 after independently committed exams9722a88 and all37 A rows passing. Current114core exams yield109passes and five expected failures on the rejected source; the full unchanged28-lane inventory now expects899methods. No candidate4 result is claimed yet. Existing ordinary MCP, subscriptions, private Studio HTTPS443→8432 and nightly schedule remain unchanged.
 
-## Current evidence
+## Previous candidate3 evidence
 
 - Branch: plan/subagent-mcp; terminal source observed at62fcd07. All18source files frozen; maximum414physical lines. The six revised owners implement strict HTTP/IPC deadlines and separate capacity-only from fatal admission.
 - Worker67c23260-0c1d-4de8-b72d-178e39c5a82d used native Codex subscription, gpt-6.1-sol, networkfalse and no MCP grants. Source remains uncommitted pending acceptance.
@@ -24,7 +24,7 @@ Exit1. [Full report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-
 1. Capacity-only monitor stop needs one first-transition audit event. It currently remains silent until a later invocation is refused. Repeated samples must not duplicate the event; audit failure must retain fatal precedence.
 2. Public error code alone must not trigger fatal storage state. Current broad promotion replaces the specified native-generation policy_unavailable refusal with storage_error and blocks task inspection after a definitive acceptance rollback. Existing corruption, audit and indeterminate-store checks must remain fatal.
 
-The independent fixture proposal records server EOF completion after the already-asserted frontend deadline, recognizes only the specified safe timeout abort, and distinguishes idempotent cancellation effects from permitted publication pending→complete. Original bytes/ASTs/results remain preserved. These are technical observation corrections, not permission to weaken code regressions or add transport grace. Exact exam-only authority is in [ROOT-REVIEW](COWORK-MCP-008-ROOT-REVIEW.md); independent committed exams and renewed A precede a separate bounded source-correction grant.
+The independent fixture proposal records server EOF completion after the already-asserted frontend deadline, recognizes only the specified safe timeout abort, and distinguishes idempotent cancellation effects from permitted publication pending→complete. Original bytes/ASTs/results remain preserved. These are technical observation corrections, not permission to weaken code regressions or add transport grace. The independent corrections and three additive audit regressions are committed at9722a88; all prior assertions remain. Root verified the amended A0 and authorized exactly one source correction at9eac6e3. Evidence is in [exam-amendment/A-readiness.json](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/A-readiness.json).
 
 Two failed v4 builds remain historical; candidate3 is the first failed build of approved revision2. The [prior final review](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/FINAL-MEASUREMENT-REVIEW.md) and original874-method failure remain intact. A second valid revised-design failure returns to design review. Earlier preflight-only environment blocks do not count as code attempts. Worker Seatbelt sysctl/ps failures remain blocked evidence; host results are authoritative.
 
@@ -48,7 +48,7 @@ Instrumented1/8/16MiB cases use4/64KiBchunks and1/2streams. Traced peaks295766�
 
 Forest approved100MB/file,1GB/task,10GBinstallation (decimalbytes), seven-day automatic completed-task payload cleanup and existing GitHub4list233 sign-in through a dedicated login app with no repository permissions. Those choices are settled. Root asked one remaining completion-trigger question; its answer is pending. Cleanup extends existing deletion/lifetime owners in a separate reviewed package. Existing job/audit history remains; all-content erasure is not promised.
 
-Auth009v5 has33-row D0 atd96dc1c; independent auth exams/A/source remain unbuilt. Optional65-package dependency profile is separately qualified and absent from ordinary MCP. Operator010/110 is a nonbinding proposal being reconciled to009v5 and new approvals. Initial secret custody/provisioning remains a later concrete operator decision.
+Auth009v5 has33-row D0 atd96dc1c; independent auth exams/A/source remain unbuilt. Optional65-package dependency profile is separately qualified and absent from ordinary MCP. Operator010/110v2 at4a4b5c0 is a reconciled nonbinding proposal under independent technical review; its O9 amendment has not yet changed009. Initial secret custody/provisioning remains a later concrete operator decision.
 
 Still required: corrected accepted core, separately gated auth/operator/retention code, qualified installed/native-tool confinement and live budgets, actual GitHub finite-token/refresh flow and numeric subject, hosted Cowork callback and raw binary materialization, then concrete service/ingress activation. No public listener, OAuth app, secret, Funnel route or launchd service exists. Preserve private443→8432.
 

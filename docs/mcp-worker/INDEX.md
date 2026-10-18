@@ -90,7 +90,7 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Cowork connector path | RT-COWORK-MCP-008 responsibility |
 |---|---|
-| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent D0/A0 and protected exams committed; second implementation candidate failed B. Forest approved the bounded design revision on2026-10-18; renewed D/A and additive exams are pending. No accepted release. OAuth and activation are separate. |
+| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent v5 D0/A0 and amended114core exams committed at9722a88. Candidate3 failed B; root9eac6e3 authorizes one bounded correction under the approved revision2. No accepted release; earlier failures remain preserved. OAuth and activation are separate. |
 | [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
 | [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
 | [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
@@ -106,7 +106,7 @@ promotion gates. The build reports record independent verification and limitatio
 | `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (new, proposed) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
 | `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
 | `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
-| `acceptance/cowork_mcp/` | Independent QA owns 89 protected core methods after additive regression commits153f730/f5be56a; original72 methods at1037b52 are preserved. Manifest, full-suite inventory and measurements remain builder read-only; second candidate failed B; all originals remain protected during the approved design revision. |
+| `acceptance/cowork_mcp/` | Independent QA owns114protected core methods at9722a88, current manifest8e32a0d697e1da3b06fef53ea8be9e2fd93363c7b88e2e2ab5b9fec8d73525dc. All original assertions are preserved except the explicitly approved v5 deadline response consequence; seven later technical observation corrections are recorded. Full899expected/28lane inventory and measurements remain builder read-only; candidate4 pending. |
 
 | Future authentication draft | RT-COWORK-AUTH-009 responsibility |
 |---|---|
@@ -131,8 +131,8 @@ The isolated optional dependency qualification requires `fastmcp-slim[server]==3
 
 | Operator setup proposal | RT-COWORK-OPERATIONS-010 /110; no implementation or activation grant |
 |---|---|
-| [COWORK-OPERATIONS-010-DRAFT.md](COWORK-OPERATIONS-010-DRAFT.md) | Draft-only extension of existing AuthStorage/provider/runtime/service owners for child-only secret resolution and initial offline provisioning. Source-qualified proposal requires reconciliation against009v5, independent review and unresolved live choices. |
+| [COWORK-OPERATIONS-010-DRAFT.md](COWORK-OPERATIONS-010-DRAFT.md) | Draft-only extension of existing AuthStorage/provider/runtime/service owners for child-only secret resolution and initial offline provisioning. Version2 at4a4b5c0 reconciles009v5 and approved GitHub/limits/retention direction; O9 proposes explicit009 amendments requiring independent review before source. Secret custody and activation remain separate. |
 | [COWORK-OPERATIONS-010-EXECUTION-DRAFT.md](COWORK-OPERATIONS-010-EXECUTION-DRAFT.md) | Proposed exact six-owner extension and independent exams; no new issuer, store, supervisor, scheduler or module. Local and activation gates remain separate. |
 
-| [COWORK-MCP-BUILD-REPORT.md](COWORK-MCP-BUILD-REPORT.md) | Root; frozen candidate, complete 874-method / 28-lane verification, independent failure evidence and measurements. Not installed. |
+| [COWORK-MCP-BUILD-REPORT.md](COWORK-MCP-BUILD-REPORT.md) | Root; frozen candidate, previous896-method /28-lane failed verification, candidate4 pending899-method inventory, independent evidence and measurements. Not installed. |
 | [COWORK-MCP-008-REVISION-2-PROPOSAL.md](COWORK-MCP-008-REVISION-2-PROPOSAL.md) | Forest-approved HTTP/IPC deadline and capacity-only inspection revision (2026-10-18). Renewed contract/exam gates remain mandatory; original attempt history is preserved. |
