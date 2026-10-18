@@ -31,7 +31,7 @@ The original 785-method baseline was784 pass / 1 failure while authorized traini
 
 ## Independent rejection and proposed correction
 
-Full 11-row source/correctness B review scores 3, at B1/B5/B7. This is the second valid failed source attempt; earlier preflight-only environment blocks are separate. Feedback 52cbfe2a-6eb5-4bea-90b6-9ea0fe162ec3 / sequence 19 records rejection. Changing worker/model/ID cannot reset that history.
+Full 11-row source/correctness B review scores 3, at B1/B5/B7. This is the second valid failed source attempt; earlier preflight-only environment blocks are separate. Feedback 52cbfe2a-6eb5-4bea-90b6-9ea0fe162ec3 / sequence 19 records rejection; final closeout 854778c2-cdfb-4e40-b675-2114ffe64050 / sequence 20 retains rejection after all measurements and identity checks completed. Changing worker/model/ID cannot reset that history.
 
 1. Response lifetime: Range 416 can stall beyond the deadline; a stalled PUT 201 response produced a second 408 response start; timeout error delivery acquired a fresh idle interval. A related actual AF_UNIX probe confirms that the oversized-response IPC fallback writes without the original deadline. The [IPC review](COWORK-MCP-008-IPC-FALLBACK-REVIEW.md) distinguishes real transport evidence from its synthetic domain-result selector.
 2. Capacity inspection: the monitor correctly detects a missed sample and stops the worker, but its admission latch also blocks the required saved-result inspection. This differs from fatal storage/audit corruption, which must continue to refuse authority.
