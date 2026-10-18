@@ -249,3 +249,32 @@ Root approves the corrected representative selector measurement in private core-
 Future-auth draft job20d04076-54f8-46a1-b527-4597ca5ad88c completed with only two new documents. Root read both, verified copied historical AC rows and unresolved decisions, and recorded draft-only feedback23b83eaa-1170-4288-92c7-87da03b6b853. Parent SHA6e13773a7075d1c0cf75b8cb39ba6f859e14320bcd04dc908b80b68c86f26ecf; execution SHA254b4238570989288f68ca89222b04bb390ffe77bad841e6ddf83f4dcb0185bb. This is not auth D/A/B or activation approval.
 
 Root technical directions for the next 009 contract revision are: O2 adopt the proposed distinct oauth_service validator and trusted constructor seam, preserving strict local_test; adopt one guarded HTTP composition owner after core acceptance. O3 develop the durable clean/dirty lifetime-marker alternative, with ordinary clean restart supported, uncertain/crashed state refused and preserved for explicit recovery; no automatic deletion, rollback claim or stale-backup restoration. Exact marker format, key/config binding, atomic replace and flush order require independent design and kill-point exams before implementation. O4 correct discovery to advertise the actual public client authentication method none and S256-only profile; retain maintained issuance/verification and forbid DCR/CIMD. O5 retain historical AC-008-01/02 verbatim and ratify R14's additional synthetic hook/race/crash requirements as local acceptance; live GitHub/Claude evidence remains additional. O6 adopt strict preparse response projection and require measured request/gate/resource budgets before A; no invented deployment defaults. O7 approve optional isolated remote dependency resolution and its reviewed lock, preserving ordinary startup environments. These are technical preparation directions within the authorized OAuth connection; they do not authorize production source, dependency installation into an existing environment, app registration or live activation. Forest's O1 identity and deployed storage/retention choices remain pending.
+
+
+## Bounded root dispatch approval — LOCAL CORE attempt 1
+
+```yaml
+contract_id: RT-COWORK-MCP-008
+contract_version: 4
+status: approved
+scope: LOCAL CORE only
+task_group_id: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1
+owner: Forest
+orchestrator: /root
+exam_commit: 1037b52db9732a10e1c7b0ce86f5fb22ad1d0c29
+exam_manifest_sha256: e0680bf5687e46b339fcea469663a17595c5bad08e1897149b2af45f2aaf2852
+parent_sha256: 5b9527ac2e71f8ef6bd345031a9dbfe68f0b743d6b004bf7e8db853b923cfc1a
+execution_sha256: 92760ded3f365f7e92074d7b2dd248660ea4b6a6435549acb57978a41f663096
+decisions_sha256: 41de4dc4023a69100eb504c1fcc099fa36f0b0d7b0050c43942ef4107d2754eb
+independent_D: 0
+independent_A: 0
+builder_selection: explicit gpt-6.1-sol
+request_id: f421590e-5994-4638-8756-41f1a3a23338
+timeout_s: 1800
+```
+
+This later approval binds the exact immutable normative bytes above; earlier author-draft status is historical, not permission to alter those bytes. Root read all37 A dispositions, current D confirmation and the committed exam README, checked all18 fixture hashes/3normative hashes/4private evidence pins and independently rechecked all641 prior protected-file hashes. The private core-A readiness SHA is6ab1fddb9acc74465aacfc291b73ad7db0cde7f597f4c6039c7a2573e5825014; full A review SHA16cad10e73f4df2c8df5c83df4865d3740d3f87eba42852f4d435c56d244e526; current D SHA7c834bec5abe262fa701a9c223bf056f53489d20cb9fc539f51a49bd11935b34. All33D and37A rows score0. CLAUDE-APP-CONNECTOR-PLAN.md is informational plan provenance under the A1.4 overlay; RT-MCP-001 is the normative dependency.
+
+The one builder receives exactly EXECUTION PackageB's18 source paths. Protected exams, contracts, other sources, installed releases and live state are read-only. Temporary test evidence may be written only to private /tmp/cowork-core-build-attempt-1 directories; root will preserve reviewed evidence afterward. No OAuth, listener, provider registration, dependency installation, native model calls, API fallback, service activation, commit or push is included. S1 is reserved for the ongoing trainer; explicit supported integration-model selection avoids loading another scorer. Native fresh subscription quota admission still applies before acceptance and START.
+
+The72method expected prebuildred (3failure/162subtesterrors/0skip) is a readiness observation, not an implementation attempt. Original785-test live baseline remains784pass/1historical whole-label comparison failure; the separately preserved historical0074/4 and current-prefix/ordinary compatibility exams do not erase it. Earlier design reviews, native evidence limits and auth defects remain. This is the first core implementation attempt; no failed-job auto-retry is authorized. Root/QA must independently verify candidate B, full accumulated inventory, source containment and measured memory/performance before accepting it. Auth integration and every live gate remain excluded.
