@@ -64,12 +64,12 @@ def _log(route_id, arguments, decision, resolved, config):
         raise WorkerError("storage_error", "The isolated Router observation could not be recorded") from exc
 
 
-def route_task(arguments, config, metadata):
+def route_task(arguments, config, metadata, *, handoff_packet: str | None = None):
     tool = "delegate" if any(key in arguments for key in ("cwd", "request_id", "timeout_s")) else "route"
     arguments = validate(tool, arguments, config)
     if "task_evidence" in arguments and missing_fields(arguments):
         raise WorkerError("needs_clarification", "Task evidence is incomplete; call context_requirements and answer its questions before resubmitting")
-    packet = handoff(arguments)
+    packet = handoff(arguments) if handoff_packet is None else handoff_packet
     worker_bytes = len(packet.encode("utf-8"))
     if worker_bytes > config["limits"]["max_handoff_bytes"]:
         raise WorkerError("worker_context_too_large", "Worker handoff exceeds the configured UTF-8 byte bound")

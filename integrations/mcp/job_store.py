@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 
 from .schemas import WorkerError, canonical, emit_event
 from .native_profile import captured_version, record_version
@@ -48,6 +49,7 @@ class JobStore:
         path = Path(config['state_dir']) / 'jobs.db'
         existed = path.exists()
         self.db = None
+        self.admission_closed = False
         try:
             self.db = sqlite3.connect(path, isolation_level=None)
             if self.db.execute('PRAGMA integrity_check').fetchone() != ('ok',):
@@ -112,7 +114,29 @@ class JobStore:
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise WorkerError('storage_error', 'Cannot read active reservations') from exc
 
-    def accept(self, arguments, route, *, cli_version):
+    @contextmanager
+    def transaction(self):
+        if self.db.in_transaction:
+            raise WorkerError('storage_error', 'Nested job store transaction refused')
+        committing = False
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            yield self.db
+            committing = True
+            self.db.execute('COMMIT')
+        except Exception as exc:
+            if committing or isinstance(exc, sqlite3.Error):
+                self.admission_closed = True
+            if self.db.in_transaction:
+                self.db.execute('ROLLBACK')
+            if isinstance(exc, sqlite3.Error):
+                raise WorkerError('storage_error', 'Job store transaction did not commit') from exc
+            raise
+
+    def accept(self, arguments, route, *, cli_version, acceptance_seed=None):
+        if acceptance_seed is not None and self.admission_closed:
+            from .remote_schemas import RemoteError
+            raise RemoteError('storage_error')
         encoded = canonical(arguments)
         record = {'job_id': str(uuid.uuid4()), 'route_id': route['route_id'], 'state': 'queued',
                   'cwd': arguments['cwd'], 'created_at_ms': utc_ms(), 'started_at_ms': None,
@@ -123,6 +147,15 @@ class JobStore:
                   'launch_nonce': str(uuid.uuid4()), 'host_boot_id': self.boot_id,
                   'watchdog': None, 'native': None, 'accepted_monotonic': time.monotonic(),
                   'stop_intent': None, 'result': None, 'state_dir': self.config['state_dir']}
+        if acceptance_seed is not None:
+            from .remote_native import build_handoff
+            from .remote_schemas import RemoteError
+            if (build_handoff(arguments, acceptance_seed.input_manifest,
+                              self.config['limits']['max_handoff_bytes']) != acceptance_seed.handoff
+                    or route['context']['worker_bytes'] != acceptance_seed.handoff.worker_bytes):
+                raise RemoteError('policy_unavailable')
+            record['execution_kind'] = 'cowork_remote_v1'
+        committing = False
         try:
             self.db.execute('BEGIN IMMEDIATE')
             previous = self.replay(arguments)
@@ -139,14 +172,22 @@ class JobStore:
             self.db.execute('INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)',
                 (record['job_id'], self.config['client_id'], arguments['request_id'],
                  record['argument_hash'], encoded, record['cwd'], 1, json.dumps(record)))
+            if acceptance_seed is not None:
+                from .task_store import accept_binding, event
+                accept_binding(self.db, record['job_id'], acceptance_seed)
+                event(self.db, 'job', record['job_id'], state='queued', request_id=arguments['request_id'])
+            committing = True
             self.db.execute('COMMIT')
         except Exception as exc:
+            if acceptance_seed is not None and (committing or isinstance(exc, sqlite3.Error)):
+                self.admission_closed = True
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
             if isinstance(exc, sqlite3.Error):
                 raise WorkerError('storage_error', 'Job reservation did not commit') from exc
             raise
-        self._event(record, None)
+        if acceptance_seed is None:
+            self._event(record, None)
         return record, True
 
     def feedback(self, arguments):
@@ -186,18 +227,28 @@ class JobStore:
         return {'ok': True, 'feedback': {'job_id': arguments['job_id'], 'feedback_id': arguments['feedback_id'],
             'seq': seq, 'created_at_ms': created, 'verdict': arguments['verdict'], 'verification_status': 'planner_asserted'}}
 
-    def _save(self, record):
+    def _save(self, record, *, old_state=None):
         try:
             self.db.execute('BEGIN IMMEDIATE')
             self.db.execute('UPDATE jobs SET active=?,record=? WHERE job_id=?',
                             (int(record['state'] not in TERMINAL), json.dumps(record), record['job_id']))
+            if record.get('execution_kind') == 'cowork_remote_v1' and old_state is not None:
+                from .task_store import event
+                event(self.db, 'job', record['job_id'], old_state, record['state'],
+                      reason=record['reason'], request_id=record['arguments']['request_id'])
             self.db.execute('COMMIT')
-        except sqlite3.Error as exc:
+        except Exception as exc:
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
+            if record.get('execution_kind') == 'cowork_remote_v1':
+                self.admission_closed = True
+                from .remote_runtime import current
+                current().fatal()
             raise WorkerError('storage_error', 'Job transition did not commit') from exc
 
     def _event(self, record, old_state):
+        if record.get('execution_kind') == 'cowork_remote_v1':
+            return
         emit_event(self.config, 'state_transition', request_id=record['arguments']['request_id'],
                    route_id=record['route_id'], job_id=record['job_id'], from_state=old_state,
                    state=record['state'], reason=record['reason'])
@@ -230,7 +281,7 @@ class JobStore:
         if state in TERMINAL:
             record['finished_at_ms'] = utc_ms()
             record['result'] = result
-        self._save(record)
+        self._save(record, old_state=old)
         self._event(record, old)
         return record
 
@@ -239,10 +290,13 @@ class JobStore:
         if record['state'] not in TERMINAL and record['reason'] != 'containment_failed':
             record['reason'] = 'containment_failed'
             record['progress'] = 'Worker termination could not be proven'
-            self._save(record)
-            emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
-                       route_id=record['route_id'], job_id=record['job_id'],
-                       from_state=record['state'], state=record['state'], reason='containment_failed')
+            if record.get('execution_kind') == 'cowork_remote_v1':
+                self._save(record, old_state=record['state'])
+            else:
+                self._save(record)
+                emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
+                           route_id=record['route_id'], job_id=record['job_id'],
+                           from_state=record['state'], state=record['state'], reason='containment_failed')
         return record
 
     @staticmethod

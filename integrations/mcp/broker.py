@@ -94,10 +94,13 @@ def ensure_broker(config, config_path, digest):
 
 
 class Broker:
-    def __init__(self, config, digest):
+    def __init__(self, config, digest, *, core_runtime=None):
         from .native_metadata import NativeMetadata
         from .native_process import host_boot_id
         self.config, self.digest = config, digest
+        self.core_runtime = core_runtime
+        if core_runtime is not None and core_runtime.lock_fd is None:
+            raise WorkerError('storage_error', 'Core runtime does not own the broker lock')
         self.store = JobStore(config, host_boot_id())
         self.metadata = NativeMetadata(config)
         try:
@@ -106,11 +109,13 @@ class Broker:
             # An unsupported executable remains a typed tool refusal. Managed
             # policy failures still refuse frontend startup before tool access.
             if exc.code != 'native_version_mismatch':
+                self.store.close()
                 raise
         self.workers, self.tasks = {}, set()
         self.admission_lock = asyncio.Lock()
         self.stopping = False
-        self.recover()
+        if core_runtime is None:
+            self.recover()
 
     def receipt(self, record):
         from .native_process import validate_receipt
@@ -197,10 +202,20 @@ class Broker:
             return False
 
     async def stop(self, job_id, reason):
-        record = self.store.get(job_id)
-        if record['state'] in TERMINAL or record['stop_intent']:
-            return record
-        record = self.store.transition(job_id, 'cancelling', reason=reason)
+        try:
+            record = self.store.get(job_id)
+            if record['state'] in TERMINAL or record['stop_intent']:
+                return record
+            record = self.store.transition(job_id, 'cancelling', reason=reason)
+        except Exception:
+            if self.core_runtime is not None:
+                try:
+                    self.core_runtime.fatal()
+                finally:
+                    process = self.workers.get(job_id)
+                    if process:
+                        await self.send(process, {'command': 'STOP', 'reason': reason})
+            raise
         process = self.workers.get(job_id)
         if process:
             await self.send(process, {'command': 'STOP', 'reason': reason})
@@ -219,11 +234,38 @@ class Broker:
             if record['route']['chosen']['model'] not in admission['models']:
                 raise WorkerError('model_unavailable', 'Selected model is no longer admitted')
 
+    async def guard_remote_launch(self, job_id):
+        runtime = self.core_runtime
+        runtime.observe_monitor(runtime.monitor_task)
+        if runtime.fatal_failed or runtime.capacity_failed or runtime.broker.store.admission_closed:
+            # A pending spawn may have missed the containment enumeration. Use
+            # this launch's identity and the existing STOP/receipt owner instead.
+            await self.stop(job_id, 'capacity_exhausted')
+
     async def run_worker(self, accepted):
         job_id, process, launch_error = accepted['job_id'], None, None
         timer = asyncio.create_task(self.deadline(job_id))
         job_dir = Path(self.config['state_dir']) / 'jobs' / job_id
+        remote = accepted.get('execution_kind') == 'cowork_remote_v1'
+        remote_errors = ()
+        if self.core_runtime is not None:
+            from .remote_schemas import RemoteError
+            remote_errors = (RemoteError,)
         try:
+            if self.core_runtime is not None:
+                remote = self.core_runtime.classify(self.store.get(job_id))
+            remote_bootstrap = {}
+            remote_cli = []
+            if remote:
+                from .remote_native import worker_binding
+                from .task_workspace import prepare
+                binding = self.core_runtime.binding(accepted)
+                task = self.core_runtime.task(binding.seed.task_id)
+                prepare(task, binding)
+                self.core_runtime.materialize_inputs(binding)
+                remote_bootstrap = {'execution_kind': 'cowork_remote_v1', 'remote_binding':
+                                    self.core_runtime.record_dict(worker_binding(binding))}
+                remote_cli = ['--execution-kind', 'cowork_remote_v1']
             job_dir.mkdir(mode=0o700, parents=True)
             # JSON string escapes may expand observed output sixfold. This IPC
             # frame limit preserves the operator's output bound without clipping
@@ -231,6 +273,7 @@ class Broker:
             with (job_dir / 'watchdog-stderr.txt').open('wb') as errors:
                 process = await asyncio.create_subprocess_exec(sys.executable, '-B', '-m',
                     'integrations.mcp.worker', '--state-dir', self.config['state_dir'],
+                    *remote_cli,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=errors, start_new_session=True,
                     limit=(self.config['limits']['max_output_bytes'] +
@@ -238,17 +281,23 @@ class Broker:
             self.workers[job_id] = process
             await self.send(process, {'config': self.config, 'arguments': accepted['arguments'],
                 'route': accepted['route'], 'job_id': job_id, 'launch_nonce': accepted['launch_nonce'],
-                'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted)})
+                'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted), **remote_bootstrap})
+            if remote:
+                await self.guard_remote_launch(job_id)
             while line := await process.stdout.readline():
                 message = json.loads(line)
+                if remote and message.get('event') == 'ready':
+                    await self.guard_remote_launch(job_id)
                 record = self.store.get(job_id)
                 if message.get('event') == 'ready':
                     record = self.store.identify(job_id, watchdog=message['watchdog'])
                     if not record['stop_intent']:
                         try:
                             await self.admit_launch(record)
-                        except WorkerError as exc:
+                        except (WorkerError, *remote_errors) as exc:
                             launch_error = exc
+                    if remote:
+                        await self.guard_remote_launch(job_id)
                     record = self.store.get(job_id)
                     if record['stop_intent'] or launch_error:
                         reason = record['stop_intent'] or launch_error.code
@@ -269,20 +318,43 @@ class Broker:
                         'result': failure_result(record, 'native_failed', 'Watchdog ended without completion')}, launch_error)
                 else:
                     self.store.containment_failed(job_id)
-        except (WorkerError, OSError, ValueError, KeyError, TypeError) as exc:
+        except (WorkerError, *remote_errors, OSError, ValueError, KeyError, TypeError) as exc:
             record = self.store.get(job_id)
             if process is None:
-                result = failure_result(record, 'native_failed', 'Watchdog could not start')
+                code = exc.code if remote and isinstance(exc, remote_errors) else 'native_failed'
+                result = failure_result(record, code, 'Watchdog could not start')
                 state = self.stop_state(record) if record['stop_intent'] else 'failed'
-                self.store.transition(job_id, state, reason=record['stop_intent'] or 'native_failed', result=result)
+                self.store.transition(job_id, state, reason=record['stop_intent'] or code, result=result)
             else:
-                await self.send(process, {'command': 'STOP', 'reason': 'native_protocol_error'})
-                self.store.containment_failed(job_id)
+                reason = exc.code if remote and isinstance(exc, remote_errors) else 'native_protocol_error'
+                await self.send(process, {'command': 'STOP', 'reason': reason})
+                if remote:
+                    # Keep ownership until the existing watchdog closes and its
+                    # termination receipt proves the native tree is contained.
+                    done = None
+                    while line := await process.stdout.readline():
+                        try:
+                            message = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            continue
+                        if message.get('event') == 'done':
+                            done = message
+                    await process.wait()
+                    if self.receipt(self.store.get(job_id)):
+                        self.finish(job_id, done or {'state': 'failed', 'reason': reason,
+                            'result': failure_result(record, reason, 'Remote launch refused')}, exc)
+                    else:
+                        self.store.containment_failed(job_id)
+                else:
+                    self.store.containment_failed(job_id)
         finally:
             timer.cancel()
-            self.workers.pop(job_id, None)
+            if not remote or process is None or self.receipt(self.store.get(job_id)):
+                self.workers.pop(job_id, None)
             if process and process.stdin:
                 process.stdin.close()
+            if remote:
+                await self.core_runtime.publish(job_id)
 
     @staticmethod
     def stop_state(record):
@@ -305,8 +377,39 @@ class Broker:
             state, reason, result = message['state'], message.get('reason'), message['result']
         self.store.transition(job_id, state, reason=reason, result=result)
 
+    async def contain_remote(self, reason):
+        jobs = set(self.workers)
+        try:
+            jobs.update(record['job_id'] for record in self.store.active()
+                        if record.get('execution_kind') == 'cowork_remote_v1')
+        except Exception:
+            self.signal_remote_failure()
+        for job_id in jobs:
+            try:
+                await self.stop(job_id, reason)
+            except Exception:
+                self.signal_remote_failure()
+
+    def signal_remote_failure(self):
+        try:
+            self.core_runtime.fatal()
+        except Exception:
+            # Runtime retains the failed sink for teardown.
+            self.core_runtime.fatal_signal_failed = True
+
     async def shutdown(self):
         self.stopping = True
+        if self.core_runtime is not None:
+            await self.contain_remote('cancel_requested')
+            if self.tasks:
+                results = await asyncio.gather(*list(self.tasks), return_exceptions=True)
+                if any(isinstance(result, BaseException) for result in results):
+                    self.signal_remote_failure()
+            for job_id in tuple(self.workers):
+                if not self.receipt(self.store.get(job_id)):
+                    raise WorkerError('containment_failed', 'Worker termination is unproven')
+                self.workers.pop(job_id, None)
+            return
         for job_id in list(self.workers):
             await self.stop(job_id, 'cancel_requested')
         if self.tasks:

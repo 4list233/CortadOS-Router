@@ -28,10 +28,25 @@ def send(event):
 
 
 class Watchdog:
-    def __init__(self, bootstrap):
+    def __init__(self, bootstrap, *, execution_kind=None):
         self.bootstrap = bootstrap
         self.config, self.arguments, self.route = (bootstrap[name] for name in ("config", "arguments", "route"))
         self.job_id = bootstrap["job_id"]
+        self.remote_binding = None
+        self.remote_errors = ()
+        if execution_kind is not None or 'execution_kind' in bootstrap or 'remote_binding' in bootstrap:
+            from .remote_schemas import RemoteError, WorkerBinding
+            from .remote_native import verify_binding, build_handoff, load_manifest
+            if execution_kind != 'cowork_remote_v1' or bootstrap.get('execution_kind') != execution_kind or not bootstrap.get('remote_binding'):
+                raise RemoteError('policy_unavailable')
+            binding = WorkerBinding(**bootstrap['remote_binding'])
+            if binding.job_id != self.job_id:
+                raise RemoteError('policy_unavailable')
+            verify_binding(binding, binding.native_manifest)
+            if build_handoff(self.arguments, binding.input_manifest, self.config['limits']['max_handoff_bytes']) != binding.handoff:
+                raise RemoteError('policy_unavailable')
+            self.remote_binding = binding
+            self.remote_errors = (RemoteError,)
         self.cli_version = record_version(bootstrap)
         self.directory = Path(self.config["state_dir"]) / "jobs" / self.job_id
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -59,7 +74,11 @@ class Watchdog:
 
     def stop(self, reason):
         if self.error is None:
-            self.error = WorkerError(reason, "Worker stopped: " + reason)
+            if self.remote_binding is not None:
+                from .remote_schemas import RemoteError
+                self.error = RemoteError(reason)
+            else:
+                self.error = WorkerError(reason, "Worker stopped: " + reason)
         if self.stop_at is None:
             self.stop_at = time.monotonic()
             if self.tracker:
@@ -97,10 +116,22 @@ class Watchdog:
         self.streams = {name: (self.directory / (name + ".tmp")).open("wb")
                         for name in ("events.jsonl", "native.stderr")}
         argv = native_arguments(self.config, self.arguments, self.route,
-                                self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None)
+                                self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None,
+                                **({'remote_binding': self.remote_binding} if self.remote_binding is not None else {}))
         environment = native_environment(self.config)
         check_version(self.config, time.monotonic() + self.config["limits"]["startup_timeout_s"],
                       expected=self.cli_version)
+        if self.remote_binding is not None:
+            from .remote_native import load_manifest, build_handoff, verify_inputs
+            from .remote_schemas import json_bytes, RemoteError
+            load_manifest(json_bytes(self.remote_binding.native_manifest), self.config, self.remote_binding.execution_policy)
+            identity = os.stat(self.arguments['cwd'], follow_symlinks=False)
+            expected = self.remote_binding.workspace_identity
+            if ((identity.st_dev, identity.st_ino) != (expected.device, expected.inode)
+                    or build_handoff(self.arguments, self.remote_binding.input_manifest,
+                                     self.config['limits']['max_handoff_bytes']) != self.remote_binding.handoff):
+                raise RemoteError('policy_unavailable')
+            verify_inputs(self.remote_binding, self.arguments['cwd'])
         self.native = subprocess.Popen(argv, cwd=self.arguments["cwd"], env=environment, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, shell=False)
         identity = process_identity(self.native.pid)
@@ -109,7 +140,8 @@ class Watchdog:
             raise WorkerError("containment_failed", "Native launch identity could not be observed")
         self.tracker = ProcessTracker(identity)
         self.tracker.sample()
-        self.handoff = memoryview(handoff(self.arguments).encode("utf-8"))
+        packet = self.remote_binding.handoff.text if self.remote_binding is not None else handoff(self.arguments)
+        self.handoff = memoryview(packet.encode("utf-8"))
         for stream, label, event in ((self.native.stdout, "events.jsonl", selectors.EVENT_READ),
                                      (self.native.stderr, "native.stderr", selectors.EVENT_READ),
                                      (self.native.stdin, "handoff", selectors.EVENT_WRITE)):
@@ -133,7 +165,7 @@ class Watchdog:
         if key.data == "events.jsonl" and self.error is None:
             try:
                 self.reader.feed(chunk)
-            except WorkerError as exc:
+            except (WorkerError, *self.remote_errors) as exc:
                 self.stop(exc.code)
 
     def _write_handoff(self, key):
@@ -187,7 +219,7 @@ class Watchdog:
                         self._output(key)
                 if self._tick():
                     break
-            except WorkerError as exc:
+            except (WorkerError, *self.remote_errors) as exc:
                 self.stop(exc.code)
             except (OSError, ValueError) as exc:
                 self.stop("storage_error" if isinstance(exc, OSError) else "native_protocol_error")
@@ -247,12 +279,13 @@ class Watchdog:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--execution-kind")
     args = parser.parse_args()
     # Bootstrap is trusted broker control, read once before any model/proxy starts.
     bootstrap = json.loads(sys.stdin.buffer.raw.readline())
     if bootstrap["config"]["state_dir"] != args.state_dir:
         raise ValueError("Watchdog state directory does not match bootstrap")
-    watchdog = Watchdog(bootstrap)
+    watchdog = Watchdog(bootstrap, execution_kind=args.execution_kind)
     signal.signal(signal.SIGTERM, lambda *_: watchdog.stop("broker_interrupted"))
     signal.signal(signal.SIGINT, lambda *_: watchdog.stop("broker_interrupted"))
     return watchdog.run()

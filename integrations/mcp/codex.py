@@ -39,7 +39,7 @@ def toml_value(value):
     raise TypeError("Unsupported native TOML value")
 
 
-def native_arguments(config, arguments, route, final_path, proxy_socket=None):
+def native_arguments(config, arguments, route, final_path, proxy_socket=None, *, remote_binding=None):
     servers = {}
     for grant in arguments["permissions"]["mcp_servers"]:
         if proxy_socket is None:
@@ -64,7 +64,11 @@ def native_arguments(config, arguments, route, final_path, proxy_socket=None):
         argv.extend(["-c", key + "=" + toml_value(value)])
     for feature in DISABLED_FEATURES:
         argv.extend(["--disable", feature])
-    return argv + ["--json", "--color", "never", "-o", str(final_path), "-"]
+    argv += ["--json", "--color", "never", "-o", str(final_path), "-"]
+    if remote_binding is not None:
+        from .remote_native import native_arguments as remote_arguments
+        return list(remote_arguments(remote_binding, tuple(argv)))
+    return argv
 
 
 class EventReader:
