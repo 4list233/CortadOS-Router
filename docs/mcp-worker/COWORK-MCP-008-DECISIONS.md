@@ -1,11 +1,13 @@
 <!-- PURPOSE: Record remaining policy/evidence gates without author rulings.
-     CONTRACT: RT-COWORK-MCP-008 v5 draft; same assignment, no self-approval.
+     CONTRACT: RT-COWORK-MCP-008 v6 draft; same assignment, no self-approval.
      DEPENDS: Parent source inspection and independent root/QA evidence.
      CEILING: No global decisions, production, tests, registration or activation edits. -->
 # Cowork 008 decision and gate record
 
-Contract: RT-COWORK-MCP-008 v5. Group: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1.
-Status: **draft; dispatchable=false**. Existing broad OAuth/tasks/file-transfer scope is authorized;
+Contract: RT-COWORK-MCP-008 v6. Group: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1.
+Status: **draft; dispatchable=false**. Current v6 authority, settled choices and four-failure ledger are in the final current v6 section. The initial O1–O5 discussions and dated author evidence below are preserved historical records; their pending-policy wording is superseded only by that current record. No D/A pass is claimed for v6.
+
+Historical initial status: Existing broad OAuth/tasks/file-transfer scope is authorized;
 do not ask for it again. This document records technical proposals and honest unresolved evidence,
 not Forest rulings. No provider registration/file-policy approval arrived in recorded docs during
 this authoring run. [Root review](COWORK-MCP-008-ROOT-REVIEW.md) and independent provider-preflight.md /
@@ -96,7 +98,7 @@ supply the GitHub upstream secret as a downstream secret.
 
 ## Historical v3 amendment and retained attempt/evidence ledger
 
-Historical record: RT-COWORK-MCP-008, group 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1, version 3; current version is 5.
+Historical record: RT-COWORK-MCP-008, group 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1, version 3; current version is 6.
 Package narrowing MUST NOT reset failed-attempt history, create a replacement group or count author
 completion as acceptance. Full existing root/worker evidence remains authoritative, not truncated
 to the entries below. Root MUST import any additional job/failure records before dispatch.
@@ -126,7 +128,7 @@ through exchange/store/delete plus transparent verification, acquire once, and r
 locks. Synthetic redemption races/restart/crash are future-auth prebuild A requirements.
 Neither candidate is declared qualified or a D pass. Auth issuance/storage stay with maintained owner.
 
-### Pending user questions remain pending
+### Historical v3 pending questions (superseded by current v6 record)
 
 [ESCALATE: activation only] GitHub identity/provider/application and downstream client registration.
 Publicly observed 4list233 / 237812476 MUST NOT become enabled configuration without recorded choice.
@@ -211,7 +213,7 @@ This section supersedes the source-seam and missing-bootstrap blockers in the hi
 Independent ordinary bootstrap capture now exists: parent section 9 pins the actual 1749-byte owner output and exact report/script hashes. It makes no native-execution claim. Existing-owner measurements and the complete 75-file inventory are pinned in EXECUTION and ROOT-REVIEW; new-core query/transfer/overshoot budgets remain pending independent A. Exact additional QA evidence paths are granted in EXECUTION. No protected exam or production source has been authored. Parent/EXECUTION API and AC tables remain exact copies. Independent D then A still precede dispatch; all prior review results and attempts remain preserved. User activation choices remain unanswered.
 
 
-## Current v5 revision-2 approval and preserved implementation ledger
+## Historical v5 revision-2 approval and preserved implementation ledger
 
 [FIXED] Contract RT-COWORK-MCP-008 v5 retains group 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1 and **two valid failed implementations**. No historical entry above is erased. This document-only revision neither increments nor resets that count. A third same-design retry remains forbidden; Forest approved a bounded revised design, not acceptance, automatic retry or immediate production dispatch.
 
@@ -251,3 +253,44 @@ Independent renewed D and A remain pending; no author self-score or approval is 
 The author checked all45 embedded JSON blocks for parsing, duplicate keys and nonfinite values; both Draft2020-12 schemas pass schema validation. All33 private valid examples validate and all33 corresponding unknown-field examples refuse. Parent/EXECUTION API, AC and admission blocks compare byte-for-byte; the admission table also equals the approved proposal bytes. Historical AC IDs03–16 and rules R001–R087 are retained, with R088–R092 added. Four Mermaid blocks remain: three are byte-identical to v4; the sequence adds the operation-permission check using its existing participant/message syntax. Rendering has not been performed and remains independent review work.
 
 Original18 candidate source hashes matched root-freeze.json. Original repository normative files remain untouched; only the three copied files changed. The copy directory is not a Git checkout, so whitespace/fence/diff checks use direct text comparison to the original repository v4 files rather than claiming a git diff run. No production tests, protected exams or external calls were run. The one identified semantic exam conflict is documented above; additional observable conflicts are not silently resolved.
+
+
+## Current v6 revision-3 authority and gate record — [FIXED]
+
+This section supersedes only earlier pending/current-status statements within the approved scope; every historical result, failure and identifier above remains evidence. Forest approved proposal SHA256 f0a19fb2741a5c08d3df095406985d9649750764cec7c47ebdacd702c00de2a1; root grant88defac authorizes exactly the three copied normative files in /Users/velox/.cortados-builds/cowork-core-contract-revision-3. Direct approval: /Users/velox/.cortados-builds/cowork-mcp-verification/core-revision-3/USER-APPROVAL.json, request7298fad4-172f-4ace-b274-fea0884edbc1. This is document authoring, not a source attempt, dispatch grant or independent D/A result. Group53f0ea39-a61e-4307-9c2c-466c1b4b0bd1 and four cumulative valid failed sources remain unchanged.
+
+| Continued attempt ledger | Preserved disposition / evidence |
+|---|---|
+| Candidate3, first valid failure under revision2, cumulative third | Host896 methods:10 failure events/1 error/0 skips,27/28 lanes pass. B1/B5/B6/B7 defective: C3-01 missing first capacity transition audit; C3-02 blanket public-code fatal promotion. Patch3bfce1b8bfdfa0f02f4dc7df1d3bef6196c1a38fbf077adfde1076fefdda088d; host2768296b0701e059f8f1d381f0eca8268098993108281ea31a7108989d9c4a13; B-FINAL f530124ae4a0eb3e58aa05faaa0983d37fb1ef282f43d62be0c849ea84d2770b. Feedback7aecbc5e-c556-47e9-8a0c-2ea256cce84a/sequence25 corrects sequence24's premature manifest verification; rejection unchanged. |
+| Historical exam corrections after candidate3 | Root's E3-01 server-close observation barrier, E3-02 exact safe timeout observation and E3-03 publication progression corrections retain original raw bytes/AST/failures; three additive audit regressions yield current114. Exam commit9722a880a9afda0779ee5b135edd343d33dec4cb, manifest8e32a0d697e1da3b06fef53ea8be9e2fd93363c7b88e2e2ab5b9fec8d73525dc. Historical A0 readiness8bdd96dc552dd729800ac925086341c845fa4da189cba81f9488d293c655c754 does not transfer to v6. No further protected assertion amendment is authorized. |
+| Candidate4 jobd583bbd4-061b-45ec-a4a9-db5a1ee5a2c8, second valid failure under revision2, cumulative fourth | REJECTED/design_error, B1/B6/B7 defective across all11 rows. C4-01 persisted policy{} causes KeyError, ends actual monitor with admission/fatal latches false, no safe signal, then real IPC admits an unrelated task. One negative fails, valid/scalar controls both pass; root reproduced. This is one source failure, not a new failure per probe. |
+| Candidate4 frozen identities | Source pinbec965aeff0471c714bd42c9f5b2354010c82a57, cumulative patch3981d2beff8e7f14d5253f942a90afcd7177e4704379a17fcd981fa76dfa2df4. Host899 pass/0 failures/0 errors/0 skips,28/28 lanes; report456464e6d5f4c9f1a098d529442312d7a939dba2b9adb73d85dc4a06327835d9. Completed matrix/ordinary/supplemental measurements do not waive C4-01. |
+| Candidate4 final evidence/rejection | B-FINAL6ecb61b42e88cf4666dd1fafd502f01eddd98d86d8ed063aeb2f2ec0a5023c70; FINAL-MANIFEST28fbb2f92cfda2962f712dd6f8e8335b6221ee9e97e99b963c798416dcfdd486. Root verified29 artifacts and680 identities, zero mismatches; feedbacka6ab574f-c50d-4d55-b710-774d76d06049/sequence28 rejects. Private core-candidate-attempt-4 retains the complete packet. |
+| Monitor ordering addendum | MONITOR-ORDER-ADDENDUM.md and monitor-terminal-order.json show task.done()==true before queued observer execution on qualified Python3.14.6. Admission must check terminal state itself; callback-only correction is insufficient. This evidence is not another source attempt. |
+
+### Changed definition/rule/AC mapping
+
+Canonical AC03–16 wording, both schemas, API and admission tables remain unchanged. New rules refine their existing ground truth; no old assertion is weakened.
+
+| Approved invariant | Definitions / atomic rules | Existing ACs / independent additions |
+|---|---|---|
+| Full closed record before nested ownership/discriminator access | Parent section4 canonical read boundary; R093 | AC05/15: actual persisted missing/unknown/nested/scalar invalid records, valid controls |
+| Causal normalization without blanket code promotion | Parent causal integrity failure; R094/R095 | AC05/06/07/09/15/16: fatal corruption versus foreign/unknown lookup, caller invalid input, generation mismatch and definitive rollback controls |
+| Observe unexpected return/exception/cancellation | Parent observed monitor lifetime; R096/R097 | AC15/16: all three terminal modes with no subsequent traffic, safe signal and closed admission |
+| Same-owner checks before queued observer and after waits | Parent admission ordering; R098 | AC03/06/15/16: deterministic completion-before-callback and post-wait denial, zero new effects |
+| Explicit expected shutdown | Parent owned expected shutdown; R099 | AC04/15/16: startup unwind and shutdown, preexisting unexpected loss cannot be reclassified |
+| Sole failure/containment owners, no recovery invention | Parent single failure and containment owners; R100–102 | AC04/05/15/16: once-only signal, signal failure, cleanup/worker proof, no restart/retry/reopen/grace |
+
+### Settled choices and separate gates
+
+Forest approved GitHub4list233 through a dedicated CortadOS Studio Workers login app without repository permissions; decimal100000000 bytes/file,1000000000/task,10000000000/installation; seven-day automatic uploaded/generated payload cleanup after the latest job settles, including failures/cancellations, preserving job history and audit. Settlement includes existing containment and publication completion; active/uncertain work is not settled and reading/downloading does not start a new completion clock. These choices are settled, not questions to ask again.
+
+Retention is a separately reviewed existing-owner extension. This core retains explicit_delete, expires_at_ms=null and no scheduler; neither this approval nor v6 implements cleanup, secret custody, account/subscription changes, native locks or live setup. Auth009v6/operator010v3 at9bf0a5d retain technical D0 only, A NOT RUN and source blocked until accepted core plus their separate grants. Their historical candidate discussions in008 are not a second current auth specification. Public activation, concrete custody/provisioning, native confinement and actual Cowork qualification remain later gates.
+
+Next: root reviews these exact three outputs; independent exam owner performs fresh full D, then additive committed exams preserving all114 current methods/assertions and repeats full A. Separate root authorization is required for an explicit Sol subscription build within unchanged18source ceiling, followed by frozen full accumulated suites, measurements and independent B. This handback declares no D/A pass and grants no source dispatch. An observable conflict returns to root; neither a model/branch change nor this revision resets the ledger.
+
+### v6 author verification (not independent D/A)
+
+Using the existing /Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python with -B, the author strictly parsed all45 embedded JSON blocks (duplicate keys/nonfinite values rejected), checked both Draft2020-12 schemas and validated33 private positive examples with33 negative unknown-field rejections. Every JSON block, including both schema identifiers, is byte-identical to the approved v5 input. Parent/EXECUTION API, AC and admission blocks are byte-identical to each other and to v5. R001–R092 remain numbered; R093–R102 add the approved invariants; only R073's reason now distinguishes settled retention from separate implementation. All historical UUID/SHA evidence identifiers remain. The sequence diagram now displays terminal observation/checks and owned shutdown; the other three diagrams are unchanged. Diagram rendering was not run and remains independent review work.
+
+The three input hashes match USER-APPROVAL.json and the proposal matches its approved SHA256. The author rehashed all680 identities from candidate4 independent/identity-initial.json:18source,3original normative,18fixture and641prior-protected, zero mismatches. Static AST inventory confirms114 existing core test methods; no exam was executed or edited. Direct v5-to-v6 text diff, fence/whitespace checks and exact18source path equality passed. The cwd contains exactly the three permitted Markdown files; no extra report/script was written. Exact final output hashes and physical diff counts are returned in the handback rather than self-referential document hashes. No production/exam/native/provider/network/install/live-state/Git mutation or nested worker action occurred. New runtime correctness, independent D/A, diagram rendering and future implementation line/measurement bounds remain unverified; this author identifies no additional policy conflict and awards no gate pass.

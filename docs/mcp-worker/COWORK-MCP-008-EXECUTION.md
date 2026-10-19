@@ -1,12 +1,12 @@
 <!-- PURPOSE: Allocate nonoverlapping future execution responsibilities and independent gates.
-     CONTRACT: RT-COWORK-MCP-008 v5; draft, not a dispatch authorization.
+     CONTRACT: RT-COWORK-MCP-008 v6; draft, not a dispatch authorization.
      DEPENDS: Parent contract, recorded root policies, independent protected fixtures.
      CEILING: This session writes documents only; no production, exams, commits or live actions. -->
 # Cowork 008 execution packages
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 5
+contract_version: 6
 task_group_id: 53f0ea39-a61e-4307-9c2c-466c1b4b0bd1
 status: draft
 dispatchable: false
@@ -26,14 +26,13 @@ local implementation; they are not prebuild requirements.
 
 Owner: root orchestrator with Forest for policies; author role produces proposals, never self-approval.
 Current exact scope_paths:
-- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008.md
-- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008-DECISIONS.md
-- /Users/velox/.cortados-builds/cowork-core-contract-revision-2/COWORK-MCP-008-EXECUTION.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-3/COWORK-MCP-008.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-3/COWORK-MCP-008-DECISIONS.md
+- /Users/velox/.cortados-builds/cowork-core-contract-revision-3/COWORK-MCP-008-EXECUTION.md
 
-Required inputs before LOCAL CORE dispatch: pinned v5 parent/source hashes, exact reviewed scopes,
+Required inputs before LOCAL CORE dispatch: pinned v6 parent/source hashes, exact reviewed scopes,
 synthetic mandatory config fixtures, protected exam commit/manifest, independent D then A and root
-package approval. No D/A pass is declared. O1 actual registration/identity and O5 deployed limits/
-retention remain pending activation choices; they MUST NOT block parameterized local enforcement.
+package approval. No D/A pass is declared. Settled identity, limits and retention choices are recorded in DECISIONS' current v6 record; concrete qualification/activation gates remain and MUST NOT block parameterized local enforcement.
 Auth implementation needs its own future reviewed package; it MUST NOT be smuggled into core scope.
 No actual Cowork connection is required for local fixtures.
 
@@ -53,7 +52,7 @@ No network permission, MCP grants, API billing fallback, provider registration, 
 state access. Inspect job_status before resubmission; no automatic failed-job retry. Retrieve job_result,
 review diff/evidence and record job_feedback accepted/rejected/inconclusive. Worker completion is not QA.
 
-Retained exact future scope_paths (all existing in candidate2):
+Retained exact future scope_paths (all existing in candidate4):
 - cortados_router/route_task.py — keyword-only full-handoff seam only
 - integrations/mcp/broker.py
 - integrations/mcp/job_store.py
@@ -130,7 +129,7 @@ baseline/candidate measurements, residual risks. No live install or commit impli
 
 Owner: designated independent MCP QA session, not B or this author. QA owns D/A/B and protected exams,
 including separately blocked future-auth qualification already underway. No exam files authored in this session.
-Retained exact acceptance_paths under existing acceptance/cowork_mcp (current 89-method inventory is historical baseline, not v5 acceptance):
+Retained exact acceptance_paths under existing acceptance/cowork_mcp (89 methods is a historical baseline; current114 are preserved, not v6 acceptance):
 - acceptance/cowork_mcp/__init__.py
 - acceptance/cowork_mcp/support.py
 - acceptance/cowork_mcp/README.md
@@ -284,8 +283,7 @@ integrations/mcp/remote_http.py, integrations/mcp/__main__.py, integrations/mcp/
 Shared remote_http ownership MUST transfer only after core acceptance and a separately approved scope;
 no simultaneous builders. No future-auth path may be written under this core package.
 
-No-public-activation gates remain: Forest identity/provider/client decision; concrete deployed limits
-and retention (payload, prompt/history, tombstones, backups); independent auth D/A with qualified
+No-public-activation gates remain: qualification of the settled identity/application and limits/retention choices in DECISIONS, remaining downstream-client and operator details; independent auth D/A with qualified
 Authlib hooks/locking; dependency lock; actual native tool confinement; measured disk/headroom;
 exact ingress/callback/rollback scope preserving private 443→8432; actual Cowork byte access,
 Authorization-header egress, approved destination and materialized PDF/DOCX/XLSX/non-UTF8 hashes.
@@ -314,7 +312,7 @@ Root approved the full-packet seam and private workspace-preparation journal wit
 
 Independent QA command correction: relative package imports require `-t .`. The authoritative core command is `/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B -m unittest discover -s acceptance/cowork_mcp -t . -p 'test_*.py' -v`. This changes invocation only; AC text and production semantics remain unchanged. The measured 100-artifact listing bound is the representative fixture size, not a production cap; each task retains its mandatory configured artifacts_per_task.
 
-## v5 revision-2 execution boundary — [FIXED]
+## Retained revision-2 execution boundary — [FIXED]
 
 Parent section 4 owns response lifetimes and capacity admission. Callable signatures and wire schemas remain unchanged; all existing entrypoints apply its exact table. For reviewer parity the table is copied verbatim:
 
@@ -336,7 +334,9 @@ Parent section 4 owns response lifetimes and capacity admission. Callable signat
 <!-- ADMISSION-END -->
 
 
-### Independent revision-2 exams and narrow semantic amendment — [FIXED]
+### Historical independent revision-2 exams and narrow semantic amendment — [FIXED]
+
+This dated authority was exercised in the recorded v5 exam revisions; it is not new permission to amend any of the current114 methods. Revision3's additive-only boundary below governs the next exams.
 
 Owner: /root/quota_evaluation_qa, the independent MCP exam/review owner. This author and the eventual source builder MUST NOT edit protected exams. After renewed D0, QA MUST preserve historical exam bytes, hashes and raw results before committing the revision exams with Exam-Owner attribution and a new MANIFEST.json/inventory. Renewed A0 and root's explicit revised source grant follow that commit. Existing 89 core / 874 accumulated methods and 28 lanes are the frozen attempt-2 baseline, not the future count or a v5 pass.
 
@@ -359,3 +359,25 @@ No new production or exam path is needed by this amendment. QA records any missi
 ```
 
 The full inventory/manifest and existing benchmark-core.py remain independently owned. QA pins any driver operands from its maintained README before execution; zero discovered tests is blocked. Production/native/provider calls are excluded from synthetic revision exams. Full B, accumulated regressions and measurements remain necessary after a revised candidate; earlier completed measurements do not accept either failed candidate.
+
+
+## v6 revision-3 execution boundary — [FIXED]
+
+Authority and current ledger are DECISIONS' current v6 record and root grant88defac. Parent section4 and R093–R102 are the sole new semantic authority. All revision-2 response/deadline and capacity-only rules above remain operative. Current source candidate4 is rejected/design_error; 899 green maintained methods/28 lanes are historical candidate evidence, not v6 acceptance. The exact18source ceiling and callable/AC/admission copies above remain unchanged. No source/exam/fixture or Git mutation belongs to this authoring.
+
+Disposition for the later gated builder: extend task_store's canonical reader using existing remote_schemas constructors before nested semantic access; extend CoreRuntime's existing monitor-task ownership, fatal signal and authorize boundary; adopt CapacityMonitor accounting and Broker/Watchdog containment. Existing dispatch/IPC/file-transfer post-wait authorization consumes the same runtime check. No new file, public API/schema/state, watcher, restart, retry, grace or reopening is granted. Parent section12 pins the actual candidate4 seams.
+
+### Additive independent regression outline (not authored exams)
+
+After fresh D0, the designated independent exam owner preserves every current114 method and assertion, adds cases in these existing files, commits with Exam-Owner attribution and updates the existing manifest/inventory before renewed A. support.py may provide synthetic synchronization only within that later grant. No installation, provider/model invocation, production listener or live state is needed. The pinned existing QA interpreter/commands above remain the execution environment; independent QA owns a newly authorized evidence destination, never overwrites old reports and records actual collected counts rather than a guessed total.
+
+| Existing acceptance/cowork_mcp path | Additive ground truth / discrimination | Rules / ACs |
+|---|---|---|
+| test_schemas.py | Complete closed persisted-record validation before nested reads: absent nested required field, unknown field, invalid scalar/array and semantic redundant-identity mismatch; valid record control. Exercise actual reader, not only constructor rejection; strict duplicate/nonfinite decoding remains covered. | R093–095; AC05/15 |
+| test_recovery.py | Reproduce C4-01 by persisting policy{} in a synthetic actual TaskRow, running the actual monitor and attempting unrelated task_create through actual IPC; fatal refusal and one safe signal precede effects. Valid and malformed-type controls distinguish blanket refusal and selective catch. | R093–097/R100; AC05/15/16 |
+| test_recovery.py | Unexpected monitor normal return, exception and cancellation each close admission and signal without new traffic. Order admission before the queued completion callback, then drain callback and prove one signal. Cover startup before ready and terminal detection while capacity-only/disabled. | R096–100; AC03/15/16 |
+| test_tasks.py / test_transfer.py | Hold an existing admission/task/stream wait with fixture events, terminate monitor, release the wait before observer execution and verify existing post-wait check refuses before task/job/ticket/reservation/worker/byte effect. Include attach/bind and all operation-table categories; cleanup-only close still settles descriptors. | R098/R101; AC03/06/15/16 |
+| test_recovery.py | Owned normal shutdown/startup unwind closes admission before monitor stop, awaits teardown and produces no false monitor-loss fatal; already-terminal unexpected loss is not excused by later shutdown. Read failure plus observer plus admission yields one signal; signal-write failure remains fatal, no retry. Accepted fake-worker containment and reservations retain existing Broker proof. | R099–102; AC04/05/15/16 |
+| test_tasks.py / test_native_policy.py / test_recovery.py | Add valid/unknown/foreign lookup and ordinary caller-validation controls; preserve existing preacceptance generation-mismatch policy_unavailable, definitive rollback and capacity-only inspection assertions. Actual corrupt binding/publication and uncertain commit stay fatal. | R094/R095; AC06/07/09/15/16 |
+
+Required evidence separates observer promptness from authorization safety: no arbitrary sleep or grace may manufacture callback ordering. Use the real event-loop ready ordering with explicit fixture synchronization. Existing monitor cadence, first-capacity audit and HTTP/IPC deadline tests remain unmodified. Source/protected identity verification, all accumulated lanes, matrix/performance and full B still follow any separately authorized frozen candidate. No acceptance or activation follows author completion.

@@ -1,12 +1,12 @@
 <!-- PURPOSE: Specify the remote Cowork boundary without authorizing implementation or activation.
-     CONTRACT: RT-COWORK-MCP-008 v5, draft; same assignment and independent gates.
+     CONTRACT: RT-COWORK-MCP-008 v6, draft; same assignment and independent gates.
      DEPENDS: RT-MCP-001–007; maintained FastMCP 3.4.9 auth and MCP 1.30.0.
      CEILING: Contract authoring only. No production, exams, credentials, commits or live changes. -->
 # Cowork remote MCP implementation contract
 
 ```yaml
 contract_id: RT-COWORK-MCP-008
-contract_version: 5
+contract_version: 6
 status: draft
 owner: Forest
 author_role: contract author
@@ -18,7 +18,7 @@ independent_review: pending designated QA D then A
 attempt_ledger: inherited; see DECISIONS evidence ledger (never reset)
 ```
 
-[FIXED] v5 defines one independently gateable **LOCAL CORE** package: closed schemas, mandatory
+[FIXED] v6 defines one independently gateable **LOCAL CORE** package: closed schemas, mandatory
 configuration, synthetic-principal composition, task ownership/folders, immutable artifacts, raw binary
 transfer, durable replay and existing broker/native seams. OAuth, general tasks without repositories,
 automatic folders, binary transfer and existing subscription workers remain authorized scope.
@@ -29,6 +29,8 @@ All operator values remain mandatory, without defaults.
 Synthetic explicit_delete fixtures do not select Forest's live retention policy.
 Independent D then A and root approval are still pending; this revision declares neither pass.
 See [decisions](COWORK-MCP-008-DECISIONS.md) and [execution packages](COWORK-MCP-008-EXECUTION.md).
+
+Current authority: Forest approved revision3; root grant88defac and private core-revision-3/USER-APPROVAL.json authorize only these three document edits. Four failed sources remain in the same group, with candidate4 rejected/design_error despite 899 maintained passes in 28 lanes. Fresh independent D, additive committed exams preserving all114 existing methods, A and a separate root source grant remain required. Historical pending-choice and two-failure statements below describe their dated evidence only; DECISIONS' current v6 record governs present status. Unchanged schema identifiers retain v5 because no schema bytes, public API or canonical AC text change in v6. Approved seven-day payload retention after latest-job settlement is a separate extension, not core behavior.
 
 
 Normative rules are numbered R entries; [FIXED] definitions supply their operands.
@@ -90,7 +92,7 @@ No independent D0/A0 is claimed. AC-008-01/02 remain exclusively future-auth.
 
 ## 2. Private definitions — [FIXED]
 
-Objects have exactly the listed fields, all required; `T|null` means a present nullable field. `T-or-U` in API notation means a union. Tuples serialize as arrays. Each named private record has the exact constructor remote_schemas.Name(**fields) and read-only named attributes. Constructors accept nested record-shaped mappings or the matching private record, and lists/tuples for declared arrays; they validate and deep-copy inputs into immutable nested collections with no retained mutable aliases. Wire-facing methods return dictionaries. Unknown/missing fields or invalid values raise RemoteError(invalid_request,"Remote operation refused: invalid_request"); caller boundaries may apply the separately specified configuration error mapping. JSON rejects duplicates, nonfinite numbers, surrogates and booleans as integers.
+Objects have exactly the listed fields, all required; `T|null` means a present nullable field. `T-or-U` in API notation means a union. Tuples serialize as arrays. Each named private record has the exact constructor remote_schemas.Name(**fields) and read-only named attributes. Constructors accept nested record-shaped mappings or the matching private record, and lists/tuples for declared arrays; they validate and deep-copy inputs into immutable nested collections with no retained mutable aliases. Wire-facing methods return dictionaries. Unknown/missing fields or invalid values raise RemoteError(invalid_request,"Remote operation refused: invalid_request"); caller boundaries may apply the separately specified configuration error mapping. Persisted canonical reads instead apply section4's revision-3 causal-integrity boundary; constructor invalid_request is not a nonfatal escape for corrupt storage. JSON rejects duplicates, nonfinite numbers, surrogates and booleans as integers.
 
 Primitives: ID and Hash are the wire schema types. N is integer 0..9007199254740991; P is integer 1..9007199254740991; Text is valid UTF-8; Nonblank is Text containing a non-whitespace character. Owner is the exact string returned by `task_evidence.canonical([issuer,subject,installation_id])`. General canonical bytes are `task_evidence.canonical(value).encode("utf-8")`. Argument hashes alone use `schemas.canonical(arguments)`, excluding request_id only. Transaction is the existing JobStore.db while JobStore owns its active transaction. BaseConfig/LocalArgs/LocalRoute/JobRecord denote the actual existing validated owner records, not parallel remote definitions.
 
@@ -214,6 +216,22 @@ CoreRuntime's constructor has no effects. Async enter validates base_raw through
 Runtime opens the existing state_dir/broker.lock with no-follow and validates owner/mode/regular-file identity; it acquires LOCK_EX|LOCK_NB and holds that fd for the lifetime. A second owner fails storage_error before DB access. Only after that does it construct Broker with core_runtime=self. That optional internal seam validates runtime lock ownership before JobStore construction and defers Broker's existing recover call. Ordinary Broker(config,digest) and serve() retain existing behavior. No second lock, connection, listener or queue is introduced.
 
 Under the lock: open/integrity-check ordinary JobStore → apply remote migration → revoke issued/claimed tickets and recovered leases → prove stream death/process containment → invoke ordinary Broker.recover once → reconcile remote creating/workspace-preparation/upload/publication/delete intents and reservations → start CapacityMonitor → mark ready. Uncertain ownership quarantines affected tasks and retains reservations; corrupt namespace fails startup. Runtime never admits calls during recovery. Failure closes endpoints, monitor, broker/store and root fds before releasing lock; effects already journaled remain for recovery. Shutdown marks stopping, refuses new calls, aborts streams, awaits their close, stops monitor, invokes Broker.shutdown/awaits its tasks, closes DB/root fds, then releases lock. A frontend disconnect alone does not invoke shutdown.
+
+### Revision-3 canonical integrity and monitor lifetime — [FIXED]
+
+Authority is root grant88defac adopting proposal SHA256 f0a19fb2741a5c08d3df095406985d9649750764cec7c47ebdacd702c00de2a1. These definitions extend R005/R010–012/R042/R065/R091–092 without changing the revision-2 deadlines or admission table.
+
+**Canonical read boundary.** task_store's existing reader owns persisted remote-record decoding. A complete closed record means every required field, nested record, array element, type, range and existing semantic constraint from section2; no defaults, partial validation or coercion repair of corrupt persisted values. Decode strict JSON, construct/validate the entire corresponding record through remote_schemas, then perform field-dependent ownership, redundant-column, discriminator and cross-record agreement checks on validated values. Structural decoding/validation necessarily inspects input shape; it is not permission to dereference an unchecked nested policy/seed/object identity for authorization. Trusted principal/client and SQL composite-owner scoping still precede object lookup under R014/R015; the new order concerns fields of a retrieved canonical record, not discovery of foreign records.
+
+**Causal integrity failure.** A canonical decoding, closed-record validation or semantic-integrity failure belongs to that read boundary regardless of Python exception class (including missing-field KeyError). It invokes CoreRuntime's existing fatal owner before the failure leaves that boundary, using existing safe RemoteError behavior: structural/decoding failures become storage_error; already prescribed semantic errors such as policy_unavailable retain their safe code while latching fatal. No raw exception text escapes. An ordinary absent/foreign scoped lookup remains the prescribed indistinguishable not-found outcome, without a fatal latch. A missing required referenced row in an already established canonical binding is integrity loss, unlike an unknown public lookup. Constructor invalid_request for caller input, preacceptance generation policy_unavailable and definitive acceptance rollback retain their existing outcomes. Error codes alone are never evidence of corruption. Uncertain commit, audit loss and actual binding/publication corruption retain fatal precedence.
+
+**Observed monitor lifetime.** CoreRuntime owns the one monitor task from creation during ordered startup until owned teardown completes. It installs terminal observation before ready admission; failed startup never opens admission. Unexpected loss is any normal return, exception or cancellation while monitoring is required, including capacity-only or disabled operation. Terminal state is observed even with no new calls. Detection immediately invokes the existing one-way fatal owner; it cannot be downgraded to capacity-only failure. The observer consumes the terminal outcome and uses the same safe once-only signal as canonical-read/audit failure; it cannot create another logger, durable event shape or signal retry.
+
+**Admission ordering.** CoreRuntime's existing authorization boundary checks the owned monitor's terminal state itself, before granting authority, as well as receiving terminal observation. Existing attach/bind, tool and stream entrypoints and existing post-wait reauthorization before effects consume that same check. A monitor that has terminated while its completion callback is queued is already lost: authorization latches fatal and refuses before a new task/job/ticket/reservation/worker or byte effect. Later observer execution does not duplicate the signal. Cleanup-only operations retain their existing table disposition, not new ordinary authority. No extra timer, grace period, polling owner or public state is introduced.
+
+**Owned expected shutdown.** Only CoreRuntime's ordered startup-unwind/shutdown path owns expected monitor termination. Before requesting monitor close/cancellation, that path closes admission and records that it is stopping this owned task. It checks an already-terminal monitor before marking termination expected, so shutdown cannot retroactively excuse unexpected loss or clear fatal state. Cancellation/return caused by that owned stop is expected and does not itself emit a false fatal signal; an independent integrity/audit/cleanup failure remains fatal. Mere ready=false, enabled=false, a capacity latch, frontend disconnect, or external cancellation is not evidence of expected shutdown. Teardown observes/awaits the monitor and retains the existing reverse cleanup/lock ownership even after an earlier failure.
+
+**Single failure and containment owners.** CoreRuntime retains once-only failure signaling, fatal latch precedence and propagation of signal failure; competing read/monitor/admission detections cannot reopen admission or retry signaling. Accepted native jobs remain Broker/Watchdog-owned through existing fail-stop/shutdown containment and termination proof. Neither a monitor task cancellation nor frontend loss is native termination proof. Reservations and uncertain files retain existing ownership until that proof. No monitor restart, new watcher, automatic retry/relaunch, admission reopening or retention cleanup is authorized.
 
 ### Process and client lifetime
 
@@ -445,7 +463,7 @@ Each entry has one enforceable rule, FIXED latitude, AC and a load-bearing reaso
 70. **R070 [FIXED; AC-008-15]** Remote migration MUST enforce the declared schema and integrity checks before recovery. Reason: partial schemas cannot safely interpret ownership.
 71. **R071 [FIXED; AC-008-08]** Explicit delete MUST refuse active job/upload/publication or uncertain containment with workspace_busy. Reason: deletion cannot destroy evidence still being written.
 72. **R072 [FIXED; AC-008-16]** Payload deletion MUST preserve operation/task tombstones and append-only job/feedback/history. Reason: erasing replay history would let old requests create new attempts.
-73. **R073 [FIXED; AC-008-16]** LOCAL CORE MUST expose only explicit task_delete with expires_at_ms=null. Reason: a scheduler would select an unanswered retention policy.
+73. **R073 [FIXED; AC-008-16]** LOCAL CORE MUST expose only explicit task_delete with expires_at_ms=null. Reason: the approved retention extension is separate from this core package.
 74. **R074 [FIXED; AC-008-15]** Restore MUST start disabled until DB/blob/policy identity and termination checks complete. Reason: recovered capabilities must not authorize uncertain state.
 75. **R075 [FIXED; AC-008-04]** Synthetic ASGI construction MUST receive identity only through trusted Python arguments. Reason: caller-selected identity would bypass authorization.
 76. **R076 [FIXED; AC-008-04]** Transport DELETE/disconnect MUST NOT cancel or retry an accepted job. Reason: frontend lifetime does not own native lifetime.
@@ -465,6 +483,17 @@ Each entry has one enforceable rule, FIXED latitude, AC and a load-bearing reaso
 90. **R090 [FIXED; AC-008-05,10,11]** remote_ipc MUST share the original response-write deadline between primary and pre-write fallback. Reason: A fallback cannot acquire fresh time.
 91. **R091 [FIXED; AC-008-03,06,16]** CoreRuntime MUST enforce the exact capacity-only operation table at all tool and stream entrypoints. Reason: Capacity refusal must not erase durable accepted outcomes.
 92. **R092 [FIXED; AC-008-06,15,16]** CoreRuntime MUST retain fatal integrity/audit/storage refusal independently of capacity-only admission. Reason: Limited observation cannot bypass corruption checks.
+
+93. **R093 [FIXED; AC-008-05,15]** The canonical reader MUST validate the complete closed record before field-dependent ownership, discriminator or agreement checks. Reason: An unchecked nested field can terminate monitoring before integrity refusal.
+94. **R094 [FIXED; AC-008-05,15,16]** The canonical reader MUST route every causal decoding, validation or semantic-integrity failure through the existing runtime fatal owner before returning failure. Reason: An exception-class shortlist leaves persisted corruption outside the fatal boundary.
+95. **R095 [FIXED; AC-008-06,07,09]** Canonical-read normalization MUST preserve the specified nonfatal ordinary not-found, caller-validation, preacceptance policy and definitive rollback outcomes. Reason: Public error-code promotion would erase valid inspection and refusal behavior.
+96. **R096 [FIXED; AC-008-15,16]** CoreRuntime MUST observe the owned monitor's terminal outcome throughout its required lifetime, including when no invocation arrives. Reason: A dead monitor cannot leave an accepting runtime.
+97. **R097 [FIXED; AC-008-15,16]** CoreRuntime MUST immediately invoke its existing fatal owner on unexpected monitor return, exception or cancellation. Reason: Monitoring loss is integrity failure rather than a recoverable capacity sample.
+98. **R098 [FIXED; AC-008-03,06,15,16]** CoreRuntime authorization MUST check monitor terminal state at admission and existing post-wait boundaries before effects. Reason: An already-ready admission can precede the queued completion callback.
+99. **R099 [FIXED; AC-008-04,15,16]** CoreRuntime MUST identify expected monitor termination only through the owned shutdown sequence defined in section4. Reason: An external cancellation or retroactive shutdown label would conceal loss of monitoring.
+100. **R100 [FIXED; AC-008-05,15,16]** Read, monitor and admission failure paths MUST share CoreRuntime's existing once-only safe failure signal. Reason: Concurrent detection must not duplicate signals or suppress a failed signal.
+101. **R101 [FIXED; AC-008-04,15,16]** Monitor-loss handling MUST preserve existing Broker/Watchdog containment and reverse teardown ownership. Reason: Cancelling a monitor does not prove accepted workers stopped.
+102. **R102 [FIXED; AC-008-04,15,16]** Revision3 handling MUST exclude monitor restart, new watcher, retry/relaunch, admission reopening and timeout grace. Reason: These would add unapproved recovery behavior.
 
 ## 6. Canonical acceptance registry
 
@@ -500,10 +529,11 @@ sequenceDiagram
   R->>R: Acquire broker.lock before DB
   R->>J: Construct and migrate
   R->>B: Recover ordinary once
-  R->>R: Reconcile remote intents and start monitor
+  R->>R: Reconcile remote intents and start monitor with terminal observation
   F->>R: Attach socketpair and bind
   F->>B: Delegate with original request ID
-  B->>R: Check operation permission and latch
+  B->>R: Check operation permission, latch and monitor terminal state
+  Note over R,B: Recheck after existing waits before effects; queued observer cannot grant admission
   B->>B: If admitted, replay and validate owned ready task
   B->>J: Commit private workspace preparation intent
   B->>B: Create empty cwd and verify inode
@@ -519,7 +549,8 @@ sequenceDiagram
   B->>W: START with nonce
   W-->>B: Proven terminal outcome
   B->>J: Publish manifest transaction
-  R->>R: Close sessions and monitor
+  R->>R: Check prior monitor loss, close admission and own expected stop
+  R->>R: Close sessions and observe monitor settlement
   R->>B: Shutdown and await workers
   R->>J: Close DB
   R->>R: Release broker.lock last
@@ -980,7 +1011,7 @@ RemoteEvent — valid closed diagnostic record, then invalid unknown-field recor
 {"valid":{"schema":"cortados.cowork-event.v1","event_id":"10000000-0000-4000-8000-000000000001","at_ms":0,"event":"refusal","entity":"runtime","object_id":null,"request_id":null,"from_state":null,"state":null,"reason":"invalid_request"},"invalid":{"schema":"cortados.cowork-event.v1","event_id":"10000000-0000-4000-8000-000000000001","at_ms":0,"event":"refusal","entity":"runtime","object_id":null,"request_id":null,"from_state":null,"state":null,"reason":"invalid_request","unexpected":true}}
 ```
 
-Additional semantic invalid cases: AcceptanceSeed with job_id is invalid_request; WorkerBinding without manifest or with differing binary hash is policy_unavailable; BlobIdentity bytes differing from Artifact bytes is artifact_corrupt; Lease offset beyond artifact length is length_mismatch; PolicySnapshot raw ticket_key is invalid_request; ReservationRow materialized_bytes>bytes is storage_error; mismatched owner/task tuple is the same not-found error as absence. These outcomes are independent of JSON type validation.
+Additional semantic invalid cases: AcceptanceSeed with job_id is invalid_request; WorkerBinding without manifest or with differing binary hash is policy_unavailable; BlobIdentity bytes differing from Artifact bytes is artifact_corrupt; Lease offset beyond artifact length is length_mismatch; PolicySnapshot raw ticket_key is invalid_request; ReservationRow materialized_bytes>bytes is storage_error; a foreign/unknown public lookup tuple is the same not-found error as absence. Disagreement inside a retrieved canonical record instead follows section4's causal-integrity boundary. These outcomes are independent of JSON type validation.
 
 Synthetic ticket vector (all-zero 32-byte key, not a credential):
 
@@ -1491,6 +1522,8 @@ Full independent v3 D report: /Users/velox/.cortados-builds/cowork-mcp-verificat
 
 ### Retained blocked candidate composition (future-auth AC-008-01/02)
 
+Historical candidate discussion below is retained as evidence, not the current auth design. Auth009v6/operator010v3 at9bf0a5d have technical D0 only; A is not run and source remains blocked on accepted core and separate grants. Current settled choices are recorded in DECISIONS; they do not authorize implementation here.
+
 [ESCALATE: future package only] LOCAL CORE MUST NOT implement this section. Retained candidates
 are source evidence, not an approved adapter. D-008-01/02 remain future-auth blockers. Independent QA
 MUST qualify the preparse hook and complete lock boundary before future-auth D/A review.
@@ -1619,7 +1652,7 @@ immediate upstream session revocation or refresh-family reuse revocation without
 These gaps can block auth activation without blocking deterministic task work.
 
 
-## 11. Revision-2 source grounding and evidence precedence
+## 11. Historical revision-2 source grounding and evidence precedence
 
 The original repository is read-only for this author. Current code claims in this section refer to /Users/velox/.cortados-builds/cortados-router-repo at the frozen candidate2 identities in /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-2/root-freeze.json. All 18 source hashes were rechecked with zero mismatches during this revision. Earlier section9 prebuild anchors remain historical; they do not imply that the candidate's existing owners are absent.
 
@@ -1642,3 +1675,31 @@ The original repository is read-only for this author. Current code claims in thi
 | integrations/mcp/file_transfer.py | d027cb889f5bf61cd447fa18ee10772e15e3f07cab5e3ac23cddb1de87f8cda3 |
 
 The exact approved operation table is copied in EXECUTION; its independent exam matrix maps all revision rules to existing protected paths. DECISIONS owns the preserved two-failure ledger and approval chronology. No live identity, storage, retention or operator default is selected.
+
+## 12. Revision-3 source grounding and feasibility (nonnormative)
+
+Read-only candidate4 under /Users/velox/.cortados-builds/cortados-router-repo, frozen atbec965aeff0471c714bd42c9f5b2354010c82a57. Section11 describes candidate2 historically, not current code. Approved proposal and actual SOURCE-B-REVIEW.md / MONITOR-ORDER-ADDENDUM.md are under the reference paths in DECISIONS. Feasibility is source inspection, not implementation or independent qualification.
+
+| Existing owner / disposition | Actual seam and bounded change |
+|---|---|
+| task_store / extend | rows :144–188 decodes nested JSON but reads seed/object_ids/policy before final record constructor at :179; policy{} reaches KeyError outside selected catch. Move whole-record validation ahead of semantic access and cover causal read failures without wrapping ordinary lookup absence into fatal. |
+| remote_schemas / adopt | Existing closed immutable constructors and strict_json own validation; reuse them, no parallel schema or new record. Persisted-read normalization belongs to task_store, not every caller error. |
+| remote_runtime / extend | authorize :44–50 already owns fatal/capacity disposition; fatal :68–99 owns one signal; __aenter__ :101–151 creates monitor; __aexit__ :153–204 awaits cancellation without owned expected-loss distinction. Add observation and same-owner terminal check plus explicit owned shutdown sequencing here. |
+| remote_capacity / adopt | run :106–144 owns measurement, capacity latch and Broker.stop; close :146–147 owns closed flag. Terminal task observation belongs to runtime, not another monitor. Preserve cadence/accounting and stop policy. |
+| remote_dispatch / adopt existing checks | authorize at entry :81, after admission lock :86 and task waits :214/:232 provides the same runtime boundary before effects; retain rather than duplicate monitoring logic. |
+| remote_ipc / file_transfer / adopt | IPC stream authorization :136 and bind :212; file_transfer._check :73–85 owns byte-effect check/lease cleanup. These consume runtime terminal state without changing frames, capability APIs or deadlines. |
+| broker / JobStore / adopt | Broker shutdown/stop and Watchdog remain containment owners; JobStore.admission_closed retains uncertain-commit/audit semantics. fatal state does not authorize deleting unknown files or claiming native termination. |
+
+| Candidate4 source | SHA256 |
+|---|---|
+| integrations/mcp/task_store.py | 6a28a57cf549aa639fd653d342bf4986f2f942a93202307d1bc3bc73e59a88eb |
+| integrations/mcp/remote_schemas.py | 717973e2bce4ad34af217ec91226ca915bff2b9d825e8b2dd7f8f6507969ed07 |
+| integrations/mcp/remote_runtime.py | 611f45788d0c91f161a90d9b4fcda649d0b8d69e2cdadd18bdcc85eda0332dd2 |
+| integrations/mcp/remote_capacity.py | 07ef6a89b5855dab5b78fc47f3d35af1f4c41a66f4ceb04e7ca5cac9bd6c32c9 |
+| integrations/mcp/remote_dispatch.py | 084a2ca286b58a8e21c4ecdb72e7e856cfb6db33668ca37c2748ee894e593ae9 |
+| integrations/mcp/remote_ipc.py | 53719f850a30d6d447c499b7e4f5f56ebdb92653c1c5dfe5d62c4aa537db1bd5 |
+| integrations/mcp/file_transfer.py | b1894e0e42547e18059b12fc5b8f77bc5588de25334a3ea7b7aafa675fc71a95 |
+| integrations/mcp/broker.py | 1c20988bdbfe36391e61b29523b1bcc3420decb119a0f91e52d2b2af9c6e9eca |
+| integrations/mcp/job_store.py | e8ffc82b3a24a78ae8524f958beebc8d6e48175ff22a9da361b6b79c58c52119 |
+
+All these files are already inside the unchanged18source ceiling. No new dependency/module is required by the approved invariants. Exact below500-line feasibility must be verified on a future implementation; this document does not claim the unbuilt code fits or passes. Public code mapping is preserved by distinguishing canonical causal failure from ordinary lookup/refusal, rather than broadening fatal classification by error string. Fresh independent D/A and later implementation/performance verification remain outstanding.
