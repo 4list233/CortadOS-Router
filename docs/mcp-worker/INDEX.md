@@ -90,23 +90,23 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Cowork connector path | RT-COWORK-MCP-008 responsibility |
 |---|---|
-| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent v5 D0/A0 and amended114core exams committed at9722a88. Candidate4 passes899 maintained tests but fails independent B at B1/B6/B7. Second revision2 failure is preserved as design_error; Forest approved revision3 and v6 contract authoring is underway. No accepted release; earlier failures remain preserved. OAuth and activation are separate. |
+| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Accepted local v6 core at88e8a5d: all33 D0/all37 A0/all11 B0;947 passing methods/28 lanes including162 core. Five prior failed candidates preserved. OAuth, retention and activation remain separate. |
 | [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
 | [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
 | [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
-| `integrations/mcp/remote_runtime.py` (new, proposed) | CoreRuntime composes the existing broker under its exclusive state lock; no-listener startup, recovery, IPC session and monitor lifetime. No second job queue. |
-| `integrations/mcp/remote_ipc.py` (new, proposed) | One bounded framed socketpair codec and CoreClient/server connection lifecycle; no descriptor-number handoff. |
-| `integrations/mcp/remote_capacity.py` (new, proposed) | Task/installation file accounting and reservation measurements; existing JobStore owns writes and Broker owns worker stop. |
+| `integrations/mcp/remote_runtime.py` (accepted local core) | CoreRuntime composes the existing broker under its exclusive state lock; no-listener startup, recovery, IPC session and monitor lifetime. No second job queue. |
+| `integrations/mcp/remote_ipc.py` (accepted local core) | One bounded framed socketpair codec and CoreClient/server connection lifecycle; no descriptor-number handoff. |
+| `integrations/mcp/remote_capacity.py` (accepted local core) | Task/installation file accounting and reservation measurements; existing JobStore owns writes and Broker owns worker stop. |
 
 | `cortados_router/route_task.py::route_task` | RT008 extends the existing route owner with keyword-only trusted full-handoff input for byte bounds and all resolver input-fit calls; None preserves ordinary behavior. |
-| `integrations/mcp/task_store.py` (new, proposed) | RT008 remote SQL record/ownership statements, including private workspace preparation; transactions remain owned by JobStore. |
-| `integrations/mcp/task_workspace.py` (new, proposed) | RT008 descriptor-anchored empty preparation, accepted input copies and proven cleanup. |
-| `integrations/mcp/remote_config.py` and `remote_schemas.py` (new, proposed) | RT008 closed configuration, private/wire records, safe errors and audit encoding. |
-| `integrations/mcp/remote_dispatch.py` and `remote_http.py` (new, proposed) | RT008 owner-scoped core operations and listener-free synthetic ASGI composition; auth is excluded. |
-| `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (new, proposed) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
-| `integrations/mcp/remote_native.py` (new, proposed) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
+| `integrations/mcp/task_store.py` (accepted local core) | RT008 remote SQL record/ownership statements, including private workspace preparation; transactions remain owned by JobStore. |
+| `integrations/mcp/task_workspace.py` (accepted local core) | RT008 descriptor-anchored empty preparation, accepted input copies and proven cleanup. |
+| `integrations/mcp/remote_config.py` and `remote_schemas.py` (accepted local core) | RT008 closed configuration, private/wire records, safe errors and audit encoding. |
+| `integrations/mcp/remote_dispatch.py` and `remote_http.py` (accepted local core) | RT008 owner-scoped core operations and listener-free synthetic ASGI composition; auth is excluded. |
+| `integrations/mcp/artifact_store.py`, `transfer_tickets.py`, `file_transfer.py` (accepted local core) | RT008 immutable artifacts, scoped capabilities and bounded descriptor-owned byte streams. |
+| `integrations/mcp/remote_native.py` (accepted local core) | RT008 frozen native manifest, complete handoff appendix and execution binding. |
 | `integrations/mcp/broker.py`, `job_store.py`, `codex.py`, `worker.py` | RT008 extends the existing lifecycle/transaction/native owners only at reviewed remote seams; ordinary001–007 remains unchanged. |
-| `acceptance/cowork_mcp/` | Independent QA owns114protected core methods at9722a88, current manifest8e32a0d697e1da3b06fef53ea8be9e2fd93363c7b88e2e2ab5b9fec8d73525dc. All original assertions are preserved except the explicitly approved v5 deadline response consequence; seven later technical observation corrections are recorded. Full899/28lane inventory passes; additional actual-runtime integrity probe fails. Exams and measurements remain builder read-only; candidate4 rejected. |
+| `acceptance/cowork_mcp/` | Independent QA owns162 protected core methods at88b2eb5; manifest01c2cfc758cb829f97a89830325a7ce93be88a091b411c2fc016e60d26af3fd0. Original assertions and all prior failures preserved; exact fixture corrections recorded in ROOT-REVIEW. Full947/28 inventory and additional actual-process ordering probes pass. Builder read-only. |
 
 | Future authentication draft | RT-COWORK-AUTH-009 responsibility |
 |---|---|
@@ -136,6 +136,13 @@ The isolated optional dependency qualification requires `fastmcp-slim[server]==3
 
 | Status and revision | Root-owned evidence and decision |
 |---|---|
-| [COWORK-MCP-BUILD-REPORT.md](COWORK-MCP-BUILD-REPORT.md) | Root; candidate4 has899 passing maintained tests but a reproduced integrity failure, independent B3 and design_error. Complete measurements and prior failed packets preserved. Not installed. |
+| [COWORK-MCP-BUILD-REPORT.md](COWORK-MCP-BUILD-REPORT.md) | Root; accepted candidate6 source88e8a5d,947 passes/28 lanes and complete measurements. Auth/operator/retention qualification and actual connection remain pending. Not installed. |
 | [COWORK-MCP-008-REVISION-2-PROPOSAL.md](COWORK-MCP-008-REVISION-2-PROPOSAL.md) | Forest-approved HTTP/IPC deadline and capacity-only inspection revision (2026-10-18). Renewed contract/exam gates remain mandatory; original attempt history is preserved. |
-| [COWORK-MCP-008-REVISION-3-PROPOSAL.md](COWORK-MCP-008-REVISION-3-PROPOSAL.md) | Forest-approved canonical-read and monitor-lifetime revision after the second failed revision2 implementation. Core v6 drafting and independent preparation underway; no source/exam grant yet. |
+| [COWORK-MCP-008-REVISION-3-PROPOSAL.md](COWORK-MCP-008-REVISION-3-PROPOSAL.md) | Forest-approved canonical-read and monitor-lifetime revision. Candidate5 failed; candidate6 closes the remaining launch race with D0/A0/B0. Historical failures and exact authorizations remain in ROOT-REVIEW. |
+
+| Retention reservation | RT-COWORK-RETENTION-011 /111; no canonical contract, exam or source grant yet |
+|---|---|
+| Private v3 drafts and core6 readiness audit | Root reserves IDs011/111. Seven-day latest-safe-settlement cleanup policy is approved. O5/O6 technical incorporation remains: accepted cumulative dependency, owner headroom/callers, additive inventory and constructor byte provenance. Auth B2 composition is sequenced first, then retention. |
+| Existing runtime/config and other proposed retention owners | One root-designated integration builder at a time; no overlapping auth/retention source writes. Future exact paths/APIs and optional pure transition placement require canonical contract review before dispatch. Existing JobStore/Broker remain sole transaction/job owners. |
+
+Auth stage-specific exam revision is currently pending: the Astra document-author attempt ended at model capacity without changing files. Root has asked for a narrow Sol authorship exception under CONVENTIONS. Unchanged009v6/010v3 D0 remains valid only for those exact bytes; fresh D and independent committed exams/A precede source. This index reserves ownership and reports status; it supplies no private runtime behavior or deployment permission.
