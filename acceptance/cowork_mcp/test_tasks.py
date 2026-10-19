@@ -293,3 +293,130 @@ class MonitorPostWaitExam(CoreCase):
                 self.assertEqual(raised.exception.code, 'storage_error')
         self.assertEqual(remote_counts(self),
                          {'remote_tasks': 0, 'jobs': 0, 'remote_tickets': 0, 'remote_reservations': 0})
+
+
+class MonitorPendingLaunchExam(CoreCase):
+    async def pending_launch(self, phase, loss, unreadable):
+        import contextlib
+        import sqlite3
+        from .support import lose_monitor, wait_for_fixture
+        self.fixture.control(hang=True)
+        gate = await monitor_fixture(self)
+        task = await self.task()
+        broker = self.runtime.broker
+        signal = FatalCapture(self)
+        reached, release = asyncio.Event(), asyncio.Event()
+        spawn, send, admit = asyncio.create_subprocess_exec, broker.send, broker.admit_launch
+        commands, processes = [], []
+        job = None
+        with contextlib.ExitStack() as seams:
+            async def pause():
+                reached.set()
+                await release.wait()
+
+            async def delayed_spawn(*args, **kwargs):
+                process = await spawn(*args, **kwargs)
+                if 'integrations.mcp.worker' in args:
+                    processes.append(process)
+                    if phase == 'spawn':
+                        await pause()
+                    elif phase == 'ready':
+                        readline = process.stdout.readline
+                        async def delayed_ready():
+                            line = await readline()
+                            if line and json.loads(line).get('event') == 'ready':
+                                await pause()
+                            return line
+                        seams.enter_context(patch.object(process.stdout, 'readline', delayed_ready))
+                return process
+
+            async def delayed_admit(record):
+                result = await admit(record)
+                if phase == 'admitted':
+                    await pause()
+                return result
+
+            async def observed_send(process, command):
+                if 'command' in command:
+                    commands.append(dict(command))
+                return await send(process, command)
+
+            seams.enter_context(patch.object(asyncio, 'create_subprocess_exec', delayed_spawn))
+            seams.enter_context(patch.object(broker, 'admit_launch', delayed_admit))
+            seams.enter_context(patch.object(broker, 'send', observed_send))
+            try:
+                job = self.ok(await self.call('delegate', self.args(task)))['job']['job_id']
+                # Seconds: local fake startup observation only; short values test host
+                # load, unbounded waits strand fixtures. No product grace is added.
+                await asyncio.wait_for(reached.wait(), 3)
+                self.assertEqual(broker.store.get(job)['state'], 'queued')
+                self.assertFalse(any(c.get('kind') == 'exec' for c in self.fixture.calls()))
+                if phase == 'spawn':
+                    self.assertNotIn(job, broker.workers)
+                else:
+                    self.assertIn(job, broker.workers)
+                if loss:
+                    fault = (patch.object(broker.store, 'active', side_effect=sqlite3.DatabaseError(
+                        'SYNTHETIC active enumeration')) if unreadable else contextlib.nullcontext())
+                    with fault:
+                        await lose_monitor(self, gate)
+                        await asyncio.wait_for(asyncio.shield(self.runtime.containment_task), 2)
+                    self.assertTrue(self.runtime.fatal_failed)
+                    signal.assert_one(self)
+                release.set()
+                async with asyncio.timeout(3):
+                    while not any(c.get('kind') == 'exec' for c in self.fixture.calls()) and any(
+                            not pending.done() for pending in broker.tasks):
+                        await asyncio.sleep(.02)
+                execution_count = sum(c.get('kind') == 'exec' for c in self.fixture.calls())
+                before_cleanup = broker.store.get(job)
+                before_commands = list(commands)
+            finally:
+                release.set()
+                (self.fixture.path / 'native/release-worker').touch()
+                if job is not None:
+                    await broker.stop(job, 'cancel_requested')
+                    await wait_for_fixture(lambda: all(pending.done() for pending in broker.tasks))
+                    self.assertTrue(broker.receipt(broker.store.get(job)))
+                    self.assertTrue(processes)
+                    self.assertTrue(all(process.returncode == 0 for process in processes))
+                    self.assertFalse(broker.workers)
+            self.assertEqual(execution_count, 0 if loss else 1,
+                             'R098/R101: resumed accepted launch must not bypass monitor loss')
+            if loss:
+                self.assertFalse(any(c['command'] == 'START' for c in before_commands))
+                self.assertTrue(any(c == {'command': 'STOP', 'reason': 'capacity_exhausted'}
+                                    for c in before_commands))
+                self.assertEqual(before_cleanup['stop_intent'], 'capacity_exhausted')
+                signal.assert_one(self)
+            else:
+                self.assertEqual(sum(c['command'] == 'START' for c in before_commands), 1)
+                self.assertFalse(self.runtime.fatal_failed)
+                self.assertFalse(self.runtime.monitor_task.done())
+
+    async def test_pending_spawn_healthy_control(self):
+        await self.pending_launch('spawn', False, False)
+
+    async def test_pending_spawn_loss_readable_control(self):
+        await self.pending_launch('spawn', True, False)
+
+    async def test_pending_spawn_loss_unreadable_active_never_starts(self):
+        await self.pending_launch('spawn', True, True)
+
+    async def test_ready_wait_healthy_control(self):
+        await self.pending_launch('ready', False, False)
+
+    async def test_ready_wait_loss_readable_control(self):
+        await self.pending_launch('ready', True, False)
+
+    async def test_ready_wait_loss_unreadable_active_never_starts(self):
+        await self.pending_launch('ready', True, True)
+
+    async def test_post_admission_wait_healthy_control(self):
+        await self.pending_launch('admitted', False, False)
+
+    async def test_post_admission_wait_loss_readable_control(self):
+        await self.pending_launch('admitted', True, False)
+
+    async def test_post_admission_wait_loss_unreadable_active_never_starts(self):
+        await self.pending_launch('admitted', True, True)

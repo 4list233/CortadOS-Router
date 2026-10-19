@@ -11,24 +11,6 @@
     "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "a6f93d4b51d050e0b7fca16cdd291b2bc844a81bd798ceba0ab3c3e815fb6750"
   },
   "test_methods": {
-    "test_compatibility.py": [
-      "test_exact_routes_methods_queries_no_redirect_or_listener",
-      "test_mcp_initialization_tools_and_failure_preserve_structured_json",
-      "test_http_raw_binary_and_unicode_disposition",
-      "test_oversized_mcp_body_never_calls_core",
-      "test_app_rejects_double_adoption_and_wrong_principal",
-      "test_frontend_disconnect_preserves_accepted_job_and_reconnect",
-      "test_handoff_override_reaches_existing_s1_fit_and_default_is_unchanged",
-      "test_live_training_prefix_exam_rows_and_protected_model_inputs",
-      "test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator",
-      "test_ordinary_native_argv_and_environment_are_unchanged",
-      "test_stalled_http_put_receive_terminates_at_idle_deadline",
-      "test_stalled_http_get_send_aborts_after_headers_at_idle_deadline",
-      "test_all_response_families_timely_status_controls",
-      "test_all_response_families_stalled_start_or_body_abort_once",
-      "test_header_attempt_failure_cannot_emit_replacement_start",
-      "test_timely_preheader_timeout_uses_positive_remaining_budget"
-    ],
     "test_monitor_lifetime.py": [
       "test_unexpected_return_signals_without_followup",
       "test_unexpected_exception_is_consumed_and_signals",
@@ -52,27 +34,23 @@
       "test_read_observer_and_admission_share_one_signal_attempt",
       "test_prior_stop_reason_and_terminal_outcome_are_preserved"
     ],
-    "test_native_policy.py": [
-      "test_native_argv_uses_complete_remote_template_and_full_input_packet",
-      "test_binary_generation_change_refuses_before_native_exec",
-      "test_output_snapshot_is_immutable_and_sorted_utf8",
-      "test_nonregular_output_fails_entire_publication_preserving_native_success",
-      "test_failed_native_retains_only_explicit_partial_output",
-      "test_full_handoff_byte_limit_is_enforced_before_acceptance",
-      "test_route_only_does_not_prepare_workspace",
-      "test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade",
-      "test_committed_manifest_order_survives_reverse_artifact_query_order",
-      "test_sealed_output_is_not_downloadable_after_publication_failure",
-      "test_unpublished_output_rejects_existing_ticket_replay_and_claim"
-    ],
-    "test_performance.py": [
-      "test_file_exact_bound_allowed_one_over_refused_without_intent",
-      "test_zero_byte_reserved_intents_consume_artifact_slots",
-      "test_pending_upload_reservation_counts_and_rename_does_not_double_count",
-      "test_selected_input_copy_reserves_destination_before_native_start",
-      "test_workspace_file_overrun_stops_actual_fake_worker",
-      "test_unknown_payload_root_entry_blocks_new_reservations",
-      "test_filesystem_available_boundary_includes_existing_promises"
+    "test_compatibility.py": [
+      "test_exact_routes_methods_queries_no_redirect_or_listener",
+      "test_mcp_initialization_tools_and_failure_preserve_structured_json",
+      "test_http_raw_binary_and_unicode_disposition",
+      "test_oversized_mcp_body_never_calls_core",
+      "test_app_rejects_double_adoption_and_wrong_principal",
+      "test_frontend_disconnect_preserves_accepted_job_and_reconnect",
+      "test_handoff_override_reaches_existing_s1_fit_and_default_is_unchanged",
+      "test_live_training_prefix_exam_rows_and_protected_model_inputs",
+      "test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator",
+      "test_ordinary_native_argv_and_environment_are_unchanged",
+      "test_stalled_http_put_receive_terminates_at_idle_deadline",
+      "test_stalled_http_get_send_aborts_after_headers_at_idle_deadline",
+      "test_all_response_families_timely_status_controls",
+      "test_all_response_families_stalled_start_or_body_abort_once",
+      "test_header_attempt_failure_cannot_emit_replacement_start",
+      "test_timely_preheader_timeout_uses_positive_remaining_budget"
     ],
     "test_recovery.py": [
       "test_second_runtime_refuses_before_second_jobstore",
@@ -102,6 +80,60 @@
       "test_first_capacity_latch_persists_one_closed_runtime_transition",
       "test_repeated_bad_then_good_samples_never_duplicate_or_reopen",
       "test_capacity_transition_audit_failure_is_fatal_and_signals_once"
+    ],
+    "test_native_policy.py": [
+      "test_native_argv_uses_complete_remote_template_and_full_input_packet",
+      "test_binary_generation_change_refuses_before_native_exec",
+      "test_output_snapshot_is_immutable_and_sorted_utf8",
+      "test_nonregular_output_fails_entire_publication_preserving_native_success",
+      "test_failed_native_retains_only_explicit_partial_output",
+      "test_full_handoff_byte_limit_is_enforced_before_acceptance",
+      "test_route_only_does_not_prepare_workspace",
+      "test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade",
+      "test_committed_manifest_order_survives_reverse_artifact_query_order",
+      "test_sealed_output_is_not_downloadable_after_publication_failure",
+      "test_unpublished_output_rejects_existing_ticket_replay_and_claim"
+    ],
+    "test_performance.py": [
+      "test_file_exact_bound_allowed_one_over_refused_without_intent",
+      "test_zero_byte_reserved_intents_consume_artifact_slots",
+      "test_pending_upload_reservation_counts_and_rename_does_not_double_count",
+      "test_selected_input_copy_reserves_destination_before_native_start",
+      "test_workspace_file_overrun_stops_actual_fake_worker",
+      "test_unknown_payload_root_entry_blocks_new_reservations",
+      "test_filesystem_available_boundary_includes_existing_promises"
+    ],
+    "test_tasks.py": [
+      "test_create_replay_keeps_identity_and_current_projection",
+      "test_delete_tombstone_replay_preserves_history",
+      "test_unknown_task_and_foreign_job_are_identical_refusals",
+      "test_group_and_context_refusals_do_not_accept_job",
+      "test_declined_quota_retires_preparation_and_same_request_can_retry",
+      "test_delegate_replay_does_not_score_or_start_twice",
+      "test_second_task_cannot_read_cancel_or_feedback_first_job",
+      "test_busy_task_blocks_delete_and_second_delegate",
+      "test_disable_latches_without_cancelling_job",
+      "test_transition_audit_has_one_creation_event_and_no_payload_secrets",
+      "test_foreign_trusted_principal_refuses_attach",
+      "test_disable_ahead_of_queued_create_rechecks_authority_after_lock",
+      "test_cancelled_ipc_call_cannot_deliver_predecessor_response",
+      "test_capacity_only_denied_tool_table_preserves_rows_and_authority",
+      "test_capacity_reconnect_inspects_owned_task_and_rejects_foreign_binding",
+      "test_capacity_only_stream_table_refuses_effects_and_retires_leases",
+      "test_monitor_loss_during_admission_wait_prevents_task_effect",
+      "test_monitor_loss_during_task_wait_prevents_ticket_and_reservation",
+      "test_healthy_admission_and_task_wait_controls",
+      "test_monitor_loss_after_route_wait_prevents_acceptance_and_native_launch",
+      "test_every_ordinary_authority_category_checks_terminal_monitor",
+      "test_pending_spawn_healthy_control",
+      "test_pending_spawn_loss_readable_control",
+      "test_pending_spawn_loss_unreadable_active_never_starts",
+      "test_ready_wait_healthy_control",
+      "test_ready_wait_loss_readable_control",
+      "test_ready_wait_loss_unreadable_active_never_starts",
+      "test_post_admission_wait_healthy_control",
+      "test_post_admission_wait_loss_readable_control",
+      "test_post_admission_wait_loss_unreadable_active_never_starts"
     ],
     "test_schemas.py": [
       "test_every_config_key_required_and_unknown_refuses",
@@ -133,29 +165,6 @@
       "test_valid_shape_redundant_identity_mismatch_keeps_policy_unavailable",
       "test_sql_boolean_domain_is_validated_before_conversion"
     ],
-    "test_tasks.py": [
-      "test_create_replay_keeps_identity_and_current_projection",
-      "test_delete_tombstone_replay_preserves_history",
-      "test_unknown_task_and_foreign_job_are_identical_refusals",
-      "test_group_and_context_refusals_do_not_accept_job",
-      "test_declined_quota_retires_preparation_and_same_request_can_retry",
-      "test_delegate_replay_does_not_score_or_start_twice",
-      "test_second_task_cannot_read_cancel_or_feedback_first_job",
-      "test_busy_task_blocks_delete_and_second_delegate",
-      "test_disable_latches_without_cancelling_job",
-      "test_transition_audit_has_one_creation_event_and_no_payload_secrets",
-      "test_foreign_trusted_principal_refuses_attach",
-      "test_disable_ahead_of_queued_create_rechecks_authority_after_lock",
-      "test_cancelled_ipc_call_cannot_deliver_predecessor_response",
-      "test_capacity_only_denied_tool_table_preserves_rows_and_authority",
-      "test_capacity_reconnect_inspects_owned_task_and_rejects_foreign_binding",
-      "test_capacity_only_stream_table_refuses_effects_and_retires_leases",
-      "test_monitor_loss_during_admission_wait_prevents_task_effect",
-      "test_monitor_loss_during_task_wait_prevents_ticket_and_reservation",
-      "test_healthy_admission_and_task_wait_controls",
-      "test_monitor_loss_after_route_wait_prevents_acceptance_and_native_launch",
-      "test_every_ordinary_authority_category_checks_terminal_monitor"
-    ],
     "test_transfer.py": [
       "test_zero_and_non_utf8_bytes_roundtrip_hash_exact",
       "test_hmac_matches_independent_encoding_and_full_get_retries",
@@ -181,7 +190,7 @@
       "test_bind_post_read_checks_monitor_before_queued_observer"
     ]
   },
-  "test_method_count": 153,
+  "test_method_count": 162,
   "ac_files": {
     "03": [
       "test_schemas.py",
@@ -892,13 +901,13 @@
     "tests/test_training_teacher.py": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f"
   },
   "fixture_files_sha256": {
-    "README.md": "087515a515e670118e4425400d6bdbb99c72e97c3e2a6bd31c0973bd34eca22a",
+    "README.md": "26811383cdca6f9a9e411d44ef76f6911cdb8fec0c5a2d2c95b5b85016409ce7",
     "__init__.py": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
     "evidence/baseline-ordinary.json": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
     "evidence/benchmark-core.py": "88b7ef0ac73e30aca3a3bb69c73e62c491fdc5fe0f3c82650dd5a6c348b95fb4",
     "evidence/historical-007-parity.py": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
     "evidence/run-full-suite.py": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
-    "evidence/suite-inventory.json": "4a2724fe5ad70d7b91590dd2b61648131a869b9a3dd645c36ca7c3f4cbb13a89",
+    "evidence/suite-inventory.json": "aff90f53dd83db1f336a2ea2e6beb85ab549e906c6528703d17780ebefc066ba",
     "fixtures/binary.bin": "eca7a2fd17bcc909b49d0bf0c90c5fa1d026696c632e76f760ad73c1c3c5b5ea",
     "fixtures/native_capture.json": "2d7deb538ccfba4c1435289336e05d6b7110d6bac17ca08d7916c413ce55d8e2",
     "fixtures/wire.json": "fc6b6435801ffe581028d4688ff72e8a8eff0f32c02ef8ad74e9283302b74970",
@@ -909,8 +918,8 @@
     "test_performance.py": "4c885e044424e53e767c4ef4f7afd20babef26061f2a2edf5765bf9d03f2c56e",
     "test_recovery.py": "20eab0c78e0aa4af173d0bddf57099ad49bf96768d71d9d21997f6f9c412e461",
     "test_schemas.py": "c0d36f405efc449a86d98948d1d3ad560a5899aca0797cee03a0f9940a7d9892",
-    "test_tasks.py": "64ec58be0c18b15d6cbc8a0cabb5da75bac86c0b5f3ce39cc50f35f17d648c9b",
-    "test_transfer.py": "04533a3970c931805bdde96bf7266430dd4d5cba35e4cc7b0e4e2c0da65e7918"
+    "test_tasks.py": "9e39784f31d52c80c7720429f245678c457567119bde7c32f251de4481f348f6",
+    "test_transfer.py": "3bb4e05b6ffc9f7bff9d2942aa8b0050c2f5e9c7fb6dcb5b4573d8dc9e93d350"
   },
   "private_evidence": {
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-exam-prebuild/final-output.log": "067f41cf3f442f20740e96f74d5474b67bc14fe0343baf0e4b071ad7583f776a",
@@ -921,34 +930,48 @@
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/prebuild-result.json": "32be3ae0659b5bcf6ca11f5b6bcfc7c55c67f5fed11758945fe389279a36325a",
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/red-discrimination.json": "850163165ef096f7bbcb36b03bbf89af34967e843f6197779264be081d180691",
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/cleanup.json": "9932b67551409e37952a4b46be6b94a8967fa36d760cc14689723be5dd1f49b2",
-    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/cli-discovery-equivalence.json": "8aec113f5edda3a72cbeecbc38a09db9964c927bf1842186833ce8e8b71718e2"
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/cli-discovery-equivalence.json": "8aec113f5edda3a72cbeecbc38a09db9964c927bf1842186833ce8e8b71718e2",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/prebuild-result.json": "02ef18ed86f7877d886b58ce64d53dfb6c4596da1fe995b8010106968c110f62",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/AST-preservation.json": "ef50ced4a032fa1def0322839bc3df7c2b85ece4bdcaf8258a92c061882985b0",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/original114-preservation.json": "f26638338fa490d7788cc43fce0a2a4c87efd00d0ad4f8e280236837a8a87c87",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/preservation-identities.json": "82ecc13c35c8547db497f916b891d67209b029c3d9272523d6ada6b5f6e58843",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/cleanup.json": "d0dfc6074c9f7ac1dd7a3d1450361ef9637a31ba857ce96f973455a9be666296"
   },
   "prebuild": {
-    "methods": 153,
-    "failure_events": 41,
-    "errors": 5,
+    "methods": 162,
+    "passed": 161,
+    "failure_events": 1,
+    "errors": 0,
     "skips": 0,
     "expected_red": true,
     "valid_builder_attempt": false,
-    "core_discovered": 153,
-    "expected_full_methods": 938,
-    "full_candidate_revision3_run": "pending separate source grant and frozen candidate",
+    "core_discovered": 162,
+    "expected_full_methods": 947,
+    "full_candidate_revision3_run": "Pending separate second revision3 source grant and frozen handback; original candidate5 host938/1fixture failure preserved",
     "evidence": {
       "prebuild-result.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/prebuild-result.json",
-        "sha256": "32be3ae0659b5bcf6ca11f5b6bcfc7c55c67f5fed11758945fe389279a36325a"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/prebuild-result.json",
+        "sha256": "02ef18ed86f7877d886b58ce64d53dfb6c4596da1fe995b8010106968c110f62"
       },
       "full-core-prebuild.log": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/full-core-prebuild.log",
-        "sha256": "955e00575299b7ccb12ff510727f4057c241d5f8f80c9474e5d8879a8ae85bb1"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/full-core-prebuild.log",
+        "sha256": "83307e7fe54888d075387f35a793e359c13cc370a5f5a4c13c78797046e4e50f"
       },
       "discovery.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/discovery.json",
-        "sha256": "d14be0cb11aef620135c9789491b46e01c886dc5d9a1cd785d40516667caf311"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/discovery.json",
+        "sha256": "a4b0bcc5b2a901abd20bb05ea12d0dbc6ebb500d1f69bc4f51c4429a7fe75605"
       },
       "AST-preservation.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/AST-preservation.json",
-        "sha256": "8459ba5011857049a3f2850f458da091e4ff0b36ea80957d1615bc5532831d96"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/AST-preservation.json",
+        "sha256": "ef50ced4a032fa1def0322839bc3df7c2b85ece4bdcaf8258a92c061882985b0"
+      },
+      "original114-preservation.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/original114-preservation.json",
+        "sha256": "f26638338fa490d7788cc43fce0a2a4c87efd00d0ad4f8e280236837a8a87c87"
+      },
+      "cleanup.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/cleanup.json",
+        "sha256": "d0dfc6074c9f7ac1dd7a3d1450361ef9637a31ba857ce96f973455a9be666296"
       }
     }
   },
@@ -960,7 +983,7 @@
     "Public Cowork binary transfer",
     "Activation"
   ],
-  "ledger": "Four valid rejected core sources retained (two original-design and two revision2); candidate4 design_error despite899 maintained passes. Forest approved revision3. Independent additive exams under3c2e7bf; A and separate source grant required. No same-design retry reset and no candidate acceptance.",
+  "ledger": "Five cumulative rejected source builds retained; candidate5 is first valid failure under approved revision3 (C5-01), separate from E5-01 fixture error. Root742e229 grants only independent exam amendment. Second revision3 source correction requires separate root grant after full A; no same-design count reset or third attempt.",
   "historical_review_docs_sha256": {
     "docs/mcp-worker/COWORK-MCP-008-ROOT-REVIEW.md": "88495028f797c33566d0e9a6c4f45dd1c4f1b6700dc31bfcd043879f126dbc8a"
   },
@@ -1050,6 +1073,22 @@
       "all_previous_method_AST_unchanged": true,
       "new_path": "test_monitor_lifetime.py",
       "private_evidence": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A"
+    },
+    {
+      "authority": "742e229",
+      "design_revision": 3,
+      "cumulative_rejected_valid_builds": 5,
+      "current_design_valid_failures": 1,
+      "previous_methods": 153,
+      "added_methods": 9,
+      "current_methods": 162,
+      "expected_full_methods": 947,
+      "original_manifest_sha256": "3a979fbaa015408dd1d84e5f1f564e933ec970633fc63bd05936726179855261",
+      "preserved_original": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment/original",
+      "AST_change": "Only MonitorStreamWaitExam.stream_wait NULL-until-seal/direct-write oracle; all153 prior test method ASTs and114 originals unchanged",
+      "private_evidence": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/exam-amendment",
+      "source_normative_prior_unchanged": true,
+      "runner_and_benchmark_unchanged": true
     }
   ],
   "historical_v4_pins": {
@@ -1164,5 +1203,34 @@
       }
     },
     "ledger": "Three cumulative valid rejected core builds preserved: two v4 failures, Forest-approved revision2, then its first valid failed build. Candidate3 B4 defect rows reflect two product causes; technical E3 fixture corrections are separate. Independent exam amendment0ae0cf4; renewed A and separate bounded source grant required; no count reset."
+  },
+  "historical_revision3_initial_prebuild": {
+    "methods": 153,
+    "failure_events": 41,
+    "errors": 5,
+    "skips": 0,
+    "expected_red": true,
+    "valid_builder_attempt": false,
+    "core_discovered": 153,
+    "expected_full_methods": 938,
+    "full_candidate_revision3_run": "pending separate source grant and frozen candidate",
+    "evidence": {
+      "prebuild-result.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/prebuild-result.json",
+        "sha256": "32be3ae0659b5bcf6ca11f5b6bcfc7c55c67f5fed11758945fe389279a36325a"
+      },
+      "full-core-prebuild.log": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/full-core-prebuild.log",
+        "sha256": "955e00575299b7ccb12ff510727f4057c241d5f8f80c9474e5d8879a8ae85bb1"
+      },
+      "discovery.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/discovery.json",
+        "sha256": "d14be0cb11aef620135c9789491b46e01c886dc5d9a1cd785d40516667caf311"
+      },
+      "AST-preservation.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/AST-preservation.json",
+        "sha256": "8459ba5011857049a3f2850f458da091e4ff0b36ea80957d1615bc5532831d96"
+      }
+    }
   }
 }

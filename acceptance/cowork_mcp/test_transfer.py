@@ -249,6 +249,16 @@ class MonitorStreamWaitExam(CoreCase):
         opened = await self.stream('open_put', {'ticket_id': ticket['ticket_id'],
             'capability': ticket['authorization'][7:], 'content_length': 3})
         lease_id = self.ok(opened['result'])['lease_id']
+        transfer = mod('file_transfer')
+        descriptor = self.runtime.descriptors[lease_id]
+        identity = transfer.os.fstat(descriptor)
+        writes = []
+        write = transfer.os.write
+        def observed_write(fd, data):
+            info = transfer.os.fstat(fd)
+            if fd == descriptor and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                writes.append(bytes(data))
+            return write(fd, data)
         entered = asyncio.Event()
         release = asyncio.Event()
         ipc = mod('remote_ipc')
@@ -266,7 +276,8 @@ class MonitorStreamWaitExam(CoreCase):
             if operation == 'put_chunk':
                 observations.append((self.runtime.monitor_task.done(), len(signal.attempts)))
             return authorize(principal, operation)
-        with patch.object(ipc, '_read', paused_read), patch.object(self.runtime, 'authorize', observe):
+        with patch.object(ipc, '_read', paused_read), patch.object(self.runtime, 'authorize', observe), \
+                patch.object(transfer.os, 'write', observed_write):
             # Drain the read already pending before instrumentation; the next frame
             # is read by the same real server with the scheduling seam installed.
             self.ok(await self.call('task_get', {'task_id': task['task_id']}))
@@ -286,13 +297,18 @@ class MonitorStreamWaitExam(CoreCase):
             self.assertEqual(observations[0], (True, 0))
             if result is not None:
                 self.error(result['result'], 'storage_error')
-            self.assertEqual(self.fixture.sql('SELECT observed_bytes FROM remote_artifacts'), [(0,)])
+            self.assertEqual(writes, [], 'Lost monitor must precede actual PUT descriptor writes')
+            self.assertEqual(self.fixture.sql(
+                'SELECT observed_bytes, observed_hash FROM remote_artifacts'), [(None, None)])
             await event_barrier()
             signal.assert_one(self)
             self.assertFalse(self.runtime.leases)
             self.assertFalse(self.runtime.descriptors)
         else:
             self.assertEqual(self.ok(result['result'])['offset'], 3)
+            self.assertEqual(b''.join(writes), b'new', 'Healthy control must exercise the real write')
+            self.assertEqual(self.fixture.sql(
+                'SELECT observed_bytes, observed_hash FROM remote_artifacts'), [(None, None)])
             self.ok((await self.stream('close', {'lease_id': lease_id, 'reason': 'abort'}))['result'])
             self.assertFalse(self.runtime.fatal_failed)
 

@@ -270,3 +270,33 @@ Private readiness evidence: `core-v6-A` under the existing verification root.
 Full candidate B still requires the unchanged full-inventory command above, raw
 matrix/ordinary/supplemental measurements and all 11 build-review rows. No current
 source or activation approval follows from committed exams or A0.
+
+## Candidate5 independent exam amendment
+
+Authority `742e229` follows the frozen full11-row candidate5 rejection. Existing
+v6 D0 remains unchanged. C5-01 is a real accepted-worker containment gap; E5-01 is
+a separate test oracle error. Original153-method bytes/ASTs, host938/1failure and
+all measured candidate5 evidence remain private under
+`core-candidate-attempt-5/{independent,exam-amendment/original}`. Five cumulative
+source rejections remain; candidate5 is the first under revision3.
+
+Only `MonitorStreamWaitExam.stream_wait` changes its canonical observation from
+zero to NULL until exact seal. A delegated actual descriptor-write observer now
+requires zero writes after loss and exactly `new` in the healthy control. All
+other error/order/signal/lease/descriptor assertions remain; no cleanup policy is
+inferred from NULL and no write is suppressed by the fixture.
+
+Nine isolated `MonitorPendingLaunchExam` methods in `test_tasks.py` cover healthy,
+loss/readable-active and loss/unreadable-active at real subprocess return,
+readiness delivery and post-admission waits. The existing fake native runs through
+the actual Broker/Watchdog. Commands, native execution, once-only fatal signaling,
+existing stop reason, validated receipt/death and empty owned-worker maps are
+observed. Fixture time bounds detect missing observations; they grant no product
+grace, timeout extension, retry or invented process owner.
+
+Discovery is162 core methods,947 expected accumulated methods in the unchanged
+28 lanes. All153 prior test methods and114 original ASTs remain unchanged; only
+the specifically authorized new stream helper oracle changes. Focused12 methods
+produce one expected C5-01 failure and11 passing controls on rejected candidate5.
+Readiness records the complete core result; it is not source acceptance. A separate
+root source grant after scoped Exam-Owner commit and full37-row A0 is required.
