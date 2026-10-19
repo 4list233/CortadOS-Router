@@ -90,7 +90,7 @@ promotion gates. The build reports record independent verification and limitatio
 
 | Cowork connector path | RT-COWORK-MCP-008 responsibility |
 |---|---|
-| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent v5 D0/A0 and amended114core exams committed at9722a88. Candidate4 passes899 maintained tests but fails independent B at B1/B6/B7. Second revision2 failure is design_error; revision3 proposal awaits Forest. No accepted release; earlier failures remain preserved. OAuth and activation are separate. |
+| [COWORK-MCP-008.md](COWORK-MCP-008.md) | Frozen local core: generated task folders, confined native execution and exact binary transfer. Independent v5 D0/A0 and amended114core exams committed at9722a88. Candidate4 passes899 maintained tests but fails independent B at B1/B6/B7. Second revision2 failure is preserved as design_error; Forest approved revision3 and v6 contract authoring is underway. No accepted release; earlier failures remain preserved. OAuth and activation are separate. |
 | [COWORK-MCP-008-DECISIONS.md](COWORK-MCP-008-DECISIONS.md) | Pending choices and evidence gates; does not amend global rulings. |
 | [COWORK-MCP-008-EXECUTION.md](COWORK-MCP-008-EXECUTION.md) | Proposed implementation and independent exam ownership; local gates precede public activation. |
 | [COWORK-MCP-008-ROOT-REVIEW.md](COWORK-MCP-008-ROOT-REVIEW.md) | Planner review, independent sandbox capture, authentication qualification and honest accumulated baseline. No public activation. |
@@ -138,4 +138,4 @@ The isolated optional dependency qualification requires `fastmcp-slim[server]==3
 |---|---|
 | [COWORK-MCP-BUILD-REPORT.md](COWORK-MCP-BUILD-REPORT.md) | Root; candidate4 has899 passing maintained tests but a reproduced integrity failure, independent B3 and design_error. Complete measurements and prior failed packets preserved. Not installed. |
 | [COWORK-MCP-008-REVISION-2-PROPOSAL.md](COWORK-MCP-008-REVISION-2-PROPOSAL.md) | Forest-approved HTTP/IPC deadline and capacity-only inspection revision (2026-10-18). Renewed contract/exam gates remain mandatory; original attempt history is preserved. |
-| [COWORK-MCP-008-REVISION-3-PROPOSAL.md](COWORK-MCP-008-REVISION-3-PROPOSAL.md) | Reviewed canonical-read and monitor-lifetime revision; awaiting Forest approval after the second failed revision2 implementation. No source/exam grant. |
+| [COWORK-MCP-008-REVISION-3-PROPOSAL.md](COWORK-MCP-008-REVISION-3-PROPOSAL.md) | Forest-approved canonical-read and monitor-lifetime revision after the second failed revision2 implementation. Core v6 drafting and independent preparation underway; no source/exam grant yet. |

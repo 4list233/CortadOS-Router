@@ -1,6 +1,6 @@
 # Cowork connector build status — 2026-10-18
 
-**Not installed or connected. Candidate 4 is rejected and requires design review.** All 899 maintained tests pass across 28 host lanes, but an additional independent integrity test proves that a malformed stored task can stop monitoring while new work remains accepted. Root reproduced the failure. The reviewed [revision 3 proposal](COWORK-MCP-008-REVISION-3-PROPOSAL.md) awaits Forest's approval; no further core or dependent auth implementation is authorized yet.
+**Not installed or connected. Candidate 4 is rejected and requires design review.** All 899 maintained tests pass across 28 host lanes, but an additional independent integrity test proves that a malformed stored task can stop monitoring while new work remains accepted. Root reproduced the failure. Forest approved the reviewed [revision 3 proposal](COWORK-MCP-008-REVISION-3-PROPOSAL.md). Contract-only Astra job `4fbcc7db-62e1-4720-9138-355a63f295c9` is reconciling the three core documents to v6 under root grant `88defac`; independent QA is preparing additive regressions. Fresh D/A gates still precede another source build.
 
 ## Frozen candidate and verification
 
@@ -37,7 +37,7 @@ The negative exits 1; controls exit 0. [Root host summary](/Users/velox/.cortado
 
 Revision 3 proposes complete canonical validation before field-dependent reads, plus explicit runtime ownership of unexpected monitor termination. Both completion observation and an admission-time check are necessary: an already-ready request can run before a queued completion callback. Expected shutdown remains distinct. Existing fatal signaling, worker containment, deadlines and capacity-only inspection/cancellation behavior remain canonical; no extra watcher, automatic restart, retry or reopening is proposed.
 
-This is the second valid failure under approved revision 2, cumulative fourth. The two v4 failures and both revision 2 failures remain in the ledger. `contracts/CONVENTIONS.md` requires design review after the second valid failure; changing model, branch or agent cannot reset the count. If Forest approves, contract amendments, independent D review and additive committed exams/A precede another bounded build and full B review. The current 114 core tests and all earlier failed evidence remain preserved.
+This is the second valid failure under approved revision 2, cumulative fourth. The two v4 failures and both revision 2 failures remain in the ledger. `contracts/CONVENTIONS.md` requires design review after the second valid failure; changing model, branch or agent cannot reset the count. Following Forest's approval, contract amendments, independent D review and additive committed exams/A precede another bounded build and full B review. The current 114 core tests and all earlier failed evidence remain preserved.
 
 ## Completed measurements
 
@@ -57,7 +57,7 @@ Instrumented 1/8/16 MiB cases use 4/64 KiB chunks and 1/2 streams. Peak traced a
 
 ## Other package progress and deployment policy
 
-Forest approved decimal 100 MB/file, 1 GB/task, 10 GB total, automatic completed-task payload cleanup after seven days, and GitHub account `4list233` for sign-in through a dedicated login app with no repository permissions. Those choices are settled. One completion-trigger clarification remains pending; no answer is inferred. Retention must extend the existing deletion/lifecycle owners through a separate reviewed package. Job and audit history remains; all-content erasure is not promised.
+Forest approved decimal 100 MB/file, 1 GB/task, 10 GB total, automatic completed-task payload cleanup after seven days, and GitHub account `4list233` for sign-in through a dedicated login app with no repository permissions. Those choices are settled. Forest selected completion after the latest job settles, including failures/cancellations. Retention must extend the existing deletion/lifecycle owners through a separate reviewed package; document-only job `f93ad1a8-66e2-4960-ac09-7b456d86f863` is preparing that draft without changing the core. Job and audit history remains; all-content erasure is not promised.
 
 Auth 009 v6 and operator 010 v3 are committed as document drafts at `9bf0a5d`, following technical reconciliation direction `ab4aff9`. Both full independent technical D reviews pass all 33 rows with zero findings. Root read both reports and verified all 26 evidence artifacts plus the four current document pins. [Auth review](/Users/velox/.cortados-builds/cowork-mcp-verification/auth-v6-D/FULL-D-REVIEW.md) and [operator review](/Users/velox/.cortados-builds/cowork-mcp-verification/operator-v3-D/FULL-D-REVIEW.md) preserve every disposition; acceptance readiness A has not run and source remains blocked. Earlier auth v5 D0 is historical evidence only; it does not approve v6. No auth exams/A/source are accepted yet. The optional 65-package dependency profile was qualified separately and is absent from ordinary MCP. Secret custody and provisioning remain a later concrete operator decision.
 
