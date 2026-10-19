@@ -270,3 +270,90 @@ async def observe_endpoint_cleanup(case, session):
     case.assertIsNone(session.task.exception())
     case.assertFalse(case.runtime.leases)
     case.assertFalse(case.runtime.descriptors)
+
+# Revision3 synchronization changes only test scheduling, never authorization flags.
+class MonitorGate:
+    def __init__(self, mode='return'):
+        self.mode = mode
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.ready_at_stop = None
+
+    async def run(self, capacity):
+        self.entered.set()
+        try:
+            await self.release.wait()
+            if self.mode == 'exception':
+                raise RuntimeError('SYNTHETIC-MONITOR-SENTINEL')
+        finally:
+            self.ready_at_stop = capacity.runtime.ready
+            self.finished.set()
+
+
+async def event_barrier():
+    """Drain already-queued callbacks; no timer or product grace is introduced."""
+    future = asyncio.get_running_loop().create_future()
+    asyncio.get_running_loop().call_soon(future.set_result, None)
+    await future
+
+
+async def monitor_fixture(case, mode='return'):
+    gate = MonitorGate(mode)
+    async def run(capacity):
+        await gate.run(capacity)
+    case.enterContext(patch.object(mod('remote_capacity').CapacityMonitor, 'run', run))
+    await case.start()
+    # One second bounds a missing fixture startup; longer would hide a hung test.
+    await asyncio.wait_for(gate.entered.wait(), 1)
+    return gate
+
+
+async def lose_monitor(case, gate):
+    if gate.mode == 'cancel':
+        case.runtime.monitor_task.cancel()
+    else:
+        gate.release.set()
+    await asyncio.wait_for(gate.finished.wait(), 1)
+    await event_barrier()
+    case.assertTrue(case.runtime.monitor_task.done())
+
+
+class FatalCapture:
+    """Observe actual fatal-event owner, optionally fault only its sink."""
+    def __init__(self, case, fail=False):
+        import contextlib
+        import io
+        self.attempts = []
+        self.fail = fail
+        self.stderr = io.StringIO()
+        api = mod('remote_schemas')
+        original = api.emit_remote_event
+        def emit(tx, event):
+            if tx is None and event.entity == 'runtime' and event.reason == 'storage_error':
+                self.attempts.append(event)
+                if self.fail:
+                    raise OSError('SYNTHETIC-SINK-SENTINEL')
+            return original(tx, event)
+        case.enterContext(contextlib.redirect_stderr(self.stderr))
+        case.enterContext(patch.object(api, 'emit_remote_event', emit))
+
+    def assert_one(self, case):
+        case.assertEqual(len(self.attempts), 1)
+        event = self.attempts[0]
+        mod('remote_schemas').RemoteEvent(**{
+            name: getattr(event, name) for name in FIXTURE['private_examples']['RemoteEvent']['valid']})
+        case.assertNotIn('SENTINEL', self.stderr.getvalue())
+
+
+async def wait_for_fixture(predicate, seconds=5):
+    # Seconds: bounds local fake-process startup/receipt observation, not native grace.
+    # Too small tests host load; too large hides a stranded fixture.
+    async with asyncio.timeout(seconds):
+        while not predicate():
+            await asyncio.sleep(.01)
+
+
+def remote_counts(case):
+    return {table: case.fixture.sql('SELECT count(*) FROM ' + table)[0][0]
+            for table in ('remote_tasks', 'jobs', 'remote_tickets', 'remote_reservations')}

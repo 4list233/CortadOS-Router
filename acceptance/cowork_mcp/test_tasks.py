@@ -189,3 +189,107 @@ class Revision2CapacityTableExam(CoreCase):
             with self.subTest(op=op):self.error((await self.stream(op,args,body))['result'],'capacity_exhausted')
         self.assertFalse(self.runtime.leases);self.assertFalse(self.runtime.descriptors)
         self.assertEqual(self.fixture.sql("SELECT count(*) FROM remote_artifacts WHERE origin='input' AND state='sealed'")[0][0],1)
+
+
+from unittest.mock import patch
+from .support import FatalCapture, event_barrier, monitor_fixture, remote_counts, sha
+
+
+class MonitorPostWaitExam(CoreCase):
+    async def queued_operation(self, lock_kind, lose=True):
+        gate = await monitor_fixture(self)
+        task = await self.task()
+        if lock_kind == 'admission':
+            lock = self.runtime.broker.admission_lock
+            tool = 'task_create'
+            args = {'request_id': uid(), 'task_group_id': uid()}
+        else:
+            lock = self.runtime.task_locks[task['task_id']] = asyncio.Lock()
+            tool = 'file_upload_ticket'
+            args = {'task_id': task['task_id'], 'request_id': uid(), 'artifact_id': None,
+                    'filename': 'late.bin', 'bytes': 0, 'sha256': sha(b''),
+                    'media_type': 'application/octet-stream'}
+        await lock.acquire()
+        reached = asyncio.Event()
+        acquire = lock.acquire
+        async def wait():
+            reached.set()
+            return await acquire()
+        signal = FatalCapture(self)
+        before = remote_counts(self)
+        observations = []
+        authorize = self.runtime.authorize
+        def observe(principal, operation=None):
+            if reached.is_set():
+                observations.append((self.runtime.monitor_task.done(), len(signal.attempts)))
+            return authorize(principal, operation)
+        with patch.object(lock, 'acquire', wait), patch.object(self.runtime, 'authorize', observe):
+            pending = asyncio.create_task(self.runtime.core.dispatch_remote(
+                self.runtime.config.principal, tool, args))
+            await asyncio.wait_for(reached.wait(), 1)
+            if lose:
+                gate.release.set()
+            lock.release()
+            result = await asyncio.wait_for(pending, 2)
+        if lose:
+            self.assertEqual(observations[0], (True, 0), 'Post-wait guard must precede observer')
+            self.error(result, 'storage_error')
+            self.assertEqual(remote_counts(self), before)
+            self.assertFalse(any(call.get('kind') == 'exec' for call in self.fixture.calls()))
+            await event_barrier()
+            signal.assert_one(self)
+        else:
+            self.ok(result)
+            self.assertFalse(self.runtime.fatal_failed)
+            self.assertFalse(self.runtime.monitor_task.done())
+
+    async def test_monitor_loss_during_admission_wait_prevents_task_effect(self):
+        await self.queued_operation('admission')
+
+    async def test_monitor_loss_during_task_wait_prevents_ticket_and_reservation(self):
+        await self.queued_operation('task')
+
+    async def test_healthy_admission_and_task_wait_controls(self):
+        await self.queued_operation('admission', lose=False)
+        await self.stack.aclose()
+        await self.queued_operation('task', lose=False)
+
+    async def test_monitor_loss_after_route_wait_prevents_acceptance_and_native_launch(self):
+        gate = await monitor_fixture(self)
+        task = await self.task()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = asyncio.to_thread
+        async def route_wait(function, *args, **kwargs):
+            result = await original(function, *args, **kwargs)
+            if function.__module__ == 'cortados_router.route_task':
+                started.set()
+                await release.wait()
+            return result
+        before = remote_counts(self)
+        with patch.object(asyncio, 'to_thread', route_wait):
+            pending = asyncio.create_task(self.runtime.core.dispatch_remote(
+                self.runtime.config.principal, 'delegate', self.args(task)))
+            await asyncio.wait_for(started.wait(), 2)
+            gate.release.set()
+            release.set()
+            result = await asyncio.wait_for(pending, 2)
+        self.error(result, 'storage_error')
+        self.assertEqual(remote_counts(self), before)
+        self.assertFalse(any(call.get('kind') == 'exec' for call in self.fixture.calls()))
+
+    async def test_every_ordinary_authority_category_checks_terminal_monitor(self):
+        gate = await monitor_fixture(self)
+        gate.release.set()
+        await gate.finished.wait()
+        operations = ('attach', 'bind', 'task_get', 'job_status', 'job_result', 'job_cancel',
+                      'job_feedback', 'task_delete', 'context_requirements', 'task_create',
+                      'route', 'delegate', 'file_upload_ticket', 'file_download_ticket',
+                      'open_put', 'open_get', 'put_chunk', 'finish_put', 'read_chunk')
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with self.assertRaises(mod('remote_schemas').RemoteError) as raised:
+                    self.runtime.authorize(self.runtime.config.principal, operation)
+                self.assertEqual(raised.exception.code, 'storage_error')
+        self.assertEqual(remote_counts(self),
+                         {'remote_tasks': 0, 'jobs': 0, 'remote_tickets': 0, 'remote_reservations': 0})

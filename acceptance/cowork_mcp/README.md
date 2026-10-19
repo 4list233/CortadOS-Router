@@ -242,3 +242,31 @@ valid build (cumulative3). These independent exam checks are not another builder
 attempt or a reset. Root must grant any bounded correction separately after immutable
 exam commit and renewed37-row A0. Auth, retention/operator work and live activation
 remain outside this package; the new user choices do not alter this frozen contract.
+
+## Revision 3 / contract v6 independent exams
+
+Authority: final D0 at `3c2e7bf` and its conditional eight-path exam grant. The
+new `test_monitor_lifetime.py` owns unexpected monitor loss and Broker containment.
+Canonical-reader additions remain in `test_schemas.py`; post-wait authority and
+frame checks remain in `test_tasks.py` and `test_transfer.py`. All 114 prior methods
+and their assertions remain unchanged; original Python bytes are retained as
+prefixes. No runner, benchmark, native-policy, recovery or fixture bytes changed.
+
+The 39 additions exercise actual SQLite reads, runtime ownership, socketpair
+framing and the existing fake native process. Scheduling events expose admission
+before a queued completion observer without adding a product grace interval.
+Observation bounds apply only to missing fixture startup/STOP/receipt events.
+Sink faults preserve the latched failure and verify the safe teardown error;
+receipt faults retain resources at the assertion, then restore only the test fault
+for proven synthetic cleanup. No production flag or persisted policy is repaired.
+
+Current discovery is 153 core methods and 938 expected accumulated methods across
+the unchanged 28-lane driver. Prebuild is deliberately expected-red against the
+frozen rejected candidate4; it is not another implementation attempt or acceptance.
+The original 899-method green host run and reproduced causal monitor failure remain
+historical evidence. Four rejected valid source attempts remain recorded.
+
+Private readiness evidence: `core-v6-A` under the existing verification root.
+Full candidate B still requires the unchanged full-inventory command above, raw
+matrix/ordinary/supplemental measurements and all 11 build-review rows. No current
+source or activation approval follows from committed exams or A0.

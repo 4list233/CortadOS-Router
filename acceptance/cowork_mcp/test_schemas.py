@@ -217,3 +217,106 @@ class Revision2IpcDeadlineExam(CoreCase):
             with self.assertRaises(EOFError):
                 async with asyncio.timeout(.5):await raw_read(right)
         self.assertFalse(self.runtime.leases);self.assertFalse(self.runtime.descriptors)
+
+
+from .support import CoreCase, FatalCapture, monitor_fixture
+
+
+class CanonicalReadRevisionExam(CoreCase):
+    """Real SQLite reader, independent frozen shapes, deliberate private corruption."""
+    records = (
+        ('remote_tasks', 'TaskRow'), ('remote_operations', 'OperationRow'),
+        ('remote_preparations', 'PreparationRow'), ('remote_job_bindings', 'RemoteBinding'),
+        ('remote_artifacts', 'ArtifactRow'), ('remote_tickets', 'TicketRow'),
+        ('remote_publications', 'PublicationRow'), ('remote_reservations', 'ReservationRow'))
+
+    async def read_case(self, table, name, field=None, corrupt=None, semantic=False):
+        await monitor_fixture(self)
+        db = self.runtime.broker.store.db
+        value = copy.deepcopy(FIXTURE['private_examples'][name]['valid'])
+        jsonschema.validate(value, {'$ref': '#/$defs/' + name,
+                                   '$defs': FIXTURE['private_schema']['$defs']})
+        columns = [row[1] for row in db.execute('PRAGMA table_info(' + table + ')')]
+        encoded = {}
+        for column in columns:
+            key = column[:-5] if column.endswith('_json') else column
+            if key in value:
+                encoded[column] = json.dumps(value[key]) if column.endswith('_json') else value[key]
+        if table == 'remote_job_bindings':
+            encoded.update(owner_id=value['seed']['owner_id'], task_id=value['seed']['task_id'], active=1)
+        if table == 'remote_operations':
+            encoded['task_id'] = value['object_ids']['task_id']
+        if field is not None:
+            encoded[field] = corrupt
+        # Only the corruption fixture bypasses SQL constraints; the real canonical
+        # reader must still validate data loaded from damaged/foreign storage.
+        db.execute('PRAGMA foreign_keys=OFF')
+        db.execute('PRAGMA ignore_check_constraints=ON')
+        keys = tuple(encoded)
+        db.execute('INSERT INTO ' + table + '(' + ','.join(keys) + ') VALUES(' +
+                   ','.join('?' for _ in keys) + ')', tuple(encoded.values()))
+        signal = FatalCapture(self)
+        try:
+            if field is None:
+                result = mod('task_store').rows(db, table)
+                self.assertEqual(len(result), 1)
+                self.assertFalse(self.runtime.fatal_failed)
+            else:
+                with self.assertRaises(mod('remote_schemas').RemoteError) as raised:
+                    mod('task_store').rows(db, table)
+                self.assertEqual(raised.exception.code, 'policy_unavailable' if semantic else 'storage_error')
+                self.assertTrue(self.runtime.fatal_failed)
+                self.assertTrue(self.runtime.broker.store.admission_closed)
+                signal.assert_one(self)
+        finally:
+            db.execute('DELETE FROM ' + table)
+            db.execute('PRAGMA ignore_check_constraints=OFF')
+            db.execute('PRAGMA foreign_keys=ON')
+            await self.stack.aclose()
+
+    async def test_every_canonical_row_valid_control(self):
+        for table, name in self.records:
+            with self.subTest(record=name):
+                await self.read_case(table, name)
+
+    async def test_missing_policy_member_before_owner_access(self):
+        await self.read_case('remote_tasks', 'TaskRow', 'policy_json', '{}')
+
+    async def test_missing_seed_member_before_redundant_owner_access(self):
+        await self.read_case('remote_job_bindings', 'RemoteBinding', 'seed_json', '{}')
+
+    async def test_missing_operation_ids_before_redundant_task_access(self):
+        await self.read_case('remote_operations', 'OperationRow', 'object_ids_json', '{}')
+
+    async def test_missing_workspace_identity_before_relative_access(self):
+        await self.read_case('remote_preparations', 'PreparationRow', 'workspace_identity_json', '{}')
+
+    async def test_nested_array_and_object_shapes_are_closed(self):
+        for table, name, column, corrupt in (
+                ('remote_artifacts', 'ArtifactRow', 'blob_json', '[]'),
+                ('remote_publications', 'PublicationRow', 'manifest_json', '{}'),
+                ('remote_tasks', 'TaskRow', 'policy_json', '{"unknown":true}')):
+            with self.subTest(record=name):
+                await self.read_case(table, name, column, corrupt)
+
+    async def test_scalar_ticket_and_reservation_fields_validate(self):
+        for table, name, column in (
+                ('remote_tickets', 'TicketRow', 'direction'),
+                ('remote_reservations', 'ReservationRow', 'state')):
+            with self.subTest(record=name):
+                await self.read_case(table, name, column, 'SYNTHETIC-invalid')
+
+    async def test_nested_duplicate_and_nonfinite_json_refuse(self):
+        for raw in ('{"device":1,"device":2}', '{"device":NaN}'):
+            with self.subTest(raw=raw):
+                await self.read_case('remote_artifacts', 'ArtifactRow', 'blob_json', raw)
+
+    async def test_valid_shape_redundant_identity_mismatch_keeps_policy_unavailable(self):
+        await self.read_case('remote_operations', 'OperationRow', 'task_id', uid(), semantic=True)
+
+    async def test_sql_boolean_domain_is_validated_before_conversion(self):
+        for table, name, column in (
+                ('remote_artifacts', 'ArtifactRow', 'partial'),
+                ('remote_job_bindings', 'RemoteBinding', 'active')):
+            with self.subTest(record=name, column=column):
+                await self.read_case(table, name, column, 2)

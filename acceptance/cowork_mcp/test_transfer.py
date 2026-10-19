@@ -235,3 +235,100 @@ class Revision2TransferLifetimeExam(CoreCase):
         self.assertNotIn(state,('cancelled','interrupted','failed','timed_out'))
         self.assertEqual(sum(c.get('kind')=='exec' for c in self.fixture.calls()),1)
         self.ok(await self.call('job_cancel',{'task_id':task['task_id'],'job_id':job}))
+
+
+from unittest.mock import patch
+from .support import FatalCapture, event_barrier, monitor_fixture
+
+
+class MonitorStreamWaitExam(CoreCase):
+    async def stream_wait(self, lose):
+        gate = await monitor_fixture(self)
+        task = await self.task()
+        ticket = await self.ticket(task['task_id'], b'new')
+        opened = await self.stream('open_put', {'ticket_id': ticket['ticket_id'],
+            'capability': ticket['authorization'][7:], 'content_length': 3})
+        lease_id = self.ok(opened['result'])['lease_id']
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        ipc = mod('remote_ipc')
+        read = ipc._read
+        async def paused_read(sock, limits):
+            frame = await read(sock, limits)
+            if frame[0].get('op') == 'put_chunk' and 'args' in frame[0]:
+                entered.set()
+                await release.wait()
+            return frame
+        signal = FatalCapture(self)
+        observations = []
+        authorize = self.runtime.authorize
+        def observe(principal, operation=None):
+            if operation == 'put_chunk':
+                observations.append((self.runtime.monitor_task.done(), len(signal.attempts)))
+            return authorize(principal, operation)
+        with patch.object(ipc, '_read', paused_read), patch.object(self.runtime, 'authorize', observe):
+            # Drain the read already pending before instrumentation; the next frame
+            # is read by the same real server with the scheduling seam installed.
+            self.ok(await self.call('task_get', {'task_id': task['task_id']}))
+            pending = asyncio.create_task(self.stream('put_chunk',
+                {'lease_id': lease_id, 'offset': 0}, b'new'))
+            await asyncio.wait_for(entered.wait(), 1)
+            if lose:
+                gate.release.set()
+            release.set()
+            try:
+                result = await asyncio.wait_for(pending, 2)
+            except mod('remote_schemas').RemoteError as error:
+                self.assertTrue(lose)
+                self.assertEqual(error.code, 'storage_error')
+                result = None
+        if lose:
+            self.assertEqual(observations[0], (True, 0))
+            if result is not None:
+                self.error(result['result'], 'storage_error')
+            self.assertEqual(self.fixture.sql('SELECT observed_bytes FROM remote_artifacts'), [(0,)])
+            await event_barrier()
+            signal.assert_one(self)
+            self.assertFalse(self.runtime.leases)
+            self.assertFalse(self.runtime.descriptors)
+        else:
+            self.assertEqual(self.ok(result['result'])['offset'], 3)
+            self.ok((await self.stream('close', {'lease_id': lease_id, 'reason': 'abort'}))['result'])
+            self.assertFalse(self.runtime.fatal_failed)
+
+    async def test_monitor_loss_while_receiving_frame_precedes_byte_effect(self):
+        await self.stream_wait(True)
+
+    async def test_healthy_frame_wait_writes_then_cleanup_only_close(self):
+        await self.stream_wait(False)
+
+    async def test_bind_post_read_checks_monitor_before_queued_observer(self):
+        gate = await monitor_fixture(self)
+        ipc = mod('remote_ipc')
+        read = ipc._read
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        async def pause_bind(sock, limits):
+            frame = await read(sock, limits)
+            if frame[0].get('op') == 'bind' and 'args' in frame[0]:
+                entered.set()
+                await release.wait()
+            return frame
+        signal = FatalCapture(self)
+        observed = []
+        authorize = self.runtime.authorize
+        def observe(principal, operation=None):
+            if operation == 'bind':
+                observed.append((self.runtime.monitor_task.done(), len(signal.attempts)))
+            return authorize(principal, operation)
+        with patch.object(ipc, '_read', pause_bind), patch.object(self.runtime, 'authorize', observe):
+            pending = asyncio.create_task(self.connect())
+            await asyncio.wait_for(entered.wait(), 1)
+            gate.release.set()
+            release.set()
+            with self.assertRaises(mod('remote_schemas').RemoteError) as raised:
+                await asyncio.wait_for(pending, 2)
+            self.assertEqual(raised.exception.code, 'storage_error')
+        self.assertEqual(observed[0], (True, 0))
+        await event_barrier()
+        signal.assert_one(self)

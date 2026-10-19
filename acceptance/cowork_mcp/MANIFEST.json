@@ -1,14 +1,14 @@
 {
   "contract": "RT-COWORK-MCP-008",
-  "contract_version": 5,
+  "contract_version": 6,
   "scope": "LOCAL CORE only",
   "exam_owner": "quota_evaluation_qa (/root/quota_evaluation_qa)",
-  "parent_review_commit": "c61e6a0",
-  "execution_command_commit": "c61e6a0",
+  "parent_review_commit": "3c2e7bf",
+  "execution_command_commit": "3c2e7bf",
   "contracts_sha256": {
-    "docs/mcp-worker/COWORK-MCP-008.md": "0fe7b4f3d139436eb9b0b0bdcbc8e0d4e442e8340d560b8abdd0f20cf2332a63",
-    "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "e93ffd915392e082fc426932e0252729376f3d77b029b2e5a067390e549eeb4d",
-    "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "e104c7548883318cb6fd80ac58814e1c9d5a217b8d2e6d1ffac56d732bdd1b40"
+    "docs/mcp-worker/COWORK-MCP-008.md": "16ce4ca69cfd7e43684f7a76de43c386b277467f3d193491f9d64e69cfe1388f",
+    "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "d030c3198fb87e1227b28ff75ab66404e384bd70929dc556c2f10f7ab86834ff",
+    "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "a6f93d4b51d050e0b7fca16cdd291b2bc844a81bd798ceba0ab3c3e815fb6750"
   },
   "test_methods": {
     "test_compatibility.py": [
@@ -28,6 +28,29 @@
       "test_all_response_families_stalled_start_or_body_abort_once",
       "test_header_attempt_failure_cannot_emit_replacement_start",
       "test_timely_preheader_timeout_uses_positive_remaining_budget"
+    ],
+    "test_monitor_lifetime.py": [
+      "test_unexpected_return_signals_without_followup",
+      "test_unexpected_exception_is_consumed_and_signals",
+      "test_external_cancellation_is_not_owned_shutdown",
+      "test_disabled_owner_still_requires_monitor",
+      "test_capacity_only_state_does_not_excuse_monitor_loss",
+      "test_admission_checks_done_task_before_queued_observer",
+      "test_healthy_monitor_and_unknown_lookups_do_not_latch",
+      "test_owned_shutdown_cancellation_emits_no_false_fatal",
+      "test_prior_terminal_loss_is_not_reclassified_by_late_shutdown",
+      "test_signal_sink_failure_is_safe_once_and_surfaces_at_teardown",
+      "test_partial_startup_unwind_owns_monitor_stop",
+      "test_missing_nested_policy_stops_actual_monitor_before_unrelated_ipc_effect",
+      "test_malformed_scalar_policy_control_is_fatal",
+      "test_valid_policy_control_keeps_actual_monitor_and_admission",
+      "test_monitor_loss_stops_running_worker_and_requires_actual_receipt",
+      "test_sink_failure_does_not_prevent_owned_worker_stop",
+      "test_active_record_enumeration_failure_still_stops_known_worker",
+      "test_stop_intent_write_failure_still_stops_without_fabricated_intent",
+      "test_unavailable_receipt_retains_lock_roots_and_reservations",
+      "test_read_observer_and_admission_share_one_signal_attempt",
+      "test_prior_stop_reason_and_terminal_outcome_are_preserved"
     ],
     "test_native_policy.py": [
       "test_native_argv_uses_complete_remote_template_and_full_input_packet",
@@ -98,7 +121,17 @@
       "test_actual_socket_primary_and_fallback_backpressure",
       "test_encoding_and_fallback_consume_original_deadline",
       "test_partial_ipc_frame_cannot_append_fallback",
-      "test_applicable_lease_deadline_bounds_response_fallback"
+      "test_applicable_lease_deadline_bounds_response_fallback",
+      "test_every_canonical_row_valid_control",
+      "test_missing_policy_member_before_owner_access",
+      "test_missing_seed_member_before_redundant_owner_access",
+      "test_missing_operation_ids_before_redundant_task_access",
+      "test_missing_workspace_identity_before_relative_access",
+      "test_nested_array_and_object_shapes_are_closed",
+      "test_scalar_ticket_and_reservation_fields_validate",
+      "test_nested_duplicate_and_nonfinite_json_refuse",
+      "test_valid_shape_redundant_identity_mismatch_keeps_policy_unavailable",
+      "test_sql_boolean_domain_is_validated_before_conversion"
     ],
     "test_tasks.py": [
       "test_create_replay_keeps_identity_and_current_projection",
@@ -116,7 +149,12 @@
       "test_cancelled_ipc_call_cannot_deliver_predecessor_response",
       "test_capacity_only_denied_tool_table_preserves_rows_and_authority",
       "test_capacity_reconnect_inspects_owned_task_and_rejects_foreign_binding",
-      "test_capacity_only_stream_table_refuses_effects_and_retires_leases"
+      "test_capacity_only_stream_table_refuses_effects_and_retires_leases",
+      "test_monitor_loss_during_admission_wait_prevents_task_effect",
+      "test_monitor_loss_during_task_wait_prevents_ticket_and_reservation",
+      "test_healthy_admission_and_task_wait_controls",
+      "test_monitor_loss_after_route_wait_prevents_acceptance_and_native_launch",
+      "test_every_ordinary_authority_category_checks_terminal_monitor"
     ],
     "test_transfer.py": [
       "test_zero_and_non_utf8_bytes_roundtrip_hash_exact",
@@ -137,27 +175,34 @@
       "test_empty_chunks_do_not_renew_idle",
       "test_acknowledged_nonempty_progress_renews_idle_not_total",
       "test_lost_http_put_receipt_exposes_seal_without_second_put",
-      "test_shared_client_expiry_does_not_cancel_accepted_worker"
+      "test_shared_client_expiry_does_not_cancel_accepted_worker",
+      "test_monitor_loss_while_receiving_frame_precedes_byte_effect",
+      "test_healthy_frame_wait_writes_then_cleanup_only_close",
+      "test_bind_post_read_checks_monitor_before_queued_observer"
     ]
   },
-  "test_method_count": 114,
+  "test_method_count": 153,
   "ac_files": {
     "03": [
       "test_schemas.py",
-      "test_tasks.py"
+      "test_tasks.py",
+      "test_monitor_lifetime.py"
     ],
     "04": [
       "test_compatibility.py",
-      "test_transfer.py"
+      "test_transfer.py",
+      "test_monitor_lifetime.py"
     ],
     "05": [
       "test_schemas.py",
       "test_tasks.py",
-      "test_transfer.py"
+      "test_transfer.py",
+      "test_monitor_lifetime.py"
     ],
     "06": [
       "test_tasks.py",
-      "test_transfer.py"
+      "test_transfer.py",
+      "test_monitor_lifetime.py"
     ],
     "07": [
       "test_tasks.py",
@@ -194,11 +239,13 @@
     ],
     "15": [
       "test_recovery.py",
-      "test_compatibility.py"
+      "test_compatibility.py",
+      "test_monitor_lifetime.py"
     ],
     "16": [
       "test_performance.py",
-      "evidence/benchmark-core.py"
+      "evidence/benchmark-core.py",
+      "test_monitor_lifetime.py"
     ]
   },
   "protected_prior_sha256": {
@@ -845,73 +892,63 @@
     "tests/test_training_teacher.py": "55cc9e7b450d98341e0f8f21085e29a43ff0b476cc02a66ca4629a512c808c7f"
   },
   "fixture_files_sha256": {
-    "README.md": "00e306be20465d60b31a50c9d8a1e74ad4cc00b9c40c53995d09f7b6c3e24fee",
+    "README.md": "087515a515e670118e4425400d6bdbb99c72e97c3e2a6bd31c0973bd34eca22a",
     "__init__.py": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
     "evidence/baseline-ordinary.json": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
     "evidence/benchmark-core.py": "88b7ef0ac73e30aca3a3bb69c73e62c491fdc5fe0f3c82650dd5a6c348b95fb4",
     "evidence/historical-007-parity.py": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
     "evidence/run-full-suite.py": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
-    "evidence/suite-inventory.json": "cad81c077ba763d01fcf84677416b1fdb9544dba42566c0237f8fcc084d249e7",
+    "evidence/suite-inventory.json": "4a2724fe5ad70d7b91590dd2b61648131a869b9a3dd645c36ca7c3f4cbb13a89",
     "fixtures/binary.bin": "eca7a2fd17bcc909b49d0bf0c90c5fa1d026696c632e76f760ad73c1c3c5b5ea",
     "fixtures/native_capture.json": "2d7deb538ccfba4c1435289336e05d6b7110d6bac17ca08d7916c413ce55d8e2",
     "fixtures/wire.json": "fc6b6435801ffe581028d4688ff72e8a8eff0f32c02ef8ad74e9283302b74970",
-    "support.py": "6923a25650ca528f4a2b65c9531485a9bb9cf77302671a15cc58b3d36f0b452e",
+    "support.py": "1b0ef9eb7c88187a96bd060a49e0a0b7d030f7aeb4888c4d88976ac05f5219a7",
     "test_compatibility.py": "d71d779d10d5db2123a501b2432c170fc1cd184a4f4991e013ccca2246538f1a",
+    "test_monitor_lifetime.py": "cd606a9f4e155c577aecd60c4ca1268fe7522eddfef9c3a23bc6e213d2df1cd1",
     "test_native_policy.py": "e515bf2e3f13321c8545ee666a514ae1f9741a1d4d38267fc8b4318cbccc4767",
     "test_performance.py": "4c885e044424e53e767c4ef4f7afd20babef26061f2a2edf5765bf9d03f2c56e",
     "test_recovery.py": "20eab0c78e0aa4af173d0bddf57099ad49bf96768d71d9d21997f6f9c412e461",
-    "test_schemas.py": "d9c6939d85863db215568816d022d11bc71a44317df7072bb8f500adb24dac8c",
-    "test_tasks.py": "5fc25093b2004167e31d4eb3f3be7c2c6d27897d2bf8349ae5f897d00a265d9d",
-    "test_transfer.py": "019ec60e06b42ad15e55ac037c629fdb7a48552cdd379f5f3c756a6ea232d4a0"
+    "test_schemas.py": "c0d36f405efc449a86d98948d1d3ad560a5899aca0797cee03a0f9940a7d9892",
+    "test_tasks.py": "64ec58be0c18b15d6cbc8a0cabb5da75bac86c0b5f3ce39cc50f35f17d648c9b",
+    "test_transfer.py": "04533a3970c931805bdde96bf7266430dd4d5cba35e4cc7b0e4e2c0da65e7918"
   },
   "private_evidence": {
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-exam-prebuild/final-output.log": "067f41cf3f442f20740e96f74d5474b67bc14fe0343baf0e4b071ad7583f776a",
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-exam-prebuild/historical-007-parity.json": "271dbb34934d52227656f39d7970775471140daa1d563bbcdda61169fe97600a",
     "/Users/velox/.cortados-builds/cowork-mcp-verification/core-baseline/planned-selectors.json": "3a57f53facdcbef02a80c58018e8cf8efd057a1b8c531a6222e355875cf04625",
-    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v4-D-closure/readiness.json": "89eb16bf23e6bb620a2da555769c8adb7e9d8e35ec5c490bdbad06df85634999"
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v4-D-closure/readiness.json": "89eb16bf23e6bb620a2da555769c8adb7e9d8e35ec5c490bdbad06df85634999",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-D-exam-map/readiness.json": "b5465a105819df2837f5a6ea3d78cd11c554650622971cda5ca24dc8ac51c1f2",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/prebuild-result.json": "32be3ae0659b5bcf6ca11f5b6bcfc7c55c67f5fed11758945fe389279a36325a",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/red-discrimination.json": "850163165ef096f7bbcb36b03bbf89af34967e843f6197779264be081d180691",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/cleanup.json": "9932b67551409e37952a4b46be6b94a8967fa36d760cc14689723be5dd1f49b2",
+    "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/cli-discovery-equivalence.json": "8aec113f5edda3a72cbeecbc38a09db9964c927bf1842186833ce8e8b71718e2"
   },
   "prebuild": {
-    "methods": 114,
-    "failure_events": 5,
-    "errors": 0,
+    "methods": 153,
+    "failure_events": 41,
+    "errors": 5,
     "skips": 0,
     "expected_red": true,
     "valid_builder_attempt": false,
-    "core_discovered": 114,
-    "expected_full_methods": 899,
-    "full_candidate_correction_run": "pending",
+    "core_discovered": 153,
+    "expected_full_methods": 938,
+    "full_candidate_revision3_run": "pending separate source grant and frozen candidate",
     "evidence": {
       "prebuild-result.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/prebuild-result.json",
-        "sha256": "016e0ee0a9a85c0ba338e79c62d446051f6e11c9d3ea8fa2bfc2513e6e9adda4"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/prebuild-result.json",
+        "sha256": "32be3ae0659b5bcf6ca11f5b6bcfc7c55c67f5fed11758945fe389279a36325a"
       },
-      "core-prebuild.log": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/core-prebuild.log",
-        "sha256": "349e0dce9d7b205ddfebbc73cb5b4d8d6ec177564695de35c805294ec43e7070"
-      },
-      "focused.log": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/focused.log",
-        "sha256": "8e0bb22021707661a17057841368cf5dbb1beb3f123e5886a8773f7395c963c9"
-      },
-      "AST-preservation.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/AST-preservation.json",
-        "sha256": "7f3c8715dce14fb608360ba49bd07f8ed3337a49153cb82b6819cb11e175f4e8"
-      },
-      "source-protected-preservation.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/source-protected-preservation.json",
-        "sha256": "74123825d563ca7de26fc8a1a66e85427099fe70a15eab9a5154613312ed6263"
+      "full-core-prebuild.log": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/full-core-prebuild.log",
+        "sha256": "955e00575299b7ccb12ff510727f4057c241d5f8f80c9474e5d8879a8ae85bb1"
       },
       "discovery.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/discovery.json",
-        "sha256": "04800ea46793c64b8ce6ea91ab4f429cb365f886191ae7523cea7ba95335ca06"
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/discovery.json",
+        "sha256": "d14be0cb11aef620135c9789491b46e01c886dc5d9a1cd785d40516667caf311"
       },
-      "cleanup.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/cleanup.json",
-        "sha256": "b40077ff6d1a53a57eb20521f3acbf7add6c885b78c2821a4d9111dcc1375a3d"
-      },
-      "original-identities.json": {
-        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/original-identities.json",
-        "sha256": "77878910f9c15df07549f07a49802cbadda4ae5d7e2066a03c2e82b6154eb4d1"
+      "AST-preservation.json": {
+        "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A/AST-preservation.json",
+        "sha256": "8459ba5011857049a3f2850f458da091e4ff0b36ea80957d1615bc5532831d96"
       }
     }
   },
@@ -923,7 +960,7 @@
     "Public Cowork binary transfer",
     "Activation"
   ],
-  "ledger": "Three cumulative valid rejected core builds preserved: two v4 failures, Forest-approved revision2, then its first valid failed build. Candidate3 B4 defect rows reflect two product causes; technical E3 fixture corrections are separate. Independent exam amendment0ae0cf4; renewed A and separate bounded source grant required; no count reset.",
+  "ledger": "Four valid rejected core sources retained (two original-design and two revision2); candidate4 design_error despite899 maintained passes. Forest approved revision3. Independent additive exams under3c2e7bf; A and separate source grant required. No same-design retry reset and no candidate acceptance.",
   "historical_review_docs_sha256": {
     "docs/mcp-worker/COWORK-MCP-008-ROOT-REVIEW.md": "88495028f797c33566d0e9a6c4f45dd1c4f1b6700dc31bfcd043879f126dbc8a"
   },
@@ -1004,6 +1041,15 @@
       "private_evidence": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment",
       "source_normative_prior_unchanged": true,
       "benchmark_and_runner_unchanged": true
+    },
+    {
+      "authority": "3c2e7bf",
+      "revision": 3,
+      "previous_methods": 114,
+      "added_methods": 39,
+      "all_previous_method_AST_unchanged": true,
+      "new_path": "test_monitor_lifetime.py",
+      "private_evidence": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-v6-A"
     }
   ],
   "historical_v4_pins": {
@@ -1061,5 +1107,62 @@
         "sha256": "1c83b0fba50cd8e7376dd11d4002f9180e1bda94013bd5ca39266ed3c8a9e6da"
       }
     }
+  },
+  "historical_revision2_candidate3_readiness": {
+    "contract_version": 5,
+    "parent_review_commit": "c61e6a0",
+    "execution_command_commit": "c61e6a0",
+    "contracts_sha256": {
+      "docs/mcp-worker/COWORK-MCP-008.md": "0fe7b4f3d139436eb9b0b0bdcbc8e0d4e442e8340d560b8abdd0f20cf2332a63",
+      "docs/mcp-worker/COWORK-MCP-008-DECISIONS.md": "e93ffd915392e082fc426932e0252729376f3d77b029b2e5a067390e549eeb4d",
+      "docs/mcp-worker/COWORK-MCP-008-EXECUTION.md": "e104c7548883318cb6fd80ac58814e1c9d5a217b8d2e6d1ffac56d732bdd1b40"
+    },
+    "test_method_count": 114,
+    "prebuild": {
+      "methods": 114,
+      "failure_events": 5,
+      "errors": 0,
+      "skips": 0,
+      "expected_red": true,
+      "valid_builder_attempt": false,
+      "core_discovered": 114,
+      "expected_full_methods": 899,
+      "full_candidate_correction_run": "pending",
+      "evidence": {
+        "prebuild-result.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/prebuild-result.json",
+          "sha256": "016e0ee0a9a85c0ba338e79c62d446051f6e11c9d3ea8fa2bfc2513e6e9adda4"
+        },
+        "core-prebuild.log": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/core-prebuild.log",
+          "sha256": "349e0dce9d7b205ddfebbc73cb5b4d8d6ec177564695de35c805294ec43e7070"
+        },
+        "focused.log": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/focused.log",
+          "sha256": "8e0bb22021707661a17057841368cf5dbb1beb3f123e5886a8773f7395c963c9"
+        },
+        "AST-preservation.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/AST-preservation.json",
+          "sha256": "7f3c8715dce14fb608360ba49bd07f8ed3337a49153cb82b6819cb11e175f4e8"
+        },
+        "source-protected-preservation.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/source-protected-preservation.json",
+          "sha256": "74123825d563ca7de26fc8a1a66e85427099fe70a15eab9a5154613312ed6263"
+        },
+        "discovery.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/discovery.json",
+          "sha256": "04800ea46793c64b8ce6ea91ab4f429cb365f886191ae7523cea7ba95335ca06"
+        },
+        "cleanup.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/cleanup.json",
+          "sha256": "b40077ff6d1a53a57eb20521f3acbf7add6c885b78c2821a4d9111dcc1375a3d"
+        },
+        "original-identities.json": {
+          "path": "/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/exam-amendment/original-identities.json",
+          "sha256": "77878910f9c15df07549f07a49802cbadda4ae5d7e2066a03c2e82b6154eb4d1"
+        }
+      }
+    },
+    "ledger": "Three cumulative valid rejected core builds preserved: two v4 failures, Forest-approved revision2, then its first valid failed build. Candidate3 B4 defect rows reflect two product causes; technical E3 fixture corrections are separate. Independent exam amendment0ae0cf4; renewed A and separate bounded source grant required; no count reset."
   }
 }
