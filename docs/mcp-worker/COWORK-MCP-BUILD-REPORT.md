@@ -1,72 +1,70 @@
 # Cowork connector build status — 2026-10-18
 
-**Not installed or connected. Candidate 4 remains rejected; the approved revision 3 design now passes all 33 independent D criteria.** The earlier 899-test green run did not catch an independent integrity failure. Corrected v6 closes complete canonical validation, unexpected monitor loss, admission ordering and sink-independent worker containment. Root verified the complete review and evidence at `3c2e7bf`. Independent QA is now adding committed regressions under the eight-path exam grant; all 114 existing methods remain protected. Full A and an explicit source grant still precede the subscription rebuild.
+**Not installed or connected. Candidate 5 is rejected for a confirmed pending-launch race.** The approved revision 3 contract passes all 33 D criteria. Independent QA is committing nine additional boundary regressions and correcting one new upload-test oracle before a fresh 37-row A review. One bounded correction remains under this design; no source grant has been issued for it yet.
 
 ## Frozen candidate and verification
 
-- Branch: `plan/subagent-mcp`; source observed at `bec965aeff0471c714bd42c9f5b2354010c82a57`. Eighteen source files are frozen, all below 500 physical lines. Candidate source remains uncommitted.
-- Codex subscription job `d583bbd4-061b-45ec-a4a9-db5a1ee5a2c8` ran the reviewed correction under grant `9eac6e3`, with `gpt-6.1-sol`, network disabled and no MCP grants. Native completion is distinct from acceptance.
-- Full host inventory: **899 tests, 0 failures, 0 errors, 0 skips; 28/28 lanes pass**. This covers the standalone Router/MCP inventory and its declared shared-router compatibility lanes, not unrelated CortadOS workstreams.
-- Additional actual-runtime negative: **1 failure, 0 errors**; discriminating controls: **2 passes**. Root reproduced both using unchanged copies of the independent scripts.
-- Independent B: **3 failed criteria across all 11 reviewed rows**, B1/B6/B7, from one causal cluster C4-01. Final rejected feedback `a6ab574f-c50d-4d55-b710-774d76d06049`, sequence 28.
-- Root verified all 29 final evidence artifacts and 680 source, normative, fixture and prior protected-file identities, with zero mismatches. No builder changed protected exams. Known worker Seatbelt boot-identity errors are retained as environment-blocked evidence; they do not replace the host results.
+- Branch: `plan/subagent-mcp`. Candidate 5 changes only the existing Broker, task-store and runtime owners relative to candidate 4. All 18 scoped source files are frozen below 500 physical lines; production changes remain uncommitted.
+- Codex subscription job `b96d1d96-06fd-4d77-a377-d1df5460bd06` ran under root grant `e3baa71`, using `gpt-6.1-sol`, network disabled and no MCP grants. Completion is distinct from acceptance.
+- Host inventory: **938 tests, 1 failure, 0 errors, 0 skips; 27/28 lanes pass**. All 785 tests outside the core lane and all 114 original core tests pass. The single inventory failure is an independently confirmed error in a new fixture, E5-01, described below.
+- Separate actual-runtime probe: **3 tests, 1 failure, 0 errors**. Healthy and readable-store controls pass; the unreadable-store pending-launch case starts native execution after fatal monitor loss. Root reproduced this using the unchanged independent script.
+- Independent B: **2 failed criteria across all 11 reviewed rows**, B1/B7, from one source cause C5-01. Final rejected feedback `e05f41df-c55b-415d-b0a8-fc9a6dcc553e`, sequence 39.
+- Root verified all 36 final packet artifacts, all 18 sources and snapshots, the 3 normative documents and all 641 prior protected identities. Original fixture identities at exam commit `8f3c8fe` were checked. Worker Seatbelt boot-identity errors remain environment-blocked evidence and do not replace host results.
 
-Exact host command, from `/Users/velox/.cortados-builds/cortados-router-repo`:
+Exact host command from `/Users/velox/.cortados-builds/cortados-router-repo`:
 
 ```sh
 umask 022
-/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/full-suite
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B acceptance/cowork_mcp/evidence/run-full-suite.py /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/full-suite
 ```
 
-Exit 0. [Full report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/full-suite/report.json), SHA256 `456464e6d5f4c9f1a098d529442312d7a939dba2b9adb73d85dc4a06327835d9`. [Source freeze](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/root-freeze.json), SHA256 `683cbaff32b7e74b10d928c23c65796c5f4c4757dac26bdb9ab32486d80fccfc`; cumulative patch `3981d2beff8e7f14d5253f942a90afcd7177e4704379a17fcd981fa76dfa2df4`.
+Exit 1. [Full report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/full-suite/report.json), SHA256 `3055e8a52e2008c04c9590b72be19ab3c3dc75d108c227f88ae2fd0b8554348f`. [Source freeze](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/root-freeze.json), SHA256 `78336c7e069adcd7da8b21b49de9dc0be8092c9dcbf164d052cc8e15b4100623`; cumulative patch `8786c3fdb0670ae965329930be6c929a1c7325199d168b8788dd9cdc6a86da4c`.
 
-[Independent final B](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/independent/B-FINAL.md), SHA256 `ac979190caa15e1a4f147e44268e238a7db350a4ed197b50cd8ed301a4e4f92b`; final 29-artifact manifest `28fbb2f92cfda2962f712dd6f8e8335b6221ee9e97e99b963c798416dcfdd486`. [Root final verification](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/ROOT-FINAL-PACKET-VERIFIED.json) records the checks.
+[Independent full B review](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/independent/QA-B-REVIEW.md), SHA256 `a10c52ad928405d389f9f78e8d7cc797ca31f36bed506d49f058b02a6509786c`; final 36-artifact manifest `d438c18e57dd1f619e2c2cc60b7711f0c2165e032710d0761ec153d8f251b3e0`. [Root final verification](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/ROOT-FINAL-PACKET-VERIFIED.json) records the checks.
 
-## Failure and proposed correction
+## Confirmed race and exam correction
 
-The task reader accesses nested policy fields before validating the complete canonical record. In a private synthetic database, policy `{}` causes a `KeyError` that terminates the real monitor. Fatal and admission latches remain false, no failure signal appears, and an unrelated task creation succeeds through actual IPC. A valid record remains healthy; a malformed scalar record takes the existing fatal path correctly. No user data, native model, provider or credential was involved.
+C5-01 pauses the return of actual subprocess creation before the Broker has registered its new watchdog. The real monitor stops unexpectedly, and active-job enumeration fails during containment. Containment finishes with fatal admission latched and one failure signal. When subprocess creation resumes, the watchdog nevertheless receives START and performs one native execution. The pending launch must observe the existing fatal state before that effect. This violates approved R098/R101; correcting it does not require a new product policy.
 
-Root reproduced the counterexample and controls with these exact commands, under `umask 022`:
+Root ran the unchanged private probe under `umask 022`:
 
 ```sh
-/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/root-probes/probe-persisted-read.py
-/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/root-probes/probe-persisted-controls.py
+/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python -B /Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/root-reproduction/probe-pending-spawn.py
 ```
 
-The negative exits 1; controls exit 0. [Root host summary](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/ROOT-HOST-SUMMARY.json) preserves the exact logs, observations and durations.
+Probe SHA256 `7329cb1028de49f996a851663dd6318318b327f88909d8deb0e387d694e39ab6`; root output `9d7ebdee83a5aadc2d58d610f981fa89b4f2def0f019d3edab9ea4a1248e97e4`. Every synthetic worker has a real containment receipt, return code 0 and an empty final owned-worker map. No user data, provider or live credential was involved. Three database-only temporary directories from the combined verification window remain explicitly recorded and untouched; no universal cleanup claim is made.
 
-Revision 3 proposes complete canonical validation before field-dependent reads, plus explicit runtime ownership of unexpected monitor termination. Both completion observation and an admission-time check are necessary: an already-ready request can run before a queued completion callback. Expected shutdown remains distinct. Existing fatal signaling, worker containment, deadlines and capacity-only inspection/cancellation behavior remain canonical; no extra watcher, automatic restart, retry or reopening is proposed.
+E5-01 expected `observed_bytes == 0` before upload sealing, whereas parent section 4 requires null until exact sealing. QA has authority under `742e229` to correct this new oracle and strengthen direct evidence: observe the real upload-descriptor writes, require zero writes after monitor loss, and require the actual three-byte write in the healthy control. Original bytes and the failed run remain preserved. The original 114 tests are unchanged. Nine isolated pending-launch cases cover process creation, readiness and admission waits with healthy, readable-store-loss and unreadable-store-loss modes. Expected discovery is 162 core / 947 accumulated tests across 28 lanes; that count remains subject to final independent A verification.
 
-This is the second valid failure under approved revision 2, cumulative fourth. The two v4 failures and both revision 2 failures remain in the ledger. `contracts/CONVENTIONS.md` requires design review after the second valid failure; changing model, branch or agent cannot reset the count. Following Forest's approval, contract amendments, independent D review and additive committed exams/A precede another bounded build and full B review. The current 114 core tests and all earlier failed evidence remain preserved.
+This is the first valid source failure under approved revision 3, cumulative fifth. All previous failures remain. The second valid failure under this design would require a design-error packet under `contracts/CONVENTIONS.md`; changing model, branch or agent does not reset the count. Fresh committed exams/A and separate root authorization precede the remaining bounded correction.
 
 ## Completed measurements
 
-All 12 instrumented transfer cases plus monitor completed in 516.031 seconds. Ordinary and supplemental workloads also completed. [Raw comparison](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/independent/performance-comparison.json), SHA256 `ad053352aa9211260f8f69eb86bc734f7f88de9510429bea3c2f572015af570a`, retains samples and limitations.
+All 12 transfer matrix cases plus monitor passed in 517.127 seconds. Ordinary and supplemental measurements completed sequentially. [Matrix report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/full-suite/core-performance.json), [ordinary report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/ordinary-measurements/report.json), and [supplemental report](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-5/supplemental-measurements/report.json) retain raw samples and limitations.
 
-| Operation | Baseline median | Candidate 4 median |
+| Operation | Baseline median | Candidate 5 median |
 |---|---:|---:|
-| Explicit route | 0.096188 ms | 0.098291 ms |
-| Synthetic S1 route | 0.615167 ms | 0.617313 ms |
-| Context requirements | 0.004375 ms | 0.004334 ms |
-| Job get | 0.027042 ms | 0.028292 ms |
-| Job replay | 0.057417 ms | 0.056916 ms |
+| Explicit route | 0.096188 ms | 0.099167 ms |
+| Synthetic S1 route | 0.615167 ms | 0.627834 ms |
+| Job get | 0.027042 ms | 0.027333 ms |
+| Job replay | 0.057417 ms | 0.055417 ms |
 
-These route measurements use deterministic scorer/quota captures; they are not actual S1 inference latency. Actual core supplemental medians: task create 15.224 ms, replay 3.471 ms, get 3.138 ms, delete 23.561 ms; ASGI+IPC get 4.055 ms. Four 1 MiB streams completed in 0.589 s. Untraced 16 MiB PUT/GET medians were 1069.697/719.329 ms. No external connections were made in these synthetic measurements.
+These route measurements use deterministic scorer/quota captures, not actual S1 inference. Actual supplemental task creation changed from candidate 4's 15.224 ms to 15.318 ms; ASGI+IPC get changed from 4.054834 ms to 4.053417 ms. Finite measured transfer workloads support bounded buffering and index budgets, without establishing a universal RSS guarantee. The approved 100 MB file maximum still requires deployment-profile qualification. Incorrect code cannot be accepted on timing results.
 
-Instrumented 1/8/16 MiB cases use 4/64 KiB chunks and 1/2 streams. Peak traced allocations stayed below 1.17 MB. This supports bounded buffering on the finite measured workloads; cumulative RSS is not an isolated per-operation measurement or universal guarantee. Two 16 MiB streams took 204.790 s at 4 KiB versus 13.682 s at 64 KiB under tracing. Existing 600 s fixture budget is not a live default. The approved 100 MB file maximum still requires deployment-profile qualification. A 4096-byte overshoot at a synthetic 4096-byte file bound demonstrates sampled containment, not an OS hard quota. No additional efficiency defect was identified; timing cannot accept incorrect code.
+## Other packages and release gates
 
-## Other package progress and deployment policy
+Settled policy: decimal 100 MB/file, 1 GB/task and 10 GB total; delete uploaded/generated payload seven days after the latest job safely settles, including failure/cancellation; retain job/audit history. A new accepted job invalidates the deadline; later uploads inherit it; tasks without a settled job remain unarmed. GitHub `4list233` is the approved sign-in identity for a dedicated login app with no repository permissions. Credentials stay on the Studio.
 
-Forest approved decimal 100 MB/file, 1 GB/task, 10 GB total, automatic completed-task payload cleanup after seven days, and GitHub account `4list233` for sign-in through a dedicated login app with no repository permissions. Those choices are settled. Forest selected completion after the latest job settles, including failures/cancellations. Retention must extend the existing deletion/lifecycle owners through a separate reviewed package; the first draft and independent critical review are complete. Document-only revision job `35d2d83d-495c-4c18-a348-b88a41624c5a` is closing its technical integration details without changing the core. The task deadline is measured from the latest safely settled job; later uploads inherit that deadline. Only a new accepted job invalidates it. Tasks with no settled job have no automatic-cleanup trigger. Job and audit history remains; all-content erasure is not promised.
+The private retention v3 draft closes all five findings from its previous review. Root verified the author output and separate critical review, recording bounded document-only acceptance. It has not passed full D/A/B or been copied into the canonical package. It still needs accepted-core pinning, source headroom checks, independent exams and implementation. Evidence: [retention review](/Users/velox/.cortados-builds/cowork-retention-v3-review/REVIEW.md).
 
-Auth 009 v6 and operator 010 v3 are committed as document drafts at `9bf0a5d`, following technical reconciliation direction `ab4aff9`. Both full independent technical D reviews pass all 33 rows with zero findings. Root read both reports and verified all 26 evidence artifacts plus the four current document pins. [Auth review](/Users/velox/.cortados-builds/cowork-mcp-verification/auth-v6-D/FULL-D-REVIEW.md) and [operator review](/Users/velox/.cortados-builds/cowork-mcp-verification/operator-v3-D/FULL-D-REVIEW.md) preserve every disposition; acceptance readiness A has not run and source remains blocked. Earlier auth v5 D0 is historical evidence only; it does not approve v6. No auth exams/A/source are accepted yet. The optional 65-package dependency profile was qualified separately and is absent from ordinary MCP. Secret custody and provisioning remain a later concrete operator decision.
+Auth 009 v6 and operator 010 v3 draft documents remain at `9bf0a5d`; each passes all 33 independent technical D rows. A, protected exams and source builds remain blocked on accepted core. The optional dependency profile is qualified separately and absent from ordinary MCP. Secret custody/provisioning remains a later concrete operator decision.
 
-Remaining release gates: accepted core; separately gated auth/operator/retention implementation; installed native-tool confinement and live budgets; actual GitHub numeric identity and finite-token refresh flow; hosted Cowork callback and binary-file materialization; then concrete service and ingress activation. No public listener, OAuth app, secret, Funnel route or launchd service has been installed. Existing private HTTPS 443 to 127.0.0.1:8432 is unchanged.
+Remaining release gates: accepted core; separately gated auth/operator/retention builds; installed native-tool confinement and live budgets; actual GitHub numeric identity and finite-token refresh flow; hosted Cowork callback and binary-file materialization; concrete service/ingress activation. No public listener, OAuth app, secret, Funnel route or launchd service has been installed. Existing private HTTPS 443 to 127.0.0.1:8432 is unchanged.
 
 Cowork remains the planner in the Air app/cloud session. Native workers, subscription credentials and optional S1 stay on the Studio. Workers receive explicit task evidence and selected files; they do not inherit Cowork's conversation, connectors or filesystem.
 
 ## Preserved history
 
-Candidate 3: 896 tests, 10 failure events, 1 error, 0 skips, 27/28 lanes pass; B1/B5/B6/B7 failed. Its final packet and 27-artifact manifest `62c244bb8584a419633bf494d011d51aab65a087805a1d7554a02ec7ef2ab9f1` remain in [candidate 3 evidence](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/independent/B-FINAL.md). Candidates 1 and 2, original red baselines, native sandbox failures and exact historical 007 replay remain intact. No protected test was removed to obtain the current green inventory.
+Candidate 4's 899-test green inventory was independently rejected for C4-01 (malformed canonical policy ending the monitor without closing admission), B1/B6/B7. Its complete packet remains in [candidate 4 evidence](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-4/ROOT-FINAL-PACKET-VERIFIED.json). Candidate 3 had 896 tests / 10 failure events / 1 error / 0 skips and failed B1/B5/B6/B7; its packet remains in [candidate 3 evidence](/Users/velox/.cortados-builds/cowork-mcp-verification/core-candidate-attempt-3/independent/B-FINAL.md). Candidates 1/2, red baselines, native sandbox failures and exact historical 007 replay remain intact. No protected test was removed to improve the result.
 
-Nightly training is separately complete: 1494 new training labels and 1500 training steps. The scheduled continuation completed evaluation; the unchanged under-routing gate rejected the model, so the incumbent remains. Training verification heartbeat is paused; the existing 01:30 nightly schedule stays active. This connector work did not change training, models or schedules.
+Nightly training is separately complete: 1494 new labels and 1500 steps. The scheduled continuation finished evaluation; the unchanged under-routing gate rejected the candidate, preserving the incumbent. Training verification heartbeat is paused; the existing 01:30 nightly schedule remains active. Connector work has not changed training, models or schedules.
