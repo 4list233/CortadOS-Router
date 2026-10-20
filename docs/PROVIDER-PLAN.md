@@ -53,9 +53,42 @@ client (Claude Code, the repo's machine)           CortadOS endpoint
 | P3 | Codex `/status` parser fix (SUBAGENT-MCP-PLAN §11.7) and inventory refresh, alongside P1–P2 | codex lane shows a non-null scarcity |
 | Later | multiple accounts per vendor; CLI runners on other machines (the Air); one model across machines; cloud clients (needs a public endpoint with auth, and a verified `BASE_URL` override in the cloud client); API-key lanes | |
 
+## P1 status (2026-10-20)
+
+Built: `cortados_router/provider/routing.py` routes each new conversation once through
+`execution_routing.select` (the router's one execution policy), limited to the routes this endpoint serves. S1 scores
+the first user message without the client's injected `<system-reminder>` context. The decision goes to the route log
+with `platform: provider:<client>` (the client comes from its User-Agent), and `log_execution` records it once the
+first turn completes, so the nightly retrain sees provider traffic. Each response carries
+`x-cortados-route: <provider>/<model> band=<band> id=<route_id>`. `--fixed-model` (or
+`CORTADOS_PROVIDER_FIXED_MODEL`) turns routing off for bridge testing.
+
+Verified with the real Claude Code client on throwaway state; on fixed S1 answers an easy request routes to
+`claude-sonnet-5` (R0, held up by the interactive floor) and a hard one to `claude-opus-5-5` (R3, required index 78.5).
+Tool-less calls (titles, summaries) are scored and logged as their own last user message, not as the conversation's
+task.
+
+**S1 down → 503 in P1.** The hard rule "a degraded scorer never defaults to Claude" is enforced by this host:
+execution mode skips the table's non-Claude fallback routes, so while S1 is unavailable Claude routes are not offered.
+With only Claude served, the endpoint answers 503 until S1 is back (Codex in P2 gives degraded conversations a lane).
+The first real-client run, before this rule was enforced, had routed degraded to `claude-sonnet-5`; Codex's P1 review
+caught it.
+
+Not yet in P1, each needing a decision or another phase:
+- **Served lanes.** Only `claude-cli`. Codex arrives with its bridge (P2). Local models need the 2026-09-28 ruling
+  ("local models are OUT of routing", `tables/benchmarks/build_tiers.py`) lifted, local entries in the model scores,
+  and the local-resources work on `main` (uncommitted) merged.
+- **S1 location.** The endpoint scores through `CORTADOS_S1_URL` (default `127.0.0.1:8431`). When the endpoint does
+  not run next to S1 (the Studio), point it there, or every conversation routes degraded.
+- **Live usage probes.** Routing reads live lane scarcity, which samples the vendor CLIs in a PTY every 20 minutes,
+  exactly as under Hermes. Run verification on a throwaway `CORTADOS_HOME` with a fresh `scarcity.json`.
+- **Interactive floor for subagents.** Every provider conversation is scored as interactive (`platform: cli`), so the
+  face floor keeps cheap models out even for a client's subagents.
+- **Context window.** Claude Code still assumes 200k for `cortados`.
+
 ## P0 known limits (each removed by a later phase or a named follow-up)
 
-- No routing: every conversation goes to the Claude CLI (`CORTADOS_PROVIDER_CLAUDE_MODEL`, else the CLI's default).
+- Routing: see P1 status above. `--fixed-model` restores the P0 behaviour (one Claude CLI model, no routing).
 - A conversation lives in one CLI process and is identified by the exact sequence of replies the endpoint wrote
   (text and tool_use ids). If the endpoint restarts, or the client compacts or edits its history, the next request
   fails with 409 instead of rebuilding the session from the transcript. Two live conversations with identical

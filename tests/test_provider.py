@@ -4,6 +4,7 @@ The fake runs the real mcp_shim, so every bridged call crosses the same process 
 """
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -201,6 +202,71 @@ class EndpointTests(unittest.TestCase):
 
     def test_a_wrong_token_is_refused(self):
         self.assertEqual(self.status_of({"messages": [{"role": "user", "content": "x"}]}, token="nope"), 401)
+
+
+class RoutedEndpointTests(EndpointTests):
+    """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls, self.executed = [], []
+
+        def router(body, client):
+            self.calls.append(client)
+            return {"provider": "claude-cli", "model": "claude-test-model", "band": "R2", "route_id": f"r{len(self.calls)}"}
+
+        self.reg.router, self.reg.executed = router, self.executed.append
+
+    def raw(self, body):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              "user-agent": "claude-cli/2.1.304 (external, cli)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.headers.get("x-cortados-route"), json.loads(r.read())
+
+    def test_a_conversation_is_routed_once_and_runs_on_the_chosen_model(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        header, r1 = self.raw({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(header, "claude-cli/claude-test-model band=R2 id=r1")
+        argv = json.loads(Path(self.argv_file).read_text())["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-test-model")
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
+        self.raw({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(self.calls, ["claude-cli"])                 # not re-routed on the continuation
+        self.assertEqual([r["route_id"] for r in self.executed], ["r1"])
+
+    def test_a_failed_execution_log_is_retried_on_the_next_turn(self):
+        attempts = []
+
+        def flaky(route):
+            attempts.append(route["route_id"])
+            if len(attempts) == 1:
+                raise sqlite3.OperationalError("database is locked")
+        self.reg.executed = flaky
+        history = [{"role": "user", "content": "please use tool"}]
+        _, r1 = self.raw({"tools": [READ_TOOL], "messages": history})          # answered despite the failed log
+        self.assertEqual(r1["stop_reason"], "tool_use")
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
+        self.raw({"tools": [READ_TOOL], "messages": history})
+        history += [{"role": "assistant", "content": [{"type": "text", "text": "tool said: x"}]}, {"role": "user", "content": "again"}]
+        self.raw({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(attempts, ["r1", "r1"])                               # retried once, then never again
+
+    def test_a_router_exception_is_a_503_and_starts_no_cli(self):
+        def broken(body, client):
+            raise sqlite3.OperationalError("database is locked")
+        self.reg.router = broken
+        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]}), 503)
+        self.assertEqual(self.reg.sessions, {})
+        self.assertFalse(Path(self.argv_file).exists())
+
+    def test_no_available_route_is_a_503_and_starts_no_cli(self):
+        self.reg.router = lambda body, client: {"error": "No authenticated, available model fits"}
+        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]}), 503)
+        self.assertEqual(self.reg.sessions, {})
+        self.assertFalse(Path(self.argv_file).exists())
 
 
 class StalledCliTests(unittest.TestCase):

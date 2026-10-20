@@ -202,8 +202,12 @@ class BridgeSession:
                     self.proc.kill()
                     self.proc.wait(timeout=5)
         finally:
-            if self.proc.stdout:
-                self.proc.stdout.close()
+            for pipe in (self.proc.stdin, self.proc.stdout):
+                try:
+                    if pipe:
+                        pipe.close()
+                except OSError:
+                    pass                                # a broken pipe to a dead CLI: nothing left to flush
             self._stderr.close()
             with self._cv:
                 self._closed = True
