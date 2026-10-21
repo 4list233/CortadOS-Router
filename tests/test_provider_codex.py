@@ -593,6 +593,12 @@ class CodexSessionUnitTests(unittest.TestCase):
         with self.assertRaises(BridgeError):
             s._abandon_turn(time.time() + 0.025)
         self.assertLess(time.time() - t0, 0.3)
+        s._pending = {f"exec-{i}": i for i in range(4)}
+        s.emitted = set(s._pending)
+        t0 = time.time()
+        with self.assertRaises(BridgeError):                            # the write is cut at the deadline, or refused after it
+            s.deliver({c: {"content": [{"type": "text", "text": "r"}], "isError": False} for c in s._pending}, timeout=0.025)
+        self.assertLess(time.time() - t0, 0.3)                           # not four fresh REPLY_WRITE_S budgets
         calls = []
         s._pending, s._call = {}, lambda method, *a, **k: calls.append(method) or {"turn": {"id": "x"}}
         with self.assertRaisesRegex(BridgeError, "deadline passed before the turn could start"):

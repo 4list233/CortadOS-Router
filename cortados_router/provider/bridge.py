@@ -139,7 +139,9 @@ class BridgeSession:
             self._waiting.discard(tool_use_id)
             return self._results.pop(tool_use_id)
 
-    def deliver(self, results: dict[str, dict[str, Any]]) -> None:
+    def deliver(self, results: dict[str, dict[str, Any]], timeout: float | None = None) -> None:
+        """Hand the client's results to the shim's waiting calls. In-process, so `timeout` (the request's remaining
+        budget, part of the session contract the Codex bridge needs for its pipe writes) has nothing to bound here."""
         unknown = [i for i in results if i not in self.emitted]
         if unknown:
             raise BridgeError(f"tool results for ids this session never issued: {unknown}")

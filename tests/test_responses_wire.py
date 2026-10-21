@@ -122,6 +122,19 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(turn.content, [{"type": "text", "text": "<system-message>\nenv: x\n</system-message>"},
                                         {"type": "text", "text": "b"}])
 
+    def test_a_developer_only_turn_keeps_the_reply_boundary_in_later_history(self):
+        # Served as: user → reply "one"; developer-only turn → reply "two"; then "next". The third request's history
+        # must hold two fingerprints, as the registry does, or the conversation comes back as a 409.
+        assistant = lambda text: {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+        developer = {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "continue"}]}
+        third = wire.parse_request(request(user("hi"), assistant("one"), developer, assistant("two"), user("next")))
+        self.assertEqual(third.history, [wire.reply_fingerprint([{"type": "text", "text": "one"}]),
+                                         wire.reply_fingerprint([{"type": "text", "text": "two"}])])
+        self.assertEqual(third.content, [{"type": "text", "text": "next"}])
+        second = wire.parse_request(request(user("hi"), assistant("one"), developer))
+        self.assertEqual(second.history, [wire.reply_fingerprint([{"type": "text", "text": "one"}])])
+        self.assertEqual(second.content, [{"type": "text", "text": "<system-message>\ncontinue\n</system-message>"}])
+
     def test_input_images_in_the_new_turn_become_anthropic_image_blocks(self):
         turn = wire.parse_request(request({"type": "message", "role": "user", "content": [
             {"type": "input_text", "text": "look"}, {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j=", "detail": "high"}]}))

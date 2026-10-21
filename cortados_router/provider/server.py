@@ -326,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 if turn.tool_results:
-                    session.deliver(turn.tool_results)
+                    session.deliver(turn.tool_results, timeout=deadline - time.time())
                 else:
                     session.send_user(turn.content, timeout=deadline - time.time())
                 outcome["turn"] = session.run_turn(deadline - time.time())

@@ -208,6 +208,12 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     for s, it in kept[:start]:
         if s == "system":
             system_parts += [b["text"] for b in _blocks_of(it.get("content")) if b["type"] == "text" and b["text"]]
+            if run:
+                # A developer item after a reply was served as its own turn (operator text, below), so the reply it
+                # follows ended there: without this boundary the two replies around it would merge into one
+                # fingerprint and a conversation this endpoint served would come back as a 409.
+                history.append(reply_fingerprint(run))
+                run = []
         elif s == "assistant":
             run += _blocks_of(it.get("content")) if it.get("type", "message") == "message" else [_tool_use_block(it)]
         else:

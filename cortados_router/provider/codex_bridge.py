@@ -495,8 +495,10 @@ class CodexSession:
                             msg["params"]["turn"].get("status"))
                 return
 
-    def deliver(self, results: dict[str, dict[str, Any]]) -> None:
-        """Answer the pending item/tool/call requests with the client's results, all of them in one request."""
+    def deliver(self, results: dict[str, dict[str, Any]], timeout: float | None = None) -> None:
+        """Answer the pending item/tool/call requests with the client's results, all of them in one request. With
+        `timeout`, every reply write is bounded by what is left of it, not by a fresh REPLY_WRITE_S each."""
+        deadline = time.time() + timeout if timeout is not None else None
         unknown = [i for i in results if i not in self.emitted]
         if unknown:
             raise BridgeError(f"tool results for ids this session never issued: {unknown}")
@@ -512,8 +514,9 @@ class CodexSession:
                               f"one assistant message must be answered in one request (missing {missing})")
         self.last_used = time.time()
         for call_id, r in results.items():
+            budget = self._budget(deadline, "while delivering the tool results") if deadline is not None else REPLY_WRITE_S
             self._reply(self._pending.pop(call_id), {"success": not r.get("isError"),
-                                                     "contentItems": _content_items(r.get("content") or [])})
+                                                     "contentItems": _content_items(r.get("content") or [])}, timeout=budget)
             self._delivered.add(call_id)
 
     # ------------------------------------------------------------------ one turn
