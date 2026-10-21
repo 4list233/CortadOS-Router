@@ -144,7 +144,7 @@ tests/                standalone tests; tests/integration needs a Hermes host or
 ```bash
 python3 -B -m unittest discover -s tests -t .      # standalone suite (stdlib only)
 python3 cortados_router/core.py table              # load and validate the routing table
-CORTADOS_HOME=$(mktemp -d) python3 cortados_router/core.py decide "rename the variable in utils.py"   # needs S1 on :8431
+CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off python3 cortados_router/core.py decide "rename the variable in utils.py"   # needs S1 on :8431; the switch stops a fresh home from opening the vendor CLIs
 python3 cortados_router/scarcity.py                # opens claude / codex / cursor-agent / agy in a PTY and reads /usage
 ```
 

@@ -26,8 +26,10 @@ is the long form.
   Baseline 2026-10-20 on the M5 Max, system Python 3.9, dirty tree: 172 run, OK, 7 skipped
   (Hermes integration). The README's "155 / 1 failing" is stale.
 - Table check: `python3 -B cortados_router/core.py table` → `table v <N> ok`
-- Real decision (shadow only, changes nothing): always set a throwaway home —
-  `CORTADOS_HOME=$(mktemp -d) python3 -B cortados_router/core.py decide "<request>"`
+- Real decision (shadow only, changes nothing): always set a throwaway home and turn the usage refresh off —
+  `CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off python3 -B cortados_router/core.py decide "<request>"`
+  The throwaway home protects the live state; the switch protects the subscriptions, because a fresh home is
+  always "due" for a usage sample and that sample opens the vendor CLIs.
 
 ## Rules specific to this repo
 - Never run against the real `~/.cortados` state in tests or verification; use `CORTADOS_HOME=$(mktemp -d)`.

@@ -116,8 +116,14 @@ allocation; the inference runtime remains the final memory authority.
 Scarcity is the maximum of memory pressure and GPU utilization for a verified
 deployment. High utilization re-ranks it without pretending a renewable quota was
 spent. A missing node or insufficient memory makes that deployment unavailable.
-Managed local readings expire after at most 120 seconds, and background local
-refresh is due every 60 seconds independently of subscription-window readings.
+A managed local reading expires with its node telemetry: `expires_at` is the
+earliest sample time among the nodes a healthy deployment stands on, plus the
+configured `max_age_s`, and never more than 120 seconds after the reading. The
+router admits no local route past it. Background local refresh is due every 60
+seconds independently of subscription-window readings and never postpones them
+(a local-only refresh keeps the previous full-sample stamp), so a `max_age_s`
+under 60 leaves the lane unavailable between refreshes rather than admitting
+stale capacity.
 
 ## What this setup does not claim
 

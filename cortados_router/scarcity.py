@@ -532,7 +532,9 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
             v.setdefault("plan", plans.get(lane))
             v["plan"] = plans.get(lane) or v.get("plan")
             lanes[lane] = v
-        out = {"fetched_at": now, "lanes": lanes, "learned_at": prev.get("learned_at"), "probe_sweep": sweep}
+        # The top-level stamp means "last full sample": a partial run (`only`, e.g. the 60-second local refresh) keeps the
+        # previous one, or current() would never find the subscription probes due again (Codex review 2026-10-21).
+        out = {"fetched_at": now if not only else float(prev.get("fetched_at") or 0), "lanes": lanes, "learned_at": prev.get("learned_at"), "probe_sweep": sweep}
         STATE.mkdir(parents=True, exist_ok=True)
         tmp = CACHE.with_suffix(".tmp")
         tmp.write_text(json.dumps(out, indent=1))
@@ -557,6 +559,10 @@ def current(max_age_s: int = 1200) -> dict[str, Any]:
         d = json.loads(CACHE.read_text())
     except Exception:
         d = {"fetched_at": 0, "lanes": {}}
+    if _env_get("CORTADOS_SCARCITY_REFRESH") == "off":
+        # Verification and ad-hoc `core.py decide` runs use a throwaway home, which is always "due", and the background
+        # sample would open the user's real vendor CLIs. With the switch the decision routes on what is on disk only.
+        return d
     global_due = time.time() - float(d.get("fetched_at") or 0) > max_age_s
     local_due = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")) and time.time() - float(
         (d.get("lanes", {}).get("local") or {}).get("tried_at") or 0) >= MIN_INTERVAL["local"]
@@ -576,8 +582,13 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
     out = {}
     managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     for lane, v in (current().get("lanes") or {}).items():
-        age_limit = min(max_reading_age_s, 120) if lane == "local" and managed_local else max_reading_age_s
-        fresh = 0 <= time.time() - float(v.get("fetched_at") or 0) < age_limit
+        now = time.time()
+        if lane == "local" and managed_local:
+            # A managed local reading expires with its node telemetry: `expires_at` is the earliest member node's sample
+            # plus the configured max_age_s (local_resources.sample), never later than the sampler's own 120-second cap.
+            fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
+        else:
+            fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
         roll = _roll(general)
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],

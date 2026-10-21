@@ -2,7 +2,8 @@
 evidence block. Each scenario reports PASS, FAIL or BLOCKED; a scenario that needs S1 is BLOCKED
 (never PASS) while S1 is unreachable, because a degraded decision cannot prove S1-driven routing.
 CEILING: Read-only with respect to ~/.cortados and the user's subscriptions. It never runs
-scarcity.py, which would open the vendor CLIs.
+scarcity.py, which would open the vendor CLIs, and every child runs with CORTADOS_SCARCITY_REFRESH=off
+so a fresh throwaway home cannot schedule a usage sample either.
 Usage: python3 -B .claude/skills/verify-router/verify.py
 """
 import json, os, subprocess, sys, tempfile, urllib.request
@@ -14,9 +15,15 @@ LIVE_HOME = Path.home() / ".cortados"
 S1_URL = os.environ.get("CORTADOS_S1_URL", "http://127.0.0.1:8431")
 
 
+PROBE_DIRS = []
+
+
 def run(args):
     home = tempfile.mkdtemp(prefix="verify-router-")
-    env = {**os.environ, "CORTADOS_HOME": home}
+    # A fresh home is always "due" for a usage sample, and that sample opens the real vendor CLIs: the switch keeps
+    # the child from scheduling one. The probe folder is checked afterwards as evidence that none was opened.
+    PROBE_DIRS.append(Path(home) / "usage-probe")
+    env = {**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"}
     p = subprocess.run([sys.executable, "-B", str(CORE), *args], cwd=REPO, env=env,
                        capture_output=True, text=True, timeout=180)
     return p.returncode, p.stdout, p.stderr
@@ -76,6 +83,8 @@ else:
 
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
+record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",
+       f"{len(PROBE_DIRS)} throwaway homes checked for usage-probe folders")
 
 print("## Router verification evidence")
 print(f"repo: {REPO}  python: {sys.version.split()[0]}  S1: {'up' if up else 'down'} ({S1_URL})")

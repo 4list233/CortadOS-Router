@@ -196,7 +196,13 @@ def sample(config_path):
     eligible = [node for node in readings if node["pool_eligible"] and node["status"] == "online"
                 and -5 <= now - float(node.get("sampled_at") or 0) <= max_age_s]
     known = [node for node in eligible if node.get("gpu_headroom_estimate_bytes") is not None]
+    # The reading is only as fresh as the oldest node a healthy deployment stands on; the router stops admitting
+    # local routes at expires_at (scarcity.lane_scarcity), so expired capacity never admits a request.
+    members = {member for deployment in healthy for member in deployment["nodes"]}
+    expires_at = min([float(nodes[member].get("sampled_at") or now) + max_age_s for member in members if member in nodes]
+                     + [now + max_age_s])
     return {"source": "local_resources: node telemetry; no quota reset", "windows": [], "fetched_at": now,
+            "max_age_s": max_age_s, "expires_at": expires_at,
             "scarcity": min((deployment["scarcity"] for deployment in healthy), default=1.0),
             "refusing": not healthy, "resource_managed": True, "pools": {},
             "why": None if healthy else "no verified local deployment currently available",

@@ -20,3 +20,5 @@ Verdicts: `PASS` only if every scenario passed. `BLOCKED` means a scenario could
 not describe the change as fully verified. `FAIL` means stop and fix.
 
 Never point verification at the live `~/.cortados` or run `scarcity.py` (it opens the real vendor CLIs).
+`verify.py` runs every child with `CORTADOS_SCARCITY_REFRESH=off`, because a fresh throwaway home would
+otherwise schedule a usage sample that opens those CLIs; keep that when adding scenarios.

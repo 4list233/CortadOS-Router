@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -122,6 +123,58 @@ class LocalResources(unittest.TestCase):
         data = {"lanes": {"local": {"fetched_at": time.time(), "scarcity": 0}}}
         with patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json"}), patch.object(scarcity, "current", return_value=data):
             self.assertTrue(scarcity.lane_scarcity()["local"]["refusing"])
+
+    def test_managed_local_reading_expires_with_its_node_telemetry(self):
+        now = time.time()
+        for expires_at, usable in ((now - 1, False), (now + 30, True)):
+            data = {"lanes": {"local": {"fetched_at": now, "resource_managed": True, "scarcity": 0.2, "refusing": False,
+                                        "expires_at": expires_at, "deployments": {"model": {"ok": True, "scarcity": 0.2}}}}}
+            with self.subTest(usable=usable), patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json"}), patch.object(scarcity, "current", return_value=data):
+                row = scarcity.lane_scarcity()["local"]
+                self.assertEqual(row["refusing"], not usable)
+                self.assertEqual(row["deployments"], {"model": {"ok": True, "scarcity": 0.2}} if usable else {})
+
+    def test_sample_reports_the_earliest_node_expiry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "resources.json"
+            deployment = {**self.deployment(), "nodes": ["studio", "pc"], "additional_memory_gib_by_node": {"studio": 2, "pc": 2}}
+            config.write_text(json.dumps({"max_age_s": 10, "nodes": [{"id": "studio"}, {"id": "pc"}], "deployments": [deployment]}))
+            now = time.time()
+            nodes = [self.node(sampled_at=now - 3), self.node(id="pc", sampled_at=now - 1)]
+            with patch.object(resources, "sample_node", side_effect=nodes):
+                row = resources.sample(config)
+            self.assertFalse(row["refusing"])
+            self.assertEqual(row["max_age_s"], 10)
+            self.assertAlmostEqual(row["expires_at"], now - 3 + 10, delta=1)
+
+    def test_local_only_sample_keeps_the_full_sample_stamp(self):
+        # A local-only refresh must not look like a full sample, or the subscription probes would never come due again.
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / "scarcity.json").write_text(json.dumps({"fetched_at": 1000, "learned_at": time.time(), "lanes": {}}))
+            local = {"resource_managed": True, "scarcity": 0, "refusing": False, "windows": [], "pools": {}, "deployments": {}}
+            with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
+                 patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "PROBE_DIR", home / "usage-probe"), \
+                 patch.dict(scarcity.SAMPLERS, {"local": lambda: dict(local)}), patch.object(scarcity, "_plans", return_value={}), \
+                 patch.object(scarcity._reaper, "sweep_stale", return_value=None):
+                out = scarcity._sample_locked(only=["local"])
+            self.assertEqual(out["fetched_at"], 1000)
+            self.assertTrue(out["lanes"]["local"]["resource_managed"])
+            self.assertEqual(json.loads((home / "scarcity.json").read_text())["fetched_at"], 1000)
+
+    def test_refresh_switch_never_schedules_a_usage_sample(self):
+        # A fresh throwaway home is always "due"; with the switch, verification and `decide` runs open no vendor CLI.
+        with tempfile.TemporaryDirectory() as folder, patch.object(scarcity, "CACHE", Path(folder) / "scarcity.json"), \
+             patch.object(scarcity, "sample") as sampler:
+            with patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"}):
+                self.assertEqual(scarcity.current()["lanes"], {})
+                self.assertFalse(scarcity._refreshing.is_set())
+            sampler.assert_not_called()
+            started = threading.Event()
+            sampler.side_effect = lambda **kw: started.set()
+            with patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "on"}):
+                scarcity.current()
+            self.assertTrue(started.wait(5), "without the switch the refresh is scheduled")
 
 
 if __name__ == "__main__":
