@@ -265,7 +265,10 @@ moving/replacing it refuses automatic replay. Continuity is path + inode + volum
 device on every mount, so a reboot changes device without changing the folder (amendment 6,
 2026-10-21: the Studio's 10-19 reboot made every run refuse its own manifest). On open the store
 adopts the current device; the next save persists it. A manifest written before amendment 6 has no
-volume and is accepted only while its device still matches; it then gains the volume field. Revision is a nonnegative nonboolean integer. Attempts is an ordered
+volume and is refused (a matching device number does not prove the volume) until the operator runs
+`LabelAttempts.migrate_volume(DATA, <verified volume UUID>)`: under the writer lock, it requires the
+named UUID to equal DATA's current volume and the saved path, device and inode to match, and writes
+only data_identity. No attempt is exposed or replayed before that migration. Revision is a nonnegative nonboolean integer. Attempts is an ordered
 list of closed records with exactly:
 `{attempt_id,request_id,row_ids,payload,sample,system_prompt,system_prompt_digest,provider,model,
 arguments,config_digest,state,job_id,result_digest,terminal_state,publication_ts,publication_rows,

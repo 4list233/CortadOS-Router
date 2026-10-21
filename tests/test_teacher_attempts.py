@@ -68,18 +68,52 @@ class TeacherAttemptRegressions(TeacherCase):
         self._rebind_saved_identity(inode=self.data.stat().st_ino + 1)
         self.assertRefused()
 
-    def test_legacy_manifest_opens_only_while_its_device_matches_and_then_gains_the_volume(self):
-        with self.store() as store: original = self.reserve(store)
+    def _make_legacy(self):
         path = self.data / '.teacher-attempts/manifest.json'
         saved = json.loads(path.read_text())
         volume = saved['data_identity'].pop('volume')
         path.write_text(json.dumps(saved))
+        return volume
+
+    def test_legacy_manifest_is_refused_even_when_path_device_and_inode_match(self):
+        with self.store() as store: self.reserve(store)
+        self._make_legacy()
+        self.assertRefused()
+
+    def test_operator_migration_records_the_verified_volume_then_the_store_opens(self):
+        from cortados_router.teacher_attempts import LabelAttempts
+        with self.store() as store: original = self.reserve(store)
+        volume = self._make_legacy()
+        LabelAttempts.migrate_volume(self.data, volume)
         with self.store() as store:
             self.assertEqual(store.pending()[0], original)
             self.assertEqual(store.manifest['data_identity']['volume'], volume)
+
+    def test_migration_refuses_a_different_volume_or_a_changed_device(self):
+        from cortados_router.teacher_attempts import LabelAttempts
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        with self.assertRaises(WorkerError):
+            LabelAttempts.migrate_volume(self.data, '00000000-0000-4000-8000-000000000000')
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
         saved['data_identity']['device'] += 1
         path.write_text(json.dumps(saved))
-        self.assertRefused()
+        with self.assertRaises(WorkerError):
+            LabelAttempts.migrate_volume(self.data, volume)
+        self.assertNotIn('volume', json.loads(path.read_text())['data_identity'])
+
+    def test_migration_refuses_while_a_writer_holds_the_lock(self):
+        from cortados_router.teacher_attempts import LabelAttempts
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        saved['data_identity']['volume'] = volume
+        path.write_text(json.dumps(saved))
+        with self.store():
+            with self.assertRaises(WorkerError):
+                LabelAttempts.migrate_volume(self.data, volume)
 
     def test_malformed_saved_identity_is_refused(self):
         with self.store() as store: self.reserve(store)

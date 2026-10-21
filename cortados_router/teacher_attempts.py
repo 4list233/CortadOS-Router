@@ -97,16 +97,40 @@ class LabelAttempts:
     def _continuous(self, saved):
         """Whether a saved identity names this same folder on this same volume.
 
-        Manifests written before the volume field existed carry no UUID: they are accepted only
-        when their device number still matches, which is the original strict check.
+        A manifest without a volume UUID proves nothing about its volume (a replacement volume can
+        receive the same device number), so it is refused until migrate_volume records one.
         """
-        legacy = {'path', 'device', 'inode'}
-        if (not isinstance(saved, dict) or set(saved) not in (legacy, legacy | {'volume'})
+        if (not isinstance(saved, dict) or set(saved) != {'path', 'device', 'inode', 'volume'}
                 or not isinstance(saved['path'], str) or not _integer(saved['device'])
                 or not _integer(saved['inode'])): _bad()
-        if (saved['path'], saved['inode']) != (self.identity['path'], self.identity['inode']): return False
-        if 'volume' in saved: return saved['volume'] == self.identity['volume']
-        return saved['device'] == self.identity['device']
+        return (saved['path'], saved['inode'], saved['volume']) == (
+            self.identity['path'], self.identity['inode'], self.identity['volume'])
+
+    @classmethod
+    def migrate_volume(cls, data_dir, volume):
+        """Operator migration for a manifest written before the volume field existed.
+
+        The operator names the volume UUID they verified as the original; it must equal the data
+        folder's current volume, and the saved path, device and inode must all still match. Takes
+        the writer lock, exposes no attempts, and changes nothing but data_identity.
+        """
+        store = cls(data_dir, validate_answers=None, questions=())
+        if volume != store.identity['volume']: _bad()
+        try:
+            fd = os.open(store.private / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'a+b'):
+                try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise WorkerError('workspace_busy', 'Teacher labels already have a writer') from exc
+                store._secure(store.path, 0o600)
+                saved = json.loads(store.path.read_text(), object_pairs_hook=_unique)
+                legacy = {k: store.identity[k] for k in ('path', 'device', 'inode')}
+                if not isinstance(saved, dict) or saved.get('data_identity') != legacy: _bad()
+                saved['data_identity'] = store.identity
+                store._atomic(store.path, canonical(saved).encode(), 0o600)
+        except (OSError, ValueError) as exc:
+            raise WorkerError('storage_error', 'Teacher attempt state is invalid') from exc
+        return store.identity
 
     def _check(self):
         if self.poisoned or self.lock is None or self.lock.closed or self.owner_pid != os.getpid(): _bad()
