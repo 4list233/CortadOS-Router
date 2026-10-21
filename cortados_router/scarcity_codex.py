@@ -19,8 +19,8 @@ PINNED_VERSIONS = ("0.163.0",)                                     # screen layo
 VERSION = re.compile(r"OpenAI Codex \(v(\d+\.\d+\.\d+)\)")
 LABEL = re.compile(r"^(?:(GPT-\d+(?:\.\d+)*(?:-[A-Za-z][A-Za-z0-9]*)*) )?(5h|Weekly)$")
 LIMIT_LINE = re.compile(r"^[\s│|]*(?P<label>[^\[\]]*?) limit: \[[^\]]*\](?P<rest>.*)$")
-ENTRY = re.compile(r"^(\d{1,3})% left(?: \(resets (?P<when>[^()]*)\))?$")   # the whole entry: nothing missing, nothing trailing
-FIELD = re.compile(r"^[\s│|]*[A-Za-z][A-Za-z0-9 .\-]*: ")                     # "Name: value": the next field ends an entry's wrap
+ENTRY = re.compile(r"^(\d{1,3})% left(?: \(resets (?P<when>[^()]+)\))?$")   # the whole entry: nothing missing, nothing trailing, "(resets )" is not "no reset"
+FIELD = re.compile(r"^[\s│|]*[A-Za-z0-9][A-Za-z0-9 .\-]*: ")                  # "Name: value" (also "5h limit:"): the next field ends an entry's wrap
 ANY_LIMIT = re.compile(r"\blimit:", re.I)
 RESET = re.compile(r"^(\d{1,2}):(\d{2})(?: ?([AaPp][Mm]))?(?: on (\d{1,2}) ([A-Z][a-z]{2}))?$")
 SPAN_S = {"5h": 5 * 3600.0, "Weekly": 7 * 86400.0}
@@ -40,7 +40,7 @@ def version(text: str) -> str:
 def reset_time(when: str | None, span: str, left: int, now: datetime) -> float | None:
     """When the window resets, as a timestamp. Missing text is allowed only for an untouched window (100 % left: the
     screen runs no reset clock); otherwise the text must read fully and land inside the window, or the sample fails."""
-    if not when:
+    if when is None:                                                # the group was absent; an empty "(resets )" never gets here
         if left >= 100:
             return None
         raise ValueError(f"{span} limit shows {left}% left but no reset time")
@@ -88,7 +88,7 @@ def parse_status(text: str, now: float | None = None) -> list[dict]:
         # the entry below it.
         parts = [m.group("rest")]
         for nxt in lines[i + 1:i + 1 + TAIL_LINES]:
-            if not nxt.strip() or FIELD.match(nxt):
+            if not nxt.strip() or FIELD.match(nxt) or ANY_LIMIT.search(nxt):
                 break
             parts.append(nxt)
         entry_text = " ".join(" ".join(p.split()) for p in parts).strip(" │|")

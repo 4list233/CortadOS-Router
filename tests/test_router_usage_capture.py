@@ -64,7 +64,8 @@ class Capture(unittest.TestCase):
         import json, time
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "windows": [], "pools": {}}
+            good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "pools": {},
+                    "windows": [{"window": "week", "pool": "all", "used_pct": 3.0, "elapsed_pct": 95.0, "scarcity": -0.6, "expiring_pct": 90, "resets_at": "soon"}]}
             (home / "scarcity.json").write_text(json.dumps({"fetched_at": time.time() - 900, "learned_at": time.time(), "lanes": {"codex": good}}))
             def refused():
                 raise ValueError("Codex CLI v0.170.0 is not one this parser was verified against")
@@ -75,6 +76,7 @@ class Capture(unittest.TestCase):
                 scarcity._sample_locked(force=True, only=["codex"])
                 lane = scarcity.lane_scarcity()["codex"]
             self.assertIsNone(lane["scarcity"])
+            self.assertEqual((lane["tightest"], lane["expiring_pct"]), ({}, 0))      # no stale "expiring unused" credit either
             self.assertIn("not one this parser", lane["error"])
             self.assertEqual(json.loads((home / "scarcity.json").read_text())["lanes"]["codex"]["scarcity"], -0.6)   # kept for diagnostics
 

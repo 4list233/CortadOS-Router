@@ -97,6 +97,19 @@ class ScoredSelection(unittest.TestCase):
         core.scored_candidates, core.model_scores, core.lane_health = _scored, (lambda: self.MS), (lambda: {})
     def tearDown(self):
         core.scored_candidates, core.model_scores, core.lane_health = self._keep
+    def test_capacity_credit_needs_a_fresh_reading(self):
+        # second adversarial review 2026-10-21: a failed Codex sample (scarcity None, read as 0) still earned the tokens-left credit and beat Claude
+        keep = core._tokens_left_for
+        core._tokens_left_for = lambda c: 500_000_000 if c["lane"] == "codex" else None
+        try:
+            fresh = {"codex": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+            core.lane_health = lambda: fresh
+            self.assertEqual(core.resolve(dec(steps=2, ambiguity=1, work_kind="code"))["chosen"]["lane"], "codex")      # fresh pool with the most room: credited
+            core.lane_health = lambda: {}                                                                                   # unknown or failed: no reading at all
+            r = core.resolve(dec(steps=2, ambiguity=1, work_kind="code"))
+            self.assertEqual(r["chosen"]["lane"], "claude"); self.assertNotIn("tokens_left", json.dumps(r["chosen"]))
+        finally:
+            core._tokens_left_for = keep
     def test_requirement_is_continuous_in_difficulty(self):
         t = core.table()
         r = [core.required_index(t, self.MS, "code", D, "R2") for D in (6, 7, 8)]
@@ -223,11 +236,14 @@ class UsageScreens(unittest.TestCase):
                             (head + " Weekly limit: [█]\n50%\nleft (resets 12:01 PM) on 27 Oct", "entry unreadable"),
                             # … a quota line the grammar cannot read must not vanish, and an impossible clock is not normalised
                             (head + " 5h limit: [█]\n100%\nleft\n Weekly limit: 0% left (resets 12:01 PM on 27 Oct)", "unreadable limit line"),
-                            (head + " 5h limit: [█]\n50%\nleft (resets 25:00 PM)", "impossible clock time")):
+                            (head + " 5h limit: [█]\n50%\nleft (resets 25:00 PM)", "impossible clock time"),
+                            (head + " Weekly limit: [█]\n100%\nleft (resets )", "entry unreadable")):          # an empty reset is not "no reset"
             with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
                 self.sc.parse_codex_status(screen, now=self.FROZEN)
         w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft", now=self.FROZEN)          # untouched: no reset clock is running
         self.assertEqual((w[0]["used_pct"], w[0]["resets_at"]), (0.0, None))
+        w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft\n 5h limit: [█]\n100%\nleft", now=self.FROZEN)   # a digit-leading entry ends the one above
+        self.assertEqual([x["window"] for x in w], ["week", "5-hour"])
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])

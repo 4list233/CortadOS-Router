@@ -123,6 +123,11 @@ Built from one real capture of Codex 0.163.0 (Forest approved the probe; the red
   that `25:00 PM` was normalised to 13:00. All five are fixed with regression cases: an entry ends at the next
   `Name: value` field and must read completely; any `limit:` line must parse; clock values are validated before
   conversion; and `lane_scarcity` treats a lane whose latest try failed as stale at once, for every vendor.
+- Its second pass found the staleness incomplete: the stale lane kept its window and "expiring unused" credit, and
+  the scored selector still paid the tokens-left credit on an unknown pool, so a failed Codex sample could beat
+  Claude. Now every routing signal goes with freshness (a stale lane has no window, no expiring credit, and earns no
+  capacity credit); a digit-leading `5h limit:` line ends the entry above it; and `(resets )` is an error, not "no
+  reset". Both selectors have resolve-level regressions.
 
 Done-when, on the real capture at today's clock: window `all:week`, `resets_at 2026-10-27 12:01` as on the screen,
 scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture day) so they never age.

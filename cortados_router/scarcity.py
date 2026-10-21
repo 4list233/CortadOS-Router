@@ -646,7 +646,9 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
         failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
         fresh = fresh and not failed
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
-        roll = _roll(general)
+        # Every routing signal goes with freshness: a stale lane's window and expiring credit are as unknown as its
+        # scarcity (second adversarial review: a refused sample still won on its old "expiring unused" bonus).
+        roll = _roll(general) if fresh else {"tightest": {}, "expiring_pct": 0}
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
                      "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {},
                      "error": v.get("error") if failed else None}
