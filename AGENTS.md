@@ -23,7 +23,7 @@ is the long form.
 ## Commands
 - Full suite (run before calling any change done):
   `python3 -B -m unittest discover -s tests -t .`
-  Baseline 2026-10-21 on the M5 Max, system Python 3.9, branch p2-codex: 323 run, OK, 7 skipped
+  Baseline 2026-10-21 on the M5 Max, system Python 3.9, branch p2-codex: 327 run, OK, 7 skipped
   (Hermes integration). The README's "155 / 1 failing" is stale.
 - Provider tests alone (fakes only; no vendor CLI is opened):
   `python3 -B -m unittest tests.test_provider tests.test_provider_codex tests.test_provider_responses tests.test_provider_routing tests.test_responses_wire`

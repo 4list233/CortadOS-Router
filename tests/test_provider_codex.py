@@ -314,6 +314,19 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(self.reg.sessions, {})                          # the just-opened session is not left for the reaper
         self.assertEqual([d for d in os.listdir(self.scratch) if d.startswith("cortados-codex-")], [])
 
+    def test_a_changed_system_prompt_on_a_continuation_is_served_under_the_original_with_a_warning(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"system": "A", "tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            r2 = self.post({"system": "B", "tools": [READ_TOOL], "messages": history})
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
+        self.assertTrue(any("system prompt changed mid-conversation" in line for line in logs.output))
+        start = [m for m in self.inbound() if m.get("method") == "thread/start"]
+        self.assertEqual([m["params"]["baseInstructions"] for m in start], ["A"])   # one thread, the original prompt
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
@@ -604,6 +617,38 @@ class CodexSessionUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "deadline passed before the turn could start"):
             s.send_user([{"type": "text", "text": "late"}], timeout=-1)
         self.assertEqual(calls, [])
+
+    def test_usage_is_reported_in_the_messages_shape_with_the_cached_part_taken_out_of_codex_input(self):
+        s = object.__new__(codex_bridge.CodexSession)
+        s._delivered, s._usage_mark = set(), {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
+        s._usage_total = {"totalTokens": 12419, "inputTokens": 12309, "cachedInputTokens": 3968, "cacheWriteInputTokens": 10,
+                          "outputTokens": 110, "reasoningOutputTokens": 42}            # the live spike's second reading
+        _, _, usage = s._finish([], "end_turn")
+        self.assertEqual(usage, {"input_tokens": (12309 - 100) - (3968 - 40), "output_tokens": 105, "cache_read_input_tokens": 3928,
+                                 "cache_creation_input_tokens": 10, "reasoning_output_tokens": 42})
+        self.assertEqual(s._usage_mark, s._usage_total)
+
+    def test_a_defensive_reply_inside_a_turn_is_bounded_by_the_request_deadline(self):
+        class SlowStdin:
+            def write(self, line):
+                time.sleep(0.12)
+
+            def flush(self):
+                pass
+
+        class Proc:
+            stdin, killed = SlowStdin(), False
+
+            def kill(self):
+                self.killed = True
+        s = object.__new__(codex_bridge.CodexSession)
+        s.id, s._fatal, s._usage_total, s._usage_mark, s.proc, s.dir = "unit", None, {}, {}, Proc(), Path(self.scratch)
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
+        s._events.put(("request", {"method": "item/tool/requestUserInput", "id": 7, "params": {"questions": []}}))
+        t0 = time.time()
+        with self.assertRaises(BridgeError):
+            s.run_turn(0.025)
+        self.assertLess(time.time() - t0, 0.3)                           # not a fresh REPLY_WRITE_S for the answer
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))

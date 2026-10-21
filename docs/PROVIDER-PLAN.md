@@ -315,6 +315,12 @@ tool type; optional, later.
    Read ran in the client, the log shows `instructionSources` and no isolation error.
 
 **P2 known limits.**
+- A running CLI keeps the system prompt it started with. A continuation whose system text differs (a changed
+  Responses `instructions`, a rewritten developer item before the first reply) is served under the original with a
+  WARNING naming the conversation; a developer item after a reply is passed as operator text instead (above).
+- Usage: both bridges report the Messages shape (input excludes cache reads/writes); the Responses wire adds them
+  into `input_tokens` and reports the cached part as `cached_tokens`, so Codex's totals match what the backend
+  billed. The Codex bridge takes `cachedInputTokens` out of Codex's inclusive `inputTokens` for the same reason.
 - Images: a tool-less single-message request keeps its image blocks on both wires; the text transcript a longer
   tool-less conversation is folded into is text only (P0 behaviour, both wires; images are P4).
 - No resume with tools: `thread/resume` and `thread/fork` take no `dynamicTools`, so a restarted endpoint answers

@@ -559,7 +559,7 @@ class CodexSession:
                     self._pending[call_id] = msg["id"]
                     self.emitted.add(call_id)
                 else:
-                    self._answer(msg)
+                    self._answer(msg, timeout=self._budget(deadline, "while answering a server request"))
             else:
                 self._note_notification(msg)
                 params = msg.get("params") or {}
@@ -640,10 +640,15 @@ class CodexSession:
     def _finish(self, blocks: list[dict[str, Any]], stop: str) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
         # One client request may span several model requests; tokenUsage.total is cumulative per thread, so the
         # request's usage is the delta since the previous boundary.
+        # The session usage contract is the Messages shape, which the Messages wire passes through: input_tokens
+        # excludes cache reads and writes, which come as cache_read_input_tokens / cache_creation_input_tokens. Codex's
+        # inputTokens includes its cachedInputTokens (spike: 12309 with 3968 cached), so the cached part is taken out.
         total, mark = self._usage_total, self._usage_mark
         delta = lambda k: int(total.get(k) or 0) - int(mark.get(k) or 0)
-        usage = {"input_tokens": delta("inputTokens"), "output_tokens": delta("outputTokens"),
-                 "cache_read_input_tokens": delta("cachedInputTokens")}
+        usage = {"input_tokens": delta("inputTokens") - delta("cachedInputTokens"), "output_tokens": delta("outputTokens"),
+                 "cache_read_input_tokens": delta("cachedInputTokens"),
+                 "cache_creation_input_tokens": delta("cacheWriteInputTokens"),
+                 "reasoning_output_tokens": delta("reasoningOutputTokens")}
         self._usage_mark = dict(total)
         self._delivered.clear()                         # the delivered-results check is scoped to one run_turn
         return blocks, stop, usage

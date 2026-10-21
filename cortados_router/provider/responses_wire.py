@@ -308,11 +308,13 @@ def new_message_id() -> str:
 
 
 def _usage_json(usage: dict[str, int]) -> dict[str, Any]:
-    """The session's usage in Responses form. Cached and reasoning counts come under the backend's own names when it
-    reports them (Claude CLI: cache_read_input_tokens; Codex app-server: cachedInputTokens / reasoningOutputTokens
-    as the bridge forwards them) and are 0 otherwise."""
-    inp, out = int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
-    cached = int(usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens") or 0)
+    """The session's usage in Responses form. Sessions report usage in the Messages shape (both bridges: input_tokens
+    excludes cache reads and writes, which come as cache_read_input_tokens / cache_creation_input_tokens), while the
+    Responses input_tokens includes everything the model read and cached_tokens is the part served from cache; the
+    two are added up here so a client's token accounting matches what the backend billed."""
+    out = int(usage.get("output_tokens", 0))
+    cached, written = int(usage.get("cache_read_input_tokens") or 0), int(usage.get("cache_creation_input_tokens") or 0)
+    inp = int(usage.get("input_tokens", 0)) + cached + written
     reasoning = int(usage.get("reasoning_output_tokens") or 0)
     return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
             "input_tokens_details": {"cached_tokens": cached}, "output_tokens_details": {"reasoning_tokens": reasoning}}

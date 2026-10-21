@@ -282,7 +282,8 @@ class StreamTests(unittest.TestCase):
         completed = events[-1][1]["response"]
         self.assertEqual((completed["id"], completed["model"], completed["status"]), (msg_id, "cortados", "completed"))
         self.assertEqual(completed["output"], done)        # the same item ids as the done events
-        self.assertEqual(completed["usage"], {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+        # Sessions report the Messages shape (input excludes the cached part); Responses input_tokens includes it.
+        self.assertEqual(completed["usage"], {"input_tokens": 13, "output_tokens": 5, "total_tokens": 18,
                                               "input_tokens_details": {"cached_tokens": 3},
                                               "output_tokens_details": {"reasoning_tokens": 0}})
 
@@ -291,6 +292,12 @@ class StreamTests(unittest.TestCase):
         added = [d["item"] for e, d in events if e == "response.output_item.added"]
         self.assertEqual((added[0]["status"], added[0]["content"]), ("in_progress", []))
         self.assertEqual(added[1]["status"], "in_progress")
+
+    def test_usage_adds_cache_reads_and_writes_into_the_responses_input_total(self):
+        # The Claude CLI's usage: 50 uncached, 100000 read from cache, 1000 written; Responses counts all of it as input.
+        claude = {"input_tokens": 50, "cache_read_input_tokens": 100000, "cache_creation_input_tokens": 1000, "output_tokens": 25}
+        u = wire.message_json("resp_x", "cortados", [], "end_turn", claude)["usage"]
+        self.assertEqual((u["input_tokens"], u["total_tokens"], u["input_tokens_details"]["cached_tokens"]), (101050, 101075, 100000))
 
     def test_message_json_is_the_completed_response_object(self):
         r = wire.message_json("resp_x", "cortados", self.BLOCKS, "tool_use", {"input_tokens": 1, "output_tokens": 2})

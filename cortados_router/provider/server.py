@@ -132,7 +132,7 @@ class Registry:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
         s = factory(self, system=turn.system, tools=turn.tools, model=route["model"] if route else self.model)
-        s.route, s.route_logged = route, False
+        s.route, s.route_logged, s.system = route, False, turn.system
         if keep:
             with self._lock:
                 self.sessions[s.id] = s
@@ -263,6 +263,12 @@ class Handler(BaseHTTPRequestHandler):
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools
             session = None if one_shot else reg.find(turn)
+            if session is not None and getattr(session, "system", turn.system) != turn.system:
+                # A running CLI keeps the system prompt it started with; a continuation that sends a different one
+                # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
+                # rather than nowhere (P2 known limit: the conversation would otherwise have to be restarted).
+                logger.warning("conversation %s: the system prompt changed mid-conversation; the running CLI keeps the "
+                               "one it started with", session.id[:8])
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,
                 # not in parse_request: it is a request-shape error all the same and answers 400.
