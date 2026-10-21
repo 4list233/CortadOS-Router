@@ -123,11 +123,10 @@ reads the Claude lane only.
 The M5 Max Pro is the stronger trainer but is in daily use; the Studio is always on and serves S1.
 
 - **Roles.** The Pro trains the adapter (the GPU-heavy step). The Studio serves S1, owns the canonical data home,
-  runs teacher labelling (CLI calls, light on compute) and S1-d outcome runs, and does promotion. Overnight both
-  work at once on different jobs; one adapter run is never split across two machines.
-- **The Pro trains only when Forest is not using it:** on AC power, no keyboard or mouse input for a set idle time
-  (macOS `HIDIdleTime`), and inside the overnight window or a manual start. Any input pauses the run: checkpoint,
-  stop, resume when idle again.
+  runs teacher labelling (CLI calls, light on compute) and S1-d outcome runs, and does promotion. Both can work at
+  once on different jobs; one adapter run is never split across two machines.
+- **The Pro trains only when Forest starts it by hand** (`s1/train start`, e.g. before bed) and stops when he runs
+  `s1/train stop`. No idle detection and no scheduled start on the Pro (Forest 2026-10-21).
 - **Data.** Before training, the Pro pulls the SFT files from the Studio; afterwards it pushes the adapter and its
   report back, and the Studio grades and promotes. Copy-back, not a network mount, so training never depends on the
   link staying up; sync runs over Tailscale when away from home.
@@ -137,7 +136,7 @@ The M5 Max Pro is the stronger trainer but is in daily use; the Studio is always
   are written into every label row. A holdout-teacher override re-labels the holdout, as in S1-a.
 - **Stop and save:** `s1/train stop` stops at once, keeps every finished label and writes a checkpoint before
   exiting. Today the trainer saves every 100 steps, so a stop can lose up to 99.
-- **Resume:** the next start, manual, idle or nightly, continues the unfinished run from its checkpoint.
+- **Resume:** the next start, manual or nightly, continues the unfinished run from its checkpoint.
 - **`s1/train status`:** machine, phase, step / target, teacher, ETA, last checkpoint.
 - **One adapter run at a time:** a lock in the Studio's data home.
 - **Per-machine services:** the Studio stops and restarts the S1 scorer around its own training; the Pro has no
@@ -145,5 +144,4 @@ The M5 Max Pro is the stronger trainer but is in daily use; the Studio is always
 
 ## Open
 
-- [ESCALATE] S1-f idle time before the Pro may start training.
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
