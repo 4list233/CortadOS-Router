@@ -213,7 +213,10 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
   overrides, a managed `requirements.toml`), and requires `model_provider="openai"`, no redefined
   `model_providers.openai`, the default `chatgpt_base_url`, the four overrides above, every `mcp_servers.*.enabled`
-  false, every disabled feature false and `code_mode_host` true in `features`. `thread/start` is when Codex starts MCP servers and binds the
+  false, every disabled feature false and `code_mode_host` true in `features`, and `openai_base_url` and
+  `model_catalog_json` unset: `ollama launch codex` writes both into config.toml, and Codex then sends a
+  ChatGPT-authenticated turn to the local Ollama endpoint (seen on the build Mac on 2026-10-21, when that config
+  appeared mid-review: the bridge would have run the "subscription" lane on a local model). `thread/start` is when Codex starts MCP servers and binds the
   provider, so a refusal here means nothing ran. The config.toml reader (which names the servers to disable) is the
   pre-spawn best effort; a server it could not name (`["mcp_servers".x]`, a dotted key, another layer) is caught here.
   Verified on 0.163.0: `config/read` reflects the `-c` overrides and `--disable` flags exactly.
@@ -331,7 +334,9 @@ tool type; optional, later.
 - `account/rateLimits/updated` arrives on every turn with `primary`/`secondary {usedPercent, windowDurationMins,
   resetsAt}`: a structured quota reading for P3's scarcity, later. Today the `/status` parser is the source.
 - Under the real Codex home the thread sees `~/.codex/AGENTS.md` and the skills list (above); the dedicated home
-  removes that.
+  removes that. On the build Mac the real home now also carries the `ollama launch codex` settings, so the codex-cli
+  lane there is refused (502 naming `openai_base_url`) until a dedicated, logged-in home is given with `--codex-home`;
+  that is the intended answer, not a bypass.
 - The usage on a `tool_use` reply can be 0/0 (the delta rule above); clients that bill per message see the turn's
   tokens on the next reply.
 - Unverified until the live checks: that Codex's SSE parser ignores `: ping` comments and accepts

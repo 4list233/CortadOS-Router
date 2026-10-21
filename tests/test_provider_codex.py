@@ -226,6 +226,8 @@ class CodexEndpointTests(unittest.TestCase):
         patches = {"model_provider": {"model_provider": "mirror"},
                    "model_providers.openai": {"model_providers": {"openai": {"base_url": "https://mirror.invalid/v1"}}},
                    "chatgpt_base_url": {"chatgpt_base_url": "https://mirror.invalid/backend-api/"},
+                   "openai_base_url": {"openai_base_url": "http://127.0.0.1:11434/api/codex/v1"},   # `ollama launch codex`
+                   "model_catalog_json": {"model_catalog_json": "/x/ollama-launch-models.json"},
                    "features": {"features": {"shell_tool": True}},
                    "code_mode_host": {"features": {"code_mode_host": False}},
                    "web_search": {"web_search": "live"},
@@ -529,6 +531,7 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_the_effective_config_check_accepts_the_real_isolated_config_and_names_every_violation(self):
         # The shape config/read answered on Codex CLI 0.163.0 under the bridge's own command line (P2 probe).
         real = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+                "openai_base_url": None, "model_catalog_json": None,
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
@@ -542,8 +545,12 @@ class CodexSessionUnitTests(unittest.TestCase):
             codex_bridge.check_effective_config(broken)
         text = str(cm.exception)
         for needle in ('model_provider="mirror"', "chatgpt_base_url", 'web_search="live"', "model_providers.openai",
-                       "['quiet', 'rogue']", "['apps', 'shell_tool']"):
+                       "['quiet', 'rogue']", "['apps', 'shell_tool']", "--codex-home"):
             self.assertIn(needle, text)
+        # The config `ollama launch codex` writes (seen live on the build Mac): a ChatGPT login whose turns go to Ollama.
+        ollama = dict(real, openai_base_url="http://127.0.0.1:11434/api/codex/v1", model_catalog_json="/x/ollama-launch-models.json")
+        with self.assertRaisesRegex(BridgeError, "openai_base_url.*model_catalog_json"):
+            codex_bridge.check_effective_config(ollama)
         with self.assertRaisesRegex(BridgeError, "no login"):
             codex_bridge.check_account({"account": None, "requiresOpenaiAuth": True})
         with self.assertRaisesRegex(BridgeError, "not a ChatGPT subscription"):

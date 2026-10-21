@@ -56,6 +56,7 @@ def toml_value(raw):
 def effective_config(argv):
     """What config/read answers: the defaults of a real 0.163.0 home with every -c override and --disable applied."""
     cfg = {"model_provider": None, "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+           "openai_base_url": None, "model_catalog_json": None,
            "mcp_servers": {}, "notify": None, "web_search": None, "include_environment_context": True,
            "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
     for i, a in enumerate(argv):

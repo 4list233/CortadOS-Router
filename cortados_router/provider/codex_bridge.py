@@ -48,8 +48,12 @@ CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_c
 # What config/read must show before thread/start (the effective config, every layer merged: config.toml, the -c
 # overrides, a managed requirements.toml). The overrides above are asked for and then checked, because a managed layer
 # wins over -c; chatgpt_base_url is the default backend of the ChatGPT login, the one the subscription bills to.
+# openai_base_url repoints the built-in provider even under a ChatGPT login (found live: `ollama launch codex` writes
+# it, and Codex then sent a ChatGPT-authenticated turn to the local Ollama endpoint); model_catalog_json replaces the
+# metadata of the models the route names. Both default to null and must stay so.
 EXPECTED_CONFIG = {"notify": [], "web_search": "disabled", "include_environment_context": False, "project_doc_max_bytes": 0,
-                   "model_provider": "openai", "chatgpt_base_url": "https://chatgpt.com/backend-api/"}
+                   "model_provider": "openai", "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+                   "openai_base_url": None, "model_catalog_json": None}
 # The login the lane bills to: a ChatGPT subscription. An API-key login (or none) would bill elsewhere, or fail later
 # as unauthorized after the route was logged as a subscription lane.
 EXPECTED_ACCOUNT_TYPE = "chatgpt"
@@ -165,7 +169,9 @@ def check_effective_config(cfg: dict[str, Any]) -> None:
     if off:
         bad.append(f"features the dynamic tools need are off: {off}")
     if bad:
-        raise BridgeError("codex app-server's effective config would not isolate the thread: " + "; ".join(bad))
+        raise BridgeError("codex app-server's effective config would not isolate the thread: " + "; ".join(bad) +
+                          ". A setting the user's own Codex needs can stay there: give the backend a dedicated, logged-in "
+                          "home instead (--codex-home / CORTADOS_PROVIDER_CODEX_HOME)")
 
 
 def check_account(account: dict[str, Any]) -> None:
