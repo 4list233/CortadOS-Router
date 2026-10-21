@@ -128,6 +128,13 @@ Built from one real capture of Codex 0.163.0 (Forest approved the probe; the red
   Claude. Now every routing signal goes with freshness (a stale lane has no window, no expiring credit, and earns no
   capacity credit); a digit-leading `5h limit:` line ends the entry above it; and `(resets )` is an error, not "no
   reset". Both selectors have resolve-level regressions.
+- Passes three to five went after the reset arithmetic: a time-only reset read during its displayed minute rolled to
+  tomorrow; `11:59 PM` read at 00:00:01 and `31 Dec` read on 1 Jan anchored to today's date or this year; naive
+  wall-clock subtraction misjudged windows across a DST change; the hour DST repeats was guessed; the hour DST skips
+  normalised to a real time. `reset_time` now turns every calendar reading the screen could mean (yesterday, today,
+  tomorrow; last, this, next year; both folds) into a timestamp, drops any that does not round-trip, keeps the earliest
+  not more than the slack hour in the past, bounds it by the window in elapsed seconds, and refuses two readings inside
+  one window. Tests pin America/Toronto for the midnight, year-end and both DST cases. The sixth pass approved.
 
 Done-when, on the real capture at today's clock: window `all:week`, `resets_at 2026-10-27 12:01` as on the screen,
 scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture day) so they never age.
