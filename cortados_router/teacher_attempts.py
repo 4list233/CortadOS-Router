@@ -70,6 +70,7 @@ class LabelAttempts:
         self.poisoned = False
         self.owner_pid, self.owner_thread = os.getpid(), threading.get_ident()
         self.handoff_nonce = None
+        self._migration = None
 
     def _identity(self):
         info = self.data.stat()
@@ -107,30 +108,25 @@ class LabelAttempts:
             self.identity['path'], self.identity['inode'], self.identity['volume'])
 
     @classmethod
-    def migrate_volume(cls, data_dir, volume):
+    def migrate_volume(cls, data_dir, volume, *, validate_answers, questions):
         """Operator migration for a manifest written before the volume field existed.
 
         The operator names the volume UUID they verified as the original; it must equal the data
-        folder's current volume, and the saved path, device and inode must all still match. Takes
-        the writer lock, exposes no attempts, and changes nothing but data_identity.
+        folder's current volume, and the saved path, device and inode must all still match. Runs
+        through the normal writer entry (lock, ownership, modes, DATA recheck) and saves the
+        migrated identity before returning, so no attempt is used under an unproven volume.
         """
-        store = cls(data_dir, validate_answers=None, questions=())
-        if volume != store.identity['volume']: _bad()
-        try:
-            fd = os.open(store.private / 'lock', os.O_RDWR | os.O_NOFOLLOW)
-            with os.fdopen(fd, 'a+b'):
-                try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise WorkerError('workspace_busy', 'Teacher labels already have a writer') from exc
-                store._secure(store.path, 0o600)
-                saved = json.loads(store.path.read_text(), object_pairs_hook=_unique)
-                legacy = {k: store.identity[k] for k in ('path', 'device', 'inode')}
-                if not isinstance(saved, dict) or saved.get('data_identity') != legacy: _bad()
-                saved['data_identity'] = store.identity
-                store._atomic(store.path, canonical(saved).encode(), 0o600)
-        except (OSError, ValueError) as exc:
-            raise WorkerError('storage_error', 'Teacher attempt state is invalid') from exc
-        return store.identity
+        store = cls(data_dir, validate_answers=validate_answers, questions=questions)
+        store._migration = volume
+        with store:
+            store._save(copy.deepcopy(store.manifest))
+        return dict(store.identity)
+
+    def _migrate(self):
+        saved = self.manifest.get('data_identity') if isinstance(self.manifest, dict) else None
+        legacy = {k: self.identity[k] for k in ('path', 'device', 'inode')}
+        if saved != legacy or self._migration != self.identity['volume']: _bad()
+        self.manifest['data_identity'] = dict(self.identity)
 
     def _check(self):
         if self.poisoned or self.lock is None or self.lock.closed or self.owner_pid != os.getpid(): _bad()
@@ -177,6 +173,7 @@ class LabelAttempts:
                 else:
                     self.manifest = dict(schema='cortados.teacher-attempts.v1', data_identity=self.identity,
                                          revision=0, attempts=[])
+                if self._migration is not None: self._migrate()
                 self._validate_manifest()
                 # Same folder on the same volume: adopt this boot's device number and the volume UUID;
                 # the next save persists both.

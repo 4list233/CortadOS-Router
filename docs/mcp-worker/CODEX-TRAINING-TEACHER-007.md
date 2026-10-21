@@ -266,9 +266,11 @@ device on every mount, so a reboot changes device without changing the folder (a
 2026-10-21: the Studio's 10-19 reboot made every run refuse its own manifest). On open the store
 adopts the current device; the next save persists it. A manifest written before amendment 6 has no
 volume and is refused (a matching device number does not prove the volume) until the operator runs
-`LabelAttempts.migrate_volume(DATA, <verified volume UUID>)`: under the writer lock, it requires the
-named UUID to equal DATA's current volume and the saved path, device and inode to match, and writes
-only data_identity. No attempt is exposed or replayed before that migration. Revision is a nonnegative nonboolean integer. Attempts is an ordered
+`LabelAttempts.migrate_volume(DATA, <verified volume UUID>, validate_answers=…, questions=…)`. It
+runs through the normal writer entry (the same lock, ownership, mode, symlink and DATA identity
+checks as any writer), requires the named UUID to equal DATA's current volume and the saved path,
+device and inode to match, and saves the migrated data_identity (a new revision) before returning.
+No attempt is exposed or replayed before that migration. Revision is a nonnegative nonboolean integer. Attempts is an ordered
 list of closed records with exactly:
 `{attempt_id,request_id,row_ids,payload,sample,system_prompt,system_prompt_digest,provider,model,
 arguments,config_digest,state,job_id,result_digest,terminal_state,publication_ts,publication_rows,
