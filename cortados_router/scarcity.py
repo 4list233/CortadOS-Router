@@ -2,7 +2,7 @@
 
 For every lane: how much of the plan's window is used (%), how much of the window's TIME has elapsed (%), when it resets,
 and what follows from the two: the pace (projected % at reset) and the allowance (% per hour we can still spend until the reset).
-scarcity ∈ [0,1] is derived from that; 1.0 = the provider is refusing or the window is spent. Local lane: free, scarce only in memory.
+scarcity ∈ [0,1] is derived from that; 1.0 = the provider is refusing or the window is spent. Local lane: GPU memory, compute and deployment availability.
 
 Sources (verified live 2026-09-21). ONE method for every subscription (Forest's ruling): open the vendor's own CLI in a PTY, type its
 usage command, read the screen. No tokens are spent, no private API is called, and the figures are exactly the ones the vendor shows its user.
@@ -414,6 +414,10 @@ def _cursor() -> dict[str, Any]:
 
 
 def _local() -> dict[str, Any]:
+    fleet_config = _env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")
+    if fleet_config:
+        from cortados_router.local_resources import sample as sample_resources
+        return sample_resources(fleet_config)
     try:
         vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
         pages = {k.strip(): int(v.strip().rstrip(".")) for k, v in (l.split(":") for l in vm.splitlines()[1:] if ":" in l) if v.strip().rstrip(".").isdigit()}
@@ -553,12 +557,15 @@ def current(max_age_s: int = 1200) -> dict[str, Any]:
         d = json.loads(CACHE.read_text())
     except Exception:
         d = {"fetched_at": 0, "lanes": {}}
-    if time.time() - float(d.get("fetched_at") or 0) > max_age_s and not _refreshing.is_set():
+    global_due = time.time() - float(d.get("fetched_at") or 0) > max_age_s
+    local_due = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")) and time.time() - float(
+        (d.get("lanes", {}).get("local") or {}).get("tried_at") or 0) >= MIN_INTERVAL["local"]
+    if (global_due or local_due) and not _refreshing.is_set():
         _refreshing.set()
 
         def bg() -> None:
             try:
-                sample()
+                sample(only=None if global_due else ["local"])
             finally:
                 _refreshing.clear()
         threading.Thread(target=bg, daemon=True, name="cortados-scarcity").start()
@@ -567,12 +574,23 @@ def current(max_age_s: int = 1200) -> dict[str, Any]:
 
 def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]]:
     out = {}
+    managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     for lane, v in (current().get("lanes") or {}).items():
-        fresh = time.time() - float(v.get("fetched_at") or 0) < max_reading_age_s
+        age_limit = min(max_reading_age_s, 120) if lane == "local" and managed_local else max_reading_age_s
+        fresh = 0 <= time.time() - float(v.get("fetched_at") or 0) < age_limit
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
         roll = _roll(general)
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
                      "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {}}
+        if lane == "local" and managed_local:
+            usable = fresh and v.get("resource_managed") is True
+            out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},
+                             scarcity=v.get("scarcity") if usable else 1.0,
+                             refusing=bool(v.get("refusing")) if usable else True,
+                             why=v.get("why") if usable else "local resource telemetry is missing or stale")
+    if managed_local and "local" not in out:
+        out["local"] = {"resource_managed": True, "deployments": {}, "scarcity": 1.0,
+                        "refusing": True, "why": "local resource telemetry has not been sampled"}
     return out
 
 
@@ -632,7 +650,10 @@ def summary_lines(d: dict[str, Any]) -> list[str]:
     lines, before = [], change_since(24)
     for lane, v in (d.get("lanes") or {}).items():
         s = v.get("scarcity")
-        lines.append(f"{lane}  [{v.get('plan')}]  scarcity {'?' if s is None else s} → router: {stance(s)}" + (f"  (last try failed: {v['error']})" if v.get("error") else ""))
+        local_stance = ("UNAVAILABLE: deployment or resource check failed" if v.get("refusing")
+                        else "BUSY: memory or GPU utilization is high" if s is not None and s >= 0.7
+                        else "available: measured local resources") if lane == "local" and v.get("resource_managed") else None
+        lines.append(f"{lane}  [{v.get('plan')}]  scarcity {'?' if s is None else s} → router: {local_stance or stance(s)}" + (f"  (last try failed: {v['error']})" if v.get("error") else ""))
         for w in v.get("windows") or []:
             reset = f"until it resets {w['resets_at']} (in {w['resets_in_h']} h)" if w.get("resets_at") else "(untouched: no reset clock running)"
             tl = tokens_left(lane, w["window"], w["used_pct"])
@@ -641,7 +662,18 @@ def summary_lines(d: dict[str, Any]) -> list[str]:
                          + (f"  ← about {w['expiring_pct']}% will expire unused" if w.get("expiring_pct", 0) >= 10 else "")
                          + (f"  [24 h: {w['used_pct'] - before[(lane, w['window'])]:+.0f} pts]" if (lane, w["window"]) in before else ""))
         if lane == "local":
-            lines.append(f"    free memory {v.get('free_gb')} GB, resident {v.get('resident')}")
+            if v.get("resource_managed"):
+                lines.append("    GPU memory, host RAM and utilization are separate; no quota reset")
+                for node in v.get("nodes", []):
+                    memory = node.get("gpu_headroom_estimate_bytes")
+                    headroom = "unknown" if memory is None else f"{memory / 2**30:.1f} GiB estimated"
+                    utilization = node.get("gpu_utilization_pct")
+                    used = "unknown" if utilization is None else f"{utilization}%"
+                    lines.append(f"    {node['id']}: {node['status']}, GPU headroom {headroom}, utilization {used}, pool={node['pool_eligible']}")
+                if v.get("why"):
+                    lines.append("    " + v["why"])
+            else:
+                lines.append(f"    free memory {v.get('free_gb')} GB, resident {v.get('resident')}")
         for pname, pv in (v.get("pools") or {}).items():
             lines.append(f"    pool {pname}: scarcity {pv.get('scarcity')}" + ("  SPENT" if pv.get("spent") else "") + (f"  ({pv['note']})" if pv.get("note") else ""))
         if v.get("per_model"):

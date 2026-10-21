@@ -362,6 +362,8 @@ def lane_health() -> dict[str, dict[str, Any]]:
     for lane, v in sc.lane_scarcity().items():
         out[lane] = {**_health_row(v.get("scarcity"), v.get("tightest"), v.get("expiring_pct"), v.get("refusing")),
                      "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()}}
+        if lane == "local" and v.get("resource_managed"):
+            out[lane].update(resource_managed=True, deployments=v.get("deployments", {}), why=v.get("why"))
     return out
 
 
@@ -375,6 +377,12 @@ def _health_row(s, w, expiring, spent) -> dict[str, Any]:
 def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """A model is as scarce as the tightest pool it draws on: the lane's general windows plus its own pool when it has one."""
     lane = health.get(c["lane"]) or {}
+    if c["lane"] == "local" and lane.get("resource_managed"):
+        deployment = (lane.get("deployments") or {}).get(c.get("model"))
+        if deployment is None:
+            return {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pool": None,
+                    "why": lane.get("why") or "local model has no verified deployment"}
+        return {**deployment, "expiring_pct": 0, "tightest": {}, "pool": None}
     pools = lane.get("pools") or {}
     pool = c.get("pool") or (_scarcity_module().pool_for(c["lane"], c.get("model", ""), list(pools)) if pools else None)
     return {**(pools.get(pool) or lane), "pool": pool if pool in pools else None} if lane else {"ok": True, "scarcity": None, "expiring_pct": 0, "tightest": {}, "pool": None}
@@ -493,6 +501,9 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     transport_rejected = set()
     for c in cands:
         cap = lane_ceiling(c['lane'], c['model'], fit.get('transport'))
+        local_cap = ch_of[id(c)].get("max_context_tokens") if c['lane'] == 'local' else None
+        if isinstance(local_cap, int) and local_cap > 0:
+            cap = min(cap, local_cap)
         if execution and c['provider'] == 'codex-cli':
             cap = int(cx.get('provider_ceiling_tokens', {}).get('codex-cli', 200000))
         why = None

@@ -1,0 +1,128 @@
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+from cortados_router import core, local_resources as resources, scarcity
+
+
+class LocalResources(unittest.TestCase):
+    def node(self, **changes):
+        return {"id": "studio", "status": "online", "pool_eligible": True,
+                "sampled_at": 1000, "gpu_budget_bytes": 24 * resources.GIB,
+                "gpu_headroom_estimate_bytes": 8 * resources.GIB,
+                "host_available_estimate_bytes": 100 * resources.GIB,
+                "gpu_utilization_pct": 10, **changes}
+
+    def deployment(self):
+        return {"model": "model", "ready": True, "nodes": ["studio"],
+                "additional_memory_gib_by_node": {"studio": 2}, "max_context_tokens": 4096}
+
+    def test_vm_stat_uses_reported_page_size(self):
+        text = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 10.\nPages inactive: 20.\nPages speculative: 3."
+        self.assertEqual(resources.mac_memory(text), 33 * 4096)
+
+    def test_missing_page_size_is_unknown(self):
+        with self.assertRaises(ValueError):
+            resources.mac_memory("Pages free: 10.")
+
+    def test_offline_node_denies_ready_deployment(self):
+        row = resources.deployment_health(self.deployment(), {"studio": self.node(status="unreachable")}, 1000, 120)
+        self.assertFalse(row["ok"])
+        self.assertIn("offline", row["why"])
+
+    def test_stale_and_future_clock_samples_are_not_capacity(self):
+        for sampled_at in (1, 2000):
+            with self.subTest(sampled_at=sampled_at):
+                row = resources.deployment_health(self.deployment(), {"studio": self.node(sampled_at=sampled_at)}, 1000, 120)
+                self.assertFalse(row["ok"])
+
+    def test_travel_client_is_not_a_home_worker(self):
+        row = resources.deployment_health(self.deployment(), {"studio": self.node(pool_eligible=False)}, 1000, 120)
+        self.assertFalse(row["ok"])
+        self.assertIn("excluded", row["why"])
+
+    def test_host_ram_does_not_rescue_gpu_memory_fit(self):
+        row = resources.deployment_health(self.deployment(), {"studio": self.node(gpu_headroom_estimate_bytes=resources.GIB)}, 1000, 120)
+        self.assertFalse(row["ok"])
+        self.assertIn("headroom", row["why"])
+
+    def test_every_shard_must_fit_on_its_assigned_worker(self):
+        deployment = self.deployment()
+        deployment["nodes"].append("pc")
+        deployment["additional_memory_gib_by_node"]["pc"] = 2
+        nodes = {"studio": self.node(), "pc": self.node(id="pc", gpu_headroom_estimate_bytes=resources.GIB)}
+        self.assertFalse(resources.deployment_health(deployment, nodes, 1000, 120)["ok"])
+
+    def test_unverified_model_is_not_made_ready_by_free_memory(self):
+        deployment = self.deployment()
+        deployment["ready"] = False
+        self.assertFalse(resources.deployment_health(deployment, {"studio": self.node()}, 1000, 120)["ok"])
+
+    def test_unknown_compute_is_not_zero_usage(self):
+        row = resources.deployment_health(self.deployment(), {"studio": self.node(gpu_utilization_pct=None)}, 1000, 120)
+        self.assertFalse(row["ok"])
+        self.assertIn("unknown GPU utilization", row["why"])
+
+    def test_unknown_context_limit_is_not_an_unbounded_model(self):
+        deployment = self.deployment()
+        deployment.pop("max_context_tokens")
+        self.assertFalse(resources.deployment_health(deployment, {"studio": self.node()}, 1000, 120)["ok"])
+
+    def test_local_summary_has_no_subscription_reset_clock(self):
+        with patch.object(scarcity, "change_since", return_value={}):
+            lines = scarcity.summary_lines({"lanes": {"local": {"scarcity": 1, "refusing": True, "resource_managed": True}}})
+        self.assertIn("UNAVAILABLE", lines[0])
+        self.assertNotIn("until the reset", " ".join(lines))
+
+    def test_busy_compute_is_ranking_signal_not_spent_quota(self):
+        row = resources.deployment_health(self.deployment(), {"studio": self.node(gpu_utilization_pct=100)}, 1000, 120)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["scarcity"], 0.95)
+        self.assertFalse(row["spent"])
+
+    def test_inventory_without_target_is_unconfigured(self):
+        row = resources.sample_node({"id": "pc", "inventory": {"vram_gib": 12, "host_ram_gib": 32}}, b"")
+        self.assertEqual(row["status"], "unconfigured")
+        self.assertNotIn("gpu_headroom_estimate_bytes", row)
+
+    def test_fleet_does_not_count_traveling_pro_or_inventory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "resources.json"
+            config.write_text(json.dumps({"nodes": [{"id": "studio"}, {"id": "pro"}]}))
+            now = time.time()
+            nodes = [self.node(sampled_at=now), self.node(id="pro", sampled_at=now, pool_eligible=False)]
+            with patch.object(resources, "sample_node", side_effect=nodes):
+                row = resources.sample(config)
+            self.assertEqual(row["known_pool_headroom_estimate_bytes"], 8 * resources.GIB)
+            self.assertTrue(row["refusing"])
+
+    def test_ssh_failures_have_no_fresh_capacity(self):
+        with patch.object(resources.subprocess, "run", side_effect=OSError()):
+            row = resources.sample_node({"id": "studio", "target": "owner@studio"}, b"")
+        self.assertEqual(row["status"], "unreachable")
+        self.assertNotIn("sampled_at", row)
+
+    def test_local_candidate_requires_exact_verified_model(self):
+        health = {"local": {"resource_managed": True, "deployments": {"ready-model": {"ok": True, "scarcity": 0.2, "max_context_tokens": 4096}}}}
+        self.assertTrue(core.candidate_health({"lane": "local", "model": "ready-model"}, health)["ok"])
+        self.assertFalse(core.candidate_health({"lane": "local", "model": "other-model"}, health)["ok"])
+
+    def test_managed_local_lane_missing_or_stale_is_unavailable(self):
+        for data in ({"lanes": {}}, {"lanes": {"local": {"fetched_at": time.time() - 121, "resource_managed": True, "scarcity": 0}}}):
+            with self.subTest(data=data), patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json"}), patch.object(scarcity, "current", return_value=data):
+                row = scarcity.lane_scarcity()["local"]
+                self.assertEqual(row["scarcity"], 1)
+                self.assertTrue(row["refusing"])
+
+    def test_legacy_local_reading_cannot_bypass_fleet_checks(self):
+        data = {"lanes": {"local": {"fetched_at": time.time(), "scarcity": 0}}}
+        with patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json"}), patch.object(scarcity, "current", return_value=data):
+            self.assertTrue(scarcity.lane_scarcity()["local"]["refusing"])
+
+
+if __name__ == "__main__":
+    unittest.main()

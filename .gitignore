@@ -12,3 +12,5 @@ s1/current.json
 *.db
 # third-party benchmark downloads: re-fetched by tables/benchmarks/fetch_benchmarks.py, never redistributed
 tables/benchmarks/raw/
+# Claude Code worktrees are per-session scratch checkouts
+.claude/worktrees/

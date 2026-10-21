@@ -78,6 +78,11 @@ cost = burn weight + 30 × scarcity − 80 × expiring credit − capacity credi
   spent. A pool on pace to overshoot its window gets more expensive. A pool whose allowance is about to expire unused
   gets cheaper. A spent pool is skipped.
 
+Local hardware can be metered separately with `CORTADOS_LOCAL_RESOURCES_CONFIG`:
+per-node GPU memory, host RAM, utilization, online state, and verified model
+placements. The home Studio is the stable coordinator; the traveling Pro is
+excluded from home capacity by default. See [local resources](docs/LOCAL-RESOURCES.md).
+
 **Final gates.**
 
 - Context fit is a hard gate.
