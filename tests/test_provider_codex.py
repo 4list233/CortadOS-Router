@@ -329,6 +329,37 @@ class CodexEndpointTests(unittest.TestCase):
         start = [m for m in self.inbound() if m.get("method") == "thread/start"]
         self.assertEqual([m["params"]["baseInstructions"] for m in start], ["A"])   # one thread, the original prompt
 
+    def test_two_overlapping_continuations_serve_one_and_refuse_the_other_without_losing_the_session(self):
+        # Both pass Registry.find (same history) before either holds the session lock: the test holds the lock so
+        # both are waiting, then releases it. One is served; the other finds the conversation moved on and gets a
+        # 409; the session survives and the next real continuation works.
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        [session] = self.reg.sessions.values()
+        codes = []
+
+        def continuation():
+            try:
+                self.post({"tools": [READ_TOOL], "messages": history})
+                codes.append(200)
+            except urllib.error.HTTPError as exc:
+                codes.append(exc.code)
+        session.lock.acquire()
+        threads = [threading.Thread(target=continuation) for _ in range(2)]
+        for t in threads:
+            t.start()
+        time.sleep(1.0)                                                  # both have found the session and wait on the lock
+        session.lock.release()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(sorted(codes), [200, 409])
+        self.assertEqual(list(self.reg.sessions.values()), [session])  # the healthy conversation was kept
+        history += [{"role": "assistant", "content": [{"type": "text", "text": "tool said: hello"}]}, {"role": "user", "content": "thanks"}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": history})["content"], [{"type": "text", "text": "echo: thanks"}])
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]

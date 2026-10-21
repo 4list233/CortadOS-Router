@@ -331,6 +331,14 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["error"] = BridgeError(f"conversation busy for {TURN_TIMEOUT_S:.0f}s")
                 return
             try:
+                if not created and session.history != turn.history:
+                    # Registry.find ran before the lock: a second continuation with the same history (a client
+                    # retry, two overlapping requests) found the session too, and the one that lost the lock now
+                    # sees a conversation that has moved on. Delivering its results would fail inside the backend
+                    # and drop a healthy conversation; it is a stale request, answered 409, and the session is kept.
+                    outcome["stale"] = LostSession("the conversation moved on while this request waited for it: another "
+                                                   "request with the same history was served first; send the current history")
+                    return
                 if turn.tool_results:
                     session.deliver(turn.tool_results, timeout=deadline - time.time())
                 else:
@@ -366,6 +374,14 @@ class Handler(BaseHTTPRequestHandler):
                         client_gone = True
                         logger.info("conversation %s: client gone mid-turn (%s); waiting for the turn to end",
                                     session.id[:8], exc)
+            if "stale" in outcome:
+                logger.warning("conversation %s: stale continuation refused: %s", session.id[:8], outcome["stale"])
+                if client_gone:
+                    return
+                if turn.stream:
+                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(outcome["stale"])))
+                    return
+                return self._error(409, "invalid_request_error", str(outcome["stale"]), wire)
             if "error" in outcome:
                 logger.warning("conversation %s failed: %s", session.id[:8], outcome["error"])
                 if not one_shot:
