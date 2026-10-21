@@ -102,3 +102,48 @@ Not yet in P1, each needing a decision or another phase:
   `<system-message>`, because the CLI's stream-json input only takes user messages.
 - Claude Code warns that it does not recognize `cortados` and assumes a 200k context window. P1 sets the window
   for the gateway model (see the link in that warning) to match the chosen lane.
+
+## S1 track (Forest's decisions 2026-10-21)
+
+Today the teacher sees only the request text and `unit_kind`, while S1 can also receive a task context: the two are
+trained on different inputs. Teachers are hardcoded (`claude-sonnet-5`, `claude-opus-5`), and the scarcity gate
+reads the Claude lane only.
+
+| # | Change |
+|---|---|
+| S1-a | Teachers resolved nightly from the model inventory, never hardcoded; labelling fails loudly if one can't be resolved. Holdout: Claude Fable 5.1, one teacher at a time; a change re-labels the holdout. Train: current top Claude model or `gpt-6-astra` by scarcity. Before a second teacher's labels count, both label a shared overlap set and their agreement is recorded. |
+| S1-b | One routing input for S1 and teacher: request, compact tool/MCP inventory (names by server), environment (repo, cwd, none). The teacher also labels the expected steps / tool calls. Fits S1's 6,000-character budget. |
+| S1-c | Provider requests, with their tool lists, are written to the route log and become training data (route logging landed in P1; the tool list is not logged yet). |
+| S1-d | Outcome benchmark: runnable real tasks (coding in a disposable worktree, graded by tests plus a judge rubric), each run at the routed band and one band either side; the lowest band that succeeded becomes a label that outranks teacher opinion. Outward tasks run against mock MCP tools that record calls only. |
+| S1-e | Surplus scheduling: when a pool is projected to reset with allowance unused, extra labelling and S1-d runs draw on it, across all accounts once multi-account lands. Stops once the pool's projected use reaches 95 %, and never runs in the last hour before that pool's reset. |
+| S1-f | Manual training, on demand, on the Pro or the Studio (below). |
+
+### S1-f: manual training and machine roles
+
+The M5 Max Pro is the stronger trainer but is in daily use; the Studio is always on and serves S1.
+
+- **Roles.** The Pro trains the adapter (the GPU-heavy step). The Studio serves S1, owns the canonical data home,
+  runs teacher labelling (CLI calls, light on compute) and S1-d outcome runs, and does promotion. Overnight both
+  work at once on different jobs; one adapter run is never split across two machines.
+- **The Pro trains only when Forest is not using it:** on AC power, no keyboard or mouse input for a set idle time
+  (macOS `HIDIdleTime`), and inside the overnight window or a manual start. Any input pauses the run: checkpoint,
+  stop, resume when idle again.
+- **Data.** Before training, the Pro pulls the SFT files from the Studio; afterwards it pushes the adapter and its
+  report back, and the Studio grades and promotes. Copy-back, not a network mount, so training never depends on the
+  link staying up; sync runs over Tailscale when away from home.
+- **Start:** `s1/train start [--teacher <model>] [--holdout-teacher <model>] [--label-only | --train-only]`. Runs
+  outside 01:30–07:00 (today `overnight.py` refuses: "nothing started").
+- **Teacher choice:** `--teacher` and `--holdout-teacher` override the inventory resolution for this run only and
+  are written into every label row. A holdout-teacher override re-labels the holdout, as in S1-a.
+- **Stop and save:** `s1/train stop` stops at once, keeps every finished label and writes a checkpoint before
+  exiting. Today the trainer saves every 100 steps, so a stop can lose up to 99.
+- **Resume:** the next start, manual, idle or nightly, continues the unfinished run from its checkpoint.
+- **`s1/train status`:** machine, phase, step / target, teacher, ETA, last checkpoint.
+- **One adapter run at a time:** a lock in the Studio's data home.
+- **Per-machine services:** the Studio stops and restarts the S1 scorer around its own training; the Pro has no
+  scorer to stop and skips that step.
+
+## Open
+
+- [ESCALATE] S1-f idle time before the Pro may start training.
+- Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
