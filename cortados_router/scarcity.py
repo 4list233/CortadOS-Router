@@ -624,11 +624,9 @@ def _sample_local_managed() -> dict[str, Any]:
             old = {}
         rec = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
     rec["plan"] = _plans().get("local") or rec.get("plan")
-    out = _write_cache({"local": rec}, None)
-    if not rec.get("error"):
-        with HISTORY.open("a") as h:
-            h.write(json.dumps({"ts": rec["fetched_at"], "lanes": {"local": {"scarcity": rec.get("scarcity"), "windows": []}}}) + "\n")
-    return out
+    # No history line: the series feeds the unit-cost learner and the 24-hour change readout, both per window, and
+    # local telemetry has no windows. A line a minute would only crowd the vendor samples out of the readout.
+    return _write_cache({"local": rec}, None)
 
 
 def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]]:
@@ -660,17 +658,19 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
 
 def change_since(hours: float = 24) -> dict[tuple[str, str], float]:
     """Points of each window used over the last `hours`, from our own sample history (negative = the window reset in between)."""
-    target, best = time.time() - hours * 3600, None
+    # The baseline is chosen per lane: samples are partial (the local refresh writes its own lines every minute, the
+    # vendor probes every 15–30), so the row nearest the target rarely holds every lane (Codex review 2026-10-21).
+    target, best = time.time() - hours * 3600, {}
     try:
         for line in HISTORY.read_text().splitlines():
             row = json.loads(line)
-            if best is None or abs(row["ts"] - target) < abs(best["ts"] - target):
-                best = row
+            for lane, v in (row.get("lanes") or {}).items():
+                if lane not in best or abs(row["ts"] - target) < abs(best[lane][0] - target):
+                    best[lane] = (row["ts"], v)
     except Exception:
         return {}
-    if not best or abs(best["ts"] - target) > hours * 3600 * 0.25:
-        return {}
-    return {(lane, w[0]): w[1] for lane, v in best["lanes"].items() for w in v.get("windows") or []}
+    return {(lane, w[0]): w[1] for lane, (ts, v) in best.items() if abs(ts - target) <= hours * 3600 * 0.25
+            for w in v.get("windows") or []}
 
 
 def stance(s: float | None) -> str:

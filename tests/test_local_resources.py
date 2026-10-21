@@ -112,6 +112,32 @@ class LocalResources(unittest.TestCase):
         self.assertTrue(core.candidate_health({"lane": "local", "model": "ready-model"}, health)["ok"])
         self.assertFalse(core.candidate_health({"lane": "local", "model": "other-model"}, health)["ok"])
 
+    def test_rejected_local_deployment_is_never_the_fallback_choice(self):
+        # Shadow mode shows the first candidate when every pool is spent; unverified local capacity is unroutable, not spent.
+        ms = {"use_cases": {"code": ""}, "reference_index": {b: {"general": v, "code": v} for b, v in (("R1", 10), ("R2", 50), ("R3", 80), ("R4", 95))},
+              "models": [{"family": "loc", "ceiling": False, "proxy": False, "index": {"general": 60, "code": 60}, "price_1m_blended_usd": None,
+                          "reach": [{"lane": "local", "provider": "custom", "model": "loc"}]}]}
+        answers = {"steps": 1, "ambiguity": 1, "blast_radius": 0, "context_size": 0, "novelty": 1, "parallelizability": 0, "outward": False,
+                   "work_kind": "code", "urgency": "now", "needs_clarification": False, "parts": 0, "diversity": False}
+        decision = {"answers": answers, "degraded": False, "engine": "test", "engine_ms": 1}
+        verified = {"local": {"resource_managed": True, "deployments": {"loc": {"ok": True, "scarcity": 0.2, "max_context_tokens": 131072}}, "scarcity": 0.2}}
+        rejected = {"local": {"resource_managed": True, "deployments": {}, "scarcity": 1.0, "refusing": True, "why": "no verified local deployment currently available"}}
+        with patch.object(core, "model_scores", lambda: ms), patch.object(core, "lane_health", lambda: verified):
+            self.assertEqual(core.resolve(decision)["chosen"]["lane"], "local")
+        with patch.object(core, "model_scores", lambda: ms), patch.object(core, "lane_health", lambda: rejected):
+            r = core.resolve(decision)
+        self.assertIsNone(r["chosen"])
+        self.assertEqual([(s["lane"], s["why"]) for s in r["skipped"]], [("local", "no verified local deployment currently available")])
+
+    def test_change_readout_takes_each_lane_baseline_from_its_own_samples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            history = Path(folder) / "scarcity-history.jsonl"
+            target = time.time() - 24 * 3600
+            history.write_text(json.dumps({"ts": target - 600, "lanes": {"codex": {"scarcity": 0.2, "windows": [["week", 30.0, 40.0]]}}}) + "\n"
+                               + json.dumps({"ts": target - 5, "lanes": {"local": {"scarcity": 0, "windows": []}}}) + "\n")
+            with patch.object(scarcity, "HISTORY", history):
+                self.assertEqual(scarcity.change_since(24), {("codex", "week"): 30.0})
+
     def test_managed_local_lane_missing_or_stale_is_unavailable(self):
         for data in ({"lanes": {}}, {"lanes": {"local": {"fetched_at": time.time() - 121, "resource_managed": True, "scarcity": 0}}}):
             with self.subTest(data=data), patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json"}), patch.object(scarcity, "current", return_value=data):

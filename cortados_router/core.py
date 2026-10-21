@@ -379,10 +379,12 @@ def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> di
     lane = health.get(c["lane"]) or {}
     if c["lane"] == "local" and lane.get("resource_managed"):
         deployment = (lane.get("deployments") or {}).get(c.get("model"))
+        # resource_rejected: unverified or stale local capacity is unroutable, not merely spent, so resolve's last-resort
+        # "first candidate shown" fallback must never pick it either (Codex review 2026-10-21).
         if deployment is None:
-            return {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pool": None,
+            return {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pool": None, "resource_rejected": True,
                     "why": lane.get("why") or "local model has no verified deployment"}
-        return {**deployment, "expiring_pct": 0, "tightest": {}, "pool": None}
+        return {**deployment, "expiring_pct": 0, "tightest": {}, "pool": None, "resource_rejected": not deployment.get("ok", False)}
     pools = lane.get("pools") or {}
     pool = c.get("pool") or (_scarcity_module().pool_for(c["lane"], c.get("model", ""), list(pools)) if pools else None)
     return {**(pools.get(pool) or lane), "pool": pool if pool in pools else None} if lane else {"ok": True, "scarcity": None, "expiring_pct": 0, "tightest": {}, "pool": None}
@@ -615,7 +617,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                                   pref.index(c["lane"]) if c["lane"] in pref else len(pref), base[id(c)]))
     usable = [c for c in cands if ok_of(c)]
     skipped = [{"lane": c["lane"], "model": c["model"], "pool": ch_of[id(c)].get("pool"), "why": ch_of[id(c)].get("why")} for c in cands if not ok_of(c) and not (ch_of[id(c)].get("why") or "").startswith("secondary")][:8]
-    fitting = [c for c in cands if id(c) not in transport_rejected]
+    fitting = [c for c in cands if id(c) not in transport_rejected and not ch_of[id(c)].get("resource_rejected")]
     chosen = usable[0] if usable else (fitting[0] if fitting and not fallback_routes and not execution else None)
     if not usable and fitting:
         rules.append("no available candidate; execution refused" if execution else
