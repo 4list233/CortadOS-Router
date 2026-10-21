@@ -6,7 +6,8 @@ Owner of two rules:
                     endpoint is a host of the router, not a second router.
   no Claude when degraded  core.resolve's hard rule that a degraded scorer never defaults to Claude. Execution mode
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
-                    down a Claude route is not offered, and with no other lane served the request is refused.
+                    down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
+                    lane survives (binary missing, capacity spent) the request is refused.
 """
 from __future__ import annotations
 
@@ -18,10 +19,14 @@ from typing import Any, Callable
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
 
-# P1 serves the Claude CLI only. codex-cli joins with its bridge (P2); local models need the 2026-09-28 "no local
-# routes" ruling lifted and local entries in the generated model scores.
-SERVED_PROVIDERS = ("claude-cli",)
+# The Claude CLI (P1, bridge.py) and the Codex CLI (P2, codex_bridge.py). Local models need the 2026-09-28 "no local
+# routes" ruling lifted and local entries in the generated model scores. `openai-codex` is deliberately absent: it is
+# the Hermes native-API provider this endpoint cannot run; its rows are served as their `codex-cli` twin instead.
+SERVED_PROVIDERS = ("claude-cli", "codex-cli")
 CLAUDE_PROVIDERS = ("claude-cli",)
+# The tables carry no codex-cli rows: core.resolve clones each openai-codex candidate into a codex-cli one under
+# execution, but only after the allowed_routes filter, so the allowlist itself must name the clone.
+CLONED_PROVIDERS = {"openai-codex": "codex-cli"}
 # Coding clients are interactive sessions: the router's face floor (selection.interactive_min_general_index) applies.
 PLATFORM = "cli"
 # Client-injected context, not the request: Claude Code wraps its reminders and environment in these.
@@ -31,7 +36,8 @@ _INJECTED = re.compile(r"<(system-reminder|system-message)>.*?</\1>", re.S)
 def served_routes(core) -> tuple[tuple[str, str], ...]:
     rows = [r for m in (core.model_scores() or {}).get("models", []) for r in m.get("reach", [])]
     rows += [r for band in core.table()["candidates"].values() for r in band]
-    return tuple(sorted({(r["provider"], r["model"]) for r in rows if r["provider"] in SERVED_PROVIDERS}))
+    pairs = {(CLONED_PROVIDERS.get(r["provider"], r["provider"]), r["model"]) for r in rows}
+    return tuple(sorted(p for p in pairs if p[0] in SERVED_PROVIDERS))
 
 
 def request_text(messages: list[dict[str, Any]], *, standalone: bool = False) -> str:
@@ -58,16 +64,21 @@ class _NoClaudeWhenDegraded:
         return self._core.resolve(decision, *args, allowed_routes=allowed_routes, **kw)
 
 
-def _credentials(claude_bin: str) -> Callable[..., None]:
+def _credentials(claude_bin: str, codex_bin: str) -> Callable[..., None]:
+    # A PATH check only: a real login check would open the vendor CLI (and for Codex spend a login refresh), which
+    # the scarcity sampler alone may do. A missing login surfaces as a 502 on the first turn instead.
+    binaries = {"claude-cli": claude_bin, "codex-cli": codex_bin}
+
     def check(*, requested: str, target_model: str) -> None:
         if requested not in SERVED_PROVIDERS:
             raise execution_routing.CredentialsUnavailable(f"{requested} is not served by this endpoint")
-        if requested == "claude-cli" and not shutil.which(claude_bin):
-            raise execution_routing.CredentialsUnavailable(f"{claude_bin} is not on PATH")
+        if not shutil.which(binaries[requested]):
+            raise execution_routing.CredentialsUnavailable(f"{binaries[requested]} is not on PATH")
     return check
 
 
-def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude") -> dict[str, Any]:
+def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
+           codex_bin: str = "codex") -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error."""
     raw = json.dumps(body)
     fit = {"known": True, "assembled": True, "input_tokens": len(raw) // 4, "input_bytes": len(raw.encode()),
@@ -76,8 +87,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints={"allowed_routes": list(served_routes(core))},
-        credential_resolver=_credentials(claude_bin), log_platform=f"provider:{client}")
+        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}")
     if r.get("error") and r.get("degraded"):
-        r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no other lane is served yet. "
-                      + r["error"])
+        r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
+                      "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
     return r

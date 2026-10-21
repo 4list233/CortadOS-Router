@@ -269,6 +269,17 @@ class RoutedEndpointTests(EndpointTests):
         self.assertFalse(Path(self.argv_file).exists())
 
 
+class StartFailureTests(unittest.TestCase):
+    def test_a_cli_that_cannot_start_is_a_bridge_error_and_leaks_no_scratch_dir(self):
+        # Registry.new and _messages map BridgeError to 502; an OSError out of popen would instead drop the client's
+        # connection without a response and leave the scratch dir and the stderr handle behind.
+        scratch = tempfile.mkdtemp()
+        with self.assertRaisesRegex(BridgeError, "cannot start .*no-such-claude"):
+            BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                          claude_bin=os.path.join(scratch, "no-such-claude"), scratch_root=scratch)
+        self.assertEqual(os.listdir(scratch), [])
+
+
 class StalledCliTests(unittest.TestCase):
     def test_a_cli_that_stops_reading_input_is_killed_at_the_deadline(self):
         os.environ["FAKE_CLAUDE_STALL"] = "1"

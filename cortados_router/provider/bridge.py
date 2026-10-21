@@ -52,28 +52,38 @@ class BridgeSession:
         self._closed = False
         self._events: queue.Queue = queue.Queue()
         self.dir = Path(tempfile.mkdtemp(prefix="cortados-bridge-", dir=scratch_root))
-        (self.dir / "work").mkdir()
+        self._stderr = None
         prefix = [claude_bin] if isinstance(claude_bin, str) else list(claude_bin)   # a list lets tests run a fake CLI
-        args = prefix + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--tools", "", "--setting-sources", "", "--settings", json.dumps({"disableAllHooks": True}),
-                "--system-prompt", system or "You are a helpful assistant."]
-        if tools:
-            (self.dir / "tools.json").write_text(json.dumps(tools))
-            (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
-                "command": sys.executable,
-                "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
-                "env": {"CORTADOS_PROVIDER_TOKEN": token}}}}))
-            args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
-                     "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
-        else:
-            args += ["--strict-mcp-config"]
-        if model:
-            args += ["--model", model]
-        env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
-        env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
-        self._stderr = open(self.dir / "stderr.log", "w")
-        self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=self._stderr, text=True, bufsize=1)
+        try:
+            (self.dir / "work").mkdir()
+            args = prefix + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                    "--tools", "", "--setting-sources", "", "--settings", json.dumps({"disableAllHooks": True}),
+                    "--system-prompt", system or "You are a helpful assistant."]
+            if tools:
+                (self.dir / "tools.json").write_text(json.dumps(tools))
+                (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
+                    "command": sys.executable,
+                    "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
+                    "env": {"CORTADOS_PROVIDER_TOKEN": token}}}}))
+                args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
+                         "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
+            else:
+                args += ["--strict-mcp-config"]
+            if model:
+                args += ["--model", model]
+            env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+            env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
+            self._stderr = open(self.dir / "stderr.log", "w")
+            self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=self._stderr, text=True, bufsize=1)
+        except OSError as exc:
+            # No process exists yet, so close() cannot run: release the stderr handle and the scratch dir by hand and
+            # report the start failure (binary gone or not executable, fork refused) as the BridgeError server.py
+            # answers with 502, instead of an OSError that would drop the client's connection without a response.
+            if self._stderr:
+                self._stderr.close()
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise BridgeError(f"cannot start {prefix[0]!r} as the headless Claude CLI: {exc}") from exc
         threading.Thread(target=self._read_stdout, daemon=True, name=f"cortados-bridge-{self.id[:8]}").start()
 
     # ------------------------------------------------------------------ CLI side
@@ -208,7 +218,8 @@ class BridgeSession:
                         pipe.close()
                 except OSError:
                     pass                                # a broken pipe to a dead CLI: nothing left to flush
-            self._stderr.close()
+            if self._stderr:
+                self._stderr.close()
             with self._cv:
                 self._closed = True
                 self._cv.notify_all()

@@ -1,0 +1,144 @@
+{
+ "model": "cortados",
+ "stream": true,
+ "input": [
+  {
+   "type": "message",
+   "id": "msg_10bc7840-6d33-557a-a0d2-403489a6493b",
+   "role": "developer",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "<developer prompt>"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_01a16015-6591-75e1-b0b6-403ffe410448",
+   "role": "developer",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "<skills instructions>"
+    },
+    {
+     "type": "input_text",
+     "text": "<permissions instructions>"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_01a16015-6591-75e1-b0b6-404dea1d6062",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<AGENTS.md instructions>\n</INSTRUCTIONS>"
+    },
+    {
+     "type": "input_text",
+     "text": "<environment_context>\n  <cwd>x</cwd>\n  <shell>x</shell>\n  <current_date>x</current_date>\n</environment_context>"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_01a16015-6591-75e1-b0b6-406973ff0480",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "say hi"
+    }
+   ]
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "name": "request_user_input",
+   "description": "<tool description>",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "questions": {
+      "type": "array",
+      "description": "<tool description>",
+      "items": {
+       "type": "object",
+       "properties": {
+        "header": {
+         "type": "string",
+         "description": "<tool description>"
+        },
+        "id": {
+         "type": "string",
+         "description": "<tool description>"
+        },
+        "options": {
+         "type": "array",
+         "description": "<tool description>",
+         "items": {
+          "type": "object",
+          "properties": {
+           "description": {
+            "type": "string",
+            "description": "<tool description>"
+           },
+           "label": {
+            "type": "string",
+            "description": "User-facing label (1-5 words)."
+           }
+          },
+          "required": [
+           "label",
+           "description"
+          ],
+          "additionalProperties": false
+         }
+        },
+        "question": {
+         "type": "string",
+         "description": "<tool description>"
+        }
+       },
+       "required": [
+        "id",
+        "header",
+        "question",
+        "options"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "questions"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "tool_choice": "auto",
+ "parallel_tool_calls": true,
+ "reasoning": {
+  "summary": "auto"
+ },
+ "store": false,
+ "include": [
+  "reasoning.encrypted_content"
+ ],
+ "prompt_cache_key": "00000000-0000-0000-0000-000000000000",
+ "client_metadata": {
+  "x-codex-turn-metadata": "x",
+  "thread_id": "x",
+  "x-codex-window-id": "x",
+  "turn_id": "x",
+  "x-codex-installation-id": "x",
+  "root_turn_id": "x",
+  "session_id": "x"
+ }
+}

@@ -85,6 +85,36 @@ if up:
 else:
     record("outward request floors blast radius (R3)", "BLOCKED", f"S1 unreachable at {S1_URL}")
 
+# P2 (2026-10-21): the provider serves Codex lanes (openai-codex rows as codex-cli). The provider's degraded path must
+# land on a Codex lane because of the hard rule that a degraded scorer never defaults to Claude; a scored decision
+# must come back on a served provider, never the native openai-codex row. Runs the real provider routing on the
+# throwaway home with the real core.decide (S1 if up, degraded otherwise); codex_bin is the interpreter so the lane's
+# PATH check passes without the real CLI, and no CLI is ever started: routing only chooses.
+PROVIDER_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+body = {"model": "cortados", "messages": [{"role": "user", "content": "rename the variable in utils.py"}]}
+r = routing.choose(core, body, client="verify", conversation_id="verify-router", claude_bin=sys.executable, codex_bin=sys.executable)
+print(json.dumps({k: r.get(k) for k in ("provider", "model", "band", "degraded", "error")}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", PROVIDER_SCENARIO], cwd=REPO, capture_output=True, text=True, timeout=180,
+                   env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("provider routes a conversation to a served lane", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    served = r.get("provider") in ("claude-cli", "codex-cli") and not r.get("error")
+    if r.get("degraded"):
+        record("provider routes a degraded conversation to a Codex lane, never Claude",
+               "PASS" if served and r["provider"] == "codex-cli" else "FAIL", json.dumps(r))
+    else:
+        record("provider routes a scored conversation to a served lane (never openai-codex itself)",
+               "PASS" if served else "FAIL", json.dumps(r))
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

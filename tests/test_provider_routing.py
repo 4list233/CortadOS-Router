@@ -38,19 +38,25 @@ class ProviderRoutingTests(unittest.TestCase):
 
     def choose(self, answers, text):
         core.decide = scored(answers)
-        return routing.choose(core, self.body(text), client="claude-cli", conversation_id=text[:8], claude_bin="python3")
+        return routing.choose(core, self.body(text), client="claude-cli", conversation_id=text[:8], claude_bin="python3",
+                              codex_bin="python3")
 
     def test_only_served_providers_are_offered(self):
         routes = routing.served_routes(core)
         self.assertTrue(routes)
-        self.assertEqual({p for p, _ in routes}, {"claude-cli"})
+        self.assertEqual({p for p, _ in routes}, {"claude-cli", "codex-cli"})
+
+    def test_codex_rows_are_served_as_codex_cli_never_as_the_native_provider(self):
+        routes = routing.served_routes(core)
+        self.assertIn(("codex-cli", "gpt-5.6-terra"), routes)
+        self.assertNotIn("openai-codex", {p for p, _ in routes})
 
     def test_harder_requests_get_a_stronger_model(self):
         easy = self.choose(EASY, "rename a variable in utils.py")
         hard = self.choose(HARD, "redesign the storage layer across services")
         self.assertNotIn("error", easy)
         self.assertNotIn("error", hard)
-        self.assertEqual((easy["provider"], hard["provider"]), ("claude-cli", "claude-cli"))
+        self.assertTrue({easy["provider"], hard["provider"]} <= set(routing.SERVED_PROVIDERS))
         self.assertLess(core.BAND_ORDER.index(easy["band"]), core.BAND_ORDER.index(hard["band"]))
         idx = {c["model"]: c["index"] for c in [easy["route"]["chosen"], hard["route"]["chosen"]]}
         self.assertLessEqual(idx[easy["model"]], idx[hard["model"]])
@@ -59,16 +65,28 @@ class ProviderRoutingTests(unittest.TestCase):
         r = self.choose(EASY, "rename a variable in utils.py")
         with sqlite3.connect(core.STATE / "router.db") as db:
             row = db.execute("SELECT platform, request, provider, model FROM routes WHERE turn_id=?", (r["route_id"],)).fetchone()
-        self.assertEqual(row, ("provider:claude-cli", "rename a variable in utils.py", "claude-cli", r["model"]))
+        self.assertEqual(row, ("provider:claude-cli", "rename a variable in utils.py", r["provider"], r["model"]))
+        self.assertIn(r["provider"], routing.SERVED_PROVIDERS)
 
     def test_injected_client_context_is_not_scored(self):
         self.assertEqual(routing.request_text(self.body("fix the bug")["messages"]), "fix the bug")
 
-    def test_a_degraded_scorer_never_routes_to_claude(self):
+    def test_a_degraded_scorer_routes_to_codex_never_to_claude(self):
         core.decide = lambda text, ctx=None: {"answers": None, "degraded": True, "engine": "s1", "engine_ms": 1, "error": "down"}
-        r = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="c", claude_bin="python3")
+        r = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="c", claude_bin="python3",
+                           codex_bin="python3")
+        self.assertNotIn("error", r)
+        self.assertEqual(r["provider"], "codex-cli")
+        self.assertTrue(r["degraded"])
+        self.assertNotIn("claude-cli", json.dumps(r["route"]["chosen"]))
+
+    def test_a_degraded_scorer_with_no_codex_lane_is_refused_not_sent_to_claude(self):
+        core.decide = lambda text, ctx=None: {"answers": None, "degraded": True, "engine": "s1", "engine_ms": 1, "error": "down"}
+        r = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="c", claude_bin="python3",
+                           codex_bin="no-such-codex-anywhere")
         self.assertIn("error", r)
         self.assertIn("never defaults to Claude", r["error"])
+        self.assertIn("no Codex lane survived", r["error"])
         self.assertFalse((core.STATE / "router.db").exists() and sqlite3.connect(core.STATE / "router.db").execute(
             "SELECT count(*) FROM routes").fetchone()[0])
 
@@ -77,16 +95,24 @@ class ProviderRoutingTests(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "deploy the payments service to production"},
                              {"role": "assistant", "content": "Deployed."},
                              {"role": "user", "content": "Return only a three word title for this conversation"}]}
-        r = routing.choose(core, body, client="claude-cli", conversation_id="t", claude_bin="python3")
+        r = routing.choose(core, body, client="claude-cli", conversation_id="t", claude_bin="python3", codex_bin="python3")
         with sqlite3.connect(core.STATE / "router.db") as db:
             row = db.execute("SELECT request FROM routes WHERE turn_id=?", (r["route_id"],)).fetchone()
         self.assertEqual(row, ("Return only a three word title for this conversation",))
 
     def test_a_missing_cli_refuses_rather_than_guessing(self):
         core.decide = scored(EASY)
-        r = routing.choose(core, self.body("x"), client="t", conversation_id="c", claude_bin="no-such-cli-anywhere")
+        r = routing.choose(core, self.body("x"), client="t", conversation_id="c", claude_bin="no-such-cli-anywhere",
+                           codex_bin="no-such-codex-anywhere")
         self.assertIn("error", r)
         self.assertIn("credentials unavailable", json.dumps(r))
+
+    def test_a_missing_codex_cli_only_removes_the_codex_lane(self):
+        core.decide = scored(EASY)
+        r = routing.choose(core, self.body("rename a variable in utils.py"), client="t", conversation_id="c",
+                           claude_bin="python3", codex_bin="no-such-codex-anywhere")
+        self.assertNotIn("error", r)
+        self.assertEqual(r["provider"], "claude-cli")
 
 
 if __name__ == "__main__":

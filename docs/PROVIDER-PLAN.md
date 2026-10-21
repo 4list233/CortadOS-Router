@@ -40,8 +40,8 @@ client (Claude Code, the repo's machine)           CortadOS endpoint
   child. `--bare` is NOT usable: it disables subscription OAuth.
 - The child's environment drops `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`: the first two
   would loop the child back into CortadOS, the third would bill an API key instead of the subscription.
-- Codex as a backend uses `codex app-server` dynamic tools (`item/tool/call` server requests). Experimental: P2
-  starts with a spike.
+- Codex as a backend uses `codex app-server` dynamic tools (`item/tool/call` server requests): the thread starts
+  with the client's tools as `dynamicTools` and every built-in tool feature off. Verified by the P2 spike (P2 status).
 
 ## Phases
 
@@ -49,7 +49,7 @@ client (Claude Code, the repo's machine)           CortadOS endpoint
 |---|---|---|
 | P0 | Anthropic Messages endpoint → bridged `claude -p`; no routing | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude -p --model cortados "summarize README.md"` from a repo: the Read runs in the client, the answer comes from the headless CLI |
 | P1 | Router in the loop: host-neutral `route_task()`, S1 scores the first request, one model per conversation, route log with `platform: "provider:<client>"`; local-model backend (Ollama / llama.cpp tool calls) | requests of different difficulty land on different lanes; every decision is in the route log |
-| P2 | Codex backend (app-server spike first); Codex as a client (OpenAI Responses wire) | the same summarize check from Codex and onto Codex |
+| P2 | Codex backend (app-server spike first); Codex as a client (OpenAI Responses wire) — built 2026-10-21, live acceptance pending (P2 status below) | the same summarize check from Codex and onto Codex |
 | P3 | Codex `/status` parser fix (SUBAGENT-MCP-PLAN §11.7) and inventory refresh, alongside P1–P2 | codex lane shows a non-null scarcity |
 | Later | multiple accounts per vendor; CLI runners on other machines (the Air); one model across machines; cloud clients (needs a public endpoint with auth, and a verified `BASE_URL` override in the cloud client); API-key lanes | |
 
@@ -68,16 +68,20 @@ Verified with the real Claude Code client on throwaway state; on fixed S1 answer
 Tool-less calls (titles, summaries) are scored and logged as their own last user message, not as the conversation's
 task.
 
-**S1 down → 503 in P1.** The hard rule "a degraded scorer never defaults to Claude" is enforced by this host:
-execution mode skips the table's non-Claude fallback routes, so while S1 is unavailable Claude routes are not offered.
-With only Claude served, the endpoint answers 503 until S1 is back (Codex in P2 gives degraded conversations a lane).
-The first real-client run, before this rule was enforced, had routed degraded to `claude-sonnet-5`; Codex's P1 review
-caught it.
+**S1 down → a Codex lane (P2), 503 in P1.** The hard rule "a degraded scorer never defaults to Claude" is enforced
+by this host: execution mode skips the table's non-Claude fallback routes, so while S1 is unavailable Claude routes
+are not offered. In P1, with only Claude served, that meant 503 until S1 was back. Since P2 a degraded conversation
+runs on a Codex lane (the table's fallback band, cheapest capable `codex-cli` model with live capacity); the endpoint
+answers 503 only when no Codex lane survives either (the Codex binary missing from PATH, or its capacity spent), and
+the error names both rules. The first real-client run, before this rule was enforced, had routed degraded to
+`claude-sonnet-5`; Codex's P1 review caught it.
 
 Not yet in P1, each needing a decision or another phase:
-- **Served lanes.** Only `claude-cli`. Codex arrives with its bridge (P2). Local models need the 2026-09-28 ruling
-  ("local models are OUT of routing", `tables/benchmarks/build_tiers.py`) lifted, local entries in the model scores,
-  and the local-resources work on `main` (uncommitted) merged.
+- **Served lanes.** `claude-cli` and, since P2, `codex-cli`: every `openai-codex` row of the tables is served as its
+  `codex-cli` twin through the app-server bridge (`openai-codex` itself, the Hermes native-API provider, is never
+  served). Local models need the 2026-09-28 ruling ("local models are OUT of routing",
+  `tables/benchmarks/build_tiers.py`) lifted, local entries in the model scores, and the local-resources work on
+  `main` (uncommitted) merged.
 - **S1 location.** The endpoint scores through `CORTADOS_S1_URL` (default `127.0.0.1:8431`). When the endpoint does
   not run next to S1 (the Studio), point it there, or every conversation routes degraded.
 - **Live usage probes.** Routing reads live lane scarcity, which samples the vendor CLIs in a PTY every 20 minutes,
@@ -142,6 +146,154 @@ scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture d
 Not done here: the port into the live fleet's copy (`plugins/cortados-router/scarcity.py` on the Studio, hunk by
 hunk, with the three live-only deltas kept and a `hermes gateway restart` at an idle point) waits for Forest's
 decision on whether the frozen Hermes fleet still gets fixes.
+
+## P2 status (2026-10-21): the Codex backend and Codex as a client
+
+Built on `p2-codex`: `cortados_router/provider/codex_bridge.py` (`CodexSession`: one `codex app-server` thread per
+conversation, the client's tools as dynamic tools), `responses_wire.py` (the OpenAI Responses wire, served at
+`POST /v1/responses`), the backend map and the per-wire seam in `server.py` (`SESSION_FACTORIES`, `WIRES`), and
+`codex-cli` in `routing.py`. Tests run on `tests/fixtures/fake_codex_app_server.py` (the exact line shapes of the
+spike log) and the fake Claude CLI; no test opens a vendor CLI. Suite: 291 run, OK, 7 skipped (Hermes integration).
+The live acceptance checks (below) are still to run; each spends subscription quota.
+
+**The app-server protocol** (verified against Codex CLI 0.163.0 with the spike; the API is experimental, so
+`SUPPORTED_CLI_VERSIONS` pins the version the same way the `/status` parser does):
+- stdio, one JSON object per line. `initialize {capabilities: {experimentalApi: true}}` (without it,
+  `thread/start.dynamicTools` is refused with -32600) → `initialized` → `thread/start {cwd: an empty scratch dir,
+  ephemeral: true, sandbox: "read-only", approvalPolicy: "never", model, baseInstructions: the client's system
+  prompt (it replaces Codex's own base prompt), dynamicTools}` → one `turn/start {threadId, input}` per client
+  request. `ephemeral` writes no session files (verified).
+- A tool call is the server request `item/tool/call {callId, tool, arguments}`. `callId` equals the
+  `dynamicToolCall` item id and becomes the `tool_use` id (Messages) or `call_id` (Responses) the client sees, so
+  the result is matched by id, never by order. It is answered when the client's next request arrives:
+  `{success: not isError, contentItems: [inputText | inputImage]}`; images travel as data URLs, because Codex
+  refuses remote image URLs. Sibling calls of one model message are collected for the same settle window as the
+  Claude bridge. Every pending call must be answered in one request (Codex continues only then); a partial set is
+  refused.
+- Final text is `item/completed` with an `agentMessage` (deltas are ignored). `turn/completed` with status
+  `completed` ends the turn; `failed` is a 502 carrying the message and `codexErrorInfo` (`usageLimitExceeded`,
+  `rateLimitExceeded`, `contextWindowExceeded`, `unauthorized`).
+- `thread/tokenUsage/updated` carries cumulative totals once per model request; a client request's usage is the
+  delta of `total` between turn boundaries. A `tool_use` reply therefore reports 0/0 when the server has not yet
+  reported that model request, and the following reply carries the whole turn.
+- Server requests that would hang the turn are answered defensively. `item/tool/requestUserInput` gets empty answers
+  (`request_user_input` is the one built-in tool that cannot be switched off; a warning is logged). Approval requests
+  are declined and raised as an invariant violation, like any item a built-in tool produces (`commandExecution`,
+  `fileChange`, `mcpToolCall`, `webSearch`, `imageView`, `collabAgentToolCall`, `subAgentActivity`), and like
+  `mcpServer/startupStatus/updated` (an MCP server started = isolation failed). The headless Codex never runs a
+  tool itself, the same invariant as the Claude bridge.
+- A new user message while a tool call is unanswered (a client interrupt): every pending call is answered
+  `success: false` with "cortados: the client moved on without a result", then `turn/interrupt`, drain to that turn's
+  `turn/completed`, then the new `turn/start`. A `turn/start` during a live turn would be steering, not a new turn.
+- Close: `thread/unsubscribe`, close stdin ("stdin closed" ends the process), kill after 5 s.
+
+**Isolation of the child.** There is no `--ignore-user-config` for `app-server`, and a throwaway `CODEX_HOME` has no
+login; refresh tokens are single-use, so a copied or linked `auth.json` could break Forest's own login and is never
+done. The backend therefore runs on the real Codex home with everything switched off on the command line:
+
+```
+codex app-server -c notify=[] -c web_search="disabled" -c include_environment_context=false -c project_doc_max_bytes=0
+  -c mcp_servers.<name>.enabled=false        # for every [mcp_servers.<name>] table of $CODEX_HOME/config.toml
+                                             # (the one read of it; `-c mcp_servers={}` merges and does nothing)
+  --disable shell_tool --disable unified_exec --disable unified_exec_tty --disable view_image --disable image_generation
+  --disable apps --disable plugins --disable hooks --disable multi_agent --disable sleep_tool --disable skill_search
+  --disable tool_suggest --disable goals --disable memories --disable browser_use --disable computer_use
+  --disable collaboration_modes
+```
+
+- With that set the tool list Codex builds is exactly `request_user_input` plus the dynamic tools (verified through
+  an exec capture under the same flags). `code_mode_host` stays on: dynamic tools are served through it, and the
+  first spike run, with it disabled, had the model report the Read tool as unavailable.
+- The child's environment drops `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` (an API key would bill an
+  API account instead of the subscription) and the Anthropic trio of the Claude bridge.
+- Two leaks remain under the real home and are documented, not hidden: `~/.codex/AGENTS.md` is loaded
+  (`instructionSources`, logged at thread start; it reaches the thread as a user message) and the user's skills list
+  is injected as a developer message. The fix is `CORTADOS_PROVIDER_CODEX_HOME` / `--codex-home`: a dedicated
+  `CODEX_HOME` Forest logs into once (`CODEX_HOME=<dir> codex login`), the multi-account path of ROUTER-DESIGN §10.
+- `--codex-bin` / `CORTADOS_PROVIDER_CODEX_BIN` names the binary (default `codex` on PATH). Scarcity's
+  `CORTADOS_CODEX_BIN` is a different setting: it points at the ChatGPT.app copy for the `/status` probe.
+- Models the account offers (`model/list`) are the routing table's `openai-codex` rows (gpt-6.1-sol, gpt-6-astra,
+  gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna). `effort` goes on `turn/start` only when the
+  route carries one.
+
+**The spike** (Forest approved; two live runs on `gpt-5.6-luna`, about 14k tokens in all; the second run's event
+stream is the model for the fake). Run one, with `code_mode_host` disabled, answered that it had no Read tool. Run
+two, with it on, made one dynamic `Read` round trip (`item/tool/call` → the client's answer → `agentMessage`) and
+answered from the file; `instructionSources` listed `~/.codex/AGENTS.md`, `ephemeral` left no session file, and the
+usage, item and turn shapes above are from its log.
+
+**Codex as a client: `POST /v1/responses`** (verified from one real request of Codex 0.163.0, kept with its prose
+replaced as `tests/fixtures/codex-responses-request-0.163.0.json`). Headers: `authorization: Bearer <env_key>`,
+`user-agent: codex_exec/0.163.0 (...)` (the route log's platform is `provider:codex_exec`). Body: `model:
+"cortados"`, `stream: true`, `input`, `tools`, `tool_choice: "auto"`, `store: false`, `include:
+["reasoning.encrypted_content"]`, `prompt_cache_key`. There is no `instructions` key: the system prompt arrives as
+`developer` message items (Codex's base prompt, then the skills block), followed by `user` items (the AGENTS.md
+block, then the prompt). The wire folds the developer items into the session's system prompt, scores the user and
+assistant text, and answers with `response.created`, per block `response.output_item.added` and `.done` (Codex
+builds its history from the done items; a `function_call`'s `call_id` is the session's tool_use id), then
+`response.completed` with the usage; `: ping` comment lines keep the stream alive while a turn runs. A 400 (Codex
+prints the body verbatim) refuses a model other than `cortados`, `previous_response_id`, a `tool_choice` other than
+auto, assistant prefill, and `namespace` tools (ChatGPT apps; run Codex with `--disable apps`). Non-function tools
+(`web_search`) are dropped with one warning. Every error on the path, the 401 included, is in the Responses shape.
+
+Codex's configuration is Forest's to add; this repo never writes `~/.codex`. Inline, nothing on disk:
+
+```
+CORTADOS_PROVIDER_TOKEN=<token> codex exec --ignore-user-config \
+  -c 'model_providers.cortados={ name="CortadOS", base_url="http://127.0.0.1:8432/v1", env_key="CORTADOS_PROVIDER_TOKEN", wire_api="responses", request_max_retries=0, stream_max_retries=0, stream_idle_timeout_ms=1800000 }' \
+  -c model_provider="cortados" -m cortados -c model_context_window=200000 \
+  --disable apps --disable multi_agent -c web_search="disabled" -s read-only --ephemeral --skip-git-repo-check \
+  "summarize README.md"
+```
+
+Or as a profile file, `$CODEX_HOME/cortados.config.toml`, used with `codex --profile cortados` (0.163.0 refuses
+`[profiles.X]` tables; `wire_api = "chat"` is gone, so the Responses wire is the only one):
+
+```toml
+model = "cortados"
+model_provider = "cortados"
+model_context_window = 200000
+
+[model_providers.cortados]
+name = "CortadOS"
+base_url = "http://127.0.0.1:8432/v1"
+env_key = "CORTADOS_PROVIDER_TOKEN"
+wire_api = "responses"
+request_max_retries = 0            # a CortadOS turn is minutes long and not idempotent: no silent re-run
+stream_max_retries = 0
+stream_idle_timeout_ms = 1800000   # must exceed the endpoint's turn timeout (CORTADOS_PROVIDER_TURN_TIMEOUT_S, 1800 s)
+```
+
+A `model_catalog_json` entry for `cortados` would silence "Model metadata for cortados not found" and set the shell
+tool type; optional, later.
+
+**P2 acceptance** (the orchestrator runs these; they spend quota and need Forest's go-ahead):
+1. Start the endpoint: `CORTADOS_PROVIDER_TOKEN=<token> python3 -B -m cortados_router.provider.server`
+   (`--codex-home <dir>` for the dedicated home).
+2. From Codex: the inline `codex exec` command above, from a repo. Pass: the `exec_command` runs in Codex, the
+   answer comes from the lane the server log names in `x-cortados-route`, and Codex shows no error for the `: ping`
+   lines or `response.created` (both unverified against its parser until this run).
+3. Onto Codex: `ANTHROPIC_BASE_URL=http://127.0.0.1:8432 ANTHROPIC_AUTH_TOKEN=<token> claude -p --model cortados
+   "summarize README.md"` with a request S1 routes to a Codex lane. Pass: the header reads `codex-cli/<model>`, the
+   Read ran in the client, the log shows `instructionSources` and no isolation error.
+
+**P2 known limits.**
+- No resume with tools: `thread/resume` and `thread/fork` take no `dynamicTools`, so a restarted endpoint answers
+  409 for a tool-bearing Codex conversation, exactly as P0 does for Claude.
+- `request_user_input` cannot be switched off. The backend answers it empty and logs a warning, so a model that asks
+  the user a question gets no answer and carries on.
+- A tool-less request (Codex's own summaries, Claude Code's titles) boots a whole app-server for one turn.
+- `account/rateLimits/updated` arrives on every turn with `primary`/`secondary {usedPercent, windowDurationMins,
+  resetsAt}`: a structured quota reading for P3's scarcity, later. Today the `/status` parser is the source.
+- Under the real Codex home the thread sees `~/.codex/AGENTS.md` and the skills list (above); the dedicated home
+  removes that.
+- The usage on a `tool_use` reply can be 0/0 (the delta rule above); clients that bill per message see the turn's
+  tokens on the next reply.
+- Unverified until the live checks: that Codex's SSE parser ignores `: ping` comments and accepts
+  `response.created`; and that the app-server accepts a dynamic tool named `request_user_input` (Codex as a client
+  sends that function tool, and the backend declares it beside the built-in of the same name; the fake accepts it,
+  the real server may refuse it as reserved, which would show as a 502 at thread/start and would mean dropping that
+  tool on the wire).
 
 ## S1 track (Forest's decisions 2026-10-21)
 
