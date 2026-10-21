@@ -617,7 +617,7 @@ def _sample_local_managed() -> dict[str, Any]:
     240-second join. It publishes through _write_cache like any other run and never touches the top-level stamp."""
     try:
         rec = {**_local(), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
-    except Exception as exc:      # keep the last good reading, say so (lane_scarcity expires it on its own clock)
+    except Exception as exc:      # keep the last good reading, say so (lane_scarcity treats a failed try as stale at once)
         try:
             old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
         except Exception:
@@ -640,10 +640,16 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
             fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
         else:
             fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
+        # A try that failed after the last good reading (the parser refused the screen, the CLI did not boot) makes the
+        # lane stale in the routing view at once; the reading stays on disk for diagnostics (Codex adversarial review
+        # 2026-10-21: a refused screen had kept a 15-minute-old reading "fresh" for up to six hours).
+        failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
+        fresh = fresh and not failed
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
         roll = _roll(general)
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
-                     "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {}}
+                     "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {},
+                     "error": v.get("error") if failed else None}
         if lane == "local" and managed_local:
             usable = fresh and v.get("resource_managed") is True
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},

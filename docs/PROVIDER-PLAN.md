@@ -117,6 +117,12 @@ Built from one real capture of Codex 0.163.0 (Forest approved the probe; the red
   never fresh-and-wrong. The screen's `OpenAI Codex (vX.Y.Z)` line is the version source; the reading records it.
 - A third fault found by the capture: the probe's ready pattern was `model:` and the screen prints `Model:`, so every
   probe waited out the full 20-second boot and retried (67 s a sample). It is case-insensitive now.
+- Codex's adversarial review of the first build (2026-10-21) found that a refused screen left the previous reading
+  "fresh" for routing for up to six hours, that a wrapped entry could borrow the next entry's figures, that truncated
+  or misplaced reset text passed as "no reset", that a quota line the grammar could not read vanished silently, and
+  that `25:00 PM` was normalised to 13:00. All five are fixed with regression cases: an entry ends at the next
+  `Name: value` field and must read completely; any `limit:` line must parse; clock values are validated before
+  conversion; and `lane_scarcity` treats a lane whose latest try failed as stale at once, for every vendor.
 
 Done-when, on the real capture at today's clock: window `all:week`, `resets_at 2026-10-27 12:01` as on the screen,
 scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture day) so they never age.

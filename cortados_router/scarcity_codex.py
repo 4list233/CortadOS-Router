@@ -19,7 +19,9 @@ PINNED_VERSIONS = ("0.163.0",)                                     # screen layo
 VERSION = re.compile(r"OpenAI Codex \(v(\d+\.\d+\.\d+)\)")
 LABEL = re.compile(r"^(?:(GPT-\d+(?:\.\d+)*(?:-[A-Za-z][A-Za-z0-9]*)*) )?(5h|Weekly)$")
 LIMIT_LINE = re.compile(r"^[\s│|]*(?P<label>[^\[\]]*?) limit: \[[^\]]*\](?P<rest>.*)$")
-LEFT = re.compile(r"(\d{1,3})% left(?: \(resets (?P<when>[^)]*)\))?")
+ENTRY = re.compile(r"^(\d{1,3})% left(?: \(resets (?P<when>[^()]*)\))?$")   # the whole entry: nothing missing, nothing trailing
+FIELD = re.compile(r"^[\s│|]*[A-Za-z][A-Za-z0-9 .\-]*: ")                     # "Name: value": the next field ends an entry's wrap
+ANY_LIMIT = re.compile(r"\blimit:", re.I)
 RESET = re.compile(r"^(\d{1,2}):(\d{2})(?: ?([AaPp][Mm]))?(?: on (\d{1,2}) ([A-Z][a-z]{2}))?$")
 SPAN_S = {"5h": 5 * 3600.0, "Weekly": 7 * 86400.0}
 SLACK_S = 3600.0            # the screen shows minutes, and a reset can sit a few minutes past the window's nominal length
@@ -45,9 +47,11 @@ def reset_time(when: str | None, span: str, left: int, now: datetime) -> float |
     m = RESET.match(" ".join(when.split()))
     if not m:
         raise ValueError(f"unreadable reset text {when!r}")
-    hour, minute = int(m.group(1)), int(m.group(2))
-    if m.group(3):
-        hour = hour % 12 + (12 if m.group(3).upper() == "PM" else 0)
+    hour, minute, meridiem = int(m.group(1)), int(m.group(2)), (m.group(3) or "").upper()
+    if not (0 <= minute <= 59 and (1 <= hour <= 12 if meridiem else 0 <= hour <= 23)):   # validate before converting: "25:00 PM" is not 13:00
+        raise ValueError(f"impossible clock time in reset text {when!r}")
+    if meridiem:
+        hour = hour % 12 + (12 if meridiem == "PM" else 0)
     reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if m.group(4):
         reset = reset.replace(month=datetime.strptime(m.group(5), "%b").month, day=int(m.group(4)))
@@ -71,21 +75,31 @@ def parse_status(text: str, now: float | None = None) -> list[dict]:
     for i, line in enumerate(lines):
         m = LIMIT_LINE.match(line)
         if not m:
+            if ANY_LIMIT.search(line):                              # a quota line the grammar cannot read must not vanish silently
+                raise ValueError(f"unreadable limit line {line.strip()!r} on the Codex /status screen")
             continue
         label = " ".join(m.group("label").split())                  # runs of spaces inside a label collapse before matching
         g = LABEL.match(label)
         if not g:
             raise ValueError(f"unknown limit label {label!r} on the Codex /status screen; refusing to guess a pool")
         model, span = g.group(1) or "", g.group(2)
-        tail = " ".join(" ".join(x.split()) for x in [m.group("rest"), *lines[i + 1:i + 1 + TAIL_LINES]])
-        left_m = LEFT.search(tail)
-        if not left_m:
-            raise ValueError(f"'{label} limit' has no 'N% left' within {TAIL_LINES} lines of it")
-        left = int(left_m.group(1))
+        # The entry's "N% left (resets …)" may wrap onto the next lines. It ends at the next "Name: value" field, a blank
+        # line or TAIL_LINES, and must then read completely: nothing missing, nothing trailing, nothing borrowed from
+        # the entry below it.
+        parts = [m.group("rest")]
+        for nxt in lines[i + 1:i + 1 + TAIL_LINES]:
+            if not nxt.strip() or FIELD.match(nxt):
+                break
+            parts.append(nxt)
+        entry_text = " ".join(" ".join(p.split()) for p in parts).strip(" │|")
+        e = ENTRY.match(entry_text)
+        if not e:
+            raise ValueError(f"'{label} limit' entry unreadable: {entry_text!r}")
+        left = int(e.group(1))
         if left > 100:
             raise ValueError(f"'{label} limit' shows {left}% left")
         entry = {"span": "5-hour" if span == "5h" else "week", "model": model, "left_pct": left,
-                 "reset_at": reset_time(left_m.group("when"), span, left, at), "version": ver}
+                 "reset_at": reset_time(e.group("when"), span, left, at), "version": ver}
         # a repainted screen shows an entry more than once: the latest paint is the screen's final state
         out = [e for e in out if (e["span"], e["model"]) != (entry["span"], model)] + [entry]
     if not out:

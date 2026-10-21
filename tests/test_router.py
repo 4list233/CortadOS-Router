@@ -215,7 +215,15 @@ class UsageScreens(unittest.TestCase):
                             (head + " Weekly limit: [█]\n40%\nleft (resets 12:01 PM on 27 Oct, maybe)", "unreadable reset"),
                             (head + " Weekly limit: [█]\n40%\nleft", "no reset time"),
                             (">_ OpenAI Codex (v0.170.0)\n Weekly limit: [█]\n100%\nleft", "not one this parser"),
-                            (" Weekly limit: [█]\n100%\nleft", "no 'OpenAI Codex")):
+                            (" Weekly limit: [█]\n100%\nleft", "no 'OpenAI Codex"),
+                            # adversarial review 2026-10-21: an incomplete entry must not borrow the next entry's figures …
+                            (head + " Weekly limit: [█]\n GPT-5.3-Codex-Spark Weekly limit: [█]\n100%\nleft", "'Weekly limit' entry unreadable"),
+                            # … a truncated or misplaced reset is not "no reset" …
+                            (head + " Weekly limit: [█]\n100%\nleft (resets 12:01 PM on 27 Oct", "entry unreadable"),
+                            (head + " Weekly limit: [█]\n50%\nleft (resets 12:01 PM) on 27 Oct", "entry unreadable"),
+                            # … a quota line the grammar cannot read must not vanish, and an impossible clock is not normalised
+                            (head + " 5h limit: [█]\n100%\nleft\n Weekly limit: 0% left (resets 12:01 PM on 27 Oct)", "unreadable limit line"),
+                            (head + " 5h limit: [█]\n50%\nleft (resets 25:00 PM)", "impossible clock time")):
             with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
                 self.sc.parse_codex_status(screen, now=self.FROZEN)
         w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft", now=self.FROZEN)          # untouched: no reset clock is running

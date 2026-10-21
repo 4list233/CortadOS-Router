@@ -59,6 +59,25 @@ class Capture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unknown limit label'):      # an unreadable screen fails the sample; nothing is guessed
                 scarcity._codex()
 
+    def test_a_refused_screen_makes_the_lane_stale_at_once(self):
+        # The previous reading stays on disk for diagnostics, but routing must not keep using it for up to six hours.
+        import json, time
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "windows": [], "pools": {}}
+            (home / "scarcity.json").write_text(json.dumps({"fetched_at": time.time() - 900, "learned_at": time.time(), "lanes": {"codex": good}}))
+            def refused():
+                raise ValueError("Codex CLI v0.170.0 is not one this parser was verified against")
+            with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
+                 patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "PROBE_DIR", home / "usage-probe"), \
+                 patch.dict(scarcity.SAMPLERS, {"codex": refused}), patch.object(scarcity, "_plans", return_value={}), \
+                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"}):
+                scarcity._sample_locked(force=True, only=["codex"])
+                lane = scarcity.lane_scarcity()["codex"]
+            self.assertIsNone(lane["scarcity"])
+            self.assertIn("not one this parser", lane["error"])
+            self.assertEqual(json.loads((home / "scarcity.json").read_text())["lanes"]["codex"]["scarcity"], -0.6)   # kept for diagnostics
+
     def test_boot_exit_recovers_once_and_retains_diagnostic(self):
         calls = []
         def capture(*args, diagnostics, **kwargs):
