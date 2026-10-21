@@ -294,15 +294,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "api_error", str(exc), wire)
         msg_id = wire.new_message_id()
         if turn.stream:
-            self.send_response(200)
-            self._route_header(session)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("cache-control", "no-cache")
-            self.send_header("connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            self.wfile.write(wire.stream_start(msg_id, turn.model))
-            self.wfile.flush()
+            try:
+                self.send_response(200)
+                self._route_header(session)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(wire.stream_start(msg_id, turn.model))
+                self.wfile.flush()
+            except OSError as exc:
+                # The client left before the first byte. A one-shot's backend lives nowhere but here, so it is closed
+                # now (a kept session is the reaper's); without this the headless CLI would outlive the request.
+                logger.info("conversation %s: client gone before the stream started (%s)", session.id[:8], exc)
+                if one_shot:
+                    session.close()
+                return
         outcome: dict[str, Any] = {}
 
         def work():

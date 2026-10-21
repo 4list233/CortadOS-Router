@@ -64,6 +64,27 @@ DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_ima
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
 LEAKED_ITEMS = frozenset({"commandExecution", "fileChange", "mcpToolCall", "webSearch", "imageView",
                           "collabAgentToolCall", "subAgentActivity", "sleep", "imageGeneration"})
+# The one mcpToolCall that is not a leak: Codex's own MCP *resource* tools (server "codex"), which it registers
+# whenever config.toml declares MCP servers, disabled or not (verified live, 0.163.0: the model called
+# list_mcp_resources and got {"resources": []}). They run inside the app-server against the configured servers, all
+# of which the effective-config check proved disabled, so nothing external runs; they are logged, not fatal.
+BENIGN_MCP_TOOLS = ("codex", frozenset({"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"}))
+# Codex's own tool names (0.163.0: the handlers under core/src/tools/handlers and the tool specs in the binary). A
+# dynamic tool carrying one of these names passes thread/start but never reaches the model, even with the built-in's
+# feature disabled (verified live: a dynamic `exec_command` was never offered and the model gave up; the same tool as
+# `client_exec_command` was called at once). Codex as a client sends exactly these names, so a colliding client tool
+# is declared under ALIAS_PREFIX + name and the item/tool/call is mapped back to the client's name. A collision with a
+# name outside this set cannot be detected here (P2 known limit).
+CODEX_TOOL_NAMES = frozenset({
+    "exec_command", "write_stdin", "shell", "shell_command", "local_shell", "apply_patch", "view_image", "update_plan",
+    "request_user_input", "request_user_input_async", "request_permissions", "web_search", "image_generation",
+    "get_goal", "create_goal", "update_goal", "sleep", "current_time", "get_context_remaining", "new_context_window",
+    "spawn_agent", "send_input", "send_message", "send_message_to_user", "send_message_to_user_async", "wait_agent", "wait",
+    "close_agent", "resume_agent", "interrupt_agent", "list_agents", "followup_task", "assign_agent_task",
+    "search_tools", "tool_search", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+    "node_repl", "js_repl", "list_available_plugins_to_install", "request_plugin_install", "wait_for_environment",
+    "test_sync_tool", "exec"})
+ALIAS_PREFIX = "client_"
 # Approval requests mean a built-in tool is about to run; they are declined AND reported as a violation (brief §A.10).
 V2_APPROVALS = {"item/commandExecution/requestApproval": {"decision": "decline"},
                 "item/fileChange/requestApproval": {"decision": "decline"}}
@@ -151,6 +172,17 @@ def check_account(account: dict[str, Any]) -> None:
                           f"codex-cli lane is a subscription lane and must not bill another account")
 
 
+def tool_aliases(tools: list[dict[str, Any]]) -> dict[str, str]:
+    """Dynamic-tool name -> client tool name, for the client tools whose names Codex would swallow (CODEX_TOOL_NAMES).
+    Refuses an alias that is itself a client tool's name: the call could not be mapped back unambiguously."""
+    names = {t["name"] for t in tools}
+    aliases = {ALIAS_PREFIX + n: n for n in sorted(names & CODEX_TOOL_NAMES)}
+    taken = sorted(set(aliases) & names)
+    if taken:
+        raise BridgeError(f"client tools {taken} collide with the aliases of Codex-named tools; rename them")
+    return aliases
+
+
 def _content_items(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """MCP tool-result content (anthropic_wire.mcp_content) as Codex DynamicToolCallResponse content items."""
     out = []
@@ -207,6 +239,7 @@ class CodexSession:
         self._usage_mark: dict[str, Any] = {}           # tokenUsage.total at the last run_turn boundary
         self.thread_id: str | None = None
         self._turn_id: str | None = None
+        self._aliases: dict[str, str] = {}              # dynamic tool name -> client tool name (tool_aliases)
         if codex_home:
             # The child's cwd is the scratch work dir while this process reads config.toml from its own cwd, so a
             # relative home would name two different directories for the two readers; make it one absolute path.
@@ -258,10 +291,16 @@ class CodexSession:
         check_account(self._call("account/read", {"refreshToken": False}, HANDSHAKE_S))
         config = self._call("config/read", {}, HANDSHAKE_S)
         check_effective_config(config["config"] if isinstance(config.get("config"), dict) else config)
+        self._aliases = tool_aliases(tools)
+        declared = {v: k for k, v in self._aliases.items()}
+        if self._aliases:
+            logger.info("codex conversation %s: client tools named like Codex's own are declared as %s", self.id[:8],
+                        sorted(self._aliases))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             "baseInstructions": system or "You are a helpful assistant.",
-            "dynamicTools": [{"type": "function", "name": t["name"], "description": t.get("description", ""),
+            "dynamicTools": [{"type": "function", "name": declared.get(t["name"], t["name"]),
+                              "description": t.get("description", ""),
                               "inputSchema": t.get("input_schema") or {"type": "object"}} for t in tools]}
         if model:
             params["model"] = model
@@ -391,6 +430,8 @@ class CodexSession:
         deadline = time.time() + timeout
         if self._pending:
             self._abandon_turn(deadline)
+            if time.time() >= deadline:
+                raise BridgeError("the request deadline passed while the previous turn was being abandoned")
         params: dict[str, Any] = {"threadId": self.thread_id, "summary": "none", "input": _turn_input(content)}
         effort = (self.route or {}).get("effort")       # only a route that carries one; otherwise the model default
         if effort:
@@ -418,10 +459,14 @@ class CodexSession:
             logger.warning("codex conversation %s: turn/interrupt refused: %s", self.id[:8], exc)
         drain_until = min(deadline, time.time() + INTERRUPT_S)
         while True:
+            # Checked on every iteration, not only when the queue runs dry: a backlog that keeps the queue non-empty
+            # (a server streaming errors) would otherwise hold the request thread and the lock past the deadline.
+            if time.time() >= drain_until:
+                raise BridgeError(f"codex app-server did not complete the interrupted turn within {INTERRUPT_S:.0f}s")
             try:
                 kind, msg = self._events.get(timeout=max(drain_until - time.time(), 0))
             except queue.Empty:
-                raise BridgeError(f"codex app-server did not complete the interrupted turn within {INTERRUPT_S:.0f}s")
+                continue
             if kind == "exit":
                 raise BridgeError(f"codex app-server exited with code {msg} while a turn was being interrupted")
             if kind == "request":
@@ -492,7 +537,8 @@ class CodexSession:
                         raise BridgeError(f"codex app-server sent a malformed item/tool/call: {json.dumps(params)[:300]}")
                     if call_id in self.emitted:
                         raise BridgeError(f"codex app-server reused tool call id {call_id}")
-                    blocks.append({"type": "tool_use", "id": call_id, "name": params.get("tool") or "", "input": args})
+                    name = params.get("tool") or ""
+                    blocks.append({"type": "tool_use", "id": call_id, "name": self._aliases.get(name, name), "input": args})
                     self._pending[call_id] = msg["id"]
                     self.emitted.add(call_id)
                 else:
@@ -532,10 +578,14 @@ class CodexSession:
         if method == "mcpServer/startupStatus/updated":
             self._check_fatal()                         # the reader set it; raise it here, on the request thread
         if method in ("item/started", "item/completed"):
-            itype = (params.get("item") or {}).get("type")
-            if itype in LEAKED_ITEMS:
+            item = params.get("item") or {}
+            itype = item.get("type")
+            if itype == "mcpToolCall" and item.get("server") == BENIGN_MCP_TOOLS[0] and item.get("tool") in BENIGN_MCP_TOOLS[1]:
+                if method == "item/started":
+                    logger.info("codex conversation %s: the model listed MCP resources (%s); none are served", self.id[:8], item.get("tool"))
+            elif itype in LEAKED_ITEMS:
                 raise BridgeError(f"codex app-server ran a built-in tool ({itype} item) despite isolation; "
-                                  f"the headless Codex must never run a tool itself")
+                                  f"the headless Codex must never run a tool itself: {json.dumps(params.get('item'))[:400]}")
         elif method == "model/rerouted":
             # Codex moved the turn to another model (one it could not serve under the routed slug); the route log
             # would then name a model that did not answer. The routed model is the one that must run.

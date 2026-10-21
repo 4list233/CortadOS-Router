@@ -217,6 +217,10 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   provider, so a refusal here means nothing ran. The config.toml reader (which names the servers to disable) is the
   pre-spawn best effort; a server it could not name (`["mcp_servers".x]`, a dotted key, another layer) is caught here.
   Verified on 0.163.0: `config/read` reflects the `-c` overrides and `--disable` flags exactly.
+- Second review pass: a client that disconnects before the first SSE byte closes its one-shot backend (the write of
+  `response.created` / `message_start` is inside the cleanup); the drain after `turn/interrupt` and `run_turn`'s
+  wait both check the absolute deadline on every iteration, so a server that streams events without end cannot hold
+  the request thread, the session lock or the backend past `TURN_TIMEOUT_S`.
 - Two leaks remain under the real home and are documented, not hidden: `~/.codex/AGENTS.md` is loaded
   (`instructionSources`, logged at thread start; it reaches the thread as a user message) and the user's skills list
   is injected as a developer message. The fix is `CORTADOS_PROVIDER_CODEX_HOME` / `--codex-home`: a dedicated
@@ -277,6 +281,22 @@ stream_idle_timeout_ms = 1800000   # must exceed the endpoint's turn timeout (CO
 
 A `model_catalog_json` entry for `cortados` would silence "Model metadata for cortados not found" and set the shell
 tool type; optional, later.
+
+**P2 live findings (2026-10-21, acceptance runs on the real app-server).**
+- A dynamic tool whose name is one of Codex's own tool names (`exec_command`, `write_stdin`, `view_image`,
+  `request_user_input`, the goal tools, ...) passes `thread/start` but is never offered to the model, even with the
+  built-in's feature disabled: the model answered "I can't access README.md". The same tool declared as
+  `client_exec_command` was called at once and the turn succeeded. Codex as a client sends exactly those names, so the
+  bridge declares colliding client tools under `client_<name>` (`codex_bridge.CODEX_TOOL_NAMES`, `tool_aliases`) and
+  maps `item/tool/call` back to the client's name. A collision with a Codex name outside that set is undetectable
+  from the bridge (known limit).
+- Codex registers its MCP *resource* tools (`list_mcp_resources`, `list_mcp_resource_templates`,
+  `read_mcp_resource`, items of type `mcpToolCall` with server `codex`) whenever config.toml declares MCP servers,
+  disabled or not. They run inside the app-server against servers the effective-config check proved disabled, so the
+  bridge logs them instead of treating them as a leak (`BENIGN_MCP_TOOLS`); every other `mcpToolCall` is still fatal.
+- Check 3 (Claude Code → `cortados` → Codex backend) passed: the client's Read ran, the answer was the heading,
+  route `codex-cli/gpt-6.1-sol` (S1 down on the build Mac, so a degraded decision). Check 2 (Codex → `cortados` →
+  Codex backend) first failed on the two findings above; rerun after the fix below.
 
 **P2 acceptance** (the orchestrator runs these; they spend quota and need Forest's go-ahead):
 1. Start the endpoint: `CORTADOS_PROVIDER_TOKEN=<token> python3 -B -m cortados_router.provider.server`

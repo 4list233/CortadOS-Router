@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 
 from cortados_router.provider import codex_bridge
+from cortados_router.provider import server as provider_server
 from cortados_router.provider.bridge import BridgeError
 from cortados_router.provider.server import ProviderServer, Registry
 
@@ -276,6 +277,41 @@ class CodexEndpointTests(unittest.TestCase):
         init = [m for m in self.inbound() if m.get("method") == "initialize"][0]["params"]
         self.assertTrue(init["capabilities"]["experimentalApi"])
 
+    def test_client_tools_named_like_codex_tools_are_aliased_on_the_wire_and_mapped_back(self):
+        # Codex as a client sends exec_command, write_stdin, request_user_input, view_image, ...: Codex as the backend
+        # would never offer a dynamic tool of those names to the model (verified live), so they go in under client_
+        # and the tool_use the client receives carries its own name again.
+        exec_tool = {"name": "exec_command", "description": "run", "input_schema": {"type": "object"}}
+        r = self.post({"tools": [exec_tool, READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
+        start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
+        self.assertEqual([t["name"] for t in start["dynamicTools"]], ["client_exec_command", "Read"])
+        [call] = [b for b in r["content"] if b["type"] == "tool_use"]
+        self.assertEqual(call["name"], "exec_command")                 # the fake calls its first dynamic tool
+        self.assertEqual(r["stop_reason"], "tool_use")
+
+    def test_a_client_gone_before_the_first_event_still_closes_the_one_shot_backend(self):
+        # A tool-less streaming request whose client disconnects while the backend starts: the first SSE write fails
+        # before the worker's cleanup exists. The one-shot's app-server is in no registry, so it must be closed here.
+        closed, orig_close, orig_start = [], codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_start
+
+        def close(s):
+            closed.append(s.id)
+            orig_close(s)
+
+        def gone(*a):
+            raise BrokenPipeError("client hung up")
+        codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_start = close, gone
+        try:
+            try:
+                self.post({"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            except Exception:
+                pass                                                     # the connection ends without a body
+        finally:
+            codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_start = orig_close, orig_start
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(self.reg.sessions, {})
+        self.assertEqual([d for d in os.listdir(self.scratch) if d.startswith("cortados-codex-")], [])
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
@@ -399,6 +435,16 @@ class CodexSessionUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(BridgeError, itype):
                 s._note_notification({"method": "item/started", "params": {"item": {"type": itype, "id": "i1"}}})
         s._note_notification({"method": "item/started", "params": {"item": {"type": "agentMessage", "id": "m1"}}})
+        # Codex's own MCP resource tools (server "codex") run inside the app-server against servers the config check
+        # proved disabled: not a leak. Any other mcpToolCall is.
+        s._note_notification({"method": "item/started", "params": {"item": {"type": "mcpToolCall", "id": "r1", "server": "codex",
+                                                                          "tool": "list_mcp_resources", "arguments": {}}}})
+        with self.assertRaisesRegex(BridgeError, "mcpToolCall"):
+            s._note_notification({"method": "item/started", "params": {"item": {"type": "mcpToolCall", "id": "r2", "server": "docs",
+                                                                              "tool": "list_mcp_resources"}}})
+        with self.assertRaisesRegex(BridgeError, "mcpToolCall"):
+            s._note_notification({"method": "item/started", "params": {"item": {"type": "mcpToolCall", "id": "r3", "server": "codex",
+                                                                              "tool": "search"}}})
 
     def test_a_binary_that_cannot_start_is_a_bridge_error_and_leaks_no_scratch_dir(self):
         with self.assertRaisesRegex(BridgeError, "cannot start .*no-such-codex"):
@@ -461,7 +507,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         # deadline must still end the turn: with calls collected they are returned, with none it is a failure.
         s = object.__new__(codex_bridge.CodexSession)
         s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
-        s._events, s._pending, s.emitted, s._delivered = queue.Queue(), {}, set(), set()
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
         stop, settle = threading.Event(), codex_bridge.CODEX_SETTLE_S
 
         def chatter():
@@ -484,6 +530,42 @@ class CodexSessionUnitTests(unittest.TestCase):
         finally:
             stop.set()
             codex_bridge.CODEX_SETTLE_S = settle
+
+    def test_tool_aliases_cover_the_codex_client_tool_set_and_refuse_a_taken_alias(self):
+        codex_client = [{"name": n} for n in ("exec_command", "write_stdin", "request_user_input", "view_image",
+                                              "get_goal", "create_goal", "update_goal", "apply_patch", "update_plan")]
+        aliases = codex_bridge.tool_aliases(codex_client + [{"name": "Read"}])
+        self.assertEqual(aliases, {"client_" + t["name"]: t["name"] for t in codex_client})
+        self.assertEqual(codex_bridge.tool_aliases([{"name": "Read"}, {"name": "Edit"}]), {})
+        with self.assertRaisesRegex(BridgeError, "client_sleep"):
+            codex_bridge.tool_aliases([{"name": "sleep"}, {"name": "client_sleep"}])
+
+    def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
+        # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
+        s = object.__new__(codex_bridge.CodexSession)
+        s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id = "unit", None, {}, {}, "t1", "turn-1"
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, set(), {}
+        s._reply, s._call = (lambda *a, **k: None), (lambda *a, **k: {})
+        stop, result = threading.Event(), {}
+
+        def chatter():
+            while not stop.is_set():
+                s._events.put(("notify", {"method": "error", "params": {"error": {"message": "x"}, "willRetry": True}}))
+                time.sleep(0.005)
+
+        def abandon():
+            try:
+                s._abandon_turn(time.time() + 0.2)
+            except BridgeError as exc:
+                result["error"] = exc
+        threading.Thread(target=chatter, daemon=True).start()
+        worker = threading.Thread(target=abandon, daemon=True)
+        worker.start()
+        worker.join(3)
+        stop.set()
+        self.assertFalse(worker.is_alive(), "the drain outlived its deadline")
+        self.assertIn("did not complete the interrupted turn", str(result.get("error")))
+        self.assertEqual(s._pending, {})
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))
