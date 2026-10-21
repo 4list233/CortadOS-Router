@@ -70,15 +70,20 @@ def reset_time(when: str | None, span: str, left: int, now: float) -> float | No
     for y, mo, d in dates:
         for fold in (0, 1):                                         # the hour that repeats when DST ends: both readings
             try:
-                stamps.add(datetime(y, mo, d, hour, minute, fold=fold).timestamp())
+                ts = datetime(y, mo, d, hour, minute, fold=fold).timestamp()
             except ValueError:                                      # 29 Feb in a year without one
-                pass
+                continue
+            if datetime.fromtimestamp(ts).timetuple()[:5] != (y, mo, d, hour, minute):   # a time DST skips normalises instead of failing: not on the calendar
+                continue
+            stamps.add(ts)
     candidates = sorted(ts for ts in stamps if ts - now >= -SLACK_S)
     if not candidates:
         raise ValueError(f"reset text {when!r} has no reading on the calendar")
     ahead = candidates[0] - now
     if ahead > SPAN_S[span] + SLACK_S:                              # a week's reset on the week's last day is still inside
         raise ValueError(f"{span} reset {when!r} is {ahead / 3600:.1f} h away, outside its {SPAN_S[span] / 3600:.0f}-hour window")
+    if len(candidates) > 1 and candidates[1] - now <= SPAN_S[span] + SLACK_S:   # only the repeated hour puts two readings inside one window
+        raise ValueError(f"reset text {when!r} names two moments inside the {span} window (the hour DST repeats); refusing to guess")
     return candidates[0]
 
 

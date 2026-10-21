@@ -279,6 +279,13 @@ class UsageScreens(unittest.TestCase):
                     self.assertEqual(w[0]["resets_at"], expect)
             with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):           # fall back: "6:30 AM" is seven elapsed hours from 00:30, not six
                 self.sc.parse_codex_status(head + " 5h limit: [█]\n50%\nleft (resets 6:30 AM on 1 Nov)", now=at(2026, 11, 1, 0, 30, 0))
+            # fifth pass: the hour DST repeats names two moments and the screen does not say which; a time DST skips is not on the calendar
+            with self.assertRaisesRegex(ValueError, "two moments"):
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n20%\nleft (resets 1:30 AM)", now=at(2026, 11, 1, 1, 45, 0))
+            with self.assertRaisesRegex(ValueError, "no reading on the calendar|outside its"):
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n50%\nleft (resets 2:30 AM on 8 Mar)", now=at(2026, 3, 8, 3, 15, 0))
+            with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):           # the skipped 2:30 is not today's; tomorrow's is 23 h out
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n50%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 3, 15, 0))
         finally:
             if saved is None:
                 os.environ.pop("TZ", None)
