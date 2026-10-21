@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -55,7 +57,7 @@ def _sha(value):
 class LabelAttempts:
     def __init__(self, data_dir, *, validate_answers, questions):
         self.data = Path(data_dir).resolve(strict=True)
-        self.identity = self._identity()
+        self.identity = dict(self._identity(), volume=self._volume())
         self.private = self.data / '.teacher-attempts'
         self.path = self.private / 'manifest.json'
         self.validate_answers, self.questions = validate_answers, tuple(questions)
@@ -74,18 +76,37 @@ class LabelAttempts:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid(): _bad()
         return dict(path=str(self.data), device=info.st_dev, inode=info.st_ino)
 
-    @staticmethod
-    def _durable(identity):
-        """The part of a data identity that survives a reboot: path and inode.
+    def _volume(self):
+        """The data folder's APFS volume UUID: stable across reboots, unlike st_dev.
 
-        APFS assigns volume device numbers at mount time, so a saved st_dev goes stale on
-        reboot (2026-10-19: every later run refused its own manifest). In-process checks
-        still compare the full identity, device included.
+        APFS assigns device numbers at mount time, so a saved st_dev goes stale on reboot
+        (2026-10-19: every later run refused its own manifest). Inodes are only unique within
+        a volume, so path + inode alone would accept a replacement volume's manifest.
         """
-        if (not isinstance(identity, dict) or set(identity) != {'path', 'device', 'inode'}
-                or not isinstance(identity['path'], str) or not _integer(identity['device'])
-                or not _integer(identity['inode'])): _bad()
-        return identity['path'], identity['inode']
+        try:
+            df = subprocess.run(['/bin/df', '-P', str(self.data)], capture_output=True, text=True,
+                                timeout=10, check=True).stdout.splitlines()
+            info = subprocess.run(['/usr/sbin/diskutil', 'info', '-plist', df[-1].split()[0]],
+                                  capture_output=True, timeout=10, check=True).stdout
+            volume = plistlib.loads(info)['VolumeUUID']
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError) as exc:
+            raise WorkerError('storage_error', 'Teacher data volume is unidentifiable') from exc
+        if not isinstance(volume, str) or not re.fullmatch('[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', volume): _bad()
+        return volume
+
+    def _continuous(self, saved):
+        """Whether a saved identity names this same folder on this same volume.
+
+        Manifests written before the volume field existed carry no UUID: they are accepted only
+        when their device number still matches, which is the original strict check.
+        """
+        legacy = {'path', 'device', 'inode'}
+        if (not isinstance(saved, dict) or set(saved) not in (legacy, legacy | {'volume'})
+                or not isinstance(saved['path'], str) or not _integer(saved['device'])
+                or not _integer(saved['inode'])): _bad()
+        if (saved['path'], saved['inode']) != (self.identity['path'], self.identity['inode']): return False
+        if 'volume' in saved: return saved['volume'] == self.identity['volume']
+        return saved['device'] == self.identity['device']
 
     def _check(self):
         if self.poisoned or self.lock is None or self.lock.closed or self.owner_pid != os.getpid(): _bad()
@@ -97,7 +118,8 @@ class LabelAttempts:
             fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise WorkerError('storage_error', 'Teacher writer lock is unavailable') from exc
-        if self._identity() != self.identity or self.manifest['data_identity'] != self.identity: _bad()
+        if (self._identity() != {k: self.identity[k] for k in ('path', 'device', 'inode')}
+                or self.manifest['data_identity'] != self.identity): _bad()
         self._secure(self.private, 0o700, directory=True)
         self._secure(self.private / 'lock', 0o600)
         if self.path.exists() or self.path.is_symlink(): self._secure(self.path, 0o600)
@@ -132,7 +154,8 @@ class LabelAttempts:
                     self.manifest = dict(schema='cortados.teacher-attempts.v1', data_identity=self.identity,
                                          revision=0, attempts=[])
                 self._validate_manifest()
-                # Same folder after a reboot: adopt this boot's device number; the next save persists it.
+                # Same folder on the same volume: adopt this boot's device number and the volume UUID;
+                # the next save persists both.
                 self.manifest['data_identity'] = self.identity
                 self._check()
                 self._labels(self.data / 'labels.jsonl')
@@ -186,8 +209,7 @@ class LabelAttempts:
         m = self.manifest
         if (not isinstance(m, dict) or set(m) != {'schema', 'data_identity', 'revision', 'attempts'}
                 or m['schema'] != 'cortados.teacher-attempts.v1' or not _integer(m['revision'])
-                or self._durable(m['data_identity']) != self._durable(self.identity)
-                or not isinstance(m['attempts'], list)): _bad()
+                or not self._continuous(m['data_identity']) or not isinstance(m['attempts'], list)): _bad()
         ids, requests, slots = set(), set(), set()
         for a in m['attempts']:
             self._validate_attempt(a)

@@ -45,7 +45,11 @@ class TeacherAttemptRegressions(TeacherCase):
         path.write_text(json.dumps(saved))
         return saved['data_identity']
 
-    def test_reboot_device_change_keeps_the_manifest_and_adopts_the_new_device(self):
+    def assertRefused(self):
+        with self.assertRaises(WorkerError):
+            with self.store(): pass
+
+    def test_reboot_device_change_on_the_same_volume_keeps_the_manifest(self):
         with self.store() as store: original = self.reserve(store)
         current = self.data.stat()
         self._rebind_saved_identity(device=current.st_dev + 1)
@@ -53,17 +57,34 @@ class TeacherAttemptRegressions(TeacherCase):
             self.assertEqual(store.pending()[0], original)
             self.assertEqual(store.manifest['data_identity']['device'], current.st_dev)
 
-    def test_different_inode_is_still_refused(self):
+    def test_replacement_volume_with_the_same_path_and_inode_is_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(device=self.data.stat().st_dev + 1,
+                                    volume='00000000-0000-4000-8000-000000000000')
+        self.assertRefused()
+
+    def test_different_inode_is_refused(self):
         with self.store() as store: self.reserve(store)
         self._rebind_saved_identity(inode=self.data.stat().st_ino + 1)
-        with self.assertRaises(WorkerError):
-            with self.store(): pass
+        self.assertRefused()
+
+    def test_legacy_manifest_opens_only_while_its_device_matches_and_then_gains_the_volume(self):
+        with self.store() as store: original = self.reserve(store)
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        volume = saved['data_identity'].pop('volume')
+        path.write_text(json.dumps(saved))
+        with self.store() as store:
+            self.assertEqual(store.pending()[0], original)
+            self.assertEqual(store.manifest['data_identity']['volume'], volume)
+        saved['data_identity']['device'] += 1
+        path.write_text(json.dumps(saved))
+        self.assertRefused()
 
     def test_malformed_saved_identity_is_refused(self):
         with self.store() as store: self.reserve(store)
         self._rebind_saved_identity(device='16777234')
-        with self.assertRaises(WorkerError):
-            with self.store(): pass
+        self.assertRefused()
 
     def test_same_invocation_context_does_not_allow_a_second_flock(self):
         from cortados_router.teacher_attempts import _ACTIVE
