@@ -38,6 +38,112 @@ class TeacherAttemptRegressions(TeacherCase):
         with self.assertRaises(WorkerError):
             with self.store(): pass
 
+    def _rebind_saved_identity(self, **changes):
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        saved['data_identity'].update(changes)
+        path.write_text(json.dumps(saved))
+        return saved['data_identity']
+
+    def assertRefused(self):
+        with self.assertRaises(WorkerError):
+            with self.store(): pass
+
+    def test_reboot_device_change_on_the_same_volume_keeps_the_manifest(self):
+        with self.store() as store: original = self.reserve(store)
+        current = self.data.stat()
+        self._rebind_saved_identity(device=current.st_dev + 1)
+        with self.store() as store:
+            self.assertEqual(store.pending()[0], original)
+            self.assertEqual(store.manifest['data_identity']['device'], current.st_dev)
+
+    def test_replacement_volume_with_the_same_path_and_inode_is_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(device=self.data.stat().st_dev + 1,
+                                    volume='00000000-0000-4000-8000-000000000000')
+        self.assertRefused()
+
+    def test_different_inode_is_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(inode=self.data.stat().st_ino + 1)
+        self.assertRefused()
+
+    def _make_legacy(self):
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        volume = saved['data_identity'].pop('volume')
+        path.write_text(json.dumps(saved))
+        return volume
+
+    def test_legacy_manifest_is_refused_even_when_path_device_and_inode_match(self):
+        with self.store() as store: self.reserve(store)
+        self._make_legacy()
+        self.assertRefused()
+
+    def migrate(self, volume):
+        from cortados_router.teacher_attempts import LabelAttempts
+        return LabelAttempts.migrate_volume(self.data, volume, validate_answers=COMMON.valid_answers,
+                                            questions=QUESTIONS)
+
+    def assertMigrationRefusedAndManifestUnchanged(self, volume):
+        path = self.data / '.teacher-attempts/manifest.json'
+        before = path.read_bytes()
+        with self.assertRaises(WorkerError):
+            self.migrate(volume)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_operator_migration_records_the_verified_volume_then_the_store_opens(self):
+        with self.store() as store: original = self.reserve(store)
+        volume = self._make_legacy()
+        self.migrate(volume)
+        saved = json.loads((self.data / '.teacher-attempts/manifest.json').read_text())
+        self.assertEqual(saved['data_identity']['volume'], volume)
+        with self.store() as store:
+            self.assertEqual(store.pending()[0], original)
+
+    def test_migration_refuses_a_different_volume_or_a_changed_device(self):
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        self.assertMigrationRefusedAndManifestUnchanged('00000000-0000-4000-8000-000000000000')
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        saved['data_identity']['device'] += 1
+        path.write_text(json.dumps(saved))
+        self.assertMigrationRefusedAndManifestUnchanged(volume)
+
+    def test_migration_refuses_while_a_writer_holds_the_lock(self):
+        import fcntl
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        with open(self.data / '.teacher-attempts/lock', 'a+b') as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertMigrationRefusedAndManifestUnchanged(volume)
+
+    def test_migration_refuses_an_insecure_lock_file(self):
+        import os
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        os.chmod(self.data / '.teacher-attempts/lock', 0o666)
+        self.assertMigrationRefusedAndManifestUnchanged(volume)
+
+    def test_migration_refuses_a_symlinked_journal_directory(self):
+        import os, shutil
+        with self.store() as store: self.reserve(store)
+        volume = self._make_legacy()
+        private = self.data / '.teacher-attempts'
+        moved = self.data.parent / 'redirected-attempts'
+        shutil.move(str(private), str(moved))
+        os.symlink(moved, private)
+        before = (moved / 'manifest.json').read_bytes()
+        with self.assertRaises(WorkerError):
+            self.migrate(volume)
+        self.assertEqual((moved / 'manifest.json').read_bytes(), before)
+
+    def test_malformed_saved_identity_is_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(device='16777234')
+        self.assertRefused()
+
     def test_same_invocation_context_does_not_allow_a_second_flock(self):
         from cortados_router.teacher_attempts import _ACTIVE
         with self.store() as first:

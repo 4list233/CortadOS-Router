@@ -260,7 +260,17 @@ canonical answer store or writer. New attempts cannot reserve occupied or alread
 
 Closed manifest schema (unknown/missing fields refuse; no implicit migrations):
 `{schema,data_identity,revision,attempts}`. data_identity is exactly
-`{path,device,inode}` for the resolved DATA directory; moving/replacing it refuses automatic replay. Revision is a nonnegative nonboolean integer. Attempts is an ordered
+`{path,device,inode,volume}` for the resolved DATA directory, where volume is its APFS volume UUID;
+moving/replacing it refuses automatic replay. Continuity is path + inode + volume: APFS renumbers
+device on every mount, so a reboot changes device without changing the folder (amendment 6,
+2026-10-21: the Studio's 10-19 reboot made every run refuse its own manifest). On open the store
+adopts the current device; the next save persists it. A manifest written before amendment 6 has no
+volume and is refused (a matching device number does not prove the volume) until the operator runs
+`LabelAttempts.migrate_volume(DATA, <verified volume UUID>, validate_answers=…, questions=…)`. It
+runs through the normal writer entry (the same lock, ownership, mode, symlink and DATA identity
+checks as any writer), requires the named UUID to equal DATA's current volume and the saved path,
+device and inode to match, and saves the migrated data_identity (a new revision) before returning.
+No attempt is exposed or replayed before that migration. Revision is a nonnegative nonboolean integer. Attempts is an ordered
 list of closed records with exactly:
 `{attempt_id,request_id,row_ids,payload,sample,system_prompt,system_prompt_digest,provider,model,
 arguments,config_digest,state,job_id,result_digest,terminal_state,publication_ts,publication_rows,

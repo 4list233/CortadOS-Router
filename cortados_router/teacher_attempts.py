@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -55,7 +57,7 @@ def _sha(value):
 class LabelAttempts:
     def __init__(self, data_dir, *, validate_answers, questions):
         self.data = Path(data_dir).resolve(strict=True)
-        self.identity = self._identity()
+        self.identity = dict(self._identity(), volume=self._volume())
         self.private = self.data / '.teacher-attempts'
         self.path = self.private / 'manifest.json'
         self.validate_answers, self.questions = validate_answers, tuple(questions)
@@ -68,11 +70,63 @@ class LabelAttempts:
         self.poisoned = False
         self.owner_pid, self.owner_thread = os.getpid(), threading.get_ident()
         self.handoff_nonce = None
+        self._migration = None
 
     def _identity(self):
         info = self.data.stat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid(): _bad()
         return dict(path=str(self.data), device=info.st_dev, inode=info.st_ino)
+
+    def _volume(self):
+        """The data folder's APFS volume UUID: stable across reboots, unlike st_dev.
+
+        APFS assigns device numbers at mount time, so a saved st_dev goes stale on reboot
+        (2026-10-19: every later run refused its own manifest). Inodes are only unique within
+        a volume, so path + inode alone would accept a replacement volume's manifest.
+        """
+        try:
+            df = subprocess.run(['/bin/df', '-P', str(self.data)], capture_output=True, text=True,
+                                timeout=10, check=True).stdout.splitlines()
+            info = subprocess.run(['/usr/sbin/diskutil', 'info', '-plist', df[-1].split()[0]],
+                                  capture_output=True, timeout=10, check=True).stdout
+            volume = plistlib.loads(info)['VolumeUUID']
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError) as exc:
+            raise WorkerError('storage_error', 'Teacher data volume is unidentifiable') from exc
+        if not isinstance(volume, str) or not re.fullmatch('[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', volume): _bad()
+        return volume
+
+    def _continuous(self, saved):
+        """Whether a saved identity names this same folder on this same volume.
+
+        A manifest without a volume UUID proves nothing about its volume (a replacement volume can
+        receive the same device number), so it is refused until migrate_volume records one.
+        """
+        if (not isinstance(saved, dict) or set(saved) != {'path', 'device', 'inode', 'volume'}
+                or not isinstance(saved['path'], str) or not _integer(saved['device'])
+                or not _integer(saved['inode'])): _bad()
+        return (saved['path'], saved['inode'], saved['volume']) == (
+            self.identity['path'], self.identity['inode'], self.identity['volume'])
+
+    @classmethod
+    def migrate_volume(cls, data_dir, volume, *, validate_answers, questions):
+        """Operator migration for a manifest written before the volume field existed.
+
+        The operator names the volume UUID they verified as the original; it must equal the data
+        folder's current volume, and the saved path, device and inode must all still match. Runs
+        through the normal writer entry (lock, ownership, modes, DATA recheck) and saves the
+        migrated identity before returning, so no attempt is used under an unproven volume.
+        """
+        store = cls(data_dir, validate_answers=validate_answers, questions=questions)
+        store._migration = volume
+        with store:
+            store._save(copy.deepcopy(store.manifest))
+        return dict(store.identity)
+
+    def _migrate(self):
+        saved = self.manifest.get('data_identity') if isinstance(self.manifest, dict) else None
+        legacy = {k: self.identity[k] for k in ('path', 'device', 'inode')}
+        if saved != legacy or self._migration != self.identity['volume']: _bad()
+        self.manifest['data_identity'] = dict(self.identity)
 
     def _check(self):
         if self.poisoned or self.lock is None or self.lock.closed or self.owner_pid != os.getpid(): _bad()
@@ -84,7 +138,8 @@ class LabelAttempts:
             fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise WorkerError('storage_error', 'Teacher writer lock is unavailable') from exc
-        if self._identity() != self.identity or self.manifest['data_identity'] != self.identity: _bad()
+        if (self._identity() != {k: self.identity[k] for k in ('path', 'device', 'inode')}
+                or self.manifest['data_identity'] != self.identity): _bad()
         self._secure(self.private, 0o700, directory=True)
         self._secure(self.private / 'lock', 0o600)
         if self.path.exists() or self.path.is_symlink(): self._secure(self.path, 0o600)
@@ -118,7 +173,11 @@ class LabelAttempts:
                 else:
                     self.manifest = dict(schema='cortados.teacher-attempts.v1', data_identity=self.identity,
                                          revision=0, attempts=[])
+                if self._migration is not None: self._migrate()
                 self._validate_manifest()
+                # Same folder on the same volume: adopt this boot's device number and the volume UUID;
+                # the next save persists both.
+                self.manifest['data_identity'] = self.identity
                 self._check()
                 self._labels(self.data / 'labels.jsonl')
                 self.active_token = _ACTIVE.set(self)
@@ -171,7 +230,7 @@ class LabelAttempts:
         m = self.manifest
         if (not isinstance(m, dict) or set(m) != {'schema', 'data_identity', 'revision', 'attempts'}
                 or m['schema'] != 'cortados.teacher-attempts.v1' or not _integer(m['revision'])
-                or m['data_identity'] != self.identity or not isinstance(m['attempts'], list)): _bad()
+                or not self._continuous(m['data_identity']) or not isinstance(m['attempts'], list)): _bad()
         ids, requests, slots = set(), set(), set()
         for a in m['attempts']:
             self._validate_attempt(a)
