@@ -271,6 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid_request_error", str(exc), wire)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
+        created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
             route = None
             if reg.router:
@@ -305,11 +306,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(wire.stream_start(msg_id, turn.model))
                 self.wfile.flush()
             except OSError as exc:
-                # The client left before the first byte. A one-shot's backend lives nowhere but here, so it is closed
-                # now (a kept session is the reaper's); without this the headless CLI would outlive the request.
+                # The client left before the first byte. A one-shot's backend lives nowhere but here, and a session
+                # this request just opened has no history a retry could find again (find() never matches an opening
+                # request), so both are closed now instead of outliving the request until the idle reaper. An
+                # existing conversation is kept: its client may well come back.
                 logger.info("conversation %s: client gone before the stream started (%s)", session.id[:8], exc)
                 if one_shot:
                     session.close()
+                elif created:
+                    reg.drop(session)
                 return
         outcome: dict[str, Any] = {}
 

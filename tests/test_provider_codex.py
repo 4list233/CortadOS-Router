@@ -302,14 +302,16 @@ class CodexEndpointTests(unittest.TestCase):
             raise BrokenPipeError("client hung up")
         codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_start = close, gone
         try:
-            try:
-                self.post({"stream": True, "messages": [{"role": "user", "content": "hi"}]})
-            except Exception:
-                pass                                                     # the connection ends without a body
+            for body in ({"stream": True, "messages": [{"role": "user", "content": "hi"}]},             # one-shot
+                         {"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]}):  # opening a kept session
+                try:
+                    self.post(body)
+                except Exception:
+                    pass                                                 # the connection ends without a body
         finally:
             codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_start = orig_close, orig_start
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(self.reg.sessions, {})
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.reg.sessions, {})                          # the just-opened session is not left for the reaper
         self.assertEqual([d for d in os.listdir(self.scratch) if d.startswith("cortados-codex-")], [])
 
     def test_the_system_prompt_is_the_thread_base_instructions(self):
@@ -566,6 +568,36 @@ class CodexSessionUnitTests(unittest.TestCase):
         self.assertFalse(worker.is_alive(), "the drain outlived its deadline")
         self.assertIn("did not complete the interrupted turn", str(result.get("error")))
         self.assertEqual(s._pending, {})
+
+    def test_abandonment_writes_share_the_request_deadline_and_an_expired_request_starts_no_turn(self):
+        # Four pending calls, a server whose stdin takes 120 ms per line, 25 ms left: one write at most, then the
+        # deadline, never four fresh REPLY_WRITE_S budgets. And with nothing pending, an expired deadline must not
+        # reach turn/start.
+        class SlowStdin:
+            def write(self, line):
+                time.sleep(0.12)
+
+            def flush(self):
+                pass
+
+        class Proc:
+            stdin, killed = SlowStdin(), False
+
+            def kill(self):
+                self.killed = True
+        s = object.__new__(codex_bridge.CodexSession)
+        s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id, s.proc = "unit", None, {}, {}, "t1", "turn-1", Proc()
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), set(), {}
+        s.route, s.last_used, s.dir = None, 0.0, Path(self.scratch)
+        t0 = time.time()
+        with self.assertRaises(BridgeError):
+            s._abandon_turn(time.time() + 0.025)
+        self.assertLess(time.time() - t0, 0.3)
+        calls = []
+        s._pending, s._call = {}, lambda method, *a, **k: calls.append(method) or {"turn": {"id": "x"}}
+        with self.assertRaisesRegex(BridgeError, "deadline passed before the turn could start"):
+            s.send_user([{"type": "text", "text": "late"}], timeout=-1)
+        self.assertEqual(calls, [])
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))

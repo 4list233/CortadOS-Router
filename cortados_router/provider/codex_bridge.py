@@ -395,10 +395,20 @@ class CodexSession:
             msg["params"] = params
         self._write(json.dumps(msg) + "\n", REPLY_WRITE_S)
 
-    def _reply(self, rid: Any, result: dict[str, Any] | None = None, error: dict[str, Any] | None = None) -> None:
+    def _reply(self, rid: Any, result: dict[str, Any] | None = None, error: dict[str, Any] | None = None,
+               timeout: float = REPLY_WRITE_S) -> None:
         msg: dict[str, Any] = {"id": rid}
         msg.update({"error": error} if error else {"result": result})
-        self._write(json.dumps(msg) + "\n", REPLY_WRITE_S)
+        self._write(json.dumps(msg) + "\n", timeout)
+
+    @staticmethod
+    def _budget(deadline: float, what: str) -> float:
+        """The write budget left under an absolute deadline; a passed deadline is a BridgeError, never a 0 s write
+        (which would kill a healthy server for being a few microseconds late)."""
+        left = deadline - time.time()
+        if left <= 0:
+            raise BridgeError(f"the request deadline passed {what}")
+        return min(REPLY_WRITE_S, left)
 
     def _call(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         """One client request; returns its result or raises BridgeError for an error reply, exit or timeout."""
@@ -430,8 +440,7 @@ class CodexSession:
         deadline = time.time() + timeout
         if self._pending:
             self._abandon_turn(deadline)
-            if time.time() >= deadline:
-                raise BridgeError("the request deadline passed while the previous turn was being abandoned")
+        self._budget(deadline, "before the turn could start")      # never start backend work for an expired request
         params: dict[str, Any] = {"threadId": self.thread_id, "summary": "none", "input": _turn_input(content)}
         effort = (self.route or {}).get("effort")       # only a route that carries one; otherwise the model default
         if effort:
@@ -447,8 +456,11 @@ class CodexSession:
         a turn instead of steering the old one."""
         logger.warning("codex conversation %s: new user message while %d tool call(s) are unanswered; failing them "
                        "and interrupting the turn", self.id[:8], len(self._pending))
-        for rid in self._pending.values():
-            self._reply(rid, {"success": False, "contentItems": [{"type": "inputText", "text": MOVED_ON}]})
+        # Every write here is bounded by what is left of the request's deadline, not by a fresh REPLY_WRITE_S each: a
+        # server that drains stdin slowly would otherwise hold the session lock for pending × REPLY_WRITE_S.
+        for rid in list(self._pending.values()):
+            self._reply(rid, {"success": False, "contentItems": [{"type": "inputText", "text": MOVED_ON}]},
+                        timeout=self._budget(deadline, "while failing the abandoned tool calls"))
         self._pending.clear()
         turn_id = self._turn_id
         try:
@@ -470,10 +482,12 @@ class CodexSession:
             if kind == "exit":
                 raise BridgeError(f"codex app-server exited with code {msg} while a turn was being interrupted")
             if kind == "request":
+                budget = self._budget(drain_until, "while draining the abandoned turn")
                 if msg["method"] == "item/tool/call":   # a late sibling call of the abandoned turn
-                    self._reply(msg["id"], {"success": False, "contentItems": [{"type": "inputText", "text": MOVED_ON}]})
+                    self._reply(msg["id"], {"success": False, "contentItems": [{"type": "inputText", "text": MOVED_ON}]},
+                                timeout=budget)
                 else:
-                    self._answer(msg)
+                    self._answer(msg, timeout=budget)
                 continue
             self._note_notification(msg)
             if msg.get("method") == "turn/completed" and (msg.get("params") or {}).get("turn", {}).get("id") == turn_id:
@@ -597,27 +611,27 @@ class CodexSession:
             logger.warning("codex conversation %s: mid-turn error %s (willRetry=%s)", self.id[:8],
                            json.dumps(params.get("error"))[:300], params.get("willRetry"))
 
-    def _answer(self, msg: dict[str, Any]) -> None:
+    def _answer(self, msg: dict[str, Any], timeout: float = REPLY_WRITE_S) -> None:
         """Defensive answers to the server requests that are not tool calls (§A.10): the turn hangs otherwise."""
         method, rid = msg["method"], msg["id"]
         if method == "item/tool/requestUserInput":
             # request_user_input is the one built-in tool that cannot be switched off; an empty answer lets the turn go on.
-            self._reply(rid, {"answers": {}})
+            self._reply(rid, {"answers": {}}, timeout=timeout)
             logger.warning("codex conversation %s: the model asked the user a question; answered empty", self.id[:8])
         elif method in V2_APPROVALS:
-            self._reply(rid, V2_APPROVALS[method])
+            self._reply(rid, V2_APPROVALS[method], timeout=timeout)
             raise BridgeError(f"codex app-server asked for approval of a built-in tool ({method}) despite isolation")
         elif method in V1_APPROVALS:
-            self._reply(rid, V1_APPROVALS[method])
+            self._reply(rid, V1_APPROVALS[method], timeout=timeout)
             raise BridgeError(f"codex app-server asked for approval of a built-in tool ({method}) despite isolation")
         elif method == "item/permissions/requestApproval":
-            self._reply(rid, {"permissions": {}})
+            self._reply(rid, {"permissions": {}}, timeout=timeout)
             logger.warning("codex conversation %s: permissions request declined", self.id[:8])
         elif method == "mcpServer/elicitation/request":
-            self._reply(rid, {"action": "decline"})
+            self._reply(rid, {"action": "decline"}, timeout=timeout)
             logger.warning("codex conversation %s: MCP elicitation declined", self.id[:8])
         else:
-            self._reply(rid, error={"code": -32601, "message": f"cortados: unsupported server request {method}"})
+            self._reply(rid, error={"code": -32601, "message": f"cortados: unsupported server request {method}"}, timeout=timeout)
             logger.warning("codex conversation %s: unsupported server request %s refused", self.id[:8], method)
 
     def _finish(self, blocks: list[dict[str, Any]], stop: str) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
