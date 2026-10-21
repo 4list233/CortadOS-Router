@@ -97,6 +97,19 @@ class ScoredSelection(unittest.TestCase):
         core.scored_candidates, core.model_scores, core.lane_health = _scored, (lambda: self.MS), (lambda: {})
     def tearDown(self):
         core.scored_candidates, core.model_scores, core.lane_health = self._keep
+    def test_capacity_credit_needs_a_fresh_reading(self):
+        # second adversarial review 2026-10-21: a failed Codex sample (scarcity None, read as 0) still earned the tokens-left credit and beat Claude
+        keep = core._tokens_left_for
+        core._tokens_left_for = lambda c: 500_000_000 if c["lane"] == "codex" else None
+        try:
+            fresh = {"codex": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+            core.lane_health = lambda: fresh
+            self.assertEqual(core.resolve(dec(steps=2, ambiguity=1, work_kind="code"))["chosen"]["lane"], "codex")      # fresh pool with the most room: credited
+            core.lane_health = lambda: {}                                                                                   # unknown or failed: no reading at all
+            r = core.resolve(dec(steps=2, ambiguity=1, work_kind="code"))
+            self.assertEqual(r["chosen"]["lane"], "claude"); self.assertNotIn("tokens_left", json.dumps(r["chosen"]))
+        finally:
+            core._tokens_left_for = keep
     def test_requirement_is_continuous_in_difficulty(self):
         t = core.table()
         r = [core.required_index(t, self.MS, "code", D, "R2") for D in (6, 7, 8)]
@@ -202,9 +215,83 @@ class UsageScreens(unittest.TestCase):
     def test_claude(self):
         w = self.sc.parse_claude_usage("Current session\r ███ \n20%\nused\r Resets 12pm (America/Toronto)\r Current week (all models)\r ████ \n70%\nused\r Resets Sep 21 at 3pm (America/Toronto)")
         self.assertEqual([(x["window"], x["used_pct"]) for x in w], [("5-hour session", 20.0), ("week (all models)", 70.0)]); self.assertTrue(all(x["resets_at"] for x in w))
+    FROZEN = __import__("datetime").datetime(2026, 10, 21, 12, 0).timestamp()   # the day of the 0.163.0 capture: the fixtures never age
     def test_codex(self):
-        w = self.sc.parse_codex_status("│ Weekly limit: [░░░░░░░░] 0% left (resets 11:35 on 23 Sep) │")
-        self.assertEqual((w[0]["window"], w[0]["used_pct"], w[0]["scarcity"], w[0]["pool"]), ("week", 100.0, 1.0, "all")); self.assertIn("-09-23 11:35", w[0]["resets_at"])
+        text = (ROOT / "tests/fixtures/codex-status-0.163.0.txt").read_text()                     # the real screen, redacted
+        w = self.sc.parse_codex_status(text, now=self.FROZEN)
+        self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("week", "all", 0.0)])   # the session uuid above the limit line is not a pool
+        self.assertIn("-10-27 12:01", w[0]["resets_at"]); self.assertTrue(143 < w[0]["resets_in_h"] < 145)   # "12:01 PM on 27 Oct" read as a date, not as under a day away
+    def test_codex_screen_is_never_guessed(self):
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        for screen, why in ((head + " 01a10000-0000-7000-8000-000000000000 Weekly limit: [█]\n100%\nleft", "unknown limit label"),
+                            (head + " Weekly limit: [█]\n40%\nleft (resets 12:01 PM on 27 Nov)", "outside its"),
+                            (head + " Weekly limit: [█]\n40%\nleft (resets 12:01 PM on 27 Oct, maybe)", "unreadable reset"),
+                            (head + " Weekly limit: [█]\n40%\nleft", "no reset time"),
+                            (">_ OpenAI Codex (v0.170.0)\n Weekly limit: [█]\n100%\nleft", "not one this parser"),
+                            (" Weekly limit: [█]\n100%\nleft", "no 'OpenAI Codex"),
+                            # adversarial review 2026-10-21: an incomplete entry must not borrow the next entry's figures …
+                            (head + " Weekly limit: [█]\n GPT-5.3-Codex-Spark Weekly limit: [█]\n100%\nleft", "'Weekly limit' entry unreadable"),
+                            # … a truncated or misplaced reset is not "no reset" …
+                            (head + " Weekly limit: [█]\n100%\nleft (resets 12:01 PM on 27 Oct", "entry unreadable"),
+                            (head + " Weekly limit: [█]\n50%\nleft (resets 12:01 PM) on 27 Oct", "entry unreadable"),
+                            # … a quota line the grammar cannot read must not vanish, and an impossible clock is not normalised
+                            (head + " 5h limit: [█]\n100%\nleft\n Weekly limit: 0% left (resets 12:01 PM on 27 Oct)", "unreadable limit line"),
+                            (head + " 5h limit: [█]\n50%\nleft (resets 25:00 PM)", "impossible clock time"),
+                            (head + " Weekly limit: [█]\n100%\nleft (resets )", "entry unreadable")):          # an empty reset is not "no reset"
+            with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
+                self.sc.parse_codex_status(screen, now=self.FROZEN)
+        w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft", now=self.FROZEN)          # untouched: no reset clock is running
+        self.assertEqual((w[0]["used_pct"], w[0]["resets_at"]), (0.0, None))
+        w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft\n 5h limit: [█]\n100%\nleft", now=self.FROZEN)   # a digit-leading entry ends the one above
+        self.assertEqual([x["window"] for x in w], ["week", "5-hour"])
+    def test_codex_time_only_reset_beside_the_clock(self):
+        # adversarial review 2026-10-21 (third pass): the screen shows minutes, so a reset read during its displayed minute is now, not tomorrow
+        import datetime
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        day = datetime.datetime(2026, 10, 21)
+        for clock, when, expect in (((12, 0, 30), "12:00 PM", day.replace(hour=12)),                 # the displayed minute
+                                    ((23, 59, 30), "12:00 AM", day + datetime.timedelta(days=1)),     # midnight, half a minute ahead
+                                    ((0, 0, 30), "12:00 AM", day),                                     # midnight, half a minute behind
+                                    ((12, 30, 0), "12:00 PM", day.replace(hour=12))):                  # clocks half an hour apart: the reset just passed, as the date form reads it
+            with self.subTest(when=when, clock=clock):
+                now = day.replace(hour=clock[0], minute=clock[1], second=clock[2]).timestamp()
+                w = self.sc.parse_codex_status(head + f" 5h limit: [█]\n0%\nleft (resets {when})", now=now)
+                self.assertEqual(w[0]["resets_at"], expect.strftime("%Y-%m-%d %H:%M"))
+        with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):                           # two hours past is tomorrow's time, and tomorrow is outside a 5-hour window
+            self.sc.parse_codex_status(head + " 5h limit: [█]\n0%\nleft (resets 12:00 PM)", now=day.replace(hour=14, second=1).timestamp())
+    def test_codex_reset_across_calendar_boundaries(self):
+        # adversarial review 2026-10-21 (fourth pass): a reset inside the past hour may sit on yesterday's date or in last year, and the window
+        # is measured in elapsed seconds, so a DST change neither refuses a reset 45 minutes past nor admits one seven hours ahead
+        import datetime, os, time
+        if not hasattr(time, "tzset"):
+            self.skipTest("needs time.tzset to pin the zone")
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Toronto"; time.tzset()
+        try:
+            at = lambda *ymdhms: datetime.datetime(*ymdhms).timestamp()
+            for clock, entry, expect in (((2026, 10, 22, 0, 0, 1), " 5h limit: [█]\n50%\nleft (resets 11:59 PM)", "2026-10-21 23:59"),              # yesterday's, 61 s past
+                                         ((2027, 1, 1, 0, 0, 1), " Weekly limit: [█]\n50%\nleft (resets 11:59 PM on 31 Dec)", "2026-12-31 23:59"),  # last year's
+                                         ((2026, 3, 8, 3, 15, 0), " 5h limit: [█]\n50%\nleft (resets 1:30 AM)", "2026-03-08 01:30"),             # spring forward: 45 min past
+                                         ((2026, 11, 1, 0, 30, 0), " 5h limit: [█]\n50%\nleft (resets 5:30 AM on 1 Nov)", "2026-11-01 05:30")):  # fall back: six elapsed hours
+                with self.subTest(expect=expect):
+                    w = self.sc.parse_codex_status(head + entry, now=at(*clock))
+                    self.assertEqual(w[0]["resets_at"], expect)
+            with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):           # fall back: "6:30 AM" is seven elapsed hours from 00:30, not six
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n50%\nleft (resets 6:30 AM on 1 Nov)", now=at(2026, 11, 1, 0, 30, 0))
+            # fifth pass: the hour DST repeats names two moments and the screen does not say which; a time DST skips is not on the calendar
+            with self.assertRaisesRegex(ValueError, "two moments"):
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n20%\nleft (resets 1:30 AM)", now=at(2026, 11, 1, 1, 45, 0))
+            with self.assertRaisesRegex(ValueError, "no reading on the calendar|outside its"):
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n50%\nleft (resets 2:30 AM on 8 Mar)", now=at(2026, 3, 8, 3, 15, 0))
+            with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):           # the skipped 2:30 is not today's; tomorrow's is 23 h out
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n50%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 3, 15, 0))
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])
@@ -221,8 +308,13 @@ class UsageScreens(unittest.TestCase):
         self.assertGreaterEqual(rec["pools"]["fable"]["scarcity"], 0.75); self.assertLess(rec["scarcity"], 0.3)   # 0.8 minus the small expiring credit
         self.assertEqual(self.sc.pool_for("claude", "claude-fable-5-1", ["fable"]), "fable"); self.assertIsNone(self.sc.pool_for("claude", "claude-haiku-4-5", ["fable"]))
     def test_codex_named_limit(self):
-        w = self.sc.parse_codex_status("│ 5h limit: [███] 80% left (resets 14:05) │ Weekly limit: [░] 0% left (resets 11:35 on 23 Sep) │ GPT-5.3-Codex-Spark Weekly limit: [███] 90% left (resets 11:35 on 23 Sep) │")
-        self.assertEqual([(x["window"], x["pool"]) for x in w], [("5-hour", "all"), ("week", "all"), ("week (GPT-5.3-Codex-Spark)", "gpt-5-3-codex-spark")])
+        # the 0.163 layout: one entry per line, "% left" wrapped under it, a model-specific week beside the general one, the screen painted twice
+        entries = (" 5h limit: [████]\n80%\nleft (resets 2:05 PM)\n Weekly limit: [░]\n0%\nleft (resets 12:01 PM on 27 Oct)\n"
+                   " GPT-5.3-Codex-Spark   Weekly limit: [███]\n90%\nleft (resets 12:01 PM on 27 Oct)\n Credits: 5396\n")
+        screen = (">_ OpenAI Codex (v0.163.0)\n Account: user@example.com\n(Pro\n200)\n Session: 01a10000-0000-7000-8000-000000000000\n" + entries) * 2
+        w = self.sc.parse_codex_status(screen, now=self.FROZEN)
+        self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("5-hour", "all", 20.0), ("week", "all", 100.0), ("week (GPT-5.3-Codex-Spark)", "gpt-5-3-codex-spark", 10.0)])
+        self.assertEqual(w[1]["scarcity"], 1.0); self.assertIn("-10-21 14:05", w[0]["resets_at"]); self.assertIn("-10-27 12:01", w[2]["resets_at"])
     def test_antigravity(self):
         g = self.sc.parse_agy_usage("GEMINI MODELS Models within this group: Gemini Flash Weekly Limit Remaining [ ███ ] 99.03% Refreshes in 35h 32m Five Hour Limit Remaining [ ██ ] 98.02% Refreshes in 4h 25m "
                                     "CLAUDE AND GPT MODELS Models within this group: Claude Opus Weekly Limit Remaining [ ███ ] 100.00% Quota available Five Hour Limit Remaining [ ███ ] 100.00% Quota available")

@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('router_usage_capture_test', ROOT/'cortados_router/scarcity.py')
 scarcity = importlib.util.module_from_spec(spec); spec.loader.exec_module(scarcity)
+
+
+def codex_screen(left_pct):
+    """A 0.163.0 /status screen as the strict parser accepts it: the version line, one week entry, a reset inside the week."""
+    from datetime import datetime, timedelta
+    reset = (datetime.now() + timedelta(days=2)).strftime('%-I:%M %p on %-d %b')
+    return f'>_ OpenAI Codex (v0.163.0)\n Weekly limit: [####]\n{left_pct}%\nleft (resets {reset})\n'
 
 
 class Capture(unittest.TestCase):
@@ -36,9 +44,41 @@ class Capture(unittest.TestCase):
                 scarcity._codex()
 
     def test_status_parser_still_uses_only_captured_panel(self):
-        with patch.object(scarcity, '_cli_env', return_value={}), patch.object(scarcity, 'tui_capture', return_value='Weekly limit: [####] 63% left'):
+        with patch.object(scarcity, '_cli_env', return_value={}), patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)):
             result = scarcity._codex()
         self.assertEqual(result['windows'][0]['used_pct'], 37)
+
+    def test_probe_reads_the_version_and_waits_for_the_screen_as_printed(self):
+        # 0.163 prints "Model:"; the old lowercase ready pattern never matched, so every probe sat out the full boot wait.
+        with patch.object(scarcity, '_cli_env', return_value={}), patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)) as call:
+            result = scarcity._codex()
+        self.assertEqual(result['cli_version'], '0.163.0')
+        self.assertTrue(re.search(call.call_args.kwargs['ready'], 'Model: GPT-6.1-Sol (reasoning high)'))
+        self.assertTrue(re.search(call.call_args.args[2], ' Weekly limit: [####]\n63%\nleft (resets 12:01 PM on 27 Oct)'))
+        with patch.object(scarcity, '_cli_env', return_value={}), patch.object(scarcity, 'tui_capture', return_value='>_ OpenAI Codex (v0.163.0)\n Session: 01a1 Weekly limit: [#]\n63%\nleft'):
+            with self.assertRaisesRegex(ValueError, 'unknown limit label'):      # an unreadable screen fails the sample; nothing is guessed
+                scarcity._codex()
+
+    def test_a_refused_screen_makes_the_lane_stale_at_once(self):
+        # The previous reading stays on disk for diagnostics, but routing must not keep using it for up to six hours.
+        import json, time
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "pools": {},
+                    "windows": [{"window": "week", "pool": "all", "used_pct": 3.0, "elapsed_pct": 95.0, "scarcity": -0.6, "expiring_pct": 90, "resets_at": "soon"}]}
+            (home / "scarcity.json").write_text(json.dumps({"fetched_at": time.time() - 900, "learned_at": time.time(), "lanes": {"codex": good}}))
+            def refused():
+                raise ValueError("Codex CLI v0.170.0 is not one this parser was verified against")
+            with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
+                 patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "PROBE_DIR", home / "usage-probe"), \
+                 patch.dict(scarcity.SAMPLERS, {"codex": refused}), patch.object(scarcity, "_plans", return_value={}), \
+                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"}):
+                scarcity._sample_locked(force=True, only=["codex"])
+                lane = scarcity.lane_scarcity()["codex"]
+            self.assertIsNone(lane["scarcity"])
+            self.assertEqual((lane["tightest"], lane["expiring_pct"]), ({}, 0))      # no stale "expiring unused" credit either
+            self.assertIn("not one this parser", lane["error"])
+            self.assertEqual(json.loads((home / "scarcity.json").read_text())["lanes"]["codex"]["scarcity"], -0.6)   # kept for diagnostics
 
     def test_boot_exit_recovers_once_and_retains_diagnostic(self):
         calls = []
@@ -47,7 +87,7 @@ class Capture(unittest.TestCase):
             if len(calls) == 1:
                 diagnostics.update(stage='boot', eof=True, startup_chars=724, response_chars=0, ready_seen=False, boot_failure='unknown')
                 return ''
-            return 'Weekly limit: [####] 61% left'
+            return codex_screen(61)
         with patch.object(scarcity, '_cli_env', return_value={}), patch.object(scarcity, 'tui_capture', side_effect=capture):
             result = scarcity._codex()
         self.assertEqual(len(calls), 2)
@@ -85,7 +125,7 @@ class Capture(unittest.TestCase):
             fake.write_text('#!/bin/sh\n'); fake.chmod(0o755)
             env = {'CORTADOS_CODEX_BIN': '/nonexistent/codex', 'PATH': tmp}
             with patch.object(scarcity, '_cli_env', return_value=env), \
-                 patch.object(scarcity, 'tui_capture', return_value='Weekly limit: [####] 63% left') as call:
+                 patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)) as call:
                 result = scarcity._codex()
         self.assertEqual(call.call_args.args[0], [str(fake)],
                          'scarcity._codex: a missing configured binary must fall back to codex on PATH')
@@ -94,7 +134,7 @@ class Capture(unittest.TestCase):
 
     def test_codex_probe_keeps_a_working_configured_binary(self):
         with patch.object(scarcity, '_cli_env', return_value={'CORTADOS_CODEX_BIN': sys.executable, 'PATH': ''}), \
-             patch.object(scarcity, 'tui_capture', return_value='Weekly limit: [####] 63% left') as call:
+             patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)) as call:
             result = scarcity._codex()
         self.assertEqual(call.call_args.args[0], [sys.executable])
         self.assertNotIn('configured_binary_missing', result)

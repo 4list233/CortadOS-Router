@@ -103,6 +103,46 @@ Not yet in P1, each needing a decision or another phase:
 - Claude Code warns that it does not recognize `cortados` and assumes a 200k context window. P1 sets the window
   for the gateway model (see the link in that warning) to match the chosen lane.
 
+## P3 status (2026-10-21): the Codex `/status` parser
+
+Built from one real capture of Codex 0.163.0 (Forest approved the probe; the redacted screen is
+`tests/fixtures/codex-status-0.163.0.txt`). `cortados_router/scarcity_codex.py` is the one Codex screen parser:
+
+- A pool label is the text on the same line as `limit:`, matched against `^(GPT-… )?(5h|Weekly)$` with runs of
+  spaces collapsed. The session uuid above the entry is no longer a pool (P1).
+- `resets 12:01 PM on 27 Oct` reads as a date; a weekly reset must land inside the week (plus an hour of slack),
+  a 5-hour reset inside its five hours. Missing reset text is allowed only for an untouched window (P1b).
+- An unknown label, unreadable or leftover reset text, an out-of-range reset, or a CLI version not in
+  `PINNED_VERSIONS` raises; `_codex` then keeps the last good reading marked with the error, so the lane goes stale,
+  never fresh-and-wrong. The screen's `OpenAI Codex (vX.Y.Z)` line is the version source; the reading records it.
+- A third fault found by the capture: the probe's ready pattern was `model:` and the screen prints `Model:`, so every
+  probe waited out the full 20-second boot and retried (67 s a sample). It is case-insensitive now.
+- Codex's adversarial review of the first build (2026-10-21) found that a refused screen left the previous reading
+  "fresh" for routing for up to six hours, that a wrapped entry could borrow the next entry's figures, that truncated
+  or misplaced reset text passed as "no reset", that a quota line the grammar could not read vanished silently, and
+  that `25:00 PM` was normalised to 13:00. All five are fixed with regression cases: an entry ends at the next
+  `Name: value` field and must read completely; any `limit:` line must parse; clock values are validated before
+  conversion; and `lane_scarcity` treats a lane whose latest try failed as stale at once, for every vendor.
+- Its second pass found the staleness incomplete: the stale lane kept its window and "expiring unused" credit, and
+  the scored selector still paid the tokens-left credit on an unknown pool, so a failed Codex sample could beat
+  Claude. Now every routing signal goes with freshness (a stale lane has no window, no expiring credit, and earns no
+  capacity credit); a digit-leading `5h limit:` line ends the entry above it; and `(resets )` is an error, not "no
+  reset". Both selectors have resolve-level regressions.
+- Passes three to five went after the reset arithmetic: a time-only reset read during its displayed minute rolled to
+  tomorrow; `11:59 PM` read at 00:00:01 and `31 Dec` read on 1 Jan anchored to today's date or this year; naive
+  wall-clock subtraction misjudged windows across a DST change; the hour DST repeats was guessed; the hour DST skips
+  normalised to a real time. `reset_time` now turns every calendar reading the screen could mean (yesterday, today,
+  tomorrow; last, this, next year; both folds) into a timestamp, drops any that does not round-trip, keeps the earliest
+  not more than the slack hour in the past, bounds it by the window in elapsed seconds, and refuses two readings inside
+  one window. Tests pin America/Toronto for the midnight, year-end and both DST cases. The sixth pass approved.
+
+Done-when, on the real capture at today's clock: window `all:week`, `resets_at 2026-10-27 12:01` as on the screen,
+scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture day) so they never age.
+
+Not done here: the port into the live fleet's copy (`plugins/cortados-router/scarcity.py` on the Studio, hunk by
+hunk, with the three live-only deltas kept and a `hermes gateway restart` at an idle point) waits for Forest's
+decision on whether the frozen Hermes fleet still gets fixes.
+
 ## S1 track (Forest's decisions 2026-10-21)
 
 Today the teacher sees only the request text and `unit_kind`, while S1 can also receive a task context: the two are

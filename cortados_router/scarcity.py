@@ -322,29 +322,28 @@ def _antigravity() -> dict[str, Any]:
     return {"source": "agy /usage (pty)", "windows": wins}
 
 
-def parse_codex_status(text: str) -> list[dict[str, Any]]:
-    wins, text = [], re.sub(r"\s+", " ", text)
-    for m in re.finditer(r"((?:[A-Za-z0-9.-]+ ){0,3}?(?:5h|[Ww]eekly)|[A-Za-z0-9.-]+) limit: \[[^\]]*\] (\d{1,3})% left(?: \(resets ([^)]+)\))?", text):
-        label, left, when = m.groups()
-        reset = None
-        t = re.search(r"(\d{1,2}):(\d{2})(?: on (\d{1,2}) ([A-Z][a-z]{2}))?", when or "")
-        if t:
-            now = datetime.now()
-            reset_dt = now.replace(hour=int(t.group(1)), minute=int(t.group(2)), second=0, microsecond=0)
-            if t.group(3):
-                reset_dt = reset_dt.replace(month=datetime.strptime(t.group(4), "%b").month, day=int(t.group(3)))
-                if reset_dt < now - timedelta(days=1):
-                    reset_dt = reset_dt.replace(year=now.year + 1)
-            elif reset_dt <= now:
-                reset_dt += timedelta(days=1)
-            reset = reset_dt.timestamp()
-        span = "5-hour" if label.endswith("5h") else "week"
-        model = re.sub(r"\s*(5h|[Ww]eekly)$", "", label).strip()
-        name = span if not model else f"{span} ({model})"
-        if not any(w["window"] == name for w in wins):
-            w = window_view(name, 100.0 - float(left), reset, H5 if span == "5-hour" else D7)
-            w["pool"] = "all" if not model else re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-            wins.append(w)
+def _load_codex_screen():
+    """Sibling module loaded by path (this plugin is not a package): the one Codex /status parser."""
+    name = "cortados_router_scarcity_codex"
+    if name not in sys.modules:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(name, str(Path(__file__).with_name("scarcity_codex.py")))
+        mod = _ilu.module_from_spec(spec); sys.modules[name] = mod; spec.loader.exec_module(mod)
+    return sys.modules[name]
+
+
+codex_screen = _load_codex_screen()
+
+
+def parse_codex_status(text: str, now: float | None = None) -> list[dict[str, Any]]:
+    """The Codex /status screen as windows. Raises on a screen it cannot read (scarcity_codex): the sample then keeps
+    its last good reading marked with the error, and goes stale rather than fresh-and-wrong."""
+    wins = []
+    for e in codex_screen.parse_status(text, now):
+        name = e["span"] if not e["model"] else f"{e['span']} ({e['model']})"
+        w = window_view(name, 100.0 - float(e["left_pct"]), e["reset_at"], H5 if e["span"] == "5-hour" else D7, now)
+        w["pool"] = "all" if not e["model"] else re.sub(r"[^a-z0-9]+", "-", e["model"].lower()).strip("-")
+        wins.append(w)
     return wins
 
 
@@ -364,24 +363,25 @@ def _codex() -> dict[str, Any]:
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
-        text = tui_capture([binary], "/status", r"limit: \[[^\]]*\] \d+% left", env, boot_s=20,
-                           ready=r"model: +(?!loading)\S+", diagnostics=diagnostic)
-        wins = parse_codex_status(text)
-        if (not wins and not text.strip() and attempt == 0 and diagnostic.get("eof")
-                and diagnostic.get("stage") in {"boot", "trust"}
+        # The screen prints "Model:" (0.163); the old lowercase pattern never matched, so every probe sat out the full
+        # boot wait and retried (67 s a sample on 2026-10-21). The entry's "% left" may wrap onto its own line.
+        text = tui_capture([binary], "/status", r"limit: \[[^\]]*\]\s+\d+%\s+left", env, boot_s=20,
+                           ready=r"(?i)model: +(?!loading)\S+", diagnostics=diagnostic)
+        if text.strip():
+            break
+        if (attempt == 0 and diagnostic.get("eof") and diagnostic.get("stage") in {"boot", "trust"}
                 and diagnostic.get("boot_failure") not in {"auth", "config", "exec"}):
             # The old PTY has already been reaped. One new CLI can recover a
             # transient startup exit; never retry malformed panels or change auth.
             retries.append(dict(diagnostic))
             continue
         break
-    if not wins:
-        if not text.strip():
-            # Metadata only: distinguish startup exit from an unresponsive TUI
-            # without persisting boot screens, credentials or prompt contents.
-            raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
-        raise RuntimeError("no 'limit: … % left' lines on the /status screen: " + re.sub(r"\s+", " ", text)[-200:])
-    return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries,
+    if not text.strip():
+        # Metadata only: distinguish startup exit from an unresponsive TUI
+        # without persisting boot screens, credentials or prompt contents.
+        raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
+    wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
+    return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
             **({"configured_binary_missing": missing_bin, "binary": binary} if missing_bin else {})}
 
 
@@ -617,7 +617,7 @@ def _sample_local_managed() -> dict[str, Any]:
     240-second join. It publishes through _write_cache like any other run and never touches the top-level stamp."""
     try:
         rec = {**_local(), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
-    except Exception as exc:      # keep the last good reading, say so (lane_scarcity expires it on its own clock)
+    except Exception as exc:      # keep the last good reading, say so (lane_scarcity treats a failed try as stale at once)
         try:
             old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
         except Exception:
@@ -640,10 +640,18 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
             fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
         else:
             fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
+        # A try that failed after the last good reading (the parser refused the screen, the CLI did not boot) makes the
+        # lane stale in the routing view at once; the reading stays on disk for diagnostics (Codex adversarial review
+        # 2026-10-21: a refused screen had kept a 15-minute-old reading "fresh" for up to six hours).
+        failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
+        fresh = fresh and not failed
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
-        roll = _roll(general)
+        # Every routing signal goes with freshness: a stale lane's window and expiring credit are as unknown as its
+        # scarcity (second adversarial review: a refused sample still won on its old "expiring unused" bonus).
+        roll = _roll(general) if fresh else {"tightest": {}, "expiring_pct": 0}
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
-                     "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {}}
+                     "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {},
+                     "error": v.get("error") if failed else None}
         if lane == "local" and managed_local:
             usable = fresh and v.get("resource_managed") is True
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},

@@ -553,7 +553,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0) - sel.get("expiring_credit_points", 80) * max(-sc, 0.0), 1)
             # capacity (Forest 2026-09-26): plans are not normalised; among pools with room, the one with the most TOKENS left gets a further credit
             tl = _tokens_left_for(c)
-            if tl is not None and sc <= 0:
+            # the credit needs a FRESH reading: an unknown or failed pool (scarcity None, read as 0 above) earns nothing
+            if tl is not None and sc <= 0 and ch_of[id(c)].get("scarcity") is not None:
                 c["tokens_left"] = tl
         most = max((c.get("tokens_left") or 0) for c in cands) or 0
         for c in cands:

@@ -1,0 +1,69 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› /status show current session configuration and token usage 
+/statusline
+configure which items appear in the status line
+/status
+
+
+
+/status
+>_ OpenAI Codex (v0.163.0)
+Visit https://chatgpt.com/settings/usage for up-to-date
+information on rate limits and credits
+ Server: Local
+background
+server
+ Model: GPT-6.1-Sol (reasoning high)
+ Model provider: openai
+ Directory: /tmp/usage-probe/p1-1
+ Permissions: Workspace
+(granular)
+ Agents.md: ~/.codex/AGENTS.md
+ Account: user@example.com
+(Pro
+200)
+ Collaboration mode: Default
+ Session: 01a10000-0000-7000-8000-000000000000
+ Weekly limit: [████████████████████]
+100%
+left (resets 12:01 PM on 27 Oct)
+ Credits: 5396
+credits
+ 
+Ask Codex to do anything
+←
+for
+agents
+·
+?
+for
+shortcuts
+
+
+
+
+
+
+
+
+› 
