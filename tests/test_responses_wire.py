@@ -218,6 +218,20 @@ class ScoringTests(unittest.TestCase):
         self.assertNotIn("<developer prompt>", block["text"])
 
 
+    def test_one_shot_content_keeps_the_images_of_a_single_user_message(self):
+        # A tool-less request with an image (a screenshot and a question) reaches its throwaway CLI with the image,
+        # as on the Anthropic wire; dropping it would answer the question without its evidence.
+        img = {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+        both = request({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "what is this"}, img]}, tools=())
+        self.assertEqual(wire.one_shot_content(both), [
+            {"type": "text", "text": "what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}])
+        only = request({"type": "message", "role": "user", "content": [img]}, tools=())
+        self.assertEqual([b["type"] for b in wire.one_shot_content(only)], ["image"])
+        self.assertEqual(wire.score_messages(only), [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}])
+
+
 def parse_sse(raw: bytes) -> list[tuple[str, dict]]:
     """A tiny SSE reader: (event, data) per event; comment lines are dropped as the spec says."""
     events = []

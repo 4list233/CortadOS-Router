@@ -18,7 +18,10 @@ A turn/interrupt that arrives while a turn waits on the client ends that turn wi
 Env: FAKE_CODEX_ARGV dumps {"argv","cwd","env"}; FAKE_CODEX_LOG appends every inbound line; FAKE_CODEX_VERSION is
 the reported thread.cliVersion (default 0.163.0); FAKE_CODEX_MODEL makes thread/start answer that model instead of
 the requested one; FAKE_CODEX_SANDBOX makes it answer that sandbox type instead of readOnly; FAKE_CODEX_LEAK_MCP
-emits mcpServer/startupStatus/updated before the thread/start reply, like a configured MCP server starting.
+emits mcpServer/startupStatus/updated before the thread/start reply, like a configured MCP server starting;
+FAKE_CODEX_ACCOUNT is the JSON `account` object account/read answers (default a chatgpt pro login; "null" = no login);
+FAKE_CODEX_CONFIG_PATCH is JSON deep-merged over the effective config that config/read answers, which is otherwise
+built from this process's own `-c` overrides and `--disable` flags exactly as the real server reflects them.
 thread/start with dynamicTools and no experimentalApi
 capability is refused with the real -32600 error. Token usage: every model request adds 100 input / 10 output tokens
 to the thread total, reported as the real server does, after the tool results and after the final message.
@@ -34,8 +37,44 @@ import uuid
 VERSION = os.environ.get("FAKE_CODEX_VERSION", "0.163.0")
 LOG = os.environ.get("FAKE_CODEX_LOG")
 SLOW_SIBLING_S = 0.6                        # longer than bridge.SETTLE_S (0.3), shorter than codex_bridge.CODEX_SETTLE_S
-ENV_KEYS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY", "CODEX_HOME")
+ENV_KEYS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CODEX_HOME")
+# Every tool feature the real registry knows; `--disable` turns one off, the rest keep their stable default (on).
+FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps", "plugins", "hooks",
+            "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals", "memories", "browser_use", "computer_use",
+            "collaboration_modes", "code_mode_host")
+
+
+def toml_value(raw):
+    """The value of a `-c key=value` override: TOML scalars and the empty array, which JSON reads the same way."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw.strip('"')
+
+
+def effective_config(argv):
+    """What config/read answers: the defaults of a real 0.163.0 home with every -c override and --disable applied."""
+    cfg = {"model_provider": None, "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+           "mcp_servers": {}, "notify": None, "web_search": None, "include_environment_context": True,
+           "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
+    for i, a in enumerate(argv):
+        if a == "--disable" and i + 1 < len(argv):
+            cfg["features"][argv[i + 1]] = False
+        if a == "-c" and i + 1 < len(argv) and "=" in argv[i + 1]:
+            key, _, raw = argv[i + 1].partition("=")
+            parts, node = key.split("."), cfg
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = toml_value(raw)
+    patch = os.environ.get("FAKE_CODEX_CONFIG_PATCH")
+    if patch:
+        def merge(into, over):
+            for k, v in over.items():
+                into[k] = merge(into.get(k) or {}, v) if isinstance(v, dict) and isinstance(into.get(k), dict) else v
+            return into
+        merge(cfg, json.loads(patch))
+    return cfg
 if os.environ.get("FAKE_CODEX_ARGV"):
     with open(os.environ["FAKE_CODEX_ARGV"], "w") as f:
         json.dump({"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in ENV_KEYS}}, f)
@@ -214,6 +253,11 @@ def main():
         elif method == "initialized":
             notify("remoteControl/status/changed", {"status": "disabled", "serverName": "fake", "installationId": "x"})
             notify("account/updated", {"authMode": "chatgpt", "planType": "pro"})
+        elif method == "account/read":
+            account = json.loads(os.environ.get("FAKE_CODEX_ACCOUNT") or '{"type": "chatgpt", "email": "x@example.invalid", "planType": "pro"}')
+            out({"id": mid, "result": {"account": account, "requiresOpenaiAuth": True}})
+        elif method == "config/read":
+            out({"id": mid, "result": {"config": effective_config(sys.argv[1:]), "origins": {}, "layers": []}})
         elif method == "thread/start":
             if params.get("dynamicTools") is not None and not state["experimental"]:
                 out({"id": mid, "error": {"code": -32600, "message": "thread/start.dynamicTools requires experimentalApi capability"}})

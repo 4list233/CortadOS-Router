@@ -193,6 +193,7 @@ done. The backend therefore runs on the real Codex home with everything switched
 
 ```
 codex app-server -c notify=[] -c web_search="disabled" -c include_environment_context=false -c project_doc_max_bytes=0
+  -c model_provider="openai"                 # the built-in provider: a config.toml model_provider cannot redirect the lane
   -c mcp_servers.<name>.enabled=false        # for every [mcp_servers.<name>] table of $CODEX_HOME/config.toml
                                              # (the one read of it; `-c mcp_servers={}` merges and does nothing)
   --disable shell_tool --disable unified_exec --disable unified_exec_tty --disable view_image --disable image_generation
@@ -205,7 +206,17 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   an exec capture under the same flags). `code_mode_host` stays on: dynamic tools are served through it, and the
   first spike run, with it disabled, had the model report the Read tool as unavailable.
 - The child's environment drops `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` (an API key would bill an
-  API account instead of the subscription) and the Anthropic trio of the Claude bridge.
+  API account instead of the subscription), `OPENAI_BASE_URL` (it would repoint the openai provider) and the Anthropic
+  trio of the Claude bridge.
+- The command line is asked for, then checked (Codex review of PR #5): before `thread/start` the bridge calls
+  `account/read {refreshToken:false}` and requires a `chatgpt` login (an API-key login or none is a 502: the lane bills
+  the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
+  overrides, a managed `requirements.toml`), and requires `model_provider="openai"`, no redefined
+  `model_providers.openai`, the default `chatgpt_base_url`, the four overrides above, every `mcp_servers.*.enabled`
+  false and every disabled feature false in `features`. `thread/start` is when Codex starts MCP servers and binds the
+  provider, so a refusal here means nothing ran. The config.toml reader (which names the servers to disable) is the
+  pre-spawn best effort; a server it could not name (`["mcp_servers".x]`, a dotted key, another layer) is caught here.
+  Verified on 0.163.0: `config/read` reflects the `-c` overrides and `--disable` flags exactly.
 - Two leaks remain under the real home and are documented, not hidden: `~/.codex/AGENTS.md` is loaded
   (`instructionSources`, logged at thread start; it reaches the thread as a user message) and the user's skills list
   is injected as a developer message. The fix is `CORTADOS_PROVIDER_CODEX_HOME` / `--codex-home`: a dedicated
@@ -278,6 +289,8 @@ tool type; optional, later.
    Read ran in the client, the log shows `instructionSources` and no isolation error.
 
 **P2 known limits.**
+- Images: a tool-less single-message request keeps its image blocks on both wires; the text transcript a longer
+  tool-less conversation is folded into is text only (P0 behaviour, both wires; images are P4).
 - No resume with tools: `thread/resume` and `thread/fork` take no `dynamicTools`, so a restarted endpoint answers
   409 for a tool-bearing Codex conversation, exactly as P0 does for Claude.
 - `request_user_input` cannot be switched off. The backend answers it empty and logs a warning, so a model that asks

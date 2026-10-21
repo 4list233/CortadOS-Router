@@ -243,8 +243,10 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
 
 
 def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, Any]]:
-    """The input as Anthropic-shaped messages, developer/system items excluded. Text only unless with_tools, which
-    adds tool_use / tool_result blocks for the transcript of a one-shot request."""
+    """The input as Anthropic-shaped messages, developer/system items excluded: text and image blocks, plus, with
+    with_tools, the tool_use / tool_result blocks for the transcript of a one-shot request. Images stay so a tool-less
+    single-message request reaches its throwaway CLI with its evidence, as on the Anthropic wire (whose
+    one_shot_content keeps a single user message's blocks; its transcript of a longer conversation is text only)."""
     messages: list[dict[str, Any]] = []
 
     def add(role: str, blocks: list[dict[str, Any]]) -> None:
@@ -256,7 +258,7 @@ def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, An
             continue
         kind = it.get("type", "message")
         if kind == "message" and it.get("role") in ("user", "assistant"):
-            add(it["role"], [b for b in _blocks_of(it.get("content")) if b["type"] == "text"])
+            add(it["role"], [b for b in _blocks_of(it.get("content")) if b["type"] in ("text", "image")])
         elif with_tools and kind == "function_call":
             add("assistant", [_tool_use_block(it)])
         elif with_tools and kind == "function_call_output":

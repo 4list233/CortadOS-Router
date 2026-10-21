@@ -6,6 +6,7 @@ The router is a stub returning a codex-cli route; the fake app-server speaks the
 """
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -61,7 +62,7 @@ class CodexEndpointTests(unittest.TestCase):
             self.reg.drop(s)
         codex_bridge.CODEX_SETTLE_S = self.settle
         for k in ("FAKE_CODEX_ARGV", "FAKE_CODEX_LOG", "FAKE_CLAUDE_ARGV", "FAKE_CODEX_VERSION", "FAKE_CODEX_LEAK_MCP",
-                  "FAKE_CODEX_MODEL", "FAKE_CODEX_SANDBOX"):
+                  "FAKE_CODEX_MODEL", "FAKE_CODEX_SANDBOX", "FAKE_CODEX_ACCOUNT", "FAKE_CODEX_CONFIG_PATCH"):
             os.environ.pop(k, None)
 
     def request(self, body):
@@ -195,12 +196,54 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertIn("isolation failed", message)
         self.assertEqual(self.reg.sessions, {})
 
+    def refused(self, body, code=502):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.post(body)
+        self.assertEqual(cm.exception.code, code)
+        return cm.exception.read().decode()
+
+    def test_an_mcp_server_the_effective_config_still_enables_is_refused_before_the_thread_starts(self):
+        # Declared in a spelling the config.toml reader cannot see (a quoted root key, a managed layer): the effective
+        # config is the authority, and the refusal comes before thread/start, which is when Codex would start it.
+        os.environ["FAKE_CODEX_CONFIG_PATCH"] = json.dumps({"mcp_servers": {"rogue": {"command": "/usr/bin/true", "enabled": True}}})
+        text = self.refused({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("rogue", text)
+        self.assertIn("would not isolate", text)
+        methods = [m.get("method") for m in self.inbound()]
+        self.assertEqual([m for m in methods if m in ("account/read", "config/read", "thread/start")], ["account/read", "config/read"])
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_a_login_that_is_not_a_chatgpt_subscription_is_refused(self):
+        for account, expect in (('{"type": "apiKey"}', "not a ChatGPT subscription"), ("null", "no login")):
+            with self.subTest(account=account):
+                os.environ["FAKE_CODEX_ACCOUNT"] = account
+                text = self.refused({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+                self.assertIn(expect, text)
+        self.assertNotIn("thread/start", [m.get("method") for m in self.inbound()])
+
+    def test_inherited_config_that_would_redirect_inference_or_re_enable_a_tool_is_refused(self):
+        patches = {"model_provider": {"model_provider": "mirror"},
+                   "model_providers.openai": {"model_providers": {"openai": {"base_url": "https://mirror.invalid/v1"}}},
+                   "chatgpt_base_url": {"chatgpt_base_url": "https://mirror.invalid/backend-api/"},
+                   "features": {"features": {"shell_tool": True}},
+                   "web_search": {"web_search": "live"},
+                   "project_doc_max_bytes": {"project_doc_max_bytes": 32768}}
+        for name, patch in patches.items():
+            with self.subTest(name):
+                os.environ["FAKE_CODEX_CONFIG_PATCH"] = json.dumps(patch)
+                text = self.refused({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+                self.assertIn("would not isolate", text)
+                self.assertIn(name.split(".")[0], text)
+        self.assertNotIn("thread/start", [m.get("method") for m in self.inbound()])
+
     def test_the_app_server_runs_isolated(self):
         os.environ["OPENAI_API_KEY"] = "sk-would-bill-an-api-account"
+        os.environ["OPENAI_BASE_URL"] = "https://mirror.invalid/v1"
         try:
             self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         finally:
             os.environ.pop("OPENAI_API_KEY")
+            os.environ.pop("OPENAI_BASE_URL")
         seen = json.loads(Path(self.argv_file).read_text())
         argv = seen["argv"]
         self.assertEqual(argv[0], "app-server")
@@ -212,10 +255,17 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertNotIn("code_mode_host", disabled)                    # dynamic tools are served through it
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                         "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false"):
+                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false"):
             self.assertIn(override, overrides)
         self.assertEqual(len([o for o in overrides if o.startswith("mcp_servers.")]), 2)   # [mcp_servers.x.env] is not a server
         self.assertIsNone(seen["env"]["OPENAI_API_KEY"])
+        self.assertIsNone(seen["env"]["OPENAI_BASE_URL"])
+        methods = [m.get("method") for m in self.inbound()]
+        # The login and the effective config are checked before the thread (and with it any MCP server) starts.
+        self.assertLess(methods.index("account/read"), methods.index("thread/start"))
+        self.assertLess(methods.index("config/read"), methods.index("thread/start"))
+        account = [m for m in self.inbound() if m.get("method") == "account/read"][0]["params"]
+        self.assertIs(account["refreshToken"], False)                   # a refresh would spend the single-use token
         self.assertEqual(seen["env"]["CODEX_HOME"], self.codex_home)
         self.assertEqual(os.listdir(seen["cwd"]), [])                   # empty scratch dir, never the project
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
@@ -325,13 +375,15 @@ class CodexSessionUnitTests(unittest.TestCase):
         home = tempfile.mkdtemp()
         Path(home, "config.toml").write_text(
             "  [mcp_servers.indented]\ncommand = 'x'\n[ mcp_servers.spaced ]\n[mcp_servers.trailing ]\n"
-            "[mcp_servers.commented] # the docs server\n[mcp_servers.'quoted.dot']\n[mcp_servers.plain.env]\nA = '1'\n")
+            "[mcp_servers.commented] # the docs server\n[mcp_servers.'quoted.dot']\n[mcp_servers.plain.env]\nA = '1'\n"
+            '["mcp_servers".rootquoted]\ncommand = "x"\n')
         self.assertEqual(codex_bridge.mcp_server_names(home),
-                         ["'quoted.dot'", "commented", "indented", "spaced", "trailing"])
+                         ["'quoted.dot'", "commented", "indented", "rootquoted", "spaced", "trailing"])
 
     def test_mcp_servers_declared_any_other_way_are_refused_before_an_app_server_starts(self):
         for form in ('mcp_servers.foo.command = "x"\n', 'mcp_servers = { foo = { command = "x" } }\n',
-                     '[mcp_servers]\nfoo = { command = "x" }\n', '[[mcp_servers.foo]]\ncommand = "x"\n'):
+                     '[mcp_servers]\nfoo = { command = "x" }\n', '[[mcp_servers.foo]]\ncommand = "x"\n',
+                     '["mcp_servers"]\nfoo = { command = "x" }\n', '"mcp_servers".foo.command = "x"\n'):
             home = tempfile.mkdtemp()
             Path(home, "config.toml").write_text('model = "m"\n' + form)
             with self.assertRaisesRegex(BridgeError, r"\[mcp_servers\.<name>\] tables"):
@@ -379,6 +431,59 @@ class CodexSessionUnitTests(unittest.TestCase):
                 s.run_turn(10)
         finally:
             s.close()
+
+    def test_the_effective_config_check_accepts_the_real_isolated_config_and_names_every_violation(self):
+        # The shape config/read answered on Codex CLI 0.163.0 under the bridge's own command line (P2 probe).
+        real = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+                "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
+                "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
+                                "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
+                "features": {**{f: False for f in codex_bridge.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True}}
+        codex_bridge.check_effective_config(real)
+        broken = dict(real, model_provider="mirror", chatgpt_base_url="https://mirror.invalid/", web_search="live",
+                      model_providers={"openai": {"base_url": "https://mirror.invalid/v1"}},
+                      mcp_servers={**real["mcp_servers"], "rogue": {"command": "x", "enabled": True}, "quiet": {"command": "y"}},
+                      features={**real["features"], "shell_tool": True, "apps": None})
+        with self.assertRaises(BridgeError) as cm:
+            codex_bridge.check_effective_config(broken)
+        text = str(cm.exception)
+        for needle in ('model_provider="mirror"', "chatgpt_base_url", 'web_search="live"', "model_providers.openai",
+                       "['quiet', 'rogue']", "['apps', 'shell_tool']"):
+            self.assertIn(needle, text)
+        with self.assertRaisesRegex(BridgeError, "no login"):
+            codex_bridge.check_account({"account": None, "requiresOpenaiAuth": True})
+        with self.assertRaisesRegex(BridgeError, "not a ChatGPT subscription"):
+            codex_bridge.check_account({"account": {"type": "apiKey"}})
+        codex_bridge.check_account({"account": {"type": "chatgpt", "planType": "pro"}})
+
+    def test_run_turn_keeps_its_deadline_while_notifications_keep_arriving(self):
+        # A server that streams notifications without end re-arms the settle window on every one; the absolute
+        # deadline must still end the turn: with calls collected they are returned, with none it is a failure.
+        s = object.__new__(codex_bridge.CodexSession)
+        s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
+        s._events, s._pending, s.emitted, s._delivered = queue.Queue(), {}, set(), set()
+        stop, settle = threading.Event(), codex_bridge.CODEX_SETTLE_S
+
+        def chatter():
+            while not stop.is_set():
+                s._events.put(("notify", {"method": "item/agentMessage/delta", "params": {"delta": "x"}}))
+                time.sleep(0.02)
+        threading.Thread(target=chatter, daemon=True).start()
+        try:
+            codex_bridge.CODEX_SETTLE_S = 5.0
+            t0 = time.time()
+            with self.assertRaisesRegex(BridgeError, "did not finish the turn within"):
+                s.run_turn(0.3)
+            self.assertLess(time.time() - t0, 2.0)
+            s._events.put(("request", {"method": "item/tool/call", "id": 0,
+                                       "params": {"callId": "exec-1", "tool": "Read", "arguments": {"file_path": "a"}}}))
+            t0 = time.time()
+            blocks, stop_reason, _ = s.run_turn(0.3)
+            self.assertEqual((stop_reason, blocks[0]["id"]), ("tool_use", "exec-1"))
+            self.assertLess(time.time() - t0, 2.0)
+        finally:
+            stop.set()
+            codex_bridge.CODEX_SETTLE_S = settle
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))

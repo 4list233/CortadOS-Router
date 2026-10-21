@@ -37,10 +37,22 @@ from cortados_router.provider.bridge import STRIPPED_ENV as CLAUDE_STRIPPED_ENV,
 SUPPORTED_CLI_VERSIONS = ("0.163.0",)
 # Dropped from the child's environment: an OpenAI/Codex API key or access token would bill an API account instead of
 # the subscription login. The Anthropic trio is harmless to a Codex child and stripped for consistency with bridge.py.
-STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN") + CLAUDE_STRIPPED_ENV
+# OPENAI_BASE_URL would point the built-in openai provider at another endpoint.
+STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL") + CLAUDE_STRIPPED_ENV
 # `-c key=value` overrides (brief §B): no desktop notifications, no web search, no environment/project context in the
-# prompt (the client's system prompt is the whole prompt; project docs would read the scratch cwd anyway).
-CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0")
+# prompt (the client's system prompt is the whole prompt; project docs would read the scratch cwd anyway), and the
+# built-in openai provider, so a `model_provider` the home's config.toml sets (a mirror, another billing account)
+# cannot redirect the subscription lane the router logged.
+CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
+                    'model_provider="openai"')
+# What config/read must show before thread/start (the effective config, every layer merged: config.toml, the -c
+# overrides, a managed requirements.toml). The overrides above are asked for and then checked, because a managed layer
+# wins over -c; chatgpt_base_url is the default backend of the ChatGPT login, the one the subscription bills to.
+EXPECTED_CONFIG = {"notify": [], "web_search": "disabled", "include_environment_context": False, "project_doc_max_bytes": 0,
+                   "model_provider": "openai", "chatgpt_base_url": "https://chatgpt.com/backend-api/"}
+# The login the lane bills to: a ChatGPT subscription. An API-key login (or none) would bill elsewhere, or fail later
+# as unauthorized after the route was logged as a subscription lane.
+EXPECTED_ACCOUNT_TYPE = "chatgpt"
 # `--disable <feature>` for every built-in tool and every integration (brief §B, verified: the tool list Codex then
 # builds is exactly request_user_input plus the dynamic tools). code_mode_host stays ON: dynamic tools are served
 # through it, and with it off the model reports them unavailable.
@@ -58,13 +70,16 @@ V2_APPROVALS = {"item/commandExecution/requestApproval": {"decision": "decline"}
 V1_APPROVALS = {"execCommandApproval": {"decision": "denied"}, "applyPatchApproval": {"decision": "denied"}}
 # Every `[mcp_servers.<name>]` table of config.toml is disabled by name: `-c mcp_servers={}` merges and does nothing.
 # The header may be indented (nested [mcp_servers.<name>.env] tables usually are), carry spaces inside the brackets,
-# a quoted key or a trailing comment: all TOML the toml crate accepts, so all shapes Codex would start a server from.
-# The name is captured without surrounding whitespace, because it becomes the `-c mcp_servers.<name>.enabled=false` key.
-MCP_TABLE = re.compile(r"""^[ \t]*\[[ \t]*mcp_servers[ \t]*\.[ \t]*("[^"]*"|'[^']*'|[A-Za-z0-9_-]+)[ \t]*\][ \t]*(?:#.*)?$""", re.M)
+# a quoted root or child key, or a trailing comment: all TOML the toml crate accepts, so all shapes Codex would start
+# a server from. The name is captured without surrounding whitespace, because it becomes the
+# `-c mcp_servers.<name>.enabled=false` key. This reader is the pre-spawn best effort; config/read is the authority
+# (check_effective_config refuses any server the effective config still enables, whatever spelling declared it).
+_ROOT = r"""(?:mcp_servers|"mcp_servers"|'mcp_servers')"""
+MCP_TABLE = re.compile(r"""^[ \t]*\[[ \t]*""" + _ROOT + r"""[ \t]*\.[ \t]*("[^"]*"|'[^']*'|[A-Za-z0-9_-]+)[ \t]*\][ \t]*(?:#.*)?$""", re.M)
 # mcp_servers declared any other way (a dotted key `mcp_servers.x.command = ...`, an inline table `mcp_servers = {...}`,
 # keys under a bare `[mcp_servers]` table, or an array of tables) cannot be enumerated by this reader, so the file is
 # refused at spawn time: a server it could not name would otherwise start and fail every turn as an isolation error.
-MCP_OTHER_FORM = re.compile(r"^[ \t]*(?:mcp_servers[ \t]*(?:=|\.)|\[[ \t]*mcp_servers[ \t]*\]|\[\[[ \t]*mcp_servers\b)", re.M)
+MCP_OTHER_FORM = re.compile(r"^[ \t]*(?:" + _ROOT + r"[ \t]*(?:=|\.)|\[[ \t]*" + _ROOT + r"[ \t]*\]|\[\[[ \t]*" + _ROOT + r"\b)", re.M)
 # Settle window after the first unanswered tool call of a turn. Codex dispatches each item/tool/call as its
 # function_call item finishes streaming, so sibling calls of one model message arrive seconds apart when their
 # arguments are long (a Write payload), not in one stdout burst as the Claude CLI's do (bridge.SETTLE_S = 0.3):
@@ -97,6 +112,43 @@ def mcp_server_names(codex_home: str) -> list[str]:
                           f"({other.group(0).strip()!r}); this bridge can only disable servers declared as "
                           f"[mcp_servers.<name>] tables, and an MCP server it cannot name would break isolation")
     return sorted(set(MCP_TABLE.findall(text)))
+
+
+def check_effective_config(cfg: dict[str, Any]) -> None:
+    """Refuse an effective config (config/read, every layer merged) under which the thread would not be the isolated
+    subscription thread this bridge promises. Runs before thread/start, which is when MCP servers are started, so a
+    server this check names never ran. Raises BridgeError naming every violation."""
+    bad = []
+    for key, want in EXPECTED_CONFIG.items():
+        if cfg.get(key) != want:
+            bad.append(f"{key}={json.dumps(cfg.get(key))} (expected {json.dumps(want)})")
+    providers = cfg.get("model_providers") or {}
+    if isinstance(providers, dict) and "openai" in providers:
+        # Redefining the built-in provider is how a config points "openai" at another base_url or credential.
+        bad.append("model_providers.openai is redefined in the config")
+    servers = cfg.get("mcp_servers") or {}
+    enabled = sorted(n for n, v in servers.items() if not (isinstance(v, dict) and v.get("enabled") is False)) \
+        if isinstance(servers, dict) else ["<mcp_servers is not a table>"]
+    if enabled:
+        bad.append(f"MCP servers still enabled: {enabled} (declared in a form the config.toml reader could not disable, "
+                   f"or by a config layer outside it)")
+    features = cfg.get("features") or {}
+    on = sorted(f for f in DISABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not False)
+    if on:
+        bad.append(f"built-in tool features still enabled: {on}")
+    if bad:
+        raise BridgeError("codex app-server's effective config would not isolate the thread: " + "; ".join(bad))
+
+
+def check_account(account: dict[str, Any]) -> None:
+    """Refuse a login that is not the ChatGPT subscription the codex-cli lane bills to."""
+    acct = account.get("account")
+    if not isinstance(acct, dict):
+        raise BridgeError("codex app-server has no login in this CODEX_HOME; the codex-cli lane needs a ChatGPT "
+                          "subscription login (run `codex login` in that home)")
+    if acct.get("type") != EXPECTED_ACCOUNT_TYPE:
+        raise BridgeError(f"codex app-server is logged in as {acct.get('type')!r}, not a ChatGPT subscription; the "
+                          f"codex-cli lane is a subscription lane and must not bill another account")
 
 
 def _content_items(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -201,6 +253,11 @@ class CodexSession:
         info = self._call("initialize", {"clientInfo": {"name": "cortados-provider", "version": "0"},
                                          "capabilities": {"experimentalApi": True}}, HANDSHAKE_S)
         self._notify("initialized")
+        # Both checks run before thread/start: that is when Codex starts MCP servers and binds the provider, so a
+        # refusal here means nothing ran. refreshToken=false: a refresh would spend the home's single-use token.
+        check_account(self._call("account/read", {"refreshToken": False}, HANDSHAKE_S))
+        config = self._call("config/read", {}, HANDSHAKE_S)
+        check_effective_config(config["config"] if isinstance(config.get("config"), dict) else config)
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             "baseInstructions": system or "You are a helpful assistant.",
@@ -408,13 +465,21 @@ class CodexSession:
         settle_until: float | None = None               # set once a call is pending: sibling calls arrive together
         while True:
             self._check_fatal()
-            wait = (settle_until if settle_until else deadline) - time.time()
+            now = time.time()
+            if now >= deadline:
+                # The absolute deadline holds whatever keeps arriving: a server that streams notifications forever
+                # (each one re-arming the settle window) would otherwise hold the request thread, the session lock and
+                # the backend past TURN_TIMEOUT_S. Calls already collected are returned; nothing collected is a failure.
+                if settle_until:
+                    return self._finish(blocks, "tool_use")
+                raise BridgeError(f"codex app-server did not finish the turn within {timeout:.0f}s")
+            wait = min(settle_until, deadline) - now if settle_until else deadline - now
             try:
                 kind, msg = self._events.get(timeout=max(wait, 0))
             except queue.Empty:
-                if settle_until:
+                if settle_until and time.time() >= settle_until:
                     return self._finish(blocks, "tool_use")
-                raise BridgeError(f"codex app-server produced nothing for {timeout:.0f}s")
+                continue                                # the deadline check at the top of the loop decides
             if kind == "exit":
                 raise BridgeError(f"codex app-server exited with code {msg}; see {self.dir / 'stderr.log'}")
             if kind == "request":
