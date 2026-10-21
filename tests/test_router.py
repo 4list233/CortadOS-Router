@@ -259,6 +259,32 @@ class UsageScreens(unittest.TestCase):
                 self.assertEqual(w[0]["resets_at"], expect.strftime("%Y-%m-%d %H:%M"))
         with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):                           # two hours past is tomorrow's time, and tomorrow is outside a 5-hour window
             self.sc.parse_codex_status(head + " 5h limit: [█]\n0%\nleft (resets 12:00 PM)", now=day.replace(hour=14, second=1).timestamp())
+    def test_codex_reset_across_calendar_boundaries(self):
+        # adversarial review 2026-10-21 (fourth pass): a reset inside the past hour may sit on yesterday's date or in last year, and the window
+        # is measured in elapsed seconds, so a DST change neither refuses a reset 45 minutes past nor admits one seven hours ahead
+        import datetime, os, time
+        if not hasattr(time, "tzset"):
+            self.skipTest("needs time.tzset to pin the zone")
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Toronto"; time.tzset()
+        try:
+            at = lambda *ymdhms: datetime.datetime(*ymdhms).timestamp()
+            for clock, entry, expect in (((2026, 10, 22, 0, 0, 1), " 5h limit: [█]\n50%\nleft (resets 11:59 PM)", "2026-10-21 23:59"),              # yesterday's, 61 s past
+                                         ((2027, 1, 1, 0, 0, 1), " Weekly limit: [█]\n50%\nleft (resets 11:59 PM on 31 Dec)", "2026-12-31 23:59"),  # last year's
+                                         ((2026, 3, 8, 3, 15, 0), " 5h limit: [█]\n50%\nleft (resets 1:30 AM)", "2026-03-08 01:30"),             # spring forward: 45 min past
+                                         ((2026, 11, 1, 0, 30, 0), " 5h limit: [█]\n50%\nleft (resets 5:30 AM on 1 Nov)", "2026-11-01 05:30")):  # fall back: six elapsed hours
+                with self.subTest(expect=expect):
+                    w = self.sc.parse_codex_status(head + entry, now=at(*clock))
+                    self.assertEqual(w[0]["resets_at"], expect)
+            with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):           # fall back: "6:30 AM" is seven elapsed hours from 00:30, not six
+                self.sc.parse_codex_status(head + " 5h limit: [█]\n50%\nleft (resets 6:30 AM on 1 Nov)", now=at(2026, 11, 1, 0, 30, 0))
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])

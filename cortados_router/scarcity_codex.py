@@ -13,6 +13,7 @@ Loaded by path from scarcity.py (this plugin is not a package); it imports nothi
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timedelta
 
 PINNED_VERSIONS = ("0.163.0",)                                     # screen layouts verified against a real capture
@@ -37,9 +38,16 @@ def version(text: str) -> str:
     return m.group(1)
 
 
-def reset_time(when: str | None, span: str, left: int, now: datetime) -> float | None:
+def reset_time(when: str | None, span: str, left: int, now: float) -> float | None:
     """When the window resets, as a timestamp. Missing text is allowed only for an untouched window (100 % left: the
-    screen runs no reset clock); otherwise the text must read fully and land inside the window, or the sample fails."""
+    screen runs no reset clock); otherwise the text must read fully and land inside the window, or the sample fails.
+
+    The screen gives a wall-clock time, with a day and month for a week and nothing else for a 5-hour window, and no
+    year. Each calendar reading it could mean (yesterday, today, tomorrow; last year, this year, next year) becomes a
+    timestamp, and the earliest one not more than SLACK_S in the past wins: a reset inside the past hour is the one the
+    screen was painted before ("11:59 PM" read at 00:00:01, "31 Dec" read on 1 Jan), anything older is the next
+    occurrence. Elapsed seconds, never naive date arithmetic, so a DST change neither refuses a reset 45 minutes past
+    nor admits one seven hours ahead (fourth adversarial review, 2026-10-21)."""
     if when is None:                                                # the group was absent; an empty "(resets )" never gets here
         if left >= 100:
             return None
@@ -52,23 +60,32 @@ def reset_time(when: str | None, span: str, left: int, now: datetime) -> float |
         raise ValueError(f"impossible clock time in reset text {when!r}")
     if meridiem:
         hour = hour % 12 + (12 if meridiem == "PM" else 0)
-    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    today = datetime.fromtimestamp(now)                             # the local calendar the screen is written in
     if m.group(4):
-        reset = reset.replace(month=datetime.strptime(m.group(5), "%b").month, day=int(m.group(4)))
-        if reset < now - timedelta(days=1):                        # a January date read in December
-            reset = reset.replace(year=now.year + 1)
-    elif reset < now - timedelta(seconds=SLACK_S):                 # time only (5-hour windows): the next such time. The screen shows minutes and the
-        reset += timedelta(days=1)                                  # clocks differ, so a time inside the past hour is the reset just passed (as the date form reads it), not tomorrow's
-    ahead = (reset - now).total_seconds()
-    if not -SLACK_S <= ahead <= SPAN_S[span] + SLACK_S:            # a week's reset on the week's last day is still inside
+        month, day = datetime.strptime(m.group(5), "%b").month, int(m.group(4))
+        dates = [(today.year + k, month, day) for k in (-1, 0, 1)]
+    else:
+        dates = [(today + timedelta(days=k)).timetuple()[:3] for k in (-1, 0, 1)]
+    stamps = set()
+    for y, mo, d in dates:
+        for fold in (0, 1):                                         # the hour that repeats when DST ends: both readings
+            try:
+                stamps.add(datetime(y, mo, d, hour, minute, fold=fold).timestamp())
+            except ValueError:                                      # 29 Feb in a year without one
+                pass
+    candidates = sorted(ts for ts in stamps if ts - now >= -SLACK_S)
+    if not candidates:
+        raise ValueError(f"reset text {when!r} has no reading on the calendar")
+    ahead = candidates[0] - now
+    if ahead > SPAN_S[span] + SLACK_S:                              # a week's reset on the week's last day is still inside
         raise ValueError(f"{span} reset {when!r} is {ahead / 3600:.1f} h away, outside its {SPAN_S[span] / 3600:.0f}-hour window")
-    return reset.timestamp()
+    return candidates[0]
 
 
 def parse_status(text: str, now: float | None = None) -> list[dict]:
     """Every '<label> limit: […] N% left (resets …)' entry on the screen, each label read from its own line.
     Returns [{span: "5-hour"|"week", model: "" | "GPT-…", left_pct, reset_at, version}]."""
-    at = datetime.fromtimestamp(now) if now else datetime.now()
+    at = now or time.time()
     ver = version(text)
     lines = text.splitlines()
     out: list[dict] = []
