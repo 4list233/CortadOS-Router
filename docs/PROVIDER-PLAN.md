@@ -49,7 +49,7 @@ client (Claude Code, the repo's machine)           CortadOS endpoint
 |---|---|---|
 | P0 | Anthropic Messages endpoint → bridged `claude -p`; no routing | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude -p --model cortados "summarize README.md"` from a repo: the Read runs in the client, the answer comes from the headless CLI |
 | P1 | Router in the loop: host-neutral `route_task()`, S1 scores the first request, one model per conversation, route log with `platform: "provider:<client>"`; local-model backend (Ollama / llama.cpp tool calls) | requests of different difficulty land on different lanes; every decision is in the route log |
-| P2 | Codex backend (app-server spike first); Codex as a client (OpenAI Responses wire) — built 2026-10-21, live acceptance pending (P2 status below) | the same summarize check from Codex and onto Codex |
+| P2 | Codex backend (app-server spike first); Codex as a client (OpenAI Responses wire) — built 2026-10-21, both live acceptance checks passed the same day (P2 status below) | the same summarize check from Codex and onto Codex |
 | P3 | Codex `/status` parser fix (SUBAGENT-MCP-PLAN §11.7) and inventory refresh, alongside P1–P2 | codex lane shows a non-null scarcity |
 | Later | multiple accounts per vendor; CLI runners on other machines (the Air); one model across machines; cloud clients (needs a public endpoint with auth, and a verified `BASE_URL` override in the cloud client); API-key lanes | |
 
@@ -154,7 +154,7 @@ conversation, the client's tools as dynamic tools), `responses_wire.py` (the Ope
 `POST /v1/responses`), the backend map and the per-wire seam in `server.py` (`SESSION_FACTORIES`, `WIRES`), and
 `codex-cli` in `routing.py`. Tests run on `tests/fixtures/fake_codex_app_server.py` (the exact line shapes of the
 spike log) and the fake Claude CLI; no test opens a vendor CLI. Suite: 291 run, OK, 7 skipped (Hermes integration).
-The live acceptance checks (below) are still to run; each spends subscription quota.
+Both live acceptance checks passed on 2026-10-21 (P2 live findings below); each spends subscription quota.
 
 **The app-server protocol** (verified against Codex CLI 0.163.0 with the spike; the API is experimental, so
 `SUPPORTED_CLI_VERSIONS` pins the version the same way the `/status` parser does):
@@ -258,7 +258,7 @@ CORTADOS_PROVIDER_TOKEN=<token> codex exec --ignore-user-config \
   -c 'model_providers.cortados={ name="CortadOS", base_url="http://127.0.0.1:8432/v1", env_key="CORTADOS_PROVIDER_TOKEN", wire_api="responses", request_max_retries=0, stream_max_retries=0, stream_idle_timeout_ms=1800000 }' \
   -c model_provider="cortados" -m cortados -c model_context_window=200000 \
   --disable apps --disable multi_agent -c web_search="disabled" -s read-only --ephemeral --skip-git-repo-check \
-  "summarize README.md"
+  "summarize README.md" < /dev/null
 ```
 
 Or as a profile file, `$CODEX_HOME/cortados.config.toml`, used with `codex --profile cortados` (0.163.0 refuses
@@ -296,9 +296,15 @@ tool type; optional, later.
   bridge logs them instead of treating them as a leak (`BENIGN_MCP_TOOLS`); every other `mcpToolCall` is still fatal.
 - Check 3 (Claude Code → `cortados` → Codex backend) passed: the client's Read ran, the answer was the heading,
   route `codex-cli/gpt-6.1-sol` (S1 down on the build Mac, so a degraded decision). Check 2 (Codex → `cortados` →
-  Codex backend) first failed on the two findings above; rerun after the fix below.
+  Codex backend) first failed on the two findings above and passed after the fix: the Codex client ran the
+  `exec_command` (`sed` on README.md) itself, the backend answered the heading, Codex reported 23,161 tokens and
+  showed no error for the `: ping` comments or `response.created`. The endpoint ran on a throwaway `CORTADOS_HOME`
+  with `CORTADOS_SCARCITY_REFRESH=off`. Spend for the whole P2 acceptance, Pro plan: two turns on gpt-6.1-sol plus
+  five spike turns on gpt-5.6-luna, roughly 100k tokens in all.
+- Scripting `codex exec`: it reads stdin until EOF ("Reading additional input from stdin...") and hangs when stdin is
+  open, so redirect `< /dev/null`; macOS has no `timeout`, use `perl -e 'alarm N; exec @ARGV' --`.
 
-**P2 acceptance** (the orchestrator runs these; they spend quota and need Forest's go-ahead):
+**P2 acceptance** (run 2026-10-21, both passed; they spend quota, so rerun only on request):
 1. Start the endpoint: `CORTADOS_PROVIDER_TOKEN=<token> python3 -B -m cortados_router.provider.server`
    (`--codex-home <dir>` for the dedicated home).
 2. From Codex: the inline `codex exec` command above, from a repo. Pass: the `exec_command` runs in Codex, the
