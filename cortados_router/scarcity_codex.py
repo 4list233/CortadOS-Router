@@ -57,8 +57,8 @@ def reset_time(when: str | None, span: str, left: int, now: datetime) -> float |
         reset = reset.replace(month=datetime.strptime(m.group(5), "%b").month, day=int(m.group(4)))
         if reset < now - timedelta(days=1):                        # a January date read in December
             reset = reset.replace(year=now.year + 1)
-    elif reset <= now:                                              # time only (5-hour windows): the next such time
-        reset += timedelta(days=1)
+    elif reset < now - timedelta(seconds=SLACK_S):                 # time only (5-hour windows): the next such time. The screen shows minutes and the
+        reset += timedelta(days=1)                                  # clocks differ, so a time inside the past hour is the reset just passed (as the date form reads it), not tomorrow's
     ahead = (reset - now).total_seconds()
     if not -SLACK_S <= ahead <= SPAN_S[span] + SLACK_S:            # a week's reset on the week's last day is still inside
         raise ValueError(f"{span} reset {when!r} is {ahead / 3600:.1f} h away, outside its {SPAN_S[span] / 3600:.0f}-hour window")

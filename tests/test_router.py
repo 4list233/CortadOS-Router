@@ -244,6 +244,21 @@ class UsageScreens(unittest.TestCase):
         self.assertEqual((w[0]["used_pct"], w[0]["resets_at"]), (0.0, None))
         w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft\n 5h limit: [█]\n100%\nleft", now=self.FROZEN)   # a digit-leading entry ends the one above
         self.assertEqual([x["window"] for x in w], ["week", "5-hour"])
+    def test_codex_time_only_reset_beside_the_clock(self):
+        # adversarial review 2026-10-21 (third pass): the screen shows minutes, so a reset read during its displayed minute is now, not tomorrow
+        import datetime
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        day = datetime.datetime(2026, 10, 21)
+        for clock, when, expect in (((12, 0, 30), "12:00 PM", day.replace(hour=12)),                 # the displayed minute
+                                    ((23, 59, 30), "12:00 AM", day + datetime.timedelta(days=1)),     # midnight, half a minute ahead
+                                    ((0, 0, 30), "12:00 AM", day),                                     # midnight, half a minute behind
+                                    ((12, 30, 0), "12:00 PM", day.replace(hour=12))):                  # clocks half an hour apart: the reset just passed, as the date form reads it
+            with self.subTest(when=when, clock=clock):
+                now = day.replace(hour=clock[0], minute=clock[1], second=clock[2]).timestamp()
+                w = self.sc.parse_codex_status(head + f" 5h limit: [█]\n0%\nleft (resets {when})", now=now)
+                self.assertEqual(w[0]["resets_at"], expect.strftime("%Y-%m-%d %H:%M"))
+        with self.assertRaisesRegex(ValueError, "outside its 5-hour window"):                           # two hours past is tomorrow's time, and tomorrow is outside a 5-hour window
+            self.sc.parse_codex_status(head + " 5h limit: [█]\n0%\nleft (resets 12:00 PM)", now=day.replace(hour=14, second=1).timestamp())
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])
