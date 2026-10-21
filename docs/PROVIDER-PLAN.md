@@ -103,6 +103,28 @@ Not yet in P1, each needing a decision or another phase:
 - Claude Code warns that it does not recognize `cortados` and assumes a 200k context window. P1 sets the window
   for the gateway model (see the link in that warning) to match the chosen lane.
 
+## P3 status (2026-10-21): the Codex `/status` parser
+
+Built from one real capture of Codex 0.163.0 (Forest approved the probe; the redacted screen is
+`tests/fixtures/codex-status-0.163.0.txt`). `cortados_router/scarcity_codex.py` is the one Codex screen parser:
+
+- A pool label is the text on the same line as `limit:`, matched against `^(GPT-… )?(5h|Weekly)$` with runs of
+  spaces collapsed. The session uuid above the entry is no longer a pool (P1).
+- `resets 12:01 PM on 27 Oct` reads as a date; a weekly reset must land inside the week (plus an hour of slack),
+  a 5-hour reset inside its five hours. Missing reset text is allowed only for an untouched window (P1b).
+- An unknown label, unreadable or leftover reset text, an out-of-range reset, or a CLI version not in
+  `PINNED_VERSIONS` raises; `_codex` then keeps the last good reading marked with the error, so the lane goes stale,
+  never fresh-and-wrong. The screen's `OpenAI Codex (vX.Y.Z)` line is the version source; the reading records it.
+- A third fault found by the capture: the probe's ready pattern was `model:` and the screen prints `Model:`, so every
+  probe waited out the full 20-second boot and retried (67 s a sample). It is case-insensitive now.
+
+Done-when, on the real capture at today's clock: window `all:week`, `resets_at 2026-10-27 12:01` as on the screen,
+scarcity −0.6 (non-null). Parser fixtures run at a frozen clock (the capture day) so they never age.
+
+Not done here: the port into the live fleet's copy (`plugins/cortados-router/scarcity.py` on the Studio, hunk by
+hunk, with the three live-only deltas kept and a `hermes gateway restart` at an idle point) waits for Forest's
+decision on whether the frozen Hermes fleet still gets fixes.
+
 ## S1 track (Forest's decisions 2026-10-21)
 
 Today the teacher sees only the request text and `unit_kind`, while S1 can also receive a task context: the two are

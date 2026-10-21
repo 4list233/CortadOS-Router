@@ -202,9 +202,24 @@ class UsageScreens(unittest.TestCase):
     def test_claude(self):
         w = self.sc.parse_claude_usage("Current session\r ███ \n20%\nused\r Resets 12pm (America/Toronto)\r Current week (all models)\r ████ \n70%\nused\r Resets Sep 21 at 3pm (America/Toronto)")
         self.assertEqual([(x["window"], x["used_pct"]) for x in w], [("5-hour session", 20.0), ("week (all models)", 70.0)]); self.assertTrue(all(x["resets_at"] for x in w))
+    FROZEN = __import__("datetime").datetime(2026, 10, 21, 12, 0).timestamp()   # the day of the 0.163.0 capture: the fixtures never age
     def test_codex(self):
-        w = self.sc.parse_codex_status("│ Weekly limit: [░░░░░░░░] 0% left (resets 11:35 on 23 Sep) │")
-        self.assertEqual((w[0]["window"], w[0]["used_pct"], w[0]["scarcity"], w[0]["pool"]), ("week", 100.0, 1.0, "all")); self.assertIn("-09-23 11:35", w[0]["resets_at"])
+        text = (ROOT / "tests/fixtures/codex-status-0.163.0.txt").read_text()                     # the real screen, redacted
+        w = self.sc.parse_codex_status(text, now=self.FROZEN)
+        self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("week", "all", 0.0)])   # the session uuid above the limit line is not a pool
+        self.assertIn("-10-27 12:01", w[0]["resets_at"]); self.assertTrue(143 < w[0]["resets_in_h"] < 145)   # "12:01 PM on 27 Oct" read as a date, not as under a day away
+    def test_codex_screen_is_never_guessed(self):
+        head = ">_ OpenAI Codex (v0.163.0)\n"
+        for screen, why in ((head + " 01a10000-0000-7000-8000-000000000000 Weekly limit: [█]\n100%\nleft", "unknown limit label"),
+                            (head + " Weekly limit: [█]\n40%\nleft (resets 12:01 PM on 27 Nov)", "outside its"),
+                            (head + " Weekly limit: [█]\n40%\nleft (resets 12:01 PM on 27 Oct, maybe)", "unreadable reset"),
+                            (head + " Weekly limit: [█]\n40%\nleft", "no reset time"),
+                            (">_ OpenAI Codex (v0.170.0)\n Weekly limit: [█]\n100%\nleft", "not one this parser"),
+                            (" Weekly limit: [█]\n100%\nleft", "no 'OpenAI Codex")):
+            with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
+                self.sc.parse_codex_status(screen, now=self.FROZEN)
+        w = self.sc.parse_codex_status(head + " Weekly limit: [█]\n100%\nleft", now=self.FROZEN)          # untouched: no reset clock is running
+        self.assertEqual((w[0]["used_pct"], w[0]["resets_at"]), (0.0, None))
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])
@@ -221,8 +236,13 @@ class UsageScreens(unittest.TestCase):
         self.assertGreaterEqual(rec["pools"]["fable"]["scarcity"], 0.75); self.assertLess(rec["scarcity"], 0.3)   # 0.8 minus the small expiring credit
         self.assertEqual(self.sc.pool_for("claude", "claude-fable-5-1", ["fable"]), "fable"); self.assertIsNone(self.sc.pool_for("claude", "claude-haiku-4-5", ["fable"]))
     def test_codex_named_limit(self):
-        w = self.sc.parse_codex_status("│ 5h limit: [███] 80% left (resets 14:05) │ Weekly limit: [░] 0% left (resets 11:35 on 23 Sep) │ GPT-5.3-Codex-Spark Weekly limit: [███] 90% left (resets 11:35 on 23 Sep) │")
-        self.assertEqual([(x["window"], x["pool"]) for x in w], [("5-hour", "all"), ("week", "all"), ("week (GPT-5.3-Codex-Spark)", "gpt-5-3-codex-spark")])
+        # the 0.163 layout: one entry per line, "% left" wrapped under it, a model-specific week beside the general one, the screen painted twice
+        entries = (" 5h limit: [████]\n80%\nleft (resets 2:05 PM)\n Weekly limit: [░]\n0%\nleft (resets 12:01 PM on 27 Oct)\n"
+                   " GPT-5.3-Codex-Spark   Weekly limit: [███]\n90%\nleft (resets 12:01 PM on 27 Oct)\n Credits: 5396\n")
+        screen = (">_ OpenAI Codex (v0.163.0)\n Account: user@example.com\n(Pro\n200)\n Session: 01a10000-0000-7000-8000-000000000000\n" + entries) * 2
+        w = self.sc.parse_codex_status(screen, now=self.FROZEN)
+        self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("5-hour", "all", 20.0), ("week", "all", 100.0), ("week (GPT-5.3-Codex-Spark)", "gpt-5-3-codex-spark", 10.0)])
+        self.assertEqual(w[1]["scarcity"], 1.0); self.assertIn("-10-21 14:05", w[0]["resets_at"]); self.assertIn("-10-27 12:01", w[2]["resets_at"])
     def test_antigravity(self):
         g = self.sc.parse_agy_usage("GEMINI MODELS Models within this group: Gemini Flash Weekly Limit Remaining [ ███ ] 99.03% Refreshes in 35h 32m Five Hour Limit Remaining [ ██ ] 98.02% Refreshes in 4h 25m "
                                     "CLAUDE AND GPT MODELS Models within this group: Claude Opus Weekly Limit Remaining [ ███ ] 100.00% Quota available Five Hour Limit Remaining [ ███ ] 100.00% Quota available")

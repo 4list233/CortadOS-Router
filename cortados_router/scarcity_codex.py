@@ -1,0 +1,93 @@
+"""The Codex CLI /status screen: the one parser (SUBAGENT-MCP-PLAN §11.7, built 2026-10-21 on a real 0.163.0 capture).
+
+A pool label is the text on the SAME LINE as "limit:", matched against a strict grammar. The 2026-10-13 breakage:
+codex 0.162 put "Session: <uuid>" directly above "Weekly limit:", and the old whitespace-collapsing regex took the
+uuid as a model name, so every sample became its own pool; the reset, now written "12:01 PM on 27 Oct", was never
+read, so the week always looked under a day from its reset.
+
+Rules: an unknown label, unreadable or leftover reset text, a reset outside its window, or a CLI version this parser
+was not verified against fails loudly, and the sample is then stale, never fresh. Nothing is guessed. Every pinned
+version has its real redacted screen in tests/fixtures/codex-status-<version>.txt.
+Loaded by path from scarcity.py (this plugin is not a package); it imports nothing from there.
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta
+
+PINNED_VERSIONS = ("0.163.0",)                                     # screen layouts verified against a real capture
+VERSION = re.compile(r"OpenAI Codex \(v(\d+\.\d+\.\d+)\)")
+LABEL = re.compile(r"^(?:(GPT-\d+(?:\.\d+)*(?:-[A-Za-z][A-Za-z0-9]*)*) )?(5h|Weekly)$")
+LIMIT_LINE = re.compile(r"^[\s│|]*(?P<label>[^\[\]]*?) limit: \[[^\]]*\](?P<rest>.*)$")
+LEFT = re.compile(r"(\d{1,3})% left(?: \(resets (?P<when>[^)]*)\))?")
+RESET = re.compile(r"^(\d{1,2}):(\d{2})(?: ?([AaPp][Mm]))?(?: on (\d{1,2}) ([A-Z][a-z]{2}))?$")
+SPAN_S = {"5h": 5 * 3600.0, "Weekly": 7 * 86400.0}
+SLACK_S = 3600.0            # the screen shows minutes, and a reset can sit a few minutes past the window's nominal length
+TAIL_LINES = 4              # a wrapped entry ("…]", "100%", "left (resets …)") never spans more lines than this
+
+
+def version(text: str) -> str:
+    m = VERSION.search(text)
+    if not m:
+        raise ValueError("Codex /status screen shows no 'OpenAI Codex (vX.Y.Z)' line")
+    if m.group(1) not in PINNED_VERSIONS:
+        raise ValueError(f"Codex CLI v{m.group(1)} is not one this parser was verified against {PINNED_VERSIONS}; sample refused")
+    return m.group(1)
+
+
+def reset_time(when: str | None, span: str, left: int, now: datetime) -> float | None:
+    """When the window resets, as a timestamp. Missing text is allowed only for an untouched window (100 % left: the
+    screen runs no reset clock); otherwise the text must read fully and land inside the window, or the sample fails."""
+    if not when:
+        if left >= 100:
+            return None
+        raise ValueError(f"{span} limit shows {left}% left but no reset time")
+    m = RESET.match(" ".join(when.split()))
+    if not m:
+        raise ValueError(f"unreadable reset text {when!r}")
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if m.group(3):
+        hour = hour % 12 + (12 if m.group(3).upper() == "PM" else 0)
+    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if m.group(4):
+        reset = reset.replace(month=datetime.strptime(m.group(5), "%b").month, day=int(m.group(4)))
+        if reset < now - timedelta(days=1):                        # a January date read in December
+            reset = reset.replace(year=now.year + 1)
+    elif reset <= now:                                              # time only (5-hour windows): the next such time
+        reset += timedelta(days=1)
+    ahead = (reset - now).total_seconds()
+    if not -SLACK_S <= ahead <= SPAN_S[span] + SLACK_S:            # a week's reset on the week's last day is still inside
+        raise ValueError(f"{span} reset {when!r} is {ahead / 3600:.1f} h away, outside its {SPAN_S[span] / 3600:.0f}-hour window")
+    return reset.timestamp()
+
+
+def parse_status(text: str, now: float | None = None) -> list[dict]:
+    """Every '<label> limit: […] N% left (resets …)' entry on the screen, each label read from its own line.
+    Returns [{span: "5-hour"|"week", model: "" | "GPT-…", left_pct, reset_at, version}]."""
+    at = datetime.fromtimestamp(now) if now else datetime.now()
+    ver = version(text)
+    lines = text.splitlines()
+    out: list[dict] = []
+    for i, line in enumerate(lines):
+        m = LIMIT_LINE.match(line)
+        if not m:
+            continue
+        label = " ".join(m.group("label").split())                  # runs of spaces inside a label collapse before matching
+        g = LABEL.match(label)
+        if not g:
+            raise ValueError(f"unknown limit label {label!r} on the Codex /status screen; refusing to guess a pool")
+        model, span = g.group(1) or "", g.group(2)
+        tail = " ".join(" ".join(x.split()) for x in [m.group("rest"), *lines[i + 1:i + 1 + TAIL_LINES]])
+        left_m = LEFT.search(tail)
+        if not left_m:
+            raise ValueError(f"'{label} limit' has no 'N% left' within {TAIL_LINES} lines of it")
+        left = int(left_m.group(1))
+        if left > 100:
+            raise ValueError(f"'{label} limit' shows {left}% left")
+        entry = {"span": "5-hour" if span == "5h" else "week", "model": model, "left_pct": left,
+                 "reset_at": reset_time(left_m.group("when"), span, left, at), "version": ver}
+        # a repainted screen shows an entry more than once: the latest paint is the screen's final state
+        out = [e for e in out if (e["span"], e["model"]) != (entry["span"], model)] + [entry]
+    if not out:
+        raise ValueError("no 'limit: […] N% left' entry on the Codex /status screen")
+    return out
