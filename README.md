@@ -78,6 +78,11 @@ cost = burn weight + 30 × scarcity − 80 × expiring credit − capacity credi
   spent. A pool on pace to overshoot its window gets more expensive. A pool whose allowance is about to expire unused
   gets cheaper. A spent pool is skipped.
 
+Local hardware can be metered separately with `CORTADOS_LOCAL_RESOURCES_CONFIG`:
+per-node GPU memory, host RAM, utilization, online state, and verified model
+placements. The home Studio is the stable coordinator; the traveling Pro is
+excluded from home capacity by default. See [local resources](docs/LOCAL-RESOURCES.md).
+
 **Final gates.**
 
 - Context fit is a hard gate.
@@ -139,7 +144,7 @@ tests/                standalone tests; tests/integration needs a Hermes host or
 ```bash
 python3 -B -m unittest discover -s tests -t .      # standalone suite (stdlib only)
 python3 cortados_router/core.py table              # load and validate the routing table
-CORTADOS_HOME=$(mktemp -d) python3 cortados_router/core.py decide "rename the variable in utils.py"   # needs S1 on :8431
+CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off python3 cortados_router/core.py decide "rename the variable in utils.py"   # needs S1 on :8431; the switch stops a fresh home from opening the vendor CLIs
 python3 cortados_router/scarcity.py                # opens claude / codex / cursor-agent / agy in a PTY and reads /usage
 ```
 

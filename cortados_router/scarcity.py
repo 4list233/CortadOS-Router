@@ -2,7 +2,7 @@
 
 For every lane: how much of the plan's window is used (%), how much of the window's TIME has elapsed (%), when it resets,
 and what follows from the two: the pace (projected % at reset) and the allowance (% per hour we can still spend until the reset).
-scarcity ∈ [0,1] is derived from that; 1.0 = the provider is refusing or the window is spent. Local lane: free, scarce only in memory.
+scarcity ∈ [0,1] is derived from that; 1.0 = the provider is refusing or the window is spent. Local lane: GPU memory, compute and deployment availability.
 
 Sources (verified live 2026-09-21). ONE method for every subscription (Forest's ruling): open the vendor's own CLI in a PTY, type its
 usage command, read the screen. No tokens are spent, no private API is called, and the figures are exactly the ones the vendor shows its user.
@@ -414,6 +414,10 @@ def _cursor() -> dict[str, Any]:
 
 
 def _local() -> dict[str, Any]:
+    fleet_config = _env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")
+    if fleet_config:
+        from cortados_router.local_resources import sample as sample_resources
+        return sample_resources(fleet_config)
     try:
         vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
         pages = {k.strip(): int(v.strip().rstrip(".")) for k, v in (l.split(":") for l in vm.splitlines()[1:] if ":" in l) if v.strip().rstrip(".").isdigit()}
@@ -494,6 +498,29 @@ def sample(force: bool = False, only: list[str] | None = None) -> dict[str, Any]
         _f.flock(lockf, _f.LOCK_UN); lockf.close()
 
 
+_write_lock = threading.Lock()
+
+
+def _write_cache(update: dict[str, Any], stamp: float | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Merge the lanes this run sampled onto whatever is on disk NOW and write atomically. Two samplers can run at once
+    (the managed local refresh never waits for the vendor probes), so neither may write back the lanes it read at its
+    start. `stamp` sets the top-level fetched_at; None keeps the one on disk."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with _write_lock, open(STATE / "scarcity-write.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            disk = json.loads(CACHE.read_text())
+        except Exception:
+            disk = {"fetched_at": 0, "lanes": {}}
+        out = {**disk, **(extra or {}), "lanes": {**(disk.get("lanes") or {}), **update}}
+        if stamp is not None:
+            out["fetched_at"] = stamp
+        tmp = CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=1))
+        tmp.replace(CACHE)
+    return out
+
+
 def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[str, Any]:
     with _lock:
         prev: dict[str, Any] = {}
@@ -528,11 +555,10 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
             v.setdefault("plan", plans.get(lane))
             v["plan"] = plans.get(lane) or v.get("plan")
             lanes[lane] = v
-        out = {"fetched_at": now, "lanes": lanes, "learned_at": prev.get("learned_at"), "probe_sweep": sweep}
-        STATE.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(out, indent=1))
-        tmp.replace(CACHE)
+        # The top-level stamp means "last sample that covered the subscription lanes": a partial run (e.g. the 60-second
+        # local refresh) keeps the previous one, or current() would never find the probes due again (Codex review 2026-10-21).
+        covers_subscriptions = not only or all(l in only for l in SAMPLERS if l != "local")
+        out = _write_cache({l: lanes[l] for l in results}, now if covers_subscriptions else None, {"probe_sweep": sweep})
         if results and "--learn" in sys.argv or (results and time.time() - float(prev.get("learned_at") or 0) > 6 * 3600):
             try:
                 import importlib.util as _ilu
@@ -553,42 +579,98 @@ def current(max_age_s: int = 1200) -> dict[str, Any]:
         d = json.loads(CACHE.read_text())
     except Exception:
         d = {"fetched_at": 0, "lanes": {}}
-    if time.time() - float(d.get("fetched_at") or 0) > max_age_s and not _refreshing.is_set():
+    if _env_get("CORTADOS_SCARCITY_REFRESH") == "off":
+        # Verification and ad-hoc `core.py decide` runs use a throwaway home, which is always "due", and the background
+        # sample would open the user's real vendor CLIs. With the switch the decision routes on what is on disk only.
+        return d
+    managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
+    global_due = time.time() - float(d.get("fetched_at") or 0) > max_age_s
+    local_due = managed_local and time.time() - float((d.get("lanes", {}).get("local") or {}).get("tried_at") or 0) >= MIN_INTERVAL["local"]
+    if global_due and not _refreshing.is_set():
         _refreshing.set()
 
         def bg() -> None:
             try:
-                sample()
+                # Managed local telemetry refreshes on its own (below): inside the full run it would be published only
+                # after every vendor probe has finished, up to 240 s, past its own 120-second expiry.
+                sample(only=[l for l in SAMPLERS if not (managed_local and l == "local")])
             finally:
                 _refreshing.clear()
         threading.Thread(target=bg, daemon=True, name="cortados-scarcity").start()
+    if local_due and not _refreshing_local.is_set():
+        _refreshing_local.set()
+
+        def bg_local() -> None:
+            try:
+                _sample_local_managed()
+            finally:
+                _refreshing_local.clear()
+        threading.Thread(target=bg_local, daemon=True, name="cortados-scarcity-local").start()
     return d
+
+
+_refreshing_local = threading.Event()
+
+
+def _sample_local_managed() -> dict[str, Any]:
+    """The managed local refresh: node telemetry only, no vendor CLI, so it takes neither the sampler lock nor its
+    240-second join. It publishes through _write_cache like any other run and never touches the top-level stamp."""
+    try:
+        rec = {**_local(), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
+    except Exception as exc:      # keep the last good reading, say so (lane_scarcity expires it on its own clock)
+        try:
+            old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
+        except Exception:
+            old = {}
+        rec = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    rec["plan"] = _plans().get("local") or rec.get("plan")
+    # No history line: the series feeds the unit-cost learner and the 24-hour change readout, both per window, and
+    # local telemetry has no windows. A line a minute would only crowd the vendor samples out of the readout.
+    return _write_cache({"local": rec}, None)
 
 
 def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]]:
     out = {}
+    managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     for lane, v in (current().get("lanes") or {}).items():
-        fresh = time.time() - float(v.get("fetched_at") or 0) < max_reading_age_s
+        now = time.time()
+        if lane == "local" and managed_local:
+            # A managed local reading expires with its node telemetry: `expires_at` is the earliest member node's sample
+            # plus the configured max_age_s (local_resources.sample), never later than the sampler's own 120-second cap.
+            fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
+        else:
+            fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
         roll = _roll(general)
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
                      "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {}}
+        if lane == "local" and managed_local:
+            usable = fresh and v.get("resource_managed") is True
+            out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},
+                             scarcity=v.get("scarcity") if usable else 1.0,
+                             refusing=bool(v.get("refusing")) if usable else True,
+                             why=v.get("why") if usable else "local resource telemetry is missing or stale")
+    if managed_local and "local" not in out:
+        out["local"] = {"resource_managed": True, "deployments": {}, "scarcity": 1.0,
+                        "refusing": True, "why": "local resource telemetry has not been sampled"}
     return out
 
 
 def change_since(hours: float = 24) -> dict[tuple[str, str], float]:
     """Points of each window used over the last `hours`, from our own sample history (negative = the window reset in between)."""
-    target, best = time.time() - hours * 3600, None
+    # The baseline is chosen per lane: samples are partial (the local refresh writes its own lines every minute, the
+    # vendor probes every 15–30), so the row nearest the target rarely holds every lane (Codex review 2026-10-21).
+    target, best = time.time() - hours * 3600, {}
     try:
         for line in HISTORY.read_text().splitlines():
             row = json.loads(line)
-            if best is None or abs(row["ts"] - target) < abs(best["ts"] - target):
-                best = row
+            for lane, v in (row.get("lanes") or {}).items():
+                if lane not in best or abs(row["ts"] - target) < abs(best[lane][0] - target):
+                    best[lane] = (row["ts"], v)
     except Exception:
         return {}
-    if not best or abs(best["ts"] - target) > hours * 3600 * 0.25:
-        return {}
-    return {(lane, w[0]): w[1] for lane, v in best["lanes"].items() for w in v.get("windows") or []}
+    return {(lane, w[0]): w[1] for lane, (ts, v) in best.items() if abs(ts - target) <= hours * 3600 * 0.25
+            for w in v.get("windows") or []}
 
 
 def stance(s: float | None) -> str:
@@ -632,7 +714,10 @@ def summary_lines(d: dict[str, Any]) -> list[str]:
     lines, before = [], change_since(24)
     for lane, v in (d.get("lanes") or {}).items():
         s = v.get("scarcity")
-        lines.append(f"{lane}  [{v.get('plan')}]  scarcity {'?' if s is None else s} → router: {stance(s)}" + (f"  (last try failed: {v['error']})" if v.get("error") else ""))
+        local_stance = ("UNAVAILABLE: deployment or resource check failed" if v.get("refusing")
+                        else "BUSY: memory or GPU utilization is high" if s is not None and s >= 0.7
+                        else "available: measured local resources") if lane == "local" and v.get("resource_managed") else None
+        lines.append(f"{lane}  [{v.get('plan')}]  scarcity {'?' if s is None else s} → router: {local_stance or stance(s)}" + (f"  (last try failed: {v['error']})" if v.get("error") else ""))
         for w in v.get("windows") or []:
             reset = f"until it resets {w['resets_at']} (in {w['resets_in_h']} h)" if w.get("resets_at") else "(untouched: no reset clock running)"
             tl = tokens_left(lane, w["window"], w["used_pct"])
@@ -641,7 +726,18 @@ def summary_lines(d: dict[str, Any]) -> list[str]:
                          + (f"  ← about {w['expiring_pct']}% will expire unused" if w.get("expiring_pct", 0) >= 10 else "")
                          + (f"  [24 h: {w['used_pct'] - before[(lane, w['window'])]:+.0f} pts]" if (lane, w["window"]) in before else ""))
         if lane == "local":
-            lines.append(f"    free memory {v.get('free_gb')} GB, resident {v.get('resident')}")
+            if v.get("resource_managed"):
+                lines.append("    GPU memory, host RAM and utilization are separate; no quota reset")
+                for node in v.get("nodes", []):
+                    memory = node.get("gpu_headroom_estimate_bytes")
+                    headroom = "unknown" if memory is None else f"{memory / 2**30:.1f} GiB estimated"
+                    utilization = node.get("gpu_utilization_pct")
+                    used = "unknown" if utilization is None else f"{utilization}%"
+                    lines.append(f"    {node['id']}: {node['status']}, GPU headroom {headroom}, utilization {used}, pool={node['pool_eligible']}")
+                if v.get("why"):
+                    lines.append("    " + v["why"])
+            else:
+                lines.append(f"    free memory {v.get('free_gb')} GB, resident {v.get('resident')}")
         for pname, pv in (v.get("pools") or {}).items():
             lines.append(f"    pool {pname}: scarcity {pv.get('scarcity')}" + ("  SPENT" if pv.get("spent") else "") + (f"  ({pv['note']})" if pv.get("note") else ""))
         if v.get("per_model"):
