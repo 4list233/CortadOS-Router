@@ -95,7 +95,7 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(header, "codex-cli/gpt-test band=R2 id=r1")
         self.assertEqual(r["stop_reason"], "end_turn")
         self.assertEqual(r["content"], [{"type": "text", "text": "echo: hi"}])
-        self.assertEqual(r["usage"], {"input_tokens": 100, "output_tokens": 10})
+        self.assertEqual(r["usage"], {"input_tokens": 100, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
         self.assertEqual(len(self.reg.sessions), 1)
         self.assertIsInstance(list(self.reg.sessions.values())[0], codex_bridge.CodexSession)
 
@@ -106,19 +106,19 @@ class CodexEndpointTests(unittest.TestCase):
         use = r1["content"][-1]
         self.assertEqual((use["type"], use["name"], use["input"]), ("tool_use", "Read", {"file_path": "f0.md"}))
         self.assertTrue(use["id"].startswith("exec-"))                  # the Codex callId, as issued
-        self.assertEqual(r1["usage"], {"input_tokens": 0, "output_tokens": 0})   # nothing reported yet by the server
+        self.assertEqual((r1["usage"]["input_tokens"], r1["usage"]["output_tokens"]), (0, 0))   # nothing reported yet by the server
         history += [{"role": "assistant", "content": r1["content"]},
                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
         r2 = self.post({"tools": [READ_TOOL], "messages": history})
         self.assertEqual(r2["stop_reason"], "end_turn")
         self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
-        self.assertEqual(r2["usage"], {"input_tokens": 200, "output_tokens": 20})  # both model requests of this turn
+        self.assertEqual((r2["usage"]["input_tokens"], r2["usage"]["output_tokens"]), (200, 20))  # both model requests of this turn
         reply = [m for m in self.inbound() if m.get("id") == 0 and "result" in m][0]
         self.assertEqual(reply["result"], {"success": True, "contentItems": [{"type": "inputText", "text": "hello"}]})
         history += [{"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "thanks"}]
         r3 = self.post({"tools": [READ_TOOL], "messages": history})
         self.assertEqual(r3["content"], [{"type": "text", "text": "echo: thanks"}])
-        self.assertEqual(r3["usage"], {"input_tokens": 100, "output_tokens": 10})  # a delta, not the thread total
+        self.assertEqual((r3["usage"]["input_tokens"], r3["usage"]["output_tokens"]), (100, 10))  # a delta, not the thread total
         self.assertEqual(len(self.reg.sessions), 1)
         self.assertEqual(len([m for m in self.inbound() if m.get("method") == "turn/start"]), 2)
 
@@ -227,6 +227,7 @@ class CodexEndpointTests(unittest.TestCase):
                    "model_providers.openai": {"model_providers": {"openai": {"base_url": "https://mirror.invalid/v1"}}},
                    "chatgpt_base_url": {"chatgpt_base_url": "https://mirror.invalid/backend-api/"},
                    "features": {"features": {"shell_tool": True}},
+                   "code_mode_host": {"features": {"code_mode_host": False}},
                    "web_search": {"web_search": "live"},
                    "project_doc_max_bytes": {"project_doc_max_bytes": 32768}}
         for name, patch in patches.items():
@@ -254,6 +255,7 @@ class CodexEndpointTests(unittest.TestCase):
                         "memories", "browser_use", "computer_use", "collaboration_modes"):
             self.assertIn(feature, disabled)
         self.assertNotIn("code_mode_host", disabled)                    # dynamic tools are served through it
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--enable"], ["code_mode_host"])
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
                          'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false"):
@@ -649,6 +651,16 @@ class CodexSessionUnitTests(unittest.TestCase):
         with self.assertRaises(BridgeError):
             s.run_turn(0.025)
         self.assertLess(time.time() - t0, 0.3)                           # not a fresh REPLY_WRITE_S for the answer
+
+    def test_the_messages_wire_reports_the_cache_counts_the_bridges_deliver(self):
+        from cortados_router.provider import anthropic_wire
+        usage = {"input_tokens": 8341, "cache_read_input_tokens": 3968, "cache_creation_input_tokens": 10, "output_tokens": 110}
+        self.assertEqual(anthropic_wire.message_json("m", "cortados", [], "end_turn", usage)["usage"],
+                         {"input_tokens": 8341, "output_tokens": 110, "cache_read_input_tokens": 3968, "cache_creation_input_tokens": 10})
+        raw = b"".join(anthropic_wire.sse_body([{"type": "text", "text": "hi"}], "end_turn", usage)).decode()
+        delta = [json.loads(l[6:]) for l in raw.splitlines() if l.startswith("data: ") and '"message_delta"' in l][0]
+        self.assertEqual(delta["usage"], {"input_tokens": 8341, "output_tokens": 110, "cache_read_input_tokens": 3968,
+                                          "cache_creation_input_tokens": 10})
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))

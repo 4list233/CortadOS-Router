@@ -61,6 +61,8 @@ def effective_config(argv):
     for i, a in enumerate(argv):
         if a == "--disable" and i + 1 < len(argv):
             cfg["features"][argv[i + 1]] = False
+        if a == "--enable" and i + 1 < len(argv):
+            cfg["features"][argv[i + 1]] = True
         if a == "-c" and i + 1 < len(argv) and "=" in argv[i + 1]:
             key, _, raw = argv[i + 1].partition("=")
             parts, node = key.split("."), cfg

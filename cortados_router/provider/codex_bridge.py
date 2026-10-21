@@ -59,6 +59,10 @@ EXPECTED_ACCOUNT_TYPE = "chatgpt"
 DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "image_generation", "apps",
                      "plugins", "hooks", "multi_agent", "sleep_tool", "skill_search", "tool_suggest", "goals",
                      "memories", "browser_use", "computer_use", "collaboration_modes")
+# `--enable <feature>`: the one feature the dynamic tools need. A home whose config turns it off would start a thread
+# whose advertised client tools cannot run (the first spike, with it off: "Read tool is unavailable"), so it is asked
+# for on the command line and checked in the effective config like the disabled ones.
+ENABLED_FEATURES = ("code_mode_host",)
 # Thread items that only a built-in tool produces: their appearance means isolation failed (brief §A.11, plus `sleep`
 # and `imageGeneration`, the items of the sleep_tool and image_generation features: the invariant is "no built-in ran",
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
@@ -157,6 +161,9 @@ def check_effective_config(cfg: dict[str, Any]) -> None:
     on = sorted(f for f in DISABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not False)
     if on:
         bad.append(f"built-in tool features still enabled: {on}")
+    off = sorted(f for f in ENABLED_FEATURES if (features.get(f) if isinstance(features, dict) else None) is not True)
+    if off:
+        bad.append(f"features the dynamic tools need are off: {off}")
     if bad:
         raise BridgeError("codex app-server's effective config would not isolate the thread: " + "; ".join(bad))
 
@@ -258,6 +265,8 @@ class CodexSession:
                 args += ["-c", f"mcp_servers.{name}.enabled=false"]
             for feature in DISABLED_FEATURES:
                 args += ["--disable", feature]
+            for feature in ENABLED_FEATURES:
+                args += ["--enable", feature]
             env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
             if codex_home:
                 env["CODEX_HOME"] = codex_home

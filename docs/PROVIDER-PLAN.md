@@ -199,7 +199,7 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   --disable shell_tool --disable unified_exec --disable unified_exec_tty --disable view_image --disable image_generation
   --disable apps --disable plugins --disable hooks --disable multi_agent --disable sleep_tool --disable skill_search
   --disable tool_suggest --disable goals --disable memories --disable browser_use --disable computer_use
-  --disable collaboration_modes
+  --disable collaboration_modes --enable code_mode_host   # dynamic tools are served through it; checked in config/read
 ```
 
 - With that set the tool list Codex builds is exactly `request_user_input` plus the dynamic tools (verified through
@@ -213,7 +213,7 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
   overrides, a managed `requirements.toml`), and requires `model_provider="openai"`, no redefined
   `model_providers.openai`, the default `chatgpt_base_url`, the four overrides above, every `mcp_servers.*.enabled`
-  false and every disabled feature false in `features`. `thread/start` is when Codex starts MCP servers and binds the
+  false, every disabled feature false and `code_mode_host` true in `features`. `thread/start` is when Codex starts MCP servers and binds the
   provider, so a refusal here means nothing ran. The config.toml reader (which names the servers to disable) is the
   pre-spawn best effort; a server it could not name (`["mcp_servers".x]`, a dotted key, another layer) is caught here.
   Verified on 0.163.0: `config/read` reflects the `-c` overrides and `--disable` flags exactly.
