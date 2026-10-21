@@ -38,6 +38,33 @@ class TeacherAttemptRegressions(TeacherCase):
         with self.assertRaises(WorkerError):
             with self.store(): pass
 
+    def _rebind_saved_identity(self, **changes):
+        path = self.data / '.teacher-attempts/manifest.json'
+        saved = json.loads(path.read_text())
+        saved['data_identity'].update(changes)
+        path.write_text(json.dumps(saved))
+        return saved['data_identity']
+
+    def test_reboot_device_change_keeps_the_manifest_and_adopts_the_new_device(self):
+        with self.store() as store: original = self.reserve(store)
+        current = self.data.stat()
+        self._rebind_saved_identity(device=current.st_dev + 1)
+        with self.store() as store:
+            self.assertEqual(store.pending()[0], original)
+            self.assertEqual(store.manifest['data_identity']['device'], current.st_dev)
+
+    def test_different_inode_is_still_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(inode=self.data.stat().st_ino + 1)
+        with self.assertRaises(WorkerError):
+            with self.store(): pass
+
+    def test_malformed_saved_identity_is_refused(self):
+        with self.store() as store: self.reserve(store)
+        self._rebind_saved_identity(device='16777234')
+        with self.assertRaises(WorkerError):
+            with self.store(): pass
+
     def test_same_invocation_context_does_not_allow_a_second_flock(self):
         from cortados_router.teacher_attempts import _ACTIVE
         with self.store() as first:

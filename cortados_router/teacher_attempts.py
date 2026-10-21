@@ -74,6 +74,19 @@ class LabelAttempts:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid(): _bad()
         return dict(path=str(self.data), device=info.st_dev, inode=info.st_ino)
 
+    @staticmethod
+    def _durable(identity):
+        """The part of a data identity that survives a reboot: path and inode.
+
+        APFS assigns volume device numbers at mount time, so a saved st_dev goes stale on
+        reboot (2026-10-19: every later run refused its own manifest). In-process checks
+        still compare the full identity, device included.
+        """
+        if (not isinstance(identity, dict) or set(identity) != {'path', 'device', 'inode'}
+                or not isinstance(identity['path'], str) or not _integer(identity['device'])
+                or not _integer(identity['inode'])): _bad()
+        return identity['path'], identity['inode']
+
     def _check(self):
         if self.poisoned or self.lock is None or self.lock.closed or self.owner_pid != os.getpid(): _bad()
         try:
@@ -119,6 +132,8 @@ class LabelAttempts:
                     self.manifest = dict(schema='cortados.teacher-attempts.v1', data_identity=self.identity,
                                          revision=0, attempts=[])
                 self._validate_manifest()
+                # Same folder after a reboot: adopt this boot's device number; the next save persists it.
+                self.manifest['data_identity'] = self.identity
                 self._check()
                 self._labels(self.data / 'labels.jsonl')
                 self.active_token = _ACTIVE.set(self)
@@ -171,7 +186,8 @@ class LabelAttempts:
         m = self.manifest
         if (not isinstance(m, dict) or set(m) != {'schema', 'data_identity', 'revision', 'attempts'}
                 or m['schema'] != 'cortados.teacher-attempts.v1' or not _integer(m['revision'])
-                or m['data_identity'] != self.identity or not isinstance(m['attempts'], list)): _bad()
+                or self._durable(m['data_identity']) != self._durable(self.identity)
+                or not isinstance(m['attempts'], list)): _bad()
         ids, requests, slots = set(), set(), set()
         for a in m['attempts']:
             self._validate_attempt(a)
