@@ -76,8 +76,12 @@ else:
 if up:
     code, j, tail = decide("email the signed invoice to the client and mark it paid")
     band = j and j["route"].get("band")
-    record("outward request floors blast radius (R3)", "PASS" if band == "R3" else "FAIL",
-           f"band={band} | {tail[0] if tail else ''}")
+    if j and j["decision"].get("degraded"):
+        # S1 answered HTTP but did not score: a degraded fallback band proves nothing about the outward rule.
+        record("outward request floors blast radius (R3)", "BLOCKED", f"S1 listening at {S1_URL} but the decision is degraded")
+    else:
+        record("outward request floors blast radius (R3)", "PASS" if band == "R3" else "FAIL",
+               f"band={band} | {tail[0] if tail else ''}")
 else:
     record("outward request floors blast radius (R3)", "BLOCKED", f"S1 unreachable at {S1_URL}")
 

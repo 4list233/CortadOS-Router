@@ -120,8 +120,10 @@ A managed local reading expires with its node telemetry: `expires_at` is the
 earliest sample time among the nodes a healthy deployment stands on, plus the
 configured `max_age_s`, and never more than 120 seconds after the reading. The
 router admits no local route past it. Background local refresh is due every 60
-seconds independently of subscription-window readings and never postpones them
-(a local-only refresh keeps the previous full-sample stamp), so a `max_age_s`
+seconds independently of subscription-window readings. It never postpones them
+(a local-only refresh keeps the previous full-sample stamp) and never waits for
+them (it runs outside the vendor-probe sampler, which can hold its lock for up
+to 240 seconds, and publishes through the same merge-on-write), so a `max_age_s`
 under 60 leaves the lane unavailable between refreshes rather than admitting
 stale capacity.
 

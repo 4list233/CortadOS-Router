@@ -162,6 +162,46 @@ class LocalResources(unittest.TestCase):
             self.assertTrue(out["lanes"]["local"]["resource_managed"])
             self.assertEqual(json.loads((home / "scarcity.json").read_text())["fetched_at"], 1000)
 
+    def test_sampler_write_keeps_lanes_published_meanwhile(self):
+        # A run merges only the lanes it sampled onto the disk copy, so a reading published during its probes survives.
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / "scarcity.json").write_text(json.dumps({"fetched_at": 1000, "lanes": {"local": {"scarcity": 0.1, "resource_managed": True}}}))
+            with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"):
+                out = scarcity._write_cache({"codex": {"scarcity": 0.5}}, 2000)
+            self.assertEqual((out["fetched_at"], out["lanes"]["local"]["scarcity"], out["lanes"]["codex"]["scarcity"]), (2000, 0.1, 0.5))
+
+    def test_managed_local_refresh_does_not_wait_for_subscription_probes(self):
+        # The vendor probes hold the sampler lock for up to 240 s; the local reading must publish without it.
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / "scarcity.json").write_text(json.dumps({"fetched_at": 1000, "lanes": {"codex": {"scarcity": 0.4}}}))
+            local = {"resource_managed": True, "scarcity": 0, "refusing": False, "windows": [], "expires_at": time.time() + 60}
+            with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
+                 patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "_local", return_value=dict(local)), \
+                 patch.object(scarcity, "_plans", return_value={}):
+                self.assertTrue(scarcity._lock.acquire(timeout=1))
+                try:
+                    done = threading.Event()
+                    threading.Thread(target=lambda: (scarcity._sample_local_managed(), done.set()), daemon=True).start()
+                    self.assertTrue(done.wait(5), "the local refresh waited on the sampler lock")
+                finally:
+                    scarcity._lock.release()
+            on_disk = json.loads((home / "scarcity.json").read_text())
+            self.assertEqual((on_disk["fetched_at"], on_disk["lanes"]["codex"]), (1000, {"scarcity": 0.4}))
+            self.assertTrue(on_disk["lanes"]["local"]["resource_managed"])
+
+    def test_managed_local_refresh_is_scheduled_apart_from_the_vendor_probes(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(scarcity, "CACHE", Path(folder) / "scarcity.json"), \
+             patch.object(scarcity, "sample") as sampler, patch.object(scarcity, "_sample_local_managed") as local, \
+             patch.dict(os.environ, {"CORTADOS_LOCAL_RESOURCES_CONFIG": "fleet.json", "CORTADOS_SCARCITY_REFRESH": "on"}):
+            full, part = threading.Event(), threading.Event()
+            sampler.side_effect = lambda **kw: full.set()
+            local.side_effect = lambda: part.set()
+            scarcity.current()
+            self.assertTrue(full.wait(5) and part.wait(5))
+            self.assertNotIn("local", sampler.call_args.kwargs["only"])
+
     def test_refresh_switch_never_schedules_a_usage_sample(self):
         # A fresh throwaway home is always "due"; with the switch, verification and `decide` runs open no vendor CLI.
         with tempfile.TemporaryDirectory() as folder, patch.object(scarcity, "CACHE", Path(folder) / "scarcity.json"), \

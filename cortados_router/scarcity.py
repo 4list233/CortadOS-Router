@@ -498,6 +498,29 @@ def sample(force: bool = False, only: list[str] | None = None) -> dict[str, Any]
         _f.flock(lockf, _f.LOCK_UN); lockf.close()
 
 
+_write_lock = threading.Lock()
+
+
+def _write_cache(update: dict[str, Any], stamp: float | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Merge the lanes this run sampled onto whatever is on disk NOW and write atomically. Two samplers can run at once
+    (the managed local refresh never waits for the vendor probes), so neither may write back the lanes it read at its
+    start. `stamp` sets the top-level fetched_at; None keeps the one on disk."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with _write_lock, open(STATE / "scarcity-write.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            disk = json.loads(CACHE.read_text())
+        except Exception:
+            disk = {"fetched_at": 0, "lanes": {}}
+        out = {**disk, **(extra or {}), "lanes": {**(disk.get("lanes") or {}), **update}}
+        if stamp is not None:
+            out["fetched_at"] = stamp
+        tmp = CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=1))
+        tmp.replace(CACHE)
+    return out
+
+
 def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[str, Any]:
     with _lock:
         prev: dict[str, Any] = {}
@@ -532,13 +555,10 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
             v.setdefault("plan", plans.get(lane))
             v["plan"] = plans.get(lane) or v.get("plan")
             lanes[lane] = v
-        # The top-level stamp means "last full sample": a partial run (`only`, e.g. the 60-second local refresh) keeps the
-        # previous one, or current() would never find the subscription probes due again (Codex review 2026-10-21).
-        out = {"fetched_at": now if not only else float(prev.get("fetched_at") or 0), "lanes": lanes, "learned_at": prev.get("learned_at"), "probe_sweep": sweep}
-        STATE.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(out, indent=1))
-        tmp.replace(CACHE)
+        # The top-level stamp means "last sample that covered the subscription lanes": a partial run (e.g. the 60-second
+        # local refresh) keeps the previous one, or current() would never find the probes due again (Codex review 2026-10-21).
+        covers_subscriptions = not only or all(l in only for l in SAMPLERS if l != "local")
+        out = _write_cache({l: lanes[l] for l in results}, now if covers_subscriptions else None, {"probe_sweep": sweep})
         if results and "--learn" in sys.argv or (results and time.time() - float(prev.get("learned_at") or 0) > 6 * 3600):
             try:
                 import importlib.util as _ilu
@@ -563,19 +583,52 @@ def current(max_age_s: int = 1200) -> dict[str, Any]:
         # Verification and ad-hoc `core.py decide` runs use a throwaway home, which is always "due", and the background
         # sample would open the user's real vendor CLIs. With the switch the decision routes on what is on disk only.
         return d
+    managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     global_due = time.time() - float(d.get("fetched_at") or 0) > max_age_s
-    local_due = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")) and time.time() - float(
-        (d.get("lanes", {}).get("local") or {}).get("tried_at") or 0) >= MIN_INTERVAL["local"]
-    if (global_due or local_due) and not _refreshing.is_set():
+    local_due = managed_local and time.time() - float((d.get("lanes", {}).get("local") or {}).get("tried_at") or 0) >= MIN_INTERVAL["local"]
+    if global_due and not _refreshing.is_set():
         _refreshing.set()
 
         def bg() -> None:
             try:
-                sample(only=None if global_due else ["local"])
+                # Managed local telemetry refreshes on its own (below): inside the full run it would be published only
+                # after every vendor probe has finished, up to 240 s, past its own 120-second expiry.
+                sample(only=[l for l in SAMPLERS if not (managed_local and l == "local")])
             finally:
                 _refreshing.clear()
         threading.Thread(target=bg, daemon=True, name="cortados-scarcity").start()
+    if local_due and not _refreshing_local.is_set():
+        _refreshing_local.set()
+
+        def bg_local() -> None:
+            try:
+                _sample_local_managed()
+            finally:
+                _refreshing_local.clear()
+        threading.Thread(target=bg_local, daemon=True, name="cortados-scarcity-local").start()
     return d
+
+
+_refreshing_local = threading.Event()
+
+
+def _sample_local_managed() -> dict[str, Any]:
+    """The managed local refresh: node telemetry only, no vendor CLI, so it takes neither the sampler lock nor its
+    240-second join. It publishes through _write_cache like any other run and never touches the top-level stamp."""
+    try:
+        rec = {**_local(), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
+    except Exception as exc:      # keep the last good reading, say so (lane_scarcity expires it on its own clock)
+        try:
+            old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
+        except Exception:
+            old = {}
+        rec = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    rec["plan"] = _plans().get("local") or rec.get("plan")
+    out = _write_cache({"local": rec}, None)
+    if not rec.get("error"):
+        with HISTORY.open("a") as h:
+            h.write(json.dumps({"ts": rec["fetched_at"], "lanes": {"local": {"scarcity": rec.get("scarcity"), "windows": []}}}) + "\n")
+    return out
 
 
 def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]]:
