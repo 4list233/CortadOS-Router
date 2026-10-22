@@ -555,6 +555,26 @@ class CodexSessionUnitTests(unittest.TestCase):
             self.session(codex_bin=os.path.join(self.scratch, "no-such-codex"))
         self.assertEqual(os.listdir(self.scratch), ["codex-home"])
 
+    def test_an_inherited_relative_codex_home_reaches_the_child_as_the_same_absolute_path(self):
+        # CODEX_HOME=./dedicated in the server's environment and no --codex-home: the config is read relative to this
+        # process's cwd, so the child (cwd: the scratch work dir) must be told the same directory, made absolute.
+        os.environ["FAKE_CODEX_ARGV"] = os.path.join(self.scratch, "argv.json")
+        Path(self.codex_home, "config.toml").write_text('[mcp_servers.node_repl]\ncommand = "x"\n')
+        relative, keep = os.path.relpath(self.codex_home), os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = relative
+        try:
+            s = self.session(codex_home=None)
+            try:
+                seen = json.loads(Path(self.scratch, "argv.json").read_text())
+            finally:
+                s.close()
+        finally:
+            os.environ.pop("CODEX_HOME", None)
+            if keep is not None:
+                os.environ["CODEX_HOME"] = keep
+        self.assertEqual(seen["env"]["CODEX_HOME"], os.path.abspath(self.codex_home))
+        self.assertIn("mcp_servers.node_repl.enabled=false", seen["argv"])   # the config of that same home was read
+
     def test_a_relative_codex_home_reaches_the_child_as_an_absolute_path(self):
         os.environ["FAKE_CODEX_ARGV"] = os.path.join(self.scratch, "argv.json")
         relative = os.path.relpath(self.codex_home)                      # relative to this process's cwd

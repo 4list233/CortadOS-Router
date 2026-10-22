@@ -120,17 +120,16 @@ class CodexSession:
         self.thread_id: str | None = None
         self._turn_id: str | None = None
         self._aliases: dict[str, str] = {}              # dynamic tool name -> client tool name (tool_aliases)
-        if codex_home:
-            # The child's cwd is the scratch work dir while this process reads config.toml from its own cwd, so a
-            # relative home would name two different directories for the two readers; make it one absolute path.
-            codex_home = os.path.abspath(os.path.expanduser(codex_home))
+        # One home for both readers: the explicit dedicated home, else an inherited CODEX_HOME, else the user's own.
+        # This process reads its config.toml from its own cwd while the child's cwd is the scratch work dir, so a
+        # relative value would name two different directories; it is made absolute once and the child is told it.
+        home = os.path.abspath(os.path.expanduser(codex_home or os.environ.get("CODEX_HOME") or "~/.codex"))
         self.dir = Path(tempfile.mkdtemp(prefix="cortados-codex-", dir=scratch_root))
         self._stderr = None
         prefix = [codex_bin] if isinstance(codex_bin, str) else list(codex_bin)   # a list lets tests run a fake
         try:
             (self.dir / "work").mkdir()
-            home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-            args, env = command_line(prefix, home), child_env(codex_home)
+            args, env = command_line(prefix, home), child_env(home)
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)

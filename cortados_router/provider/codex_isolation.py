@@ -179,11 +179,11 @@ def command_line(prefix: list[str], codex_home: str) -> list[str]:
     return args
 
 
-def child_env(codex_home: str | None) -> dict[str, str]:
-    """The child's environment: STRIPPED_ENV removed; CODEX_HOME set only for a dedicated home, otherwise the child
-    finds the user's own (a throwaway home has no login, and a copied auth.json would spend the single-use refresh
-    token)."""
+def child_env(home: str) -> dict[str, str]:
+    """The child's environment: STRIPPED_ENV removed and CODEX_HOME set to the one absolute home this process read
+    config.toml from (dedicated, inherited or the user's own), so both readers name the same directory whatever
+    the child's cwd. The home is never copied: a throwaway one has no login, and a copied auth.json would spend the
+    single-use refresh token."""
     env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
-    if codex_home:
-        env["CODEX_HOME"] = codex_home
+    env["CODEX_HOME"] = home
     return env
