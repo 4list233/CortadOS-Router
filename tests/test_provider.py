@@ -300,3 +300,22 @@ class StalledCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MessagesWireFoldTests(unittest.TestCase):
+    def test_text_and_images_beside_tool_results_ride_on_the_last_result(self):
+        # Claude Code can send a pasted screenshot in the same message as the tool results; the CLI only receives
+        # that message through the pending MCP calls, so every block rides on the last result, images included.
+        from cortados_router.provider import anthropic_wire
+        tool = {"name": "Read", "description": "r", "input_schema": {"type": "object"}}
+        body = {"model": "cortados", "tools": [tool], "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "body"},
+                                         {"type": "text", "text": "<reminder>"},
+                                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]}
+        turn = anthropic_wire.parse_request(body)
+        self.assertEqual(turn.content, [])
+        self.assertEqual(turn.tool_results["t1"]["content"], [{"type": "text", "text": "body"}, {"type": "text", "text": "<reminder>"},
+                                                              {"type": "image", "data": "QUJD", "mimeType": "image/png"}])
+

@@ -98,7 +98,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
         # The CLI can only receive tool results through the pending MCP calls, so text sent next to them (Claude
         # Code's reminders) rides on the last result rather than being dropped.
         last_id = list(results)[-1]
-        results[last_id]["content"] += mcp_content([b for b in content if b.get("type") == "text"])
+        results[last_id]["content"] += mcp_content(content)        # text and images alike; nothing the client sent is dropped
         content = []
     tools = body.get("tools") or []
     if not isinstance(tools, list):

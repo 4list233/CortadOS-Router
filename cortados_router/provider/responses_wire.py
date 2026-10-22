@@ -240,7 +240,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
         # The CLI can only receive tool results through the pending calls, so text sent next to them rides on the
         # last result rather than being dropped (same rule as the Messages wire).
         last_id = list(results)[-1]
-        results[last_id]["content"] += mcp_content([b for b in content if b.get("type") == "text"])
+        results[last_id]["content"] += mcp_content(content)        # text and images alike; nothing the client sent is dropped
         content = []
     if not content and not results:
         raise WireError("the new turn carries no user content and no tool outputs")

@@ -113,6 +113,13 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(turn.content, [])
         self.assertEqual(turn.tool_results["c"]["content"],
                          [{"type": "text", "text": "body"}, {"type": "text", "text": "<reminder>"}])
+        # A screenshot sent beside the outputs rides along too; it used to be dropped before either backend saw it.
+        shot = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "see"},
+                                                              {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}]}
+        turn = wire.parse_request(request(user("go"), {"type": "function_call", "call_id": "c", "name": "Read", "arguments": "{}"},
+                                          {"type": "function_call_output", "call_id": "c", "output": "body"}, shot))
+        self.assertEqual(turn.tool_results["c"]["content"][1:], [{"type": "text", "text": "see"},
+                                                                 {"type": "image", "data": "QUJD", "mimeType": "image/png"}])
 
     def test_a_developer_item_after_the_first_reply_joins_the_turn_as_operator_text(self):
         body = request(user("a"), {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "one"}]},
