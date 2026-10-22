@@ -387,6 +387,35 @@ class CodexEndpointTests(unittest.TestCase):
             codex_bridge.CodexSession.close = orig_close
             sock.close()
 
+    def test_a_blocked_keepalive_does_not_keep_a_finished_one_shot_backend_alive(self):
+        # Streaming, tool-less, and the client never reads: 1 MB keepalives every 10 ms fill the socket so the ping
+        # write blocks the handler thread. The one-shot's close must not wait for that thread.
+        import socket
+        closed, orig_close, orig_ping = [], codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_ping
+        ping_s = provider_server.PING_S
+
+        def close(s):
+            closed.append(s.id)
+            orig_close(s)
+        codex_bridge.CodexSession.close = close
+        provider_server.ANTHROPIC.stream_ping = lambda: b": " + b"x" * (1 << 20) + b"\n\n"
+        provider_server.PING_S = 0.01
+        body = json.dumps({"stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=30)
+        try:
+            sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                         b"Authorization: Bearer " + TOKEN.encode() + b"\r\nUser-Agent: t/1\r\nContent-Length: "
+                         + str(len(body)).encode() + b"\r\n\r\n" + body)
+            deadline = time.time() + 20
+            while not closed and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(closed), 1, "the one-shot backend was not closed while a keepalive write was blocked")
+            self.assertEqual(self.reg.sessions, {})
+        finally:
+            codex_bridge.CodexSession.close, provider_server.ANTHROPIC.stream_ping = orig_close, orig_ping
+            provider_server.PING_S = ping_s
+            sock.close()
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]

@@ -47,6 +47,11 @@ TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
+# Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
+# would otherwise block an SSE write forever and with it the handler thread. Too short: a client on a slow link, or
+# one that pauses while it renders, is treated as gone and loses the reply. Too long: a dead client holds a handler
+# thread that long. Backend cleanup does not depend on this: the worker that ran the turn owns it.
+SOCKET_TIMEOUT_S = 120.0
 logger = logging.getLogger("cortados.provider")
 
 
@@ -175,6 +180,7 @@ class LostSession(LookupError):
 class Handler(BaseHTTPRequestHandler):
     server: "ProviderServer"
     protocol_version = "HTTP/1.1"
+    timeout = SOCKET_TIMEOUT_S
 
     def log_message(self, fmt, *args):                  # route http.server's stderr lines into logging
         logger.debug("%s " + fmt, self.address_string(), *args)
@@ -357,10 +363,16 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["error"] = exc
             finally:
                 session.lock.release()
+                if one_shot:
+                    # The throwaway CLI's work is done; the worker closes it here because this thread never touches
+                    # the socket: a client that stopped reading can block the handler on a keepalive or on the reply
+                    # write for as long as it likes, and a one-shot is in no registry for the reaper to find.
+                    session.close()
+                    outcome["closed"] = True
 
         worker = threading.Thread(target=work, daemon=True)
         worker.start()
-        client_gone = closed = False
+        client_gone = False
         try:
             while worker.is_alive():
                 worker.join(PING_S)
@@ -374,12 +386,6 @@ class Handler(BaseHTTPRequestHandler):
                         client_gone = True
                         logger.info("conversation %s: client gone mid-turn (%s); waiting for the turn to end",
                                     session.id[:8], exc)
-            if one_shot:
-                # The throwaway CLI's work is done once the worker has joined: close it before the reply is written,
-                # not after, because a client that stops reading can block the write for as long as it likes, and a
-                # one-shot is in no registry for the reaper to find. The finally below stays for every earlier exit.
-                session.close()
-                closed = True
             if "stale" in outcome:
                 logger.warning("conversation %s: stale continuation refused: %s", session.id[:8], outcome["stale"])
                 if client_gone:
@@ -410,8 +416,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, wire.message_json(msg_id, turn.model, blocks, stop, usage), session=session)
         finally:
-            if one_shot and not closed:
-                session.close()                         # a throwaway CLI is not in the registry: nothing else reaps it
+            if one_shot and not outcome.get("closed"):
+                session.close()                         # the worker never got to it (it did not run): close it here
 
     def _client(self) -> str:
         """The calling tool, from its User-Agent ("claude-cli/2.1.304 (external, cli)" → "claude-cli",
