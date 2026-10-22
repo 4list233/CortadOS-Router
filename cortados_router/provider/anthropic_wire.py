@@ -98,7 +98,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
         # The CLI can only receive tool results through the pending MCP calls, so text sent next to them (Claude
         # Code's reminders) rides on the last result rather than being dropped.
         last_id = list(results)[-1]
-        results[last_id]["content"] += mcp_content([b for b in content if b.get("type") == "text"])
+        results[last_id]["content"] += mcp_content(content)        # text and images alike; nothing the client sent is dropped
         content = []
     tools = body.get("tools") or []
     if not isinstance(tools, list):
@@ -142,7 +142,16 @@ def new_message_id() -> str:
 def message_json(msg_id: str, model: str, blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, int]) -> dict:
     return {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": blocks,
             "stop_reason": stop_reason, "stop_sequence": None,
-            "usage": {"input_tokens": int(usage.get("input_tokens", 0)), "output_tokens": int(usage.get("output_tokens", 0))}}
+            "usage": usage_json(usage)}
+
+
+def usage_json(usage: dict[str, int]) -> dict[str, int]:
+    """The session's usage in Messages form: input_tokens excludes the cache reads and writes, which are reported
+    beside it as the API does (both bridges report this shape; dropping the cache counts would hide most of a cached
+    turn's input from the client's accounting)."""
+    return {"input_tokens": int(usage.get("input_tokens", 0)), "output_tokens": int(usage.get("output_tokens", 0)),
+            "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0)}
 
 
 def sse(event: str, data: dict[str, Any]) -> bytes:
@@ -171,8 +180,10 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
         else:
             raise ValueError(f"unsupported block type {b['type']!r}")
         yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+    # message_start carried zeros (nothing was known then); the whole turn's usage, cache counts included, rides here,
+    # where the API reports cumulative usage and where clients read it.
     yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                                "usage": {"output_tokens": int(usage.get("output_tokens", 0))}})
+                                "usage": usage_json(usage)})
     yield sse("message_stop", {"type": "message_stop"})
 
 

@@ -12,7 +12,14 @@ is the long form.
 
 ## Layout
 - `cortados_router/` — router package. `core.py` resolve/decide (CLI: `table`, `decide`),
-  `scarcity.py` quota reading via vendor CLIs, `unitcost.py`, `transport.py`, `local_resources.py`.
+  `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
+  `transport.py`, `local_resources.py`.
+- `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
+  `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
+  `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
+  `routing.py` picks the lane through the router's execution policy; `bridge.py` drives a headless Claude CLI with
+  `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
+  dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.
@@ -23,9 +30,19 @@ is the long form.
 ## Commands
 - Full suite (run before calling any change done):
   `python3 -B -m unittest discover -s tests -t .`
-  Baseline 2026-10-20 on the M5 Max, system Python 3.9, dirty tree: 172 run, OK, 7 skipped
+  Baseline 2026-10-21 on the M5 Max, system Python 3.9, branch p2-codex: 334 run, OK, 7 skipped
   (Hermes integration). The README's "155 / 1 failing" is stale.
+- Provider tests alone (fakes only; no vendor CLI is opened):
+  `python3 -B -m unittest tests.test_provider tests.test_provider_codex tests.test_provider_responses tests.test_provider_routing tests.test_responses_wire`
 - Table check: `python3 -B cortados_router/core.py table` → `table v <N> ok`
+- Provider endpoint with both backends (every conversation spends subscription quota: start it only when asked):
+  `CORTADOS_PROVIDER_TOKEN=<token> python3 -B -m cortados_router.provider.server [--port 8432] [--claude-bin claude] [--codex-bin codex] [--codex-home <dir>] [--fixed-model <claude model>]`
+  Env equivalents: `CORTADOS_PROVIDER_CLAUDE_BIN`, `CORTADOS_PROVIDER_CODEX_BIN` (not scarcity's `CORTADOS_CODEX_BIN`,
+  which is the ChatGPT.app copy for the `/status` probe), `CORTADOS_PROVIDER_CODEX_HOME` (a dedicated, logged-in
+  `CODEX_HOME` for the Codex backend; unset, the backend runs on `~/.codex`, whose AGENTS.md and skills reach the
+  thread), `CORTADOS_PROVIDER_FIXED_MODEL` (no routing). Clients: Claude Code on `/v1/messages`
+  (`ANTHROPIC_BASE_URL=http://127.0.0.1:8432 ANTHROPIC_AUTH_TOKEN=<token> claude --model cortados`), Codex on
+  `/v1/responses` with the provider config in `docs/PROVIDER-PLAN.md` (P2 status); this repo never writes `~/.codex`.
 - Real decision (shadow only, changes nothing): always set a throwaway home and turn the usage refresh off —
   `CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off python3 -B cortados_router/core.py decide "<request>"`
   The throwaway home protects the live state; the switch protects the subscriptions, because a fresh home is
