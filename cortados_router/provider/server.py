@@ -360,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
 
         worker = threading.Thread(target=work, daemon=True)
         worker.start()
-        client_gone = False
+        client_gone = closed = False
         try:
             while worker.is_alive():
                 worker.join(PING_S)
@@ -374,6 +374,12 @@ class Handler(BaseHTTPRequestHandler):
                         client_gone = True
                         logger.info("conversation %s: client gone mid-turn (%s); waiting for the turn to end",
                                     session.id[:8], exc)
+            if one_shot:
+                # The throwaway CLI's work is done once the worker has joined: close it before the reply is written,
+                # not after, because a client that stops reading can block the write for as long as it likes, and a
+                # one-shot is in no registry for the reaper to find. The finally below stays for every earlier exit.
+                session.close()
+                closed = True
             if "stale" in outcome:
                 logger.warning("conversation %s: stale continuation refused: %s", session.id[:8], outcome["stale"])
                 if client_gone:
@@ -404,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, wire.message_json(msg_id, turn.model, blocks, stop, usage), session=session)
         finally:
-            if one_shot:
+            if one_shot and not closed:
                 session.close()                         # a throwaway CLI is not in the registry: nothing else reaps it
 
     def _client(self) -> str:

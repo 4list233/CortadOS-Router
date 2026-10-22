@@ -12,7 +12,14 @@ is the long form.
 
 ## Layout
 - `cortados_router/` — router package. `core.py` resolve/decide (CLI: `table`, `decide`),
-  `scarcity.py` quota reading via vendor CLIs, `unitcost.py`, `transport.py`, `local_resources.py`.
+  `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
+  `transport.py`, `local_resources.py`.
+- `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
+  `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
+  `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
+  `routing.py` picks the lane through the router's execution policy; `bridge.py` drives a headless Claude CLI with
+  `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
+  dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.
@@ -23,7 +30,7 @@ is the long form.
 ## Commands
 - Full suite (run before calling any change done):
   `python3 -B -m unittest discover -s tests -t .`
-  Baseline 2026-10-21 on the M5 Max, system Python 3.9, branch p2-codex: 329 run, OK, 7 skipped
+  Baseline 2026-10-21 on the M5 Max, system Python 3.9, branch p2-codex: 330 run, OK, 7 skipped
   (Hermes integration). The README's "155 / 1 failing" is stale.
 - Provider tests alone (fakes only; no vendor CLI is opened):
   `python3 -B -m unittest tests.test_provider tests.test_provider_codex tests.test_provider_responses tests.test_provider_routing tests.test_responses_wire`

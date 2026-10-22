@@ -37,6 +37,29 @@ class BridgeError(RuntimeError):
     """The CLI died, timed out or reported an error; the server answers 502 (or 409 for a lost session)."""
 
 
+def write_line(proc: subprocess.Popen, line: str, timeout: float, who: str) -> None:
+    """Write one line to a child's stdin under a deadline. A child that stops reading stdin would block the write
+    forever once the pipe buffer fills, so the write runs on its own thread and the child is killed if it misses the
+    deadline. The one owner of that rule for both bridges (the Claude CLI and the Codex app-server)."""
+    failed: list[BaseException] = []
+
+    def write():
+        try:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            failed.append(exc)
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    writer.join(max(timeout, 0))
+    if writer.is_alive():
+        proc.kill()
+        raise BridgeError(f"{who} did not read its input within {timeout:.0f}s; killed")
+    if failed:
+        raise BridgeError(f"{who} is gone: {failed[0]}")
+
+
 class BridgeSession:
     def __init__(self, *, system: str, tools: list[dict[str, Any]], gateway_url: str, token: str,
                  claude_bin: str | list[str] = "claude", model: str | None = None, scratch_root: str | None = None,
@@ -102,27 +125,10 @@ class BridgeSession:
         self._events.put(("exit", self.proc.wait()))
 
     def send_user(self, content: list[dict[str, Any]], timeout: float) -> None:
-        """Write one user message. A CLI that stops reading stdin would block the write forever once the pipe buffer
-        fills, so the write runs on its own thread and the CLI is killed if it misses the deadline."""
+        """Write one user message, under write_line's deadline rule."""
         self.last_used = time.time()
-        line = json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
-        failed: list[BaseException] = []
-
-        def write():
-            try:
-                self.proc.stdin.write(line)
-                self.proc.stdin.flush()
-            except (OSError, ValueError) as exc:
-                failed.append(exc)
-
-        writer = threading.Thread(target=write, daemon=True)
-        writer.start()
-        writer.join(max(timeout, 0))
-        if writer.is_alive():
-            self.proc.kill()
-            raise BridgeError(f"the headless CLI did not read its input within {timeout:.0f}s; killed")
-        if failed:
-            raise BridgeError(f"the headless CLI is gone: {failed[0]}")
+        write_line(self.proc, json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n",
+                   timeout, "the headless CLI")
 
     # ------------------------------------------------------------------ shim side
     def wait_result(self, tool_use_id: str, timeout: float) -> dict[str, Any]:

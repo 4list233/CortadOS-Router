@@ -290,7 +290,7 @@ tool type; optional, later.
   `request_user_input`, the goal tools, ...) passes `thread/start` but is never offered to the model, even with the
   built-in's feature disabled: the model answered "I can't access README.md". The same tool declared as
   `client_exec_command` was called at once and the turn succeeded. Codex as a client sends exactly those names, so the
-  bridge declares colliding client tools under `client_<name>` (`codex_bridge.CODEX_TOOL_NAMES`, `tool_aliases`) and
+  bridge declares colliding client tools under `client_<name>` (`codex_isolation.CODEX_TOOL_NAMES`, `tool_aliases`) and
   maps `item/tool/call` back to the client's name. A collision with a Codex name outside that set is undetectable
   from the bridge (known limit).
 - Codex registers its MCP *resource* tools (`list_mcp_resources`, `list_mcp_resource_templates`,

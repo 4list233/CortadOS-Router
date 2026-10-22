@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from cortados_router.provider import codex_bridge
+from cortados_router.provider import codex_bridge, codex_isolation
 from cortados_router.provider import server as provider_server
 from cortados_router.provider.bridge import BridgeError
 from cortados_router.provider.server import ProviderServer, Registry
@@ -362,6 +362,31 @@ class CodexEndpointTests(unittest.TestCase):
         history += [{"role": "assistant", "content": [{"type": "text", "text": "tool said: hello"}]}, {"role": "user", "content": "thanks"}]
         self.assertEqual(self.post({"tools": [READ_TOOL], "messages": history})["content"], [{"type": "text", "text": "echo: thanks"}])
 
+    def test_a_finished_one_shot_backend_is_closed_before_the_reply_is_written(self):
+        # A client that stops reading blocks the reply write for as long as it likes; the throwaway app-server must
+        # be gone by then (it is in no registry). A 3 MB echo and a socket that never reads make the write block.
+        import socket
+        closed, orig_close = [], codex_bridge.CodexSession.close
+
+        def close(s):
+            closed.append(s.id)
+            orig_close(s)
+        codex_bridge.CodexSession.close = close
+        body = json.dumps({"messages": [{"role": "user", "content": "x" * (3 * 1024 * 1024)}]}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=30)
+        try:
+            sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                         b"Authorization: Bearer " + TOKEN.encode() + b"\r\nUser-Agent: t/1\r\nContent-Length: "
+                         + str(len(body)).encode() + b"\r\n\r\n" + body)
+            deadline = time.time() + 20
+            while not closed and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(closed), 1, "the one-shot backend was not closed while the reply write was pending")
+            self.assertEqual(self.reg.sessions, {})
+        finally:
+            codex_bridge.CodexSession.close = orig_close
+            sock.close()
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
@@ -451,8 +476,8 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_mcp_server_names_come_from_the_table_headers_only(self):
         home = tempfile.mkdtemp()
         Path(home, "config.toml").write_text('[mcp_servers.a]\nx=1\n[mcp_servers.a.env]\ny=2\n[mcp_servers."b c"]\nz=3\n[other]\n')
-        self.assertEqual(codex_bridge.mcp_server_names(home), ['"b c"', "a"])
-        self.assertEqual(codex_bridge.mcp_server_names(tempfile.mkdtemp()), [])
+        self.assertEqual(codex_isolation.mcp_server_names(home), ['"b c"', "a"])
+        self.assertEqual(codex_isolation.mcp_server_names(tempfile.mkdtemp()), [])
 
     def test_mcp_table_headers_in_every_toml_spelling_name_the_server_exactly(self):
         # Indented (how nested [mcp_servers.x.env] tables are usually written), spaces inside the brackets, a trailing
@@ -463,7 +488,7 @@ class CodexSessionUnitTests(unittest.TestCase):
             "  [mcp_servers.indented]\ncommand = 'x'\n[ mcp_servers.spaced ]\n[mcp_servers.trailing ]\n"
             "[mcp_servers.commented] # the docs server\n[mcp_servers.'quoted.dot']\n[mcp_servers.plain.env]\nA = '1'\n"
             '["mcp_servers".rootquoted]\ncommand = "x"\n')
-        self.assertEqual(codex_bridge.mcp_server_names(home),
+        self.assertEqual(codex_isolation.mcp_server_names(home),
                          ["'quoted.dot'", "commented", "indented", "rootquoted", "spaced", "trailing"])
 
     def test_mcp_servers_declared_any_other_way_are_refused_before_an_app_server_starts(self):
@@ -473,7 +498,7 @@ class CodexSessionUnitTests(unittest.TestCase):
             home = tempfile.mkdtemp()
             Path(home, "config.toml").write_text('model = "m"\n' + form)
             with self.assertRaisesRegex(BridgeError, r"\[mcp_servers\.<name>\] tables"):
-                codex_bridge.mcp_server_names(home)
+                codex_isolation.mcp_server_names(home)
             with self.assertRaises(BridgeError):
                 self.session(codex_home=home)
             self.assertEqual(os.listdir(self.scratch), ["codex-home"])  # the scratch dir of the refused session is gone
@@ -535,14 +560,14 @@ class CodexSessionUnitTests(unittest.TestCase):
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
-                "features": {**{f: False for f in codex_bridge.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True}}
-        codex_bridge.check_effective_config(real)
+                "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True}}
+        codex_isolation.check_effective_config(real)
         broken = dict(real, model_provider="mirror", chatgpt_base_url="https://mirror.invalid/", web_search="live",
                       model_providers={"openai": {"base_url": "https://mirror.invalid/v1"}},
                       mcp_servers={**real["mcp_servers"], "rogue": {"command": "x", "enabled": True}, "quiet": {"command": "y"}},
                       features={**real["features"], "shell_tool": True, "apps": None})
         with self.assertRaises(BridgeError) as cm:
-            codex_bridge.check_effective_config(broken)
+            codex_isolation.check_effective_config(broken)
         text = str(cm.exception)
         for needle in ('model_provider="mirror"', "chatgpt_base_url", 'web_search="live"', "model_providers.openai",
                        "['quiet', 'rogue']", "['apps', 'shell_tool']", "--codex-home"):
@@ -550,12 +575,12 @@ class CodexSessionUnitTests(unittest.TestCase):
         # The config `ollama launch codex` writes (seen live on the build Mac): a ChatGPT login whose turns go to Ollama.
         ollama = dict(real, openai_base_url="http://127.0.0.1:11434/api/codex/v1", model_catalog_json="/x/ollama-launch-models.json")
         with self.assertRaisesRegex(BridgeError, "openai_base_url.*model_catalog_json"):
-            codex_bridge.check_effective_config(ollama)
+            codex_isolation.check_effective_config(ollama)
         with self.assertRaisesRegex(BridgeError, "no login"):
-            codex_bridge.check_account({"account": None, "requiresOpenaiAuth": True})
+            codex_isolation.check_account({"account": None, "requiresOpenaiAuth": True})
         with self.assertRaisesRegex(BridgeError, "not a ChatGPT subscription"):
-            codex_bridge.check_account({"account": {"type": "apiKey"}})
-        codex_bridge.check_account({"account": {"type": "chatgpt", "planType": "pro"}})
+            codex_isolation.check_account({"account": {"type": "apiKey"}})
+        codex_isolation.check_account({"account": {"type": "chatgpt", "planType": "pro"}})
 
     def test_run_turn_keeps_its_deadline_while_notifications_keep_arriving(self):
         # A server that streams notifications without end re-arms the settle window on every one; the absolute
@@ -589,11 +614,11 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_tool_aliases_cover_the_codex_client_tool_set_and_refuse_a_taken_alias(self):
         codex_client = [{"name": n} for n in ("exec_command", "write_stdin", "request_user_input", "view_image",
                                               "get_goal", "create_goal", "update_goal", "apply_patch", "update_plan")]
-        aliases = codex_bridge.tool_aliases(codex_client + [{"name": "Read"}])
+        aliases = codex_isolation.tool_aliases(codex_client + [{"name": "Read"}])
         self.assertEqual(aliases, {"client_" + t["name"]: t["name"] for t in codex_client})
-        self.assertEqual(codex_bridge.tool_aliases([{"name": "Read"}, {"name": "Edit"}]), {})
+        self.assertEqual(codex_isolation.tool_aliases([{"name": "Read"}, {"name": "Edit"}]), {})
         with self.assertRaisesRegex(BridgeError, "client_sleep"):
-            codex_bridge.tool_aliases([{"name": "sleep"}, {"name": "client_sleep"}])
+            codex_isolation.tool_aliases([{"name": "sleep"}, {"name": "client_sleep"}])
 
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
@@ -702,7 +727,7 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_the_codex_version_pin_names_the_verified_release(self):
         self.assertEqual(codex_bridge.SUPPORTED_CLI_VERSIONS, ("0.163.0",))
-        self.assertNotIn("code_mode_host", codex_bridge.DISABLED_FEATURES)
+        self.assertNotIn("code_mode_host", codex_isolation.DISABLED_FEATURES)
 
 
 if __name__ == "__main__":
