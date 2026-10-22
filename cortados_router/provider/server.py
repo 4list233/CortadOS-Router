@@ -407,14 +407,23 @@ class Handler(BaseHTTPRequestHandler):
             blocks, stop, usage = outcome["turn"]
             logger.info("conversation %s: %s, %d blocks%s", session.id[:8], stop, len(blocks),
                         " (client gone; reply not sent)" if client_gone else "")
-            if client_gone:
-                return
-            if turn.stream:
-                for chunk in wire.stream_body(msg_id, turn.model, blocks, stop, usage):
-                    self.wfile.write(chunk)
-                self.wfile.flush()
-            else:
-                self._json(200, wire.message_json(msg_id, turn.model, blocks, stop, usage), session=session)
+            if not client_gone:
+                try:
+                    if turn.stream:
+                        for chunk in wire.stream_body(msg_id, turn.model, blocks, stop, usage):
+                            self.wfile.write(chunk)
+                        self.wfile.flush()
+                    else:
+                        self._json(200, wire.message_json(msg_id, turn.model, blocks, stop, usage), session=session)
+                except OSError as exc:
+                    client_gone = True
+                    logger.info("conversation %s: client gone while the reply was written (%s)", session.id[:8], exc)
+            if client_gone and created and not one_shot:
+                # The reply never reached the client, and this request opened the conversation: its history on the
+                # client side is still empty, so no retry can ever find this session (find() never matches an
+                # opening request). Drop it now rather than leaving a backend to the idle reaper. An existing
+                # conversation is kept: its client has the earlier replies and can continue.
+                reg.drop(session)
         finally:
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here

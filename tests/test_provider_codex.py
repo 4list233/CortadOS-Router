@@ -416,6 +416,36 @@ class CodexEndpointTests(unittest.TestCase):
             provider_server.PING_S = ping_s
             sock.close()
 
+    def test_an_opening_request_whose_client_leaves_mid_turn_does_not_leave_its_session_behind(self):
+        # The client (a Ctrl-C) hangs up after message_start while the turn runs: the reply can never reach it, and
+        # its retry starts over with an empty history, so the just-opened session must be dropped, not reaped later.
+        import socket
+        closed, orig_close, ping_s = [], codex_bridge.CodexSession.close, provider_server.PING_S
+
+        def close(s):
+            closed.append(s.id)
+            orig_close(s)
+        codex_bridge.CodexSession.close, provider_server.PING_S = close, 0.05
+        body = json.dumps({"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=30)
+        try:
+            sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                         b"Authorization: Bearer " + TOKEN.encode() + b"\r\nUser-Agent: t/1\r\nContent-Length: "
+                         + str(len(body)).encode() + b"\r\n\r\n" + body)
+            head = b""
+            while b"message_start" not in head:
+                head += sock.recv(4096)
+        finally:
+            sock.close()                                                 # the client is gone mid-turn
+        try:
+            deadline = time.time() + 20
+            while (not closed or self.reg.sessions) and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(closed), 1, "the just-opened session was not closed after its client left")
+            self.assertEqual(self.reg.sessions, {})
+        finally:
+            codex_bridge.CodexSession.close, provider_server.PING_S = orig_close, ping_s
+
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
