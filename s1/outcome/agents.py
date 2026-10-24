@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from cortados_router.provider import codex_isolation
+from outcome import codex_preflight, store
 
 # ANTHROPIC_BASE_URL / AUTH_TOKEN would loop a child back into a cortados endpoint; ANTHROPIC_API_KEY would bill an
 # API key instead of the subscription (the provider's rule, reused: cortados_router/provider/bridge.py).
@@ -68,10 +69,16 @@ def _codex_env() -> dict:
     return env
 
 
+def _journal_root() -> Path:
+    root = store.home() / "journals"
+    root.mkdir(exist_ok=True)
+    return root
+
+
 def codex_isolation_args(*, keep_tools: tuple = ()) -> list[str]:
     """Overrides that disable every MCP server, integration and (except `keep_tools`) built-in tool of the home."""
     args = []
-    for override in codex_isolation.CONFIG_OVERRIDES:
+    for override in (*codex_isolation.CONFIG_OVERRIDES, *codex_preflight.SANDBOX_PINS):
         args += ["-c", override]
     for name in codex_isolation.mcp_server_names(codex_home()):
         args += ["-c", f"mcp_servers.{name}.enabled=false"]
@@ -101,10 +108,13 @@ def _run(argv, *, cwd, timeout, env, stdin=None) -> tuple[int | None, str, str, 
 def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: list, timeout_s: int) -> dict:
     """The agent carries out `prompt` in `workspace`. Returns a trace summary; never raises for a failed run.
 
-    The mock-call journal lives outside the workspace, so neither the fixture nor the agent can forge or edit the
-    evidence of outward calls (Codex review 2026-10-24)."""
-    journal_dir = tempfile.mkdtemp(prefix="outcome-calls-")
+    Every agent-writable root is the workspace itself: TMPDIR points inside it (`.tmp`, excluded from the diff), and
+    the mock-call journal lives in the data home, which neither sandbox can write, so neither the fixture nor the
+    agent can forge or erase outward-call evidence (Codex reviews 2026-10-24)."""
+    journal_dir = tempfile.mkdtemp(prefix="calls-", dir=str(_journal_root()))
     calls = os.path.join(journal_dir, "calls.jsonl")
+    private_tmp = os.path.join(workspace, ".tmp")
+    os.makedirs(private_tmp, exist_ok=True)
     try:
         if lane == "claude":
             mcp = {"mcpServers": {"mock": {"command": sys.executable, "args": [MOCK_SERVER, calls, *outward_tools]}}} \
@@ -114,18 +124,20 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                     *(["--allowedTools", *(f"mcp__mock__{t}" for t in outward_tools)] if outward_tools else []),
                     "--strict-mcp-config", "--mcp-config", json.dumps(mcp), "--setting-sources", "",
                     "--settings", json.dumps(CLAUDE_SETTINGS), "--no-session-persistence"]
-            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=child_env(), stdin=prompt)
+            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=child_env({"TMPDIR": private_tmp}),
+                                        stdin=prompt)
             trace = _claude_trace(out)
         elif lane == "codex":
+            isolation = codex_isolation_args(keep_tools=CODEX_TASK_TOOL_FEATURES)
+            env = dict(_codex_env(), TMPDIR=private_tmp)
+            codex_preflight.preflight([codex_bin()], isolation, env, CODEX_TASK_TOOL_FEATURES)
             mock = []
             if outward_tools:
                 mock = ["-c", f"mcp_servers.outcome_mock.command={json.dumps(sys.executable)}",
                         "-c", f"mcp_servers.outcome_mock.args={json.dumps([MOCK_SERVER, calls, *outward_tools])}"]
-            argv = [codex_bin(), "exec", "-m", model, "-s", "workspace-write",
-                    "-c", "sandbox_workspace_write.network_access=false",
-                    *codex_isolation_args(keep_tools=CODEX_TASK_TOOL_FEATURES), *mock,
+            argv = [codex_bin(), "exec", "-m", model, "-s", "workspace-write", *isolation, *mock,
                     "-C", workspace, "--skip-git-repo-check", "--json", "-"]
-            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=_codex_env(), stdin=prompt)
+            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=env, stdin=prompt)
             trace = _codex_trace(out)
         else:
             raise ValueError(f"lane {lane!r} has no task runner")
@@ -200,12 +212,14 @@ def ask_claude(model: str, system: str, user: str, timeout_s: int = 900) -> str:
 def ask_codex(model: str, prompt: str, timeout_s: int = 900, effort: str | None = None) -> str:
     """A tool-free Codex text call in an empty read-only folder: every built-in tool, MCP server and integration of
     the home is off, so mined text in the prompt cannot make it act. Returns its last message."""
+    isolation, env = codex_isolation_args(), _codex_env()
+    codex_preflight.preflight([codex_bin()], isolation, env, ())
     with tempfile.TemporaryDirectory() as cwd:
         last = os.path.join(cwd, ".last-message.txt")
-        argv = [codex_bin(), "exec", "-m", model, "--sandbox", "read-only", *codex_isolation_args(),
+        argv = [codex_bin(), "exec", "-m", model, "--sandbox", "read-only", *isolation,
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
                 "--skip-git-repo-check", "-C", cwd, "--output-last-message", last, "-"]
-        code, out, err, _ = _run(argv, cwd=cwd, timeout=timeout_s, env=_codex_env(), stdin=prompt)
+        code, out, err, _ = _run(argv, cwd=cwd, timeout=timeout_s, env=env, stdin=prompt)
         if code != 0:
             raise RuntimeError(f"codex {model} exited {code}: {(err or out)[-300:]}")
         if not os.path.exists(last):

@@ -101,7 +101,8 @@ def generate(limit: int = 0, ask=agents.ask_codex, admit=None) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
-    print(json.dumps(generate(ap.parse_args().limit)))
+    with store.single_instance():
+        print(json.dumps(generate(ap.parse_args().limit)))
 
 
 if __name__ == "__main__":

@@ -120,7 +120,8 @@ def main() -> None:
     ap.add_argument("--home", default=str(Path.home()))
     ap.add_argument("--host", default=None)
     a = ap.parse_args()
-    print(json.dumps(mine(Path(a.home).expanduser(), a.host)))
+    with store.single_instance():
+        print(json.dumps(mine(Path(a.home).expanduser(), a.host)))
 
 
 if __name__ == "__main__":

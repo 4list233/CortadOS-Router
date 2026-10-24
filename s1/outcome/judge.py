@@ -104,7 +104,8 @@ def judge(limit: int = 0, ask=agents.ask_claude, admit=None) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
-    print(json.dumps(judge(ap.parse_args().limit)))
+    with store.single_instance():
+        print(json.dumps(judge(ap.parse_args().limit)))
 
 
 if __name__ == "__main__":

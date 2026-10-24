@@ -148,8 +148,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
     served = provider_routing.served_routes(core)
-    for spec in pending(ap.parse_args().limit):
-        print(json.dumps({"task": spec["id"], **run_task(spec, served)}), flush=True)
+    with store.single_instance():
+        for spec in pending(ap.parse_args().limit):
+            print(json.dumps({"task": spec["id"], **run_task(spec, served)}), flush=True)
 
 
 if __name__ == "__main__":

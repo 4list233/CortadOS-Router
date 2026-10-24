@@ -32,11 +32,13 @@ def read(name: str) -> list[dict]:
     p = path(name)
     if not p.exists():
         return rows
-    for line in p.read_text().splitlines():
+    for line in p.read_bytes().split(b"\n"):
+        if not line:
+            continue
         try:
-            rows.append(json.loads(line))
-        except ValueError:
-            continue                                     # the one torn last line a crash can leave
+            rows.append(json.loads(line.decode("utf-8")))
+        except ValueError:                               # incl. UnicodeDecodeError: a tail torn inside a character
+            continue
     return rows
 
 
@@ -95,7 +97,8 @@ class Claims:
 
 
 def single_instance():
-    """An exclusive lock on the data home: one loop per home, across processes. Returns the open lock file."""
+    """An exclusive lock on the data home: one loop or stage command per home, across processes, so claims and the
+    quota door are never contended by a second process. Returns the open lock file."""
     import fcntl
     f = (home() / "loop.lock").open("a")
     try:

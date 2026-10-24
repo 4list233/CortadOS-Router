@@ -15,7 +15,7 @@ os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 sys.path.insert(0, str(REPO / "s1"))
 
-from outcome import agents, containment, generate, judge, mine, quota, run, store, tasks  # noqa: E402
+from outcome import agents, codex_preflight, containment, generate, judge, mine, quota, run, store, tasks  # noqa: E402
 
 
 def _jsonl(path: Path, rows) -> None:
@@ -392,39 +392,75 @@ class FakeScarcity:
         return "fable" if "fable" in model and "fable" in pools else None
 
 
-class QuotaTests(unittest.TestCase):
-    NOW = 1_000_000.0
+class QuotaTests(OutcomeCase):
+    """Windows come from the real producer (scarcity.window_view), never a hand-made shape (Codex review)."""
+    WEEK = 7 * 86400
 
-    def _w(self, projected=60, used=40, hours=30, pool="all", window="week"):
-        return {"window": window, "pool": pool, "projected_pct_at_reset": projected, "used_pct": used,
-                "reset_epoch": self.NOW + hours * 3600}
-
-    def test_quota_rule_checks_every_applicable_window_with_absolute_resets(self):
-        cases = [([self._w()], True), ([self._w(projected=95)], False), ([self._w(used=96)], False),
-                 ([self._w(hours=0.5)], False), ([self._w(), self._w(hours=0.5, window="5h")], False),
-                 ([self._w(projected=None)], False), ([], False)]
-        for windows, allowed in cases:
-            with self.subTest(windows=windows):
-                self.assertEqual(quota.verdict(windows, "", now=self.NOW)[0], allowed)
-        self.assertFalse(quota.verdict(None, "stale")[0])
+    def _w(self, used=40.0, hours=30.0, elapsed_frac=None, pool="all", window="week", window_s=None):
+        import time as _t
+        window_s = window_s or self.WEEK
+        now = _t.time()
+        w = run.core._scarcity_module().window_view(window, used, now + hours * 3600, window_s, now)
+        return dict(w, pool=pool)
 
     def _core(self, sc):
         return mock.Mock(_scarcity_module=lambda: sc)
 
+    def test_real_window_view_output_is_admitted_when_there_is_room(self):
+        w = self._w(used=10, hours=24)
+        self.assertIsInstance(w["reset_epoch"], float)
+        self.assertTrue(quota.admit(self._core(FakeScarcity([w])), "claude", "m")[0])
+
+    def test_quota_rule_on_real_windows(self):
+        import time as _t
+        cases = [([self._w(used=10, hours=100)], True), ([self._w(used=96, hours=100)], False),
+                 ([self._w(used=10, hours=0.5)], False),
+                 ([self._w(used=10, hours=100), self._w(used=10, hours=0.5, window="5-hour", window_s=5 * 3600)], False),
+                 ([], False)]
+        for windows, allowed in cases:
+            with self.subTest(windows=[(w["window"], w["used_pct"], w["resets_in_h"]) for w in windows]):
+                self.assertEqual(quota.verdict(windows, now=_t.time())[0] if windows else False, allowed)
+
+    def test_a_reading_written_before_reset_epoch_existed_uses_its_sample_time(self):
+        w = self._w(used=10, hours=0.8)
+        w.pop("reset_epoch")
+        sc = FakeScarcity([w], fetched_at=__import__("time").time() - 2 * 3600)   # sampled 2 h ago: reset passed
+        self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
+
     def test_a_model_pool_at_its_stop_refuses_that_model_only(self):
-        sc = FakeScarcity([self._w(hours=1e6), self._w(projected=96, pool="fable", hours=1e6)])
+        sc = FakeScarcity([self._w(used=10, hours=100), self._w(used=96, hours=100, pool="fable")])
         self.assertFalse(quota.admit(self._core(sc), "claude", "claude-fable-5-1")[0])
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
     def test_stale_or_refusing_readings_refuse(self):
-        for sc in (FakeScarcity([self._w(hours=1e6)], scarcity=None), FakeScarcity([self._w(hours=1e6)], refusing=True)):
+        for sc in (FakeScarcity([self._w()], scarcity=None), FakeScarcity([self._w()], refusing=True)):
             self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
 
+    def _near_stop(self, extra_pool=False):
+        w = self._w(used=90, hours=100)
+        w["projected_pct_at_reset"] = 90                     # pin the pace so the arithmetic below is exact
+        return [w] + ([dict(w, pool="fable", used_pct=10, projected_pct_at_reset=10)] if extra_pool else [])
+
     def test_calls_admitted_on_one_reading_count_toward_the_stop(self):
-        sc = FakeScarcity([self._w(projected=90, used=40, hours=1e6)], fetched_at=2222.0)
+        sc = FakeScarcity(self._near_stop(), fetched_at=2222.0)
         results = [quota.admit(self._core(sc), "claude", "m")[0] for _ in range(8)]
         allowed = int((quota.STOP_PROJECTED_PCT - 90) / quota.ASSUMED_PCT_PER_CALL)
         self.assertEqual(results, [True] * allowed + [False] * (8 - allowed))
+
+    def test_a_shared_window_is_one_budget_across_models(self):
+        sc = FakeScarcity(self._near_stop(extra_pool=True), fetched_at=3333.0)
+        core = self._core(sc)
+        results = [quota.admit(core, "claude", m)[0] for m in ["claude-fable-5-1"] * 3 + ["claude-sonnet-5-5"] * 5]
+        self.assertEqual(sum(results), int((quota.STOP_PROJECTED_PCT - 90) / quota.ASSUMED_PCT_PER_CALL))
+
+    def test_reservations_survive_a_restart(self):
+        import importlib
+        sc = FakeScarcity(self._near_stop(), fetched_at=4444.0)
+        for _ in range(3):
+            quota.admit(self._core(sc), "claude", "m")
+        fresh = importlib.reload(quota)
+        results = [fresh.admit(self._core(sc), "claude", "m")[0] for _ in range(4)]
+        self.assertEqual(results, [True, True, False, False])
 
 
 class StoreTests(OutcomeCase):
@@ -441,6 +477,14 @@ class StoreTests(OutcomeCase):
         store.append("runs", {"id": "c"})
         self.assertEqual([r["id"] for r in store.read("runs")], ["a", "c"])
         self.assertIn('{"id": "b"', store.path("runs").with_suffix(".torn").read_text())
+
+    def test_a_tail_torn_inside_a_multibyte_character_is_recovered(self):
+        store.append("runs", {"id": "a", "text": "é"})
+        with store.path("runs").open("ab") as f:
+            f.write('{"id": "b", "text": "é'.encode()[:-1])
+        self.assertEqual([r["id"] for r in store.read("runs")], ["a"])
+        store.append("runs", {"id": "c"})
+        self.assertEqual([r["id"] for r in store.read("runs")], ["a", "c"])
 
     def test_claims_are_exclusive_until_released(self):
         claims = store.Claims()
@@ -482,10 +526,38 @@ class ContainmentTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(ws, "inside.txt")))
         self.assertEqual(os.listdir(outside), [])
 
-    def test_fixtures_may_not_create_reserved_directories(self):
-        for d in tasks.RESERVED_DIRS:
-            with self.subTest(d=d), self.assertRaisesRegex(tasks.SpecError, "reserved"):
-                tasks.validate(_spec(fixture={"files": {f"{d}/config": "x"}}))
+    def test_fixtures_may_not_create_reserved_directories_in_any_case_or_depth(self):
+        for path in [f"{d}/config" for d in tasks.RESERVED_DIRS] + [".GIT/config", ".Git/hooks/x", "src/.git/config",
+                                                                      ".Claude/settings.json", ".CODEX/config.toml"]:
+            with self.subTest(path=path), self.assertRaisesRegex(tasks.SpecError, "reserved"):
+                tasks.validate(_spec(fixture={"files": {path: "x"}}))
+
+    def _refused(self, argv):
+        ws = tempfile.mkdtemp()
+        spec = _spec(check={"argv": argv, "timeout_s": 30})
+        return tasks.run_check(spec, ws)["passed"] is False
+
+    def test_a_check_cannot_signal_an_outside_process(self):
+        sleeper = subprocess.Popen(["sleep", "30"])
+        try:
+            self.assertTrue(self._refused([sys.executable, "-c", f"import os; os.kill({sleeper.pid}, 15)"]))
+            self.assertIsNone(sleeper.poll())
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+    def test_a_check_cannot_send_apple_events(self):
+        self.assertTrue(self._refused(["/usr/bin/osascript", "-e", 'tell application "Finder" to get count of windows']))
+
+    def test_the_runner_git_ignores_a_planted_fsmonitor(self):
+        ws = tempfile.mkdtemp()
+        tasks.materialize(_spec(), ws)
+        marker = os.path.join(tempfile.mkdtemp(), "fsmonitor-ran")
+        with open(os.path.join(ws, ".git", "config"), "a") as f:
+            f.write(f"[core]\n\tfsmonitor = touch {marker}\n")
+        Path(ws, "new.txt").write_text("x")
+        self.assertIn("new.txt", tasks.workspace_diff(ws))
+        self.assertFalse(os.path.exists(marker))
 
 
 class LadderCapabilityTests(unittest.TestCase):
@@ -523,6 +595,34 @@ class CodexIsolationTests(unittest.TestCase):
         self.assertNotIn("shell_tool", task_args)
         self.assertIn("shell_tool", text_args)
         self.assertIn('model_provider="openai"', task_args)
+        for pin in codex_preflight.SANDBOX_PINS:
+            self.assertIn(pin, task_args)
+
+    def _cfg(self, **over):
+        from cortados_router.provider import codex_isolation
+        cfg = dict(codex_isolation.EXPECTED_CONFIG, mcp_servers={"github": {"enabled": False}},
+                   features={f: False for f in codex_isolation.DISABLED_FEATURES},
+                   sandbox_workspace_write=dict(codex_preflight.EXPECTED_SANDBOX))
+        cfg.update(over)
+        return cfg
+
+    def test_preflight_accepts_the_isolated_config_and_names_every_violation(self):
+        self.assertEqual(codex_preflight.check_config(self._cfg(), ()), [])
+        bad = codex_preflight.check_config(self._cfg(
+            openai_base_url="http://127.0.0.1:11434/v1", model_providers={"openai": {}},
+            mcp_servers={"erp": {"enabled": True}}, features={"hooks": True},
+            sandbox_workspace_write={"writable_roots": ["/Users/velox"], "network_access": True}), ())
+        text = "; ".join(bad)
+        for needle in ("openai_base_url", "model_providers.openai", "erp", "hooks", "writable_roots", "network_access",
+                       "exclude_tmpdir_env_var"):
+            self.assertIn(needle, text)
+
+    def test_preflight_allows_the_kept_task_tools(self):
+        cfg = self._cfg()
+        cfg["features"] = {f: False for f in cfg["features"]}
+        cfg["features"].update({f: True for f in agents.CODEX_TASK_TOOL_FEATURES})
+        self.assertEqual(codex_preflight.check_config(cfg, agents.CODEX_TASK_TOOL_FEATURES), [])
+        self.assertTrue(codex_preflight.check_config(cfg, ()))
 
 
 if __name__ == "__main__":

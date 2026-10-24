@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import unicodedata
 from pathlib import PurePosixPath
 
 import common
@@ -19,7 +20,7 @@ MAX_PROMPT_CHARS = 6000          # S1's request clip
 TOOL_NAME_CHARS = 64
 # Directories a fixture may not create: git's own state, and the agent CLIs' config folders, which could reconfigure
 # the run (settings, hooks, MCP servers) from inside the task.
-RESERVED_DIRS = (".git", ".claude", ".codex", ".tmp")
+RESERVED_DIRS = (".git", ".claude", ".codex", ".tmp", ".gitmodules", ".gitattributes")
 
 
 class SpecError(ValueError):
@@ -46,7 +47,8 @@ def validate(spec: dict) -> dict:
         p = PurePosixPath(rel) if isinstance(rel, str) else None
         if p is None or not rel or p.is_absolute() or ".." in p.parts:
             raise SpecError(f"fixture path {rel!r} must be relative and stay inside the workspace")
-        if p.parts[0] in RESERVED_DIRS:
+        # APFS is case- and normalisation-insensitive: `.GIT/config` is `.git/config` (Codex review), at any depth.
+        if any(unicodedata.normalize("NFC", part).casefold() in RESERVED_DIRS for part in p.parts):
             raise SpecError(f"fixture path {rel!r} is under a reserved directory {RESERVED_DIRS}")
         if not isinstance(text, str):
             raise SpecError(f"fixture file {rel!r} must be text")
@@ -77,10 +79,23 @@ def materialize(spec: dict, workspace: str) -> None:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w") as f:
             f.write(text)
-    env = dict(os.environ, GIT_AUTHOR_NAME="outcome", GIT_AUTHOR_EMAIL="outcome@localhost",
-               GIT_COMMITTER_NAME="outcome", GIT_COMMITTER_EMAIL="outcome@localhost")
-    for argv in (["git", "init", "-q"], ["git", "add", "-A"], ["git", "commit", "-q", "--allow-empty", "-m", "fixture"]):
-        subprocess.run(argv, cwd=workspace, env=env, check=True, capture_output=True)
+    for argv in (["init", "-q"], ["add", "-A"], ["commit", "-q", "--allow-empty", "-m", "fixture"]):
+        _git(argv, workspace, check=True)
+    with open(os.path.join(workspace, ".git", "info", "exclude"), "a") as f:
+        f.write("\n.tmp/\n")                          # the run's private temp dir is not part of the work product
+
+
+# Git never runs user, system or repository-supplied commands for the loop: no global/system config, no hooks,
+# no fsmonitor, and every call contained like a check (the agent may have rewritten .git/config).
+_GIT_FLAGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.sshCommand=false",
+              "-c", "protocol.allow=never", "-c", "user.name=outcome", "-c", "user.email=outcome@localhost"]
+
+
+def _git(args: list[str], workspace: str, check: bool = False) -> subprocess.CompletedProcess:
+    env = dict(containment.env(workspace), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
+               GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(containment.wrap(["git", *_GIT_FLAGS, *args], workspace), cwd=workspace, env=env,
+                          check=check, capture_output=True, text=True)
 
 
 def run_check(spec: dict, workspace: str) -> dict:
@@ -101,10 +116,6 @@ def run_check(spec: dict, workspace: str) -> dict:
 def workspace_diff(workspace: str, limit: int = 20_000) -> str:
     """What the agent changed, for the judge. Clipped: the judge needs the shape of the change, not every byte.
 
-    The agent may have edited .git/config: git runs contained, with hooks and fsmonitor (both command runners) off."""
-    git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
-    env = containment.env(workspace)
-    subprocess.run(containment.wrap(git + ["add", "-A"], workspace), cwd=workspace, env=env, capture_output=True)
-    p = subprocess.run(containment.wrap(git + ["diff", "--cached", "--stat", "-p"], workspace), cwd=workspace, env=env,
-                       capture_output=True, text=True)
-    return p.stdout[:limit]
+    The agent may have edited .git/config: git runs contained, with every command-running setting off (_git)."""
+    _git(["add", "-A"], workspace)
+    return _git(["diff", "--cached", "--stat", "-p"], workspace).stdout[:limit]
