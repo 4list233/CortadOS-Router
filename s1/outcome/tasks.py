@@ -6,6 +6,7 @@ import subprocess
 from pathlib import PurePosixPath
 
 import common
+from outcome import containment
 
 FIELDS = {"id", "seed_id", "prompt", "category", "work_kind", "fixture", "check", "rubric", "outward_tools"}
 # Small repos keep generation fast and runs cheap (docs/S1-OUTCOME-LOOP.md, Limits). Too small: no room for a real
@@ -16,6 +17,9 @@ MAX_FIXTURE_FILES = 40
 MAX_CHECK_TIMEOUT_S = 300
 MAX_PROMPT_CHARS = 6000          # S1's request clip
 TOOL_NAME_CHARS = 64
+# Directories a fixture may not create: git's own state, and the agent CLIs' config folders, which could reconfigure
+# the run (settings, hooks, MCP servers) from inside the task.
+RESERVED_DIRS = (".git", ".claude", ".codex", ".tmp")
 
 
 class SpecError(ValueError):
@@ -40,8 +44,10 @@ def validate(spec: dict) -> dict:
     size = 0
     for rel, text in files.items():
         p = PurePosixPath(rel) if isinstance(rel, str) else None
-        if p is None or not rel or p.is_absolute() or ".." in p.parts or p.parts[0] == ".git":
+        if p is None or not rel or p.is_absolute() or ".." in p.parts:
             raise SpecError(f"fixture path {rel!r} must be relative and stay inside the workspace")
+        if p.parts[0] in RESERVED_DIRS:
+            raise SpecError(f"fixture path {rel!r} is under a reserved directory {RESERVED_DIRS}")
         if not isinstance(text, str):
             raise SpecError(f"fixture file {rel!r} must be text")
         size += len(text.encode())
@@ -82,7 +88,8 @@ def run_check(spec: dict, workspace: str) -> dict:
     if not argv:
         return {"ran": False, "passed": None}
     try:
-        p = subprocess.run(argv, cwd=workspace, capture_output=True, text=True, timeout=spec["check"]["timeout_s"])
+        p = subprocess.run(containment.wrap(argv, workspace), cwd=workspace, env=containment.env(workspace),
+                           capture_output=True, text=True, timeout=spec["check"]["timeout_s"])
     except subprocess.TimeoutExpired:
         return {"ran": True, "passed": False, "exit": None, "why": "check timed out"}
     except OSError as exc:
@@ -92,7 +99,12 @@ def run_check(spec: dict, workspace: str) -> dict:
 
 
 def workspace_diff(workspace: str, limit: int = 20_000) -> str:
-    """What the agent changed, for the judge. Clipped: the judge needs the shape of the change, not every byte."""
-    subprocess.run(["git", "add", "-A"], cwd=workspace, capture_output=True)
-    p = subprocess.run(["git", "diff", "--cached", "--stat", "-p"], cwd=workspace, capture_output=True, text=True)
+    """What the agent changed, for the judge. Clipped: the judge needs the shape of the change, not every byte.
+
+    The agent may have edited .git/config: git runs contained, with hooks and fsmonitor (both command runners) off."""
+    git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+    env = containment.env(workspace)
+    subprocess.run(containment.wrap(git + ["add", "-A"], workspace), cwd=workspace, env=env, capture_output=True)
+    p = subprocess.run(containment.wrap(git + ["diff", "--cached", "--stat", "-p"], workspace), cwd=workspace, env=env,
+                       capture_output=True, text=True)
     return p.stdout[:limit]

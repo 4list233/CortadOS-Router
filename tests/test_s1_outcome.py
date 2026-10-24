@@ -15,7 +15,7 @@ os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 sys.path.insert(0, str(REPO / "s1"))
 
-from outcome import agents, generate, judge, mine, quota, run, store, tasks  # noqa: E402
+from outcome import agents, containment, generate, judge, mine, quota, run, store, tasks  # noqa: E402
 
 
 def _jsonl(path: Path, rows) -> None:
@@ -132,11 +132,10 @@ class LadderTests(OutcomeCase):
         self.assertTrue(all(c["execution"] and c["allowed_routes"] == (("codex-cli", "m"),) for c in self.calls))
         self.assertEqual(rungs[0]["route"]["model"], "m-R1")
 
-    def test_ladder_stays_inside_r0_to_r4(self):
+    def test_ladder_starts_at_r0(self):
         self.calls = []
         with mock.patch.object(run.core, "resolve", self._resolve):
             self.assertEqual([r["band"] for r in run.ladder("R0", "code", ())], ["R0", "R1"])
-            self.assertEqual([r["band"] for r in run.ladder("R4", "code", ())], ["R3", "R4"])
 
     def test_zero_decision_carries_only_the_work_kind(self):
         d = run.zero_decision("writing")
@@ -195,10 +194,9 @@ class RunTests(OutcomeCase):
         for key in agents.SCRUBBED_ENV:
             self.assertNotIn(key, env)
 
-    def test_claude_run_disallows_web_tools_and_isolates_settings(self):
+    def test_claude_run_isolates_settings_and_mcp(self):
         run.run_one(_spec(), self._rung())
         argv = self._dump()["argv"]
-        self.assertIn("WebFetch", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
         self.assertIn("--strict-mcp-config", argv)
 
@@ -215,28 +213,55 @@ class RunTests(OutcomeCase):
         rungs = [self._rung(b) for b in ("R1", "R2", "R3")]
         for i, r in enumerate(rungs):
             r["route"] = dict(r["route"], model=f"claude-{i}")
-        held = {"n": 0}
+        asked = []
 
-        def gate():
-            held["n"] += 1
-            return {"claude": (held["n"] > 1, "test gate")}
+        def admit(lane, model):
+            asked.append((lane, model))
+            return (len(asked) > 1, "test gate")
         with mock.patch.object(run, "ladder", return_value=rungs):
-            first = run.run_task(spec, served, gate=gate)
+            first = run.run_task(spec, served, admit=admit)
             self.assertEqual(first["held"], 1)
             self.assertNotIn(spec["id"], store.ids("ladders"))
-            second = run.run_task(spec, served, gate=lambda: {"claude": (True, "ok")})
+            second = run.run_task(spec, served, admit=lambda lane, model: (True, "ok"))
+        self.assertEqual(asked[0], ("claude", "claude-0"))
         self.assertEqual(sum(1 for r in store.read("runs") if r["task_id"] == spec["id"]), 3)
         self.assertEqual(second["ran"], 1)
         self.assertIn(spec["id"], store.ids("ladders"))
         self.assertEqual(run.pending(), [])
+        self.assertEqual(len(store.read("attempts")), 3)
 
     def test_two_bands_on_one_model_share_one_run(self):
         spec = _spec()
         store.append("scores", {"id": "s", "task_id": spec["id"], "band": "R1", "answers": {}, "engine": "s1", "D": 1})
         with mock.patch.object(run, "ladder", return_value=[self._rung("R0"), self._rung("R1")]):
-            counts = run.run_task(spec, (), gate=lambda: {"claude": (True, "ok")})
+            counts = run.run_task(spec, (), admit=lambda lane, model: (True, "ok"))
         self.assertEqual(counts["ran"], 1)
         self.assertTrue(store.read("runs")[1]["reused"])
+
+    def test_a_claimed_task_is_not_run_twice(self):
+        self.assertTrue(run.CLAIMS.take("task.1"))
+        try:
+            self.assertEqual(run.run_task(_spec(), (), admit=lambda *a: self.fail("admitted"))["skipped"],
+                             "claimed by another worker")
+        finally:
+            run.CLAIMS.release("task.1")
+
+    def test_claude_run_is_os_sandboxed_without_unsandboxed_escape(self):
+        run.run_one(_spec(), self._rung())
+        argv = self._dump()["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], agents.CLAUDE_TOOLS)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["sandbox"], {"enabled": True, "failIfUnavailable": True, "autoAllowBashIfSandboxed": True,
+                                               "allowUnsandboxedCommands": False, "excludedCommands": [],
+                                               "network": {"allowedDomains": []}})
+        self.assertNotIn("WebFetch", argv[argv.index("--tools") + 1])
+
+    def test_outward_call_evidence_cannot_be_forged_from_the_workspace(self):
+        forged = json.dumps({"tool": "send_email", "arguments": {}}) + "\n"
+        spec = _spec(fixture={"files": {"calls.jsonl": forged, ".outcome-mock-calls.jsonl": forged}},
+                     outward_tools=["send_email"])
+        result = run.run_one(spec, self._rung())
+        self.assertEqual(result["trace"]["outward_calls"], [])
 
 
 class MockToolsTests(unittest.TestCase):
@@ -291,8 +316,10 @@ class JudgeTests(OutcomeCase):
             asked.append(model)
             return json.dumps({"verdicts": {"R0": {"pass": False, "why": "-"}, "R1": {"pass": True, "why": "-"}},
                                "labels": self._labels()})
-        counts = judge.judge(ask=ask, gate=lambda: {"claude": (True, "ok")})
-        again = judge.judge(ask=ask, gate=lambda: {"claude": (True, "ok")})
+        admitted = []
+        counts = judge.judge(ask=ask, admit=lambda lane, model: (admitted.append((lane, model)) or True, "ok"))
+        again = judge.judge(ask=ask, admit=lambda lane, model: (True, "ok"))
+        self.assertEqual(set(admitted), {("claude", "claude-fable-5-1")})
         self.assertEqual((counts["judged"], again["judged"]), (3, 0))
         self.assertEqual(set(asked), {"claude-fable-5-1"})
         outcomes = store.read("outcomes")
@@ -303,14 +330,14 @@ class JudgeTests(OutcomeCase):
         store.append("tasks", _spec())
         store.append("ladders", {"id": "task.1", "s1_band": "R1", "bands": ["R1"]})
         bad = lambda *a: json.dumps({"verdicts": {}, "labels": {"steps": 9}})
-        counts = judge.judge(ask=bad, gate=lambda: {"claude": (True, "ok")})
+        counts = judge.judge(ask=bad, admit=lambda lane, model: (True, "ok"))
         self.assertEqual((counts["judged"], counts["failed"]), (0, 1))
         self.assertEqual(store.read("outcomes"), [])
 
     def test_judging_waits_when_the_claude_pool_is_held(self):
         store.append("tasks", _spec())
         store.append("ladders", {"id": "task.1", "s1_band": "R1", "bands": ["R1"]})
-        counts = judge.judge(ask=lambda *a: self.fail("asked while held"), gate=lambda: {"claude": (False, "95%")})
+        counts = judge.judge(ask=lambda *a: self.fail("asked while held"), admit=lambda lane, model: (False, "95%"))
         self.assertEqual(counts["held"], 1)
 
 
@@ -320,43 +347,182 @@ class GenerateTests(OutcomeCase):
             store.append("seeds", {"id": f"seed.{i}", "text": f"request {i}", "tools": []})
         good = {k: v for k, v in _spec().items() if k not in ("id", "seed_id")}
 
-        def ask(model, prompt):
-            self.assertEqual(model, generate.GENERATOR)
+        def ask(model, prompt, effort=None):
+            self.assertEqual((model, effort), (generate.GENERATOR, generate.EFFORT))
             return json.dumps([{**good, "seed": 0}, {**good, "seed": 1, "fixture": {"files": {"/abs": "x"}}}])
-        counts = generate.generate(ask=ask)
+        ok = lambda lane, model: (True, "ok")
+        counts = generate.generate(ask=ask, admit=ok)
         self.assertEqual((counts["tasks"], counts["refused"]), (1, 2))
         self.assertEqual(store.read("tasks")[0]["seed_id"], "seed.0")
-        self.assertEqual(generate.generate(ask=lambda *a: self.fail("seed retried"))["batches"], 0)
+        self.assertEqual(generate.generate(ask=lambda *a, **k: self.fail("seed retried"), admit=ok)["batches"], 0)
 
     def test_a_failed_generation_call_leaves_its_seeds_pending(self):
         store.append("seeds", {"id": "seed.0", "text": "r", "tools": []})
 
-        def boom(*a):
+        def boom(*a, **k):
             raise RuntimeError("codex exited 1")
-        self.assertEqual(generate.generate(ask=boom)["failed_batches"], 1)
+        self.assertEqual(generate.generate(ask=boom, admit=lambda lane, model: (True, "ok"))["failed_batches"], 1)
         self.assertEqual(len(generate._pending_seeds()), 1)
+
+    def test_every_generation_call_passes_the_quota_door(self):
+        for i in range(generate.BATCH * 2):
+            store.append("seeds", {"id": f"seed.{i}", "text": f"r{i}", "tools": []})
+        admitted = []
+
+        def admit(lane, model):
+            admitted.append((lane, model))
+            return (len(admitted) == 1, "held after one")
+        counts = generate.generate(ask=lambda *a, **k: "[]", admit=admit)
+        self.assertEqual((counts["batches"], counts["held"]), (1, 1))
+        self.assertEqual(admitted, [("codex", generate.GENERATOR)] * 2)
+
+
+class FakeScarcity:
+    def __init__(self, windows, fetched_at=None, scarcity=0.1, refusing=False):
+        self.windows, self.fetched = windows, fetched_at or 1000.0
+        self.view = {"scarcity": scarcity, "refusing": refusing}
+
+    def current(self):
+        return {"lanes": {"claude": {"fetched_at": self.fetched, "windows": self.windows}}}
+
+    def lane_scarcity(self, max_reading_age_s):
+        return {"claude": self.view}
+
+    def pool_for(self, lane, model, pools):
+        return "fable" if "fable" in model and "fable" in pools else None
 
 
 class QuotaTests(unittest.TestCase):
-    def _r(self, projected, used, resets_in, **kw):
-        return {"scarcity": 0.1, "refusing": False, **kw,
-                "tightest": {"projected_pct_at_reset": projected, "used_pct": used, "resets_in_h": resets_in}}
+    NOW = 1_000_000.0
 
-    def test_quota_rule(self):
-        cases = [(self._r(60, 40, 30), True), (self._r(95, 40, 30), False), (self._r(50, 96, 30), False),
-                 (self._r(60, 40, 0.5), False), (None, False), (self._r(60, 40, 30, refusing=True), False),
-                 (self._r(60, 40, 30, scarcity=None), False), (self._r(None, 40, 30), False)]
-        for reading, allowed in cases:
-            with self.subTest(reading=reading):
-                self.assertEqual(quota.verdict(reading)[0], allowed)
+    def _w(self, projected=60, used=40, hours=30, pool="all", window="week"):
+        return {"window": window, "pool": pool, "projected_pct_at_reset": projected, "used_pct": used,
+                "reset_epoch": self.NOW + hours * 3600}
+
+    def test_quota_rule_checks_every_applicable_window_with_absolute_resets(self):
+        cases = [([self._w()], True), ([self._w(projected=95)], False), ([self._w(used=96)], False),
+                 ([self._w(hours=0.5)], False), ([self._w(), self._w(hours=0.5, window="5h")], False),
+                 ([self._w(projected=None)], False), ([], False)]
+        for windows, allowed in cases:
+            with self.subTest(windows=windows):
+                self.assertEqual(quota.verdict(windows, "", now=self.NOW)[0], allowed)
+        self.assertFalse(quota.verdict(None, "stale")[0])
+
+    def _core(self, sc):
+        return mock.Mock(_scarcity_module=lambda: sc)
+
+    def test_a_model_pool_at_its_stop_refuses_that_model_only(self):
+        sc = FakeScarcity([self._w(hours=1e6), self._w(projected=96, pool="fable", hours=1e6)])
+        self.assertFalse(quota.admit(self._core(sc), "claude", "claude-fable-5-1")[0])
+        self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
+
+    def test_stale_or_refusing_readings_refuse(self):
+        for sc in (FakeScarcity([self._w(hours=1e6)], scarcity=None), FakeScarcity([self._w(hours=1e6)], refusing=True)):
+            self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
+
+    def test_calls_admitted_on_one_reading_count_toward_the_stop(self):
+        sc = FakeScarcity([self._w(projected=90, used=40, hours=1e6)], fetched_at=2222.0)
+        results = [quota.admit(self._core(sc), "claude", "m")[0] for _ in range(8)]
+        allowed = int((quota.STOP_PROJECTED_PCT - 90) / quota.ASSUMED_PCT_PER_CALL)
+        self.assertEqual(results, [True] * allowed + [False] * (8 - allowed))
 
 
 class StoreTests(OutcomeCase):
-    def test_a_torn_last_line_is_skipped_and_appends_continue(self):
+    def test_a_torn_last_line_is_skipped(self):
         store.append("runs", {"id": "a"})
         with store.path("runs").open("a") as f:
             f.write('{"id": "b"')
         self.assertEqual([r["id"] for r in store.read("runs")], ["a"])
+
+    def test_an_append_after_a_torn_line_survives_and_the_tail_is_quarantined(self):
+        store.append("runs", {"id": "a"})
+        with store.path("runs").open("a") as f:
+            f.write('{"id": "b"')
+        store.append("runs", {"id": "c"})
+        self.assertEqual([r["id"] for r in store.read("runs")], ["a", "c"])
+        self.assertIn('{"id": "b"', store.path("runs").with_suffix(".torn").read_text())
+
+    def test_claims_are_exclusive_until_released(self):
+        claims = store.Claims()
+        self.assertTrue(claims.take("t"))
+        self.assertFalse(claims.take("t"))
+        claims.release("t")
+        self.assertTrue(claims.take("t"))
+
+    def test_one_loop_per_data_home(self):
+        lock = store.single_instance()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "another outcome loop"):
+                store.single_instance()
+        finally:
+            lock.close()
+
+
+@unittest.skipUnless(os.path.exists(containment.SANDBOX_EXEC), "macOS Seatbelt only")
+class ContainmentTests(unittest.TestCase):
+    def test_a_generated_check_cannot_write_outside_or_reach_the_network(self):
+        ws, outside = tempfile.mkdtemp(), tempfile.mkdtemp()
+        probe = textwrap.dedent(f"""\
+            import os, socket, sys
+            open('inside.txt', 'w').write('ok')
+            bad = []
+            for p in ({os.path.join(outside, 'x')!r}, {str(Path.home() / 'outcome-probe-should-not-exist')!r}):
+                try:
+                    open(p, 'w').write('x'); bad.append(p)
+                except OSError:
+                    pass
+            try:
+                socket.create_connection(('1.1.1.1', 443), timeout=3); bad.append('network')
+            except OSError:
+                pass
+            sys.exit(1 if bad else 0)
+            """)
+        spec = _spec(check={"argv": [sys.executable, "-c", probe], "timeout_s": 30})
+        self.assertTrue(tasks.run_check(spec, ws)["passed"])
+        self.assertTrue(os.path.exists(os.path.join(ws, "inside.txt")))
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_fixtures_may_not_create_reserved_directories(self):
+        for d in tasks.RESERVED_DIRS:
+            with self.subTest(d=d), self.assertRaisesRegex(tasks.SpecError, "reserved"):
+                tasks.validate(_spec(fixture={"files": {f"{d}/config": "x"}}))
+
+
+class LadderCapabilityTests(unittest.TestCase):
+    def test_the_ladder_stops_at_r3(self):
+        calls = []
+
+        def resolve(decision, **kw):
+            calls.append(kw["minimum_band"])
+            return {"band": kw["minimum_band"], "chosen": None, "skipped": [], "required_index": 1}
+        with mock.patch.object(run.core, "resolve", resolve):
+            self.assertEqual([r["band"] for r in run.ladder("R3", "code", ())], ["R2", "R3"])
+            self.assertEqual([r["band"] for r in run.ladder("R4", "code", ())], ["R2", "R3"])
+        self.assertNotIn("R4", calls)
+
+    def test_required_capability_rises_up_the_ladder_with_the_real_resolver_and_tables(self):
+        from cortados_router.provider import routing
+        served = routing.served_routes(run.core)
+        for kind in ("code", "writing", "research"):
+            with self.subTest(kind=kind):
+                req = [r["required_index"] for r in run.ladder("R1", kind, served) + run.ladder("R3", kind, served)[1:]]
+                self.assertEqual(req, sorted(req))
+                self.assertLess(req[0], req[-1])
+
+
+class CodexIsolationTests(unittest.TestCase):
+    def test_codex_runs_disable_every_home_mcp_server_and_integration(self):
+        home = tempfile.mkdtemp()
+        Path(home, "config.toml").write_text('[mcp_servers.github]\ncommand = "x"\n[mcp_servers.erp]\ncommand = "y"\n')
+        with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_CODEX_HOME": home}):
+            task_args = agents.codex_isolation_args(keep_tools=agents.CODEX_TASK_TOOL_FEATURES)
+            text_args = agents.codex_isolation_args()
+        for name in ("github", "erp"):
+            self.assertIn(f"mcp_servers.{name}.enabled=false", task_args)
+        self.assertIn("hooks", task_args)
+        self.assertNotIn("shell_tool", task_args)
+        self.assertIn("shell_tool", text_args)
+        self.assertIn('model_provider="openai"', task_args)
 
 
 if __name__ == "__main__":

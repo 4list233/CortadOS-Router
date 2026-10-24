@@ -39,16 +39,15 @@ def step(homes: list[tuple[Path, str | None]], state: dict) -> bool:
         for home, host in homes:
             print(json.dumps({"mine": str(home), **mine.mine(home, host)}), flush=True)
         state["mined_at"] = time.time()
-    gates = quota.gates(core)
-    print(json.dumps({"gates": {k: v[1] for k, v in gates.items()}}), flush=True)
+    print(json.dumps({"quota": quota.status(core)}), flush=True)
     backlog = len(run.pending())
-    if backlog < TASK_BACKLOG and gates["codex"][0] and not _stopped():
+    if backlog < TASK_BACKLOG and not _stopped():      # every generation call passes quota.admit itself
         counts = generate.generate(limit=TASK_BACKLOG - backlog)
         print(json.dumps({"generate": counts}), flush=True)
         worked = worked or counts["tasks"] > 0
     served = provider_routing.served_routes(core)
     batch = run.pending()[:WORKERS * 2]
-    if batch and any(ok for ok, _ in gates.values()) and not _stopped():
+    if batch and not _stopped():
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             for spec, counts in zip(batch, pool.map(lambda s: run.run_task(s, served), batch)):
                 print(json.dumps({"run": spec["id"], **counts}), flush=True)
@@ -66,6 +65,7 @@ def main() -> None:
     ap.add_argument("--extra-home", action="append", default=[], help="DIR:HOST, e.g. a copy of the Pro's transcripts")
     a = ap.parse_args()
     homes = [(Path(a.home).expanduser(), None)] + [(Path(h.rsplit(":", 1)[0]), h.rsplit(":", 1)[1]) for h in a.extra_home]
+    lock = store.single_instance()                     # one loop per data home, across processes
     state: dict = {}
     print(json.dumps({"loop": "start", "home": str(store.home()), "teacher": judge.TEACHER,
                       "generator": generate.GENERATOR}), flush=True)
@@ -78,6 +78,7 @@ def main() -> None:
         if not worked and not _stopped():
             time.sleep(IDLE_SLEEP_S)
     print(json.dumps({"loop": "stopped"}), flush=True)
+    lock.close()
 
 
 if __name__ == "__main__":

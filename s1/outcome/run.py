@@ -11,6 +11,7 @@ import argparse
 import json
 import shutil
 import tempfile
+import time
 
 import common
 from cortados_router.provider import routing as provider_routing
@@ -49,14 +50,21 @@ def s1_score(spec: dict, served) -> dict | None:
     return row
 
 
+# R4 is the table's escalation-only ceiling: core.required_index gives it no capability floor, so a zero-difficulty
+# decision floored at R4 resolves to an R1-level model (Codex review 2026-10-24). The ladder tops out at R3.
+TOP_BAND = "R3"
+
+
 def ladder(band: str, work_kind: str, served) -> list[dict]:
-    i = core.BAND_ORDER.index(band)
+    order = core.BAND_ORDER[: core.BAND_ORDER.index(TOP_BAND) + 1]
+    i = order.index(band) if band in order else len(order) - 1
     rungs = []
-    for b in core.BAND_ORDER[max(0, i - 1): i + 2]:
+    for b in order[max(0, i - 1): i + 2]:
         r = core.resolve(zero_decision(work_kind), unit_kind=UNIT_KIND, execution=True, minimum_band=b,
                          allowed_routes=served)
         chosen = r.get("chosen")
-        rungs.append({"band": b, "route": {k: chosen.get(k) for k in ("lane", "provider", "model")} if chosen else None,
+        rungs.append({"band": b, "required_index": r.get("required_index"),
+                      "route": {k: chosen.get(k) for k in ("lane", "provider", "model")} if chosen else None,
                       "why_none": None if chosen else "; ".join(f"{s.get('model')}: {s.get('why')}" for s in (r.get("skipped") or [])[:5])})
     return rungs
 
@@ -75,9 +83,24 @@ def run_one(spec: dict, rung: dict) -> dict:
     return {"trace": trace, "diff": diff, "check": check}
 
 
-def run_task(spec: dict, served, gate=None) -> dict:
-    """All ladder runs for one task not yet run. Returns counts; rows go to runs.jsonl as they finish."""
-    gate = gate or (lambda: quota.gates(core))
+CLAIMS = store.Claims()
+
+
+def run_task(spec: dict, served, admit=None) -> dict:
+    """All ladder runs for one task not yet run. Returns counts; rows go to runs.jsonl as they finish.
+
+    A task is claimed first, so no two workers launch paid work for it; every run is announced in attempts.jsonl
+    before it starts, so a crash mid-run leaves a visible spent attempt (the run itself is safe to repeat)."""
+    admit = admit or (lambda lane, model: quota.admit(core, lane, model))
+    if not CLAIMS.take(spec["id"]):
+        return {"skipped": "claimed by another worker"}
+    try:
+        return _run_claimed(spec, served, admit)
+    finally:
+        CLAIMS.release(spec["id"])
+
+
+def _run_claimed(spec: dict, served, admit) -> dict:
     previous = {r["band"]: r for r in store.read("runs") if r["task_id"] == spec["id"]}
     score = s1_score(spec, served)
     if score is None:
@@ -91,7 +114,8 @@ def run_task(spec: dict, served, gate=None) -> dict:
         if rung["band"] in previous:
             continue
         row = {"id": store.digest_id("run", spec["id"], rung["band"]), "task_id": spec["id"], "band": rung["band"],
-               "s1_band": band, "split": common.split_of(spec["id"]), "route": rung["route"]}
+               "s1_band": band, "split": common.split_of(spec["id"]), "route": rung["route"],
+               "required_index": rung.get("required_index")}
         if rung["route"] is None:
             store.append("runs", {**row, "result": None, "why_none": rung["why_none"]})
             continue
@@ -99,11 +123,13 @@ def run_task(spec: dict, served, gate=None) -> dict:
         if key in by_route:                            # two bands resolved to the same model: one run serves both
             store.append("runs", {**row, "result": by_route[key], "reused": True})
             continue
-        ok, why = gate().get(LANE_OF_PROVIDER[rung["route"]["provider"]], (False, "lane has no quota rule"))
+        ok, why = admit(LANE_OF_PROVIDER[rung["route"]["provider"]], rung["route"]["model"])
         if not ok:
             counts["held"] += 1
             print(f"  · {spec['id']} {rung['band']} held: {why}", flush=True)
             continue
+        store.append("attempts", {"id": row["id"] + "." + str(time.time()), "run_id": row["id"], "task_id": spec["id"],
+                                  "band": rung["band"], "route": rung["route"], "started": time.time()})
         result = run_one(spec, rung)
         by_route[key] = result
         store.append("runs", {**row, "result": result})

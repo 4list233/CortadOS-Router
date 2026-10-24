@@ -44,13 +44,63 @@ def ids(name: str, key: str = "id") -> set:
     return {r[key] for r in read(name) if key in r}
 
 
+def _repair_tail(p: Path) -> None:
+    """Move a crash's unterminated last line to <name>.torn before appending, so the next row is not glued to it
+    (Codex review 2026-10-24: a row appended after a torn line was silently lost on read)."""
+    if not p.exists() or p.stat().st_size == 0:
+        return
+    with p.open("rb+") as f:
+        f.seek(-1, os.SEEK_END)
+        if f.read(1) == b"\n":
+            return
+        f.seek(0)
+        data = f.read()
+        cut = data.rfind(b"\n") + 1
+        with p.with_suffix(".torn").open("ab") as q:
+            q.write(data[cut:] + b"\n")
+        f.truncate(cut)
+        os.fsync(f.fileno())
+
+
 def append(name: str, row: dict) -> None:
     line = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-    with _write, path(name).open("a") as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
+    with _write:
+        _repair_tail(path(name))
+        with path(name).open("a") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def digest_id(prefix: str, *parts: str) -> str:
     return prefix + "." + hashlib.sha1("\x1f".join(parts).encode()).hexdigest()[:16]
+
+
+class Claims:
+    """In-process claims on task ids, so two workers never launch paid work for the same task (Codex review)."""
+
+    def __init__(self):
+        self._lock, self._held = threading.Lock(), set()
+
+    def take(self, key: str) -> bool:
+        with self._lock:
+            if key in self._held:
+                return False
+            self._held.add(key)
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._held.discard(key)
+
+
+def single_instance():
+    """An exclusive lock on the data home: one loop per home, across processes. Returns the open lock file."""
+    import fcntl
+    f = (home() / "loop.lock").open("a")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise RuntimeError(f"another outcome loop holds {home() / 'loop.lock'}")
+    return f

@@ -54,19 +54,40 @@ rubric: [str], outward_tools: [str]}`
 
 ### Band ladder
 
-S1 scores the prompt → band B. The route for band b is the router's own choice when b is the floor:
+S1 scores the prompt → band B (stored once per task in `scores.jsonl`, so a retry keeps the same ladder). The route
+for band b is the router's own choice when b is the floor:
 `core.resolve(zero_decision(work_kind), execution=True, minimum_band=b, allowed_routes=served)`. The zero decision
-carries only the task's work kind, so the band is exactly b and the work-kind preference still applies. Bands outside
-R0–R4 are dropped (B−1 at R0, B+1 at R4). No second model list exists (ENG-03).
+carries only the task's work kind, so the band is exactly b and the work-kind preference still applies. The ladder
+spans R0–R3: R4 is the table's escalation-only ceiling and `core.required_index` gives it no capability floor, so a
+floored R4 resolves to an R1-level model (review finding). Each run row records the rung's required index. No second
+model list exists (ENG-03).
 
-### Runs
+### Containment (untrusted: mined text, generated specs, fixture code)
 
-- Claude lane: `claude -p --model <m> --output-format json --permission-mode acceptEdits` with built-in web tools
-  disallowed and only the mock MCP server configured (`--strict-mcp-config`).
-- Codex lane: `codex exec -m <m> -s workspace-write -C <workspace> --json` (network off in that sandbox), mock MCP
-  server via `-c mcp_servers…`.
-- The child environment drops `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` (no loop back into the
-  provider; no API-key billing), as the provider bridge does.
+- **Checks and the runner's git calls** run under macOS Seatbelt (`s1/outcome/containment.py`): no network, file
+  writes only inside the workspace, minimal environment with HOME/TMPDIR inside it. Missing `sandbox-exec` refuses
+  the check instead of running it unconfined. Git runs with hooks and fsmonitor off.
+- **Claude lane:** `claude -p --model <m> --tools Bash,Read,Edit,Write,Glob,Grep --permission-mode acceptEdits` with
+  Claude Code's OS sandbox for Bash and its children (`sandbox.enabled`, `failIfUnavailable`,
+  `allowUnsandboxedCommands=false`, empty network allowlist), no settings files, hooks off, only the mock MCP server.
+  Edit/Write are approved only inside the working directory; in `-p` anything needing approval is denied.
+- **Codex lane:** `codex exec -s workspace-write` (Seatbelt, network pinned off), with the provider's isolation rules
+  reused from `provider/codex_isolation.py`: every MCP server of the home disabled by name, hooks/apps/plugins/
+  memories/browser/computer use off, provider pinned to the OpenAI subscription, project docs off. Generation is
+  tool-free (every built-in tool disabled, read-only sandbox).
+- The mock-call journal lives in a runner-owned folder outside the workspace, so neither a fixture nor an agent can
+  forge outward-call evidence. Fixtures may not create `.git`, `.claude`, `.codex` or `.tmp`.
+- The child environment drops the provider's stripped variables (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, and for Codex the OpenAI key and base URL).
+- A timeout kills the CLI's whole process group.
+
+### Concurrency and recovery
+
+- One loop per data home (`loop.lock`, an exclusive lock across processes); within it, a task is claimed before any
+  paid work, so two workers never run the same task.
+- Every run is announced in `attempts.jsonl` before it starts; a crash mid-run leaves a visible spent attempt. A
+  sandboxed run has no outside effect, so it is safe to repeat.
+- A torn last line is moved to `<store>.torn` under the writer lock before the next append.
 
 ### Outcome band and labels
 
@@ -78,8 +99,12 @@ R0–R4 are dropped (B−1 at R0, B+1 at R4). No second model list exists (ENG-0
 
 ### Quota rule (D4)
 
-Before each model call the loop reads `scarcity.lane_scarcity()` for that lane. It stops using a pool when its
-projected use at reset ≥ 95 % or its reset is under 1 hour away. Unknown readings stop the pool (never assume room).
+Every model call (generation, each run, each judgement) goes through `quota.admit(lane, model)`. It checks every
+window that applies to that model (the lane's general windows and the model's own pool), computes the time to reset
+from the window's absolute reset time, and refuses when any window is at projected or used ≥ 95 %, under 1 hour from
+reset, incomplete, or the lane's reading is stale (> 1 h) or refusing. Admission is atomic, and each call admitted on
+one reading adds an assumed 1 % to that pool until the next sample (an unmeasured assumption, recorded as such), so
+concurrent workers cannot overshoot between samples.
 
 ## Limits (ENG-10)
 
@@ -99,7 +124,7 @@ projected use at reset ≥ 95 % or its reset is under 1 hour away. Unknown readi
 | AC-01 | `mine` extracts the first real user request from each Claude Code / Cowork / Codex transcript, skipping tool results, system and injected reminder text; unreadable lines are counted, not fatal. |
 | AC-02 | `mine` is idempotent: rerunning adds no duplicate seed ids. |
 | AC-03 | A task spec with an unknown field, an absolute or escaping fixture path, or an oversize fixture is refused with a named reason. |
-| AC-04 | The ladder for B gives routes for B−1, B, B+1 within R0–R4, each from `core.resolve` with `minimum_band`. |
+| AC-04 | The ladder for B gives routes for B−1, B, B+1 within R0–R3, each from `core.resolve` with `minimum_band`; the required index rises up the ladder with the real tables. |
 | AC-05 | A run writes the fixture into a fresh git repo, runs the agent there, runs the check there, and records pass/fail and the trace summary; the workspace is removed afterwards. |
 | AC-06 | The child environment never carries `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`. |
 | AC-07 | Mock outward tools record each call and return success; the run's trace lists them. |
@@ -107,6 +132,9 @@ projected use at reset ≥ 95 % or its reset is under 1 hour away. Unknown readi
 | AC-09 | The quota gate stops a pool at projected ≥ 95 %, within 1 h of reset, or when the reading is unknown. |
 | AC-10 | Every stage resumes after a crash without duplicating rows. |
 | AC-11 | Holdout tasks (by `split_of`) are judged and trace-labelled by Fable 5.1 only. |
+| AC-12 | A generated check cannot write outside its workspace or open a network connection; a Claude run starts only with its OS sandbox; a Codex run disables every MCP server and integration of the home. |
+| AC-13 | Outward-call evidence cannot be forged from the workspace; fixtures cannot create reserved directories. |
+| AC-14 | A claimed task is not run twice; one loop per data home; an append after a torn line survives. |
 
 ## Not in v1
 

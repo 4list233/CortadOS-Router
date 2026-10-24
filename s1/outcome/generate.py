@@ -12,12 +12,15 @@ import json
 import os
 
 import common
-from outcome import agents, store, tasks
+from outcome import agents, quota, store, tasks
 
 GENERATOR = os.environ.get("CORTADOS_OUTCOME_GENERATOR", "gpt-6-astra")
 # Eight seeds keep one reply well under the CLI's message size with full fixtures. Fewer: more calls for the same
 # tasks. More: the JSON reply truncates and the whole batch is lost.
 BATCH = 8
+# Writing a task spec is not a hard reasoning problem. The Studio's Codex home defaults to xhigh, measured 2026-10-24
+# at 8.5 minutes for a two-seed batch; medium keeps the night's generation from crowding out the runs.
+EFFORT = "medium"
 
 PROMPT = """You turn real requests into runnable benchmark tasks for a model router.
 
@@ -51,16 +54,23 @@ def _pending_seeds() -> list[dict]:
     return [s for s in store.read("seeds") if s["id"] not in used]
 
 
-def generate(limit: int = 0, ask=agents.ask_codex) -> dict:
+def generate(limit: int = 0, ask=agents.ask_codex, admit=None) -> dict:
+    admit = admit or (lambda lane, model: quota.admit(common.core, lane, model))
     seeds = _pending_seeds()[: limit or None]
-    counts = {"tasks": 0, "refused": 0, "batches": 0, "failed_batches": 0}
+    counts = {"tasks": 0, "refused": 0, "batches": 0, "failed_batches": 0, "held": 0}
     for k in range(0, len(seeds), BATCH):
         batch = seeds[k:k + BATCH]
+        ok, why = admit("codex", GENERATOR)
+        if not ok:
+            counts["held"] += 1
+            print(f"  · generation held: {why}", flush=True)
+            break
         payload = json.dumps([{"i": n, "request": s["text"], "tools_used": s["tools"][:10]} for n, s in enumerate(batch)],
                              ensure_ascii=False)
         counts["batches"] += 1
         try:
-            reply = agents.json_payload(ask(GENERATOR, PROMPT.format(work_kinds=common.core.WORK_KINDS, requests=payload)))
+            reply = agents.json_payload(ask(GENERATOR, PROMPT.format(work_kinds=common.core.WORK_KINDS, requests=payload),
+                                            effort=EFFORT))
         except Exception as exc:                       # the batch is retried on the next pass: its seeds stay pending
             counts["failed_batches"] += 1
             print(f"  ! generation batch failed: {type(exc).__name__}: {str(exc)[:200]}", flush=True)

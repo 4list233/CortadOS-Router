@@ -72,8 +72,8 @@ def judge_task(spec: dict, runs: list[dict], ask=agents.ask_claude) -> dict:
     return {"verdicts": verdicts, "labels": {q: labels[q] for q in common.QUESTIONS}, "outcome_band": outcome_band(verdicts, runs)}
 
 
-def judge(limit: int = 0, ask=agents.ask_claude, gate=None) -> dict:
-    gate = gate or (lambda: quota.gates(core))
+def judge(limit: int = 0, ask=agents.ask_claude, admit=None) -> dict:
+    admit = admit or (lambda lane, model: quota.admit(core, lane, model))
     specs = {t["id"]: t for t in store.read("tasks")}
     done = store.ids("outcomes", key="task_id")
     runs_by_task: dict[str, list] = {}
@@ -82,7 +82,7 @@ def judge(limit: int = 0, ask=agents.ask_claude, gate=None) -> dict:
     ladders = [l for l in store.read("ladders") if l["id"] not in done and l["id"] in specs][: limit or None]
     counts = {"judged": 0, "held": 0, "failed": 0}
     for lad in ladders:
-        ok, why = gate().get("claude", (False, "no rule"))
+        ok, why = admit("claude", TEACHER)
         if not ok:
             counts["held"] += 1
             print(f"  · judging held: {why}", flush=True)
