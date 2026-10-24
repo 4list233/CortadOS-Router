@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from cortados_router.provider import codex_isolation
-from outcome import codex_preflight, store
+from outcome import codex_preflight, containment, store
 
 # ANTHROPIC_BASE_URL / AUTH_TOKEN would loop a child back into a cortados endpoint; ANTHROPIC_API_KEY would bill an
 # API key instead of the subscription (the provider's rule, reused: cortados_router/provider/bridge.py).
@@ -89,20 +89,11 @@ def codex_isolation_args(*, keep_tools: tuple = ()) -> list[str]:
 
 
 def _run(argv, *, cwd, timeout, env, stdin=None) -> tuple[int | None, str, str, float]:
-    """Run in its own process group, so a timeout kills the CLI and every tool process it started."""
+    """Run in its own process group; on every exit path the group is killed and the working folder swept, so no
+    tool process the CLI started outlives the run (containment.run_group)."""
     t0 = time.time()
-    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, start_new_session=True)
-    try:
-        out, err = p.communicate(stdin, timeout=timeout)
-        return p.returncode, out, err, time.time() - t0
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, 9)
-        except ProcessLookupError:
-            pass
-        out, err = p.communicate()
-        return None, out or "", "timeout", time.time() - t0
+    code, out, err = containment.run_group(argv, cwd=cwd, env=env, timeout=timeout, stdin=stdin)
+    return code, out, err, time.time() - t0
 
 
 def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: list, timeout_s: int) -> dict:
@@ -115,6 +106,10 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
     calls = os.path.join(journal_dir, "calls.jsonl")
     private_tmp = os.path.join(workspace, ".tmp")
     os.makedirs(private_tmp, exist_ok=True)
+    # Claude Code's sandbox grants writes to its own scratch root, CLAUDE_CODE_TMPDIR (else /tmp) + /claude-<uid>,
+    # which TMPDIR does not move: left alone, every live Claude session's scratch is writable from the task (Codex
+    # review 2026-10-24). Each run gets a private, short one (a long path makes the CLI fall back to /tmp).
+    claude_scratch = tempfile.mkdtemp(prefix="oc-", dir="/tmp")
     try:
         if lane == "claude":
             mcp = {"mcpServers": {"mock": {"command": sys.executable, "args": [MOCK_SERVER, calls, *outward_tools]}}} \
@@ -124,8 +119,8 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                     *(["--allowedTools", *(f"mcp__mock__{t}" for t in outward_tools)] if outward_tools else []),
                     "--strict-mcp-config", "--mcp-config", json.dumps(mcp), "--setting-sources", "",
                     "--settings", json.dumps(CLAUDE_SETTINGS), "--no-session-persistence"]
-            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=child_env({"TMPDIR": private_tmp}),
-                                        stdin=prompt)
+            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, stdin=prompt,
+                                        env=child_env({"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch}))
             trace = _claude_trace(out)
         elif lane == "codex":
             isolation = codex_isolation_args(keep_tools=CODEX_TASK_TOOL_FEATURES)
@@ -145,6 +140,8 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                      stderr_tail=err[-1000:] if code not in (0, None) else "", outward_calls=_read_calls(calls))
         return trace
     finally:
+        containment.sweep(claude_scratch)
+        shutil.rmtree(claude_scratch, ignore_errors=True)
         shutil.rmtree(journal_dir, ignore_errors=True)
 
 

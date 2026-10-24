@@ -29,6 +29,10 @@ MAX_READING_AGE_S = 3600
 # 1 % of a weekly window on the plans seen so far. Too small: workers overshoot 95 % between samples. Too large: the
 # loop stalls until each new sample although room is left.
 ASSUMED_PCT_PER_CALL = 1.0
+# How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
+# timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and the loop overshoots.
+# Longer: finished work is counted twice and the loop pauses early.
+IN_FLIGHT_S = 900 + 1200
 LANES = ("claude", "codex")
 
 _thread_lock = threading.Lock()
@@ -56,24 +60,33 @@ def _windows(sc, lane: str, model: str | None):
     windows = raw.get("windows") or []
     pools = sorted({w.get("pool") for w in windows if w.get("pool") not in (None, "all")})
     pool = sc.pool_for(lane, model or "", pools) if (model and pools) else None
-    applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}|{fetched}")
+    applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
+                       key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")
                   for w in windows if w.get("pool", "all") in ("all", pool)]
     if not applicable:
         return None, "no usage window applies"
+    stale = [w for w in applicable if w.get("stale")]
+    if stale:
+        # The sampler carries an unreadable model pool forward marked stale while the lane's general windows refresh;
+        # spending on it would spend an allowance nobody has observed (Codex review 2026-10-24).
+        return None, f"{stale[0].get('window')}/{stale[0].get('pool')} is a carried-forward reading"
     return applicable, None
 
 
 def verdict(windows: list[dict], reserved: dict | None = None, now: float | None = None) -> tuple[bool, str]:
-    """Whether one more call fits every window, counting the calls already reserved against each."""
+    """Whether one more call fits every window, counting the calls already reserved against each.
+
+    Reservations are usage; the projection is recomputed from it the way scarcity.window_view computes it
+    (used / elapsed share, the share floored at 5 %), so a reservation late in a window weighs what it really will."""
     now = time.time() if now is None else now
     reserved = reserved or {}
     notes = []
     for w in windows:
-        projected, used, reset = w.get("projected_pct_at_reset"), w.get("used_pct"), w.get("reset_epoch")
-        if not all(isinstance(x, (int, float)) for x in (projected, used, reset)):
+        used, elapsed, reset = w.get("used_pct"), w.get("elapsed_pct"), w.get("reset_epoch")
+        if not all(isinstance(x, (int, float)) for x in (used, elapsed, reset, w.get("projected_pct_at_reset"))):
             return False, f"window {w.get('window')} reading is incomplete"
-        extra = (reserved.get(w.get("key"), 0) + 1) * ASSUMED_PCT_PER_CALL
-        projected, used = projected + extra, used + extra
+        used = used + (reserved.get(w.get("key"), 0) + 1) * ASSUMED_PCT_PER_CALL
+        projected = max(w["projected_pct_at_reset"], used / max(elapsed / 100.0, 0.05))
         hours = (reset - now) / 3600
         if max(projected, used) > STOP_PROJECTED_PCT:
             return False, f"{w.get('window')}/{w.get('pool', 'all')}: projected {projected:.0f}% used {used:.0f}% would pass {STOP_PROJECTED_PCT:.0f}%"
@@ -83,11 +96,14 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
     return True, ", ".join(notes)
 
 
-def _reserved(keys: set) -> dict:
+def _reserved(windows: list[dict]) -> dict:
+    """Calls that may not show in a window's reading yet: every admission from IN_FLIGHT_S before that reading's
+    sample on. Work admitted earlier is assumed visible; counting a visible call twice only stops the loop sooner."""
+    since = {w["key"]: w["observed_at"] - IN_FLIGHT_S for w in windows}
     counts: dict = {}
     for row in store.read("admissions"):
         for k in row.get("windows", []):
-            if k in keys:
+            if k in since and row.get("ts", 0) >= since[k]:
                 counts[k] = counts.get(k, 0) + 1
     return counts
 
@@ -100,10 +116,10 @@ def admit(core, lane: str, model: str | None = None) -> tuple[bool, str]:
         windows, why = _windows(sc, lane, model)
         if windows is None:
             return False, why
-        keys = {w["key"] for w in windows}
-        ok, why = verdict(windows, _reserved(keys))
+        ok, why = verdict(windows, _reserved(windows))
         if ok:
-            store.append("admissions", {"ts": time.time(), "lane": lane, "model": model, "windows": sorted(keys)})
+            store.append("admissions", {"ts": time.time(), "lane": lane, "model": model,
+                                        "windows": sorted(w["key"] for w in windows)})
         return ok, why
 
 
@@ -113,5 +129,5 @@ def status(core) -> dict[str, str]:
     out = {}
     for lane in LANES:
         windows, why = _windows(sc, lane, None)
-        out[lane] = why if windows is None else verdict(windows, _reserved({w["key"] for w in windows}))[1]
+        out[lane] = why if windows is None else verdict(windows, _reserved(windows))[1]
     return out

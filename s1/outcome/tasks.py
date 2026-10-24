@@ -91,11 +91,18 @@ _GIT_FLAGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-
               "-c", "protocol.allow=never", "-c", "user.name=outcome", "-c", "user.email=outcome@localhost"]
 
 
+# A git call on a small fixture repo takes well under a second; a minute means it is blocked, not slow.
+GIT_TIMEOUT_S = 60
+
+
 def _git(args: list[str], workspace: str, check: bool = False) -> subprocess.CompletedProcess:
     env = dict(containment.env(workspace), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                GIT_TERMINAL_PROMPT="0")
-    return subprocess.run(containment.wrap(["git", *_GIT_FLAGS, *args], workspace), cwd=workspace, env=env,
-                          check=check, capture_output=True, text=True)
+    argv = containment.wrap(["git", *_GIT_FLAGS, *args], workspace)
+    code, out, err = containment.run_group(argv, cwd=workspace, env=env, timeout=GIT_TIMEOUT_S)
+    if check and code != 0:
+        raise subprocess.CalledProcessError(code if code is not None else -9, argv, out, err)
+    return subprocess.CompletedProcess(argv, code if code is not None else -9, out, err)
 
 
 def run_check(spec: dict, workspace: str) -> dict:
@@ -103,14 +110,13 @@ def run_check(spec: dict, workspace: str) -> dict:
     if not argv:
         return {"ran": False, "passed": None}
     try:
-        p = subprocess.run(containment.wrap(argv, workspace), cwd=workspace, env=containment.env(workspace),
-                           capture_output=True, text=True, timeout=spec["check"]["timeout_s"])
-    except subprocess.TimeoutExpired:
-        return {"ran": True, "passed": False, "exit": None, "why": "check timed out"}
+        code, out, err = containment.run_group(containment.wrap(argv, workspace), cwd=workspace,
+                                               env=containment.env(workspace), timeout=spec["check"]["timeout_s"])
     except OSError as exc:
         return {"ran": True, "passed": False, "exit": None, "why": f"check could not start: {exc}"}
-    return {"ran": True, "passed": p.returncode == 0, "exit": p.returncode,
-            "tail": (p.stdout + p.stderr)[-2000:]}
+    if code is None:
+        return {"ran": True, "passed": False, "exit": None, "why": "check timed out"}
+    return {"ran": True, "passed": code == 0, "exit": code, "tail": (out + err)[-2000:]}
 
 
 def workspace_diff(workspace: str, limit: int = 20_000) -> str:

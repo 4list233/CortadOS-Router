@@ -8,7 +8,10 @@ check_account) plus the task sandbox pins below. Codex review 2026-10-24: launch
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import threading
 import time
 
 from cortados_router.provider import codex_isolation
@@ -73,6 +76,11 @@ def preflight(argv_prefix: list[str], overrides: list[str], env: dict, kept_feat
         return
     proc = subprocess.Popen([*argv_prefix, "app-server", *overrides], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+    # readline() cannot be interrupted by a deadline check: a watchdog kills the process group at the deadline,
+    # which ends the read with EOF (Codex review 2026-10-24: a silent server froze the loop).
+    watchdog = threading.Timer(HANDSHAKE_S, _kill_group, args=(proc,))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         deadline = time.time() + HANDSHAKE_S
         _rpc(proc, 1, "initialize", {"clientInfo": {"name": "cortados-outcome", "version": "0"},
@@ -85,6 +93,19 @@ def preflight(argv_prefix: list[str], overrides: list[str], env: dict, kept_feat
         if bad:
             raise BridgeError("the Codex home's effective config would not isolate outcome runs: " + "; ".join(bad))
     finally:
-        proc.kill()
+        watchdog.cancel()
+        _kill_group(proc)
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                pipe.close()
+            except OSError:
+                pass
         proc.wait()
     _checked[key] = time.time()
+
+
+def _kill_group(proc) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass

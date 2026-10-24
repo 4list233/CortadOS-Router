@@ -194,6 +194,13 @@ class RunTests(OutcomeCase):
         for key in agents.SCRUBBED_ENV:
             self.assertNotIn(key, env)
 
+    def test_each_claude_run_gets_a_private_short_scratch_root_that_is_removed(self):
+        run.run_one(_spec(), self._rung())
+        scratch = self._dump()["env"]["CLAUDE_CODE_TMPDIR"]
+        self.assertTrue(scratch.startswith("/tmp/oc-"))
+        self.assertLess(len(scratch), 40)
+        self.assertFalse(os.path.exists(scratch))
+
     def test_claude_run_isolates_settings_and_mcp(self):
         run.run_one(_spec(), self._rung())
         argv = self._dump()["argv"]
@@ -436,31 +443,68 @@ class QuotaTests(OutcomeCase):
         for sc in (FakeScarcity([self._w()], scarcity=None), FakeScarcity([self._w()], refusing=True)):
             self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
 
-    def _near_stop(self, extra_pool=False):
-        w = self._w(used=90, hours=100)
-        w["projected_pct_at_reset"] = 90                     # pin the pace so the arithmetic below is exact
-        return [w] + ([dict(w, pool="fable", used_pct=10, projected_pct_at_reset=10)] if extra_pool else [])
+    def _near_stop(self, extra_pool=False, used=90.0):
+        w = self._w(used=used, hours=1.5)                    # 1.5 h before a weekly reset: ~99 % of the window gone
+        return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else [])
+
+    @staticmethod
+    def _expected_calls(w):
+        """How many calls fit by the producer's own pace formula (used / elapsed share)."""
+        k = 0
+        while (w["used_pct"] + (k + 1) * quota.ASSUMED_PCT_PER_CALL) / max(w["elapsed_pct"] / 100, 0.05) <= quota.STOP_PROJECTED_PCT:
+            k += 1
+        return k
+
+    def _fresh_now(self):
+        return __import__("time").time()
 
     def test_calls_admitted_on_one_reading_count_toward_the_stop(self):
-        sc = FakeScarcity(self._near_stop(), fetched_at=2222.0)
+        windows = self._near_stop()
+        sc = FakeScarcity(windows, fetched_at=self._fresh_now())
         results = [quota.admit(self._core(sc), "claude", "m")[0] for _ in range(8)]
-        allowed = int((quota.STOP_PROJECTED_PCT - 90) / quota.ASSUMED_PCT_PER_CALL)
+        allowed = self._expected_calls(windows[0])
+        self.assertGreater(allowed, 0)
         self.assertEqual(results, [True] * allowed + [False] * (8 - allowed))
 
+    def test_a_reservation_counts_at_the_pace_the_producer_projects(self):
+        # 47 % used at half the window projects 94 %: one more call (48 %) projects 96 % and must be refused.
+        w = self._w(used=47.0, hours=84.0)
+        self.assertAlmostEqual(w["elapsed_pct"], 50.0, delta=0.5)
+        self.assertFalse(quota.verdict([dict(w, key="k")], now=self._fresh_now())[0])
+        self.assertTrue(quota.verdict([dict(self._w(used=46.0, hours=84.0), key="k")], now=self._fresh_now())[0])
+
     def test_a_shared_window_is_one_budget_across_models(self):
-        sc = FakeScarcity(self._near_stop(extra_pool=True), fetched_at=3333.0)
-        core = self._core(sc)
+        windows = self._near_stop(extra_pool=True)
+        core = self._core(FakeScarcity(windows, fetched_at=self._fresh_now()))
         results = [quota.admit(core, "claude", m)[0] for m in ["claude-fable-5-1"] * 3 + ["claude-sonnet-5-5"] * 5]
-        self.assertEqual(sum(results), int((quota.STOP_PROJECTED_PCT - 90) / quota.ASSUMED_PCT_PER_CALL))
+        self.assertEqual(sum(results), self._expected_calls(windows[0]))
 
     def test_reservations_survive_a_restart(self):
         import importlib
-        sc = FakeScarcity(self._near_stop(), fetched_at=4444.0)
-        for _ in range(3):
+        windows = self._near_stop()
+        sc = FakeScarcity(windows, fetched_at=self._fresh_now())
+        allowed = self._expected_calls(windows[0])
+        for _ in range(allowed - 1):
             quota.admit(self._core(sc), "claude", "m")
         fresh = importlib.reload(quota)
-        results = [fresh.admit(self._core(sc), "claude", "m")[0] for _ in range(4)]
-        self.assertEqual(results, [True, True, False, False])
+        self.assertEqual([fresh.admit(self._core(sc), "claude", "m")[0] for _ in range(2)], [True, False])
+
+    def test_in_flight_work_still_counts_after_a_new_sample(self):
+        windows = self._near_stop()
+        t = self._fresh_now()
+        allowed = self._expected_calls(windows[0])
+        for _ in range(allowed):
+            quota.admit(self._core(FakeScarcity(windows, fetched_at=t - 600)), "claude", "m")
+        # A newer sample of the same windows, 10 minutes later, does not yet show the running work.
+        self.assertFalse(quota.admit(self._core(FakeScarcity(windows, fetched_at=t)), "claude", "m")[0])
+
+    def test_a_carried_forward_model_pool_is_refused(self):
+        windows = [self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
+        sc = FakeScarcity(windows, fetched_at=self._fresh_now())
+        ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
+        self.assertFalse(ok)
+        self.assertIn("carried-forward", why)
+        self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
 
 class StoreTests(OutcomeCase):
@@ -546,6 +590,21 @@ class ContainmentTests(unittest.TestCase):
             sleeper.kill()
             sleeper.wait()
 
+    def test_a_check_leaves_no_process_behind_even_a_detached_one(self):
+        script = ("import subprocess, time\n"
+                  "p = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+                  "open('child.pid', 'w').write(str(p.pid))\n"
+                  "time.sleep(60)\n")
+        ws = tempfile.mkdtemp()
+        t0 = __import__("time").time()
+        result = tasks.run_check(_spec(check={"argv": [sys.executable, "-c", script], "timeout_s": 3}), ws)
+        self.assertEqual(result.get("why"), "check timed out")
+        self.assertLess(__import__("time").time() - t0, 20)        # the detached child's pipe does not hold the run
+        pid = int(Path(ws, "child.pid").read_text())
+        __import__("time").sleep(0.5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_a_check_cannot_send_apple_events(self):
         self.assertTrue(self._refused(["/usr/bin/osascript", "-e", 'tell application "Finder" to get count of windows']))
 
@@ -616,6 +675,15 @@ class CodexIsolationTests(unittest.TestCase):
         for needle in ("openai_base_url", "model_providers.openai", "erp", "hooks", "writable_roots", "network_access",
                        "exclude_tmpdir_env_var"):
             self.assertIn(needle, text)
+
+    def test_preflight_gives_up_on_a_silent_app_server(self):
+        fake = Path(tempfile.mkdtemp(), "codex")
+        fake.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+        fake.chmod(0o755)
+        t0 = __import__("time").time()
+        with mock.patch.object(codex_preflight, "HANDSHAKE_S", 1), self.assertRaises(Exception):
+            codex_preflight.preflight([str(fake)], ["-c", "x=1"], dict(os.environ), ())
+        self.assertLess(__import__("time").time() - t0, 15)
 
     def test_preflight_allows_the_kept_task_tools(self):
         cfg = self._cfg()

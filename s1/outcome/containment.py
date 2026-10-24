@@ -11,8 +11,61 @@ git init/add/commit/diff, node and writes inside work; writes outside or to the 
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# After the group is killed, the remaining output is already buffered; ten seconds means a pipe holder escaped the
+# sweep (it left the workspace), and waiting longer would only hold the worker.
+DRAIN_S = 10
+
+
+def sweep(workspace: str) -> int:
+    """Kill every process still holding the workspace open (cwd or a file): what a child that left the process group
+    (setsid) would otherwise keep running after the workspace is removed. Returns how many were killed."""
+    try:
+        out = subprocess.run(["/usr/sbin/lsof", "-t", "+D", os.path.realpath(workspace)], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    killed = 0
+    for pid in {int(p) for p in out.split() if p.isdigit()} - {os.getpid()}:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
+
+
+def run_group(argv: list[str], *, cwd: str, env: dict, timeout: float, stdin: str | None = None):
+    """Run in a new process group; on every exit path (success, failure, timeout) kill the group and sweep the
+    workspace, so no fixture child outlives its run (Codex review 2026-10-24). Returns (exit or None, out, err)."""
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    code = None
+    try:
+        out, err = p.communicate(stdin, timeout=timeout)
+        code = p.returncode
+    except subprocess.TimeoutExpired:
+        out, err = "", "timeout"
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        # A detached child can still hold the output pipes: kill it first, then read what is left, bounded.
+        sweep(cwd)
+        if code is None:
+            try:
+                more_out, more_err = p.communicate(timeout=DRAIN_S)
+                out, err = (out or "") + (more_out or ""), (err or "") + (more_err or "")
+            except subprocess.TimeoutExpired:
+                for pipe in (p.stdin, p.stdout, p.stderr):
+                    if pipe:
+                        pipe.close()
+                p.wait()
+    return code, out or "", err or ""
 
 
 def profile(workspace: str) -> str:
