@@ -40,13 +40,18 @@ def served_routes(core) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(p for p in pairs if p[0] in SERVED_PROVIDERS))
 
 
+def strip_injected(text: str) -> str:
+    """A user message without the client's injected reminders: what S1 scores (also used by the S1 outcome miner)."""
+    return _INJECTED.sub("", text).strip()
+
+
 def request_text(messages: list[dict[str, Any]], *, standalone: bool = False) -> str:
     """What S1 scores, without the client's injected context: the conversation's first user message (the task the
     session is for), or for a standalone tool-less call (a title or summary) its own last user message."""
     users = [m for m in messages if m.get("role") == "user"]
     pick = (users[-1] if standalone else users[0]) if users else {}
     text = "\n".join(b.get("text", "") for b in wire._blocks(pick.get("content")) if b.get("type") == "text")
-    return _INJECTED.sub("", text).strip()
+    return strip_injected(text)
 
 
 class _NoClaudeWhenDegraded:
