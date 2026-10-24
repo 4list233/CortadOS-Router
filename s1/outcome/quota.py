@@ -48,6 +48,22 @@ def _reset_epoch(w: dict, fetched_at: float) -> float | None:
     return None
 
 
+def _remember_pools(lane: str, seen: list) -> list:
+    """Every model pool ever observed on a lane (known_pools.json in the data home), the current ones added."""
+    path = store.home() / "known_pools.json"
+    try:
+        known = json.loads(path.read_text())
+    except (OSError, ValueError):
+        known = {}
+    merged = sorted(set(known.get(lane, [])) | set(seen))
+    if merged != known.get(lane):
+        known[lane] = merged
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(known, sort_keys=True))
+        tmp.replace(path)
+    return merged
+
+
 def _windows(sc, lane: str, model: str | None):
     """(applicable windows, None) or (None, why)."""
     raw = (sc.current().get("lanes") or {}).get(lane) or {}
@@ -59,6 +75,13 @@ def _windows(sc, lane: str, model: str | None):
     fetched = float(raw.get("fetched_at") or 0)
     windows = raw.get("windows") or []
     pools = sorted({w.get("pool") for w in windows if w.get("pool") not in (None, "all")})
+    known = _remember_pools(lane, pools)
+    # A model whose own pool has ever been seen needs that pool's reading now: when the vendor's per-model panel does
+    # not load, the sampler drops the pool after its reset and only the general windows remain, which would spend an
+    # unobserved allowance (Codex review 2026-10-24).
+    owner = sc.pool_for(lane, model or "", known) if (model and known) else None
+    if owner and owner not in pools:
+        return None, f"{lane} pool {owner} for {model} is missing from the current reading ({raw.get('per_model') or 'not shown'})"
     pool = sc.pool_for(lane, model or "", pools) if (model and pools) else None
     applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
                        key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")

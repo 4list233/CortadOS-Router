@@ -38,9 +38,38 @@ def sweep(workspace: str) -> int:
     return killed
 
 
+# Every contained process carries this env var set to a per-run token. A descendant inherits it and cannot change it,
+# so a kill-by-token scan finds a child even after it leaves the process group (setsid), is reparented, changes its
+# working folder and closes its descriptors — the cases killpg and the workspace sweep miss (Codex reviews 2026-10-24).
+RUN_TOKEN_VAR = "CORTADOS_OUTCOME_RUN"
+
+
+def _kill_by_token(token: str) -> int:
+    """Kill every process whose environment carries RUN_TOKEN_VAR=token. `ps -axEww` prints each process's env."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axEww", "-o", "pid=,command="], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    marker = f"{RUN_TOKEN_VAR}={token}"
+    killed = 0
+    for line in out.splitlines():
+        pid = line.split(None, 1)[0] if line.split() else ""
+        if marker in line and pid.isdigit() and int(pid) != os.getpid():
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+    return killed
+
+
 def run_group(argv: list[str], *, cwd: str, env: dict, timeout: float, stdin: str | None = None):
-    """Run in a new process group; on every exit path (success, failure, timeout) kill the group and sweep the
-    workspace, so no fixture child outlives its run (Codex review 2026-10-24). Returns (exit or None, out, err)."""
+    """Run in a new process group; on every exit path (success, failure, timeout) kill every process carrying this
+    run's token, then the group, then sweep the workspace, so no fixture descendant outlives its run (Codex reviews
+    2026-10-24). Returns (exit or None, out, err)."""
+    token = os.urandom(16).hex()
+    env = dict(env, **{RUN_TOKEN_VAR: token})
     p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
     code = None
@@ -50,12 +79,12 @@ def run_group(argv: list[str], *, cwd: str, env: dict, timeout: float, stdin: st
     except subprocess.TimeoutExpired:
         out, err = "", "timeout"
     finally:
+        _kill_by_token(token)                             # primary: catches detached, reparented, moved descendants
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        # A detached child can still hold the output pipes: kill it first, then read what is left, bounded.
-        sweep(cwd)
+        sweep(cwd)                                        # secondary: anything still holding the workspace open
         if code is None:
             try:
                 more_out, more_err = p.communicate(timeout=DRAIN_S)

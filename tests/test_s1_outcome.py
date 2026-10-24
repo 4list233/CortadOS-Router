@@ -79,6 +79,18 @@ class MineTests(OutcomeCase):
         self.assertEqual(counts["unreadable_lines"], 1)
         self.assertEqual({s["host"] for s in seeds.values()}, {"pro"})
 
+    def test_the_loops_own_sessions_never_become_seeds(self):
+        root = Path(tempfile.mkdtemp())
+        store.append("tasks", _spec(prompt="Refactor the invoice parser into a module"))
+        _jsonl(root / ".codex/sessions/a.jsonl", [{"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": generate.PROMPT[:200]}]}}])
+        _jsonl(root / ".codex/sessions/b.jsonl", [{"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text",
+                                                            "text": "Refactor the invoice parser into a module"}]}}])
+        counts = mine.mine(root, "studio")
+        self.assertEqual(store.read("seeds"), [])
+        self.assertEqual(counts["loop_own"], 2)
+
     def test_mine_is_idempotent(self):
         root = Path(tempfile.mkdtemp())
         self._transcripts(root)
@@ -498,6 +510,16 @@ class QuotaTests(OutcomeCase):
         # A newer sample of the same windows, 10 minutes later, does not yet show the running work.
         self.assertFalse(quota.admit(self._core(FakeScarcity(windows, fetched_at=t)), "claude", "m")[0])
 
+    def test_a_model_pool_missing_from_the_reading_is_refused_once_it_has_been_seen(self):
+        general = self._w(used=10, hours=100)
+        with_pool = FakeScarcity([general, dict(self._w(used=10, hours=100), pool="fable")], fetched_at=self._fresh_now())
+        self.assertTrue(quota.admit(self._core(with_pool), "claude", "claude-fable-5-1")[0])
+        without = FakeScarcity([general], fetched_at=self._fresh_now())
+        ok, why = quota.admit(self._core(without), "claude", "claude-fable-5-1")
+        self.assertFalse(ok)
+        self.assertIn("missing", why)
+        self.assertTrue(quota.admit(self._core(without), "claude", "claude-sonnet-5-5")[0])
+
     def test_a_carried_forward_model_pool_is_refused(self):
         windows = [self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
         sc = FakeScarcity(windows, fetched_at=self._fresh_now())
@@ -605,6 +627,33 @@ class ContainmentTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def _detached_script(self, then_exit: bool) -> str:
+        child = ("import os, time; os.chdir('/'); "
+                 "[os.close(fd) for fd in (0, 1, 2)]; time.sleep(60)")
+        return ("import subprocess, sys, time\n"
+                f"p = subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True, cwd='/',\n"
+                "                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "open('child.pid', 'w').write(str(p.pid))\n"
+                + ("" if then_exit else "time.sleep(60)\n"))
+
+    def _assert_gone(self, ws):
+        pid = int(Path(ws, "child.pid").read_text())
+        __import__("time").sleep(0.5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_a_detached_child_that_left_the_workspace_is_killed_after_a_timeout(self):
+        ws = tempfile.mkdtemp()
+        tasks.run_check(_spec(check={"argv": [sys.executable, "-c", self._detached_script(False)], "timeout_s": 3}), ws)
+        self._assert_gone(ws)
+
+    def test_a_detached_child_that_left_the_workspace_is_killed_after_success(self):
+        ws = tempfile.mkdtemp()
+        result = tasks.run_check(_spec(check={"argv": [sys.executable, "-c", self._detached_script(True)],
+                                              "timeout_s": 30}), ws)
+        self.assertTrue(result["passed"])
+        self._assert_gone(ws)
+
     def test_a_check_cannot_send_apple_events(self):
         self.assertTrue(self._refused(["/usr/bin/osascript", "-e", 'tell application "Finder" to get count of windows']))
 
@@ -675,6 +724,23 @@ class CodexIsolationTests(unittest.TestCase):
         for needle in ("openai_base_url", "model_providers.openai", "erp", "hooks", "writable_roots", "network_access",
                        "exclude_tmpdir_env_var"):
             self.assertIn(needle, text)
+
+    def test_every_codex_call_is_ephemeral(self):
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            last = argv[argv.index("--output-last-message") + 1] if "--output-last-message" in argv else None
+            if last:
+                Path(last).write_text("[]")
+            return 0, "", "", 0.0
+        ws = tempfile.mkdtemp()
+        with mock.patch.object(agents, "_run", fake_run), mock.patch.object(codex_preflight, "preflight"):
+            agents.ask_codex("gpt-6-astra", "hi")
+            agents.run_task("codex", "gpt-6-luna", "hi", ws, [], 30)
+        self.assertEqual(len(seen), 2)
+        for argv in seen:
+            self.assertEqual(argv[1:3], ["exec", "--ephemeral"])
 
     def test_preflight_gives_up_on_a_silent_app_server(self):
         fake = Path(tempfile.mkdtemp(), "codex")

@@ -22,6 +22,14 @@ from outcome import store
 SEED_CHARS = 6000
 # Claude Code writes local slash-command echoes and their caveat as user messages; they are not requests.
 CLAUDE_NOISE_PREFIXES = ("<command-", "<local-command", "Caveat:", "[Request interrupted")
+# The loop's own prompts, should a session of it ever be persisted (sessions before --ephemeral were): the
+# generator's instruction and the judge's. Mining them would feed the loop its own synthetic work.
+LOOP_PROMPT_PREFIXES = ("You turn real requests into runnable benchmark tasks", "You are now the JUDGE and TEACHER")
+
+
+def _own_prompts() -> set:
+    """Prompts the loop itself produced (task prompts): a session that ran one is benchmark work, not a seed."""
+    return {t["prompt"].strip() for t in store.read("tasks") if isinstance(t.get("prompt"), str)}
 
 
 def _sources(home: Path) -> list[tuple[str, Path]]:
@@ -91,6 +99,7 @@ def mine(home: Path, host: str | None = None) -> dict:
     `home` is a user home or a copy of one (the Pro's transcripts copied to the Studio); `host` names whose it is."""
     have = store.ids("seeds")
     host = host or platform.node()
+    own = _own_prompts()
     counts = collections.Counter()
     for source, path in _sources(home):
         read = _codex_session if source == "codex" else _claude_session
@@ -103,6 +112,9 @@ def mine(home: Path, host: str | None = None) -> dict:
         text = common.clean_request(text[:SEED_CHARS]) if text else None
         if not text:
             counts["no_request"] += 1
+            continue
+        if text.startswith(LOOP_PROMPT_PREFIXES) or text.strip() in own:
+            counts["loop_own"] += 1                    # the loop's own generation or benchmark prompt, not real work
             continue
         seed_id = store.digest_id("seed", host, str(path))
         if seed_id in have:

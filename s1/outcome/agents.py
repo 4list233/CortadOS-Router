@@ -130,7 +130,7 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
             if outward_tools:
                 mock = ["-c", f"mcp_servers.outcome_mock.command={json.dumps(sys.executable)}",
                         "-c", f"mcp_servers.outcome_mock.args={json.dumps([MOCK_SERVER, calls, *outward_tools])}"]
-            argv = [codex_bin(), "exec", "-m", model, "-s", "workspace-write", *isolation, *mock,
+            argv = [codex_bin(), "exec", "--ephemeral", "-m", model, "-s", "workspace-write", *isolation, *mock,
                     "-C", workspace, "--skip-git-repo-check", "--json", "-"]
             code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, env=env, stdin=prompt)
             trace = _codex_trace(out)
@@ -213,7 +213,8 @@ def ask_codex(model: str, prompt: str, timeout_s: int = 900, effort: str | None 
     codex_preflight.preflight([codex_bin()], isolation, env, ())
     with tempfile.TemporaryDirectory() as cwd:
         last = os.path.join(cwd, ".last-message.txt")
-        argv = [codex_bin(), "exec", "-m", model, "--sandbox", "read-only", *isolation,
+        # --ephemeral: no session file, so the loop's own calls never land in ~/.codex/sessions and get mined as seeds.
+        argv = [codex_bin(), "exec", "--ephemeral", "-m", model, "--sandbox", "read-only", *isolation,
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
                 "--skip-git-repo-check", "-C", cwd, "--output-last-message", last, "-"]
         code, out, err, _ = _run(argv, cwd=cwd, timeout=timeout_s, env=env, stdin=prompt)
