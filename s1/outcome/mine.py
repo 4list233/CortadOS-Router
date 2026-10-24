@@ -28,8 +28,9 @@ LOOP_PROMPT_PREFIXES = ("You turn real requests into runnable benchmark tasks", 
 
 
 def _own_prompts() -> set:
-    """Prompts the loop itself produced (task prompts): a session that ran one is benchmark work, not a seed."""
-    return {t["prompt"].strip() for t in store.read("tasks") if isinstance(t.get("prompt"), str)}
+    """Prompts the loop itself produced (task prompts), clipped to SEED_CHARS as the miner clips extracted text, so a
+    persisted benchmark session matches its task however long. Compared before clean_request (see mine)."""
+    return {t["prompt"][:SEED_CHARS].strip() for t in store.read("tasks") if isinstance(t.get("prompt"), str)}
 
 
 def _sources(home: Path) -> list[tuple[str, Path]]:
@@ -109,12 +110,16 @@ def mine(home: Path, host: str | None = None) -> dict:
             counts["unreadable_files"] += 1
             continue
         counts["unreadable_lines"] += unreadable
-        text = common.clean_request(text[:SEED_CHARS]) if text else None
+        raw = text[:SEED_CHARS].strip() if text else ""
+        # Check ownership against the RAW extracted prompt, before clean_request: clean_request rewrites a request
+        # over 2,400 chars into a head+tail, so a long benchmark prompt would not equal its stored original and would
+        # be mined as real work (Codex review 2026-10-24).
+        if raw.startswith(LOOP_PROMPT_PREFIXES) or raw in own:
+            counts["loop_own"] += 1                    # the loop's own generation or benchmark prompt, not real work
+            continue
+        text = common.clean_request(raw) if raw else None
         if not text:
             counts["no_request"] += 1
-            continue
-        if text.startswith(LOOP_PROMPT_PREFIXES) or text.strip() in own:
-            counts["loop_own"] += 1                    # the loop's own generation or benchmark prompt, not real work
             continue
         seed_id = store.digest_id("seed", host, str(path))
         if seed_id in have:

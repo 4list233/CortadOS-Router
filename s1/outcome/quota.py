@@ -48,24 +48,33 @@ def _reset_epoch(w: dict, fetched_at: float) -> float | None:
     return None
 
 
-def _remember_pools(lane: str, seen: list) -> list:
-    """Every model pool ever observed on a lane (known_pools.json in the data home), the current ones added."""
-    path = store.home() / "known_pools.json"
+def _remember(lane: str, general: set, pools: set) -> tuple[list, list]:
+    """Every general window name and model pool ever observed on a lane (known_windows.json in the data home), the
+    current ones added. An allowance seen before but absent now is missing, not gone: it must not be spent blind."""
+    path = store.home() / "known_windows.json"
     try:
         known = json.loads(path.read_text())
     except (OSError, ValueError):
         known = {}
-    merged = sorted(set(known.get(lane, [])) | set(seen))
-    if merged != known.get(lane):
-        known[lane] = merged
+    lane_known = known.get(lane) or {}
+    merged_g = sorted(set(lane_known.get("general", [])) | general)
+    merged_p = sorted(set(lane_known.get("pools", [])) | pools)
+    if merged_g != lane_known.get("general") or merged_p != lane_known.get("pools"):
+        known[lane] = {"general": merged_g, "pools": merged_p}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(known, sort_keys=True))
         tmp.replace(path)
-    return merged
+    return merged_g, merged_p
+
+
+def _panel_unavailable(raw: dict) -> bool:
+    note = raw.get("per_model")
+    return isinstance(note, str) and ("not shown" in note or "unavailable" in note)
 
 
 def _windows(sc, lane: str, model: str | None):
-    """(applicable windows, None) or (None, why)."""
+    """(applicable windows, None) or (None, why). Refuses unless the full expected inventory for the call is present:
+    every general window ever seen, and (for a model call) its own pool — observed this reading, not carried forward."""
     raw = (sc.current().get("lanes") or {}).get(lane) or {}
     view = sc.lane_scarcity(max_reading_age_s=MAX_READING_AGE_S).get(lane) or {}
     if not raw or view.get("scarcity") is None:
@@ -74,25 +83,31 @@ def _windows(sc, lane: str, model: str | None):
         return None, "provider is refusing or the window is spent"
     fetched = float(raw.get("fetched_at") or 0)
     windows = raw.get("windows") or []
-    pools = sorted({w.get("pool") for w in windows if w.get("pool") not in (None, "all")})
-    known = _remember_pools(lane, pools)
-    # A model whose own pool has ever been seen needs that pool's reading now: when the vendor's per-model panel does
-    # not load, the sampler drops the pool after its reset and only the general windows remain, which would spend an
-    # unobserved allowance (Codex review 2026-10-24).
-    owner = sc.pool_for(lane, model or "", known) if (model and known) else None
-    if owner and owner not in pools:
-        return None, f"{lane} pool {owner} for {model} is missing from the current reading ({raw.get('per_model') or 'not shown'})"
-    pool = sc.pool_for(lane, model or "", pools) if (model and pools) else None
+    general_now = {w.get("window") for w in windows if w.get("pool", "all") == "all" and not w.get("stale")}
+    pools_now = {w.get("pool") for w in windows if w.get("pool") not in (None, "all") and not w.get("stale")}
+    # A pool's name is remembered even when only ever seen carried-forward (stale), so a model whose panel has not
+    # loaded since a fresh home still has its limit treated as known-and-unobserved rather than absent.
+    pools_any = {w.get("pool") for w in windows if w.get("pool") not in (None, "all")}
+    known_general, known_pools = _remember(lane, general_now, pools_now | pools_any)
+    missing = sorted(set(known_general) - general_now)
+    if missing:
+        return None, f"{lane} general window(s) {missing} missing from the current reading"
+    if model:
+        # The per-model panel not loading means this model's own limit is unknown; never spend blind on a general
+        # window instead (Codex review 2026-10-24: first start and rate-limited panel both admitted blind).
+        if _panel_unavailable(raw):
+            return None, f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s own limit is unknown"
+        owner = sc.pool_for(lane, model, known_pools) if known_pools else None
+        if owner and owner not in pools_now:
+            carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
+            return None, (f"{lane} pool {owner} for {model} is "
+                          + ("a carried-forward reading" if carried else "missing from the current reading"))
+    pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None
     applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
                        key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")
-                  for w in windows if w.get("pool", "all") in ("all", pool)]
+                  for w in windows if w.get("pool", "all") in ("all", pool) and not w.get("stale")]
     if not applicable:
         return None, "no usage window applies"
-    stale = [w for w in applicable if w.get("stale")]
-    if stale:
-        # The sampler carries an unreadable model pool forward marked stale while the lane's general windows refresh;
-        # spending on it would spend an allowance nobody has observed (Codex review 2026-10-24).
-        return None, f"{stale[0].get('window')}/{stale[0].get('pool')} is a carried-forward reading"
     return applicable, None
 
 

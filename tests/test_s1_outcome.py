@@ -397,12 +397,16 @@ class GenerateTests(OutcomeCase):
 
 
 class FakeScarcity:
-    def __init__(self, windows, fetched_at=None, scarcity=0.1, refusing=False):
+    def __init__(self, windows, fetched_at=None, scarcity=0.1, refusing=False, per_model=None):
         self.windows, self.fetched = windows, fetched_at or 1000.0
         self.view = {"scarcity": scarcity, "refusing": refusing}
+        self.per_model = per_model
 
     def current(self):
-        return {"lanes": {"claude": {"fetched_at": self.fetched, "windows": self.windows}}}
+        lane = {"fetched_at": self.fetched, "windows": self.windows}
+        if self.per_model is not None:
+            lane["per_model"] = self.per_model
+        return {"lanes": {"claude": lane}}
 
     def lane_scarcity(self, max_reading_age_s):
         return {"claude": self.view}
@@ -527,6 +531,22 @@ class QuotaTests(OutcomeCase):
         self.assertFalse(ok)
         self.assertIn("carried-forward", why)
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
+
+    def test_an_unavailable_per_model_panel_refuses_any_model_call_from_a_fresh_home(self):
+        # Fresh data home, no pool ever seen, but the lane reports its per-model panel did not load.
+        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+        ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
+        self.assertFalse(ok)
+        self.assertIn("per-model panel unavailable", why)
+
+    def test_a_missing_general_window_refuses_even_a_poolless_model(self):
+        both = [self._w(used=10, hours=100, window="week"), self._w(used=10, hours=4, window="5-hour", window_s=5 * 3600)]
+        self.assertTrue(quota.admit(self._core(FakeScarcity(both, fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
+        only_5h = [self._w(used=10, hours=4, window="5-hour", window_s=5 * 3600)]
+        ok, why = quota.admit(self._core(FakeScarcity(only_5h, fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertFalse(ok)
+        self.assertIn("week", why)
 
 
 class StoreTests(OutcomeCase):
