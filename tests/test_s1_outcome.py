@@ -545,16 +545,16 @@ class QuotaTests(OutcomeCase):
         self.assertIn("carried-forward", why)
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
-    def test_a_pooled_model_is_held_when_its_pool_is_unreadable_but_a_shared_window_model_runs(self):
-        # Fresh home, per-model panel rate-limited so no pool is observed. Fable has its own pool (pool_for knows it),
-        # so it is refused — its cap is unreadable. The run models ride only the visible shared window and are admitted
-        # (Forest 2026-10-25: corrects the blanket panel refusal that stalled haiku/sonnet/opus runs).
-        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
-                          per_model="not shown this read (vendor rate limit on the per-model panel)")
-        ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
-        self.assertFalse(ok)
-        self.assertIn("missing", why)
-        self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
+    def test_fable_pool_is_derived_from_the_weekly_window_when_its_panel_is_unavailable(self):
+        # Per-model panel rate-limited: Fable's cap is 50% of the weekly budget and its utilisation tracks the weekly
+        # window (Forest 2026-10-25), so it is modelled from that window rather than held — judging is not blocked.
+        healthy = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+                               per_model="not shown this read (vendor rate limit on the per-model panel)")
+        self.assertTrue(quota.admit(self._core(healthy), "claude", "claude-fable-5-1")[0])    # weekly healthy → Fable judges
+        self.assertTrue(quota.admit(self._core(healthy), "claude", "claude-sonnet-5-5")[0])   # run model still runs
+        near = FakeScarcity([self._sess(), self._w(used=97, hours=100)], fetched_at=self._fresh_now(),
+                            per_model="not shown this read (vendor rate limit on the per-model panel)")
+        self.assertFalse(quota.admit(self._core(near), "claude", "claude-fable-5-1")[0])      # weekly over stop → Fable held too
 
     def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
         # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is

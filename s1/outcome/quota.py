@@ -88,6 +88,21 @@ def _confirmed_shared(lane: str, model: str | None) -> bool:
     return lane == "claude" and any(tok in (model or "").lower() for tok in CLAUDE_SHARED_MODELS)
 
 
+def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:
+    """Fable's cap is 50% of the weekly all-models budget and, by Forest's 50/50 split (2026-10-25), its utilisation
+    tracks that weekly window. When Fable's own per-model panel is rate-limited we model its pool from the visible
+    weekly window so judging is not blocked. This OVER-estimates Fable here: the loop uses it for a minority of calls
+    (one judge per task vs. the three-band run ladder), so its true share is below 50% and this errs toward stopping
+    early. Returns a derived Fable window (same usage/projection/reset as the weekly window) or None when unavailable."""
+    if lane != "claude" or owner != "fable":
+        return None
+    week = next((w for w in windows if "week" in (w.get("window") or "").lower()
+                 and w.get("pool", "all") == "all" and not w.get("stale")), None)
+    if not week:
+        return None
+    return {**week, "window": "week (fable, derived from weekly)", "pool": "fable", "derived": True}
+
+
 def _windows(sc, lane: str, model: str | None):
     """(applicable windows, None) or (None, why). Refuses unless the full expected inventory for the call is present:
     every general window ever seen, and (for a model call) its own pool — observed this reading, not carried forward."""
@@ -119,9 +134,14 @@ def _windows(sc, lane: str, model: str | None):
         # although their real caps were in hand — Forest 2026-10-25: Fable is the pooled one, the run models are not.)
         owner = sc.pool_for(lane, model or "", sorted(known_pools))
         if owner and owner not in pools_now:
-            carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
-            return None, (f"{lane} pool {owner} for {model} is "
-                          + ("a carried-forward reading" if carried else "missing from the current reading"))
+            derived = _derive_fable_pool(lane, owner, windows) if _panel_unavailable(raw) else None
+            if derived is not None:                      # model Fable's pool from the weekly window (its panel is down)
+                windows = windows + [derived]
+                pools_now = pools_now | {owner}
+            else:
+                carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
+                return None, (f"{lane} pool {owner} for {model} is "
+                              + ("a carried-forward reading" if carried else "missing from the current reading"))
         if owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model):
             return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
                           "unknown and it may have an unobserved cap")
