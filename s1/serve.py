@@ -31,7 +31,7 @@ MAX_RSS_GB = float(os.environ.get("CORTADOS_S1_MAX_RSS_GB", "6"))
 MAX_BODY_BYTES = int(os.environ.get("CORTADOS_S1_MAX_BODY_BYTES", str(256 * 1024)))  # a score request is a few KB; refuse larger reads outright
 MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))                   # cap the backlog: the bounded queue below refuses a flood (503)
 REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # hard ceiling on the client wait; the client's own timeout usually shortens it
-HEADER_DEADLINE_S = float(os.environ.get("CORTADOS_S1_HEADER_DEADLINE_S", "10"))     # total time allowed to send the request line + headers; a trickle past this is cut
+RECV_DEADLINE_S = float(os.environ.get("CORTADOS_S1_RECV_DEADLINE_S", "10"))         # total time allowed to receive the whole request (line + headers + body); a trickle past this is cut
 TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
 
 # Bounded, so a put_nowait that would exceed MAX_PENDING raises queue.Full and the handler returns 503 atomically -- a
@@ -137,28 +137,29 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
-    # Absolute deadline for finishing the request line + headers. The socket timeout bounds inactivity per recv, which a
-    # trickle (one byte every few ms) evades; this timer shuts the connection once the total header time is up, whether
-    # or not bytes keep arriving. Cancelled the moment a method handler runs (headers are then fully parsed).
+    # Absolute deadline covering the whole inbound request: request line, headers AND body. The socket timeout bounds
+    # inactivity per recv, which a trickle (a byte every few ms) evades; this timer shuts the connection once the total
+    # receive time is up, whether or not bytes keep arriving. Cancelled once the request is fully read (do_GET has no
+    # body; do_POST cancels after reading the body), so scoring time is never bounded by it.
     def setup(self):
         super().setup()
-        self._hdr_timer = threading.Timer(HEADER_DEADLINE_S, self._kill_slow_headers)
-        self._hdr_timer.daemon = True
-        self._hdr_timer.start()
+        self._recv_timer = threading.Timer(RECV_DEADLINE_S, self._kill_slow_recv)
+        self._recv_timer.daemon = True
+        self._recv_timer.start()
 
-    def _kill_slow_headers(self):
+    def _kill_slow_recv(self):
         try:
-            self.connection.shutdown(socket.SHUT_RDWR)   # unblocks the header read; the handler then ends and the slot frees
+            self.connection.shutdown(socket.SHUT_RDWR)   # unblocks a stalled read; the handler then ends and the slot frees
         except OSError:
             pass
 
-    def _headers_done(self):
-        t = getattr(self, "_hdr_timer", None)
+    def _recv_done(self):
+        t = getattr(self, "_recv_timer", None)
         if t is not None:
             t.cancel()
 
     def finish(self):
-        self._headers_done()                             # belt-and-braces: never leave a timer armed past the connection
+        self._recv_done()                                # belt-and-braces: never leave a timer armed past the connection
         super().finish()
 
     def _send(self, code: int, body: dict) -> None:
@@ -167,13 +168,12 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        self._headers_done()
+        self._recv_done()
         self._send(200, {"ok": _state["scorer"] is not None, "model": _state["model"], "loaded_s": _state["loaded_s"]})
 
     def do_POST(self):
         try:
-            self._headers_done()                              # headers are parsed; stop the slow-header deadline
-            self.connection.settimeout(REPLY_TIMEOUT_S)       # bound a stalled body upload so it cannot hold a handler thread forever
+            self.connection.settimeout(REPLY_TIMEOUT_S)       # per-recv inactivity bound; the absolute RECV deadline (armed in setup) bounds total receive time
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -181,7 +181,9 @@ class H(BaseHTTPRequestHandler):
             refusal = admission(self.headers.get("Authorization", ""), length)
             if refusal is not None:                           # token / bad length / oversized body: refuse before reading
                 self._send(*refusal); return
-            body = json.loads(self.rfile.read(length) or b"{}")   # length is now 0..MAX_BODY_BYTES
+            raw = self.rfile.read(length)                     # length is 0..MAX_BODY_BYTES; the RECV timer cuts a trickled body
+            self._recv_done()                                 # whole request received; stop the deadline before scoring
+            body = json.loads(raw or b"{}")
             wait = client_wait(self.headers.get("X-Request-Timeout-S"))
             reply, full = enqueue(body, time.time() + wait)
             if full is not None:                              # bounded backlog full: shed load
