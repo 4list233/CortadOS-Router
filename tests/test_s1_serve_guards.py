@@ -2,7 +2,10 @@
 cap (admission); the atomic backlog cap (enqueue on a bounded queue); the caller-timeout propagation (client_wait);
 and dropping a job whose deadline passed (_expired). Tested through pure helpers: no socket, worker or MLX."""
 import queue
+import socket
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -91,6 +94,47 @@ class ConnectionCapTests(unittest.TestCase):
         # socketserver applies H.timeout to the connection at setup, so a stalled request line/headers is dropped
         self.assertEqual(serve.H.timeout, serve.REPLY_TIMEOUT_S)
         self.assertGreater(serve.H.timeout, 0)
+
+
+class SlowHeaderTests(unittest.TestCase):
+    """A slow-drip client (bytes under the inactivity timeout) must not hold a slot indefinitely: the absolute header
+    deadline cuts it, and the freed slot serves a normal client even while the attacker keeps transmitting."""
+
+    def setUp(self):
+        self._saved = serve.HEADER_DEADLINE_S
+        serve.HEADER_DEADLINE_S = 0.3                         # short, so the test is quick
+        self.srv = serve.BoundedServer(("127.0.0.1", 0), serve.H, max_conns=1)   # one slot: the drip must free it
+        self.port = self.srv.server_address[1]
+        self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.t.start()
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close()
+        serve.HEADER_DEADLINE_S = self._saved
+
+    def test_trickle_frees_the_slot_for_a_real_request(self):
+        drip = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        drip.sendall(b"GET / HTTP/1.0\r\n")                   # start, then never finish the headers
+        stop = threading.Event()
+
+        def keep_dripping():
+            while not stop.is_set():
+                try:
+                    drip.sendall(b"X-Pad: y\r\n")            # a header line every 40 ms: under any inactivity timeout
+                except OSError:
+                    return
+                time.sleep(0.04)
+        dripper = threading.Thread(target=keep_dripping, daemon=True); dripper.start()
+        try:
+            time.sleep(serve.HEADER_DEADLINE_S + 0.3)         # let the deadline cut the drip and free the one slot
+            real = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+            real.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            real.settimeout(3)
+            resp = real.recv(4096)
+            self.assertIn(b"200", resp.split(b"\r\n", 1)[0])  # the slot recovered while the attacker kept transmitting
+            real.close()
+        finally:
+            stop.set(); drip.close()
 
 
 if __name__ == "__main__":

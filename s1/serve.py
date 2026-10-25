@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ MAX_RSS_GB = float(os.environ.get("CORTADOS_S1_MAX_RSS_GB", "6"))
 MAX_BODY_BYTES = int(os.environ.get("CORTADOS_S1_MAX_BODY_BYTES", str(256 * 1024)))  # a score request is a few KB; refuse larger reads outright
 MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))                   # cap the backlog: the bounded queue below refuses a flood (503)
 REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # hard ceiling on the client wait; the client's own timeout usually shortens it
+HEADER_DEADLINE_S = float(os.environ.get("CORTADOS_S1_HEADER_DEADLINE_S", "10"))     # total time allowed to send the request line + headers; a trickle past this is cut
 TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
 
 # Bounded, so a put_nowait that would exceed MAX_PENDING raises queue.Full and the handler returns 503 atomically -- a
@@ -135,17 +137,43 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    # Absolute deadline for finishing the request line + headers. The socket timeout bounds inactivity per recv, which a
+    # trickle (one byte every few ms) evades; this timer shuts the connection once the total header time is up, whether
+    # or not bytes keep arriving. Cancelled the moment a method handler runs (headers are then fully parsed).
+    def setup(self):
+        super().setup()
+        self._hdr_timer = threading.Timer(HEADER_DEADLINE_S, self._kill_slow_headers)
+        self._hdr_timer.daemon = True
+        self._hdr_timer.start()
+
+    def _kill_slow_headers(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)   # unblocks the header read; the handler then ends and the slot frees
+        except OSError:
+            pass
+
+    def _headers_done(self):
+        t = getattr(self, "_hdr_timer", None)
+        if t is not None:
+            t.cancel()
+
+    def finish(self):
+        self._headers_done()                             # belt-and-braces: never leave a timer armed past the connection
+        super().finish()
+
     def _send(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
+        self._headers_done()
         self._send(200, {"ok": _state["scorer"] is not None, "model": _state["model"], "loaded_s": _state["loaded_s"]})
 
     def do_POST(self):
         try:
-            self.connection.settimeout(REPLY_TIMEOUT_S)       # bound a stalled upload so it cannot hold a handler thread forever
+            self._headers_done()                              # headers are parsed; stop the slow-header deadline
+            self.connection.settimeout(REPLY_TIMEOUT_S)       # bound a stalled body upload so it cannot hold a handler thread forever
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -199,6 +227,12 @@ class BoundedServer(ThreadingHTTPServer):
             super().shutdown_request(request)
         finally:
             self._release_connection()
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)):
+            return                                              # client went away or was cut mid-exchange: normal, not a server fault
+        super().handle_error(request, client_address)
 
 
 if __name__ == "__main__":
