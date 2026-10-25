@@ -93,6 +93,9 @@ def window_view(name: str, used_pct: float, reset_at: float | None, window_s: fl
             "projected_pct_at_reset": round(projected), "allowance_pct_per_h": round(headroom / max(remaining_s / 3600, 0.25), 2),
             "resets_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(reset_at)) if reset_at else None,
             "resets_in_h": round(remaining_s / 3600, 1) if reset_at else None, "scarcity": round(s, 2),
+            # The absolute reset time: resets_in_h is relative to the sample and goes stale as the reading ages; a reader
+            # that acts between samples (the S1 outcome loop's quota door) recomputes the countdown from this.
+            "reset_epoch": float(reset_at) if reset_at else None,
             # use-it-or-lose-it: headroom the reset will wipe (what we'd still have left at today's pace), only meaningful near the reset
             "expiring_pct": round(wasted) if reset_at and window_s >= 86400 and elapsed >= 0.85 else 0}
 
