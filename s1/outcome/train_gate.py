@@ -56,9 +56,11 @@ def main() -> None:
     a = ap.parse_args()
     marker = store.home() / ARM_MARKER
     if a.arm:
-        d = decision()
-        if not d["fire"]:                                # nothing to arm: outcomes are below the training threshold, so
-            print(json.dumps({"armed": False, "refused": d["reason"]}))   # no outcome-trained candidate exists to review
+        import build_sft
+        # Arm only when the latest SFT build actually trained on outcomes (its provenance), so --arm always references a
+        # reviewed outcome-trained candidate, never a teacher-only one from before the threshold (Codex review 2026-10-25).
+        if build_sft.outcomes_trained() <= 0:
+            print(json.dumps({"armed": False, "refused": "no outcome-trained candidate yet: the latest SFT build included no outcomes"}))
             return
         marker.write_text("armed by Forest after reviewing the first outcome-trained candidate\n")
         print(json.dumps({"armed": True, "marker": str(marker)}))

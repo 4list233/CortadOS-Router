@@ -290,8 +290,11 @@ def main() -> int:
     # Hold-first (Forest 2026-10-25): the first candidate trained once outcome data is in the mix is held for review,
     # however it grades; after Forest arms it (`python3 -B -m outcome.train_gate --arm`), outcome-trained candidates
     # auto-promote on no-regression as before. Only active once the loop has produced train-split outcomes.
+    import build_sft
     from outcome import train_gate
-    if hold_first_active(train_gate.decision()["fire"], train_gate.armed()):
+    # Provenance of THIS candidate (what build_sft actually included), not a live recount: closes the 149→150 race
+    # where the live count could cross the threshold between dataset construction and evaluation (Codex review 2026-10-25).
+    if hold_first_active(build_sft.outcomes_trained() > 0, train_gate.armed()):
         report["promote_recommended"] = report["promote"]
         report["promote"] = False
         report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "

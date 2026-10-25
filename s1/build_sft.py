@@ -46,6 +46,7 @@ def outcome_examples() -> tuple[list, list, Counter, int]:
     # The fire threshold gates INCLUSION, not just promotion: below it, outcomes are not training data yet, so a nightly
     # run trains on the teacher labels alone and no outcome-trained pass starts early (Codex review 2026-10-25).
     if not train_gate.decision()["fire"]:
+        _write_provenance(0)
         return train, valid, bands, n
     for o in outcome_store.read("outcomes"):
         a = o.get("labels")
@@ -61,7 +62,28 @@ def outcome_examples() -> tuple[list, list, Counter, int]:
         k = reps * (UPWEIGHT_HIGH if (under and not is_valid) else 1)
         ex = {"messages": messages(o["request"], OUTCOME_UNIT_KIND, a)}
         (valid if is_valid else train).extend([ex] * k)
+    _write_provenance(n)
     return train, valid, bands, n
+
+
+def _provenance_path():
+    from outcome import store as outcome_store
+    return outcome_store.home() / "sft-provenance.json"
+
+
+def _write_provenance(n: int) -> None:
+    """Record how many outcomes THIS build included, so hold-first and --arm reflect what actually trained the
+    candidate rather than a later live recount across the 149→150 boundary (Codex review 2026-10-25)."""
+    import time
+    _provenance_path().write_text(json.dumps({"outcomes_included": n, "when": time.strftime("%Y-%m-%d %H:%M")}))
+
+
+def outcomes_trained() -> int:
+    """Outcomes included in the current SFT build (0 if none / no build yet) — the candidate's fixed training provenance."""
+    try:
+        return int(json.loads(_provenance_path().read_text()).get("outcomes_included", 0))
+    except (OSError, ValueError):
+        return 0
 
 
 def main() -> int:

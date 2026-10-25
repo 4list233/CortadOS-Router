@@ -856,15 +856,32 @@ class OutcomeTrainGateTests(OutcomeCase):
         (store.home() / train_gate.ARM_MARKER).write_text("x")
         self.assertTrue(train_gate.armed())
 
-    def test_arm_is_refused_below_the_threshold(self):
+    def test_arm_requires_a_build_that_actually_trained_on_outcomes(self):
+        import build_sft
         from outcome import train_gate
-        store.append("outcomes", _outcome("o.1", "train"))
-        with mock.patch.object(train_gate, "MIN_TRAIN", 100), mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
+        store.append("outcomes", _outcome(_nonvalid_id("a"), "train"))
+        with mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
             train_gate.main()
-        self.assertFalse(train_gate.armed())            # 1 < 100: nothing to arm, no outcome-trained candidate yet
-        with mock.patch.object(train_gate, "MIN_TRAIN", 1), mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
+        self.assertFalse(train_gate.armed())            # no build yet → no provenance → nothing to arm
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
+            build_sft.outcome_examples()                # a build that includes outcomes records provenance > 0
+        self.assertGreater(build_sft.outcomes_trained(), 0)
+        with mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
             train_gate.main()
-        self.assertTrue(train_gate.armed())             # threshold met: arming takes effect
+        self.assertTrue(train_gate.armed())
+
+    def test_hold_first_uses_build_provenance_not_the_live_count(self):
+        import build_sft
+        import evaluate
+        from outcome import train_gate
+        store.append("outcomes", _outcome(_nonvalid_id("r"), "train"))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 100):   # build at 1 outcome, threshold 100: none included
+            build_sft.outcome_examples()
+        self.assertEqual(build_sft.outcomes_trained(), 0)
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):     # live count now "crosses" the threshold …
+            self.assertTrue(train_gate.decision()["fire"])
+        # … but THIS candidate trained on no outcomes, so it is NOT held/arm-eligible (no false first-outcome label)
+        self.assertFalse(evaluate.hold_first_active(build_sft.outcomes_trained() > 0, train_gate.armed()))
 
 
 class OutcomeSftTests(OutcomeCase):
