@@ -16,10 +16,20 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from build_sft import OUTCOME_UNIT_KIND                # the one reading outcome tasks are graded under (interactive)
 from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
 from student import N_OPTIONS, Scorer, encode
 
 BANDS = ["R0", "R1", "R2", "R3", "R4"]
+
+
+def outcome_holdout() -> list[tuple[dict, str]]:
+    """Held-out tasks the loop actually ran, as (request_row, outcome_band). 'above' (no band passed) is not a label,
+    so it is dropped. Empty until the loop has judged holdout tasks."""
+    from outcome import store as outcome_store
+    return [({"id": o["id"], "request": o["request"], "unit_kind": OUTCOME_UNIT_KIND}, o["outcome_band"])
+            for o in outcome_store.read("outcomes")
+            if o.get("split") == "holdout" and o.get("outcome_band") in BANDS and isinstance(o.get("request"), str)]
 
 
 def band_of(a: dict) -> str:
@@ -107,6 +117,25 @@ def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
             "latency_ms_median": int(statistics.median(lat)) if lat else None}
 
 
+def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
+    """Band accuracy against the band each held-out task ACTUALLY needed (its outcome band), not a teacher's reading.
+    Rows are (request_row, outcome_band). Under-routing here is the costly error the whole loop exists to drive down."""
+    hits = under = over = misses = n = 0
+    for r, truth in rows:
+        p = predict(r)
+        if p is None:
+            misses += 1
+            continue
+        n += 1
+        b = band_of(p["answers"])
+        hits += b == truth
+        under += BANDS.index(b) < BANDS.index(truth)
+        over += BANDS.index(b) > BANDS.index(truth)
+    nn = max(n, 1)
+    return {"n": n, "no_answer": misses, "band_accuracy": round(hits / nn, 3),
+            "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
+
+
 def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, str | None]:
     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
     writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
@@ -158,6 +187,10 @@ def main() -> int:
               "temperatures": T, "holdout_rows": len(holdout), "valid_rows": len(valid),
               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
               "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
+    o_holdout = outcome_holdout()                              # the loop's held-out tasks; truth = the band they needed
+    if o_holdout:
+        report["outcome_holdout_rows"] = len(o_holdout)
+        report["outcome"] = grade_outcome(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
     if a.baseline:
         cache_p = DATA / "baseline-incumbent.jsonl"
         cache = {x["id"]: x for x in read_jsonl(cache_p)}
@@ -194,12 +227,22 @@ def main() -> int:
             if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
                 hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
+                # The outcome bar (promoted adapter on the outcome holdout) is cached in parallel, keyed by the outcome
+                # holdout + settings, so the promote rule can require no outcome under-routing regression without a re-grade.
+                ohkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in o_holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12] if o_holdout else None
+                obar_p = DATA / f"outcome-bar-{Path(cur['adapter']).parent.name}-{ohkey}.json" if ohkey else None
                 if cache_p.exists():
                     bar = json.loads(cache_p.read_text())
+                    if obar_p and obar_p.exists():
+                        report["outcome_bar"] = json.loads(obar_p.read_text())
                 else:
                     inc = Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
                     bar = grade(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), holdout)
                     cache_p.write_text(json.dumps(bar))
+                    if o_holdout:
+                        obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
+                        obar_p.write_text(json.dumps(obar))
+                        report["outcome_bar"] = obar
                 report["bar_source"] = f"promoted adapter {cur['adapter']} re-graded on this holdout"
         except Exception as exc:
             report["bar_error"] = f"{type(exc).__name__}: {exc}"
@@ -211,9 +254,24 @@ def main() -> int:
     better_under = bool(bar) and c["under_routed"] < bar["under_routed"]
     acc_ok = bool(bar) and c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
     # under-routing may not regress beyond one request of noise (Forest 2026-09-29: a 2-in-229 regression should not block a +7-pt model)
-    report["promote"] = bool(bar) and acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"]
+    obar, co = report.get("outcome_bar"), report.get("outcome")
+    # When the promoted model was graded on the outcome holdout too, the candidate may not regress on the band the
+    # tasks actually needed (the loop's whole point). No outcome bar yet → recorded, not enforced (can't gate blind).
+    outcome_ok = not (obar and co and co.get("n")) or co["under_routed"] <= obar["under_routed"] + 1.0 / max(co["n"], 1)
+    report["outcome_regression_checked"] = bool(obar and co and co.get("n"))
+    report["promote"] = bool(bar) and acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"] and outcome_ok
+    # Hold-first (Forest 2026-10-25): the first candidate trained once outcome data is in the mix is held for review,
+    # however it grades; after Forest arms it (`python3 -B -m outcome.train_gate --arm`), outcome-trained candidates
+    # auto-promote on no-regression as before. Only active once the loop has produced train-split outcomes.
+    from outcome import store as outcome_store
+    if any(o.get("split") == "train" for o in outcome_store.read("outcomes")) and not (outcome_store.home() / "outcome-train-armed").exists():
+        report["promote_recommended"] = report["promote"]
+        report["promote"] = False
+        report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "
+                                 "`python3 -B -m outcome.train_gate --arm` to allow auto-promotion henceforth")
     (out / "report.json").write_text(json.dumps(report, indent=1))
-    print(json.dumps({k: report[k] for k in ("holdout_rows", "teacher_band_mix", "candidate", "incumbent", "promote") if k in report}, indent=1))
+    print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
+                                              "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
     return 0
 
 

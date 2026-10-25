@@ -154,7 +154,23 @@ processes are killed as a set). That is a scope decision, not a patch. Until the
 boundary and this accepted residual; a periodic `pkill`-style reaper cannot help, because an env-cleared orphan is
 indistinguishable from unrelated processes.
 
+## Outcome → weights (RT-S1-OUTCOME-002, Forest 2026-10-25)
+
+The loop produces the data; this turns it into trained weights, reusing the existing trainer (`s1/nightly.sh`) and its
+one promoter — no second training or promotion path (ENG-03).
+
+| ID | Decision |
+|---|---|
+| [FIXED] W1 | `build_sft.py` merges outcome examples with the teacher labels (outcomes **+** existing labels), one example per train-split outcome from its trace-teacher labels; `unit_kind` fixed `interactive`; an outcome where S1 under-routed (its band below the outcome band) counts `UPWEIGHT_HIGH` times. |
+| [FIXED] W2 | `evaluate.py` grades the candidate's band against the **outcome band** on the holdout outcomes (`grade_outcome`), and the promote rule gains a no-regression-on-outcome-under-routing clause whenever the promoted model has a fresh outcome bar (cached in parallel to the teacher bar). |
+| [FIXED] W3 | **Hold-first:** once train-split outcomes exist, the first trained candidate is held for review however it grades (`report.promote` forced false, `promote_recommended` kept). After `python3 -B -m outcome.train_gate --arm`, later candidates auto-promote on no-regression. |
+| [FIXED] W4 | **Fire threshold:** `outcome.train_gate` reports fire/hold at `MIN_TRAIN` = 150 train-split labelled outcomes (`CORTADOS_OUTCOME_MIN_TRAIN`). The gate counts and arms only; it does not train or promote. |
+
+Deploy note: the trainer, its MLX venv and the base model live in the Studio's training deployment; the outcome-aware
+`build_sft.py`/`evaluate.py` must be reconciled into that deployment (diff first — it is a separate repo line) before a
+real train fires. The actual fine-tune stays gated behind W4 (data) and W3 (review).
+
 ## Not in v1
 
-Training and promotion on outcome data (next: `evaluate.py` gains an outcome-band grade; `build_sft.py` reads
-`outcomes.jsonl`). Multi-account pools. Remote CLI hosts. The Pro's manual training commands (S1-f).
+Multi-account pools. Remote CLI hosts. The Pro's manual training commands (S1-f). Sampling the trace teacher k times
+for soft outcome labels (today each outcome is one labelling; the outcome band carries the orthogonal signal).

@@ -779,5 +779,95 @@ class CodexIsolationTests(unittest.TestCase):
         self.assertTrue(codex_preflight.check_config(cfg, ()))
 
 
+def _olabels(**over):
+    a = {"steps": 1, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0,
+         "outward": False, "work_kind": "code", "urgency": "now", "needs_clarification": False, "parts": 0,
+         "diversity": False}
+    a.update(over)
+    return a
+
+
+def _outcome(oid, split, s1_band="R1", outcome_band="R1", labels=None):
+    return {"id": oid, "task_id": oid, "split": split, "teacher": "claude-fable-5-1", "s1_band": s1_band,
+            "request": f"do {oid}", "outcome_band": outcome_band, "verdicts": {},
+            "labels": _olabels() if labels is None else labels}
+
+
+def _nonvalid_id(prefix):
+    """An outcome id that the valid-split hash (10%) does NOT select, so REPS/upweight are deterministic in a test."""
+    import hashlib
+    i = 0
+    while int(hashlib.sha1(("v" + f"{prefix}.{i}").encode()).hexdigest(), 16) % 10 == 0:
+        i += 1
+    return f"{prefix}.{i}"
+
+
+class OutcomeTrainGateTests(OutcomeCase):
+    def test_counts_only_valid_labelled_by_split(self):
+        from outcome import train_gate
+        store.append("outcomes", _outcome("o.t1", "train"))
+        store.append("outcomes", _outcome("o.t2", "train"))
+        store.append("outcomes", _outcome("o.h1", "holdout"))
+        store.append("outcomes", _outcome("o.bad", "train", labels={"steps": 9}))    # off-schema label: not training data
+        c = train_gate.counts()
+        self.assertEqual((c["train"], c["holdout"], c["unlabelled"]), (2, 1, 1))
+
+    def test_decision_fires_at_threshold(self):
+        from outcome import train_gate
+        with mock.patch.object(train_gate, "MIN_TRAIN", 2):
+            self.assertFalse(train_gate.decision()["fire"])
+            store.append("outcomes", _outcome("o.1", "train"))
+            store.append("outcomes", _outcome("o.2", "train"))
+            d = train_gate.decision()
+            self.assertTrue(d["fire"])
+            self.assertEqual(d["counts"]["train"], 2)
+
+    def test_arm_marker_round_trips(self):
+        from outcome import train_gate
+        self.assertFalse(train_gate.armed())
+        (store.home() / train_gate.ARM_MARKER).write_text("x")
+        self.assertTrue(train_gate.armed())
+
+
+class OutcomeSftTests(OutcomeCase):
+    def test_outcome_examples_are_train_split_valid_only(self):
+        import build_sft
+        store.append("outcomes", _outcome("o.t", "train"))
+        store.append("outcomes", _outcome("o.hold", "holdout"))
+        store.append("outcomes", _outcome("o.bad", "train", labels={"steps": 9}))
+        train, valid, bands, n = build_sft.outcome_examples()
+        self.assertEqual(n, 1)                                                       # holdout + invalid excluded
+        self.assertTrue(all("messages" in e and len(e["messages"]) == 3 for e in train + valid))
+
+    def test_under_routing_is_upweighted(self):
+        import build_sft
+        matched, under = _nonvalid_id("om"), _nonvalid_id("ou")
+        store.append("outcomes", _outcome(matched, "train", s1_band="R2", outcome_band="R2"))   # no under-routing
+        store.append("outcomes", _outcome(under, "train", s1_band="R0", outcome_band="R2"))     # S1 under-routed
+        band = build_sft.band_of(_olabels())
+        reps = build_sft.REPS.get(band, 1)
+        train = build_sft.outcome_examples()[0]
+        self.assertEqual(len(train), reps * (1 + build_sft.UPWEIGHT_HIGH))
+
+
+class OutcomeEvalTests(OutcomeCase):
+    def test_outcome_holdout_keeps_banded_truth_and_drops_above(self):
+        import evaluate
+        store.append("outcomes", _outcome("e.h1", "holdout", outcome_band="R2"))
+        store.append("outcomes", _outcome("e.above", "holdout", outcome_band="above"))
+        store.append("outcomes", _outcome("e.train", "train", outcome_band="R1"))
+        rows = evaluate.outcome_holdout()
+        self.assertEqual([(r["id"], truth) for r, truth in rows], [("e.h1", "R2")])
+
+    def test_grade_outcome_counts_under_and_over(self):
+        import evaluate
+        rows = [({"id": "1", "request": "a", "unit_kind": "interactive"}, "R2"),
+                ({"id": "2", "request": "b", "unit_kind": "interactive"}, "R1")]
+        preds = {"a": "R0", "b": "R3"}                       # a under-routes (R0<R2); b over-routes (R3>R1)
+        with mock.patch.object(evaluate, "band_of", lambda ans: preds[ans["r"]]):
+            g = evaluate.grade_outcome(lambda r: {"answers": {"r": r["request"]}}, rows)
+        self.assertEqual((g["n"], g["under_routed"], g["over_routed"], g["band_accuracy"]), (2, 0.5, 0.5, 0.0))
+
+
 if __name__ == "__main__":
     unittest.main()
