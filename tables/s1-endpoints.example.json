@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to tables/s1-endpoints.json (git-ignored) and edit. Maps device names to the S1 scorer URL each one serves. No address is hardcoded in code; add or move a device by editing this file. A session picks a device with CORTADOS_S1_ENDPOINT=<name>, or falls back to the 'default' below. CORTADOS_S1_URL still overrides everything. Serve S1 on a chosen device by setting CORTADOS_S1_BIND there to the same host.",
+  "default": "local",
+  "endpoints": {
+    "local": "http://127.0.0.1:8431",
+    "studio": "http://100.100.100.100:8431",
+    "air": "http://100.100.100.101:8431"
+  }
+}

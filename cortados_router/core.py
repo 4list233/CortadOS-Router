@@ -159,7 +159,8 @@ def table() -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ interim decision engine (typed JSON, local 14B)
-S1_URL = _env_get("CORTADOS_S1_URL", "http://127.0.0.1:8431")
+from cortados_router.s1_endpoint import resolve_url as _resolve_s1_url
+S1_URL = _resolve_s1_url()   # explicit CORTADOS_S1_URL, else a named device from the endpoints file, else loopback
 S1_TIMEOUT_S = float(_env_get("CORTADOS_S1_TIMEOUT_S", "15"))
 FAIL_UP_BELOW = float(_env_get("CORTADOS_S1_FAIL_UP", "0.75"))   # Forest 2026-09-24: the right answer over cost   # a feature whose top probability is below this takes the HIGHER of its two most likely levels
 OUTWARD_AT = float(_env_get("CORTADOS_S1_OUTWARD_AT", "0.25"))   # the destructive question is called at a lower probability (Jev: stricter gate for destructive actions)

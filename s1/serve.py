@@ -1,7 +1,8 @@
 """CortadOS Router S1 scorer service: the promoted adapter (s1/current.json) loaded once, answering POST /score in ~1 s on this Mac.
   POST /score {"request": str, "unit_kind": "interactive"|"background"} → {"answers", "probs", "confidence", "ms", "model"}
   GET  /health → {"ok", "model", "loaded_s"}
-Reloads when current.json changes (a promotion). Never more than one request at a time (MLX is not thread-safe); the router's own timeout guards the turn."""
+Reloads when current.json changes (a promotion). Never more than one request at a time (MLX is not thread-safe); the router's own timeout guards the turn.
+Binds 127.0.0.1:8431 by default. Set CORTADOS_S1_BIND to a tailnet IP (or 0.0.0.0) to let other hosts reach it, and CORTADOS_S1_PORT for the port; clients resolve the matching URL through cortados_router.s1_endpoint."""
 from __future__ import annotations
 
 import json
@@ -15,11 +16,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))                 # repo root, so `import cortados_router` works from any launch cwd
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from student import Scorer  # noqa: E402
 
 CURRENT = HERE / "current.json"
-PORT = int(os.environ.get("CORTADOS_S1_PORT", "8431"))
 _state: dict = {"scorer": None, "mtime": 0.0, "model": None, "loaded_s": None}
 _jobs: "queue.Queue[tuple[dict, queue.Queue]]" = queue.Queue()
 
@@ -101,7 +102,12 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    from cortados_router.s1_endpoint import bind_address
+    host, port = bind_address()                                 # 127.0.0.1 unless CORTADOS_S1_BIND widens it
     threading.Thread(target=worker, daemon=True, name="mlx").start()
     _jobs.put(({"request": "warm up"}, queue.Queue()))          # load + first pass on the worker thread
-    print(f"CortadOS Router S1 scorer on 127.0.0.1:{PORT}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    if host not in ("127.0.0.1", "localhost", "::1"):           # a non-loopback bind is a deliberate network exposure: say so
+        print(f"CortadOS Router S1 scorer EXPOSED on {host}:{port} (reachable by other hosts; token-free, trust the network)", flush=True)
+    else:
+        print(f"CortadOS Router S1 scorer on {host}:{port}", flush=True)
+    ThreadingHTTPServer((host, port), H).serve_forever()

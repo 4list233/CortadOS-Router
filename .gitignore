@@ -8,6 +8,8 @@ s1/sources/
 s1/laya/
 s1/current.json
 *.safetensors
+# the real S1 endpoints map holds this machine's tailnet addresses: local only (ship the .example instead)
+tables/s1-endpoints.json
 # runtime state belongs in ~/.cortados, never in the repository
 *.db
 # third-party benchmark downloads: re-fetched by tables/benchmarks/fetch_benchmarks.py, never redistributed
