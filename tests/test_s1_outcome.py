@@ -861,49 +861,6 @@ class OutcomeTrainGateTests(OutcomeCase):
             self.assertTrue(d["fire"])
             self.assertEqual(d["counts"]["train"], 2)
 
-    def test_arm_marker_round_trips(self):
-        from outcome import train_gate
-        self.assertFalse(train_gate.armed())
-        (store.home() / train_gate.ARM_MARKER).write_text("x")
-        self.assertTrue(train_gate.armed())
-
-    def test_arm_requires_a_report_whose_candidate_trained_on_outcomes(self):
-        from outcome import train_gate
-        with mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
-            train_gate.main()
-        self.assertFalse(train_gate.armed())            # no report → nothing to arm against
-        teacher = Path(self.home) / "teacher-report.json"
-        teacher.write_text(json.dumps({"outcomes_trained": 0}))
-        with mock.patch.object(sys, "argv", ["train_gate", "--arm", "--report", str(teacher)]):
-            train_gate.main()
-        self.assertFalse(train_gate.armed())            # report's candidate trained on no outcomes → refused
-        real = Path(self.home) / "outcome-report.json"
-        real.write_text(json.dumps({"outcomes_trained": 7}))
-        with mock.patch.object(sys, "argv", ["train_gate", "--arm", "--report", str(real)]):
-            train_gate.main()
-        self.assertTrue(train_gate.armed())             # a reviewed outcome-trained report → armed
-
-    def test_hold_first_uses_run_provenance_and_survives_a_no_op_resume(self):
-        import evaluate
-        run = Path(self.home) / "run"
-        run.mkdir()
-        (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 0}))   # teacher-only checkpoint
-        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
-        # the global build later rebuilds at 150, but a no-op resume writes nothing into the run dir
-        (Path(self.home) / "sft-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
-        self.assertEqual(evaluate.run_outcomes_trained(run), 0)                               # run untouched
-        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
-        # a run that actually trained on outcomes is held for review
-        (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
-        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
-
-    def test_missing_run_provenance_is_held_not_auto_promoted(self):
-        import evaluate
-        run = Path(self.home) / "run2"
-        run.mkdir()
-        self.assertIsNone(evaluate.run_outcomes_trained(run))                                # no provenance file
-        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
-
 
 class OutcomeSftTests(OutcomeCase):
     def test_outcome_examples_are_train_split_valid_only(self):
@@ -928,17 +885,6 @@ class OutcomeSftTests(OutcomeCase):
         with mock.patch.object(train_gate, "MIN_TRAIN", 1):
             train = build_sft.outcome_examples()[0]
         self.assertEqual(len(train), reps * (1 + build_sft.UPWEIGHT_HIGH))
-
-    def test_publish_provenance_is_atomic_and_aborts_without_a_source(self):
-        import build_sft
-        run = Path(self.home) / "pubrun"
-        run.mkdir()
-        with self.assertRaises(FileNotFoundError):            # no build provenance → abort, run file not written
-            build_sft.publish_provenance(run)
-        self.assertFalse((run / "outcome-provenance.json").exists())
-        (Path(self.home) / "sft-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
-        build_sft.publish_provenance(run)                     # source present → published verbatim
-        self.assertEqual(json.loads((run / "outcome-provenance.json").read_text())["outcomes_included"], 150)
 
     def test_outcomes_are_withheld_from_training_below_the_fire_threshold(self):
         import build_sft
@@ -988,13 +934,6 @@ class OutcomeEvalTests(OutcomeCase):
         bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
         self.assertEqual(evaluate.promote_decision(c, bar, None, None, False), (True, False))   # no outcomes: teacher bar alone
         self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
-
-    def test_hold_first_active_holds_on_outcomes_or_missing_provenance(self):
-        import evaluate
-        self.assertTrue(evaluate.hold_first_active(5, False))       # trained on outcomes → hold for review
-        self.assertFalse(evaluate.hold_first_active(0, False))      # explicit teacher-only candidate → not held
-        self.assertTrue(evaluate.hold_first_active(None, False))    # provenance missing → hold (abnormal, never auto)
-        self.assertFalse(evaluate.hold_first_active(5, True))       # armed → auto-promote path
 
 
 if __name__ == "__main__":

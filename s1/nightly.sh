@@ -158,15 +158,8 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
-  # On a SUCCESSFUL training segment (and only then), atomically bind this checkpoint to the outcomes it trained on, via
-  # store.home()'s sft-provenance.json. evaluate reads $RUN/outcome-provenance.json for hold-first; publishing only on
-  # success and preserving it across no-op resumes means a completed teacher-only checkpoint keeps its own provenance.
-  # A missing source or failed publish ABORTS the run (exit 1) rather than leave a stale provenance that could exempt an
-  # outcome-trained checkpoint from review (Codex review 2026-10-25). Kept on this line so the resume-planning test, which
-  # extracts the loop up to here, does not run it.
   HF_HUB_OFFLINE=1 $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
-    --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume \
-    && { python3 -c "import sys, build_sft; build_sft.publish_provenance(sys.argv[1])" "$RUN" || { echo "provenance publish failed; aborting before evaluation"; exit 1; }; break; }
+    --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
   attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1
   sleep 60

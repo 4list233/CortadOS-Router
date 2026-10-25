@@ -136,30 +136,6 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
             "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
 
 
-def run_outcomes_trained(out_dir):
-    """Outcomes that actually trained THIS candidate, from the run dir's own provenance (the trainer writes it when it
-    runs a segment and preserves it across no-op resumes), not the latest dataset build — so a completed teacher-only
-    checkpoint re-evaluated after the count crosses 150 is not mislabelled outcome-trained (Codex review 2026-10-25).
-    Returns the integer count, or None when the provenance file is absent/unreadable — abnormal for a trained candidate
-    and treated as needs-review below, never as teacher-only."""
-    p = Path(out_dir) / "outcome-provenance.json"
-    if not p.exists():
-        return None
-    try:
-        return int(json.loads(p.read_text()).get("outcomes_included", 0))
-    except (OSError, ValueError):
-        return None
-
-
-def hold_first_active(outcomes_trained, armed: bool) -> bool:
-    """Hold a candidate for review when it trained on outcomes (provenance > 0) OR its provenance is missing/unreadable
-    (None): a trained candidate must carry provenance, so its absence means needs-review, never a silent auto-promote
-    (Codex review 2026-10-25). An explicit 0 is a genuine teacher-only candidate and is not held. Armed → never hold."""
-    if armed:
-        return False
-    return outcomes_trained is None or outcomes_trained > 0
-
-
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
     """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
     to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
@@ -301,21 +277,11 @@ def main() -> int:
     bar = bar or i
     report["bar"] = bar
     # Forest 2026-09-24: the right answer over cost (the rule lives in promote_decision, exercised directly in tests).
+    # Auto-promote purely on the no-regression bar (Forest 2026-10-25): a candidate goes live only if it does not regress
+    # against the CURRENTLY PROMOTED model on under-routing, outward recall, band accuracy AND the outcome band, so the
+    # live scorer can never get worse. No hold-first/arm ceremony — the bar alone guards every promotion.
     report["promote"], report["outcome_regression_checked"] = promote_decision(
         c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout))
-    # Hold-first (Forest 2026-10-25): the first candidate trained once outcome data is in the mix is held for review,
-    # however it grades; after Forest arms it (`python3 -B -m outcome.train_gate --arm`), outcome-trained candidates
-    # auto-promote on no-regression as before. Only active once the loop has produced train-split outcomes.
-    from outcome import train_gate
-    # THIS candidate's own training provenance from its run dir (written by the trainer when it actually trained,
-    # preserved across no-op resumes), not the latest dataset build — closes the completed-checkpoint resume race where
-    # a teacher-only checkpoint re-evaluated after the count crosses 150 was mislabelled outcome-trained (Codex review).
-    report["outcomes_trained"] = run_outcomes_trained(out)
-    if hold_first_active(report["outcomes_trained"], train_gate.armed()):
-        report["promote_recommended"] = report["promote"]
-        report["promote"] = False
-        report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "
-                                 f"`python3 -B -m outcome.train_gate --arm --report {out / 'report.json'}`")
     (out / "report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
                                               "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
