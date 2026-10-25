@@ -96,6 +96,9 @@ def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | Non
     early. Returns a derived Fable window (same usage/projection/reset as the weekly window) or None when unavailable."""
     if lane != "claude" or owner != "fable":
         return None
+    if any(w.get("pool") == owner for w in windows):
+        return None            # a real Fable reading exists (fresh OR carried-forward): use it, never override a known
+                               # — possibly exhausted — pool with a lower estimate (Codex review 2026-10-25)
     week = next((w for w in windows if "week" in (w.get("window") or "").lower()
                  and w.get("pool", "all") == "all" and not w.get("stale")), None)
     if not week:

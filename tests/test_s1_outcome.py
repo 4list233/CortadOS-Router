@@ -556,6 +556,17 @@ class QuotaTests(OutcomeCase):
                             per_model="not shown this read (vendor rate limit on the per-model panel)")
         self.assertFalse(quota.admit(self._core(near), "claude", "claude-fable-5-1")[0])      # weekly over stop → Fable held too
 
+    def test_a_known_exhausted_fable_pool_is_not_overridden_by_the_derivation(self):
+        # Fable at 100% carried-forward, panel down, weekly only 50%: the derivation must NOT replace the known
+        # (exhausted) reading with a lower weekly estimate (Codex review 2026-10-25).
+        windows = [self._sess(), self._w(used=50, hours=100),
+                   dict(self._w(used=100, hours=24, pool="fable"), stale=True)]
+        sc = FakeScarcity(windows, fetched_at=self._fresh_now(),
+                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+        ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
+        self.assertFalse(ok)
+        self.assertIn("carried-forward", why)
+
     def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
         # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
         # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
@@ -877,14 +888,21 @@ class OutcomeTrainGateTests(OutcomeCase):
         run = Path(self.home) / "run"
         run.mkdir()
         (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 0}))   # teacher-only checkpoint
-        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
+        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
         # the global build later rebuilds at 150, but a no-op resume writes nothing into the run dir
         (Path(self.home) / "sft-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
         self.assertEqual(evaluate.run_outcomes_trained(run), 0)                               # run untouched
-        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
+        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
         # a run that actually trained on outcomes is held for review
         (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
-        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
+        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
+
+    def test_missing_run_provenance_is_held_not_auto_promoted(self):
+        import evaluate
+        run = Path(self.home) / "run2"
+        run.mkdir()
+        self.assertIsNone(evaluate.run_outcomes_trained(run))                                # no provenance file
+        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run), False))
 
 
 class OutcomeSftTests(OutcomeCase):
@@ -960,11 +978,12 @@ class OutcomeEvalTests(OutcomeCase):
         self.assertEqual(evaluate.promote_decision(c, bar, None, None, False), (True, False))   # no outcomes: teacher bar alone
         self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
 
-    def test_hold_first_active_keys_on_actual_outcome_inclusion(self):
+    def test_hold_first_active_holds_on_outcomes_or_missing_provenance(self):
         import evaluate
-        self.assertTrue(evaluate.hold_first_active(True, False))    # outcomes included, not armed → hold for review
-        self.assertFalse(evaluate.hold_first_active(False, False))  # below threshold: teacher-only candidate, no hold
-        self.assertFalse(evaluate.hold_first_active(True, True))    # armed → auto-promote path
+        self.assertTrue(evaluate.hold_first_active(5, False))       # trained on outcomes → hold for review
+        self.assertFalse(evaluate.hold_first_active(0, False))      # explicit teacher-only candidate → not held
+        self.assertTrue(evaluate.hold_first_active(None, False))    # provenance missing → hold (abnormal, never auto)
+        self.assertFalse(evaluate.hold_first_active(5, True))       # armed → auto-promote path
 
 
 if __name__ == "__main__":

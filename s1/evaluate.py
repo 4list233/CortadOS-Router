@@ -136,22 +136,28 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
             "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
 
 
-def run_outcomes_trained(out_dir) -> int:
+def run_outcomes_trained(out_dir):
     """Outcomes that actually trained THIS candidate, from the run dir's own provenance (the trainer writes it when it
     runs a segment and preserves it across no-op resumes), not the latest dataset build — so a completed teacher-only
-    checkpoint re-evaluated after the count crosses 150 is not mislabelled outcome-trained (Codex review 2026-10-25)."""
+    checkpoint re-evaluated after the count crosses 150 is not mislabelled outcome-trained (Codex review 2026-10-25).
+    Returns the integer count, or None when the provenance file is absent/unreadable — abnormal for a trained candidate
+    and treated as needs-review below, never as teacher-only."""
+    p = Path(out_dir) / "outcome-provenance.json"
+    if not p.exists():
+        return None
     try:
-        return int(json.loads((Path(out_dir) / "outcome-provenance.json").read_text()).get("outcomes_included", 0))
+        return int(json.loads(p.read_text()).get("outcomes_included", 0))
     except (OSError, ValueError):
-        return 0
+        return None
 
 
-def hold_first_active(fire: bool, armed: bool) -> bool:
-    """Whether to hold a candidate for review. Keyed on outcomes actually being INCLUDED in training (the fire
-    threshold), not merely existing: below it build_sft adds no outcomes, so a teacher-only candidate must not be
-    labelled 'first outcome-trained' nor let an --arm below threshold waive review of the real first one at 150
-    (Codex review 2026-10-25)."""
-    return fire and not armed
+def hold_first_active(outcomes_trained, armed: bool) -> bool:
+    """Hold a candidate for review when it trained on outcomes (provenance > 0) OR its provenance is missing/unreadable
+    (None): a trained candidate must carry provenance, so its absence means needs-review, never a silent auto-promote
+    (Codex review 2026-10-25). An explicit 0 is a genuine teacher-only candidate and is not held. Armed → never hold."""
+    if armed:
+        return False
+    return outcomes_trained is None or outcomes_trained > 0
 
 
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
@@ -305,7 +311,7 @@ def main() -> int:
     # preserved across no-op resumes), not the latest dataset build — closes the completed-checkpoint resume race where
     # a teacher-only checkpoint re-evaluated after the count crosses 150 was mislabelled outcome-trained (Codex review).
     report["outcomes_trained"] = run_outcomes_trained(out)
-    if hold_first_active(report["outcomes_trained"] > 0, train_gate.armed()):
+    if hold_first_active(report["outcomes_trained"], train_gate.armed()):
         report["promote_recommended"] = report["promote"]
         report["promote"] = False
         report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "

@@ -159,9 +159,13 @@ while :; do
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
   # Bind this checkpoint to the dataset it is training on, ONLY when a segment actually trains (we are past the no-op
-  # break above). evaluate reads $RUN/outcome-provenance.json for hold-first, so a completed teacher-only checkpoint
-  # re-evaluated after the outcome count later crosses the threshold is never mislabelled outcome-trained (Codex review).
-  [ -n "${CORTADOS_OUTCOME_HOME:-}" ] && [ -f "$CORTADOS_OUTCOME_HOME/sft-provenance.json" ] && cp "$CORTADOS_OUTCOME_HOME/sft-provenance.json" "$RUN/outcome-provenance.json"
+  # break above). evaluate reads $RUN/outcome-provenance.json for hold-first. The source is resolved through the
+  # canonical store.home() (its default included), not an env var, so a default outcome home cannot skip the copy and
+  # silently bypass hold-first (Codex review 2026-10-25). Best-effort: if it cannot be written, evaluate sees no run
+  # provenance and HOLDS the candidate for review rather than auto-promoting, so a missing copy fails safe either way.
+  SFT_PROV=$(python3 -c "from outcome import store; print(store.home()/'sft-provenance.json')" 2>/dev/null)
+  if [ -n "$SFT_PROV" ] && [ -f "$SFT_PROV" ]; then cp "$SFT_PROV" "$RUN/outcome-provenance.json"
+  else echo "warning: no SFT provenance ($SFT_PROV); evaluate will hold this candidate (missing run provenance)"; fi
   HF_HUB_OFFLINE=1 $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
     --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
