@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import threading
 import time
 
@@ -67,9 +68,61 @@ def _remember(lane: str, general: set, pools: set) -> tuple[list, list]:
     return merged_g, merged_p
 
 
+# Claude models Forest has confirmed draw ONLY on the shared 5-hour + weekly windows (no separate per-model cap), so
+# they may run while the per-model panel is unavailable. Fable is the pooled exception (pool_for knows it). A Claude
+# model in neither set has UNKNOWN ownership while the panel is down and is refused rather than spent against the shared
+# windows blind — it might have an unobserved cap (Codex review 2026-10-25). Forest 2026-10-25: Fable is the pooled one.
+CLAUDE_SHARED_MODELS = ("haiku", "sonnet", "opus")
+# General windows a lane ALWAYS has, so a reading missing one is an incomplete capture — not evidence the limit is gone.
+# Claude's are the rolling session and the weekly all-models window; both must be in hand before any Claude call, even
+# before either has been observed on a fresh home (Codex review 2026-10-25: a partial capture with only the session
+# window otherwise admitted a shared model against an unseen, possibly exhausted weekly limit).
+REQUIRED_GENERAL = {"claude": ("5-hour", "week")}
+
+
 def _panel_unavailable(raw: dict) -> bool:
     note = raw.get("per_model")
     return isinstance(note, str) and ("not shown" in note or "unavailable" in note)
+
+
+def _confirmed_shared(lane: str, model: str | None) -> bool:
+    return lane == "claude" and any(tok in (model or "").lower() for tok in CLAUDE_SHARED_MODELS)
+
+
+# Fable's own pool, when its per-model panel is rate-limited, is modelled from the visible weekly window. Fable's cap is
+# HALF the weekly budget, so Fable utilisation = 2 × (Fable's share of weekly usage) × weekly utilisation. That share is
+# unknown and unenforceable (ladder runs use Codex/other Claude models, judging uses Fable), so the SAFE default assumes
+# the worst case — ALL weekly usage is Fable (share 1.0 → the derived pool is 2× the weekly window), which refuses once
+# weekly passes ~48 %. Forest asserted a 50/50 split for his account (2026-10-25); set CORTADOS_FABLE_WEEKLY_SHARE=0.5 to
+# model Fable at that split (then Fable util == weekly util) at his own risk (Codex review 2026-10-25).
+FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
+# How much of ITS OWN cap one call consumes relative to the weekly budget, per separately-metered pool. A call is about
+# 1 % of the weekly budget (ASSUMED_PCT_PER_CALL); Fable's cap is HALF that budget, so the same call is ~2 % of Fable's
+# cap. Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
+# scale, so pending calls are not under-counted when the panel recovers before they appear in a sample (Codex review).
+POOL_CAP_SCALE = {"fable": 2.0}
+
+
+def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:
+    """Model Fable's pool from the visible weekly window when its own per-model panel is rate-limited, scaled by its
+    half-sized cap and assumed weekly share (FABLE_WEEKLY_SHARE) so judging is not blocked. Returns None — and the
+    caller refuses — when any real Fable reading exists (a known, possibly exhausted pool is never overridden with an
+    estimate) or no weekly window is in hand (Codex review 2026-10-25)."""
+    if lane != "claude" or owner != "fable":
+        return None
+    if any(w.get("pool") == owner for w in windows):
+        return None            # a real Fable reading exists (fresh OR carried-forward): use it, never override a known
+                               # — possibly exhausted — pool with a lower estimate (Codex review 2026-10-25)
+    week = next((w for w in windows if "week" in (w.get("window") or "").lower()
+                 and w.get("pool", "all") == "all" and not w.get("stale")), None)
+    if not week:
+        return None
+    factor = 2.0 * FABLE_WEEKLY_SHARE                           # Fable cap is half the budget → ×2; share 1.0 = worst case
+    derived = {**week, "window": "week (fable, derived from weekly)", "pool": "fable", "derived": True}
+    for k in ("used_pct", "projected_pct_at_reset"):            # convert weekly utilisation into Fable-cap utilisation
+        if isinstance(week.get(k), (int, float)):
+            derived[k] = min(100.0, week[k] * factor)
+    return derived                                             # cap_scale for reservations is set from POOL_CAP_SCALE in _windows
 
 
 def _windows(sc, lane: str, model: str | None):
@@ -89,23 +142,42 @@ def _windows(sc, lane: str, model: str | None):
     # loaded since a fresh home still has its limit treated as known-and-unobserved rather than absent.
     pools_any = {w.get("pool") for w in windows if w.get("pool") not in (None, "all")}
     known_general, known_pools = _remember(lane, general_now, pools_now | pools_any)
+    required = [r for r in REQUIRED_GENERAL.get(lane, ()) if not any(r in (w or "").lower() for w in general_now)]
+    if required:
+        return None, f"{lane} required general window(s) {required} not in the current reading (incomplete capture)"
     missing = sorted(set(known_general) - general_now)
     if missing:
         return None, f"{lane} general window(s) {missing} missing from the current reading"
     if model:
-        # The per-model panel not loading means this model's own limit is unknown; never spend blind on a general
-        # window instead (Codex review 2026-10-24: first start and rate-limited panel both admitted blind).
-        if _panel_unavailable(raw):
-            return None, f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s own limit is unknown"
-        owner = sc.pool_for(lane, model, known_pools) if known_pools else None
+        # A model with its own separately-metered pool (pool_for knows which, e.g. Claude Fable) is refused when that
+        # pool is absent from the current reading — including when the per-model panel is rate-limited, since its cap is
+        # then unreadable. A model that rides only the shared 'all' windows is unaffected: those windows ARE its cap and
+        # they are visible. (Corrects the review-5 blanket per-model-panel refusal that stalled haiku/sonnet/opus runs
+        # although their real caps were in hand — Forest 2026-10-25: Fable is the pooled one, the run models are not.)
+        owner = sc.pool_for(lane, model or "", sorted(known_pools))
         if owner and owner not in pools_now:
-            carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
-            return None, (f"{lane} pool {owner} for {model} is "
-                          + ("a carried-forward reading" if carried else "missing from the current reading"))
+            derived = _derive_fable_pool(lane, owner, windows) if _panel_unavailable(raw) else None
+            if derived is not None:                      # model Fable's pool from the weekly window (its panel is down)
+                windows = windows + [derived]
+                pools_now = pools_now | {owner}
+            else:
+                carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
+                return None, (f"{lane} pool {owner} for {model} is "
+                              + ("a carried-forward reading" if carried else "missing from the current reading"))
+        if owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model):
+            return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
+                          "unknown and it may have an unobserved cap")
     pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None
-    applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
-                       key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")
-                  for w in windows if w.get("pool", "all") in ("all", pool) and not w.get("stale")]
+    applicable = []
+    for w in windows:
+        wp = w.get("pool", "all")
+        if wp not in ("all", pool) or w.get("stale"):
+            continue
+        # Reservation identity is STABLE across a pool's derived and measured readings (their window names differ):
+        # pooled windows key on the pool, general windows on the window name (Codex review 2026-10-25).
+        key = f"{lane}|pool|{wp}" if wp != "all" else f"{lane}|win|{w.get('window')}"
+        applicable.append(dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched, key=key,
+                               cap_scale=w.get("cap_scale", POOL_CAP_SCALE.get(wp, 1.0))))
     if not applicable:
         return None, "no usage window applies"
     return applicable, None
@@ -123,7 +195,11 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
         used, elapsed, reset = w.get("used_pct"), w.get("elapsed_pct"), w.get("reset_epoch")
         if not all(isinstance(x, (int, float)) for x in (used, elapsed, reset, w.get("projected_pct_at_reset"))):
             return False, f"window {w.get('window')} reading is incomplete"
-        used = used + (reserved.get(w.get("key"), 0) + 1) * ASSUMED_PCT_PER_CALL
+        # A call consumes cap_scale × ASSUMED_PCT_PER_CALL of THIS window's budget: for the derived Fable pool (cap_scale
+        # = 2 × share) one call is a larger slice of its half-sized cap than of the weekly budget, so reservations must be
+        # scaled too, not only the sampled usage — otherwise the pool can still be exhausted between samples (Codex review).
+        per_call = ASSUMED_PCT_PER_CALL * w.get("cap_scale", 1.0)
+        used = used + (reserved.get(w.get("key"), 0) + 1) * per_call
         projected = max(w["projected_pct_at_reset"], used / max(elapsed / 100.0, 0.05))
         hours = (reset - now) / 3600
         if max(projected, used) > STOP_PROJECTED_PCT:
@@ -134,6 +210,19 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
     return True, ", ".join(notes)
 
 
+def _canonical_key(key: str) -> str:
+    """Map an admission key to the current identity. Rows persisted before the key change use lane|window|pool; the
+    current scheme is lane|pool|<pool> for pooled windows and lane|win|<window> for general ones. Normalising on read
+    means reservations outstanding across an upgrade still count (Codex review 2026-10-25)."""
+    parts = key.split("|")
+    if len(parts) == 3 and parts[1] in ("pool", "win"):
+        return key                                   # already the current scheme
+    if len(parts) >= 3:                               # legacy lane|window(…)|pool (a window name may itself contain '|')
+        lane, pool, window = parts[0], parts[-1], "|".join(parts[1:-1])
+        return f"{lane}|pool|{pool}" if pool != "all" else f"{lane}|win|{window}"
+    return key
+
+
 def _reserved(windows: list[dict]) -> dict:
     """Calls that may not show in a window's reading yet: every admission from IN_FLIGHT_S before that reading's
     sample on. Work admitted earlier is assumed visible; counting a visible call twice only stops the loop sooner."""
@@ -141,8 +230,9 @@ def _reserved(windows: list[dict]) -> dict:
     counts: dict = {}
     for row in store.read("admissions"):
         for k in row.get("windows", []):
-            if k in since and row.get("ts", 0) >= since[k]:
-                counts[k] = counts.get(k, 0) + 1
+            ck = _canonical_key(k)                    # legacy keys normalise to the current identity so they still count
+            if ck in since and row.get("ts", 0) >= since[ck]:
+                counts[ck] = counts.get(ck, 0) + 1
     return counts
 
 

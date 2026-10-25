@@ -16,10 +16,20 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from build_sft import OUTCOME_UNIT_KIND                # the one reading outcome tasks are graded under (interactive)
 from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
 from student import N_OPTIONS, Scorer, encode
 
 BANDS = ["R0", "R1", "R2", "R3", "R4"]
+
+
+def outcome_holdout() -> list[tuple[dict, str]]:
+    """Held-out tasks the loop actually ran, as (request_row, outcome_band). 'above' (no band passed) is not a label,
+    so it is dropped. Empty until the loop has judged holdout tasks."""
+    from outcome import store as outcome_store
+    return [({"id": o["id"], "request": o["request"], "unit_kind": OUTCOME_UNIT_KIND}, o["outcome_band"])
+            for o in outcome_store.read("outcomes")
+            if o.get("split") == "holdout" and o.get("outcome_band") in BANDS and isinstance(o.get("request"), str)]
 
 
 def band_of(a: dict) -> str:
@@ -107,6 +117,58 @@ def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
             "latency_ms_median": int(statistics.median(lat)) if lat else None}
 
 
+def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
+    """Band accuracy against the band each held-out task ACTUALLY needed (its outcome band), not a teacher's reading.
+    Rows are (request_row, outcome_band). Under-routing here is the costly error the whole loop exists to drive down."""
+    hits = under = over = misses = n = 0
+    for r, truth in rows:
+        p = predict(r)
+        if p is None:
+            misses += 1
+            continue
+        n += 1
+        b = band_of(p["answers"])
+        hits += b == truth
+        under += BANDS.index(b) < BANDS.index(truth)
+        over += BANDS.index(b) > BANDS.index(truth)
+    nn = max(n, 1)
+    # Raw counts are kept alongside the rounded ratios so promote_decision compares exactly (no rounding can hide a
+    # one-task regression on a large outcome holdout); the ratios are for display (Codex review 2026-10-25).
+    return {"n": n, "no_answer": misses, "band_hits": hits, "under": under, "over": over,
+            "band_accuracy": round(hits / nn, 3), "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
+
+
+def _no_outcome_regression(co: dict, obar: dict) -> bool:
+    """No regression on outcome band accuracy or under-routing, compared on RAW counts (cross-multiplied, exact — a
+    one-task regression on a large holdout cannot round away). A grade without raw counts (a legacy cache) returns
+    False → promotion is blocked until that bar is recomputed with raw counts, never compared on rounded ratios
+    (Codex review 2026-10-25). The candidate and the bar are graded on the same outcome holdout."""
+    if not (all(k in co and k in obar for k in ("band_hits", "under", "n")) and co["n"] and obar["n"]):
+        return False
+    return (co["band_hits"] * obar["n"] >= obar["band_hits"] * co["n"]
+            and co["under"] * obar["n"] <= obar["under"] * co["n"])
+
+
+def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
+    """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
+    to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
+    never regress. When held-out outcomes exist a valid outcome bar is REQUIRED, and on the SAME outcome holdout the
+    candidate may regress on neither outcome band accuracy nor outcome under-routing (strict, no slack — these are the
+    actual-task ground truth, so no degradation is allowed; Forest/Codex review 2026-10-25). A missing/failed outcome
+    baseline blocks promotion rather than defaulting to OK."""
+    if not bar:
+        return False, False
+    slack = 1.0 / max(c["n"], 1)
+    better_under = c["under_routed"] < bar["under_routed"]
+    acc_ok = c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
+    if has_outcome_holdout:
+        outcome_ok = bool(obar and co and co.get("n")) and _no_outcome_regression(co, obar)
+    else:
+        outcome_ok = True
+    promote = acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"] and outcome_ok
+    return promote, bool(has_outcome_holdout and obar and co and co.get("n"))
+
+
 def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, str | None]:
     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
     writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
@@ -158,6 +220,10 @@ def main() -> int:
               "temperatures": T, "holdout_rows": len(holdout), "valid_rows": len(valid),
               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
               "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
+    o_holdout = outcome_holdout()                              # the loop's held-out tasks; truth = the band they needed
+    if o_holdout:
+        report["outcome_holdout_rows"] = len(o_holdout)
+        report["outcome"] = grade_outcome(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
     if a.baseline:
         cache_p = DATA / "baseline-incumbent.jsonl"
         cache = {x["id"]: x for x in read_jsonl(cache_p)}
@@ -189,9 +255,13 @@ def main() -> int:
         except Exception as exc:
             report["bar_error"] = f"{type(exc).__name__}: {exc}"
     else:
+        cur, inc = {}, None
         try:
             cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
-            if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
+        except Exception as exc:
+            report["bar_error"] = f"{type(exc).__name__}: {exc}"
+        if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
+            try:
                 hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
                 if cache_p.exists():
@@ -201,19 +271,36 @@ def main() -> int:
                     bar = grade(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), holdout)
                     cache_p.write_text(json.dumps(bar))
                 report["bar_source"] = f"promoted adapter {cur['adapter']} re-graded on this holdout"
-        except Exception as exc:
-            report["bar_error"] = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                report["bar_error"] = f"{type(exc).__name__}: {exc}"
+            # The outcome bar is graded INDEPENDENTLY of the teacher-bar cache: a cached teacher bar must never let a
+            # missing outcome bar skip the outcome no-regression check (Codex review 2026-10-25). A grading failure here
+            # leaves no outcome bar, and promotion below is then blocked whenever outcome holdouts exist.
+            if o_holdout:
+                try:
+                    ohkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in o_holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+                    obar_p = DATA / f"outcome-bar-{Path(cur['adapter']).parent.name}-{ohkey}.json"
+                    cached = json.loads(obar_p.read_text()) if obar_p.exists() else None
+                    if cached and "band_hits" in cached:       # a legacy cache without raw counts is recomputed, not trusted
+                        report["outcome_bar"] = cached
+                    else:
+                        inc = inc or Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
+                        obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
+                        obar_p.write_text(json.dumps(obar))
+                        report["outcome_bar"] = obar
+                except Exception as exc:
+                    report["outcome_bar_error"] = f"{type(exc).__name__}: {exc}"
     bar = bar or i
-    slack = 1.0 / max(c["n"], 1)
     report["bar"] = bar
-    # Forest 2026-09-24: the right answer over cost. Under-routing and outward recall never regress; band accuracy may give up to 3 points
-    # when under-routing improves (the loss moved to the cheap side), else it must hold within noise.
-    better_under = bool(bar) and c["under_routed"] < bar["under_routed"]
-    acc_ok = bool(bar) and c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
-    # under-routing may not regress beyond one request of noise (Forest 2026-09-29: a 2-in-229 regression should not block a +7-pt model)
-    report["promote"] = bool(bar) and acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"]
+    # Forest 2026-09-24: the right answer over cost (the rule lives in promote_decision, exercised directly in tests).
+    # Auto-promote purely on the no-regression bar (Forest 2026-10-25): a candidate goes live only if it does not regress
+    # against the CURRENTLY PROMOTED model on under-routing, outward recall, band accuracy AND the outcome band, so the
+    # live scorer can never get worse. No hold-first/arm ceremony — the bar alone guards every promotion.
+    report["promote"], report["outcome_regression_checked"] = promote_decision(
+        c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout))
     (out / "report.json").write_text(json.dumps(report, indent=1))
-    print(json.dumps({k: report[k] for k in ("holdout_rows", "teacher_band_mix", "candidate", "incumbent", "promote") if k in report}, indent=1))
+    print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
+                                              "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
     return 0
 
 

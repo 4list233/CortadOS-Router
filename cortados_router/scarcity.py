@@ -442,6 +442,8 @@ def pool_for(lane: str, model: str, pools: list[str]) -> str | None:
         return "cursor-models" if re.search(r"grok|composer|^auto$|^default$|vega", m) else "other-models"
     if lane == "antigravity":
         return "gemini" if "gemini" in m else "claude-gpt"
+    if lane == "claude" and "fable" in m:
+        return "fable"                                   # Forest 2026-10-25: Fable is separately metered; true even when the per-model panel is rate-limited so no pool is observed this read
     hits = [p for p in pools if p not in ("all", "info") and all(tok in m for tok in p.split("-") if tok)]
     return max(hits, key=len) if hits else None
 

@@ -412,7 +412,7 @@ class FakeScarcity:
         return {"claude": self.view}
 
     def pool_for(self, lane, model, pools):
-        return "fable" if "fable" in model and "fable" in pools else None
+        return "fable" if "fable" in (model or "") else None    # matches the real pool_for: Fable is pooled even when unobserved
 
 
 class QuotaTests(OutcomeCase):
@@ -426,13 +426,25 @@ class QuotaTests(OutcomeCase):
         w = run.core._scarcity_module().window_view(window, used, now + hours * 3600, window_s, now)
         return dict(w, pool=pool)
 
+    def _sess(self, used=5.0, hours=4.0):
+        """A healthy 5-hour session window — Claude admission now requires one alongside the weekly window."""
+        return self._w(used=used, hours=hours, window="5-hour", window_s=5 * 3600)
+
     def _core(self, sc):
         return mock.Mock(_scarcity_module=lambda: sc)
 
     def test_real_window_view_output_is_admitted_when_there_is_room(self):
         w = self._w(used=10, hours=24)
         self.assertIsInstance(w["reset_epoch"], float)
-        self.assertTrue(quota.admit(self._core(FakeScarcity([w])), "claude", "m")[0])
+        self.assertTrue(quota.admit(self._core(FakeScarcity([self._sess(), w])), "claude", "m")[0])
+
+    def test_claude_admission_requires_both_the_session_and_weekly_windows(self):
+        week, sess = self._w(used=10, hours=100), self._sess()
+        self.assertTrue(quota.admit(self._core(FakeScarcity([sess, week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
+        ok_wk, why_wk = quota.admit(self._core(FakeScarcity([sess], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertFalse(ok_wk); self.assertIn("week", why_wk)          # partial capture: only the session window
+        ok_se, why_se = quota.admit(self._core(FakeScarcity([week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertFalse(ok_se); self.assertIn("5-hour", why_se)        # partial capture: only the weekly window
 
     def test_quota_rule_on_real_windows(self):
         import time as _t
@@ -447,11 +459,11 @@ class QuotaTests(OutcomeCase):
     def test_a_reading_written_before_reset_epoch_existed_uses_its_sample_time(self):
         w = self._w(used=10, hours=0.8)
         w.pop("reset_epoch")
-        sc = FakeScarcity([w], fetched_at=__import__("time").time() - 2 * 3600)   # sampled 2 h ago: reset passed
+        sc = FakeScarcity([self._sess(), w], fetched_at=__import__("time").time() - 2 * 3600)   # sampled 2 h ago: reset passed
         self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
 
     def test_a_model_pool_at_its_stop_refuses_that_model_only(self):
-        sc = FakeScarcity([self._w(used=10, hours=100), self._w(used=96, hours=100, pool="fable")])
+        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100), self._w(used=96, hours=100, pool="fable")])
         self.assertFalse(quota.admit(self._core(sc), "claude", "claude-fable-5-1")[0])
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
@@ -461,7 +473,8 @@ class QuotaTests(OutcomeCase):
 
     def _near_stop(self, extra_pool=False, used=90.0):
         w = self._w(used=used, hours=1.5)                    # 1.5 h before a weekly reset: ~99 % of the window gone
-        return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else [])
+        # windows[0] stays the binding weekly window; a healthy session window satisfies the required-windows check.
+        return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else []) + [self._sess()]
 
     @staticmethod
     def _expected_calls(w):
@@ -516,29 +529,86 @@ class QuotaTests(OutcomeCase):
 
     def test_a_model_pool_missing_from_the_reading_is_refused_once_it_has_been_seen(self):
         general = self._w(used=10, hours=100)
-        with_pool = FakeScarcity([general, dict(self._w(used=10, hours=100), pool="fable")], fetched_at=self._fresh_now())
+        with_pool = FakeScarcity([self._sess(), general, dict(self._w(used=10, hours=100), pool="fable")], fetched_at=self._fresh_now())
         self.assertTrue(quota.admit(self._core(with_pool), "claude", "claude-fable-5-1")[0])
-        without = FakeScarcity([general], fetched_at=self._fresh_now())
+        without = FakeScarcity([self._sess(), general], fetched_at=self._fresh_now())
         ok, why = quota.admit(self._core(without), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
         self.assertIn("missing", why)
         self.assertTrue(quota.admit(self._core(without), "claude", "claude-sonnet-5-5")[0])
 
     def test_a_carried_forward_model_pool_is_refused(self):
-        windows = [self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
+        windows = [self._sess(), self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
         sc = FakeScarcity(windows, fetched_at=self._fresh_now())
         ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
         self.assertIn("carried-forward", why)
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
-    def test_an_unavailable_per_model_panel_refuses_any_model_call_from_a_fresh_home(self):
-        # Fresh data home, no pool ever seen, but the lane reports its per-model panel did not load.
-        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+    def test_fable_pool_is_derived_from_the_weekly_window_when_its_panel_is_unavailable(self):
+        # Per-model panel rate-limited: Fable's cap is 50% of the weekly budget and its utilisation tracks the weekly
+        # window (Forest 2026-10-25), so it is modelled from that window rather than held — judging is not blocked.
+        healthy = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+                               per_model="not shown this read (vendor rate limit on the per-model panel)")
+        self.assertTrue(quota.admit(self._core(healthy), "claude", "claude-fable-5-1")[0])    # weekly healthy → Fable judges
+        self.assertTrue(quota.admit(self._core(healthy), "claude", "claude-sonnet-5-5")[0])   # run model still runs
+        near = FakeScarcity([self._sess(), self._w(used=97, hours=100)], fetched_at=self._fresh_now(),
+                            per_model="not shown this read (vendor rate limit on the per-model panel)")
+        self.assertFalse(quota.admit(self._core(near), "claude", "claude-fable-5-1")[0])      # weekly over stop → Fable held too
+
+    def test_a_known_exhausted_fable_pool_is_not_overridden_by_the_derivation(self):
+        # Fable at 100% carried-forward, panel down, weekly only 50%: the derivation must NOT replace the known
+        # (exhausted) reading with a lower weekly estimate (Codex review 2026-10-25).
+        windows = [self._sess(), self._w(used=50, hours=100),
+                   dict(self._w(used=100, hours=24, pool="fable"), stale=True)]
+        sc = FakeScarcity(windows, fetched_at=self._fresh_now(),
                           per_model="not shown this read (vendor rate limit on the per-model panel)")
         ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
-        self.assertIn("per-model panel unavailable", why)
+        self.assertIn("carried-forward", why)
+
+    def test_derive_fable_pool_scales_for_its_half_sized_cap(self):
+        # Fable's cap is half the weekly budget: the derived pool is 2× the weekly window by default (worst case all
+        # weekly usage is Fable), or 1× under Forest's asserted 50/50 split (Codex review 2026-10-25).
+        wk = dict(self._w(used=30, hours=100), used_pct=30.0, projected_pct_at_reset=30.0)
+        d = quota._derive_fable_pool("claude", "fable", [wk])
+        self.assertEqual((d["used_pct"], d["projected_pct_at_reset"]), (60.0, 60.0))    # default worst case: 2× weekly
+        with mock.patch.object(quota, "FABLE_WEEKLY_SHARE", 0.5):
+            d5 = quota._derive_fable_pool("claude", "fable", [wk])
+        self.assertEqual((d5["used_pct"], d5["projected_pct_at_reset"]), (30.0, 30.0))  # Forest's 50/50: util == weekly
+
+    def test_legacy_reservation_keys_still_count_after_the_key_change(self):
+        # An admission persisted under the pre-upgrade lane|window|pool scheme (derived Fable, measured Fable, and a
+        # general window) must still count against the current pool-/window-based keys (Codex review 2026-10-25).
+        now = self._fresh_now()
+        store.append("admissions", {"ts": now, "lane": "claude", "model": "claude-fable-5-1",
+                                    "windows": ["claude|week (fable, derived ×2.00 from weekly)|fable",
+                                                "claude|week (all models)|all"]})
+        r = quota._reserved([{"key": "claude|pool|fable", "observed_at": now},
+                             {"key": "claude|win|week (all models)", "observed_at": now}])
+        self.assertEqual(r.get("claude|pool|fable"), 1)
+        self.assertEqual(r.get("claude|win|week (all models)"), 1)
+
+    def test_fable_reservations_are_scaled_to_its_half_sized_cap(self):
+        # Derived Fable at 80% used (2× a 40% weekly), cap_scale 2: each reservation is 2% of the Fable cap, so at 80%
+        # the 8th admitted call passes 95% and is rejected — reservations are scaled, not just sampled usage (Codex review).
+        now = self._fresh_now()
+        fable = {"window": "week (fable, derived ×2.00 from weekly)", "pool": "fable", "cap_scale": 2.0, "key": "k",
+                 "used_pct": 80.0, "elapsed_pct": 100.0, "projected_pct_at_reset": 80.0, "reset_epoch": now + 2 * 3600}
+        results = [quota.verdict([fable], reserved={"k": i}, now=now)[0] for i in range(8)]
+        self.assertEqual(results, [True] * 7 + [False])
+
+    def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
+        # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
+        # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
+        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+        ok, why = quota.admit(self._core(sc), "claude", "claude-newmodel-9")
+        self.assertFalse(ok)
+        self.assertIn("ownership is unknown", why)
+        # when the panel IS available, the same unknown model admits against the shared windows normally
+        ok2, _ = quota.admit(self._core(FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now())), "claude", "claude-newmodel-9")
+        self.assertTrue(ok2)
 
     def test_a_missing_general_window_refuses_even_a_poolless_model(self):
         both = [self._w(used=10, hours=100, window="week"), self._w(used=10, hours=4, window="5-hour", window_s=5 * 3600)]
@@ -777,6 +847,136 @@ class CodexIsolationTests(unittest.TestCase):
         cfg["features"].update({f: True for f in agents.CODEX_TASK_TOOL_FEATURES})
         self.assertEqual(codex_preflight.check_config(cfg, agents.CODEX_TASK_TOOL_FEATURES), [])
         self.assertTrue(codex_preflight.check_config(cfg, ()))
+
+
+def _olabels(**over):
+    a = {"steps": 1, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0,
+         "outward": False, "work_kind": "code", "urgency": "now", "needs_clarification": False, "parts": 0,
+         "diversity": False}
+    a.update(over)
+    return a
+
+
+def _outcome(oid, split, s1_band="R1", outcome_band="R1", labels=None):
+    return {"id": oid, "task_id": oid, "split": split, "teacher": "claude-fable-5-1", "s1_band": s1_band,
+            "request": f"do {oid}", "outcome_band": outcome_band, "verdicts": {},
+            "labels": _olabels() if labels is None else labels}
+
+
+def _nonvalid_id(prefix):
+    """An outcome id that the valid-split hash (10%) does NOT select, so REPS/upweight are deterministic in a test."""
+    import hashlib
+    i = 0
+    while int(hashlib.sha1(("v" + f"{prefix}.{i}").encode()).hexdigest(), 16) % 10 == 0:
+        i += 1
+    return f"{prefix}.{i}"
+
+
+class OutcomeTrainGateTests(OutcomeCase):
+    def test_counts_only_valid_labelled_by_split(self):
+        from outcome import train_gate
+        store.append("outcomes", _outcome("o.t1", "train"))
+        store.append("outcomes", _outcome("o.t2", "train"))
+        store.append("outcomes", _outcome("o.h1", "holdout"))
+        store.append("outcomes", _outcome("o.bad", "train", labels={"steps": 9}))    # off-schema label: not training data
+        c = train_gate.counts()
+        self.assertEqual((c["train"], c["holdout"], c["unlabelled"]), (2, 1, 1))
+
+    def test_decision_fires_at_threshold(self):
+        from outcome import train_gate
+        with mock.patch.object(train_gate, "MIN_TRAIN", 2):
+            self.assertFalse(train_gate.decision()["fire"])
+            store.append("outcomes", _outcome("o.1", "train"))
+            store.append("outcomes", _outcome("o.2", "train"))
+            d = train_gate.decision()
+            self.assertTrue(d["fire"])
+            self.assertEqual(d["counts"]["train"], 2)
+
+
+class OutcomeSftTests(OutcomeCase):
+    def test_outcome_examples_are_train_split_valid_only(self):
+        import build_sft
+        from outcome import train_gate
+        store.append("outcomes", _outcome("o.t", "train"))
+        store.append("outcomes", _outcome("o.hold", "holdout"))
+        store.append("outcomes", _outcome("o.bad", "train", labels={"steps": 9}))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
+            train, valid, bands, n = build_sft.outcome_examples()
+        self.assertEqual(n, 1)                                                       # holdout + invalid excluded
+        self.assertTrue(all("messages" in e and len(e["messages"]) == 3 for e in train + valid))
+
+    def test_under_routing_is_upweighted(self):
+        import build_sft
+        from outcome import train_gate
+        matched, under = _nonvalid_id("om"), _nonvalid_id("ou")
+        store.append("outcomes", _outcome(matched, "train", s1_band="R2", outcome_band="R2"))   # no under-routing
+        store.append("outcomes", _outcome(under, "train", s1_band="R0", outcome_band="R2"))     # S1 under-routed
+        band = build_sft.band_of(_olabels())
+        reps = build_sft.REPS.get(band, 1)
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
+            train = build_sft.outcome_examples()[0]
+        self.assertEqual(len(train), reps * (1 + build_sft.UPWEIGHT_HIGH))
+
+    def test_outcomes_are_withheld_from_training_below_the_fire_threshold(self):
+        import build_sft
+        from outcome import train_gate
+        for i in range(3):
+            store.append("outcomes", _outcome(_nonvalid_id(f"ot{i}"), "train"))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 100):                        # 3 < 100: not training data yet
+            train, valid, _bands, n = build_sft.outcome_examples()
+            self.assertEqual((train, valid, n), ([], [], 0))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 3):                          # threshold met: included
+            self.assertEqual(build_sft.outcome_examples()[3], 3)
+
+
+class OutcomeEvalTests(OutcomeCase):
+    def test_outcome_holdout_keeps_banded_truth_and_drops_above(self):
+        import evaluate
+        store.append("outcomes", _outcome("e.h1", "holdout", outcome_band="R2"))
+        store.append("outcomes", _outcome("e.above", "holdout", outcome_band="above"))
+        store.append("outcomes", _outcome("e.train", "train", outcome_band="R1"))
+        rows = evaluate.outcome_holdout()
+        self.assertEqual([(r["id"], truth) for r, truth in rows], [("e.h1", "R2")])
+
+    def test_grade_outcome_counts_under_and_over(self):
+        import evaluate
+        rows = [({"id": "1", "request": "a", "unit_kind": "interactive"}, "R2"),
+                ({"id": "2", "request": "b", "unit_kind": "interactive"}, "R1")]
+        preds = {"a": "R0", "b": "R3"}                       # a under-routes (R0<R2); b over-routes (R3>R1)
+        with mock.patch.object(evaluate, "band_of", lambda ans: preds[ans["r"]]):
+            g = evaluate.grade_outcome(lambda r: {"answers": {"r": r["request"]}}, rows)
+        self.assertEqual((g["n"], g["under_routed"], g["over_routed"], g["band_accuracy"]), (2, 0.5, 0.5, 0.0))
+
+    def test_promote_decision_blocks_any_outcome_regression_and_requires_a_bar(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        perfect = {"n": 20, "band_hits": 20, "under": 0}       # incumbent on the outcome holdout
+        self.assertEqual(evaluate.promote_decision(c, bar, perfect, {"n": 20, "band_hits": 19, "under": 0}, True)[0], False)  # over-routes one → BLOCKED
+        self.assertEqual(evaluate.promote_decision(c, bar, perfect, {"n": 20, "band_hits": 19, "under": 1}, True)[0], False)  # under-routes one → BLOCKED
+        self.assertEqual(evaluate.promote_decision(c, bar, None, {"n": 20, "band_hits": 20, "under": 0}, True), (False, False))  # no outcome bar → blocked
+        self.assertEqual(evaluate.promote_decision(c, bar, {"n": 20, "band_hits": 18, "under": 2}, {"n": 20, "band_hits": 20, "under": 0}, True), (True, True))  # candidate better/equal → promotes
+        # a bar WITHOUT raw counts (legacy cache) is never trusted on rounded ratios → blocked
+        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 1.0, "under_routed": 0.0},
+                                                   {"n": 20, "band_hits": 20, "under": 0}, True)[0], False)
+
+    def test_promote_decision_uses_raw_outcome_counts_not_rounded(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        # 2001-task outcome holdout: incumbent perfect, candidate gets ONE more wrong → identical rounded ratios, but the
+        # raw counts catch the regression → BLOCKED (Codex review 2026-10-25).
+        obar = {"n": 2001, "band_hits": 2001, "under": 0, "band_accuracy": 1.0, "under_routed": 0.0}
+        co = {"n": 2001, "band_hits": 2000, "under": 1, "band_accuracy": 1.0, "under_routed": 0.0}
+        self.assertEqual(evaluate.promote_decision(c, bar, obar, co, True)[0], False)
+        self.assertEqual(evaluate.promote_decision(c, bar, obar, dict(obar), True), (True, True))   # identical → promotes
+
+    def test_promote_decision_unaffected_without_outcomes_and_never_promotes_without_a_bar(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        self.assertEqual(evaluate.promote_decision(c, bar, None, None, False), (True, False))   # no outcomes: teacher bar alone
+        self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
 
 
 if __name__ == "__main__":
