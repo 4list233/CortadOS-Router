@@ -155,3 +155,44 @@ class SelectorPropagatesAccountTests(unittest.TestCase):
         r = self._select()
         self.assertEqual(r.get("provider"), "claude-cli")        # base = account A
         self.assertEqual(r.get("account"), "a")
+
+
+class ExpandAndVisionTests(unittest.TestCase):
+    """Pass-2 findings 1 & 3: static/fallback candidates are account-expanded with config_dir, and the vision filter
+    keeps sibling accounts."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.home = tempfile.mkdtemp()
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=self.home, CORTADOS_SCARCITY_REFRESH="off")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_expand_binds_config_dir_on_static_candidates(self):
+        expanded = core._expand_claude_accounts([{"lane": "claude", "provider": "claude-cli", "model": "claude-x"},
+                                                 {"lane": "codex", "provider": "openai-codex", "model": "gpt-x"}])
+        claude = [c for c in expanded if core._base_lane(c["lane"]) == "claude"]
+        self.assertEqual({c["account"] for c in claude}, {"a", "b"})
+        self.assertTrue(all(c["config_dir"].endswith((".claude-acctA", ".claude-acctB")) for c in claude))
+        self.assertEqual([c for c in expanded if c["lane"] == "codex"][0].get("account"), None)   # non-claude untouched
+
+    def test_vision_keeps_a_sibling_account(self):
+        core.model_scores = lambda: MS2
+        core.lane_health = lambda: {"claude": SPENT, "claude#b": OK}         # base account A spent, sibling B available
+        fit = {"known": True, "assembled": True, "input_tokens": 10, "input_bytes": 40, "source": "test"}
+        r = execution_routing.select(core, prompt="describe this image", platform="cli", face="provider",
+                                     entrypoint="provider", input_fit=fit,
+                                     constraints={"allowed_routes": list(routing.served_routes(core)),
+                                                  "required_capabilities": ["vision"]},
+                                     credential_resolver=lambda *, requested, target_model: None)
+        self.assertNotIn("error", r)                                         # not a no-route
+        self.assertEqual(core._base_provider(r["provider"]), "claude-cli")   # a Claude account served it
+        self.assertEqual(r["account"], "b")                                  # the sibling, since A is spent

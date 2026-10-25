@@ -106,12 +106,12 @@ def _base_provider(p: str) -> str:
     return (p or "").split("#", 1)[0]
 
 
-def _claude_session(reg: "Registry", *, account: str | None = None, **kw) -> BridgeSession:
+def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> BridgeSession:
     return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin,
-                         config_dir=reg.claude_config_dir(account), **kw)
+                         config_dir=config_dir, **kw)
 
 
-def _codex_session(reg: "Registry", *, account: str | None = None, **kw) -> CodexSession:
+def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> CodexSession:
     return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, **kw)   # Codex multi-account is Phase B
 
 
@@ -157,8 +157,12 @@ class Registry:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
         kw = {"system": turn.system, "tools": turn.tools, "model": route["model"] if route else self.model}
-        if route and route.get("account"):          # only a multi-account route carries one; omit it so plain factories need no account kwarg
-            kw["account"] = route["account"]
+        if route and route.get("account"):          # a multi-account route carries its account + the config_dir resolved AT selection
+            cfg = route.get("config_dir")
+            if not cfg:                             # a named account that cannot be resolved must refuse, never fall back to the default login
+                raise UnservedProvider(f"routed to account {route['account']!r} on {route['provider']!r}, "
+                                       f"which has no resolvable login (config_dir missing)")
+            kw["account"], kw["config_dir"] = route["account"], cfg
         s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
         if keep:

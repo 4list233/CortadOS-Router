@@ -305,16 +305,10 @@ def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> lis
         for r in m["reach"]:
             if r["provider"] not in KNOWN_PROVIDERS:
                 continue
-            base = {"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
-                    "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})}
-            # One candidate per configured vendor account (Option A, lane-per-account). Claude today; other vendors are
-            # single-account until configured. Each account is its own lane/pool, so the cost formula routes between them.
-            if r["lane"] == "claude":
-                for a in _vendor_accounts("claude", "claude", r["provider"]):
-                    out.append({**base, "lane": a["lane"], "provider": a["provider"], "account": a["account"], "reserve": a["reserve"]})
-            else:
-                out.append(base)
-    return out or None
+            out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
+                        "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
+    # One candidate per configured Claude account (Option A, lane-per-account); single default login leaves this unchanged.
+    return _expand_claude_accounts(out) or None
 
 
 NATIVE_LANE = (("claude", "claude"), ("gpt-oss", None), ("gpt", "codex"), ("o1", "codex"), ("o3", "codex"), ("o4", "codex"), ("gemini", "antigravity"))
@@ -358,6 +352,37 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
     return out
 
 
+def _base_provider(provider: str) -> str:
+    """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
+    return (provider or "").split("#", 1)[0]
+
+
+def _native_account_lanes(native_lane: str) -> list[str]:
+    """The configured account lanes for a native vendor (claude, claude#b, …); [native_lane] for a single-account
+    vendor. Driven by accounts.json, NOT the scarcity cache, so an unsampled new account counts and a removed one does not."""
+    if native_lane == "claude":
+        return [a["lane"] for a in _vendor_accounts("claude", "claude", "claude-cli")]
+    return [native_lane]
+
+
+def _expand_claude_accounts(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace each Claude candidate with one per configured account (Option A), binding account id, reserve flag and
+    config_dir. Applied to BOTH scored and static/fallback candidate lists so account identity is never lost. A single
+    default login (no accounts.json) leaves candidates effectively unchanged (account/config_dir None)."""
+    accts = _vendor_accounts("claude", "claude", "claude-cli")
+    out = []
+    for c in cands:
+        if c.get("account") is not None:                       # already expanded
+            out.append(c)
+        elif c.get("lane") == "claude" and _base_provider(c.get("provider", "")) == "claude-cli":
+            for a in accts:
+                out.append({**c, "lane": a["lane"], "provider": a["provider"], "account": a["account"],
+                            "reserve": a["reserve"], "config_dir": a["config_dir"]})
+        else:
+            out.append(c)
+    return out
+
+
 def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
     """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json; None if unknown."""
     try:
@@ -386,8 +411,10 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
         # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
         tpp = uc.get("tokens_per_pct")
-        gen = [w for w in (lane.get("windows") or []) if w.get("pool", "all") == "all"] or (lane.get("windows") or [])
-        headroom = min((w.get("headroom_pct") for w in gen if w.get("headroom_pct") is not None), default=None)
+        # the model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g. Fable),
+        # so use the min headroom across both, not general alone.
+        relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
+        headroom = min((w.get("headroom_pct") for w in relevant if w.get("headroom_pct") is not None), default=None)
         return float(tpp) * float(headroom) if tpp and headroom is not None else None
     except Exception:
         return None
@@ -501,13 +528,15 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     demote, expiring = float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
     scored = scored_candidates(t, band, ans.get("work_kind"))
-    cands = scored if scored else list(t["candidates"].get(band, []))
+    # The static band list carries no account metadata; expand it too, so a missing/unreadable score catalog still binds
+    # the routed Claude account (identity is never lost on the fallback path).
+    cands = scored if scored else _expand_claude_accounts([dict(c) for c in t["candidates"].get(band, [])])
     # Explicit degraded-service policy: do not spend Claude by default when
     # the scorer cannot classify a request. Retain quota and context-fit gates.
     fallback_routes = (t.get("fallback", {}).get("routes")
                        if not execution and (decision.get("degraded") or not decision.get("answers")) else None)
     if fallback_routes:
-        cands = [dict(c) for c in fallback_routes]
+        cands = _expand_claude_accounts([dict(c) for c in fallback_routes])
         scored = []
         pref = []
         rules.append("scorer unavailable → configured GPT Terra fallback")
@@ -623,9 +652,10 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
             if c["secondary"]:
                 # native-first holds while ANY configured native account still has this model's pool (not just the bare lane):
-                # with account A spent but B available, a Cursor Claude route must still wait for B.
-                nat_lanes = [l for l in health if _base_lane(l) == native]
-                nat_ok = any(candidate_health({"lane": l, "model": c.get("family") or c["model"]}, health).get("ok", False) for l in nat_lanes)
+                # with account A spent but B available, a Cursor Claude route must still wait for B. Enumerate CONFIGURED
+                # accounts (not the scarcity cache), so a new unsampled account counts and a removed one does not.
+                nat_ok = any(candidate_health({"lane": l, "model": c.get("family") or c["model"]}, health).get("ok", False)
+                             for l in _native_account_lanes(native))
                 if nat_ok:
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
         # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling account

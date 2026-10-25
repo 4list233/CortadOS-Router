@@ -115,7 +115,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     if 'vision' in capabilities:
         allowed = {(p, m) for p, m in allowed if
                    (p in ('openai-codex', 'codex-cli') and m.startswith('gpt-')) or
-                   (p == 'claude-cli' and m.startswith('claude-')) or
+                   (p.split('#', 1)[0] == 'claude-cli' and m.startswith('claude-')) or    # base provider: keep sibling accounts (claude-cli#b)
                    (p == 'agy-cli' and m.startswith('gemini-'))}
     if (constraints or {}).get('kind') == 'review' and constraints.get('owner') == 'auxiliary.review':
         allowed = {(p, m) for p, m in allowed
@@ -163,7 +163,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         cap = core.lane_ceiling(choice['lane'], model)
         if provider == 'codex-cli':
             cap = int(core._context_cfg().get('provider_ceiling_tokens', {}).get(provider, 200000))
-        return {'router': ROUTER, 'provider': provider, 'model': model, 'account': choice.get('account'), 'context_length': cap,
+        return {'router': ROUTER, 'provider': provider, 'model': model, 'account': choice.get('account'),
+                'config_dir': choice.get('config_dir'), 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
                 'band': route['band'], 'projection': projection,
                 'decision': decision, 'route': route}

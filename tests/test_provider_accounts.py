@@ -87,3 +87,15 @@ class ConfigDirResolverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefuseUnresolvedAccountTests(unittest.TestCase):
+    """Codex review pass 2 finding 2: a named account that cannot be resolved to a login must refuse, never silently
+    run on the default login."""
+    def test_named_account_without_config_dir_is_refused(self):
+        from cortados_router.provider.server import UnservedProvider
+        reg = Registry(gateway_url="http://x", token="t")
+        turn = SimpleNamespace(system="", tools=[])
+        route = {"provider": "claude-cli#b", "account": "b", "model": "m", "config_dir": None}
+        with self.assertRaises(UnservedProvider):
+            reg.new(turn, keep=False, route=route)
