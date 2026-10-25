@@ -577,6 +577,18 @@ class QuotaTests(OutcomeCase):
             d5 = quota._derive_fable_pool("claude", "fable", [wk])
         self.assertEqual((d5["used_pct"], d5["projected_pct_at_reset"]), (30.0, 30.0))  # Forest's 50/50: util == weekly
 
+    def test_legacy_reservation_keys_still_count_after_the_key_change(self):
+        # An admission persisted under the pre-upgrade lane|window|pool scheme (derived Fable, measured Fable, and a
+        # general window) must still count against the current pool-/window-based keys (Codex review 2026-10-25).
+        now = self._fresh_now()
+        store.append("admissions", {"ts": now, "lane": "claude", "model": "claude-fable-5-1",
+                                    "windows": ["claude|week (fable, derived ×2.00 from weekly)|fable",
+                                                "claude|week (all models)|all"]})
+        r = quota._reserved([{"key": "claude|pool|fable", "observed_at": now},
+                             {"key": "claude|win|week (all models)", "observed_at": now}])
+        self.assertEqual(r.get("claude|pool|fable"), 1)
+        self.assertEqual(r.get("claude|win|week (all models)"), 1)
+
     def test_fable_reservations_are_scaled_to_its_half_sized_cap(self):
         # Derived Fable at 80% used (2× a 40% weekly), cap_scale 2: each reservation is 2% of the Fable cap, so at 80%
         # the 8th admitted call passes 95% and is rejected — reservations are scaled, not just sampled usage (Codex review).

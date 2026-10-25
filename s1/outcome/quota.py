@@ -210,6 +210,19 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
     return True, ", ".join(notes)
 
 
+def _canonical_key(key: str) -> str:
+    """Map an admission key to the current identity. Rows persisted before the key change use lane|window|pool; the
+    current scheme is lane|pool|<pool> for pooled windows and lane|win|<window> for general ones. Normalising on read
+    means reservations outstanding across an upgrade still count (Codex review 2026-10-25)."""
+    parts = key.split("|")
+    if len(parts) == 3 and parts[1] in ("pool", "win"):
+        return key                                   # already the current scheme
+    if len(parts) >= 3:                               # legacy lane|window(…)|pool (a window name may itself contain '|')
+        lane, pool, window = parts[0], parts[-1], "|".join(parts[1:-1])
+        return f"{lane}|pool|{pool}" if pool != "all" else f"{lane}|win|{window}"
+    return key
+
+
 def _reserved(windows: list[dict]) -> dict:
     """Calls that may not show in a window's reading yet: every admission from IN_FLIGHT_S before that reading's
     sample on. Work admitted earlier is assumed visible; counting a visible call twice only stops the loop sooner."""
@@ -217,8 +230,9 @@ def _reserved(windows: list[dict]) -> dict:
     counts: dict = {}
     for row in store.read("admissions"):
         for k in row.get("windows", []):
-            if k in since and row.get("ts", 0) >= since[k]:
-                counts[k] = counts.get(k, 0) + 1
+            ck = _canonical_key(k)                    # legacy keys normalise to the current identity so they still count
+            if ck in since and row.get("ts", 0) >= since[ck]:
+                counts[ck] = counts.get(ck, 0) + 1
     return counts
 
 
