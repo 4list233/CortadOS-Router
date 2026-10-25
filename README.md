@@ -10,7 +10,7 @@ It works in three steps:
 
 ## Two ways to use it
 
-**As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it and every turn is scored and routed; the chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. One model id, routed per conversation. See `docs/PROVIDER-PLAN.md`.
+**As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. See `docs/PROVIDER-PLAN.md`.
 
 **As a decision library/CLI.** Call `core.decide` to get a routing decision for a request without running anything, for shadow logging or for a host that dispatches calls itself.
 
@@ -146,11 +146,14 @@ CORTADOS_S1_BIND=<private-ip> CORTADOS_S1_TOKEN=<token> python3 -B s1/serve.py
 **Run the provider** (on the machine hosting the CLIs):
 
 ```bash
-CORTADOS_PROVIDER_TOKEN=<token> CORTADOS_S1_TOKEN=<s1-token> \
+CORTADOS_PROVIDER_TOKEN=<token> \
+CORTADOS_S1_URL=http://<scorer-ip>:8431 CORTADOS_S1_TOKEN=<s1-token> \
   python3 -B -m cortados_router.provider.server \
     --host <private-ip> --port 8432 \
     --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
+
+`CORTADOS_S1_URL` names the scorer; without it (and without a configured endpoints file that selects a remote device) the provider looks for S1 on loopback and routes degraded. On one machine, drop both `CORTADOS_S1_*` and S1 is found on loopback.
 
 **Point a client at it:**
 
