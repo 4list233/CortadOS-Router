@@ -8,6 +8,7 @@ import json
 import random
 import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 
 from common import DATA, core, read_jsonl, read_labels, valid_answers
 from student import messages
@@ -72,10 +73,21 @@ def _provenance_path():
 
 
 def _write_provenance(n: int) -> None:
-    """Record how many outcomes THIS build included. nightly.sh copies this file into a run dir when that run actually
+    """Record how many outcomes THIS build included. nightly.sh publishes it into a run dir when that run actually
     trains, so evaluate can read the candidate's own training provenance rather than a later rebuild (Codex review)."""
     import time
     _provenance_path().write_text(json.dumps({"outcomes_included": n, "when": time.strftime("%Y-%m-%d %H:%M")}))
+
+
+def publish_provenance(run_dir) -> None:
+    """Atomically bind a run to the outcomes it trained on: copy the build's sft-provenance.json into the run dir.
+    nightly.sh calls this ONLY when a segment actually trains and aborts the run if it raises, so a failed or missing
+    publish can never leave a stale teacher-only provenance that would exempt an outcome-trained checkpoint from review
+    (Codex review 2026-10-25). Raises FileNotFoundError when the build wrote no provenance (build_sft always writes one)."""
+    data = _provenance_path().read_text()
+    tmp = Path(run_dir) / "outcome-provenance.json.tmp"
+    tmp.write_text(data)
+    tmp.replace(Path(run_dir) / "outcome-provenance.json")
 
 
 def main() -> int:

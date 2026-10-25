@@ -929,6 +929,17 @@ class OutcomeSftTests(OutcomeCase):
             train = build_sft.outcome_examples()[0]
         self.assertEqual(len(train), reps * (1 + build_sft.UPWEIGHT_HIGH))
 
+    def test_publish_provenance_is_atomic_and_aborts_without_a_source(self):
+        import build_sft
+        run = Path(self.home) / "pubrun"
+        run.mkdir()
+        with self.assertRaises(FileNotFoundError):            # no build provenance → abort, run file not written
+            build_sft.publish_provenance(run)
+        self.assertFalse((run / "outcome-provenance.json").exists())
+        (Path(self.home) / "sft-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
+        build_sft.publish_provenance(run)                     # source present → published verbatim
+        self.assertEqual(json.loads((run / "outcome-provenance.json").read_text())["outcomes_included"], 150)
+
     def test_outcomes_are_withheld_from_training_below_the_fire_threshold(self):
         import build_sft
         from outcome import train_gate

@@ -158,16 +158,15 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
-  # Bind this checkpoint to the dataset it is training on, ONLY when a segment actually trains (we are past the no-op
-  # break above). evaluate reads $RUN/outcome-provenance.json for hold-first. The source is resolved through the
-  # canonical store.home() (its default included), not an env var, so a default outcome home cannot skip the copy and
-  # silently bypass hold-first (Codex review 2026-10-25). Best-effort: if it cannot be written, evaluate sees no run
-  # provenance and HOLDS the candidate for review rather than auto-promoting, so a missing copy fails safe either way.
-  SFT_PROV=$(python3 -c "from outcome import store; print(store.home()/'sft-provenance.json')" 2>/dev/null)
-  if [ -n "$SFT_PROV" ] && [ -f "$SFT_PROV" ]; then cp "$SFT_PROV" "$RUN/outcome-provenance.json"
-  else echo "warning: no SFT provenance ($SFT_PROV); evaluate will hold this candidate (missing run provenance)"; fi
+  # On a SUCCESSFUL training segment (and only then), atomically bind this checkpoint to the outcomes it trained on, via
+  # store.home()'s sft-provenance.json. evaluate reads $RUN/outcome-provenance.json for hold-first; publishing only on
+  # success and preserving it across no-op resumes means a completed teacher-only checkpoint keeps its own provenance.
+  # A missing source or failed publish ABORTS the run (exit 1) rather than leave a stale provenance that could exempt an
+  # outcome-trained checkpoint from review (Codex review 2026-10-25). Kept on this line so the resume-planning test, which
+  # extracts the loop up to here, does not run it.
   HF_HUB_OFFLINE=1 $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
-    --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
+    --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume \
+    && { python3 -c "import sys, build_sft; build_sft.publish_provenance(sys.argv[1])" "$RUN" || { echo "provenance publish failed; aborting before evaluation"; exit 1; }; break; }
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
   attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1
   sleep 60
