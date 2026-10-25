@@ -67,11 +67,6 @@ def _remember(lane: str, general: set, pools: set) -> tuple[list, list]:
     return merged_g, merged_p
 
 
-def _panel_unavailable(raw: dict) -> bool:
-    note = raw.get("per_model")
-    return isinstance(note, str) and ("not shown" in note or "unavailable" in note)
-
-
 def _windows(sc, lane: str, model: str | None):
     """(applicable windows, None) or (None, why). Refuses unless the full expected inventory for the call is present:
     every general window ever seen, and (for a model call) its own pool — observed this reading, not carried forward."""
@@ -93,11 +88,12 @@ def _windows(sc, lane: str, model: str | None):
     if missing:
         return None, f"{lane} general window(s) {missing} missing from the current reading"
     if model:
-        # The per-model panel not loading means this model's own limit is unknown; never spend blind on a general
-        # window instead (Codex review 2026-10-24: first start and rate-limited panel both admitted blind).
-        if _panel_unavailable(raw):
-            return None, f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s own limit is unknown"
-        owner = sc.pool_for(lane, model, known_pools) if known_pools else None
+        # A model with its own separately-metered pool (pool_for knows which, e.g. Claude Fable) is refused when that
+        # pool is absent from the current reading — including when the per-model panel is rate-limited, since its cap is
+        # then unreadable. A model that rides only the shared 'all' windows is unaffected: those windows ARE its cap and
+        # they are visible. (Corrects the review-5 blanket per-model-panel refusal that stalled haiku/sonnet/opus runs
+        # although their real caps were in hand — Forest 2026-10-25: Fable is the pooled one, the run models are not.)
+        owner = sc.pool_for(lane, model or "", sorted(known_pools))
         if owner and owner not in pools_now:
             carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
             return None, (f"{lane} pool {owner} for {model} is "

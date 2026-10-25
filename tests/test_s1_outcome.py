@@ -412,7 +412,7 @@ class FakeScarcity:
         return {"claude": self.view}
 
     def pool_for(self, lane, model, pools):
-        return "fable" if "fable" in model and "fable" in pools else None
+        return "fable" if "fable" in (model or "") else None    # matches the real pool_for: Fable is pooled even when unobserved
 
 
 class QuotaTests(OutcomeCase):
@@ -532,13 +532,16 @@ class QuotaTests(OutcomeCase):
         self.assertIn("carried-forward", why)
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
-    def test_an_unavailable_per_model_panel_refuses_any_model_call_from_a_fresh_home(self):
-        # Fresh data home, no pool ever seen, but the lane reports its per-model panel did not load.
+    def test_a_pooled_model_is_held_when_its_pool_is_unreadable_but_a_shared_window_model_runs(self):
+        # Fresh home, per-model panel rate-limited so no pool is observed. Fable has its own pool (pool_for knows it),
+        # so it is refused — its cap is unreadable. The run models ride only the visible shared window and are admitted
+        # (Forest 2026-10-25: corrects the blanket panel refusal that stalled haiku/sonnet/opus runs).
         sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
                           per_model="not shown this read (vendor rate limit on the per-model panel)")
         ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
-        self.assertIn("per-model panel unavailable", why)
+        self.assertIn("missing", why)
+        self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
     def test_a_missing_general_window_refuses_even_a_poolless_model(self):
         both = [self._w(used=10, hours=100, window="week"), self._w(used=10, hours=4, window="5-hour", window_s=5 * 3600)]
@@ -867,6 +870,25 @@ class OutcomeEvalTests(OutcomeCase):
         with mock.patch.object(evaluate, "band_of", lambda ans: preds[ans["r"]]):
             g = evaluate.grade_outcome(lambda r: {"answers": {"r": r["request"]}}, rows)
         self.assertEqual((g["n"], g["under_routed"], g["over_routed"], g["band_accuracy"]), (2, 0.5, 0.5, 0.0))
+
+    def test_promote_decision_requires_a_valid_outcome_bar_when_holdouts_exist(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        under = {"n": 20, "under_routed": 0.5}                 # candidate under-routes the outcomes badly
+        # outcome bar present + worse outcome under-routing → blocked
+        self.assertEqual(evaluate.promote_decision(c, bar, {"under_routed": 0.0}, under, True)[0], False)
+        # outcome holdouts exist but NO outcome bar (cache miss / grading failure) → blocked, not defaulted to OK
+        self.assertEqual(evaluate.promote_decision(c, bar, None, under, True), (False, False))
+        # outcome bar present and no regression → promotes, and records that the check ran
+        self.assertEqual(evaluate.promote_decision(c, bar, {"under_routed": 0.5}, {"n": 20, "under_routed": 0.5}, True), (True, True))
+
+    def test_promote_decision_unaffected_without_outcomes_and_never_promotes_without_a_bar(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        self.assertEqual(evaluate.promote_decision(c, bar, None, None, False), (True, False))   # no outcomes: teacher bar alone
+        self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
 
 
 if __name__ == "__main__":
