@@ -82,8 +82,14 @@ Not yet in P1, each needing a decision or another phase:
   served). Local models need the 2026-09-28 ruling ("local models are OUT of routing",
   `tables/benchmarks/build_tiers.py`) lifted, local entries in the model scores, and the local-resources work on
   `main` (uncommitted) merged.
-- **S1 location.** The endpoint scores through `CORTADOS_S1_URL` (default `127.0.0.1:8431`). When the endpoint does
-  not run next to S1 (the Studio), point it there, or every conversation routes degraded.
+- **S1 location.** The endpoint scores through `cortados_router.s1_endpoint.resolve_url()`: `CORTADOS_S1_URL` wins if
+  set, else a named device from the endpoints file (`CORTADOS_S1_ENDPOINT=<name>`, or its `default`), else loopback
+  `127.0.0.1:8431`. The file is `CORTADOS_S1_ENDPOINTS` or `tables/s1-endpoints.json` (git-ignored; copy
+  `tables/s1-endpoints.example.json`), mapping device names to URLs so no address is in code. S1 itself listens on
+  `127.0.0.1` unless `CORTADOS_S1_BIND` widens it (e.g. the Studio's tailnet IP); on a host that does not run S1 next
+  to it, select the serving device or every conversation routes degraded. A widened bind is guarded: body size and
+  backlog are capped, a job whose client already timed out is dropped unscored, and `CORTADOS_S1_TOKEN` (when set)
+  requires a bearer token. The tailnet (Tailscale ACLs) is the access boundary; the token is the belt-and-braces.
 - **Live usage probes.** Routing reads live lane scarcity, which samples the vendor CLIs in a PTY every 20 minutes,
   exactly as under Hermes. Run verification on a throwaway `CORTADOS_HOME` with a fresh `scarcity.json`.
 - **Interactive floor for subagents.** Every provider conversation is scored as interactive (`platform: cli`), so the
