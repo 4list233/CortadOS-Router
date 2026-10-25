@@ -136,6 +136,16 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
             "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
 
 
+def run_outcomes_trained(out_dir) -> int:
+    """Outcomes that actually trained THIS candidate, from the run dir's own provenance (the trainer writes it when it
+    runs a segment and preserves it across no-op resumes), not the latest dataset build — so a completed teacher-only
+    checkpoint re-evaluated after the count crosses 150 is not mislabelled outcome-trained (Codex review 2026-10-25)."""
+    try:
+        return int(json.loads((Path(out_dir) / "outcome-provenance.json").read_text()).get("outcomes_included", 0))
+    except (OSError, ValueError):
+        return 0
+
+
 def hold_first_active(fire: bool, armed: bool) -> bool:
     """Whether to hold a candidate for review. Keyed on outcomes actually being INCLUDED in training (the fire
     threshold), not merely existing: below it build_sft adds no outcomes, so a teacher-only candidate must not be
@@ -290,15 +300,16 @@ def main() -> int:
     # Hold-first (Forest 2026-10-25): the first candidate trained once outcome data is in the mix is held for review,
     # however it grades; after Forest arms it (`python3 -B -m outcome.train_gate --arm`), outcome-trained candidates
     # auto-promote on no-regression as before. Only active once the loop has produced train-split outcomes.
-    import build_sft
     from outcome import train_gate
-    # Provenance of THIS candidate (what build_sft actually included), not a live recount: closes the 149→150 race
-    # where the live count could cross the threshold between dataset construction and evaluation (Codex review 2026-10-25).
-    if hold_first_active(build_sft.outcomes_trained() > 0, train_gate.armed()):
+    # THIS candidate's own training provenance from its run dir (written by the trainer when it actually trained,
+    # preserved across no-op resumes), not the latest dataset build — closes the completed-checkpoint resume race where
+    # a teacher-only checkpoint re-evaluated after the count crosses 150 was mislabelled outcome-trained (Codex review).
+    report["outcomes_trained"] = run_outcomes_trained(out)
+    if hold_first_active(report["outcomes_trained"] > 0, train_gate.armed()):
         report["promote_recommended"] = report["promote"]
         report["promote"] = False
         report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "
-                                 "`python3 -B -m outcome.train_gate --arm` to allow auto-promotion henceforth")
+                                 f"`python3 -B -m outcome.train_gate --arm --report {out / 'report.json'}`")
     (out / "report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
                                               "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))

@@ -856,32 +856,35 @@ class OutcomeTrainGateTests(OutcomeCase):
         (store.home() / train_gate.ARM_MARKER).write_text("x")
         self.assertTrue(train_gate.armed())
 
-    def test_arm_requires_a_build_that_actually_trained_on_outcomes(self):
-        import build_sft
+    def test_arm_requires_a_report_whose_candidate_trained_on_outcomes(self):
         from outcome import train_gate
-        store.append("outcomes", _outcome(_nonvalid_id("a"), "train"))
         with mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
             train_gate.main()
-        self.assertFalse(train_gate.armed())            # no build yet → no provenance → nothing to arm
-        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
-            build_sft.outcome_examples()                # a build that includes outcomes records provenance > 0
-        self.assertGreater(build_sft.outcomes_trained(), 0)
-        with mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
+        self.assertFalse(train_gate.armed())            # no report → nothing to arm against
+        teacher = Path(self.home) / "teacher-report.json"
+        teacher.write_text(json.dumps({"outcomes_trained": 0}))
+        with mock.patch.object(sys, "argv", ["train_gate", "--arm", "--report", str(teacher)]):
             train_gate.main()
-        self.assertTrue(train_gate.armed())
+        self.assertFalse(train_gate.armed())            # report's candidate trained on no outcomes → refused
+        real = Path(self.home) / "outcome-report.json"
+        real.write_text(json.dumps({"outcomes_trained": 7}))
+        with mock.patch.object(sys, "argv", ["train_gate", "--arm", "--report", str(real)]):
+            train_gate.main()
+        self.assertTrue(train_gate.armed())             # a reviewed outcome-trained report → armed
 
-    def test_hold_first_uses_build_provenance_not_the_live_count(self):
-        import build_sft
+    def test_hold_first_uses_run_provenance_and_survives_a_no_op_resume(self):
         import evaluate
-        from outcome import train_gate
-        store.append("outcomes", _outcome(_nonvalid_id("r"), "train"))
-        with mock.patch.object(train_gate, "MIN_TRAIN", 100):   # build at 1 outcome, threshold 100: none included
-            build_sft.outcome_examples()
-        self.assertEqual(build_sft.outcomes_trained(), 0)
-        with mock.patch.object(train_gate, "MIN_TRAIN", 1):     # live count now "crosses" the threshold …
-            self.assertTrue(train_gate.decision()["fire"])
-        # … but THIS candidate trained on no outcomes, so it is NOT held/arm-eligible (no false first-outcome label)
-        self.assertFalse(evaluate.hold_first_active(build_sft.outcomes_trained() > 0, train_gate.armed()))
+        run = Path(self.home) / "run"
+        run.mkdir()
+        (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 0}))   # teacher-only checkpoint
+        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
+        # the global build later rebuilds at 150, but a no-op resume writes nothing into the run dir
+        (Path(self.home) / "sft-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
+        self.assertEqual(evaluate.run_outcomes_trained(run), 0)                               # run untouched
+        self.assertFalse(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
+        # a run that actually trained on outcomes is held for review
+        (run / "outcome-provenance.json").write_text(json.dumps({"outcomes_included": 150}))
+        self.assertTrue(evaluate.hold_first_active(evaluate.run_outcomes_trained(run) > 0, False))
 
 
 class OutcomeSftTests(OutcomeCase):

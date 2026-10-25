@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 import common
 from outcome import store
@@ -52,18 +53,25 @@ def decision() -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", action="store_true", help="allow outcome-trained candidates to auto-promote from here on")
+    ap.add_argument("--report", help="with --arm: the reviewed run's report.json; arming requires it trained on outcomes")
     ap.add_argument("--disarm", action="store_true", help="require review of the next outcome-trained candidate again")
     a = ap.parse_args()
     marker = store.home() / ARM_MARKER
     if a.arm:
-        import build_sft
-        # Arm only when the latest SFT build actually trained on outcomes (its provenance), so --arm always references a
-        # reviewed outcome-trained candidate, never a teacher-only one from before the threshold (Codex review 2026-10-25).
-        if build_sft.outcomes_trained() <= 0:
-            print(json.dumps({"armed": False, "refused": "no outcome-trained candidate yet: the latest SFT build included no outcomes"}))
+        # Arm only against a specific reviewed report whose candidate actually trained on outcomes (its own
+        # outcomes_trained provenance), never a teacher-only one — so --arm cannot be set on the wrong candidate before
+        # the real first outcome-trained one is reviewed (Codex review 2026-10-25).
+        trained = 0
+        if a.report:
+            try:
+                trained = int(json.loads(Path(a.report).read_text()).get("outcomes_trained", 0))
+            except (OSError, ValueError):
+                trained = 0
+        if trained <= 0:
+            print(json.dumps({"armed": False, "refused": "pass --report <run>/report.json of a reviewed candidate that trained on outcomes (outcomes_trained > 0)"}))
             return
-        marker.write_text("armed by Forest after reviewing the first outcome-trained candidate\n")
-        print(json.dumps({"armed": True, "marker": str(marker)}))
+        marker.write_text(f"armed after reviewing {a.report} (outcomes_trained={trained})\n")
+        print(json.dumps({"armed": True, "marker": str(marker), "report": a.report}))
         return
     if a.disarm:
         marker.unlink(missing_ok=True)

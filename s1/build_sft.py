@@ -72,18 +72,10 @@ def _provenance_path():
 
 
 def _write_provenance(n: int) -> None:
-    """Record how many outcomes THIS build included, so hold-first and --arm reflect what actually trained the
-    candidate rather than a later live recount across the 149→150 boundary (Codex review 2026-10-25)."""
+    """Record how many outcomes THIS build included. nightly.sh copies this file into a run dir when that run actually
+    trains, so evaluate can read the candidate's own training provenance rather than a later rebuild (Codex review)."""
     import time
     _provenance_path().write_text(json.dumps({"outcomes_included": n, "when": time.strftime("%Y-%m-%d %H:%M")}))
-
-
-def outcomes_trained() -> int:
-    """Outcomes included in the current SFT build (0 if none / no build yet) — the candidate's fixed training provenance."""
-    try:
-        return int(json.loads(_provenance_path().read_text()).get("outcomes_included", 0))
-    except (OSError, ValueError):
-        return 0
 
 
 def main() -> int:

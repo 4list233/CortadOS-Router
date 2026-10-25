@@ -158,6 +158,10 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
+  # Bind this checkpoint to the dataset it is training on, ONLY when a segment actually trains (we are past the no-op
+  # break above). evaluate reads $RUN/outcome-provenance.json for hold-first, so a completed teacher-only checkpoint
+  # re-evaluated after the outcome count later crosses the threshold is never mislabelled outcome-trained (Codex review).
+  [ -n "${CORTADOS_OUTCOME_HOME:-}" ] && [ -f "$CORTADOS_OUTCOME_HOME/sft-provenance.json" ] && cp "$CORTADOS_OUTCOME_HOME/sft-provenance.json" "$RUN/outcome-provenance.json"
   HF_HUB_OFFLINE=1 $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
     --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
