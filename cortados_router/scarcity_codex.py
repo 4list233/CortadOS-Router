@@ -16,7 +16,7 @@ import re
 import time
 from datetime import datetime, timedelta
 
-PINNED_VERSIONS = ("0.163.0",)                                     # screen layouts verified against a real capture
+PINNED_VERSIONS = ("0.163.0", "0.164.0")                           # screen layouts verified against a real capture
 VERSION = re.compile(r"OpenAI Codex \(v(\d+\.\d+\.\d+)\)")
 LABEL = re.compile(r"^(?:(GPT-\d+(?:\.\d+)*(?:-[A-Za-z][A-Za-z0-9]*)*) )?(5h|Weekly)$")
 LIMIT_LINE = re.compile(r"^[\s│|]*(?P<label>[^\[\]]*?) limit: \[[^\]]*\](?P<rest>.*)$")

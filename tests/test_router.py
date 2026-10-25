@@ -221,6 +221,13 @@ class UsageScreens(unittest.TestCase):
         w = self.sc.parse_codex_status(text, now=self.FROZEN)
         self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("week", "all", 0.0)])   # the session uuid above the limit line is not a pool
         self.assertIn("-10-27 12:01", w[0]["resets_at"]); self.assertTrue(143 < w[0]["resets_in_h"] < 145)   # "12:01 PM on 27 Oct" read as a date, not as under a day away
+
+    def test_codex_0_164(self):
+        text = (ROOT / "tests/fixtures/codex-status-0.164.0.txt").read_text()                     # real 0.164.0 screen, redacted
+        now = __import__("datetime").datetime(2026, 10, 25, 16, 30).timestamp()                   # the day of the 0.164.0 capture
+        w = self.sc.parse_codex_status(text, now=now)
+        self.assertEqual([(x["window"], x["pool"], x["used_pct"]) for x in w], [("week", "all", 0.0)])   # 100% left = 0% used
+        self.assertIn("-11-01 14:55", w[0]["resets_at"]); self.assertTrue(166 < w[0]["resets_in_h"] < 168)   # "2:55 PM on 1 Nov" within the week
     def test_codex_screen_is_never_guessed(self):
         head = ">_ OpenAI Codex (v0.163.0)\n"
         for screen, why in ((head + " 01a10000-0000-7000-8000-000000000000 Weekly limit: [█]\n100%\nleft", "unknown limit label"),
