@@ -72,5 +72,26 @@ class ExpiryTests(unittest.TestCase):
         self.assertFalse(serve._expired(None))   # the warmup job carries no deadline
 
 
+class ConnectionCapTests(unittest.TestCase):
+    """A capped number of live connections, so a slow-header flood cannot spawn unbounded handler threads. Tested on an
+    ephemeral port without real client sockets: the admit/release pair is the gate process_request uses."""
+
+    def test_admit_refuses_past_capacity_and_recovers_on_release(self):
+        srv = serve.BoundedServer(("127.0.0.1", 0), serve.H, max_conns=2)
+        try:
+            self.assertTrue(srv._admit_connection())
+            self.assertTrue(srv._admit_connection())
+            self.assertFalse(srv._admit_connection())   # at capacity
+            srv._release_connection()
+            self.assertTrue(srv._admit_connection())    # a freed slot admits again
+        finally:
+            srv.server_close()
+
+    def test_handler_arms_a_connection_timeout(self):
+        # socketserver applies H.timeout to the connection at setup, so a stalled request line/headers is dropped
+        self.assertEqual(serve.H.timeout, serve.REPLY_TIMEOUT_S)
+        self.assertGreater(serve.H.timeout, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

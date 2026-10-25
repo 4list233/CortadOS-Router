@@ -164,6 +164,43 @@ class H(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
 
+H.timeout = REPLY_TIMEOUT_S   # socketserver arms this on the connection at setup, before the request line/headers are read, so a stalled peer is dropped
+MAX_CONNS = int(os.environ.get("CORTADOS_S1_MAX_CONNS", str(max(2 * MAX_PENDING, 64))))  # cap live connections: a slow-header flood can't spawn unbounded threads
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer spawns a thread per connection with no cap, and BaseHTTPRequestHandler reads the request
+    line and headers before do_POST runs -- so a peer that withholds headers would stall a thread past every in-handler
+    guard. A per-connection semaphore caps concurrency (excess connections are closed, not threaded), and H.timeout
+    (set below) arms a socket timeout at setup so an incomplete request line or headers is dropped, not held."""
+    daemon_threads = True
+
+    def __init__(self, *a, max_conns: int, **k):
+        self._conns = threading.BoundedSemaphore(max_conns)
+        super().__init__(*a, **k)
+
+    def _admit_connection(self) -> bool:
+        return self._conns.acquire(blocking=False)
+
+    def _release_connection(self) -> None:
+        try:
+            self._conns.release()
+        except ValueError:
+            pass
+
+    def process_request(self, request, client_address):
+        if not self._admit_connection():                        # at capacity: close the socket now, spawn no handler
+            self.close_request(request)
+            return
+        super().process_request(request, client_address)       # admitted: the handler thread's shutdown_request releases
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._release_connection()
+
+
 if __name__ == "__main__":
     from cortados_router.s1_endpoint import bind_address
     host, port = bind_address()                                 # 127.0.0.1 unless CORTADOS_S1_BIND widens it
@@ -171,7 +208,7 @@ if __name__ == "__main__":
     _jobs.put(({"request": "warm up"}, queue.Queue(), None))     # load + first pass on the worker thread (no deadline)
     if host not in ("127.0.0.1", "localhost", "::1"):           # a non-loopback bind is a deliberate network exposure: say what guards it
         guard = "token required" if TOKEN else "no token set (rely on the tailnet as the access boundary, or set CORTADOS_S1_TOKEN)"
-        print(f"CortadOS Router S1 scorer EXPOSED on {host}:{port} ({guard}; body<={MAX_BODY_BYTES}B, backlog<={MAX_PENDING})", flush=True)
+        print(f"CortadOS Router S1 scorer EXPOSED on {host}:{port} ({guard}; body<={MAX_BODY_BYTES}B, backlog<={MAX_PENDING}, conns<={MAX_CONNS})", flush=True)
     else:
         print(f"CortadOS Router S1 scorer on {host}:{port}", flush=True)
-    ThreadingHTTPServer((host, port), H).serve_forever()
+    BoundedServer((host, port), H, max_conns=MAX_CONNS).serve_forever()
