@@ -63,7 +63,8 @@ def write_line(proc: subprocess.Popen, line: str, timeout: float, who: str) -> N
 class BridgeSession:
     def __init__(self, *, system: str, tools: list[dict[str, Any]], gateway_url: str, token: str,
                  claude_bin: str | list[str] = "claude", model: str | None = None, scratch_root: str | None = None,
-                 popen: Callable[..., subprocess.Popen] = subprocess.Popen):
+                 config_dir: str | None = None, popen: Callable[..., subprocess.Popen] = subprocess.Popen):
+        self.config_dir = config_dir            # CLAUDE_CONFIG_DIR of the routed account; None = the default login
         self.id = uuid.uuid4().hex
         self.lock = threading.Lock()                    # one client request at a time per conversation
         self.last_used = time.time()
@@ -95,6 +96,8 @@ class BridgeSession:
             if model:
                 args += ["--model", model]
             env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+            if config_dir:
+                env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
             env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

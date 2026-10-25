@@ -171,6 +171,7 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 | `CORTADOS_S1_ENDPOINT` | — | a device name in `tables/s1-endpoints.json` (`CORTADOS_S1_ENDPOINTS` relocates that file); else its `default`, else loopback `127.0.0.1:8431` |
 | `CORTADOS_S1_TOKEN` | unset | bearer sent by clients and required by a token-guarded scorer |
 | `CORTADOS_S1_BIND` | `127.0.0.1` | interface `s1/serve.py` listens on |
+| `tables/accounts.json` | absent | multiple accounts per vendor (git-ignored; copy `accounts.example.json`). Each Claude account is its own lane/pool metered from its own `CLAUDE_CONFIG_DIR`; routing steers to the account with unused expiring credit, and a `reserve` account is spared while another has room |
 | `CORTADOS_PROVIDER_TOKEN` | generated | the `cortados` endpoint's bearer token |
 | `CORTADOS_PROVIDER_CLAUDE_BIN` / `CORTADOS_PROVIDER_CODEX_BIN` | `claude` / `codex` | backend CLIs the provider drives |
 | `CORTADOS_PROVIDER_CODEX_HOME` | unset | a dedicated logged-in `CODEX_HOME` for the Codex backend |

@@ -303,9 +303,17 @@ def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> lis
         if not (t.get("selection") or {}).get("ceiling_by_score") and m["ceiling"] != (band == "R4"):   # G112 mode: ceiling only by escalation
             continue
         for r in m["reach"]:
-            if r["provider"] in KNOWN_PROVIDERS:
-                out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
-                            "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
+            if r["provider"] not in KNOWN_PROVIDERS:
+                continue
+            base = {"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
+                    "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})}
+            # One candidate per configured vendor account (Option A, lane-per-account). Claude today; other vendors are
+            # single-account until configured. Each account is its own lane/pool, so the cost formula routes between them.
+            if r["lane"] == "claude":
+                for a in _vendor_accounts("claude", "claude", r["provider"]):
+                    out.append({**base, "lane": a["lane"], "provider": a["provider"], "account": a["account"], "reserve": a["reserve"]})
+            else:
+                out.append(base)
     return out or None
 
 
@@ -323,6 +331,33 @@ def native_lane_for(model_or_family: str) -> str | None:
     return None
 
 
+def _base_lane(lane: str) -> str:
+    """The vendor lane a per-account lane belongs to: `claude#b` -> `claude`. A bare lane is its own base."""
+    return (lane or "").split("#", 1)[0]
+
+
+def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[dict[str, Any]]:
+    """One entry per configured account of a vendor: {lane, provider, account, reserve}. The first account keeps the
+    bare lane/provider; others get a `#<id>` suffix. No accounts.json (or one account) -> the single default login,
+    exactly today's behaviour. A `reserve` account is spared while a non-reserve sibling has room (see resolve)."""
+    try:
+        from cortados_router.paths import tables_dir
+        accts = json.loads((tables_dir() / "accounts.json").read_text()).get(vendor) or []
+        accts = [a for a in accts if isinstance(a, dict) and a.get("config_dir")]
+    except Exception:
+        accts = []
+    if not accts:
+        return [{"lane": base_lane, "provider": base_provider, "account": None, "reserve": False, "config_dir": None}]
+    out = []
+    for i, a in enumerate(accts):
+        aid = str(a.get("id") or i)
+        out.append({"lane": base_lane if i == 0 else f"{base_lane}#{aid}",
+                    "provider": base_provider if i == 0 else f"{base_provider}#{aid}",
+                    "account": aid, "reserve": bool(a.get("reserve")),
+                    "config_dir": os.path.expanduser(a["config_dir"])})
+    return out
+
+
 def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
     """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json; None if unknown."""
     try:
@@ -330,7 +365,7 @@ def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
+               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
         uc = (sc.unit_costs() or {}).get(key or "") or {}
         return float(uc["tokens_per_pct"]) if uc.get("tokens_per_pct") else None
     except Exception:
@@ -344,7 +379,7 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
+               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
         uc = (sc.unit_costs() or {}).get(key or "") or {}
         return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
     except Exception:
@@ -574,15 +609,22 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             if len(weak) < len(cands):
                 for c in weak:
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"below the face floor (general {c['general']} < {floor_g:g})"}
-        # primary-source rule: a Claude/GPT/Gemini route on another provider is secondary, usable only when the vendor's own pool is spent
+        # primary-source rule: a Claude/GPT/Gemini route on another VENDOR is secondary, usable only when the vendor's own pool is spent.
+        # Compare the base lane so a second same-vendor account (claude#b) is NOT treated as a cross-vendor secondary of claude.
         for c in cands:
             native = native_lane_for(c.get("family") or c["model"])
-            c["secondary"] = bool(native) and c["lane"] != native
+            c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
             if c["secondary"]:
                 nat = health.get(native) or {}
                 nat_pool = candidate_health({"lane": native, "model": c.get("family") or c["model"]}, health) if nat else {}
                 if nat and nat_pool.get("ok", True):
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
+        # reserve accounts (accounts.json "reserve": true): spared while a non-reserve sibling account of the same vendor has room,
+        # so e.g. account A is kept in reserve and work goes to account B until B is spent. The expiring-credit term still steers
+        # usage onto whichever account's unused weekly credit is about to reset.
+        for c in cands:
+            if c.get("reserve") and any(_base_lane(k["lane"]) == _base_lane(c["lane"]) and not k.get("reserve") and ok_of(k) for k in cands):
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; {_base_lane(c['lane'])} has a non-reserve account with room"}
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
             same = lambda k: (abs(k["price"] - c["price"]) <= 0.25 * max(k["price"], c["price"]) if k.get("price") and c.get("price")

@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to tables/accounts.json (git-ignored; holds machine-local config-dir paths). Lists accounts per vendor. The first account keeps the bare lane name ('claude'); others become '<vendor>#<id>' (e.g. 'claude#b'). The router meters each account's real usage from its own login and routes between them by scarcity, so unused weekly credit attracts work before it resets. For Claude, config_dir is a CLAUDE_CONFIG_DIR with that account logged in.",
+  "claude": [
+    {"id": "a", "config_dir": "~/.claude-acctA"},
+    {"id": "b", "config_dir": "~/.claude-acctB"}
+  ]
+}

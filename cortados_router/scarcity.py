@@ -297,9 +297,48 @@ def _cli_env() -> dict[str, str]:
     return env
 
 
-def _claude(prev: dict[str, Any] | None = None) -> dict[str, Any]:
+def _accounts(vendor: str) -> list[dict[str, Any]]:
+    """Configured accounts for a vendor from tables/accounts.json, or [] (the single default login). Shape:
+    {"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "b", "config_dir": "~/.claude-acctB"}]}."""
+    try:
+        from cortados_router.paths import tables_dir
+        data = json.loads((tables_dir() / "accounts.json").read_text())
+        return [a for a in (data.get(vendor) or []) if isinstance(a, dict) and a.get("config_dir")]
+    except Exception:
+        return []
+
+
+def claude_lanes() -> list[tuple[str, str | None]]:
+    """(lane_key, config_dir) per Claude account. The first account keeps the bare `claude` key (back-compat); the rest
+    are `claude#<id>`. No accounts.json → [("claude", None)], i.e. today's single default login, unchanged."""
+    accts = _accounts("claude")
+    if not accts:
+        return [("claude", None)]
+    return [("claude" if i == 0 else f"claude#{a.get('id') or i}", os.path.expanduser(a["config_dir"]))
+            for i, a in enumerate(accts)]
+
+
+def _ensure_trust(config_dir: str) -> None:
+    """A fresh per-account CLAUDE_CONFIG_DIR has not accepted the workspace-trust dialog, which blocks the /usage TUI on
+    the folder the probe runs in. Pre-accept it for the home folder so the probe reaches the usage screen."""
+    try:
+        p = Path(config_dir) / ".claude.json"
+        cfg = json.loads(p.read_text()) if p.exists() else {}
+        proj = cfg.setdefault("projects", {}).setdefault(str(Path.home()), {})
+        if not proj.get("hasTrustDialogAccepted"):
+            proj["hasTrustDialogAccepted"] = True
+            p.write_text(json.dumps(cfg, indent=1))
+    except Exception:
+        pass                                                   # best-effort; a real block still surfaces as a probe error
+
+
+def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -> dict[str, Any]:
     # the per-model weeks (Fable, Opus, …) load from a rate-limited endpoint; the screen offers "r to retry". Two gentle presses, never more.
-    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", _cli_env(), run_s=25,
+    env = _cli_env()
+    if config_dir:                                             # a named account: read THIS login's usage, not the default
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+        _ensure_trust(config_dir)
+    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", env, run_s=25,
                        nudge=(r"Current week \((?!all models)[^)]+\)\D{0,160}?\d+\s*% used", r"breakdown unavailable", b"r", 2, 8.0))
     wins = parse_claude_usage(text)
     if not wins:
@@ -536,12 +575,28 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         sweep = _reaper.sweep_stale(PROBE_DIR)     # reclaim CLIs orphaned by a sampler process that died mid-probe
         now, plans = time.time(), _plans()
         lanes = dict(prev.get("lanes") or {})
-        due = [l for l in SAMPLERS if (not only or l in only) and (force or now - float((lanes.get(l) or {}).get("tried_at") or 0) >= MIN_INTERVAL[l])]
+        # Expand the one `claude` sampler into one lane per configured account (claude, claude#b, …); every other vendor
+        # is unchanged. Each account lane reads its own login's /usage, so another process spending on an account shows
+        # up in that account's own reading.
+        cl = claude_lanes()
+        claude_dir = {k: cd for k, cd in cl}
+        plan = {k: SAMPLERS["claude"] for k, _ in cl}
+        plan.update({name: fn for name, fn in SAMPLERS.items() if name != "claude"})
+
+        def _base(lane: str) -> str:
+            return lane.split("#", 1)[0]
+
+        def _interval(lane: str) -> float:
+            return MIN_INTERVAL.get(lane) or MIN_INTERVAL.get(_base(lane), 900)
+
+        def _wanted(lane: str) -> bool:
+            return not only or lane in only or _base(lane) in only
+        due = [l for l in plan if _wanted(l) and (force or now - float((lanes.get(l) or {}).get("tried_at") or 0) >= _interval(l))]
         results: dict[str, Any] = {}
 
         def run(lane: str) -> None:
             try:
-                rec = SAMPLERS[lane](lanes.get(lane)) if lane == "claude" else SAMPLERS[lane]()
+                rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
                 results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
             except Exception as exc:      # keep the last good reading, say so
                 old = lanes.get(lane) or {}
@@ -557,8 +612,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         [t.start() for t in threads]
         [t.join(240) for t in threads]          # the Claude /usage probe can take ~100 s when it retries the per-model panel
         for lane, v in results.items():
-            v.setdefault("plan", plans.get(lane))
-            v["plan"] = plans.get(lane) or v.get("plan")
+            v["plan"] = plans.get(lane) or plans.get(_base(lane)) or v.get("plan")   # account lanes inherit the vendor's plan
             lanes[lane] = v
         # The top-level stamp means "last sample that covered the subscription lanes": a partial run (e.g. the 60-second
         # local refresh) keeps the previous one, or current() would never find the probes due again (Codex review 2026-10-21).
