@@ -56,6 +56,10 @@ def main() -> None:
     a = ap.parse_args()
     marker = store.home() / ARM_MARKER
     if a.arm:
+        d = decision()
+        if not d["fire"]:                                # nothing to arm: outcomes are below the training threshold, so
+            print(json.dumps({"armed": False, "refused": d["reason"]}))   # no outcome-trained candidate exists to review
+            return
         marker.write_text("armed by Forest after reviewing the first outcome-trained candidate\n")
         print(json.dumps({"armed": True, "marker": str(marker)}))
         return

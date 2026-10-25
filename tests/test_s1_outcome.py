@@ -426,13 +426,25 @@ class QuotaTests(OutcomeCase):
         w = run.core._scarcity_module().window_view(window, used, now + hours * 3600, window_s, now)
         return dict(w, pool=pool)
 
+    def _sess(self, used=5.0, hours=4.0):
+        """A healthy 5-hour session window — Claude admission now requires one alongside the weekly window."""
+        return self._w(used=used, hours=hours, window="5-hour", window_s=5 * 3600)
+
     def _core(self, sc):
         return mock.Mock(_scarcity_module=lambda: sc)
 
     def test_real_window_view_output_is_admitted_when_there_is_room(self):
         w = self._w(used=10, hours=24)
         self.assertIsInstance(w["reset_epoch"], float)
-        self.assertTrue(quota.admit(self._core(FakeScarcity([w])), "claude", "m")[0])
+        self.assertTrue(quota.admit(self._core(FakeScarcity([self._sess(), w])), "claude", "m")[0])
+
+    def test_claude_admission_requires_both_the_session_and_weekly_windows(self):
+        week, sess = self._w(used=10, hours=100), self._sess()
+        self.assertTrue(quota.admit(self._core(FakeScarcity([sess, week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
+        ok_wk, why_wk = quota.admit(self._core(FakeScarcity([sess], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertFalse(ok_wk); self.assertIn("week", why_wk)          # partial capture: only the session window
+        ok_se, why_se = quota.admit(self._core(FakeScarcity([week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertFalse(ok_se); self.assertIn("5-hour", why_se)        # partial capture: only the weekly window
 
     def test_quota_rule_on_real_windows(self):
         import time as _t
@@ -447,11 +459,11 @@ class QuotaTests(OutcomeCase):
     def test_a_reading_written_before_reset_epoch_existed_uses_its_sample_time(self):
         w = self._w(used=10, hours=0.8)
         w.pop("reset_epoch")
-        sc = FakeScarcity([w], fetched_at=__import__("time").time() - 2 * 3600)   # sampled 2 h ago: reset passed
+        sc = FakeScarcity([self._sess(), w], fetched_at=__import__("time").time() - 2 * 3600)   # sampled 2 h ago: reset passed
         self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
 
     def test_a_model_pool_at_its_stop_refuses_that_model_only(self):
-        sc = FakeScarcity([self._w(used=10, hours=100), self._w(used=96, hours=100, pool="fable")])
+        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100), self._w(used=96, hours=100, pool="fable")])
         self.assertFalse(quota.admit(self._core(sc), "claude", "claude-fable-5-1")[0])
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
@@ -461,7 +473,8 @@ class QuotaTests(OutcomeCase):
 
     def _near_stop(self, extra_pool=False, used=90.0):
         w = self._w(used=used, hours=1.5)                    # 1.5 h before a weekly reset: ~99 % of the window gone
-        return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else [])
+        # windows[0] stays the binding weekly window; a healthy session window satisfies the required-windows check.
+        return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else []) + [self._sess()]
 
     @staticmethod
     def _expected_calls(w):
@@ -516,16 +529,16 @@ class QuotaTests(OutcomeCase):
 
     def test_a_model_pool_missing_from_the_reading_is_refused_once_it_has_been_seen(self):
         general = self._w(used=10, hours=100)
-        with_pool = FakeScarcity([general, dict(self._w(used=10, hours=100), pool="fable")], fetched_at=self._fresh_now())
+        with_pool = FakeScarcity([self._sess(), general, dict(self._w(used=10, hours=100), pool="fable")], fetched_at=self._fresh_now())
         self.assertTrue(quota.admit(self._core(with_pool), "claude", "claude-fable-5-1")[0])
-        without = FakeScarcity([general], fetched_at=self._fresh_now())
+        without = FakeScarcity([self._sess(), general], fetched_at=self._fresh_now())
         ok, why = quota.admit(self._core(without), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
         self.assertIn("missing", why)
         self.assertTrue(quota.admit(self._core(without), "claude", "claude-sonnet-5-5")[0])
 
     def test_a_carried_forward_model_pool_is_refused(self):
-        windows = [self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
+        windows = [self._sess(), self._w(used=10, hours=100), dict(self._w(used=10, hours=100), pool="fable", stale=True)]
         sc = FakeScarcity(windows, fetched_at=self._fresh_now())
         ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
@@ -536,7 +549,7 @@ class QuotaTests(OutcomeCase):
         # Fresh home, per-model panel rate-limited so no pool is observed. Fable has its own pool (pool_for knows it),
         # so it is refused — its cap is unreadable. The run models ride only the visible shared window and are admitted
         # (Forest 2026-10-25: corrects the blanket panel refusal that stalled haiku/sonnet/opus runs).
-        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
                           per_model="not shown this read (vendor rate limit on the per-model panel)")
         ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
         self.assertFalse(ok)
@@ -546,13 +559,13 @@ class QuotaTests(OutcomeCase):
     def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
         # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
         # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
-        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
                           per_model="not shown this read (vendor rate limit on the per-model panel)")
         ok, why = quota.admit(self._core(sc), "claude", "claude-newmodel-9")
         self.assertFalse(ok)
         self.assertIn("ownership is unknown", why)
-        # when the panel IS available, the same unknown model admits against the shared window normally
-        ok2, _ = quota.admit(self._core(FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now())), "claude", "claude-newmodel-9")
+        # when the panel IS available, the same unknown model admits against the shared windows normally
+        ok2, _ = quota.admit(self._core(FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now())), "claude", "claude-newmodel-9")
         self.assertTrue(ok2)
 
     def test_a_missing_general_window_refuses_even_a_poolless_model(self):
@@ -843,6 +856,16 @@ class OutcomeTrainGateTests(OutcomeCase):
         (store.home() / train_gate.ARM_MARKER).write_text("x")
         self.assertTrue(train_gate.armed())
 
+    def test_arm_is_refused_below_the_threshold(self):
+        from outcome import train_gate
+        store.append("outcomes", _outcome("o.1", "train"))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 100), mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
+            train_gate.main()
+        self.assertFalse(train_gate.armed())            # 1 < 100: nothing to arm, no outcome-trained candidate yet
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1), mock.patch.object(sys, "argv", ["train_gate", "--arm"]):
+            train_gate.main()
+        self.assertTrue(train_gate.armed())             # threshold met: arming takes effect
+
 
 class OutcomeSftTests(OutcomeCase):
     def test_outcome_examples_are_train_split_valid_only(self):
@@ -916,6 +939,12 @@ class OutcomeEvalTests(OutcomeCase):
         bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
         self.assertEqual(evaluate.promote_decision(c, bar, None, None, False), (True, False))   # no outcomes: teacher bar alone
         self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
+
+    def test_hold_first_active_keys_on_actual_outcome_inclusion(self):
+        import evaluate
+        self.assertTrue(evaluate.hold_first_active(True, False))    # outcomes included, not armed → hold for review
+        self.assertFalse(evaluate.hold_first_active(False, False))  # below threshold: teacher-only candidate, no hold
+        self.assertFalse(evaluate.hold_first_active(True, True))    # armed → auto-promote path
 
 
 if __name__ == "__main__":

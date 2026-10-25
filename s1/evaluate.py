@@ -136,6 +136,14 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
             "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
 
 
+def hold_first_active(fire: bool, armed: bool) -> bool:
+    """Whether to hold a candidate for review. Keyed on outcomes actually being INCLUDED in training (the fire
+    threshold), not merely existing: below it build_sft adds no outcomes, so a teacher-only candidate must not be
+    labelled 'first outcome-trained' nor let an --arm below threshold waive review of the real first one at 150
+    (Codex review 2026-10-25)."""
+    return fire and not armed
+
+
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
     """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
     to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
@@ -282,8 +290,8 @@ def main() -> int:
     # Hold-first (Forest 2026-10-25): the first candidate trained once outcome data is in the mix is held for review,
     # however it grades; after Forest arms it (`python3 -B -m outcome.train_gate --arm`), outcome-trained candidates
     # auto-promote on no-regression as before. Only active once the loop has produced train-split outcomes.
-    from outcome import store as outcome_store
-    if any(o.get("split") == "train" for o in outcome_store.read("outcomes")) and not (outcome_store.home() / "outcome-train-armed").exists():
+    from outcome import train_gate
+    if hold_first_active(train_gate.decision()["fire"], train_gate.armed()):
         report["promote_recommended"] = report["promote"]
         report["promote"] = False
         report["hold_reason"] = ("first outcome-trained candidate held for review; after reading report.json run "

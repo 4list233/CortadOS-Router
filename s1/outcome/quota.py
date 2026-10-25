@@ -72,6 +72,11 @@ def _remember(lane: str, general: set, pools: set) -> tuple[list, list]:
 # model in neither set has UNKNOWN ownership while the panel is down and is refused rather than spent against the shared
 # windows blind — it might have an unobserved cap (Codex review 2026-10-25). Forest 2026-10-25: Fable is the pooled one.
 CLAUDE_SHARED_MODELS = ("haiku", "sonnet", "opus")
+# General windows a lane ALWAYS has, so a reading missing one is an incomplete capture — not evidence the limit is gone.
+# Claude's are the rolling session and the weekly all-models window; both must be in hand before any Claude call, even
+# before either has been observed on a fresh home (Codex review 2026-10-25: a partial capture with only the session
+# window otherwise admitted a shared model against an unseen, possibly exhausted weekly limit).
+REQUIRED_GENERAL = {"claude": ("5-hour", "week")}
 
 
 def _panel_unavailable(raw: dict) -> bool:
@@ -100,6 +105,9 @@ def _windows(sc, lane: str, model: str | None):
     # loaded since a fresh home still has its limit treated as known-and-unobserved rather than absent.
     pools_any = {w.get("pool") for w in windows if w.get("pool") not in (None, "all")}
     known_general, known_pools = _remember(lane, general_now, pools_now | pools_any)
+    required = [r for r in REQUIRED_GENERAL.get(lane, ()) if not any(r in (w or "").lower() for w in general_now)]
+    if required:
+        return None, f"{lane} required general window(s) {required} not in the current reading (incomplete capture)"
     missing = sorted(set(known_general) - general_now)
     if missing:
         return None, f"{lane} general window(s) {missing} missing from the current reading"
