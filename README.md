@@ -155,6 +155,7 @@ python3 cortados_router/scarcity.py                # opens claude / codex / curs
 | `CORTADOS_ROUTING_TABLE` | `tables/routing-table.json` | a single routing table |
 | `CORTADOS_S1_URL` | resolved | the S1 scorer; wins over the endpoints file. Else `CORTADOS_S1_ENDPOINT` names a device in `tables/s1-endpoints.json` (`CORTADOS_S1_ENDPOINTS` to relocate it), else loopback `127.0.0.1:8431` |
 | `CORTADOS_S1_BIND` | `127.0.0.1` | interface `s1/serve.py` listens on; set to a tailnet IP or `0.0.0.0` to serve other hosts |
+| `CORTADOS_S1_TOKEN` | unset | when set, `POST /score` requires `Authorization: Bearer <token>`; pair with a non-loopback bind |
 
 Legacy `WANGCAI_*` names still work and log a deprecation warning.
 

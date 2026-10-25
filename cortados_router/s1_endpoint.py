@@ -35,13 +35,15 @@ DEFAULT_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 _SCHEMES = ("http://", "https://")
 
 
-def endpoints_path(*, environ=None) -> Path:
-    """The endpoints file: $CORTADOS_S1_ENDPOINTS, else <tables>/s1-endpoints.json."""
+def endpoints_path(*, environ=None) -> tuple[Path, bool]:
+    """(path, explicit) for the endpoints file: $CORTADOS_S1_ENDPOINTS (explicit), else <tables>/s1-endpoints.json.
+    `explicit` matters because an operator who named a file meant it to exist; the shipped default path may simply be
+    absent on a single-machine host."""
     override = getenv("CORTADOS_S1_ENDPOINTS", environ=environ)
     if override:
-        return Path(override)
+        return Path(override), True
     from cortados_router.paths import tables_dir
-    return tables_dir() / "s1-endpoints.json"
+    return tables_dir() / "s1-endpoints.json", False
 
 
 def _normalize(url: str, *, source: str) -> str:
@@ -53,10 +55,13 @@ def _normalize(url: str, *, source: str) -> str:
 
 
 def load_endpoints(*, environ=None) -> dict[str, Any]:
-    """Parse the endpoints file. {} when it does not exist (loopback is then the default); a clear error when it exists
-    but is malformed -- a broken config must not silently fall back to the wrong machine."""
-    path = endpoints_path(environ=environ)
+    """Parse the endpoints file. {} when the shipped default path is simply absent (loopback is then the default); a
+    clear error when a file an operator *named* (CORTADOS_S1_ENDPOINTS) is missing, or when any file is malformed -- a
+    broken config must not silently fall back to the wrong machine."""
+    path, explicit = endpoints_path(environ=environ)
     if not path.exists():
+        if explicit:
+            raise ValueError(f"S1 endpoints file {path} (from CORTADOS_S1_ENDPOINTS) does not exist")
         return {}
     try:
         data = json.loads(path.read_text())
@@ -74,18 +79,22 @@ def resolve_url(*, environ=None) -> str:
         return _normalize(explicit, source="CORTADOS_S1_URL")
 
     data = load_endpoints(environ=environ)
+    path, _ = endpoints_path(environ=environ)
     table = data.get("endpoints", {})
     chosen = getenv("CORTADOS_S1_ENDPOINT", environ=environ)
     source = "CORTADOS_S1_ENDPOINT"
     if not chosen:
-        chosen = data.get("default")
-        source = f"the 'default' in {endpoints_path(environ=environ)}"
+        default = data.get("default")
+        if default is not None and not (isinstance(default, str) and default):
+            raise ValueError(f"S1 endpoints file {path} has a non-string 'default': {default!r}")
+        chosen = default
+        source = f"the 'default' in {path}"
     if not chosen:
         return DEFAULT_URL                                   # no device selected: serve/reach S1 on loopback
 
     if chosen not in table:
         known = ", ".join(sorted(table)) or "(none)"
-        raise ValueError(f"S1 endpoint {chosen!r} (from {source}) is not in {endpoints_path(environ=environ)}; known: {known}")
+        raise ValueError(f"S1 endpoint {chosen!r} (from {source}) is not in {path}; known: {known}")
     return _normalize(table[chosen], source=f"endpoint {chosen!r}")
 
 

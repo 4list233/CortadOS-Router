@@ -54,6 +54,18 @@ class ResolveUrlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ep.resolve_url(environ=e)
 
+    def test_explicit_missing_file_raises_even_without_a_name(self):
+        # an operator who set CORTADOS_S1_ENDPOINTS meant that file to exist: its absence is an error, not loopback
+        e = env(CORTADOS_S1_ENDPOINTS=str(self.dir / "absent.json"))
+        with self.assertRaises(ValueError):
+            ep.resolve_url(environ=e)
+
+    def test_non_string_default_raises(self):
+        for bad in (False, [], 0, {}):
+            path = self.write({"default": bad, "endpoints": {"studio": "http://10.0.0.5:8431"}})
+            with self.assertRaises(ValueError):
+                ep.resolve_url(environ=env(CORTADOS_S1_ENDPOINTS=path))
+
     def test_malformed_file_raises_not_silently_loopback(self):
         self.file.write_text("{not json")
         with self.assertRaises(ValueError):

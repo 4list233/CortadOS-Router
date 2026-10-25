@@ -12,7 +12,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 CORE = REPO / "cortados_router" / "core.py"
 LIVE_HOME = Path.home() / ".cortados"
-S1_URL = os.environ.get("CORTADOS_S1_URL", "http://127.0.0.1:8431")
+sys.path.insert(0, str(REPO))
+from cortados_router.s1_endpoint import resolve_url   # noqa: E402  same resolver core uses, so health probe and decision hit one scorer
+S1_URL = resolve_url()
 
 
 PROBE_DIRS = []

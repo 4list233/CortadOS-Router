@@ -87,7 +87,9 @@ Not yet in P1, each needing a decision or another phase:
   `127.0.0.1:8431`. The file is `CORTADOS_S1_ENDPOINTS` or `tables/s1-endpoints.json` (git-ignored; copy
   `tables/s1-endpoints.example.json`), mapping device names to URLs so no address is in code. S1 itself listens on
   `127.0.0.1` unless `CORTADOS_S1_BIND` widens it (e.g. the Studio's tailnet IP); on a host that does not run S1 next
-  to it, select the serving device or every conversation routes degraded.
+  to it, select the serving device or every conversation routes degraded. A widened bind is guarded: body size and
+  backlog are capped, a job whose client already timed out is dropped unscored, and `CORTADOS_S1_TOKEN` (when set)
+  requires a bearer token. The tailnet (Tailscale ACLs) is the access boundary; the token is the belt-and-braces.
 - **Live usage probes.** Routing reads live lane scarcity, which samples the vendor CLIs in a PTY every 20 minutes,
   exactly as under Hermes. Run verification on a throwaway `CORTADOS_HOME` with a fresh `scarcity.json`.
 - **Interactive floor for subagents.** Every provider conversation is scored as interactive (`platform: cli`), so the

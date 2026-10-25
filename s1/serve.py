@@ -26,6 +26,13 @@ _jobs: "queue.Queue[tuple[dict, queue.Queue]]" = queue.Queue()
 
 
 MAX_RSS_GB = float(os.environ.get("CORTADOS_S1_MAX_RSS_GB", "6"))
+# Guards that matter once CORTADOS_S1_BIND exposes the port beyond loopback: one MLX worker serves everything, so an
+# unbounded body or backlog from any reachable host is a resource-exhaustion lever. These bound it; the tailnet (or a
+# token) is the access boundary.
+MAX_BODY_BYTES = int(os.environ.get("CORTADOS_S1_MAX_BODY_BYTES", str(256 * 1024)))  # a score request is a few KB; refuse larger reads outright
+MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))                   # cap the backlog: a flood is refused (503), never queued without limit
+REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # client wait; a job still queued past this is dropped unscored by the worker
+TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
 
 
 def score_request(body, scorer, *, task_context_contract=None):
@@ -46,6 +53,18 @@ def score_request(body, scorer, *, task_context_contract=None):
     return result
 
 
+def admission(auth: str, length: int, pending: int):
+    """Why a POST /score is refused before it reaches the worker, or None to admit it. Pure, so it is unit-tested
+    without a socket: token (when set), body-size cap, backlog cap."""
+    if TOKEN is not None and auth != f"Bearer {TOKEN}":
+        return 401, {"error": "unauthorized"}
+    if length > MAX_BODY_BYTES:
+        return 413, {"error": f"request body {length} exceeds {MAX_BODY_BYTES} bytes"}
+    if pending >= MAX_PENDING:
+        return 503, {"error": "scorer busy: pending queue full"}
+    return None
+
+
 def _rss_gb() -> float:
     import resource
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30
@@ -55,7 +74,10 @@ def worker() -> None:
     """The only thread that touches MLX (its streams are thread-local)."""
     n = 0
     while True:
-        body, reply = _jobs.get()
+        body, reply, deadline = _jobs.get()
+        if deadline is not None and time.time() > deadline:   # the client already gave up; don't spend an MLX pass on a dead request
+            reply.put({"error": "dropped: client deadline passed before scoring"})
+            continue
         try:
             ensure_loaded()
             reply.put(score_request(body, _state['scorer'], task_context_contract=_state.get('task_context_contract')))
@@ -92,10 +114,14 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            length = int(self.headers.get("Content-Length") or 0)
+            refusal = admission(self.headers.get("Authorization", ""), length, _jobs.qsize())
+            if refusal is not None:                           # token / oversized body / full backlog: refuse before reading or queuing
+                self._send(*refusal); return
+            body = json.loads(self.rfile.read(length) or b"{}")
             reply: queue.Queue = queue.Queue()
-            _jobs.put((body, reply))
-            r = reply.get(timeout=60)
+            _jobs.put((body, reply, time.time() + REPLY_TIMEOUT_S))
+            r = reply.get(timeout=REPLY_TIMEOUT_S)
             self._send(500 if "error" in r else 200, {**r, "model": _state["model"]})
         except Exception as exc:
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
@@ -105,9 +131,10 @@ if __name__ == "__main__":
     from cortados_router.s1_endpoint import bind_address
     host, port = bind_address()                                 # 127.0.0.1 unless CORTADOS_S1_BIND widens it
     threading.Thread(target=worker, daemon=True, name="mlx").start()
-    _jobs.put(({"request": "warm up"}, queue.Queue()))          # load + first pass on the worker thread
-    if host not in ("127.0.0.1", "localhost", "::1"):           # a non-loopback bind is a deliberate network exposure: say so
-        print(f"CortadOS Router S1 scorer EXPOSED on {host}:{port} (reachable by other hosts; token-free, trust the network)", flush=True)
+    _jobs.put(({"request": "warm up"}, queue.Queue(), None))     # load + first pass on the worker thread (no deadline)
+    if host not in ("127.0.0.1", "localhost", "::1"):           # a non-loopback bind is a deliberate network exposure: say what guards it
+        guard = "token required" if TOKEN else "no token set (rely on the tailnet as the access boundary, or set CORTADOS_S1_TOKEN)"
+        print(f"CortadOS Router S1 scorer EXPOSED on {host}:{port} ({guard}; body<={MAX_BODY_BYTES}B, backlog<={MAX_PENDING})", flush=True)
     else:
         print(f"CortadOS Router S1 scorer on {host}:{port}", flush=True)
     ThreadingHTTPServer((host, port), H).serve_forever()
