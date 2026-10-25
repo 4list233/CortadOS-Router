@@ -132,8 +132,20 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
         under += BANDS.index(b) < BANDS.index(truth)
         over += BANDS.index(b) > BANDS.index(truth)
     nn = max(n, 1)
-    return {"n": n, "no_answer": misses, "band_accuracy": round(hits / nn, 3),
-            "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
+    # Raw counts are kept alongside the rounded ratios so promote_decision compares exactly (no rounding can hide a
+    # one-task regression on a large outcome holdout); the ratios are for display (Codex review 2026-10-25).
+    return {"n": n, "no_answer": misses, "band_hits": hits, "under": under, "over": over,
+            "band_accuracy": round(hits / nn, 3), "under_routed": round(under / nn, 3), "over_routed": round(over / nn, 3)}
+
+
+def _no_outcome_regression(co: dict, obar: dict) -> bool:
+    """No regression on outcome band accuracy or under-routing. Compared on RAW counts (cross-multiplied, exact — a
+    one-task regression on a large holdout cannot round away) when both grades carry them, else on the rounded ratios
+    (Codex review 2026-10-25). The candidate and the bar are graded on the same outcome holdout."""
+    if all(k in co and k in obar for k in ("band_hits", "under", "n")) and co["n"] and obar["n"]:
+        return (co["band_hits"] * obar["n"] >= obar["band_hits"] * co["n"]
+                and co["under"] * obar["n"] <= obar["under"] * co["n"])
+    return co["band_accuracy"] >= obar["band_accuracy"] and co["under_routed"] <= obar["under_routed"]
 
 
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
@@ -149,9 +161,7 @@ def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | No
     better_under = c["under_routed"] < bar["under_routed"]
     acc_ok = c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
     if has_outcome_holdout:
-        outcome_ok = (bool(obar and co and co.get("n"))
-                      and co["band_accuracy"] >= obar["band_accuracy"]
-                      and co["under_routed"] <= obar["under_routed"])
+        outcome_ok = bool(obar and co and co.get("n")) and _no_outcome_regression(co, obar)
     else:
         outcome_ok = True
     promote = acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"] and outcome_ok

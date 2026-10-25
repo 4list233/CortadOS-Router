@@ -577,6 +577,15 @@ class QuotaTests(OutcomeCase):
             d5 = quota._derive_fable_pool("claude", "fable", [wk])
         self.assertEqual((d5["used_pct"], d5["projected_pct_at_reset"]), (30.0, 30.0))  # Forest's 50/50: util == weekly
 
+    def test_fable_reservations_are_scaled_to_its_half_sized_cap(self):
+        # Derived Fable at 80% used (2× a 40% weekly), cap_scale 2: each reservation is 2% of the Fable cap, so at 80%
+        # the 8th admitted call passes 95% and is rejected — reservations are scaled, not just sampled usage (Codex review).
+        now = self._fresh_now()
+        fable = {"window": "week (fable, derived ×2.00 from weekly)", "pool": "fable", "cap_scale": 2.0, "key": "k",
+                 "used_pct": 80.0, "elapsed_pct": 100.0, "projected_pct_at_reset": 80.0, "reset_epoch": now + 2 * 3600}
+        results = [quota.verdict([fable], reserved={"k": i}, now=now)[0] for i in range(8)]
+        self.assertEqual(results, [True] * 7 + [False])
+
     def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
         # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
         # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
@@ -941,6 +950,17 @@ class OutcomeEvalTests(OutcomeCase):
         # no regression on either outcome metric → promotes, and records that the check ran
         self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 0.9, "under_routed": 0.1},
                                                    {"n": 20, "band_accuracy": 0.9, "under_routed": 0.1}, True), (True, True))
+
+    def test_promote_decision_uses_raw_outcome_counts_not_rounded(self):
+        import evaluate
+        c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
+        # 2001-task outcome holdout: incumbent perfect, candidate gets ONE more wrong → identical rounded ratios, but the
+        # raw counts catch the regression → BLOCKED (Codex review 2026-10-25).
+        obar = {"n": 2001, "band_hits": 2001, "under": 0, "band_accuracy": 1.0, "under_routed": 0.0}
+        co = {"n": 2001, "band_hits": 2000, "under": 1, "band_accuracy": 1.0, "under_routed": 0.0}
+        self.assertEqual(evaluate.promote_decision(c, bar, obar, co, True)[0], False)
+        self.assertEqual(evaluate.promote_decision(c, bar, obar, dict(obar), True), (True, True))   # identical → promotes
 
     def test_promote_decision_unaffected_without_outcomes_and_never_promotes_without_a_bar(self):
         import evaluate

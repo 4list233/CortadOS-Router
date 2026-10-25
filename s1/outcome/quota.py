@@ -113,7 +113,8 @@ def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | Non
     if not week:
         return None
     factor = 2.0 * FABLE_WEEKLY_SHARE                           # Fable cap is half the budget → ×2; share 1.0 = worst case
-    derived = {**week, "window": f"week (fable, derived ×{factor:.2f} from weekly)", "pool": "fable", "derived": True}
+    derived = {**week, "window": f"week (fable, derived ×{factor:.2f} from weekly)", "pool": "fable",
+               "derived": True, "cap_scale": factor}           # verdict scales reservations by cap_scale too (Codex review)
     for k in ("used_pct", "projected_pct_at_reset"):
         if isinstance(week.get(k), (int, float)):
             derived[k] = min(100.0, week[k] * factor)
@@ -183,7 +184,11 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
         used, elapsed, reset = w.get("used_pct"), w.get("elapsed_pct"), w.get("reset_epoch")
         if not all(isinstance(x, (int, float)) for x in (used, elapsed, reset, w.get("projected_pct_at_reset"))):
             return False, f"window {w.get('window')} reading is incomplete"
-        used = used + (reserved.get(w.get("key"), 0) + 1) * ASSUMED_PCT_PER_CALL
+        # A call consumes cap_scale × ASSUMED_PCT_PER_CALL of THIS window's budget: for the derived Fable pool (cap_scale
+        # = 2 × share) one call is a larger slice of its half-sized cap than of the weekly budget, so reservations must be
+        # scaled too, not only the sampled usage — otherwise the pool can still be exhausted between samples (Codex review).
+        per_call = ASSUMED_PCT_PER_CALL * w.get("cap_scale", 1.0)
+        used = used + (reserved.get(w.get("key"), 0) + 1) * per_call
         projected = max(w["projected_pct_at_reset"], used / max(elapsed / 100.0, 0.05))
         hours = (reset - now) / 3600
         if max(projected, used) > STOP_PROJECTED_PCT:
