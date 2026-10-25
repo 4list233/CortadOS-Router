@@ -543,6 +543,18 @@ class QuotaTests(OutcomeCase):
         self.assertIn("missing", why)
         self.assertTrue(quota.admit(self._core(sc), "claude", "claude-sonnet-5-5")[0])
 
+    def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
+        # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
+        # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
+        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
+                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+        ok, why = quota.admit(self._core(sc), "claude", "claude-newmodel-9")
+        self.assertFalse(ok)
+        self.assertIn("ownership is unknown", why)
+        # when the panel IS available, the same unknown model admits against the shared window normally
+        ok2, _ = quota.admit(self._core(FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now())), "claude", "claude-newmodel-9")
+        self.assertTrue(ok2)
+
     def test_a_missing_general_window_refuses_even_a_poolless_model(self):
         both = [self._w(used=10, hours=100, window="week"), self._w(used=10, hours=4, window="5-hour", window_s=5 * 3600)]
         self.assertTrue(quota.admit(self._core(FakeScarcity(both, fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
@@ -835,22 +847,37 @@ class OutcomeTrainGateTests(OutcomeCase):
 class OutcomeSftTests(OutcomeCase):
     def test_outcome_examples_are_train_split_valid_only(self):
         import build_sft
+        from outcome import train_gate
         store.append("outcomes", _outcome("o.t", "train"))
         store.append("outcomes", _outcome("o.hold", "holdout"))
         store.append("outcomes", _outcome("o.bad", "train", labels={"steps": 9}))
-        train, valid, bands, n = build_sft.outcome_examples()
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
+            train, valid, bands, n = build_sft.outcome_examples()
         self.assertEqual(n, 1)                                                       # holdout + invalid excluded
         self.assertTrue(all("messages" in e and len(e["messages"]) == 3 for e in train + valid))
 
     def test_under_routing_is_upweighted(self):
         import build_sft
+        from outcome import train_gate
         matched, under = _nonvalid_id("om"), _nonvalid_id("ou")
         store.append("outcomes", _outcome(matched, "train", s1_band="R2", outcome_band="R2"))   # no under-routing
         store.append("outcomes", _outcome(under, "train", s1_band="R0", outcome_band="R2"))     # S1 under-routed
         band = build_sft.band_of(_olabels())
         reps = build_sft.REPS.get(band, 1)
-        train = build_sft.outcome_examples()[0]
+        with mock.patch.object(train_gate, "MIN_TRAIN", 1):
+            train = build_sft.outcome_examples()[0]
         self.assertEqual(len(train), reps * (1 + build_sft.UPWEIGHT_HIGH))
+
+    def test_outcomes_are_withheld_from_training_below_the_fire_threshold(self):
+        import build_sft
+        from outcome import train_gate
+        for i in range(3):
+            store.append("outcomes", _outcome(_nonvalid_id(f"ot{i}"), "train"))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 100):                        # 3 < 100: not training data yet
+            train, valid, _bands, n = build_sft.outcome_examples()
+            self.assertEqual((train, valid, n), ([], [], 0))
+        with mock.patch.object(train_gate, "MIN_TRAIN", 3):                          # threshold met: included
+            self.assertEqual(build_sft.outcome_examples()[3], 3)
 
 
 class OutcomeEvalTests(OutcomeCase):

@@ -67,6 +67,22 @@ def _remember(lane: str, general: set, pools: set) -> tuple[list, list]:
     return merged_g, merged_p
 
 
+# Claude models Forest has confirmed draw ONLY on the shared 5-hour + weekly windows (no separate per-model cap), so
+# they may run while the per-model panel is unavailable. Fable is the pooled exception (pool_for knows it). A Claude
+# model in neither set has UNKNOWN ownership while the panel is down and is refused rather than spent against the shared
+# windows blind — it might have an unobserved cap (Codex review 2026-10-25). Forest 2026-10-25: Fable is the pooled one.
+CLAUDE_SHARED_MODELS = ("haiku", "sonnet", "opus")
+
+
+def _panel_unavailable(raw: dict) -> bool:
+    note = raw.get("per_model")
+    return isinstance(note, str) and ("not shown" in note or "unavailable" in note)
+
+
+def _confirmed_shared(lane: str, model: str | None) -> bool:
+    return lane == "claude" and any(tok in (model or "").lower() for tok in CLAUDE_SHARED_MODELS)
+
+
 def _windows(sc, lane: str, model: str | None):
     """(applicable windows, None) or (None, why). Refuses unless the full expected inventory for the call is present:
     every general window ever seen, and (for a model call) its own pool — observed this reading, not carried forward."""
@@ -98,6 +114,9 @@ def _windows(sc, lane: str, model: str | None):
             carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
             return None, (f"{lane} pool {owner} for {model} is "
                           + ("a carried-forward reading" if carried else "missing from the current reading"))
+        if owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model):
+            return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
+                          "unknown and it may have an unobserved cap")
     pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None
     applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
                        key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")

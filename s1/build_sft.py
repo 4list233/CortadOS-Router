@@ -40,8 +40,13 @@ def outcome_examples() -> tuple[list, list, Counter, int]:
     An outcome where S1 under-routed — its band below the band the task actually needed — is the expensive mistake,
     so it counts UPWEIGHT_HIGH times, the same asymmetry the teacher-sample path applies to the hardest reading."""
     from outcome import store as outcome_store                 # the loop's canonical store (CORTADOS_OUTCOME_HOME-aware)
+    from outcome import train_gate
     order = core.BAND_ORDER
     train, valid, bands, n = [], [], Counter(), 0
+    # The fire threshold gates INCLUSION, not just promotion: below it, outcomes are not training data yet, so a nightly
+    # run trains on the teacher labels alone and no outcome-trained pass starts early (Codex review 2026-10-25).
+    if not train_gate.decision()["fire"]:
+        return train, valid, bands, n
     for o in outcome_store.read("outcomes"):
         a = o.get("labels")
         if o.get("split") != "train" or not isinstance(a, dict) or not valid_answers(a):
