@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import threading
 import time
 
@@ -88,12 +89,20 @@ def _confirmed_shared(lane: str, model: str | None) -> bool:
     return lane == "claude" and any(tok in (model or "").lower() for tok in CLAUDE_SHARED_MODELS)
 
 
+# Fable's own pool, when its per-model panel is rate-limited, is modelled from the visible weekly window. Fable's cap is
+# HALF the weekly budget, so Fable utilisation = 2 × (Fable's share of weekly usage) × weekly utilisation. That share is
+# unknown and unenforceable (ladder runs use Codex/other Claude models, judging uses Fable), so the SAFE default assumes
+# the worst case — ALL weekly usage is Fable (share 1.0 → the derived pool is 2× the weekly window), which refuses once
+# weekly passes ~48 %. Forest asserted a 50/50 split for his account (2026-10-25); set CORTADOS_FABLE_WEEKLY_SHARE=0.5 to
+# model Fable at that split (then Fable util == weekly util) at his own risk (Codex review 2026-10-25).
+FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
+
+
 def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:
-    """Fable's cap is 50% of the weekly all-models budget and, by Forest's 50/50 split (2026-10-25), its utilisation
-    tracks that weekly window. When Fable's own per-model panel is rate-limited we model its pool from the visible
-    weekly window so judging is not blocked. This OVER-estimates Fable here: the loop uses it for a minority of calls
-    (one judge per task vs. the three-band run ladder), so its true share is below 50% and this errs toward stopping
-    early. Returns a derived Fable window (same usage/projection/reset as the weekly window) or None when unavailable."""
+    """Model Fable's pool from the visible weekly window when its own per-model panel is rate-limited, scaled by its
+    half-sized cap and assumed weekly share (FABLE_WEEKLY_SHARE) so judging is not blocked. Returns None — and the
+    caller refuses — when any real Fable reading exists (a known, possibly exhausted pool is never overridden with an
+    estimate) or no weekly window is in hand (Codex review 2026-10-25)."""
     if lane != "claude" or owner != "fable":
         return None
     if any(w.get("pool") == owner for w in windows):
@@ -103,7 +112,12 @@ def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | Non
                  and w.get("pool", "all") == "all" and not w.get("stale")), None)
     if not week:
         return None
-    return {**week, "window": "week (fable, derived from weekly)", "pool": "fable", "derived": True}
+    factor = 2.0 * FABLE_WEEKLY_SHARE                           # Fable cap is half the budget → ×2; share 1.0 = worst case
+    derived = {**week, "window": f"week (fable, derived ×{factor:.2f} from weekly)", "pool": "fable", "derived": True}
+    for k in ("used_pct", "projected_pct_at_reset"):
+        if isinstance(week.get(k), (int, float)):
+            derived[k] = min(100.0, week[k] * factor)
+    return derived
 
 
 def _windows(sc, lane: str, model: str | None):

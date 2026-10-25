@@ -139,15 +139,19 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
     """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
     to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
-    never regress. When held-out outcomes exist a valid outcome bar is REQUIRED and outcome under-routing may not
-    regress — a missing/failed outcome baseline blocks promotion rather than defaulting to OK (Codex review 2026-10-25)."""
+    never regress. When held-out outcomes exist a valid outcome bar is REQUIRED, and on the SAME outcome holdout the
+    candidate may regress on neither outcome band accuracy nor outcome under-routing (strict, no slack — these are the
+    actual-task ground truth, so no degradation is allowed; Forest/Codex review 2026-10-25). A missing/failed outcome
+    baseline blocks promotion rather than defaulting to OK."""
     if not bar:
         return False, False
     slack = 1.0 / max(c["n"], 1)
     better_under = c["under_routed"] < bar["under_routed"]
     acc_ok = c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
     if has_outcome_holdout:
-        outcome_ok = bool(obar and co and co.get("n")) and co["under_routed"] <= obar["under_routed"] + 1.0 / max(co["n"], 1)
+        outcome_ok = (bool(obar and co and co.get("n"))
+                      and co["band_accuracy"] >= obar["band_accuracy"]
+                      and co["under_routed"] <= obar["under_routed"])
     else:
         outcome_ok = True
     promote = acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"] and outcome_ok

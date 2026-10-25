@@ -567,6 +567,16 @@ class QuotaTests(OutcomeCase):
         self.assertFalse(ok)
         self.assertIn("carried-forward", why)
 
+    def test_derive_fable_pool_scales_for_its_half_sized_cap(self):
+        # Fable's cap is half the weekly budget: the derived pool is 2× the weekly window by default (worst case all
+        # weekly usage is Fable), or 1× under Forest's asserted 50/50 split (Codex review 2026-10-25).
+        wk = dict(self._w(used=30, hours=100), used_pct=30.0, projected_pct_at_reset=30.0)
+        d = quota._derive_fable_pool("claude", "fable", [wk])
+        self.assertEqual((d["used_pct"], d["projected_pct_at_reset"]), (60.0, 60.0))    # default worst case: 2× weekly
+        with mock.patch.object(quota, "FABLE_WEEKLY_SHARE", 0.5):
+            d5 = quota._derive_fable_pool("claude", "fable", [wk])
+        self.assertEqual((d5["used_pct"], d5["projected_pct_at_reset"]), (30.0, 30.0))  # Forest's 50/50: util == weekly
+
     def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
         # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
         # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
@@ -916,17 +926,21 @@ class OutcomeEvalTests(OutcomeCase):
             g = evaluate.grade_outcome(lambda r: {"answers": {"r": r["request"]}}, rows)
         self.assertEqual((g["n"], g["under_routed"], g["over_routed"], g["band_accuracy"]), (2, 0.5, 0.5, 0.0))
 
-    def test_promote_decision_requires_a_valid_outcome_bar_when_holdouts_exist(self):
+    def test_promote_decision_blocks_any_outcome_regression_and_requires_a_bar(self):
         import evaluate
         c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
         bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
-        under = {"n": 20, "under_routed": 0.5}                 # candidate under-routes the outcomes badly
-        # outcome bar present + worse outcome under-routing → blocked
-        self.assertEqual(evaluate.promote_decision(c, bar, {"under_routed": 0.0}, under, True)[0], False)
+        # candidate OVER-routes every outcome: outcome band accuracy 1.0 → 0.0, under-routing unchanged → BLOCKED
+        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 1.0, "under_routed": 0.0},
+                                                   {"n": 20, "band_accuracy": 0.0, "under_routed": 0.0}, True)[0], False)
+        # outcome under-routing regresses by one → BLOCKED (no slack)
+        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 1.0, "under_routed": 0.0},
+                                                   {"n": 20, "band_accuracy": 1.0, "under_routed": 0.05}, True)[0], False)
         # outcome holdouts exist but NO outcome bar (cache miss / grading failure) → blocked, not defaulted to OK
-        self.assertEqual(evaluate.promote_decision(c, bar, None, under, True), (False, False))
-        # outcome bar present and no regression → promotes, and records that the check ran
-        self.assertEqual(evaluate.promote_decision(c, bar, {"under_routed": 0.5}, {"n": 20, "under_routed": 0.5}, True), (True, True))
+        self.assertEqual(evaluate.promote_decision(c, bar, None, {"n": 20, "band_accuracy": 1.0, "under_routed": 0.0}, True), (False, False))
+        # no regression on either outcome metric → promotes, and records that the check ran
+        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 0.9, "under_routed": 0.1},
+                                                   {"n": 20, "band_accuracy": 0.9, "under_routed": 0.1}, True), (True, True))
 
     def test_promote_decision_unaffected_without_outcomes_and_never_promotes_without_a_bar(self):
         import evaluate
