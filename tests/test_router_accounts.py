@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cortados_router import core
+from cortados_router import core, execution_routing
+from cortados_router.provider import routing
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,5 +75,83 @@ class ReserveRoutingTests(unittest.TestCase):
         self.assertEqual(r["chosen"]["lane"], "codex")
 
 
+REF2 = {b: {"general": v, "writing": v} for b, v in (("R1", 10), ("R2", 50), ("R3", 80), ("R4", 95))}
+# two Claude models: a weak Sonnet-class and a strong Fable (separately metered as the "fable" pool)
+MS2 = {"use_cases": {"writing": ""}, "reference_index": REF2,
+       "models": [{"family": "sonnet", "ceiling": False, "proxy": False, "index": {"general": 42, "writing": 42}, "price_1m_blended_usd": 4.0,
+                   "reach": [{"lane": "claude", "provider": "claude-cli", "model": "claude-sonnet-5"}]},
+                  {"family": "fable", "ceiling": False, "proxy": False, "index": {"general": 81, "writing": 81}, "price_1m_blended_usd": 10.0,
+                   "reach": [{"lane": "claude", "provider": "claude-cli", "model": "claude-fable-5-1"}]}]}
+
+
+class ReserveNeverOverridesCapabilityTests(unittest.TestCase):
+    """Codex review finding 3: with the needed model spent on B but available on reserve A, the reserve preference must
+    not pick an underqualified B model. A's qualifying Fable must win."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        self._env = (os.environ.get("CORTADOS_ROUTER_TABLES"), os.environ.get("CORTADOS_ROUTING_TABLE"))
+        os.environ["CORTADOS_ROUTER_TABLES"] = self.dir
+        os.environ["CORTADOS_ROUTING_TABLE"] = str(ROOT / "tables/routing-table.json")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core.model_scores = lambda: MS2
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in zip(("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE"), self._env):
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_reserve_A_fable_wins_when_B_fable_is_spent(self):
+        # B's Fable pool spent, everything else healthy; a hard writing task needs the Fable-class index
+        fable_spent = {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {},
+                       "pools": {"fable": {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}}}}
+        core.lane_health = lambda: {"claude": OK, "claude#b": fable_spent}
+        r = core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="writing"))     # D≈9 → needs the Fable-class index
+        self.assertEqual(r["chosen"]["model"], "claude-fable-5-1")
+        self.assertEqual(r["chosen"]["lane"], "claude")                                  # reserve A, because B's Fable is spent
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectorPropagatesAccountTests(unittest.TestCase):
+    """Codex review findings 1 & 2: a sibling-account route survives execution_routing.select's allowlist, and the
+    selected account is returned so the provider can run it on that login."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.home = tempfile.mkdtemp()
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=self.home, CORTADOS_SCARCITY_REFRESH="off")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core.model_scores = lambda: MS
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def _select(self):
+        fit = {"known": True, "assembled": True, "input_tokens": 10, "input_bytes": 40, "source": "test"}
+        return execution_routing.select(core, prompt="refactor the auth module", platform="cli", face="provider",
+                                        entrypoint="provider", input_fit=fit,
+                                        constraints={"allowed_routes": list(routing.served_routes(core))},
+                                        credential_resolver=lambda *, requested, target_model: None)
+
+    def test_sibling_survives_and_account_is_returned(self):
+        core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": SCARCE}
+        r = self._select()
+        self.assertEqual(r.get("provider"), "claude-cli#b")      # B survived the allowlist intersection and was chosen
+        self.assertEqual(r.get("account"), "b")                  # account propagated to the result for the backend
+
+    def test_reserve_A_takes_over_through_the_selector_when_B_spent(self):
+        core.lane_health = lambda: {"claude": OK, "claude#b": SPENT, "codex": SCARCE}
+        r = self._select()
+        self.assertEqual(r.get("provider"), "claude-cli")        # base = account A
+        self.assertEqual(r.get("account"), "a")

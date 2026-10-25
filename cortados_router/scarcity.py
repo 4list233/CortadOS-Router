@@ -475,8 +475,10 @@ def _local() -> dict[str, Any]:
 
 
 def pool_for(lane: str, model: str, pools: list[str]) -> str | None:
-    """Which separately-metered pool a model draws from, beyond the lane's general windows."""
+    """Which separately-metered pool a model draws from, beyond the lane's general windows. Base-lane aware, so a
+    per-account lane (claude#b) maps the same way as its vendor (claude)."""
     m = (model or "").lower()
+    lane = (lane or "").split("#", 1)[0]
     if lane == "cursor":
         return "cursor-models" if re.search(r"grok|composer|^auto$|^default$|vega", m) else "other-models"
     if lane == "antigravity":

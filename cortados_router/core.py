@@ -381,7 +381,14 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
                ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
         uc = (sc.unit_costs() or {}).get(key or "") or {}
-        return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
+        if "#" not in c["lane"]:                                     # base/default account: the learned absolute remaining
+            return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
+        # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
+        # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
+        tpp = uc.get("tokens_per_pct")
+        gen = [w for w in (lane.get("windows") or []) if w.get("pool", "all") == "all"] or (lane.get("windows") or [])
+        headroom = min((w.get("headroom_pct") for w in gen if w.get("headroom_pct") is not None), default=None)
+        return float(tpp) * float(headroom) if tpp and headroom is not None else None
     except Exception:
         return None
 
@@ -615,16 +622,20 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             native = native_lane_for(c.get("family") or c["model"])
             c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
             if c["secondary"]:
-                nat = health.get(native) or {}
-                nat_pool = candidate_health({"lane": native, "model": c.get("family") or c["model"]}, health) if nat else {}
-                if nat and nat_pool.get("ok", True):
+                # native-first holds while ANY configured native account still has this model's pool (not just the bare lane):
+                # with account A spent but B available, a Cursor Claude route must still wait for B.
+                nat_lanes = [l for l in health if _base_lane(l) == native]
+                nat_ok = any(candidate_health({"lane": l, "model": c.get("family") or c["model"]}, health).get("ok", False) for l in nat_lanes)
+                if nat_ok:
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
-        # reserve accounts (accounts.json "reserve": true): spared while a non-reserve sibling account of the same vendor has room,
-        # so e.g. account A is kept in reserve and work goes to account B until B is spent. The expiring-credit term still steers
-        # usage onto whichever account's unused weekly credit is about to reset.
+        # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling account
+        # is available — so account A is kept in reserve while B can serve this model, but A is used when B's pool for it is
+        # spent (never letting the reserve preference pick an underqualified model). The expiring-credit term still steers usage
+        # onto whichever account's unused weekly credit is about to reset.
         for c in cands:
-            if c.get("reserve") and any(_base_lane(k["lane"]) == _base_lane(c["lane"]) and not k.get("reserve") and ok_of(k) for k in cands):
-                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; {_base_lane(c['lane'])} has a non-reserve account with room"}
+            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
+                                        and not k.get("reserve") and ok_of(k) for k in cands):
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
             same = lambda k: (abs(k["price"] - c["price"]) <= 0.25 * max(k["price"], c["price"]) if k.get("price") and c.get("price")
