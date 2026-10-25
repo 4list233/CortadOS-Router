@@ -939,17 +939,14 @@ class OutcomeEvalTests(OutcomeCase):
         import evaluate
         c = {"n": 100, "band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
         bar = {"band_accuracy": 0.9, "under_routed": 0.1, "outward_recall": 1.0}
-        # candidate OVER-routes every outcome: outcome band accuracy 1.0 → 0.0, under-routing unchanged → BLOCKED
+        perfect = {"n": 20, "band_hits": 20, "under": 0}       # incumbent on the outcome holdout
+        self.assertEqual(evaluate.promote_decision(c, bar, perfect, {"n": 20, "band_hits": 19, "under": 0}, True)[0], False)  # over-routes one → BLOCKED
+        self.assertEqual(evaluate.promote_decision(c, bar, perfect, {"n": 20, "band_hits": 19, "under": 1}, True)[0], False)  # under-routes one → BLOCKED
+        self.assertEqual(evaluate.promote_decision(c, bar, None, {"n": 20, "band_hits": 20, "under": 0}, True), (False, False))  # no outcome bar → blocked
+        self.assertEqual(evaluate.promote_decision(c, bar, {"n": 20, "band_hits": 18, "under": 2}, {"n": 20, "band_hits": 20, "under": 0}, True), (True, True))  # candidate better/equal → promotes
+        # a bar WITHOUT raw counts (legacy cache) is never trusted on rounded ratios → blocked
         self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 1.0, "under_routed": 0.0},
-                                                   {"n": 20, "band_accuracy": 0.0, "under_routed": 0.0}, True)[0], False)
-        # outcome under-routing regresses by one → BLOCKED (no slack)
-        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 1.0, "under_routed": 0.0},
-                                                   {"n": 20, "band_accuracy": 1.0, "under_routed": 0.05}, True)[0], False)
-        # outcome holdouts exist but NO outcome bar (cache miss / grading failure) → blocked, not defaulted to OK
-        self.assertEqual(evaluate.promote_decision(c, bar, None, {"n": 20, "band_accuracy": 1.0, "under_routed": 0.0}, True), (False, False))
-        # no regression on either outcome metric → promotes, and records that the check ran
-        self.assertEqual(evaluate.promote_decision(c, bar, {"band_accuracy": 0.9, "under_routed": 0.1},
-                                                   {"n": 20, "band_accuracy": 0.9, "under_routed": 0.1}, True), (True, True))
+                                                   {"n": 20, "band_hits": 20, "under": 0}, True)[0], False)
 
     def test_promote_decision_uses_raw_outcome_counts_not_rounded(self):
         import evaluate

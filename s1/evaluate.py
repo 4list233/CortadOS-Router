@@ -139,13 +139,14 @@ def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
 
 
 def _no_outcome_regression(co: dict, obar: dict) -> bool:
-    """No regression on outcome band accuracy or under-routing. Compared on RAW counts (cross-multiplied, exact — a
-    one-task regression on a large holdout cannot round away) when both grades carry them, else on the rounded ratios
+    """No regression on outcome band accuracy or under-routing, compared on RAW counts (cross-multiplied, exact — a
+    one-task regression on a large holdout cannot round away). A grade without raw counts (a legacy cache) returns
+    False → promotion is blocked until that bar is recomputed with raw counts, never compared on rounded ratios
     (Codex review 2026-10-25). The candidate and the bar are graded on the same outcome holdout."""
-    if all(k in co and k in obar for k in ("band_hits", "under", "n")) and co["n"] and obar["n"]:
-        return (co["band_hits"] * obar["n"] >= obar["band_hits"] * co["n"]
-                and co["under"] * obar["n"] <= obar["under"] * co["n"])
-    return co["band_accuracy"] >= obar["band_accuracy"] and co["under_routed"] <= obar["under_routed"]
+    if not (all(k in co and k in obar for k in ("band_hits", "under", "n")) and co["n"] and obar["n"]):
+        return False
+    return (co["band_hits"] * obar["n"] >= obar["band_hits"] * co["n"]
+            and co["under"] * obar["n"] <= obar["under"] * co["n"])
 
 
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
@@ -279,8 +280,9 @@ def main() -> int:
                 try:
                     ohkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in o_holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
                     obar_p = DATA / f"outcome-bar-{Path(cur['adapter']).parent.name}-{ohkey}.json"
-                    if obar_p.exists():
-                        report["outcome_bar"] = json.loads(obar_p.read_text())
+                    cached = json.loads(obar_p.read_text()) if obar_p.exists() else None
+                    if cached and "band_hits" in cached:       # a legacy cache without raw counts is recomputed, not trusted
+                        report["outcome_bar"] = cached
                     else:
                         inc = inc or Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
                         obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)

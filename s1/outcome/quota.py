@@ -96,6 +96,11 @@ def _confirmed_shared(lane: str, model: str | None) -> bool:
 # weekly passes ~48 %. Forest asserted a 50/50 split for his account (2026-10-25); set CORTADOS_FABLE_WEEKLY_SHARE=0.5 to
 # model Fable at that split (then Fable util == weekly util) at his own risk (Codex review 2026-10-25).
 FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
+# How much of ITS OWN cap one call consumes relative to the weekly budget, per separately-metered pool. A call is about
+# 1 % of the weekly budget (ASSUMED_PCT_PER_CALL); Fable's cap is HALF that budget, so the same call is ~2 % of Fable's
+# cap. Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
+# scale, so pending calls are not under-counted when the panel recovers before they appear in a sample (Codex review).
+POOL_CAP_SCALE = {"fable": 2.0}
 
 
 def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:
@@ -113,12 +118,11 @@ def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | Non
     if not week:
         return None
     factor = 2.0 * FABLE_WEEKLY_SHARE                           # Fable cap is half the budget → ×2; share 1.0 = worst case
-    derived = {**week, "window": f"week (fable, derived ×{factor:.2f} from weekly)", "pool": "fable",
-               "derived": True, "cap_scale": factor}           # verdict scales reservations by cap_scale too (Codex review)
-    for k in ("used_pct", "projected_pct_at_reset"):
+    derived = {**week, "window": "week (fable, derived from weekly)", "pool": "fable", "derived": True}
+    for k in ("used_pct", "projected_pct_at_reset"):            # convert weekly utilisation into Fable-cap utilisation
         if isinstance(week.get(k), (int, float)):
             derived[k] = min(100.0, week[k] * factor)
-    return derived
+    return derived                                             # cap_scale for reservations is set from POOL_CAP_SCALE in _windows
 
 
 def _windows(sc, lane: str, model: str | None):
@@ -164,9 +168,16 @@ def _windows(sc, lane: str, model: str | None):
             return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
                           "unknown and it may have an unobserved cap")
     pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None
-    applicable = [dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched,
-                       key=f"{lane}|{w.get('window')}|{w.get('pool', 'all')}")
-                  for w in windows if w.get("pool", "all") in ("all", pool) and not w.get("stale")]
+    applicable = []
+    for w in windows:
+        wp = w.get("pool", "all")
+        if wp not in ("all", pool) or w.get("stale"):
+            continue
+        # Reservation identity is STABLE across a pool's derived and measured readings (their window names differ):
+        # pooled windows key on the pool, general windows on the window name (Codex review 2026-10-25).
+        key = f"{lane}|pool|{wp}" if wp != "all" else f"{lane}|win|{w.get('window')}"
+        applicable.append(dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched, key=key,
+                               cap_scale=w.get("cap_scale", POOL_CAP_SCALE.get(wp, 1.0))))
     if not applicable:
         return None, "no usage window applies"
     return applicable, None
