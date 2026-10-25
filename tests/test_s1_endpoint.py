@@ -3,7 +3,9 @@ bind follows CORTADOS_S1_BIND. No network and no real config file: every case pa
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 from cortados_router import s1_endpoint as ep
 
@@ -75,6 +77,33 @@ class ResolveUrlTests(unittest.TestCase):
         path = self.write({"default": "studio", "endpoints": {"studio": "10.0.0.5:8431"}})
         with self.assertRaises(ValueError):
             ep.resolve_url(environ=env(CORTADOS_S1_ENDPOINTS=path))
+
+
+class ClientAuthTests(unittest.TestCase):
+    """core.decide_s1 must present the bearer token (when configured) and its own timeout, or a token-guarded scorer
+    rejects every routing decision with 401."""
+
+    def _capture(self, token):
+        from cortados_router import core
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["headers"] = {k.lower(): v for k, v in req.headers.items()}
+            raise urllib.error.URLError("captured")          # abort after the headers are built
+
+        with patch.object(core, "S1_TOKEN", token), patch("urllib.request.urlopen", fake_urlopen):
+            core.decide_s1("hello")
+        return seen["headers"]
+
+    def test_sends_bearer_and_timeout_when_token_set(self):
+        h = self._capture("abc")
+        self.assertEqual(h.get("authorization"), "Bearer abc")
+        self.assertIn("x-request-timeout-s", h)
+
+    def test_no_authorization_header_without_token(self):
+        h = self._capture(None)
+        self.assertNotIn("authorization", h)
+        self.assertIn("x-request-timeout-s", h)              # timeout is always propagated
 
 
 class BindAddressTests(unittest.TestCase):

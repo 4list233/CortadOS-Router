@@ -22,17 +22,19 @@ from student import Scorer  # noqa: E402
 
 CURRENT = HERE / "current.json"
 _state: dict = {"scorer": None, "mtime": 0.0, "model": None, "loaded_s": None}
-_jobs: "queue.Queue[tuple[dict, queue.Queue]]" = queue.Queue()
-
 
 MAX_RSS_GB = float(os.environ.get("CORTADOS_S1_MAX_RSS_GB", "6"))
 # Guards that matter once CORTADOS_S1_BIND exposes the port beyond loopback: one MLX worker serves everything, so an
 # unbounded body or backlog from any reachable host is a resource-exhaustion lever. These bound it; the tailnet (or a
 # token) is the access boundary.
 MAX_BODY_BYTES = int(os.environ.get("CORTADOS_S1_MAX_BODY_BYTES", str(256 * 1024)))  # a score request is a few KB; refuse larger reads outright
-MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))                   # cap the backlog: a flood is refused (503), never queued without limit
-REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # client wait; a job still queued past this is dropped unscored by the worker
+MAX_PENDING = int(os.environ.get("CORTADOS_S1_MAX_PENDING", "32"))                   # cap the backlog: the bounded queue below refuses a flood (503)
+REPLY_TIMEOUT_S = float(os.environ.get("CORTADOS_S1_REPLY_TIMEOUT_S", "60"))         # hard ceiling on the client wait; the client's own timeout usually shortens it
 TOKEN = os.environ.get("CORTADOS_S1_TOKEN") or None                                  # when set, POST /score needs Authorization: Bearer <token>; loopback default leaves it unset
+
+# Bounded, so a put_nowait that would exceed MAX_PENDING raises queue.Full and the handler returns 503 atomically -- a
+# qsize() check before a separate put races under ThreadingHTTPServer and lets concurrent handlers overshoot.
+_jobs: "queue.Queue[tuple[dict, queue.Queue, float]]" = queue.Queue(maxsize=MAX_PENDING)
 
 
 def score_request(body, scorer, *, task_context_contract=None):
@@ -53,16 +55,42 @@ def score_request(body, scorer, *, task_context_contract=None):
     return result
 
 
-def admission(auth: str, length: int, pending: int):
-    """Why a POST /score is refused before it reaches the worker, or None to admit it. Pure, so it is unit-tested
-    without a socket: token (when set), body-size cap, backlog cap."""
+def admission(auth: str, length: int):
+    """Why a POST /score is refused before its body is read, or None to admit it. Pure, so it is unit-tested without a
+    socket: token (when set), a sane Content-Length, body-size cap. The backlog cap is enforced at enqueue, atomically."""
     if TOKEN is not None and auth != f"Bearer {TOKEN}":
         return 401, {"error": "unauthorized"}
+    if length < 0:                                           # a negative Content-Length would make rfile.read(length) read until EOF, unbounded
+        return 400, {"error": "negative Content-Length"}
     if length > MAX_BODY_BYTES:
         return 413, {"error": f"request body {length} exceeds {MAX_BODY_BYTES} bytes"}
-    if pending >= MAX_PENDING:
-        return 503, {"error": "scorer busy: pending queue full"}
     return None
+
+
+def client_wait(header: str | None) -> float:
+    """The server's wait for this request: the caller's own timeout (X-Request-Timeout-S) when sane, capped at
+    REPLY_TIMEOUT_S. Propagating it lets the worker drop a job the caller has already abandoned."""
+    if not header:
+        return REPLY_TIMEOUT_S
+    try:
+        t = float(header)
+    except ValueError:
+        return REPLY_TIMEOUT_S
+    return max(0.0, min(REPLY_TIMEOUT_S, t))
+
+
+def enqueue(body: dict, deadline: float):
+    """(reply_queue, None) when the job is queued, or (None, refusal) when the bounded backlog is full."""
+    reply: queue.Queue = queue.Queue()
+    try:
+        _jobs.put_nowait((body, reply, deadline))
+    except queue.Full:
+        return None, (503, {"error": "scorer busy: pending queue full"})
+    return reply, None
+
+
+def _expired(deadline: float) -> bool:
+    return deadline is not None and time.time() > deadline
 
 
 def _rss_gb() -> float:
@@ -75,11 +103,14 @@ def worker() -> None:
     n = 0
     while True:
         body, reply, deadline = _jobs.get()
-        if deadline is not None and time.time() > deadline:   # the client already gave up; don't spend an MLX pass on a dead request
+        if _expired(deadline):                                # the client already gave up; don't spend an MLX pass on a dead request
             reply.put({"error": "dropped: client deadline passed before scoring"})
             continue
         try:
             ensure_loaded()
+            if _expired(deadline):                            # loading the scorer can take seconds; re-check right before spending the pass
+                reply.put({"error": "dropped: client deadline passed during model load"})
+                continue
             reply.put(score_request(body, _state['scorer'], task_context_contract=_state.get('task_context_contract')))
         except Exception as exc:
             reply.put({"error": f"{type(exc).__name__}: {exc}"})
@@ -114,14 +145,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            refusal = admission(self.headers.get("Authorization", ""), length, _jobs.qsize())
-            if refusal is not None:                           # token / oversized body / full backlog: refuse before reading or queuing
+            self.connection.settimeout(REPLY_TIMEOUT_S)       # bound a stalled upload so it cannot hold a handler thread forever
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._send(400, {"error": "bad Content-Length"}); return
+            refusal = admission(self.headers.get("Authorization", ""), length)
+            if refusal is not None:                           # token / bad length / oversized body: refuse before reading
                 self._send(*refusal); return
-            body = json.loads(self.rfile.read(length) or b"{}")
-            reply: queue.Queue = queue.Queue()
-            _jobs.put((body, reply, time.time() + REPLY_TIMEOUT_S))
-            r = reply.get(timeout=REPLY_TIMEOUT_S)
+            body = json.loads(self.rfile.read(length) or b"{}")   # length is now 0..MAX_BODY_BYTES
+            wait = client_wait(self.headers.get("X-Request-Timeout-S"))
+            reply, full = enqueue(body, time.time() + wait)
+            if full is not None:                              # bounded backlog full: shed load
+                self._send(*full); return
+            r = reply.get(timeout=max(wait, 1.0))
             self._send(500 if "error" in r else 200, {**r, "model": _state["model"]})
         except Exception as exc:
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
