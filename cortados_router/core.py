@@ -21,6 +21,8 @@ import subprocess
 import threading
 import time
 import urllib.request
+import urllib.error
+import http.client
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -162,6 +164,8 @@ def table() -> dict[str, Any]:
 from cortados_router.s1_endpoint import resolve_url as _resolve_s1_url
 S1_URL = _resolve_s1_url()   # explicit CORTADOS_S1_URL, else a named device from the endpoints file, else loopback
 S1_TIMEOUT_S = float(_env_get("CORTADOS_S1_TIMEOUT_S", "15"))
+S1_RETRIES = int(_env_get("CORTADOS_S1_RETRIES", "1"))   # one retry on a transient connection error before degrading (Forest 2026-10-26)
+S1_RETRY_BACKOFF_S = float(_env_get("CORTADOS_S1_RETRY_BACKOFF_S", "0.3"))
 S1_TOKEN = _env_get("CORTADOS_S1_TOKEN")   # sent as a bearer when the chosen scorer requires one (a non-loopback bind)
 FAIL_UP_BELOW = float(_env_get("CORTADOS_S1_FAIL_UP", "0.75"))   # Forest 2026-09-24: the right answer over cost   # a feature whose top probability is below this takes the HIGHER of its two most likely levels
 OUTWARD_AT = float(_env_get("CORTADOS_S1_OUTWARD_AT", "0.25"))   # the destructive question is called at a lower probability (Jev: stricter gate for destructive actions)
@@ -185,10 +189,24 @@ def decide_s1(text: str, unit_kind: str = "interactive", *, task_context=None) -
             headers["Authorization"] = f"Bearer {S1_TOKEN}"
         req = urllib.request.Request(f"{S1_URL}/score", data=json.dumps(payload).encode(),
                                      headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=S1_TIMEOUT_S) as r:
-            d = json.loads(r.read())
-    except Exception as exc:
+    except Exception as exc:                             # building the request failed: nothing to retry
         return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    # One quick retry on a transient connection error: a restarting or momentarily overloaded S1 closes the connection
+    # (Connection refused / RemoteDisconnected), which a single retry rides out before we fall back to degraded (Forest 2026-10-26).
+    _transient = (urllib.error.URLError, http.client.HTTPException, OSError)
+    d = None
+    for _attempt in range(S1_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=S1_TIMEOUT_S) as r:
+                d = json.loads(r.read())
+            break
+        except _transient as exc:
+            if _attempt < S1_RETRIES:
+                time.sleep(S1_RETRY_BACKOFF_S)
+                continue
+            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        except Exception as exc:                          # a non-transient error (e.g. a malformed body): do not retry
+            return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
     if d.get("error") or not d.get("answers"):
         return {"answers": None, "degraded": True, "engine": "s1", "engine_ms": int((time.time() - t0) * 1000), "error": str(d.get("error"))[:200]}
     if digest is not None and d.get('task_context_digest') != digest:
@@ -677,7 +695,13 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                 c["weight"] = round(100.0 * c["price"] / price_ref, 1) if c.get("price") else (0.0 if c["lane"] == "local" else c["general"])
         for c in cands:
             sc = sc_of(c)
-            c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0) - sel.get("expiring_credit_points", 80) * max(-sc, 0.0), 1)
+            # Forest 2026-10-26 (reserve by time-to-reset): a window that resets SOON with credit unspent must beat one
+            # that is merely under-pace with a far reset. scarcity.window_view sets expiring_pct only for a weekly+ window
+            # past 85% elapsed, equal to the share that will be wasted at the current pace; the under-pace gap (-sc) alone
+            # wrongly prefers the account with more headroom but a distant reset, so add a strong deadline discount keyed
+            # on that time-gated signal. It is zero outside the expiring zone, so routing elsewhere is unchanged.
+            c["cost"] = round(c["weight"] + sel.get("scarcity_points", 30) * max(sc, 0.0) - sel.get("expiring_credit_points", 80) * max(-sc, 0.0)
+                              - float(sel.get("expiring_soon_points", 250)) * (exp_of(c) / 100.0), 1)
             # capacity (Forest 2026-09-26): plans are not normalised; among pools with room, the one with the most TOKENS left gets a further credit
             tl = _tokens_left_for(c)
             # the credit needs a FRESH reading: an unknown or failed pool (scarcity None, read as 0 above) earns nothing
