@@ -55,6 +55,10 @@ def _err(text: str) -> dict:
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
                urlopen=urllib.request.urlopen) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
+    provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
+    # Never let the token reach model-visible text. Only a token long enough to be a real secret is scrubbed; a short
+    # token is not a credential and scrubbing it would mangle ordinary words (a real provider token is a long random string).
+    scrub = (lambda s: s.replace(token, "***")) if (token and len(token) >= 8) else (lambda s: s)
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
     if not (task and str(task).strip()):
@@ -77,10 +81,11 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
             detail = ": " + (json.loads(exc.read()).get("error", {}).get("message") or "")[:300]
         except Exception:
             pass
-        return _err(f"cortados route_task: provider returned HTTP {exc.code}{detail}")
+        return _err(scrub(f"cortados route_task: provider returned HTTP {exc.code}{detail}"))
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-        # http.client.HTTPException covers a truncated body (IncompleteRead) after a dropped connection.
-        return _err(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})")
+        # http.client.HTTPException covers a truncated body (IncompleteRead) after a dropped connection; ValueError covers
+        # urllib's header validation, whose message would otherwise echo the token (scrubbed above).
+        return _err(scrub(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})"))
     if not isinstance(data, dict) or data.get("type") == "error" or data.get("error"):
         msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
         return _err(f"cortados route_task: routing error: {msg or data}")
@@ -156,8 +161,8 @@ def main() -> None:
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
-            continue                                    # a malformed line is skipped, not fatal
+        except (ValueError, RecursionError):
+            continue                                    # a malformed or pathologically nested line is skipped, not fatal
         for one in (msg if isinstance(msg, list) else [msg]):   # tolerate a JSON-RPC batch by dispatching each element
             _dispatch(one, cfg)
 

@@ -165,3 +165,65 @@ class ResponsivenessTests(unittest.TestCase):
         finally:
             m.route_task = orig
             gate.set()
+
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SERVER = Path(__file__).resolve().parents[1] / "cortados_router" / "subagent_mcp.py"
+
+
+class TokenSafetyTests(unittest.TestCase):
+    def test_error_text_never_contains_the_token(self):
+        tok = "synthetic-review-secret"
+
+        def _boom(req, timeout=None):
+            raise ValueError(f"Invalid header value {tok!r}")       # mimics urllib's header-validation error
+        r = m.route_task("http://x", tok, "task", urlopen=_boom)
+        self.assertTrue(r["isError"])
+        self.assertNotIn(tok, r["content"][0]["text"])
+        self.assertIn("***", r["content"][0]["text"])
+
+    def test_token_whitespace_is_stripped_from_the_header(self):
+        seen = {}
+
+        def _open(req, timeout=None):
+            seen["token"] = req.headers.get("X-api-key")
+            return FakeResp({"content": [{"type": "text", "text": "ok"}]})
+        m.route_task("http://x", "tok\n", "task", urlopen=_open)
+        self.assertEqual(seen["token"], "tok")
+
+
+class DeepNestCrashTests(unittest.TestCase):
+    def test_deeply_nested_line_does_not_crash_the_server(self):
+        env = {**os.environ, "CORTADOS_PROVIDER_URL": "http://127.0.0.1:1", "CORTADOS_PROVIDER_TOKEN": "t"}
+        p = subprocess.Popen([sys.executable, str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             env=env, text=True, bufsize=1)
+        got = {"msg": None}
+
+        def reader():
+            for line in p.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == "ping-x":
+                    got["msg"] = msg
+                    break
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            p.stdin.write("[" * 1500 + "]" * 1500 + "\n")           # pathologically nested → RecursionError in json.loads
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": "ping-x", "method": "ping"}) + "\n")
+            p.stdin.flush()
+            t.join(6)
+            self.assertIsNotNone(got["msg"])                        # the server survived the nested line and still answered the ping
+        finally:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+            p.terminate()
+            p.wait(timeout=5)
