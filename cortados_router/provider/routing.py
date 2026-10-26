@@ -33,11 +33,26 @@ PLATFORM = "cli"
 _INJECTED = re.compile(r"<(system-reminder|system-message)>.*?</\1>", re.S)
 
 
+def _base_provider(p: str) -> str:
+    """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
+    return (p or "").split("#", 1)[0]
+
+
 def served_routes(core) -> tuple[tuple[str, str], ...]:
     rows = [r for m in (core.model_scores() or {}).get("models", []) for r in m.get("reach", [])]
     rows += [r for band in core.table()["candidates"].values() for r in band]
     pairs = {(CLONED_PROVIDERS.get(r["provider"], r["provider"]), r["model"]) for r in rows}
-    return tuple(sorted(p for p in pairs if p[0] in SERVED_PROVIDERS))
+    served = {p for p in pairs if p[0] in SERVED_PROVIDERS}
+    # Expand each Claude pair across configured accounts (claude-cli, claude-cli#b, …) so a second-account candidate
+    # survives the allowlist filter in execution_routing.select; one account leaves this unchanged. A broken accounts
+    # config refuses Claude (drops its pairs) rather than serving it on an ambient login.
+    try:
+        accts = core._vendor_accounts("claude", "claude", "claude-cli")
+    except core.AccountsConfigError:
+        return tuple(sorted(p for p in served if _base_provider(p[0]) != "claude-cli"))
+    if len(accts) > 1:
+        served |= {(a["provider"], model) for (prov, model) in set(served) if prov == "claude-cli" for a in accts}
+    return tuple(sorted(served))
 
 
 def strip_injected(text: str) -> str:
@@ -65,7 +80,7 @@ class _NoClaudeWhenDegraded:
 
     def resolve(self, decision, *args, allowed_routes=None, **kw):
         if decision.get("degraded") or not decision.get("answers"):
-            allowed_routes = tuple(p for p in (allowed_routes or ()) if p[0] not in CLAUDE_PROVIDERS)
+            allowed_routes = tuple(p for p in (allowed_routes or ()) if _base_provider(p[0]) not in CLAUDE_PROVIDERS)
         return self._core.resolve(decision, *args, allowed_routes=allowed_routes, **kw)
 
 
@@ -75,10 +90,11 @@ def _credentials(claude_bin: str, codex_bin: str) -> Callable[..., None]:
     binaries = {"claude-cli": claude_bin, "codex-cli": codex_bin}
 
     def check(*, requested: str, target_model: str) -> None:
-        if requested not in SERVED_PROVIDERS:
+        base = _base_provider(requested)        # a per-account provider (claude-cli#b) shares the base binary/login check
+        if base not in SERVED_PROVIDERS:
             raise execution_routing.CredentialsUnavailable(f"{requested} is not served by this endpoint")
-        if not shutil.which(binaries[requested]):
-            raise execution_routing.CredentialsUnavailable(f"{binaries[requested]} is not on PATH")
+        if not shutil.which(binaries[base]):
+            raise execution_routing.CredentialsUnavailable(f"{binaries[base]} is not on PATH")
     return check
 
 
@@ -92,7 +108,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints={"allowed_routes": list(served_routes(core))},
-        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}")
+        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
+        supports_accounts=True)   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])

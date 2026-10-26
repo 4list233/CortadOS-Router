@@ -292,7 +292,7 @@ def required_index(t: dict[str, Any], ms: dict[str, Any], use_case: str, D: int 
     return round(min(max(req, floor), best), 1)
 
 
-def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> list[dict[str, Any]] | None:
+def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = False) -> list[dict[str, Any]] | None:
     """Every reachable model × every subscription that can run it, with its index for this use case. No band lists."""
     ms = model_scores()
     if (t.get("tiering") or {}).get("mode") != "scores" or not ms:
@@ -303,10 +303,12 @@ def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> lis
         if not (t.get("selection") or {}).get("ceiling_by_score") and m["ceiling"] != (band == "R4"):   # G112 mode: ceiling only by escalation
             continue
         for r in m["reach"]:
-            if r["provider"] in KNOWN_PROVIDERS:
-                out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
-                            "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
-    return out or None
+            if r["provider"] not in KNOWN_PROVIDERS:
+                continue
+            out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
+                        "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
+    # One candidate per configured Claude account (Option A, lane-per-account); single default login leaves this unchanged.
+    return _expand_claude_accounts(out, accounts_aware) or None
 
 
 NATIVE_LANE = (("claude", "claude"), ("gpt-oss", None), ("gpt", "codex"), ("o1", "codex"), ("o3", "codex"), ("o4", "codex"), ("gemini", "antigravity"))
@@ -323,6 +325,95 @@ def native_lane_for(model_or_family: str) -> str | None:
     return None
 
 
+def _base_lane(lane: str) -> str:
+    """The vendor lane a per-account lane belongs to: `claude#b` -> `claude`. A bare lane is its own base."""
+    return (lane or "").split("#", 1)[0]
+
+
+class AccountsConfigError(Exception):
+    """tables/accounts.json is present but unreadable/malformed. A broken file must never silently fall back to the
+    default login (that would run on an account outside the configured set); callers refuse the vendor instead."""
+
+
+def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[dict[str, Any]]:
+    """One entry per configured account of a vendor: {lane, provider, account, reserve, config_dir}. The first account
+    keeps the bare lane/provider; others get a `#<id>` suffix. An ABSENT accounts.json (or no entries for this vendor)
+    -> the single default login, exactly today's behaviour. A PRESENT-but-broken file raises AccountsConfigError rather
+    than defaulting. A `reserve` account is spared while a non-reserve sibling has room (see resolve)."""
+    from cortados_router.paths import tables_dir
+    default = [{"lane": base_lane, "provider": base_provider, "account": None, "reserve": False, "config_dir": None}]
+    path = tables_dir() / "accounts.json"
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise AccountsConfigError(f"{path} is present but unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AccountsConfigError(f"{path}: root must be a JSON object, got {type(data).__name__}")
+    if vendor not in data:
+        return default                                         # vendor key simply absent
+    raw = data[vendor]
+    if not isinstance(raw, list):                              # explicit null, a scalar or an object → malformed, never default
+        raise AccountsConfigError(f"{path}: {vendor!r} must be a list of accounts, got {type(raw).__name__}")
+    if not raw:
+        return default                                         # explicit empty list: no accounts for this vendor
+    for a in raw:
+        if not isinstance(a, dict) or not (isinstance(a.get("config_dir"), str) and a["config_dir"].strip()):
+            raise AccountsConfigError(f"{path}: each {vendor!r} account needs a non-empty string config_dir")
+    accts = raw
+    out = []
+    for i, a in enumerate(accts):
+        aid = str(a.get("id") or i)
+        out.append({"lane": base_lane if i == 0 else f"{base_lane}#{aid}",
+                    "provider": base_provider if i == 0 else f"{base_provider}#{aid}",
+                    "account": aid, "reserve": bool(a.get("reserve")),
+                    "config_dir": os.path.expanduser(a["config_dir"])})
+    # Duplicate ids (or ids that collide with a generated lane key) would mix execution and quota identities: routing
+    # would keep two candidates while sampling collapses them to one directory. Reject the collision.
+    lanes = [a["lane"] for a in out]
+    if len(set(a["account"] for a in out)) != len(out) or len(set(lanes)) != len(lanes):
+        raise AccountsConfigError(f"{path}: {vendor!r} account ids must be unique (they key both routing and quota)")
+    return out
+
+
+def _base_provider(provider: str) -> str:
+    """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
+    return (provider or "").split("#", 1)[0]
+
+
+def _expand_claude_accounts(cands: list[dict[str, Any]], accounts_aware: bool = False) -> list[dict[str, Any]]:
+    """Replace each Claude candidate with one per configured account (Option A), binding account id, reserve flag and
+    config_dir. Applied to scored and static/fallback lists so account identity is never lost.
+
+    `accounts_aware` is the host's capability (execution_routing.select sets it from supports_accounts). When accounts
+    ARE configured but the host cannot honour a specific account (accounts_aware False), Claude is excluded entirely
+    rather than offered on the first bare-provider account — otherwise the host would run on its ambient login while the
+    decision was metered against account A. A single default login (no accounts.json) leaves candidates unchanged for
+    every host; a broken config refuses Claude."""
+    try:
+        accts = _vendor_accounts("claude", "claude", "claude-cli")
+    except AccountsConfigError:
+        accts = None                                           # broken config: refuse Claude rather than run on an ambient login
+    configured = accts is not None and (len(accts) > 1 or accts[0].get("account") is not None)
+    out = []
+    for c in cands:
+        is_claude = c.get("lane") == "claude" and _base_provider(c.get("provider", "")) == "claude-cli"
+        if not is_claude or c.get("account") is not None:      # non-Claude, or already expanded
+            out.append(c)
+        elif accts is None:
+            continue                                           # unreadable accounts config: drop Claude
+        elif not configured:
+            out.append(c)                                      # single default login: plain Claude, unchanged for all hosts
+        elif not accounts_aware:
+            continue                                           # accounts configured but host can't honour one: do not offer Claude
+        else:
+            for a in accts:
+                out.append({**c, "lane": a["lane"], "provider": a["provider"], "account": a["account"],
+                            "reserve": a["reserve"], "config_dir": a["config_dir"]})
+    return out
+
+
 def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
     """Learned size of the pool this route draws on (tokens per 1 % of its window), from unit-cost.json; None if unknown."""
     try:
@@ -330,7 +421,7 @@ def _pool_tokens_per_pct(c: dict[str, Any]) -> float | None:
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
+               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
         uc = (sc.unit_costs() or {}).get(key or "") or {}
         return float(uc["tokens_per_pct"]) if uc.get("tokens_per_pct") else None
     except Exception:
@@ -342,11 +433,22 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
     try:
         sc = _scarcity_module()
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+            return None                                              # cached reading is for a different login (reorder or default<->named): no capacity credit
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
-               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((c["lane"], pool))
+               ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
         uc = (sc.unit_costs() or {}).get(key or "") or {}
-        return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
+        if "#" not in c["lane"]:                                     # base/default account: the learned absolute remaining
+            return float(uc["remaining_tokens"]) if uc.get("remaining_tokens") else None
+        # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
+        # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
+        tpp = uc.get("tokens_per_pct")
+        # the model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g. Fable),
+        # so use the min headroom across both, not general alone.
+        relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
+        headroom = min((w.get("headroom_pct") for w in relevant if w.get("headroom_pct") is not None), default=None)
+        return float(tpp) * float(headroom) if tpp and headroom is not None else None
     except Exception:
         return None
 
@@ -366,7 +468,8 @@ def lane_health() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for lane, v in sc.lane_scarcity().items():
         out[lane] = {**_health_row(v.get("scarcity"), v.get("tightest"), v.get("expiring_pct"), v.get("refusing")),
-                     "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()}}
+                     "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()},
+                     "config_dir": v.get("config_dir")}   # the login this reading was sampled from (account identity, not the positional lane name)
         if lane == "local" and v.get("resource_managed"):
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}), why=v.get("why"))
     return out
@@ -382,6 +485,12 @@ def _health_row(s, w, expiring, spent) -> dict[str, Any]:
 def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """A model is as scarce as the tightest pool it draws on: the lane's general windows plus its own pool when it has one."""
     lane = health.get(c["lane"]) or {}
+    if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+        # the cached reading under this positional lane key was sampled from a DIFFERENT login (accounts reordered, or a
+        # default<->named transition — the default login's config_dir is None, a distinct identity). Do not trust it
+        # either way: unavailable until a fresh same-identity sample, rather than risk routing to a spent login.
+        return {"ok": False, "scarcity": None, "expiring_pct": 0, "tightest": {}, "pool": None,
+                "why": "stale cross-account reading; awaiting a fresh sample for this login"}
     if c["lane"] == "local" and lane.get("resource_managed"):
         deployment = (lane.get("deployments") or {}).get(c.get("model"))
         # resource_rejected: unverified or stale local capacity is unroutable, not merely spent, so resolve's last-resort
@@ -409,21 +518,22 @@ def turn_tokens(history_chars: int) -> int:
 
 
 def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> int:
+    b = _base_lane(lane)   # a per-account lane (claude#b) inherits its vendor's context limits, including [1m]
     # A transport-keyed ceiling applies only to the transport that measured it (the Donna
     # model gateway's calibrated fit); unknown or absent transports keep the lane ceiling.
-    by_transport = (_context_cfg().get("ceiling_tokens_by_transport") or {}).get(lane) or {}
+    by_transport = (_context_cfg().get("ceiling_tokens_by_transport") or {}).get(b) or {}
     if transport is not None and transport in by_transport:
         return int(by_transport[transport])
     cx = _context_cfg().get("ceiling_tokens") or {}
-    if lane == "claude" and "[1m]" in (model or ""):
+    if b == "claude" and "[1m]" in (model or ""):
         return int(cx.get("claude[1m]", 1000000))
-    return int(cx.get(lane, 200000))
+    return int(cx.get(b, 200000))
 
 
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
-            execution: bool = False, minimum_band: str | None = None) -> dict[str, Any]:
+            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False) -> dict[str, Any]:
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -458,14 +568,16 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     health, pol = lane_health(), _policy()
     demote, expiring = float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
-    scored = scored_candidates(t, band, ans.get("work_kind"))
-    cands = scored if scored else list(t["candidates"].get(band, []))
+    scored = scored_candidates(t, band, ans.get("work_kind"), accounts_aware)
+    # The static band list carries no account metadata; expand it too, so a missing/unreadable score catalog still binds
+    # the routed Claude account (identity is never lost on the fallback path).
+    cands = scored if scored else _expand_claude_accounts([dict(c) for c in t["candidates"].get(band, [])], accounts_aware)
     # Explicit degraded-service policy: do not spend Claude by default when
     # the scorer cannot classify a request. Retain quota and context-fit gates.
     fallback_routes = (t.get("fallback", {}).get("routes")
                        if not execution and (decision.get("degraded") or not decision.get("answers")) else None)
     if fallback_routes:
-        cands = [dict(c) for c in fallback_routes]
+        cands = _expand_claude_accounts([dict(c) for c in fallback_routes], accounts_aware)
         scored = []
         pref = []
         rules.append("scorer unavailable → configured GPT Terra fallback")
@@ -518,8 +630,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             why = f"turn ≈{need // 1000}k tokens exceeds {c['lane']} ceiling {cap // 1000}k"
         elif fit.get('known') is False and c['lane'] in ('antigravity', 'local'):
             why = 'exact session history unavailable; constrained transport not admitted'
-        elif c['lane'] in byte_caps and int(fit.get('input_bytes') or 0) > int(byte_caps[c['lane']]):
-            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {byte_caps[c['lane']]}"
+        elif _base_lane(c['lane']) in byte_caps and int(fit.get('input_bytes') or 0) > int(byte_caps[_base_lane(c['lane'])]):
+            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {byte_caps[_base_lane(c['lane'])]}"
         elif c['lane'] == 'local' and history_chars // 4 > int(cx.get('local_fresh_only_history_tokens', 8000)):
             why = 'local lanes take fresh-context work only'
         if why:
@@ -531,6 +643,16 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     exp_of = lambda c: ch_of[id(c)].get("expiring_pct") or 0
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     base = {id(c): i for i, c in enumerate(cands)}
+
+    def apply_reserve():
+        # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling is
+        # available, so account A stays in reserve while B can serve this model, but A is used when B's pool for it is spent
+        # (never letting the reserve preference pick an underqualified model). Applied on BOTH the scored and static paths.
+        for c in cands:
+            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
+                                        and not k.get("reserve") and ok_of(k) for k in cands):
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
+
     if scored:
         sel = t["selection"]
         tie = sel.get("lane_tiebreak", [])
@@ -574,15 +696,23 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             if len(weak) < len(cands):
                 for c in weak:
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"below the face floor (general {c['general']} < {floor_g:g})"}
-        # primary-source rule: a Claude/GPT/Gemini route on another provider is secondary, usable only when the vendor's own pool is spent
+        # primary-source rule: a Claude/GPT/Gemini route on another VENDOR is secondary, usable only when the vendor's own pool is spent.
+        # Compare the base lane so a second same-vendor account (claude#b) is NOT treated as a cross-vendor secondary of claude.
         for c in cands:
             native = native_lane_for(c.get("family") or c["model"])
-            c["secondary"] = bool(native) and c["lane"] != native
-            if c["secondary"]:
-                nat = health.get(native) or {}
-                nat_pool = candidate_health({"lane": native, "model": c.get("family") or c["model"]}, health) if nat else {}
-                if nat and nat_pool.get("ok", True):
-                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
+            c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
+        for c in cands:
+            if c.get("secondary"):
+                # native-first holds only while an ELIGIBLE native candidate for the same model is available (any
+                # configured account, including an unsampled one that reads ok). Checking the candidates themselves,
+                # not the scarcity cache, both protects unsampled accounts and never suppresses a secondary when there
+                # is no native route to prefer (single-account deployments keep their Cursor fallback).
+                fam = c.get("family") or c["model"]
+                native = native_lane_for(fam)
+                if any(not k.get("secondary") and _base_lane(k["lane"]) == native
+                       and (k.get("family") or k["model"]) == fam and ok_of(k) for k in cands):
+                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {fam}"}
+        apply_reserve()      # the expiring-credit term still steers usage onto whichever account's credit is about to reset
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
             same = lambda k: (abs(k["price"] - c["price"]) <= 0.25 * max(k["price"], c["price"]) if k.get("price") and c.get("price")
@@ -619,6 +749,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         if target != req:
             rules.append(f"no available model reaches {req}: strongest available ({best_avail}) taken")
     else:
+        apply_reserve()      # the static/fallback path honours the reserve policy too, not only scored selection
         cands.sort(key=lambda c: (0 if exp_of(c) >= expiring and sc_of(c) < demote else 1, 1 if sc_of(c) >= demote else 0,
                                   pref.index(c["lane"]) if c["lane"] in pref else len(pref), base[id(c)]))
     usable = [c for c in cands if ok_of(c)]

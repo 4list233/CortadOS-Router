@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("core", str(ROOT / "cortados_router/core.py")); core = importlib.util.module_from_spec(spec); spec.loader.exec_module(core)
 core.lane_health = lambda: {}  # tests are about the table, not live lane state
 _scored = core.scored_candidates
-core.scored_candidates = lambda t, band, kind: None  # …and about the hand-written fallback candidates; scored selection has its own tests below
+core.scored_candidates = lambda t, band, kind, accounts_aware=True: None  # …and about the hand-written fallback candidates; scored selection has its own tests below
 
 def dec(steps=0, ambiguity=0, blast=0, ctx=0, novelty=0, par=0, **kw):
     a = {"steps": steps, "ambiguity": ambiguity, "blast_radius": blast, "context_size": ctx, "novelty": novelty, "parallelizability": par,

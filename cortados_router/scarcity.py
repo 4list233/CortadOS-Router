@@ -297,15 +297,76 @@ def _cli_env() -> dict[str, str]:
     return env
 
 
-def _claude(prev: dict[str, Any] | None = None) -> dict[str, Any]:
+def _accounts(vendor: str) -> list[dict[str, Any]]:
+    """Configured accounts for a vendor from tables/accounts.json, or [] (the single default login). Shape:
+    {"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "b", "config_dir": "~/.claude-acctB"}]}."""
+    from cortados_router.paths import tables_dir
+    p = tables_dir() / "accounts.json"
+    if not p.exists():
+        return []                                              # absent: single default login
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"accounts.json present but unreadable: {exc}")   # broken: caller refuses Claude sampling, never samples the wrong login
+    if not isinstance(data, dict):
+        raise ValueError("accounts.json: root must be a JSON object")
+    if vendor not in data:
+        return []
+    raw = data[vendor]
+    if not isinstance(raw, list):                              # explicit null / scalar / object → malformed
+        raise ValueError(f"accounts.json: {vendor!r} must be a list of accounts")
+    for a in raw:
+        if not isinstance(a, dict) or not (isinstance(a.get("config_dir"), str) and a["config_dir"].strip()):
+            raise ValueError(f"accounts.json: each {vendor!r} account needs a non-empty config_dir")
+    return raw
+
+
+def claude_lanes() -> list[tuple[str, str | None]]:
+    """(lane_key, config_dir) per Claude account. The first account keeps the bare `claude` key (back-compat); the rest
+    are `claude#<id>`. No accounts.json → [("claude", None)], i.e. today's single default login, unchanged."""
+    try:
+        accts = _accounts("claude")
+    except Exception:
+        return []                                              # broken config: skip Claude sampling rather than read the wrong login
+    if not accts:
+        return [("claude", None)]
+    lanes = [("claude" if i == 0 else f"claude#{a.get('id') or i}", os.path.expanduser(a["config_dir"]))
+             for i, a in enumerate(accts)]
+    if len({k for k, _ in lanes}) != len(lanes):               # duplicate account id → collapsed sampling key: refuse rather than sample one dir for two
+        return []
+    return lanes
+
+
+def _ensure_trust(config_dir: str) -> None:
+    """A fresh per-account CLAUDE_CONFIG_DIR has not accepted the workspace-trust dialog, which blocks the /usage TUI on
+    the folder the probe runs in. Pre-accept it for the home folder so the probe reaches the usage screen."""
+    try:
+        p = Path(config_dir) / ".claude.json"
+        cfg = json.loads(p.read_text()) if p.exists() else {}
+        proj = cfg.setdefault("projects", {}).setdefault(str(Path.home()), {})
+        if not proj.get("hasTrustDialogAccepted"):
+            proj["hasTrustDialogAccepted"] = True
+            p.write_text(json.dumps(cfg, indent=1))
+    except Exception:
+        pass                                                   # best-effort; a real block still surfaces as a probe error
+
+
+def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -> dict[str, Any]:
     # the per-model weeks (Fable, Opus, …) load from a rate-limited endpoint; the screen offers "r to retry". Two gentle presses, never more.
-    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", _cli_env(), run_s=25,
+    env = _cli_env()
+    if config_dir:                                             # a named account: read THIS login's usage, not the default
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)               # an inherited ambient token would override the account's stored login
+        _ensure_trust(config_dir)
+    text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", env, run_s=25,
                        nudge=(r"Current week \((?!all models)[^)]+\)\D{0,160}?\d+\s*% used", r"breakdown unavailable", b"r", 2, 8.0))
     wins = parse_claude_usage(text)
     if not wins:
         raise RuntimeError("no '% used' lines on the /usage screen: " + text[-200:].replace("\n", " "))
-    out: dict[str, Any] = {"source": "claude /usage (pty)"}
-    if not any(w["pool"] != "all" for w in wins):
+    out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir}
+    if not any(w["pool"] != "all" for w in wins) and (prev or {}).get("config_dir") == config_dir:
+        # carry the last per-model reading forward only when it was sampled for THIS same account (config_dir): after a
+        # reorder, the positional lane key may now point to a different login, and its old windows must not cross over.
         out["per_model"] = "not shown this read (vendor rate limit on the per-model panel)"
         for w in (prev or {}).get("windows") or []:          # keep the last per-model reading until its own reset passes
             if w.get("pool", "all") != "all" and w.get("resets_at") and w["resets_at"] > time.strftime("%Y-%m-%d %H:%M"):
@@ -436,8 +497,10 @@ def _local() -> dict[str, Any]:
 
 
 def pool_for(lane: str, model: str, pools: list[str]) -> str | None:
-    """Which separately-metered pool a model draws from, beyond the lane's general windows."""
+    """Which separately-metered pool a model draws from, beyond the lane's general windows. Base-lane aware, so a
+    per-account lane (claude#b) maps the same way as its vendor (claude)."""
     m = (model or "").lower()
+    lane = (lane or "").split("#", 1)[0]
     if lane == "cursor":
         return "cursor-models" if re.search(r"grok|composer|^auto$|^default$|vega", m) else "other-models"
     if lane == "antigravity":
@@ -536,12 +599,28 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         sweep = _reaper.sweep_stale(PROBE_DIR)     # reclaim CLIs orphaned by a sampler process that died mid-probe
         now, plans = time.time(), _plans()
         lanes = dict(prev.get("lanes") or {})
-        due = [l for l in SAMPLERS if (not only or l in only) and (force or now - float((lanes.get(l) or {}).get("tried_at") or 0) >= MIN_INTERVAL[l])]
+        # Expand the one `claude` sampler into one lane per configured account (claude, claude#b, …); every other vendor
+        # is unchanged. Each account lane reads its own login's /usage, so another process spending on an account shows
+        # up in that account's own reading.
+        cl = claude_lanes()
+        claude_dir = {k: cd for k, cd in cl}
+        plan = {k: SAMPLERS["claude"] for k, _ in cl}
+        plan.update({name: fn for name, fn in SAMPLERS.items() if name != "claude"})
+
+        def _base(lane: str) -> str:
+            return lane.split("#", 1)[0]
+
+        def _interval(lane: str) -> float:
+            return MIN_INTERVAL.get(lane) or MIN_INTERVAL.get(_base(lane), 900)
+
+        def _wanted(lane: str) -> bool:
+            return not only or lane in only or _base(lane) in only
+        due = [l for l in plan if _wanted(l) and (force or now - float((lanes.get(l) or {}).get("tried_at") or 0) >= _interval(l))]
         results: dict[str, Any] = {}
 
         def run(lane: str) -> None:
             try:
-                rec = SAMPLERS[lane](lanes.get(lane)) if lane == "claude" else SAMPLERS[lane]()
+                rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
                 results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
             except Exception as exc:      # keep the last good reading, say so
                 old = lanes.get(lane) or {}
@@ -557,8 +636,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         [t.start() for t in threads]
         [t.join(240) for t in threads]          # the Claude /usage probe can take ~100 s when it retries the per-model panel
         for lane, v in results.items():
-            v.setdefault("plan", plans.get(lane))
-            v["plan"] = plans.get(lane) or v.get("plan")
+            v["plan"] = plans.get(lane) or plans.get(_base(lane)) or v.get("plan")   # account lanes inherit the vendor's plan
             lanes[lane] = v
         # The top-level stamp means "last sample that covered the subscription lanes": a partial run (e.g. the 60-second
         # local refresh) keeps the previous one, or current() would never find the probes due again (Codex review 2026-10-21).
@@ -656,7 +734,7 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
         roll = _roll(general) if fresh else {"tightest": {}, "expiring_pct": 0}
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
                      "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {},
-                     "error": v.get("error") if failed else None}
+                     "error": v.get("error") if failed else None, "config_dir": v.get("config_dir")}
         if lane == "local" and managed_local:
             usable = fresh and v.get("resource_managed") is True
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},
@@ -715,7 +793,7 @@ POOL_KEY = {("claude", "week (all models)"): "claude:all", ("claude", "week (fab
 
 
 def tokens_left(lane: str, window: str, used_pct: float) -> float | None:
-    uc = unit_costs().get(POOL_KEY.get((lane, window), ""))
+    uc = unit_costs().get(POOL_KEY.get((lane.split("#", 1)[0], window), ""))   # account lanes (claude#b) share the base pool-size key
     return (100 - used_pct) * uc["tokens_per_pct"] if uc and uc.get("tokens_per_pct") else None
 
 

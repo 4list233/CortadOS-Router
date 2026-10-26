@@ -51,7 +51,8 @@ client (Claude Code, the repo's machine)           CortadOS endpoint
 | P1 | Router in the loop: host-neutral `route_task()`, S1 scores the first request, one model per conversation, route log with `platform: "provider:<client>"`; local-model backend (Ollama / llama.cpp tool calls) | requests of different difficulty land on different lanes; every decision is in the route log |
 | P2 | Codex backend (app-server spike first); Codex as a client (OpenAI Responses wire) — built 2026-10-21, both live acceptance checks passed the same day (P2 status below) | the same summarize check from Codex and onto Codex |
 | P3 | Codex `/status` parser fix (SUBAGENT-MCP-PLAN §11.7) and inventory refresh, alongside P1–P2 | codex lane shows a non-null scarcity |
-| Later | multiple accounts per vendor; CLI runners on other machines (the Air); one model across machines; cloud clients (needs a public endpoint with auth, and a verified `BASE_URL` override in the cloud client); API-key lanes | |
+| Phase A | multiple Claude accounts (Option A, lane-per-account): each account is its own scarcity lane/pool with its own reset, sampled from its own `CLAUDE_CONFIG_DIR`; the cost formula routes between them (unused weekly credit attracts work before it resets), and a `reserve` account is spared while a non-reserve sibling has room; the provider runs the chosen account on its login. Config: `tables/accounts.json` (git-ignored; copy `accounts.example.json`). Codex multi-account (per-account `CODEX_HOME`) is Phase B. | two accounts show distinct usage/resets; routing steers to the non-reserve/expiring account; a turn runs on the chosen account |
+| Later | CLI runners on other machines (the Air); one model across machines; cloud clients (needs a public endpoint with auth, and a verified `BASE_URL` override in the cloud client); API-key lanes (Phase C) | |
 
 ## P1 status (2026-10-20)
 

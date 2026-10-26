@@ -101,12 +101,18 @@ class UnservedProvider(BridgeError):
     """The route names a provider this endpoint has no backend for; the server answers 503, never a guess."""
 
 
-def _claude_session(reg: "Registry", **kw) -> BridgeSession:
-    return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin, **kw)
+def _base_provider(p: str) -> str:
+    """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
+    return (p or "").split("#", 1)[0]
 
 
-def _codex_session(reg: "Registry", **kw) -> CodexSession:
-    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, **kw)
+def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> BridgeSession:
+    return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin,
+                         config_dir=config_dir, **kw)
+
+
+def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> CodexSession:
+    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, **kw)   # Codex multi-account is Phase B
 
 
 # Backend per route provider. Each factory takes the registry (for its binary and gateway settings, read at call time
@@ -130,13 +136,34 @@ class Registry:
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
 
+    def claude_config_dir(self, account: str | None) -> str | None:
+        """The CLAUDE_CONFIG_DIR for a routed Claude account id, from tables/accounts.json; None (the default login)
+        when no account is named or none is configured."""
+        if not account:
+            return None
+        try:
+            from cortados_router import core
+            for a in core._vendor_accounts("claude", "claude", "claude-cli"):
+                if a.get("account") == account:
+                    return a.get("config_dir")
+        except Exception:
+            pass
+        return None
+
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None):
         provider = route["provider"] if route else "claude-cli"
-        factory = self._factories.get(provider)
+        factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
-        s = factory(self, system=turn.system, tools=turn.tools, model=route["model"] if route else self.model)
+        kw = {"system": turn.system, "tools": turn.tools, "model": route["model"] if route else self.model}
+        if route and route.get("account"):          # a multi-account route carries its account + the config_dir resolved AT selection
+            cfg = route.get("config_dir")
+            if not cfg:                             # a named account that cannot be resolved must refuse, never fall back to the default login
+                raise UnservedProvider(f"routed to account {route['account']!r} on {route['provider']!r}, "
+                                       f"which has no resolvable login (config_dir missing)")
+            kw["account"], kw["config_dir"] = route["account"], cfg
+        s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
         if keep:
             with self._lock:

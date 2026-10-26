@@ -78,7 +78,7 @@ def scoring_input(prompt, task_context=None, recall=''):
 def select(core, *, prompt, session_id='', face='default', platform='', entrypoint='agent',
            turn_id='', api_request_id='', input_fit=None, task_context=None, recall='',
            current_provider='', current_model='', constraints=None, escalate=None,
-           credential_resolver=None, route_id=None, log_platform=None):
+           credential_resolver=None, route_id=None, log_platform=None, supports_accounts=False):
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
     request, projection = scoring_input(prompt, task_context, recall)
@@ -105,13 +105,17 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     candidates += [r for rows in table['candidates'].values() for r in rows]
     allowed = {(r['provider'], r['model']) for r in candidates if r['provider'] != 'custom'}
     allowed |= {('codex-cli', m) for p, m in allowed if p == 'openai-codex'}
+    # The selector does NOT invent per-account providers: account routes come only from a host that explicitly allows
+    # them (constraints.allowed_routes, e.g. the provider's served_routes). The allowed_routes intersection below is
+    # base-provider aware, so a host's own sibling route (claude-cli#b) survives while a host that lists none is never
+    # offered one (it could not honour the account identity).
     capabilities = set((constraints or {}).get('required_capabilities') or [])
     if capabilities - {'vision'}:
         raise ValueError('Unsupported required model capability')
     if 'vision' in capabilities:
         allowed = {(p, m) for p, m in allowed if
                    (p in ('openai-codex', 'codex-cli') and m.startswith('gpt-')) or
-                   (p == 'claude-cli' and m.startswith('claude-')) or
+                   (p.split('#', 1)[0] == 'claude-cli' and m.startswith('claude-')) or    # base provider: keep sibling accounts (claude-cli#b)
                    (p == 'agy-cli' and m.startswith('gemini-'))}
     if (constraints or {}).get('kind') == 'review' and constraints.get('owner') == 'auxiliary.review':
         allowed = {(p, m) for p, m in allowed
@@ -123,7 +127,10 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                 not isinstance(p, (tuple, list)) or len(p) != 2 or
                 any(not isinstance(x, str) or not x for x in p) for p in limits):
             raise ValueError('Trusted route constraints must contain provider/model pairs')
-        allowed &= {tuple(p) for p in limits}
+        # Base-provider aware: a host's own per-account route (claude-cli#b, model) survives when its base pair
+        # (claude-cli, model) is in the canonical universe, without the selector inventing account routes for hosts
+        # that list none.
+        allowed = {tuple(p) for p in limits if tuple(p) in allowed or (tuple(p)[0].split('#', 1)[0], tuple(p)[1]) in allowed}
     excluded = (constraints or {}).get('excluded_routes', [])
     allowed -= {tuple(p) for p in excluded}
     fit = dict(input_fit or {})
@@ -134,7 +141,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     while allowed:
         route = core.resolve(decision, unit, input_fit=fit, escalate=escalate,
                              allowed_routes=tuple(sorted(allowed)), execution=True,
-                             minimum_band=(constraints or {}).get('min_band'))
+                             minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts)
         choice = route.get('chosen')
         if not choice:
             break
@@ -159,7 +166,11 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         cap = core.lane_ceiling(choice['lane'], model)
         if provider == 'codex-cli':
             cap = int(core._context_cfg().get('provider_ceiling_tokens', {}).get(provider, 200000))
-        return {'router': ROUTER, 'provider': provider, 'model': model, 'context_length': cap,
+        # Account identity is returned only to a host that opted in (supports_accounts); a host that ignores it (e.g.
+        # Hermes) must not be handed an account/config_dir it would silently drop while running on an ambient login.
+        return {'router': ROUTER, 'provider': provider, 'model': model,
+                'account': choice.get('account') if supports_accounts else None,
+                'config_dir': choice.get('config_dir') if supports_accounts else None, 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
                 'band': route['band'], 'projection': projection,
                 'decision': decision, 'route': route}
