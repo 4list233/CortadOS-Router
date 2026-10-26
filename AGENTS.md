@@ -13,7 +13,8 @@ is the long form.
 ## Layout
 - `cortados_router/` — router package. `core.py` resolve/decide (CLI: `table`, `decide`),
   `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
-  `transport.py`, `local_resources.py`.
+  `transport.py`, `local_resources.py`, `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
+  self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
