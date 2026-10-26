@@ -45,6 +45,16 @@ DEFAULT_PORT = 8432                                     # next to S1's 8431
 TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 # A conversation the client has not touched for this long is closed; its CLI process holds memory and a login slot.
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
+
+_DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
+_dashboard_cache: dict = {}
+
+
+def _dashboard_html() -> bytes:
+    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /resources)."""
+    if "b" not in _dashboard_cache:
+        _dashboard_cache["b"] = _DASHBOARD_PATH.read_bytes()
+    return _dashboard_cache["b"]
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
 # Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
@@ -245,6 +255,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
+        if self.path in ("/", "/dashboard"):
+            html = _dashboard_html()                    # static page; the data it shows (/resources) still needs the token
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
         if self.path.startswith("/v1/models"):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")

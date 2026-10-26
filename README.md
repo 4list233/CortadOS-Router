@@ -120,6 +120,7 @@ s1/                        CortadOS Router S1: dataset, label, build_sft, evalua
 tables/                    routing table, budgets, use cases, generated scores, benchmarks/, community/, inventory/,
                            s1-endpoints.example.json, resources.example.json, local-models.json
 integrations/hermes/       the frozen Hermes plugin (reference only)
+integrations/claude-mod/   cortados-pulse: a Claude Code pane that shows the resource pool beside the chat
 tests/                     stdlib unittest suite; tests/integration needs a Hermes host and skips without it
 ```
 
@@ -209,7 +210,7 @@ fails if a literal value is ever placed there.
 
 ## The resource pool at a glance
 
-A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard.
+A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (reachable from any device on the tailnet; it asks for the token and never embeds it), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.
 
 ## Status
 
@@ -217,7 +218,7 @@ A read-only `GET /resources` on the provider (same token) returns one JSON snaps
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision, and a `GET /resources` snapshot (usage, subscription scarcity, local devices, model-fit).
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **550 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **552 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 
