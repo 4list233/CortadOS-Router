@@ -308,10 +308,12 @@ def _accounts(vendor: str) -> list[dict[str, Any]]:
         data = json.loads(p.read_text())
     except (OSError, ValueError) as exc:
         raise ValueError(f"accounts.json present but unreadable: {exc}")   # broken: caller refuses Claude sampling, never samples the wrong login
-    raw = data.get(vendor)
-    if raw is None:
+    if not isinstance(data, dict):
+        raise ValueError("accounts.json: root must be a JSON object")
+    if vendor not in data:
         return []
-    if not isinstance(raw, list):
+    raw = data[vendor]
+    if not isinstance(raw, list):                              # explicit null / scalar / object → malformed
         raise ValueError(f"accounts.json: {vendor!r} must be a list of accounts")
     for a in raw:
         if not isinstance(a, dict) or not (isinstance(a.get("config_dir"), str) and a["config_dir"].strip()):

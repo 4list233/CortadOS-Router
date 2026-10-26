@@ -142,7 +142,8 @@ class SelectorPropagatesAccountTests(unittest.TestCase):
         return execution_routing.select(core, prompt="refactor the auth module", platform="cli", face="provider",
                                         entrypoint="provider", input_fit=fit,
                                         constraints={"allowed_routes": list(routing.served_routes(core))},
-                                        credential_resolver=lambda *, requested, target_model: None)
+                                        credential_resolver=lambda *, requested, target_model: None,
+                                        supports_accounts=True)
 
     def test_sibling_survives_and_account_is_returned(self):
         core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": SCARCE}
@@ -192,7 +193,8 @@ class ExpandAndVisionTests(unittest.TestCase):
                                      entrypoint="provider", input_fit=fit,
                                      constraints={"allowed_routes": list(routing.served_routes(core)),
                                                   "required_capabilities": ["vision"]},
-                                     credential_resolver=lambda *, requested, target_model: None)
+                                     credential_resolver=lambda *, requested, target_model: None,
+                                     supports_accounts=True)
         self.assertNotIn("error", r)                                         # not a no-route
         self.assertEqual(core._base_provider(r["provider"]), "claude-cli")   # a Claude account served it
         self.assertEqual(r["account"], "b")                                  # the sibling, since A is spent
@@ -284,3 +286,39 @@ class Pass4RegressionTests(unittest.TestCase):
         core.lane_health = lambda: {"cursor": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
         r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"))   # D=8 needs 70: only the Cursor-Claude model qualifies
         self.assertEqual(r["chosen"]["lane"], "cursor")
+
+
+class Pass5RegressionTests(unittest.TestCase):
+    """Codex review pass 5: a host that does not opt in gets no account identity (not even the first bare-provider
+    account); and bad root/null config shapes raise instead of defaulting or aborting all routing."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=tempfile.mkdtemp(), CORTADOS_SCARCITY_REFRESH="off")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_host_without_opt_in_gets_no_account_identity(self):
+        # a single configured account (bare claude-cli) must NOT hand its config_dir to a host that did not opt in
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}]}))
+        core.model_scores = lambda: MS
+        core.lane_health = lambda: {"claude": OK, "codex": SCARCE}
+        fit = {"known": True, "assembled": True, "input_tokens": 10, "input_bytes": 40, "source": "test"}
+        r = execution_routing.select(core, prompt="x", platform="cli", face="provider", entrypoint="provider",
+                                     input_fit=fit, constraints={"allowed_routes": list(routing.served_routes(core))},
+                                     credential_resolver=lambda *, requested, target_model: None)   # supports_accounts defaults False
+        if core._base_provider(r.get("provider", "")) == "claude-cli":
+            self.assertIsNone(r.get("account"))
+            self.assertIsNone(r.get("config_dir"))
+
+    def test_bad_root_and_null_vendor_raise(self):
+        for bad in ("[]", "null", "\"scalar\"", "123", '{"claude": null}'):
+            (Path(self.dir) / "accounts.json").write_text(bad)
+            with self.assertRaises(core.AccountsConfigError):
+                core._vendor_accounts("claude", "claude", "claude-cli")

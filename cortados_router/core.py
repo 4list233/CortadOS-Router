@@ -349,10 +349,12 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
         data = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         raise AccountsConfigError(f"{path} is present but unreadable: {exc}") from exc
-    raw = data.get(vendor)
-    if raw is None:
-        return default                                         # vendor simply not configured
-    if not isinstance(raw, list):
+    if not isinstance(data, dict):
+        raise AccountsConfigError(f"{path}: root must be a JSON object, got {type(data).__name__}")
+    if vendor not in data:
+        return default                                         # vendor key simply absent
+    raw = data[vendor]
+    if not isinstance(raw, list):                              # explicit null, a scalar or an object → malformed, never default
         raise AccountsConfigError(f"{path}: {vendor!r} must be a list of accounts, got {type(raw).__name__}")
     if not raw:
         return default                                         # explicit empty list: no accounts for this vendor

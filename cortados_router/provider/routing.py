@@ -108,7 +108,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints={"allowed_routes": list(served_routes(core))},
-        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}")
+        credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
+        supports_accounts=True)   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])

@@ -78,7 +78,7 @@ def scoring_input(prompt, task_context=None, recall=''):
 def select(core, *, prompt, session_id='', face='default', platform='', entrypoint='agent',
            turn_id='', api_request_id='', input_fit=None, task_context=None, recall='',
            current_provider='', current_model='', constraints=None, escalate=None,
-           credential_resolver=None, route_id=None, log_platform=None):
+           credential_resolver=None, route_id=None, log_platform=None, supports_accounts=False):
     credential_resolver, auth_errors = _credential_policy(credential_resolver)
     unit = 'interactive' if platform in ('discord', 'telegram', 'cli') else 'background'
     request, projection = scoring_input(prompt, task_context, recall)
@@ -166,8 +166,11 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         cap = core.lane_ceiling(choice['lane'], model)
         if provider == 'codex-cli':
             cap = int(core._context_cfg().get('provider_ceiling_tokens', {}).get(provider, 200000))
-        return {'router': ROUTER, 'provider': provider, 'model': model, 'account': choice.get('account'),
-                'config_dir': choice.get('config_dir'), 'context_length': cap,
+        # Account identity is returned only to a host that opted in (supports_accounts); a host that ignores it (e.g.
+        # Hermes) must not be handed an account/config_dir it would silently drop while running on an ambient login.
+        return {'router': ROUTER, 'provider': provider, 'model': model,
+                'account': choice.get('account') if supports_accounts else None,
+                'config_dir': choice.get('config_dir') if supports_accounts else None, 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
                 'band': route['band'], 'projection': projection,
                 'decision': decision, 'route': route}
