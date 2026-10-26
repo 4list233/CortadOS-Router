@@ -67,5 +67,28 @@ class S1RetryTests(unittest.TestCase):
         self.assertEqual(fake.calls, 1)
 
 
+    def test_permanent_http_error_is_not_retried(self):
+        # a 4xx (auth / body too large) is permanent: degrade immediately, no duplicate request, no backoff wait
+        calls = {"n": 0}
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+        core.urllib.request.urlopen = fake
+        res = core.decide_s1("do a thing")
+        self.assertTrue(res["degraded"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_retryable_http_error_is_retried_once(self):
+        # a 503 is a transient server state: retry once, then degrade
+        calls = {"n": 0}
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 503, "busy", {}, None)
+        core.urllib.request.urlopen = fake
+        res = core.decide_s1("do a thing")
+        self.assertTrue(res["degraded"])
+        self.assertEqual(calls["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

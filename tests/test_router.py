@@ -141,6 +141,14 @@ class ScoredSelection(unittest.TestCase):
         core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.39, "expiring_pct": 0, "tightest": {}, "pools": {}},
                                     "codex": {"ok": True, "why": None, "scarcity": -1.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
         self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["lane"], "codex")
+
+    def test_a_scarce_now_window_suppresses_the_expiring_discount(self):
+        # claude's weekly credit is expiring (expiring_pct=33) but its tightest window is scarce NOW (scarcity 0.8, e.g. the
+        # 5-hour session nearly spent). The deadline discount must not route work onto a lane with no immediate room; codex,
+        # which has room now, wins. (Codex review 2026-10-26)
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": 0.8, "expiring_pct": 33, "tightest": {"window": "5-hour session", "resets_at": "x"}, "pools": {}},
+                                    "codex": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["lane"], "codex")
     def test_secondary_source_only_when_native_spent(self):
         ms = {"use_cases": {"code": ""}, "reference_index": ScoredSelection.MS["reference_index"],
               "models": [{"family": "claude-opus-5", "ceiling": False, "proxy": False, "index": {"general": 80, "code": 85},
