@@ -1,0 +1,10 @@
+{
+  "_comment": "Rough memory estimates for candidate local models at 4-bit, WEIGHTS ONLY (excludes KV-cache, context and scratch, which grow with sequence length and concurrency). For the dashboard's 'what could fit' estimate only; actual admission still needs a verified deployment measured on real hardware (docs/LOCAL-RESOURCES.md). Numbers are approximate.",
+  "models": [
+    {"id": "qwen3-4b-4bit", "params_b": 4, "quant": "4bit", "approx_gib": 2.5},
+    {"id": "qwen3-8b-4bit", "params_b": 8, "quant": "4bit", "approx_gib": 5.0},
+    {"id": "qwen3-14b-4bit", "params_b": 14, "quant": "4bit", "approx_gib": 8.5},
+    {"id": "qwen3-32b-4bit", "params_b": 32, "quant": "4bit", "approx_gib": 19.0},
+    {"id": "llama-3.3-70b-4bit", "params_b": 70, "quant": "4bit", "approx_gib": 40.0}
+  ]
+}

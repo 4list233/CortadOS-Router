@@ -971,6 +971,30 @@ def recent(n: int = 8) -> list[dict[str, Any]]:
             c.close()
 
 
+def usage_summary(limit: int = 12) -> dict[str, Any]:
+    """A read-only roll-up of logged routes for the dashboard: counts by band and chosen lane, the degraded rate, S1
+    latency percentiles, and the most recent turns. No subscription CLI is opened; this only reads router.db."""
+    from collections import Counter
+    with _db_lock:
+        c = _db()
+        c.row_factory = sqlite3.Row
+        try:
+            rows = [dict(x) for x in c.execute("SELECT ts, platform, band, lane, model, degraded, engine_ms, turn_ms, "
+                                               "response_chars, actual_model FROM routes ORDER BY ts DESC")]
+        finally:
+            c.close()
+    ems = sorted(r["engine_ms"] for r in rows if r["engine_ms"] is not None)
+    pct = lambda xs, q: xs[min(len(xs) - 1, int(len(xs) * q))] if xs else None
+    return {"total_routes": len(rows),
+            "by_band": dict(Counter(r["band"] for r in rows if r["band"])),
+            "by_lane": dict(Counter(f"{r['lane']}/{r['model']}" for r in rows if r["lane"])),
+            "degraded": {"count": sum(1 for r in rows if r["degraded"]), "of": len(rows)},
+            "s1_latency_ms": {"median": pct(ems, 0.5), "p90": pct(ems, 0.9)} if ems else {},
+            "recent": [{"ts": r["ts"], "platform": r["platform"], "band": r["band"], "lane": r["lane"],
+                        "model": r["model"], "degraded": bool(r["degraded"]), "turn_ms": r["turn_ms"],
+                        "response_chars": r["response_chars"]} for r in rows[:limit]]}
+
+
 if __name__ == "__main__":
     import sys
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"

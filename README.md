@@ -110,7 +110,7 @@ An **outcome loop** (`s1/outcome/`) adds a second signal beyond teacher agreemen
 
 ```
 cortados_router/           the router: core (scoring client, rules, resolve, logging), scarcity, unitcost,
-                           transport, images, reviews, execution_routing / cron_routing, task_context,
+                           transport, images, reviews, resources (the pool snapshot), execution_routing / cron_routing, task_context,
                            s1_endpoint (where the scorer lives, config-driven), compat, paths
 cortados_router/provider/  the `cortados` endpoint: server (HTTP + conversation registry + wire seam),
                            anthropic_wire (/v1/messages) and responses_wire (/v1/responses), routing (lane choice),
@@ -118,7 +118,7 @@ cortados_router/provider/  the `cortados` endpoint: server (HTTP + conversation 
                            mcp_shim (serves the client's tools to the backend)
 s1/                        CortadOS Router S1: dataset, label, build_sft, evaluate, serve, student, outcome/, nightly
 tables/                    routing table, budgets, use cases, generated scores, benchmarks/, community/, inventory/,
-                           s1-endpoints.example.json, resources.example.json
+                           s1-endpoints.example.json, resources.example.json, local-models.json
 integrations/hermes/       the frozen Hermes plugin (reference only)
 tests/                     stdlib unittest suite; tests/integration needs a Hermes host and skips without it
 ```
@@ -207,13 +207,17 @@ codex mcp add cortados-route \
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
 
+## The resource pool at a glance
+
+A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard.
+
 ## Status
 
 - Live per-turn routing, with mandatory routing for agent, cron, delegation and auxiliary calls when enabled.
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
-- Shadow logging of every decision.
+- Shadow logging of every decision, and a `GET /resources` snapshot (usage, subscription scarcity, local devices, model-fit).
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **530 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **543 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 

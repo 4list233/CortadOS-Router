@@ -250,6 +250,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "authentication_error", "bad or missing token")
             return self._json(200, {"data": [{"type": "model", "id": wire.MODEL_ID, "display_name": "CortadOS"}],
                                     "has_more": False, "first_id": wire.MODEL_ID, "last_id": wire.MODEL_ID})
+        if self.path == "/resources":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
+            snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
+            return self._json(200, snap)
         self._error(404, "not_found_error", self.path)
 
     def do_POST(self):
