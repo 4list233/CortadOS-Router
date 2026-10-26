@@ -59,8 +59,26 @@ class IngestionTests(unittest.TestCase):
         _make_db(db, turn_id="t1", request="refactor the parser")
         rows = dataset._rows_from_db(db)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["id"], "rt.router-air.t1")                      # tagged by stem, distinct from a local rt.t1
+        self.assertTrue(rows[0]["id"].startswith("rt.router-air-"))              # tagged <stem>-<pathhash>, distinct from a local rt.t1
+        self.assertTrue(rows[0]["id"].endswith(".t1"))
         self.assertIn("refactor the parser", rows[0]["request"])
+
+    def test_same_stem_dbs_on_different_paths_get_distinct_ids(self):
+        # /air/router.db and /studio/router.db share a stem; a shared turn_id must still produce two distinct rows
+        a = Path(tempfile.mkdtemp()) / "router.db"; b = Path(tempfile.mkdtemp()) / "router.db"
+        _make_db(a, turn_id="dup", request="from air"); _make_db(b, turn_id="dup", request="from studio")
+        ida = dataset._rows_from_db(a)[0]["id"]; idb = dataset._rows_from_db(b)[0]["id"]
+        self.assertNotEqual(ida, idb)                                            # no silent collision
+        self.assertTrue(ida.endswith(".dup") and idb.endswith(".dup"))
+
+    def test_an_unresolvable_path_is_skipped_not_fatal(self):
+        d = Path(tempfile.mkdtemp())
+        loop_a, loop_b = d / "a", d / "b"
+        import os as _os
+        _os.symlink(loop_b, loop_a); _os.symlink(loop_a, loop_b)                 # a symlink loop: resolve() raises
+        _os.environ["CORTADOS_ROUTER_DB_EXTRA"] = str(loop_a / "router.db")
+        dbs = dataset._router_dbs()                                              # must not raise; the loop source is skipped
+        self.assertEqual(dbs, [dataset.ROUTER_DB.resolve()])
 
     def test_local_db_rows_stay_unqualified(self):
         d = Path(tempfile.mkdtemp()); db = d / "router.db"

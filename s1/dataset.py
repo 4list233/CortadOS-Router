@@ -5,6 +5,7 @@ the provider host, so the whole fleet's daily usage feeds training). No request 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -23,7 +24,11 @@ def _router_dbs() -> list[Path]:
     variable so daily usage from the whole fleet feeds training, not only this machine's (Forest 2026-10-26)."""
     paths, seen = [], set()
     for db in [ROUTER_DB] + [Path(x).expanduser() for x in os.environ.get("CORTADOS_ROUTER_DB_EXTRA", "").split(os.pathsep) if x.strip()]:
-        rp = db.resolve()                                   # absolute + canonical: a relative path survives as_uri(), and one file named two ways dedupes once
+        try:
+            rp = db.resolve()                               # absolute + canonical: a relative path survives as_uri(), and one file named two ways dedupes once
+        except (OSError, RuntimeError) as exc:              # a symlink loop (RuntimeError on 3.9) or bad path: skip this source, never abort the rest
+            print(f"dataset: skipping router db {db}: {exc}", file=sys.stderr)
+            continue
         if rp not in seen:
             seen.add(rp); paths.append(rp)
     return paths
@@ -31,8 +36,12 @@ def _router_dbs() -> list[Path]:
 
 def _source_tag(db: Path) -> str:
     """The local db keeps unqualified ids (`rt.<turn_id>`) so existing requests.jsonl ids are unchanged; every other db is
-    tagged by its file stem so two machines sharing a turn_id become distinct rows instead of silently dropping one."""
-    return "" if db.resolve() == ROUTER_DB.resolve() else db.stem
+    tagged `<stem>-<hash of its resolved path>` — the stem alone collides across machines (`/air/router.db` and
+    `/studio/router.db` share a stem), so a shared turn_id would silently drop one. The path hash makes each source a
+    distinct, stable namespace (Codex review 2026-10-26)."""
+    if db.resolve() == ROUTER_DB.resolve():
+        return ""
+    return db.stem + "-" + hashlib.sha1(str(db.resolve()).encode()).hexdigest()[:8]
 
 
 def _rows_from_db(db: Path) -> list:
@@ -59,12 +68,12 @@ def main() -> None:
         for r in csv.DictReader(SHEET.open()):
             new.append({"id": r["id"], "source": "1.0-sheet", "unit_kind": "interactive", "request": clean_request(r["request"])})
     for db in _router_dbs():
-        if not db.exists():
-            continue                                        # a synced copy that has not arrived yet is simply skipped
         try:
+            if not db.exists():                             # a synced copy that has not arrived yet is simply skipped
+                continue
             new.extend(_rows_from_db(db))
-        except (sqlite3.Error, OSError, ValueError) as exc:
-            print(f"dataset: skipping unreadable router db {db}: {exc}", file=sys.stderr)   # one bad source never loses the others
+        except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
+            print(f"dataset: skipping router db {db}: {exc}", file=sys.stderr)   # one bad/unreadable source never loses the others
     added = 0
     with out.open("a") as f:
         for r in new:
