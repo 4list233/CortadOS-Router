@@ -236,6 +236,21 @@ class RoutedEndpointTests(EndpointTests):
         self.assertEqual(self.calls, ["claude-cli"])                 # not re-routed on the continuation
         self.assertEqual([r["route_id"] for r in self.executed], ["r1"])
 
+    def test_the_turn_outcome_logs_the_delivered_text_size(self):
+        logged = threading.Event()
+        outcomes = []
+        def record(route, chars, turn_ms):
+            outcomes.append((route["route_id"], chars, turn_ms)); logged.set()
+        self.reg.log_outcome = record
+        _, r1 = self.raw({"messages": [{"role": "user", "content": "hello there"}]})   # a plain turn: the fake answers "echo: hello there"
+        self.assertTrue(logged.wait(10), "the outcome was never logged (it runs off the critical path)")
+        rid, chars, ms = outcomes[0]
+        self.assertEqual(rid, "r1")
+        expected = sum(len(b["text"]) for b in r1["content"] if b.get("type") == "text")
+        self.assertGreater(expected, 0)                              # the reply really had text
+        self.assertEqual(chars, expected)                            # the metric is the delivered text size, not a constant
+        self.assertIsInstance(ms, int); self.assertGreaterEqual(ms, 0)
+
     def test_a_failed_execution_log_is_retried_on_the_next_turn(self):
         attempts = []
 
