@@ -12,6 +12,8 @@ s1/current.json
 tables/s1-endpoints.json
 # the real accounts map holds machine-local CLI config-dir paths: local only (ship the .example)
 tables/accounts.json
+# the real resources map holds this machine's SSH targets and tailnet addresses: local only (ship the .example)
+tables/resources.json
 # runtime state belongs in ~/.cortados, never in the repository
 *.db
 # third-party benchmark downloads: re-fetched by tables/benchmarks/fetch_benchmarks.py, never redistributed

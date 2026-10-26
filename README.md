@@ -83,7 +83,7 @@ cost = burn weight + 30 × scarcity − 80 × expiring credit − capacity credi
 
 **Final gates:** context fit is hard; a vendor's models come from that vendor's own subscription first; sessions stay on their model while it stays near the cheapest choice; agent-facing turns never fall below a minimum general index. `docs/ROUTER-DESIGN.md` is the full design log.
 
-Local hardware can be metered as a resource pool with `CORTADOS_LOCAL_RESOURCES_CONFIG`; see `docs/LOCAL-RESOURCES.md`.
+Local hardware can be metered as a resource pool: copy `tables/resources.example.json` to `tables/resources.json` (git-ignored; the Studio, the RTX 3060 PC, the Air and the Pro) and point `CORTADOS_LOCAL_RESOURCES_CONFIG` at it. See `docs/LOCAL-RESOURCES.md`.
 
 ## CortadOS Router S1
 
@@ -118,7 +118,7 @@ cortados_router/provider/  the `cortados` endpoint: server (HTTP + conversation 
                            mcp_shim (serves the client's tools to the backend)
 s1/                        CortadOS Router S1: dataset, label, build_sft, evaluate, serve, student, outcome/, nightly
 tables/                    routing table, budgets, use cases, generated scores, benchmarks/, community/, inventory/,
-                           s1-endpoints.example.json
+                           s1-endpoints.example.json, resources.example.json
 integrations/hermes/       the frozen Hermes plugin (reference only)
 tests/                     stdlib unittest suite; tests/integration needs a Hermes host and skips without it
 ```
@@ -213,7 +213,7 @@ fails if a literal value is ever placed there.
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision.
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **524 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **529 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 
