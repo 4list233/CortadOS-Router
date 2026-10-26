@@ -292,7 +292,7 @@ def required_index(t: dict[str, Any], ms: dict[str, Any], use_case: str, D: int 
     return round(min(max(req, floor), best), 1)
 
 
-def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> list[dict[str, Any]] | None:
+def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = True) -> list[dict[str, Any]] | None:
     """Every reachable model × every subscription that can run it, with its index for this use case. No band lists."""
     ms = model_scores()
     if (t.get("tiering") or {}).get("mode") != "scores" or not ms:
@@ -308,7 +308,7 @@ def scored_candidates(t: dict[str, Any], band: str, use_case: str | None) -> lis
             out.append({"lane": r["lane"], "provider": r["provider"], "model": r["model"], "family": m["family"], "index": m["index"].get(u, m["index"]["general"]),
                         "general": m["index"]["general"], "price": m.get("price_1m_blended_usd"), "tokens_per_s": m.get("tokens_per_s"), "ceiling": m["ceiling"], "use_case": u, "tier": "scored", **({"pool": r["pool"]} if r.get("pool") else {}), **({"proxy": True} if m.get("proxy") else {})})
     # One candidate per configured Claude account (Option A, lane-per-account); single default login leaves this unchanged.
-    return _expand_claude_accounts(out) or None
+    return _expand_claude_accounts(out, accounts_aware) or None
 
 
 NATIVE_LANE = (("claude", "claude"), ("gpt-oss", None), ("gpt", "codex"), ("o1", "codex"), ("o3", "codex"), ("o4", "codex"), ("gemini", "antigravity"))
@@ -377,27 +377,35 @@ def _base_provider(provider: str) -> str:
     return (provider or "").split("#", 1)[0]
 
 
-def _expand_claude_accounts(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _expand_claude_accounts(cands: list[dict[str, Any]], accounts_aware: bool = True) -> list[dict[str, Any]]:
     """Replace each Claude candidate with one per configured account (Option A), binding account id, reserve flag and
-    config_dir. Applied to BOTH scored and static/fallback candidate lists so account identity is never lost. A single
-    default login (no accounts.json) leaves candidates effectively unchanged (account/config_dir None)."""
+    config_dir. Applied to scored and static/fallback lists so account identity is never lost.
+
+    `accounts_aware` is the host's capability (execution_routing.select sets it from supports_accounts). When accounts
+    ARE configured but the host cannot honour a specific account (accounts_aware False), Claude is excluded entirely
+    rather than offered on the first bare-provider account — otherwise the host would run on its ambient login while the
+    decision was metered against account A. A single default login (no accounts.json) leaves candidates unchanged for
+    every host; a broken config refuses Claude."""
     try:
         accts = _vendor_accounts("claude", "claude", "claude-cli")
     except AccountsConfigError:
         accts = None                                           # broken config: refuse Claude rather than run on an ambient login
+    configured = accts is not None and (len(accts) > 1 or accts[0].get("account") is not None)
     out = []
     for c in cands:
         is_claude = c.get("lane") == "claude" and _base_provider(c.get("provider", "")) == "claude-cli"
-        if c.get("account") is not None:                       # already expanded
+        if not is_claude or c.get("account") is not None:      # non-Claude, or already expanded
             out.append(c)
-        elif is_claude and accts is None:
-            continue                                           # drop Claude candidates while the accounts config is unreadable
-        elif is_claude:
+        elif accts is None:
+            continue                                           # unreadable accounts config: drop Claude
+        elif not configured:
+            out.append(c)                                      # single default login: plain Claude, unchanged for all hosts
+        elif not accounts_aware:
+            continue                                           # accounts configured but host can't honour one: do not offer Claude
+        else:
             for a in accts:
                 out.append({**c, "lane": a["lane"], "provider": a["provider"], "account": a["account"],
                             "reserve": a["reserve"], "config_dir": a["config_dir"]})
-        else:
-            out.append(c)
     return out
 
 
@@ -510,7 +518,7 @@ def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> in
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
-            execution: bool = False, minimum_band: str | None = None) -> dict[str, Any]:
+            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = True) -> dict[str, Any]:
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:
@@ -545,16 +553,16 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     health, pol = lane_health(), _policy()
     demote, expiring = float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
-    scored = scored_candidates(t, band, ans.get("work_kind"))
+    scored = scored_candidates(t, band, ans.get("work_kind"), accounts_aware)
     # The static band list carries no account metadata; expand it too, so a missing/unreadable score catalog still binds
     # the routed Claude account (identity is never lost on the fallback path).
-    cands = scored if scored else _expand_claude_accounts([dict(c) for c in t["candidates"].get(band, [])])
+    cands = scored if scored else _expand_claude_accounts([dict(c) for c in t["candidates"].get(band, [])], accounts_aware)
     # Explicit degraded-service policy: do not spend Claude by default when
     # the scorer cannot classify a request. Retain quota and context-fit gates.
     fallback_routes = (t.get("fallback", {}).get("routes")
                        if not execution and (decision.get("degraded") or not decision.get("answers")) else None)
     if fallback_routes:
-        cands = _expand_claude_accounts([dict(c) for c in fallback_routes])
+        cands = _expand_claude_accounts([dict(c) for c in fallback_routes], accounts_aware)
         scored = []
         pref = []
         rules.append("scorer unavailable → configured GPT Terra fallback")

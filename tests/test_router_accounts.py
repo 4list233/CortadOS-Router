@@ -304,18 +304,18 @@ class Pass5RegressionTests(unittest.TestCase):
         for k, v in self._env.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
-    def test_host_without_opt_in_gets_no_account_identity(self):
-        # a single configured account (bare claude-cli) must NOT hand its config_dir to a host that did not opt in
+    def test_host_without_opt_in_is_not_offered_a_configured_account(self):
+        # a configured account must NOT be selected for a host that did not opt in (it would run on its ambient login
+        # while the decision was metered against account A). Claude is excluded entirely; the host routes elsewhere.
         (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}]}))
         core.model_scores = lambda: MS
-        core.lane_health = lambda: {"claude": OK, "codex": SCARCE}
+        core.lane_health = lambda: {"claude": OK, "codex": OK}
         fit = {"known": True, "assembled": True, "input_tokens": 10, "input_bytes": 40, "source": "test"}
         r = execution_routing.select(core, prompt="x", platform="cli", face="provider", entrypoint="provider",
                                      input_fit=fit, constraints={"allowed_routes": list(routing.served_routes(core))},
                                      credential_resolver=lambda *, requested, target_model: None)   # supports_accounts defaults False
-        if core._base_provider(r.get("provider", "")) == "claude-cli":
-            self.assertIsNone(r.get("account"))
-            self.assertIsNone(r.get("config_dir"))
+        self.assertNotEqual(core._base_provider(r.get("provider", "")), "claude-cli")   # configured Claude account not offered
+        self.assertIsNone(r.get("account"))
 
     def test_bad_root_and_null_vendor_raise(self):
         for bad in ("[]", "null", "\"scalar\"", "123", '{"claude": null}'):

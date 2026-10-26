@@ -141,7 +141,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     while allowed:
         route = core.resolve(decision, unit, input_fit=fit, escalate=escalate,
                              allowed_routes=tuple(sorted(allowed)), execution=True,
-                             minimum_band=(constraints or {}).get('min_band'))
+                             minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts)
         choice = route.get('chosen')
         if not choice:
             break
