@@ -16,13 +16,16 @@ Register with Claude Code, e.g.:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.request
 
 PROTOCOL = "2025-06-18"
+SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
 TIMEOUT_S = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", "300"))   # a routed subtask can take a while (cold lane, large output)
 DEFAULT_MAX_TOKENS = 8000
 
@@ -75,7 +78,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         except Exception:
             pass
         return _err(f"cortados route_task: provider returned HTTP {exc.code}{detail}")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        # http.client.HTTPException covers a truncated body (IncompleteRead) after a dropped connection.
         return _err(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})")
     if not isinstance(data, dict) or data.get("type") == "error" or data.get("error"):
         msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
@@ -88,26 +92,61 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
 
 
 def handle(msg: dict, cfg: dict) -> dict | None:
-    """One JSON-RPC message in, one reply message out (None for a notification). Pure, for tests."""
-    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    """One JSON-RPC message in, one reply message out (None for a notification). Pure, for tests. Validates shapes so a
+    malformed request yields a JSON-RPC error instead of crashing the session."""
+    if not isinstance(msg, dict):
+        return None                                     # a non-object line: no id to answer, drop it
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        params = {}
     if mid is None:
         return None                                     # notifications need no answer
     base = {"jsonrpc": "2.0", "id": mid}
+    if not isinstance(method, str):
+        return {**base, "error": {"code": -32600, "message": "invalid request: 'method' must be a string"}}
     if method == "initialize":
-        return {**base, "result": {"protocolVersion": params.get("protocolVersion", PROTOCOL),
-                                    "capabilities": {"tools": {}},
+        req = params.get("protocolVersion")
+        version = req if req in SUPPORTED_PROTOCOLS else PROTOCOL   # only echo versions we actually implement
+        return {**base, "result": {"protocolVersion": version, "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "cortados-route", "version": "0"}}}
     if method == "tools/list":
         return {**base, "result": {"tools": [TOOL]}}
     if method == "tools/call":
         if params.get("name") != "route_task":
             return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
-        a = params.get("arguments") or {}
+        a = params.get("arguments")
+        if not isinstance(a, dict):
+            a = {}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
                                               a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS))}
     if method == "ping":
         return {**base, "result": {}}
     return {**base, "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
+_out_lock = threading.Lock()
+
+
+def _write(reply: dict) -> None:
+    with _out_lock:                                     # serialize stdout across concurrent workers
+        sys.stdout.write(json.dumps(reply) + "\n")
+        sys.stdout.flush()
+
+
+def _dispatch(msg, cfg, write=_write) -> None:
+    """Run one message's handler on its own thread so a slow route_task never blocks the stdin reader (pings stay
+    prompt). Replies are matched by id, so out-of-order writes are fine."""
+    def run():
+        try:
+            reply = handle(msg, cfg)
+        except Exception as exc:                        # never let one bad request kill the session
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error: {exc}"}} if mid is not None else None
+        if reply is not None:
+            write(reply)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def main() -> None:
@@ -116,12 +155,11 @@ def main() -> None:
         if not line.strip():
             continue
         try:
-            reply = handle(json.loads(line), cfg)
+            msg = json.loads(line)
         except ValueError:
             continue                                    # a malformed line is skipped, not fatal
-        if reply is not None:
-            sys.stdout.write(json.dumps(reply) + "\n")
-            sys.stdout.flush()
+        for one in (msg if isinstance(msg, list) else [msg]):   # tolerate a JSON-RPC batch by dispatching each element
+            _dispatch(one, cfg)
 
 
 if __name__ == "__main__":
