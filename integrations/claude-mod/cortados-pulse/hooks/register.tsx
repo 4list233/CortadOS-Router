@@ -57,19 +57,21 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-    const lat = s.s1_latency_ms ?? {}
-    const deg = s.degraded ?? { count: 0, of: 0 }
+    const u = s.usage ?? {}
+    const lat = u.s1_latency_ms ?? {}
+    const deg = u.degraded ?? { count: 0, of: 0 }
     const dev = s.devices ?? { status: 'pending' }
-    const subs = Object.entries(s.subscriptions ?? {}).filter(([k]) => k !== 'error')
+    const subs = Object.entries(s.subscriptions ?? {}).filter(([k, v]) => k !== 'error' && typeof v === 'object')
     return (
       <Box flexDirection="column">
-        <Text>routes {s.total_routes ?? '—'} · degraded {deg.count}/{deg.of}</Text>
+        {u.error && <Text dimColor>usage: {u.error}</Text>}
+        <Text>routes {u.total_routes ?? '—'} · degraded {deg.count}/{deg.of}</Text>
         <Text>S1 {lat.median ?? '—'}ms median · p90 {lat.p90 ?? '—'}ms</Text>
         <Text dimColor>— subscriptions —</Text>
         {subs.length === 0 && <Text dimColor>none cached</Text>}
-        {subs.map(([lane, h]) => (
+        {subs.map(([lane, hv]) => { const h = hv as { scarcity?: number | null; expiring_pct?: number; ok?: boolean }; return (
           <Text>{lane}: scarcity {h.scarcity ?? '—'} · expiring {h.expiring_pct ?? 0}%{h.ok === false ? ' SPENT' : ''}</Text>
-        ))}
+        ) })}
         <Text dimColor>— devices ({dev.status ?? '—'}) —</Text>
         {(dev.nodes ?? []).map(n => (
           <Text>{n.id} {n.status ?? ''} · {gib(n.gpu_headroom_estimate_bytes)} · fits {(n.fits ?? []).length}</Text>

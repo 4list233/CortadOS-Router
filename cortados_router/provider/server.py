@@ -256,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
-            html = _dashboard_html()                    # static page; the data it shows (/resources) still needs the token
+            try:
+                html = _dashboard_html()                # static page; the data it shows (/resources) still needs the token
+            except OSError:
+                return self._error(500, "api_error", "dashboard page unavailable")
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(html)))

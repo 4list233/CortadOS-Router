@@ -6,11 +6,15 @@ export interface PulseNode {
   gpu_utilization_pct?: number | null
   fits?: string[]
 }
-export interface Pulse {
+export interface PulseUsage {
   total_routes?: number
   degraded?: { count: number; of: number }
   s1_latency_ms?: { median?: number; p90?: number; window?: number }
-  subscriptions?: Record<string, { scarcity?: number | null; expiring_pct?: number; ok?: boolean }>
+  error?: string
+}
+export interface Pulse {
+  usage?: PulseUsage
+  subscriptions?: Record<string, { scarcity?: number | null; expiring_pct?: number; ok?: boolean } | string>
   devices?: { status?: string; nodes?: PulseNode[]; pool_fits?: string[]; error?: string | null }
 }
 

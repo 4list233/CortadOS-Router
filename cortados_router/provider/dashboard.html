@@ -57,9 +57,11 @@ let timer = null;
 function gib(b) { return (b === null || b === undefined) ? "—" : (b / (2 ** 30)).toFixed(1) + " GiB"; }
 function pct(n) { return (n === null || n === undefined) ? "—" : Math.round(n) + "%"; }
 function esc(s) { const d = document.createElement("div"); d.textContent = (s === null || s === undefined) ? "" : String(s); return d.innerHTML; }
+function num(v) { return (v === null || v === undefined) ? "—" : esc(v); }   // numbers are escaped too: a stray string in the data can never inject HTML
 
-function token() { try { return localStorage.getItem(TKEY) || ""; } catch (e) { return ""; } }
-function setToken(t) { try { localStorage.setItem(TKEY, t); } catch (e) {} }
+let memToken = "";   // fallback when localStorage is blocked, so a token entered this session still works
+function token() { try { return localStorage.getItem(TKEY) || memToken; } catch (e) { return memToken; } }
+function setToken(t) { memToken = t; try { localStorage.setItem(TKEY, t); } catch (e) {} }
 
 async function load() {
   const t = token();
@@ -80,17 +82,18 @@ async function load() {
 
 function render(s) {
   const u = s.usage || {}, subs = s.subscriptions || {}, dev = s.devices || {};
+  const errs = [u.error && ("usage: " + u.error), subs.error && ("subscriptions: " + subs.error)].filter(Boolean);
   const lat = u.s1_latency_ms || {};
   const deg = u.degraded || {};
-  const bands = Object.entries(u.by_band || {}).map(([b, n]) => `<span class="chip">${esc(b)} · ${n}</span>`).join("") || "—";
-  const lanes = Object.entries(u.by_lane || {}).sort((a, b) => b[1] - a[1]).map(([l, n]) => `<span class="chip">${esc(l)} · ${n}</span>`).join("") || "—";
-  const recent = (u.recent || []).map(r => `<tr><td>${new Date((r.ts||0)*1000).toLocaleTimeString()}</td><td>${esc(r.band)}</td><td>${esc(r.lane)}/${esc(r.model)}</td><td>${r.degraded ? '<span class="chip bad">degraded</span>' : ''}</td><td class="mut">${r.response_chars ?? "—"} ch</td></tr>`).join("");
+  const bands = Object.entries(u.by_band || {}).map(([b, n]) => `<span class="chip">${esc(b)} · ${num(n)}</span>`).join("") || "—";
+  const lanes = Object.entries(u.by_lane || {}).sort((a, b) => b[1] - a[1]).map(([l, n]) => `<span class="chip">${esc(l)} · ${num(n)}</span>`).join("") || "—";
+  const recent = (u.recent || []).map(r => `<tr><td>${new Date((r.ts||0)*1000).toLocaleTimeString()}</td><td>${esc(r.band)}</td><td>${esc(r.lane)}/${esc(r.model)}</td><td>${r.degraded ? '<span class="chip bad">degraded</span>' : ''}</td><td class="mut">${num(r.response_chars)} ch</td></tr>`).join("");
 
   const subCards = Object.entries(subs).filter(([k]) => k !== "error").map(([lane, h]) => {
     const w = h.tightest || {};
     const cls = h.ok === false ? "bad" : (h.expiring_pct > 10 ? "warn" : "ok");
     return `<div class="card"><h3>${esc(lane)}</h3>
-      <div class="row"><span class="mut">scarcity</span><span>${h.scarcity ?? "—"}</span></div>
+      <div class="row"><span class="mut">scarcity</span><span>${num(h.scarcity)}</span></div>
       <div class="row"><span class="mut">expiring</span><span class="${h.expiring_pct>10?'fit':''}">${pct(h.expiring_pct)}</span></div>
       ${w.window ? `<div class="row"><span class="mut">${esc(w.window)}</span><span>${pct(w.used_pct)} used / ${pct(w.elapsed_pct)} elapsed</span></div>` : ""}
       ${w.resets_at ? `<div class="row"><span class="mut">resets</span><span>${esc(w.resets_at)}</span></div>` : ""}
@@ -111,11 +114,12 @@ function render(s) {
   }
 
   $("#main").innerHTML = `
+    ${errs.length ? `<p class="chip bad">${errs.map(esc).join(" · ")}</p>` : ""}
     <section><h2>Usage</h2>
       <div class="grid">
-        <div class="card"><div class="mut">routes logged</div><div class="big">${u.total_routes ?? "—"}</div></div>
-        <div class="card"><div class="mut">degraded</div><div class="big ${deg.count?'':''}">${deg.count ?? 0}<span class="mut" style="font-size:14px"> / ${deg.of ?? 0}</span></div></div>
-        <div class="card"><div class="mut">S1 latency</div><div class="big">${lat.median ?? "—"}<span class="mut" style="font-size:14px"> ms median</span></div><div class="mut">p90 ${lat.p90 ?? "—"} ms${lat.window?` · last ${lat.window}`:""}</div></div>
+        <div class="card"><div class="mut">routes logged</div><div class="big">${num(u.total_routes)}</div></div>
+        <div class="card"><div class="mut">degraded</div><div class="big">${num(deg.count ?? 0)}<span class="mut" style="font-size:14px"> / ${num(deg.of ?? 0)}</span></div></div>
+        <div class="card"><div class="mut">S1 latency</div><div class="big">${num(lat.median)}<span class="mut" style="font-size:14px"> ms median</span></div><div class="mut">p90 ${num(lat.p90)} ms${lat.window?` · last ${num(lat.window)}`:""}</div></div>
       </div>
       <p>${bands}</p><p>${lanes}</p>
       ${recent ? `<table><thead><tr><th>time</th><th>band</th><th>route</th><th></th><th>size</th></tr></thead><tbody>${recent}</tbody></table>` : ""}
