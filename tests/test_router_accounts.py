@@ -344,3 +344,25 @@ class DuplicateAccountIdTests(unittest.TestCase):
     def test_scarcity_reader_refuses_duplicate_ids(self):
         from cortados_router import scarcity as sc
         self.assertEqual(sc.claude_lanes(), [])      # collapsed sampling key: refuse rather than sample one dir for two
+
+
+class ReorderCacheIdentityTests(unittest.TestCase):
+    """Codex review pass 8: a cached reading under a positional lane key sampled from a DIFFERENT login (accounts
+    reordered) must not be trusted for the current account; candidate_health returns unavailable, not spent/healthy."""
+    def test_mismatched_config_dir_reading_is_not_trusted(self):
+        # the lane 'claude' cache was sampled from /acctA, but the candidate on 'claude' now points to /acctB (reordered)
+        health = {"claude": {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": "/acctA"}}
+        cand = {"lane": "claude", "model": "claude-x", "config_dir": "/acctB"}
+        h = core.candidate_health(cand, health)
+        self.assertFalse(h["ok"])                               # not trusted as the spent /acctA reading
+        self.assertIn("stale cross-account", h.get("why") or "")
+
+    def test_matching_config_dir_reading_is_used(self):
+        health = {"claude": {"ok": True, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": "/acctA"}}
+        cand = {"lane": "claude", "model": "claude-x", "config_dir": "/acctA"}
+        self.assertTrue(core.candidate_health(cand, health)["ok"])   # same login: the reading applies
+
+    def test_fake_health_without_config_dir_is_unaffected(self):
+        health = {"claude": {"ok": True, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        cand = {"lane": "claude", "model": "claude-x", "config_dir": "/acctA"}
+        self.assertTrue(core.candidate_health(cand, health)["ok"])   # no identity recorded → guard off (back-compat)

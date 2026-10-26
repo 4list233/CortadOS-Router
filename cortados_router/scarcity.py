@@ -363,8 +363,10 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     wins = parse_claude_usage(text)
     if not wins:
         raise RuntimeError("no '% used' lines on the /usage screen: " + text[-200:].replace("\n", " "))
-    out: dict[str, Any] = {"source": "claude /usage (pty)"}
-    if not any(w["pool"] != "all" for w in wins):
+    out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir}
+    if not any(w["pool"] != "all" for w in wins) and (prev or {}).get("config_dir") == config_dir:
+        # carry the last per-model reading forward only when it was sampled for THIS same account (config_dir): after a
+        # reorder, the positional lane key may now point to a different login, and its old windows must not cross over.
         out["per_model"] = "not shown this read (vendor rate limit on the per-model panel)"
         for w in (prev or {}).get("windows") or []:          # keep the last per-model reading until its own reset passes
             if w.get("pool", "all") != "all" and w.get("resets_at") and w["resets_at"] > time.strftime("%Y-%m-%d %H:%M"):
@@ -732,7 +734,7 @@ def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]
         roll = _roll(general) if fresh else {"tightest": {}, "expiring_pct": 0}
         out[lane] = {"scarcity": v.get("scarcity") if fresh else None, "tightest": roll["tightest"], "expiring_pct": roll["expiring_pct"],
                      "refusing": bool(v.get("refusing")) and fresh, "pools": (v.get("pools") or {}) if fresh else {},
-                     "error": v.get("error") if failed else None}
+                     "error": v.get("error") if failed else None, "config_dir": v.get("config_dir")}
         if lane == "local" and managed_local:
             usable = fresh and v.get("resource_managed") is True
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}) if usable else {},

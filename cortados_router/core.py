@@ -433,6 +433,8 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
     try:
         sc = _scarcity_module()
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
+        if c.get("config_dir") and lane.get("config_dir") and lane["config_dir"] != c["config_dir"]:
+            return None                                              # cached reading is for a different login (reorder): no capacity credit
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
                ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
@@ -466,7 +468,8 @@ def lane_health() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for lane, v in sc.lane_scarcity().items():
         out[lane] = {**_health_row(v.get("scarcity"), v.get("tightest"), v.get("expiring_pct"), v.get("refusing")),
-                     "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()}}
+                     "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()},
+                     "config_dir": v.get("config_dir")}   # the login this reading was sampled from (account identity, not the positional lane name)
         if lane == "local" and v.get("resource_managed"):
             out[lane].update(resource_managed=True, deployments=v.get("deployments", {}), why=v.get("why"))
     return out
@@ -482,6 +485,11 @@ def _health_row(s, w, expiring, spent) -> dict[str, Any]:
 def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """A model is as scarce as the tightest pool it draws on: the lane's general windows plus its own pool when it has one."""
     lane = health.get(c["lane"]) or {}
+    if c.get("config_dir") and lane.get("config_dir") and lane["config_dir"] != c["config_dir"]:
+        # the cached reading under this positional lane key was sampled from a DIFFERENT login (accounts were reordered):
+        # do not trust it either way. Unavailable until a fresh same-identity sample, rather than risk routing to a spent login.
+        return {"ok": False, "scarcity": None, "expiring_pct": 0, "tightest": {}, "pool": None,
+                "why": "stale cross-account reading; awaiting a fresh sample for this login"}
     if c["lane"] == "local" and lane.get("resource_managed"):
         deployment = (lane.get("deployments") or {}).get(c.get("model"))
         # resource_rejected: unverified or stale local capacity is unroutable, not merely spent, so resolve's last-resort
