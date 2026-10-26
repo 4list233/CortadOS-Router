@@ -194,13 +194,13 @@ export CORTADOS_PROVIDER_TOKEN=<token>
 ```
 
 Claude Code reads `.mcp.json` from the repo root and offers to enable the server. Codex keeps MCP servers in its own
-global config, so register it once:
+global config, so register it once (run from the repo root so the path resolves absolutely):
 
 ```bash
 codex mcp add cortados-route \
   --env CORTADOS_PROVIDER_URL=$CORTADOS_PROVIDER_URL \
   --env CORTADOS_PROVIDER_TOKEN=$CORTADOS_PROVIDER_TOKEN \
-  -- python3 cortados_router/subagent_mcp.py
+  -- python3 "$PWD/cortados_router/subagent_mcp.py"
 ```
 
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
