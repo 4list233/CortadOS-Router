@@ -44,8 +44,12 @@ def served_routes(core) -> tuple[tuple[str, str], ...]:
     pairs = {(CLONED_PROVIDERS.get(r["provider"], r["provider"]), r["model"]) for r in rows}
     served = {p for p in pairs if p[0] in SERVED_PROVIDERS}
     # Expand each Claude pair across configured accounts (claude-cli, claude-cli#b, …) so a second-account candidate
-    # survives the allowlist filter in execution_routing.select; one account leaves this unchanged.
-    accts = core._vendor_accounts("claude", "claude", "claude-cli")
+    # survives the allowlist filter in execution_routing.select; one account leaves this unchanged. A broken accounts
+    # config refuses Claude (drops its pairs) rather than serving it on an ambient login.
+    try:
+        accts = core._vendor_accounts("claude", "claude", "claude-cli")
+    except core.AccountsConfigError:
+        return tuple(sorted(p for p in served if _base_provider(p[0]) != "claude-cli"))
     if len(accts) > 1:
         served |= {(a["provider"], model) for (prov, model) in set(served) if prov == "claude-cli" for a in accts}
     return tuple(sorted(served))

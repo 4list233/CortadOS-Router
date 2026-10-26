@@ -99,3 +99,22 @@ class RefuseUnresolvedAccountTests(unittest.TestCase):
         route = {"provider": "claude-cli#b", "account": "b", "model": "m", "config_dir": None}
         with self.assertRaises(UnservedProvider):
             reg.new(turn, keep=False, route=route)
+
+
+class OAuthTokenStripTests(unittest.TestCase):
+    """Codex review pass 3 finding 1: an inherited ambient CLAUDE_CODE_OAUTH_TOKEN would override a named account's
+    stored login; it must be dropped when a config dir is set so the account's own login wins."""
+    def test_named_account_drops_inherited_oauth_token(self):
+        seen = {}
+
+        def fake_popen(args, **kw):
+            seen["env"] = kw.get("env"); raise OSError("stop")
+        old = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "ambient-account-A-token"
+        try:
+            with self.assertRaises(BridgeError):
+                BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                              claude_bin="claude", config_dir="/tmp/acctB", popen=fake_popen)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen["env"])
+        finally:
+            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None) if old is None else os.environ.__setitem__("CLAUDE_CODE_OAUTH_TOKEN", old)

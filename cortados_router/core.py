@@ -330,18 +330,28 @@ def _base_lane(lane: str) -> str:
     return (lane or "").split("#", 1)[0]
 
 
+class AccountsConfigError(Exception):
+    """tables/accounts.json is present but unreadable/malformed. A broken file must never silently fall back to the
+    default login (that would run on an account outside the configured set); callers refuse the vendor instead."""
+
+
 def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[dict[str, Any]]:
-    """One entry per configured account of a vendor: {lane, provider, account, reserve}. The first account keeps the
-    bare lane/provider; others get a `#<id>` suffix. No accounts.json (or one account) -> the single default login,
-    exactly today's behaviour. A `reserve` account is spared while a non-reserve sibling has room (see resolve)."""
+    """One entry per configured account of a vendor: {lane, provider, account, reserve, config_dir}. The first account
+    keeps the bare lane/provider; others get a `#<id>` suffix. An ABSENT accounts.json (or no entries for this vendor)
+    -> the single default login, exactly today's behaviour. A PRESENT-but-broken file raises AccountsConfigError rather
+    than defaulting. A `reserve` account is spared while a non-reserve sibling has room (see resolve)."""
+    from cortados_router.paths import tables_dir
+    default = [{"lane": base_lane, "provider": base_provider, "account": None, "reserve": False, "config_dir": None}]
+    path = tables_dir() / "accounts.json"
+    if not path.exists():
+        return default
     try:
-        from cortados_router.paths import tables_dir
-        accts = json.loads((tables_dir() / "accounts.json").read_text()).get(vendor) or []
-        accts = [a for a in accts if isinstance(a, dict) and a.get("config_dir")]
-    except Exception:
-        accts = []
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise AccountsConfigError(f"{path} is present but unreadable: {exc}") from exc
+    accts = [a for a in (data.get(vendor) or []) if isinstance(a, dict) and a.get("config_dir")]
     if not accts:
-        return [{"lane": base_lane, "provider": base_provider, "account": None, "reserve": False, "config_dir": None}]
+        return default
     out = []
     for i, a in enumerate(accts):
         aid = str(a.get("id") or i)
@@ -361,7 +371,10 @@ def _native_account_lanes(native_lane: str) -> list[str]:
     """The configured account lanes for a native vendor (claude, claude#b, …); [native_lane] for a single-account
     vendor. Driven by accounts.json, NOT the scarcity cache, so an unsampled new account counts and a removed one does not."""
     if native_lane == "claude":
-        return [a["lane"] for a in _vendor_accounts("claude", "claude", "claude-cli")]
+        try:
+            return [a["lane"] for a in _vendor_accounts("claude", "claude", "claude-cli")]
+        except AccountsConfigError:
+            return []                                          # broken config: no native Claude account to protect
     return [native_lane]
 
 
@@ -369,12 +382,18 @@ def _expand_claude_accounts(cands: list[dict[str, Any]]) -> list[dict[str, Any]]
     """Replace each Claude candidate with one per configured account (Option A), binding account id, reserve flag and
     config_dir. Applied to BOTH scored and static/fallback candidate lists so account identity is never lost. A single
     default login (no accounts.json) leaves candidates effectively unchanged (account/config_dir None)."""
-    accts = _vendor_accounts("claude", "claude", "claude-cli")
+    try:
+        accts = _vendor_accounts("claude", "claude", "claude-cli")
+    except AccountsConfigError:
+        accts = None                                           # broken config: refuse Claude rather than run on an ambient login
     out = []
     for c in cands:
+        is_claude = c.get("lane") == "claude" and _base_provider(c.get("provider", "")) == "claude-cli"
         if c.get("account") is not None:                       # already expanded
             out.append(c)
-        elif c.get("lane") == "claude" and _base_provider(c.get("provider", "")) == "claude-cli":
+        elif is_claude and accts is None:
+            continue                                           # drop Claude candidates while the accounts config is unreadable
+        elif is_claude:
             for a in accts:
                 out.append({**c, "lane": a["lane"], "provider": a["provider"], "account": a["account"],
                             "reserve": a["reserve"], "config_dir": a["config_dir"]})
@@ -602,6 +621,16 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     exp_of = lambda c: ch_of[id(c)].get("expiring_pct") or 0
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     base = {id(c): i for i, c in enumerate(cands)}
+
+    def apply_reserve():
+        # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling is
+        # available, so account A stays in reserve while B can serve this model, but A is used when B's pool for it is spent
+        # (never letting the reserve preference pick an underqualified model). Applied on BOTH the scored and static paths.
+        for c in cands:
+            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
+                                        and not k.get("reserve") and ok_of(k) for k in cands):
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
+
     if scored:
         sel = t["selection"]
         tie = sel.get("lane_tiebreak", [])
@@ -658,14 +687,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
                              for l in _native_account_lanes(native))
                 if nat_ok:
                     ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
-        # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling account
-        # is available — so account A is kept in reserve while B can serve this model, but A is used when B's pool for it is
-        # spent (never letting the reserve preference pick an underqualified model). The expiring-credit term still steers usage
-        # onto whichever account's unused weekly credit is about to reset.
-        for c in cands:
-            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
-                                        and not k.get("reserve") and ok_of(k) for k in cands):
-                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
+        apply_reserve()      # the expiring-credit term still steers usage onto whichever account's credit is about to reset
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
             same = lambda k: (abs(k["price"] - c["price"]) <= 0.25 * max(k["price"], c["price"]) if k.get("price") and c.get("price")
@@ -702,6 +724,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         if target != req:
             rules.append(f"no available model reaches {req}: strongest available ({best_avail}) taken")
     else:
+        apply_reserve()      # the static/fallback path honours the reserve policy too, not only scored selection
         cands.sort(key=lambda c: (0 if exp_of(c) >= expiring and sc_of(c) < demote else 1, 1 if sc_of(c) >= demote else 0,
                                   pref.index(c["lane"]) if c["lane"] in pref else len(pref), base[id(c)]))
     usable = [c for c in cands if ok_of(c)]

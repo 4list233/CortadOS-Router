@@ -196,3 +196,44 @@ class ExpandAndVisionTests(unittest.TestCase):
         self.assertNotIn("error", r)                                         # not a no-route
         self.assertEqual(core._base_provider(r["provider"]), "claude-cli")   # a Claude account served it
         self.assertEqual(r["account"], "b")                                  # the sibling, since A is spent
+
+
+class BrokenConfigAndStaticReserveTests(unittest.TestCase):
+    """Pass-3 findings 2 & 3: a broken accounts.json refuses Claude (never the default login), and the static/fallback
+    selection path honours the reserve policy."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.home = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=self.home, CORTADOS_SCARCITY_REFRESH="off")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_absent_config_is_default_login(self):
+        self.assertEqual(core._vendor_accounts("claude", "claude", "claude-cli")[0]["account"], None)
+
+    def test_broken_config_raises(self):
+        (Path(self.dir) / "accounts.json").write_text("{ not valid json")
+        with self.assertRaises(core.AccountsConfigError):
+            core._vendor_accounts("claude", "claude", "claude-cli")
+
+    def test_expand_drops_claude_on_broken_config(self):
+        (Path(self.dir) / "accounts.json").write_text("{ not valid json")
+        out = core._expand_claude_accounts([{"lane": "claude", "provider": "claude-cli", "model": "claude-x"},
+                                            {"lane": "codex", "provider": "openai-codex", "model": "gpt-x"}])
+        self.assertEqual([c["lane"] for c in out], ["codex"])           # Claude refused, not run on the default login
+
+    def test_static_path_honours_reserve(self):
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        core.model_scores = lambda: None                                 # force the static band-list path
+        core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": OK, "cursor": OK}
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="writing"))   # R2 static, both accounts healthy
+        self.assertNotEqual(r["chosen"]["lane"], "claude")               # reserve A not consumed
+        self.assertTrue(any(s["lane"] == "claude" and "reserve" in (s.get("why") or "") for s in r["skipped"]))

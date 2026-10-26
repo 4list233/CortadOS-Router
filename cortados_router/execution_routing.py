@@ -106,9 +106,13 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     allowed = {(r['provider'], r['model']) for r in candidates if r['provider'] != 'custom'}
     allowed |= {('codex-cli', m) for p, m in allowed if p == 'openai-codex'}
     # Each configured vendor account is its own provider (claude-cli, claude-cli#b, …); expand them into the canonical
-    # universe so a sibling-account route survives the intersection with allowed_routes below. One account is a no-op.
-    allowed |= {(a['provider'], m) for (p, m) in list(allowed) if p == 'claude-cli'
-                for a in core._vendor_accounts('claude', 'claude', 'claude-cli')}
+    # universe so a sibling-account route survives the intersection with allowed_routes below. One account is a no-op;
+    # a broken accounts config refuses Claude (drops its pairs) rather than routing on an ambient login.
+    try:
+        allowed |= {(a['provider'], m) for (p, m) in list(allowed) if p == 'claude-cli'
+                    for a in core._vendor_accounts('claude', 'claude', 'claude-cli')}
+    except core.AccountsConfigError:
+        allowed = {(p, m) for (p, m) in allowed if p.split('#', 1)[0] != 'claude-cli'}
     capabilities = set((constraints or {}).get('required_capabilities') or [])
     if capabilities - {'vision'}:
         raise ValueError('Unsupported required model capability')

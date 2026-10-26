@@ -98,6 +98,7 @@ class BridgeSession:
             env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
+                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)    # an inherited ambient token would override the account's stored login: drop it so config_dir wins
             env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

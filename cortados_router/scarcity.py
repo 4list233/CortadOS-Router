@@ -300,18 +300,24 @@ def _cli_env() -> dict[str, str]:
 def _accounts(vendor: str) -> list[dict[str, Any]]:
     """Configured accounts for a vendor from tables/accounts.json, or [] (the single default login). Shape:
     {"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "b", "config_dir": "~/.claude-acctB"}]}."""
+    from cortados_router.paths import tables_dir
+    p = tables_dir() / "accounts.json"
+    if not p.exists():
+        return []                                              # absent: single default login
     try:
-        from cortados_router.paths import tables_dir
-        data = json.loads((tables_dir() / "accounts.json").read_text())
-        return [a for a in (data.get(vendor) or []) if isinstance(a, dict) and a.get("config_dir")]
-    except Exception:
-        return []
+        data = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"accounts.json present but unreadable: {exc}")   # broken: caller refuses Claude sampling, never samples the wrong login
+    return [a for a in (data.get(vendor) or []) if isinstance(a, dict) and a.get("config_dir")]
 
 
 def claude_lanes() -> list[tuple[str, str | None]]:
     """(lane_key, config_dir) per Claude account. The first account keeps the bare `claude` key (back-compat); the rest
     are `claude#<id>`. No accounts.json → [("claude", None)], i.e. today's single default login, unchanged."""
-    accts = _accounts("claude")
+    try:
+        accts = _accounts("claude")
+    except Exception:
+        return []                                              # broken config: skip Claude sampling rather than read the wrong login
     if not accts:
         return [("claude", None)]
     return [("claude" if i == 0 else f"claude#{a.get('id') or i}", os.path.expanduser(a["config_dir"]))
@@ -337,6 +343,7 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     env = _cli_env()
     if config_dir:                                             # a named account: read THIS login's usage, not the default
         env["CLAUDE_CONFIG_DIR"] = config_dir
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)               # an inherited ambient token would override the account's stored login
         _ensure_trust(config_dir)
     text = tui_capture(["claude", "--strict-mcp-config"], "/usage", r"% used[\s\S]*% used", env, run_s=25,
                        nudge=(r"Current week \((?!all models)[^)]+\)\D{0,160}?\d+\s*% used", r"breakdown unavailable", b"r", 2, 8.0))
