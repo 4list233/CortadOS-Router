@@ -179,13 +179,40 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 
 Legacy `WANGCAI_*` names still work and log a deprecation warning.
 
+## Delegating sub-agent work through the router
+
+Point a whole tool at `cortados` to route everything, or keep your main session on its own model and route only the
+sub-tasks it chooses to hand off. The repo ships a project MCP server, `cortados-route` (`.mcp.json`), exposing one tool,
+`route_task(task, context?, max_tokens?)`: it sends a self-contained sub-task to the provider, S1 scores it, the cheapest
+capable model runs it, and the text comes back. The main session keeps its own model and login.
+
+Set two environment variables and have the provider running:
+
+```bash
+export CORTADOS_PROVIDER_URL=http://<provider-ip>:8432
+export CORTADOS_PROVIDER_TOKEN=<token>
+```
+
+Claude Code reads `.mcp.json` from the repo root and offers to enable the server. Codex keeps MCP servers in its own
+global config, so register it once (run from the repo root so the path resolves absolutely):
+
+```bash
+codex mcp add cortados-route \
+  --env CORTADOS_PROVIDER_URL=$CORTADOS_PROVIDER_URL \
+  --env CORTADOS_PROVIDER_TOKEN=$CORTADOS_PROVIDER_TOKEN \
+  -- python3 "$PWD/cortados_router/subagent_mcp.py"
+```
+
+No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
+fails if a literal value is ever placed there.
+
 ## Status
 
 - Live per-turn routing, with mandatory routing for agent, cron, delegation and auxiliary calls when enabled.
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision.
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **440 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **506 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 
