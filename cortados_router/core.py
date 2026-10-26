@@ -630,8 +630,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             why = f"turn ≈{need // 1000}k tokens exceeds {c['lane']} ceiling {cap // 1000}k"
         elif fit.get('known') is False and c['lane'] in ('antigravity', 'local'):
             why = 'exact session history unavailable; constrained transport not admitted'
-        elif c['lane'] in byte_caps and int(fit.get('input_bytes') or 0) > int(byte_caps[c['lane']]):
-            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {byte_caps[c['lane']]}"
+        elif _base_lane(c['lane']) in byte_caps and int(fit.get('input_bytes') or 0) > int(byte_caps[_base_lane(c['lane'])]):
+            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {byte_caps[_base_lane(c['lane'])]}"
         elif c['lane'] == 'local' and history_chars // 4 > int(cx.get('local_fresh_only_history_tokens', 8000)):
             why = 'local lanes take fresh-context work only'
         if why:

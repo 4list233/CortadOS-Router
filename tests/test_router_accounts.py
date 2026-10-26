@@ -397,3 +397,30 @@ class SiblingContextCeilingTests(unittest.TestCase):
         self.assertEqual(core.lane_ceiling("claude#b", "claude-sonnet-5"),
                          core.lane_ceiling("claude", "claude-sonnet-5"))
         self.assertGreater(core.lane_ceiling("claude#b", "claude-sonnet-5[1m]"), 200000)
+
+
+class SiblingByteCeilingTests(unittest.TestCase):
+    """Codex review pass 11: an account sibling lane inherits the base vendor's byte ceiling; an oversized request must
+    reject BOTH accounts, not slip through on claude#b."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH", "CORTADOS_ROUTER_BUDGETS")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=tempfile.mkdtemp(), CORTADOS_SCARCITY_REFRESH="off")
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        self._keep = (core.model_scores, core.lane_health, core._table, core._context_cfg)
+        core.model_scores = lambda: MS
+        core.lane_health = lambda: {"claude#a": OK, "claude#b": OK, "codex": OK}
+        core._context_cfg = lambda: {"ceiling_bytes": {"claude": 400000}}
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table, core._context_cfg = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_oversized_request_rejects_both_claude_accounts(self):
+        fit = {"known": True, "assembled": True, "input_tokens": 125000, "input_bytes": 500000, "source": "test"}
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"), input_fit=fit, accounts_aware=True)
+        self.assertNotIn("claude", core._base_lane((r.get("chosen") or {}).get("lane", "")))   # no Claude account carried the oversized input

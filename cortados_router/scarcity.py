@@ -793,7 +793,7 @@ POOL_KEY = {("claude", "week (all models)"): "claude:all", ("claude", "week (fab
 
 
 def tokens_left(lane: str, window: str, used_pct: float) -> float | None:
-    uc = unit_costs().get(POOL_KEY.get((lane, window), ""))
+    uc = unit_costs().get(POOL_KEY.get((lane.split("#", 1)[0], window), ""))   # account lanes (claude#b) share the base pool-size key
     return (100 - used_pct) * uc["tokens_per_pct"] if uc and uc.get("tokens_per_pct") else None
 
 
