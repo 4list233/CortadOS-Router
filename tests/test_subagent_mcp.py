@@ -227,3 +227,27 @@ class DeepNestCrashTests(unittest.TestCase):
                 pass
             p.terminate()
             p.wait(timeout=5)
+
+
+class EmbeddedNewlineTokenTests(unittest.TestCase):
+    def test_token_with_embedded_newline_is_rejected_without_leak(self):
+        tok = "synthetic-review-\nsecret-0123456789"
+        called = {"n": 0}
+
+        def _open(req, timeout=None):
+            called["n"] += 1                                    # must never be reached
+            return FakeResp({"content": [{"type": "text", "text": "ok"}]})
+        r = m.route_task("http://x", tok, "task", urlopen=_open)
+        self.assertTrue(r["isError"])
+        self.assertEqual(called["n"], 0)                        # rejected before any request
+        self.assertNotIn("secret-0123456789", r["content"][0]["text"])
+        self.assertNotIn("synthetic-review", r["content"][0]["text"])
+
+    def test_clean_token_still_reaches_the_provider(self):
+        seen = {}
+
+        def _open(req, timeout=None):
+            seen["token"] = req.headers.get("X-api-key")
+            return FakeResp({"content": [{"type": "text", "text": "ok"}]})
+        m.route_task("http://x", "cortados-provider-token-0123456789", "task", urlopen=_open)
+        self.assertEqual(seen["token"], "cortados-provider-token-0123456789")   # printable token passes the check

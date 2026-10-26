@@ -61,6 +61,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     scrub = (lambda s: s.replace(token, "***")) if (token and len(token) >= 8) else (lambda s: s)
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
+    if any(ord(c) < 32 or ord(c) == 127 for c in token):
+        # Reject a token with control chars (e.g. an embedded newline from a wrapped paste) BEFORE building the request:
+        # urllib's header validator would otherwise raise with the token's escaped bytes, which the raw-string scrub misses.
+        return _err("cortados route_task: CORTADOS_PROVIDER_TOKEN contains control characters (e.g. an embedded newline); fix it")
     if not (task and str(task).strip()):
         return _err("route_task requires a non-empty 'task'")
     prompt = str(task) if not context else f"{task}\n\nContext:\n{context}"
