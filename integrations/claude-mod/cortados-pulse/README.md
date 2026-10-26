@@ -18,3 +18,13 @@ Set the mod's config `providerUrl` (the provider base URL, e.g. the Air on the t
 `/cortados-pulse` command; it also opens on session start.
 
 No address or token is committed; both come from the mod's config.
+
+## Install (Claude Code / Claude desktop app)
+
+One step on Claude Code 2.1.275 or later:
+
+```
+/plugin install cortados-pulse --marketplace 4list233/CortadOS-Router
+```
+
+Then set the two config values when prompted: **Provider URL** (e.g. `http://100.103.11.9:8432`, the Air on the tailnet) and **Provider token** (`CORTADOS_PROVIDER_TOKEN`). The pane opens beside the chat and refreshes every few seconds.

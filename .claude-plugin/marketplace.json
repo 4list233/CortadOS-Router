@@ -1,0 +1,14 @@
+{
+  "name": "cortados-router",
+  "owner": { "name": "Forest Li", "url": "https://github.com/4list233" },
+  "metadata": {
+    "description": "CortadOS Router mods for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "cortados-pulse",
+      "source": "./integrations/claude-mod/cortados-pulse",
+      "description": "A pane beside the chat with the CortadOS router's live resource pool: usage, subscription scarcity, online devices and model fit."
+    }
+  ]
+}
