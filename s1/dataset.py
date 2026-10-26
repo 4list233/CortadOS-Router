@@ -1,10 +1,12 @@
 """Collect every real request we have into s1/data/requests.jsonl (idempotent; new rows are appended, old rows never change).
 Sources: an optional private seed sheet (sources/labeling-sheet.csv: columns id, request; not published) + every turn the
-shadow router has logged (~/.cortados/router.db). No request data ships with this repository."""
+shadow router has logged (~/.cortados/router.db, plus any db named in CORTADOS_ROUTER_DB_EXTRA — e.g. one rsynced from
+the provider host, so the whole fleet's daily usage feeds training). No request data ships with this repository."""
 from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -15,6 +17,17 @@ SHEET = Path(__file__).resolve().parent / "sources/labeling-sheet.csv"
 ROUTER_DB = Path.home() / ".cortados/router.db"
 
 
+def _router_dbs() -> list[Path]:
+    """The local shadow-router db plus any synced from other machines (CORTADOS_ROUTER_DB_EXTRA, os.pathsep-separated).
+    A provider running on another host logs to its OWN ~/.cortados/router.db; rsync a copy here and name it in that
+    variable so daily usage from the whole fleet feeds training, not only this machine's (Forest 2026-10-26)."""
+    paths, seen = [], set()
+    for db in [ROUTER_DB] + [Path(x).expanduser() for x in os.environ.get("CORTADOS_ROUTER_DB_EXTRA", "").split(os.pathsep) if x.strip()]:
+        if str(db) not in seen:
+            seen.add(str(db)); paths.append(db)
+    return paths
+
+
 def main() -> None:
     out = DATA / "requests.jsonl"
     have = {r["id"] for r in read_jsonl(out)}
@@ -23,11 +36,15 @@ def main() -> None:
     if SHEET.exists():
         for r in csv.DictReader(SHEET.open()):
             new.append({"id": r["id"], "source": "1.0-sheet", "unit_kind": "interactive", "request": clean_request(r["request"])})
-    if ROUTER_DB.exists():
-        c = sqlite3.connect(ROUTER_DB.as_uri() + "?mode=ro", uri=True)
-        for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
-            new.append({"id": "rt." + tid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})
-        c.close()
+    for db in _router_dbs():
+        if not db.exists():
+            continue                                        # a synced copy that has not arrived yet is simply skipped
+        c = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+        try:
+            for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
+                new.append({"id": "rt." + tid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})
+        finally:
+            c.close()
     added = 0
     with out.open("a") as f:
         for r in new:

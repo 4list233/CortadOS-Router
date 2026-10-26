@@ -128,10 +128,11 @@ class Registry:
     def __init__(self, *, gateway_url: str, token: str, claude_bin: str | list[str] = "claude",
                  codex_bin: str | list[str] = "codex", codex_home: str | None = None, model: str | None = None,
                  router: Callable[[dict, str], dict] | None = None, executed: Callable[[dict], None] | None = None,
+                 log_outcome: Callable[[dict, int, int], None] | None = None,
                  session_factories: dict[str, Callable[..., Any]] | None = None):
         self.gateway_url, self.token, self.claude_bin, self.model = gateway_url, token, claude_bin, model
         self.codex_bin, self.codex_home = codex_bin, codex_home
-        self.router, self.executed = router, executed
+        self.router, self.executed, self.log_outcome = router, executed, log_outcome
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
@@ -376,12 +377,18 @@ class Handler(BaseHTTPRequestHandler):
                     session.deliver(turn.tool_results, timeout=deadline - time.time())
                 else:
                     session.send_user(turn.content, timeout=deadline - time.time())
+                _turn_t0 = time.time()
                 outcome["turn"] = session.run_turn(deadline - time.time())
+                _turn_ms = int((time.time() - _turn_t0) * 1000)
                 session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
                 if session.route and not session.route_logged and reg.executed:
                     try:
                         reg.executed(session.route)
-                        session.route_logged = True     # only after the write succeeded; a failure retries next turn
+                        if reg.log_outcome:             # the turn's size and duration, for training; once per conversation, same row as the route
+                            blocks = outcome["turn"][0]
+                            chars = sum(len(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                            reg.log_outcome(session.route, chars, _turn_ms)
+                        session.route_logged = True     # only after the writes succeeded; a failure retries next turn
                     except Exception:
                         # The reply is good; only its training record failed. Answer the client and say so loudly.
                         logger.exception("execution log for route %s failed%s", session.route.get("route_id"),
@@ -476,7 +483,7 @@ class ProviderServer(ThreadingHTTPServer):
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
           fixed_model: str | None) -> None:
-    router = executed = None
+    router = executed = log_turn_outcome = None
     if not fixed_model:
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
@@ -488,8 +495,12 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])
 
+        def log_turn_outcome(route, response_chars, turn_ms):
+            core.log_outcome(route["route_id"], response_chars, turn_ms)
+
     registry = Registry(gateway_url=f"http://{host}:{port}", token=token, claude_bin=claude_bin, codex_bin=codex_bin,
-                        codex_home=codex_home, model=fixed_model, router=router, executed=executed)
+                        codex_home=codex_home, model=fixed_model, router=router, executed=executed,
+                        log_outcome=log_turn_outcome)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

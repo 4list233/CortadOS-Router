@@ -93,7 +93,7 @@ The pipeline is in `s1/`, run nightly by `s1/nightly.sh`:
 
 | step | file | what it does |
 |---|---|---|
-| collect | `dataset.py` | gathers routed requests; a request's train/holdout split is fixed by its id |
+| collect | `dataset.py` | gathers routed requests from the local `router.db` and any in `CORTADOS_ROUTER_DB_EXTRA` (e.g. rsynced from the provider host); a request's train/holdout split is fixed by its id |
 | label | `label.py` | teacher labels via a stateless CLI, k = 3 soft samples; train split by Sonnet, holdout by a stronger Opus |
 | build | `build_sft.py` | builds the SFT set, oversampling rare bands |
 | train | `mlx_lm lora` | warm-starts from the promoted adapter |
@@ -172,6 +172,7 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 | `CORTADOS_S1_TOKEN` | unset | bearer sent by clients and required by a token-guarded scorer |
 | `CORTADOS_S1_BIND` | `127.0.0.1` | interface `s1/serve.py` listens on |
 | `tables/accounts.json` | absent | multiple accounts per vendor (git-ignored; copy `accounts.example.json`). Each Claude account is its own lane/pool metered from its own `CLAUDE_CONFIG_DIR`; routing steers to the account with unused expiring credit, and a `reserve` account is spared while another has room |
+| `CORTADOS_ROUTER_DB_EXTRA` | unset | extra `router.db` files to feed S1 training, `os.pathsep`-separated — e.g. one rsynced from the provider host, so the whole fleet's daily usage is labelled, not just this machine's |
 | `CORTADOS_PROVIDER_TOKEN` | generated | the `cortados` endpoint's bearer token |
 | `CORTADOS_PROVIDER_CLAUDE_BIN` / `CORTADOS_PROVIDER_CODEX_BIN` | `claude` / `codex` | backend CLIs the provider drives |
 | `CORTADOS_PROVIDER_CODEX_HOME` | unset | a dedicated logged-in `CODEX_HOME` for the Codex backend |
@@ -212,7 +213,7 @@ fails if a literal value is ever placed there.
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision.
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **506 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **518 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 
