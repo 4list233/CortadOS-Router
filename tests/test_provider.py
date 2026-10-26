@@ -223,6 +223,15 @@ class EndpointTests(unittest.TestCase):
             urllib.request.urlopen(req, timeout=30)
         self.assertEqual(cm.exception.code, 401)
 
+    def test_dashboard_page_is_served_without_a_token(self):
+        req = urllib.request.Request(self.url + "/dashboard")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn("text/html", r.headers.get("content-type", ""))
+            body = r.read().decode()
+        self.assertIn("CortadOS Router", body)               # the page title/heading
+        self.assertIn("/resources", body)                    # it fetches the resources endpoint for its data
+
 
 class RoutedEndpointTests(EndpointTests):
     """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
