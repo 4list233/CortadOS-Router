@@ -23,9 +23,31 @@ def _router_dbs() -> list[Path]:
     variable so daily usage from the whole fleet feeds training, not only this machine's (Forest 2026-10-26)."""
     paths, seen = [], set()
     for db in [ROUTER_DB] + [Path(x).expanduser() for x in os.environ.get("CORTADOS_ROUTER_DB_EXTRA", "").split(os.pathsep) if x.strip()]:
-        if str(db) not in seen:
-            seen.add(str(db)); paths.append(db)
+        rp = db.resolve()                                   # absolute + canonical: a relative path survives as_uri(), and one file named two ways dedupes once
+        if rp not in seen:
+            seen.add(rp); paths.append(rp)
     return paths
+
+
+def _source_tag(db: Path) -> str:
+    """The local db keeps unqualified ids (`rt.<turn_id>`) so existing requests.jsonl ids are unchanged; every other db is
+    tagged by its file stem so two machines sharing a turn_id become distinct rows instead of silently dropping one."""
+    return "" if db.resolve() == ROUTER_DB.resolve() else db.stem
+
+
+def _rows_from_db(db: Path) -> list:
+    """Requests from one router db (read-only). Raises on an unreadable/locked/malformed db; the caller isolates that so
+    one bad source never discards rows already collected from the healthy ones."""
+    tag = _source_tag(db)
+    c = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+    try:
+        rows = []
+        for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
+            rid = "rt." + tid if not tag else f"rt.{tag}.{tid}"
+            rows.append({"id": rid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})
+        return rows
+    finally:
+        c.close()
 
 
 def main() -> None:
@@ -39,12 +61,10 @@ def main() -> None:
     for db in _router_dbs():
         if not db.exists():
             continue                                        # a synced copy that has not arrived yet is simply skipped
-        c = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
         try:
-            for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
-                new.append({"id": "rt." + tid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})
-        finally:
-            c.close()
+            new.extend(_rows_from_db(db))
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(f"dataset: skipping unreadable router db {db}: {exc}", file=sys.stderr)   # one bad source never loses the others
     added = 0
     with out.open("a") as f:
         for r in new:

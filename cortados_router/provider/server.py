@@ -384,15 +384,24 @@ class Handler(BaseHTTPRequestHandler):
                 if session.route and not session.route_logged and reg.executed:
                     try:
                         reg.executed(session.route)
-                        if reg.log_outcome:             # the turn's size and duration, for training; once per conversation, same row as the route
-                            blocks = outcome["turn"][0]
-                            chars = sum(len(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text")
-                            reg.log_outcome(session.route, chars, _turn_ms)
-                        session.route_logged = True     # only after the writes succeeded; a failure retries next turn
+                        session.route_logged = True     # only after the write succeeded; a failure retries next turn
                     except Exception:
                         # The reply is good; only its training record failed. Answer the client and say so loudly.
                         logger.exception("execution log for route %s failed%s", session.route.get("route_id"),
                                          " (one-shot: no later turn to retry)" if one_shot else "; retrying next turn")
+                    else:
+                        if reg.log_outcome:             # the turn's size and duration, for training; once per conversation, same row as the route
+                            blocks = outcome["turn"][0]
+                            chars = sum(len(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                            # off the critical path: a slow SQLite write must not hold the session lock or delay the reply.
+                            # Best effort — a failed outcome log is logged, not retried (the request label is already saved).
+                            route = session.route
+                            def _log_outcome(route=route, chars=chars, ms=_turn_ms):
+                                try:
+                                    reg.log_outcome(route, chars, ms)
+                                except Exception:
+                                    logger.exception("outcome log for route %s failed", route.get("route_id"))
+                            threading.Thread(target=_log_outcome, name="cortados-outcome-log", daemon=True).start()
             except BridgeError as exc:
                 outcome["error"] = exc
             finally:

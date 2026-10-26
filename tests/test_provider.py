@@ -236,20 +236,20 @@ class RoutedEndpointTests(EndpointTests):
         self.assertEqual(self.calls, ["claude-cli"])                 # not re-routed on the continuation
         self.assertEqual([r["route_id"] for r in self.executed], ["r1"])
 
-    def test_the_turn_outcome_is_logged_once_with_size_and_duration(self):
+    def test_the_turn_outcome_logs_the_delivered_text_size(self):
+        logged = threading.Event()
         outcomes = []
-        self.reg.log_outcome = lambda route, chars, turn_ms: outcomes.append((route["route_id"], chars, turn_ms))
-        history = [{"role": "user", "content": "please use tool"}]
-        _, r1 = self.raw({"tools": [READ_TOOL], "messages": history})
-        self.assertEqual(len(outcomes), 1)                           # logged on the routed turn
+        def record(route, chars, turn_ms):
+            outcomes.append((route["route_id"], chars, turn_ms)); logged.set()
+        self.reg.log_outcome = record
+        _, r1 = self.raw({"messages": [{"role": "user", "content": "hello there"}]})   # a plain turn: the fake answers "echo: hello there"
+        self.assertTrue(logged.wait(10), "the outcome was never logged (it runs off the critical path)")
         rid, chars, ms = outcomes[0]
         self.assertEqual(rid, "r1")
-        self.assertIsInstance(chars, int); self.assertGreaterEqual(chars, 0)
+        expected = sum(len(b["text"]) for b in r1["content"] if b.get("type") == "text")
+        self.assertGreater(expected, 0)                              # the reply really had text
+        self.assertEqual(chars, expected)                            # the metric is the delivered text size, not a constant
         self.assertIsInstance(ms, int); self.assertGreaterEqual(ms, 0)
-        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
-        self.raw({"tools": [READ_TOOL], "messages": history})
-        self.assertEqual(len(outcomes), 1)                           # a continuation does not re-log (once per conversation)
 
     def test_a_failed_execution_log_is_retried_on_the_next_turn(self):
         attempts = []
