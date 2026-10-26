@@ -237,3 +237,50 @@ class BrokenConfigAndStaticReserveTests(unittest.TestCase):
         r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="writing"))   # R2 static, both accounts healthy
         self.assertNotEqual(r["chosen"]["lane"], "claude")               # reserve A not consumed
         self.assertTrue(any(s["lane"] == "claude" and "reserve" in (s.get("why") or "") for s in r["skipped"]))
+
+
+class Pass4RegressionTests(unittest.TestCase):
+    """Codex review pass 4: malformed-but-parseable config must raise (not default); no account route for a host that
+    does not allowlist one; and a single-account deployment keeps its Cursor fallback when there is no native route."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_ROUTER_TABLES", "CORTADOS_ROUTING_TABLE", "CORTADOS_HOME", "CORTADOS_SCARCITY_REFRESH")}
+        os.environ.update(CORTADOS_ROUTER_TABLES=self.dir, CORTADOS_ROUTING_TABLE=str(ROOT / "tables/routing-table.json"),
+                          CORTADOS_HOME=tempfile.mkdtemp(), CORTADOS_SCARCITY_REFRESH="off")
+        self._keep = (core.model_scores, core.lane_health, core._table)
+        core._table = None
+
+    def tearDown(self):
+        core.model_scores, core.lane_health, core._table = self._keep
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_malformed_but_parseable_config_raises(self):
+        for bad in ('{"claude": {"id": "b", "config_dir": "/x"}}', '{"claude": [{"id": "b", "config_dir": ""}]}',
+                    '{"claude": [{"id": "b"}]}'):
+            (Path(self.dir) / "accounts.json").write_text(bad)
+            with self.assertRaises(core.AccountsConfigError):
+                core._vendor_accounts("claude", "claude", "claude-cli")
+
+    def test_no_account_route_without_host_allowlist(self):
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
+        core.model_scores = lambda: MS
+        core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": SCARCE}
+        base_limits = [list(p) for p in routing.served_routes(core) if "#" not in p[0]]   # a host that lists only base routes
+        fit = {"known": True, "assembled": True, "input_tokens": 10, "input_bytes": 40, "source": "test"}
+        r = execution_routing.select(core, prompt="x", platform="cli", face="provider", entrypoint="provider",
+                                     input_fit=fit, constraints={"allowed_routes": base_limits},
+                                     credential_resolver=lambda *, requested, target_model: None)
+        self.assertNotIn("#", r.get("provider", ""))           # selector never invents a sibling account route
+
+    def test_single_account_keeps_cursor_fallback_when_no_native_candidate(self):
+        # a Claude model reachable ONLY via Cursor (no claude-cli reach) must still route to Cursor; with no native
+        # candidate present, native-first must not suppress it (single-account regression from pass 3).
+        ms = {"use_cases": {"code": ""}, "reference_index": {b: {"general": v, "code": v} for b, v in (("R1", 10), ("R2", 50), ("R3", 80), ("R4", 95))},
+              "models": [{"family": "claude-opus-5", "ceiling": False, "proxy": False, "index": {"general": 85, "code": 88},
+                          "reach": [{"lane": "cursor", "provider": "cursor-cli", "model": "claude-opus-5-thinking-high", "pool": "other-models"}]}]}
+        core.model_scores = lambda: ms
+        core.lane_health = lambda: {"cursor": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=3, work_kind="code"))   # D=8 needs 70: only the Cursor-Claude model qualifies
+        self.assertEqual(r["chosen"]["lane"], "cursor")

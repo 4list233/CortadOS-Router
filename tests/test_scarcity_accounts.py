@@ -40,9 +40,12 @@ class ClaudeLanesTests(unittest.TestCase):
         self.assertTrue(lanes[1][1].endswith(".claude-acctB"))
         self.assertNotIn("~", lanes[0][1])
 
-    def test_entries_without_config_dir_ignored(self):
+    def test_entry_without_config_dir_is_malformed_and_refuses(self):
+        # a present-but-malformed config (an entry missing config_dir) must not silently default/ignore: refuse Claude sampling
         self._write({"claude": [{"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "x"}]})
-        self.assertEqual([k for k, _ in sc.claude_lanes()], ["claude"])
+        self.assertEqual(sc.claude_lanes(), [])
+        with self.assertRaises(ValueError):
+            sc._accounts("claude")
 
 
 class TrustPreseedTests(unittest.TestCase):

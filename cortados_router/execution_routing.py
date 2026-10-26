@@ -105,14 +105,10 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
     candidates += [r for rows in table['candidates'].values() for r in rows]
     allowed = {(r['provider'], r['model']) for r in candidates if r['provider'] != 'custom'}
     allowed |= {('codex-cli', m) for p, m in allowed if p == 'openai-codex'}
-    # Each configured vendor account is its own provider (claude-cli, claude-cli#b, …); expand them into the canonical
-    # universe so a sibling-account route survives the intersection with allowed_routes below. One account is a no-op;
-    # a broken accounts config refuses Claude (drops its pairs) rather than routing on an ambient login.
-    try:
-        allowed |= {(a['provider'], m) for (p, m) in list(allowed) if p == 'claude-cli'
-                    for a in core._vendor_accounts('claude', 'claude', 'claude-cli')}
-    except core.AccountsConfigError:
-        allowed = {(p, m) for (p, m) in allowed if p.split('#', 1)[0] != 'claude-cli'}
+    # The selector does NOT invent per-account providers: account routes come only from a host that explicitly allows
+    # them (constraints.allowed_routes, e.g. the provider's served_routes). The allowed_routes intersection below is
+    # base-provider aware, so a host's own sibling route (claude-cli#b) survives while a host that lists none is never
+    # offered one (it could not honour the account identity).
     capabilities = set((constraints or {}).get('required_capabilities') or [])
     if capabilities - {'vision'}:
         raise ValueError('Unsupported required model capability')
@@ -131,7 +127,10 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                 not isinstance(p, (tuple, list)) or len(p) != 2 or
                 any(not isinstance(x, str) or not x for x in p) for p in limits):
             raise ValueError('Trusted route constraints must contain provider/model pairs')
-        allowed &= {tuple(p) for p in limits}
+        # Base-provider aware: a host's own per-account route (claude-cli#b, model) survives when its base pair
+        # (claude-cli, model) is in the canonical universe, without the selector inventing account routes for hosts
+        # that list none.
+        allowed = {tuple(p) for p in limits if tuple(p) in allowed or (tuple(p)[0].split('#', 1)[0], tuple(p)[1]) in allowed}
     excluded = (constraints or {}).get('excluded_routes', [])
     allowed -= {tuple(p) for p in excluded}
     fit = dict(input_fit or {})

@@ -349,9 +349,17 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
         data = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         raise AccountsConfigError(f"{path} is present but unreadable: {exc}") from exc
-    accts = [a for a in (data.get(vendor) or []) if isinstance(a, dict) and a.get("config_dir")]
-    if not accts:
-        return default
+    raw = data.get(vendor)
+    if raw is None:
+        return default                                         # vendor simply not configured
+    if not isinstance(raw, list):
+        raise AccountsConfigError(f"{path}: {vendor!r} must be a list of accounts, got {type(raw).__name__}")
+    if not raw:
+        return default                                         # explicit empty list: no accounts for this vendor
+    for a in raw:
+        if not isinstance(a, dict) or not (isinstance(a.get("config_dir"), str) and a["config_dir"].strip()):
+            raise AccountsConfigError(f"{path}: each {vendor!r} account needs a non-empty string config_dir")
+    accts = raw
     out = []
     for i, a in enumerate(accts):
         aid = str(a.get("id") or i)
@@ -365,17 +373,6 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
 def _base_provider(provider: str) -> str:
     """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
     return (provider or "").split("#", 1)[0]
-
-
-def _native_account_lanes(native_lane: str) -> list[str]:
-    """The configured account lanes for a native vendor (claude, claude#b, …); [native_lane] for a single-account
-    vendor. Driven by accounts.json, NOT the scarcity cache, so an unsampled new account counts and a removed one does not."""
-    if native_lane == "claude":
-        try:
-            return [a["lane"] for a in _vendor_accounts("claude", "claude", "claude-cli")]
-        except AccountsConfigError:
-            return []                                          # broken config: no native Claude account to protect
-    return [native_lane]
 
 
 def _expand_claude_accounts(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -679,14 +676,17 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         for c in cands:
             native = native_lane_for(c.get("family") or c["model"])
             c["secondary"] = bool(native) and _base_lane(c["lane"]) != native
-            if c["secondary"]:
-                # native-first holds while ANY configured native account still has this model's pool (not just the bare lane):
-                # with account A spent but B available, a Cursor Claude route must still wait for B. Enumerate CONFIGURED
-                # accounts (not the scarcity cache), so a new unsampled account counts and a removed one does not.
-                nat_ok = any(candidate_health({"lane": l, "model": c.get("family") or c["model"]}, health).get("ok", False)
-                             for l in _native_account_lanes(native))
-                if nat_ok:
-                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {c.get('family')}"}
+        for c in cands:
+            if c.get("secondary"):
+                # native-first holds only while an ELIGIBLE native candidate for the same model is available (any
+                # configured account, including an unsampled one that reads ok). Checking the candidates themselves,
+                # not the scarcity cache, both protects unsampled accounts and never suppresses a secondary when there
+                # is no native route to prefer (single-account deployments keep their Cursor fallback).
+                fam = c.get("family") or c["model"]
+                native = native_lane_for(fam)
+                if any(not k.get("secondary") and _base_lane(k["lane"]) == native
+                       and (k.get("family") or k["model"]) == fam and ok_of(k) for k in cands):
+                    ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"secondary source; {native} still has {fam}"}
         apply_reserve()      # the expiring-credit term still steers usage onto whichever account's credit is about to reset
         keep = []
         for c in sorted(cands, key=lambda c: -c["index"]):          # same lane+pool and same price class (±25 % when priced) → keep the strongest only
