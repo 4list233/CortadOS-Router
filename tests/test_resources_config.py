@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,12 +40,26 @@ class ResourcesExampleTests(unittest.TestCase):
         self.assertNotIn("100.", blob)                                   # no tailnet CGNAT addresses committed
         self.assertIn(".local", blob)
 
-    def test_sampler_rejects_duplicate_ids_before_any_network(self):
+    def test_duplicate_ids_are_rejected_before_any_node_is_sampled(self):
         bad = {"max_age_s": 120, "deployments": [],
                "nodes": [{"id": "x", "target": "local"}, {"id": "x", "target": "local"}]}
         path = Path(tempfile.mkdtemp()) / "bad.json"; path.write_text(json.dumps(bad))
-        with self.assertRaises(ValueError):                              # guard fires before the SSH sampler runs
-            local_resources.sample(str(path))
+        with mock.patch.object(local_resources, "sample_node") as sampled:
+            with self.assertRaises(ValueError):
+                local_resources.sample(str(path))
+            sampled.assert_not_called()                                 # the guard runs BEFORE any node is contacted
+
+    def test_the_committed_example_runs_through_the_sampler_with_mocked_telemetry(self):
+        # a structural check alone would pass a null reserve or a wrong-typed target that then crashes the sampler;
+        # run the real example through sample() with node telemetry faked, so the whole config path is exercised
+        def fake_sample_node(node, source):
+            return {"id": node["id"], "role": node.get("role"), "pool_eligible": node.get("pool_eligible", False),
+                    "inventory": node.get("inventory", {}), "status": "online", "sampled_at": 0.0,
+                    "gpu_headroom_estimate_bytes": 8 * 2**30, "gpu_budget_bytes": 12 * 2**30, "gpu_utilization_pct": 10}
+        with mock.patch.object(local_resources, "sample_node", fake_sample_node):
+            result = local_resources.sample(str(ROOT / "tables" / "resources.example.json"))
+        self.assertEqual(len(result["nodes"]), 4)
+        self.assertIn("known_pool_headroom_estimate_bytes", result)
 
 
 if __name__ == "__main__":
