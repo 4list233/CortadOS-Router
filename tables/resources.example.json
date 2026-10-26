@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to tables/resources.json (git-ignored; holds real SSH targets / tailnet addresses) and edit, then point the router at it with CORTADOS_LOCAL_RESOURCES_CONFIG. Each node is sampled over SSH (target 'local' means this machine); the collector reports unified/VRAM memory and GPU headroom. 'inventory' is documentation only. 'deployments' stays empty until a model is verified on real hardware (see docs/LOCAL-RESOURCES.md). Addresses here are placeholders.",
+  "max_age_s": 120,
+  "nodes": [
+    {"id": "studio", "role": "coordinator", "target": "owner@studio.local", "pool_eligible": true,
+     "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 4,
+     "inventory": {"chip": "M1 Max", "unified_gib": 32, "memory_scope": "unified"}},
+    {"id": "pc3060", "role": "worker", "target": "owner@wsl-host", "pool_eligible": true, "reserve_gib": 2,
+     "inventory": {"gpu": "RTX 3060", "vram_gib": 12, "host_ram_gib": 32, "memory_scope": "wsl_vm"}},
+    {"id": "air", "role": "optional", "target": "owner@air.local", "pool_eligible": false,
+     "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 3,
+     "inventory": {"chip": "M2", "unified_gib": 16, "memory_scope": "unified"}},
+    {"id": "pro", "role": "client", "target": "local", "pool_eligible": false,
+     "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 6,
+     "inventory": {"chip": "M5 Max", "unified_gib": 48, "memory_scope": "unified"}}
+  ],
+  "deployments": []
+}
