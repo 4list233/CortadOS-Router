@@ -656,15 +656,16 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         return out
 
 
-def current(max_age_s: int = 1200) -> dict[str, Any]:
-    """Never blocks a turn: returns what is on disk and refreshes in the background when it is getting old."""
+def current(max_age_s: int = 1200, *, refresh: bool = True) -> dict[str, Any]:
+    """Never blocks a turn: returns what is on disk and refreshes in the background when it is getting old. refresh=False
+    is a guaranteed cache-only read (the dashboard's GET must open no vendor CLI), independent of CORTADOS_SCARCITY_REFRESH."""
     try:
         d = json.loads(CACHE.read_text())
     except Exception:
         d = {"fetched_at": 0, "lanes": {}}
-    if _env_get("CORTADOS_SCARCITY_REFRESH") == "off":
-        # Verification and ad-hoc `core.py decide` runs use a throwaway home, which is always "due", and the background
-        # sample would open the user's real vendor CLIs. With the switch the decision routes on what is on disk only.
+    if not refresh or _env_get("CORTADOS_SCARCITY_REFRESH") == "off":
+        # refresh=False: a guaranteed cache-only read. Also: verification and ad-hoc `core.py decide` runs use a throwaway
+        # home, always "due", and the background sample would open the user's real vendor CLIs; the switch routes on disk only.
         return d
     managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     global_due = time.time() - float(d.get("fetched_at") or 0) > max_age_s
@@ -712,10 +713,10 @@ def _sample_local_managed() -> dict[str, Any]:
     return _write_cache({"local": rec}, None)
 
 
-def lane_scarcity(max_reading_age_s: int = 6 * 3600) -> dict[str, dict[str, Any]]:
+def lane_scarcity(max_reading_age_s: int = 6 * 3600, *, refresh: bool = True) -> dict[str, dict[str, Any]]:
     out = {}
     managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
-    for lane, v in (current().get("lanes") or {}).items():
+    for lane, v in (current(refresh=refresh).get("lanes") or {}).items():
         now = time.time()
         if lane == "local" and managed_local:
             # A managed local reading expires with its node telemetry: `expires_at` is the earliest member node's sample

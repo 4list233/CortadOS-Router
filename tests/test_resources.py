@@ -1,6 +1,8 @@
 """The resource-pool snapshot (cortados_router/resources.py): model-fit estimate, the non-blocking local-telemetry
 cache, and the aggregator. No network and no real state — core is a fake and the device sampler is injected."""
+import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -48,7 +50,7 @@ class FakeCore:
     def usage_summary(self, limit=12):
         return {"total_routes": 3, "by_band": {"R1": 3}, "degraded": {"count": 0, "of": 3}, "recent": []}
 
-    def lane_health(self):
+    def lane_health(self, *, refresh=True):
         return {"claude": {"ok": True, "scarcity": -0.3, "expiring_pct": 34,
                            "tightest": {"window": "week", "resets_at": "x"}, "why": None}}
 
@@ -75,6 +77,69 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snap["devices"]["status"], "pending")
         self.assertIsNone(snap["devices"].get("error"))
 
+
+
+class CacheOnlyTests(unittest.TestCase):
+    def test_scarcity_current_refresh_false_never_samples(self):
+        import cortados_router.scarcity as sc
+        called = {"n": 0}
+        keep_sample, keep_env = sc.sample, os.environ.get("CORTADOS_SCARCITY_REFRESH")
+        sc.sample = lambda *a, **k: called.__setitem__("n", called["n"] + 1)
+        os.environ["CORTADOS_SCARCITY_REFRESH"] = "on"           # prove refresh=False (not the env switch) blocks sampling
+        try:
+            sc.current(refresh=False)                            # an empty/stale cache would normally start a background sample
+            self.assertEqual(called["n"], 0)
+        finally:
+            sc.sample = keep_sample
+            if keep_env is None:
+                os.environ.pop("CORTADOS_SCARCITY_REFRESH", None)
+            else:
+                os.environ["CORTADOS_SCARCITY_REFRESH"] = keep_env
+
+    def test_lane_health_threads_refresh_false_to_scarcity(self):
+        import cortados_router.core as core
+        seen = {}
+        keep = core._scarcity_module
+
+        class FakeScModule:
+            def lane_scarcity(self, *, refresh=True):
+                seen["refresh"] = refresh
+                return {}
+        core._scarcity_module = lambda: FakeScModule()
+        try:
+            core.lane_health(refresh=False)
+            self.assertFalse(seen["refresh"])                    # the dashboard's cache-only read reaches scarcity as refresh=False
+        finally:
+            core._scarcity_module = keep
+
+
+class LocalRefreshBehaviorTests(unittest.TestCase):
+    def setUp(self):
+        resources._local.update(at=0.0, data=None, refreshing=False)
+
+    def test_cold_call_returns_immediately_then_populates_in_background(self):
+        gate = threading.Event()
+
+        def sampler(cfg):
+            gate.wait(5)
+            return {"nodes": [{"id": "studio"}]}
+        started = time.time()
+        first = resources.local_snapshot("cfg", sampler=sampler)
+        self.assertIsNone(first)                                 # sample pending: returns at once, does not join
+        self.assertLess(time.time() - started, 1.0)              # and did not block on the slow sampler
+        gate.set()
+        for _ in range(500):
+            if resources._local["data"] is not None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(resources._local["data"]["nodes"][0]["id"], "studio")
+
+    def test_recovers_after_a_failed_refresh(self):
+        def boom(cfg):
+            raise OSError("ssh down")
+        resources.refresh_local("cfg", sampler=boom)
+        self.assertFalse(resources._local["refreshing"])         # flag cleared so a later GET retries, not wedged
+        self.assertIn("error", resources._local["data"])
 
 if __name__ == "__main__":
     unittest.main()

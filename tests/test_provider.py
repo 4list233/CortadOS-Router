@@ -211,6 +211,10 @@ class EndpointTests(unittest.TestCase):
             snap = json.loads(r.read())
         for key in ("usage", "subscriptions", "devices", "generated_at"):
             self.assertIn(key, snap)
+        self.assertNotIn("error", snap["usage"])                 # a real (empty) summary, not an error section
+        self.assertEqual(snap["usage"]["total_routes"], 0)       # isolated temp CORTADOS_HOME: no routes
+        self.assertEqual(snap["devices"]["status"], "pending")   # no fleet config here: device telemetry not sampled
+        self.assertIsInstance(snap["subscriptions"], dict)
 
     def test_resources_endpoint_needs_a_token(self):
         req = urllib.request.Request(self.url + "/resources")

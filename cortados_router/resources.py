@@ -53,12 +53,16 @@ def refresh_local(config_path: str, sampler=None) -> dict[str, Any]:
     """Sample the fleet synchronously and store it. A failure is stored as an {error} reading, not raised, so the
     dashboard shows 'unavailable' rather than breaking."""
     try:
-        data = (sampler or _default_sampler)(config_path)
-    except Exception as exc:                            # SSH/collector failure: surfaced, not fatal
-        data = {"error": f"{type(exc).__name__}: {exc}"}
-    with _local_lock:
-        _local.update(at=time.time(), data=data, refreshing=False)
-    return data
+        try:
+            data = (sampler or _default_sampler)(config_path)
+        except Exception as exc:                        # SSH/collector failure: surfaced, not fatal
+            data = {"error": f"{type(exc).__name__}: {exc}"}
+        with _local_lock:
+            _local.update(at=time.time(), data=data)
+        return data
+    finally:
+        with _local_lock:
+            _local["refreshing"] = False                # cleared even on BaseException, so the cache never wedges "refreshing"
 
 
 def local_snapshot(config_path: str | None, *, now: float | None = None, sampler=None) -> dict[str, Any] | None:
@@ -71,7 +75,11 @@ def local_snapshot(config_path: str | None, *, now: float | None = None, sampler
         stale = _local["data"] is None or now - _local["at"] > LOCAL_TTL_S
         if stale and not _local["refreshing"]:
             _local["refreshing"] = True
-            threading.Thread(target=refresh_local, args=(config_path, sampler), name="cortados-resources-sample", daemon=True).start()
+            try:
+                threading.Thread(target=refresh_local, args=(config_path, sampler), name="cortados-resources-sample", daemon=True).start()
+            except BaseException:                       # thread could not start: roll back so a later GET retries
+                _local["refreshing"] = False
+                raise
         return _local["data"]
 
 
@@ -105,7 +113,7 @@ def snapshot(core, *, local_config: str | None = None, usage_limit: int = 12,
     except Exception as exc:
         usage = {"error": f"{type(exc).__name__}: {exc}"}
     try:
-        health = core.lane_health()                     # cached subscription scarcity; never opens a vendor CLI
+        health = core.lane_health(refresh=False)        # GUARANTEED cache-only: never opens a vendor CLI, whatever the refresh setting
         subscriptions = {lane: {"ok": h.get("ok"), "scarcity": h.get("scarcity"), "expiring_pct": h.get("expiring_pct"),
                                 "tightest": h.get("tightest"), "why": h.get("why")} for lane, h in health.items()}
     except Exception as exc:
