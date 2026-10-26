@@ -366,3 +366,23 @@ class ReorderCacheIdentityTests(unittest.TestCase):
         health = {"claude": {"ok": True, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
         cand = {"lane": "claude", "model": "claude-x", "config_dir": "/acctA"}
         self.assertTrue(core.candidate_health(cand, health)["ok"])   # no identity recorded → guard off (back-compat)
+
+
+class DefaultNamedTransitionTests(unittest.TestCase):
+    """Codex review pass 9: the default login (config_dir None) is a distinct identity; readings must not cross a
+    default<->named transition even though one side's config_dir is null."""
+    def test_default_cache_not_trusted_for_a_named_account(self):
+        health = {"claude": {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": None}}
+        cand = {"lane": "claude", "model": "claude-x", "config_dir": "/acctA"}      # accounts.json added: lane now a named login
+        h = core.candidate_health(cand, health)
+        self.assertFalse(h["ok"]); self.assertIn("stale cross-account", h.get("why") or "")
+
+    def test_named_cache_not_trusted_for_the_default_login(self):
+        health = {"claude": {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": "/acctA"}}
+        cand = {"lane": "claude", "model": "claude-x"}                              # accounts.json removed: default login, no config_dir
+        self.assertFalse(core.candidate_health(cand, health)["ok"])
+
+    def test_default_cache_trusted_for_the_default_login(self):
+        health = {"claude": {"ok": True, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": None}}
+        cand = {"lane": "claude", "model": "claude-x"}
+        self.assertTrue(core.candidate_health(cand, health)["ok"])                  # both default: the reading applies

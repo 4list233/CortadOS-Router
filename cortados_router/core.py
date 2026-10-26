@@ -433,8 +433,8 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
     try:
         sc = _scarcity_module()
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
-        if c.get("config_dir") and lane.get("config_dir") and lane["config_dir"] != c["config_dir"]:
-            return None                                              # cached reading is for a different login (reorder): no capacity credit
+        if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+            return None                                              # cached reading is for a different login (reorder or default<->named): no capacity credit
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
                ("antigravity", "claude-gpt"): "antigravity:claude-gpt", ("cursor", "cursor-models"): "cursor:cursor-models", ("cursor", "other-models"): "cursor:other-models"}.get((_base_lane(c["lane"]), pool))
@@ -485,9 +485,10 @@ def _health_row(s, w, expiring, spent) -> dict[str, Any]:
 def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """A model is as scarce as the tightest pool it draws on: the lane's general windows plus its own pool when it has one."""
     lane = health.get(c["lane"]) or {}
-    if c.get("config_dir") and lane.get("config_dir") and lane["config_dir"] != c["config_dir"]:
-        # the cached reading under this positional lane key was sampled from a DIFFERENT login (accounts were reordered):
-        # do not trust it either way. Unavailable until a fresh same-identity sample, rather than risk routing to a spent login.
+    if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+        # the cached reading under this positional lane key was sampled from a DIFFERENT login (accounts reordered, or a
+        # default<->named transition — the default login's config_dir is None, a distinct identity). Do not trust it
+        # either way: unavailable until a fresh same-identity sample, rather than risk routing to a spent login.
         return {"ok": False, "scarcity": None, "expiring_pct": 0, "tightest": {}, "pool": None,
                 "why": "stale cross-account reading; awaiting a fresh sample for this login"}
     if c["lane"] == "local" and lane.get("resource_managed"):
