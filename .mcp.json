@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cortados-route": {
+      "command": "python3",
+      "args": ["cortados_router/subagent_mcp.py"],
+      "env": {
+        "CORTADOS_PROVIDER_URL": "${CORTADOS_PROVIDER_URL}",
+        "CORTADOS_PROVIDER_TOKEN": "${CORTADOS_PROVIDER_TOKEN}"
+      }
+    }
+  }
+}

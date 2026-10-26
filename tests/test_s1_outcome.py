@@ -809,7 +809,7 @@ class CodexIsolationTests(unittest.TestCase):
         bad = codex_preflight.check_config(self._cfg(
             openai_base_url="http://127.0.0.1:11434/v1", model_providers={"openai": {}},
             mcp_servers={"erp": {"enabled": True}}, features={"hooks": True},
-            sandbox_workspace_write={"writable_roots": ["/Users/velox"], "network_access": True}), ())
+            sandbox_workspace_write={"writable_roots": ["/Users/example"], "network_access": True}), ())
         text = "; ".join(bad)
         for needle in ("openai_base_url", "model_providers.openai", "erp", "hooks", "writable_roots", "network_access",
                        "exclude_tmpdir_env_var"):

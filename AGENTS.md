@@ -61,3 +61,18 @@ is the long form.
 ## Verification
 After the suite passes, follow `.claude/skills/verify-router/SKILL.md` and paste its evidence block
 into the handback / PR. Codex and Cursor: read that file and follow it the same way.
+
+## Delegating subtasks through the router (route_task)
+
+This repo ships a project MCP server, `cortados-route` (`.mcp.json` launches `cortados_router/subagent_mcp.py`), that
+exposes one tool, `route_task`. It hands a single self-contained subtask to the `cortados` provider, which scores it with
+S1 and runs it on the cheapest capable model in the pool, then returns the answer as text. The main session keeps its own
+model and login; only the delegated subtask is routed.
+
+Prefer `route_task` over a full-model subagent when you want a RESULT for a self-contained piece of work — an analysis, a
+draft, a focused reasoning or coding question — and do not need tools run on this machine. Put everything the delegate
+needs into the task: it has no access to this conversation, the repo, or your files. For work that must read or edit the
+repo, use an ordinary subagent, not `route_task`.
+
+It needs `CORTADOS_PROVIDER_URL` and `CORTADOS_PROVIDER_TOKEN` in the environment and the provider reachable. If the tool
+is unconfigured or the provider is unreachable it returns a clear error; fall back to an ordinary subagent then.

@@ -111,8 +111,8 @@ class BindAddressTests(unittest.TestCase):
         self.assertEqual(ep.bind_address(environ={}), ("127.0.0.1", 8431))
 
     def test_bind_and_port_overrides(self):
-        e = {"CORTADOS_S1_BIND": "100.126.238.127", "CORTADOS_S1_PORT": "8500"}
-        self.assertEqual(ep.bind_address(environ=e), ("100.126.238.127", 8500))
+        e = {"CORTADOS_S1_BIND": "100.100.100.100", "CORTADOS_S1_PORT": "8500"}
+        self.assertEqual(ep.bind_address(environ=e), ("100.100.100.100", 8500))
 
 
 if __name__ == "__main__":
