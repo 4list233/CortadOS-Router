@@ -217,7 +217,7 @@ A read-only `GET /resources` on the provider (same token) returns one JSON snaps
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision, and a `GET /resources` snapshot (usage, subscription scarcity, local devices, model-fit).
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **543 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **550 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 

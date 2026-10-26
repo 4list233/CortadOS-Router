@@ -987,29 +987,31 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
     except sqlite3.Error as exc:
         return {**empty, "error": f"{type(exc).__name__}: {exc}"}
     conn.row_factory = sqlite3.Row
+    LAT_WINDOW = 500                                        # S1 latency is read over the most recent turns, so work is bounded, not O(history)
     try:
+        if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='routes'").fetchone():
+            return empty                                   # a db that exists but has no routes table yet: no data, not an error
         total = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
         by_band = {r["band"]: r["n"] for r in conn.execute("SELECT band, COUNT(*) AS n FROM routes WHERE band IS NOT NULL GROUP BY band")}
         by_lane = {f'{r["lane"]}/{r["model"]}': r["n"] for r in conn.execute("SELECT lane, model, COUNT(*) AS n FROM routes WHERE lane IS NOT NULL GROUP BY lane, model")}
         degraded = conn.execute("SELECT COALESCE(SUM(degraded), 0) FROM routes").fetchone()[0]
-        n_lat = conn.execute("SELECT COUNT(*) FROM routes WHERE engine_ms IS NOT NULL").fetchone()[0]
-
-        def at(off):   # the off-th smallest engine_ms, by index
-            row = conn.execute("SELECT engine_ms FROM routes WHERE engine_ms IS NOT NULL ORDER BY engine_ms LIMIT 1 OFFSET ?", (off,)).fetchone()
-            return row[0] if row else None
-        if n_lat:
-            median = at(n_lat // 2) if n_lat % 2 else (at(n_lat // 2 - 1) + at(n_lat // 2)) / 2
-            lat = {"median": median, "p90": at(min(n_lat - 1, max(0, math.ceil(0.9 * n_lat) - 1))), "p90_convention": "nearest-rank"}
-        else:
-            lat = {}
-        recent = [{"ts": r["ts"], "platform": r["platform"], "band": r["band"], "lane": r["lane"], "model": r["model"],
-                   "degraded": bool(r["degraded"]), "turn_ms": r["turn_ms"], "response_chars": r["response_chars"]}
-                  for r in conn.execute("SELECT ts, platform, band, lane, model, degraded, turn_ms, response_chars "
-                                        "FROM routes ORDER BY ts DESC LIMIT ?", (limit,))]
+        window = [dict(r) for r in conn.execute("SELECT ts, platform, band, lane, model, degraded, engine_ms, turn_ms, "
+                                                "response_chars FROM routes ORDER BY ts DESC LIMIT ?", (max(limit, LAT_WINDOW),))]
     except sqlite3.Error as exc:
         return {**empty, "error": f"{type(exc).__name__}: {exc}"}
     finally:
         conn.close()
+    ems = sorted(r["engine_ms"] for r in window if r["engine_ms"] is not None)
+    if ems:
+        n = len(ems)
+        median = ems[n // 2] if n % 2 else (ems[n // 2 - 1] + ems[n // 2]) / 2
+        lat = {"median": median, "p90": ems[min(n - 1, max(0, math.ceil(0.9 * n) - 1))],
+               "p90_convention": "nearest-rank", "window": n}
+    else:
+        lat = {}
+    recent = [{"ts": r["ts"], "platform": r["platform"], "band": r["band"], "lane": r["lane"], "model": r["model"],
+               "degraded": bool(r["degraded"]), "turn_ms": r["turn_ms"], "response_chars": r["response_chars"]}
+              for r in window[:limit]]
     return {"total_routes": total, "by_band": by_band, "by_lane": by_lane,
             "degraded": {"count": int(degraded), "of": total}, "s1_latency_ms": lat, "recent": recent}
 

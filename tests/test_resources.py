@@ -141,5 +141,48 @@ class LocalRefreshBehaviorTests(unittest.TestCase):
         self.assertFalse(resources._local["refreshing"])         # flag cleared so a later GET retries, not wedged
         self.assertIn("error", resources._local["data"])
 
+
+class UsageSummaryTests(unittest.TestCase):
+    def setUp(self):
+        import cortados_router.core as core
+        import tempfile
+        self.core = core
+        self._keep = core.STATE
+        self.tmp = Path(tempfile.mkdtemp())
+        core.STATE = self.tmp
+
+    def tearDown(self):
+        self.core.STATE = self._keep
+
+    def test_missing_db_is_a_clean_empty_summary(self):
+        s = self.core.usage_summary()
+        self.assertEqual(s["total_routes"], 0)
+        self.assertNotIn("error", s)
+
+    def test_db_without_a_routes_table_is_clean_empty_not_an_error(self):
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "router.db")
+        conn.execute("CREATE TABLE other (x)"); conn.commit(); conn.close()
+        s = self.core.usage_summary()
+        self.assertEqual(s["total_routes"], 0)
+        self.assertNotIn("error", s)                         # a missing routes table is no-data, not an error
+
+    def test_counts_recent_and_bounded_latency_from_real_rows(self):
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "router.db")
+        conn.execute("CREATE TABLE routes (turn_id TEXT, ts REAL, platform TEXT, band TEXT, lane TEXT, model TEXT, "
+                     "degraded INT, engine_ms INT, turn_ms INT, response_chars INT)")
+        for i in range(5):
+            conn.execute("INSERT INTO routes VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (f"t{i}", float(i), "p", "R1", "codex", "gpt", 0, 100 + i * 10, 200, 300))
+        conn.commit(); conn.close()
+        s = self.core.usage_summary(limit=3)
+        self.assertEqual(s["total_routes"], 5)
+        self.assertEqual(s["by_band"], {"R1": 5})
+        self.assertEqual(s["by_lane"], {"codex/gpt": 5})
+        self.assertEqual(len(s["recent"]), 3)                # bounded by limit
+        self.assertEqual(s["s1_latency_ms"]["median"], 120)  # median of 100,110,120,130,140
+        self.assertEqual(s["s1_latency_ms"]["window"], 5)
+
 if __name__ == "__main__":
     unittest.main()
