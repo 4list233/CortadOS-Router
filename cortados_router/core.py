@@ -292,7 +292,7 @@ def required_index(t: dict[str, Any], ms: dict[str, Any], use_case: str, D: int 
     return round(min(max(req, floor), best), 1)
 
 
-def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = True) -> list[dict[str, Any]] | None:
+def scored_candidates(t: dict[str, Any], band: str, use_case: str | None, accounts_aware: bool = False) -> list[dict[str, Any]] | None:
     """Every reachable model × every subscription that can run it, with its index for this use case. No band lists."""
     ms = model_scores()
     if (t.get("tiering") or {}).get("mode") != "scores" or not ms:
@@ -369,6 +369,11 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
                     "provider": base_provider if i == 0 else f"{base_provider}#{aid}",
                     "account": aid, "reserve": bool(a.get("reserve")),
                     "config_dir": os.path.expanduser(a["config_dir"])})
+    # Duplicate ids (or ids that collide with a generated lane key) would mix execution and quota identities: routing
+    # would keep two candidates while sampling collapses them to one directory. Reject the collision.
+    lanes = [a["lane"] for a in out]
+    if len(set(a["account"] for a in out)) != len(out) or len(set(lanes)) != len(lanes):
+        raise AccountsConfigError(f"{path}: {vendor!r} account ids must be unique (they key both routing and quota)")
     return out
 
 
@@ -377,7 +382,7 @@ def _base_provider(provider: str) -> str:
     return (provider or "").split("#", 1)[0]
 
 
-def _expand_claude_accounts(cands: list[dict[str, Any]], accounts_aware: bool = True) -> list[dict[str, Any]]:
+def _expand_claude_accounts(cands: list[dict[str, Any]], accounts_aware: bool = False) -> list[dict[str, Any]]:
     """Replace each Claude candidate with one per configured account (Option A), binding account id, reserve flag and
     config_dir. Applied to scored and static/fallback lists so account identity is never lost.
 
@@ -518,7 +523,7 @@ def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> in
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
             escalate: dict[str, Any] | None = None, input_fit: dict[str, Any] | None = None,
             allowed_routes: tuple[tuple[str, str], ...] | None = None,
-            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = True) -> dict[str, Any]:
+            execution: bool = False, minimum_band: str | None = None, accounts_aware: bool = False) -> dict[str, Any]:
     t = table()
     rules: list[str] = []
     if decision["degraded"] or not decision["answers"]:

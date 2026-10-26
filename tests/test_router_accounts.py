@@ -50,11 +50,11 @@ class ReserveRoutingTests(unittest.TestCase):
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
     def _resolve(self):
-        return core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))   # D=6 → needs 50; mid(52) and mid2(58) qualify
+        return core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"), accounts_aware=True)   # D=6 → needs 50
 
     def test_both_accounts_are_candidates(self):
         core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": SCARCE}
-        lanes = {c["lane"] for c in core.scored_candidates(core.table(), "R2", "code")}
+        lanes = {c["lane"] for c in core.scored_candidates(core.table(), "R2", "code", accounts_aware=True)}
         self.assertIn("claude", lanes)
         self.assertIn("claude#b", lanes)
 
@@ -108,7 +108,7 @@ class ReserveNeverOverridesCapabilityTests(unittest.TestCase):
         fable_spent = {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {},
                        "pools": {"fable": {"ok": False, "scarcity": 1.0, "expiring_pct": 0, "tightest": {}}}}
         core.lane_health = lambda: {"claude": OK, "claude#b": fable_spent}
-        r = core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="writing"))     # D≈9 → needs the Fable-class index
+        r = core.resolve(dec(steps=3, ambiguity=3, novelty=3, work_kind="writing"), accounts_aware=True)     # D≈9 → needs the Fable-class index
         self.assertEqual(r["chosen"]["model"], "claude-fable-5-1")
         self.assertEqual(r["chosen"]["lane"], "claude")                                  # reserve A, because B's Fable is spent
 
@@ -179,7 +179,7 @@ class ExpandAndVisionTests(unittest.TestCase):
 
     def test_expand_binds_config_dir_on_static_candidates(self):
         expanded = core._expand_claude_accounts([{"lane": "claude", "provider": "claude-cli", "model": "claude-x"},
-                                                 {"lane": "codex", "provider": "openai-codex", "model": "gpt-x"}])
+                                                 {"lane": "codex", "provider": "openai-codex", "model": "gpt-x"}], accounts_aware=True)
         claude = [c for c in expanded if core._base_lane(c["lane"]) == "claude"]
         self.assertEqual({c["account"] for c in claude}, {"a", "b"})
         self.assertTrue(all(c["config_dir"].endswith((".claude-acctA", ".claude-acctB")) for c in claude))
@@ -236,7 +236,7 @@ class BrokenConfigAndStaticReserveTests(unittest.TestCase):
             {"id": "a", "config_dir": "~/.claude-acctA", "reserve": True}, {"id": "b", "config_dir": "~/.claude-acctB"}]}))
         core.model_scores = lambda: None                                 # force the static band-list path
         core.lane_health = lambda: {"claude": OK, "claude#b": OK, "codex": OK, "cursor": OK}
-        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="writing"))   # R2 static, both accounts healthy
+        r = core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="writing"), accounts_aware=True)   # R2 static, both accounts healthy
         self.assertNotEqual(r["chosen"]["lane"], "claude")               # reserve A not consumed
         self.assertTrue(any(s["lane"] == "claude" and "reserve" in (s.get("why") or "") for s in r["skipped"]))
 
@@ -322,3 +322,25 @@ class Pass5RegressionTests(unittest.TestCase):
             (Path(self.dir) / "accounts.json").write_text(bad)
             with self.assertRaises(core.AccountsConfigError):
                 core._vendor_accounts("claude", "claude", "claude-cli")
+
+
+class DuplicateAccountIdTests(unittest.TestCase):
+    """Codex review pass 7 finding 2: duplicate account ids would mix execution and quota identities; both readers reject."""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self._old = os.environ.get("CORTADOS_ROUTER_TABLES")
+        os.environ["CORTADOS_ROUTER_TABLES"] = self.dir
+        (Path(self.dir) / "accounts.json").write_text(json.dumps({"claude": [
+            {"id": "a", "config_dir": "~/.claude-acctA"}, {"id": "b", "config_dir": "~/.claude-acctB"},
+            {"id": "b", "config_dir": "~/.claude-acctC"}]}))   # duplicate non-first id collapses the generated lane key
+
+    def tearDown(self):
+        os.environ.pop("CORTADOS_ROUTER_TABLES", None) if self._old is None else os.environ.__setitem__("CORTADOS_ROUTER_TABLES", self._old)
+
+    def test_core_reader_rejects_duplicate_ids(self):
+        with self.assertRaises(core.AccountsConfigError):
+            core._vendor_accounts("claude", "claude", "claude-cli")
+
+    def test_scarcity_reader_refuses_duplicate_ids(self):
+        from cortados_router import scarcity as sc
+        self.assertEqual(sc.claude_lanes(), [])      # collapsed sampling key: refuse rather than sample one dir for two

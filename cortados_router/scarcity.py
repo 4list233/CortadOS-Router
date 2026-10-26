@@ -330,8 +330,11 @@ def claude_lanes() -> list[tuple[str, str | None]]:
         return []                                              # broken config: skip Claude sampling rather than read the wrong login
     if not accts:
         return [("claude", None)]
-    return [("claude" if i == 0 else f"claude#{a.get('id') or i}", os.path.expanduser(a["config_dir"]))
-            for i, a in enumerate(accts)]
+    lanes = [("claude" if i == 0 else f"claude#{a.get('id') or i}", os.path.expanduser(a["config_dir"]))
+             for i, a in enumerate(accts)]
+    if len({k for k, _ in lanes}) != len(lanes):               # duplicate account id → collapsed sampling key: refuse rather than sample one dir for two
+        return []
+    return lanes
 
 
 def _ensure_trust(config_dir: str) -> None:
