@@ -7,6 +7,8 @@ import os
 import sqlite3
 import sys
 import tempfile
+os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
+os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import threading
 import time
 import unittest
@@ -202,6 +204,24 @@ class EndpointTests(unittest.TestCase):
 
     def test_a_wrong_token_is_refused(self):
         self.assertEqual(self.status_of({"messages": [{"role": "user", "content": "x"}]}, token="nope"), 401)
+
+    def test_resources_endpoint_returns_a_snapshot(self):
+        req = urllib.request.Request(self.url + "/resources", headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            snap = json.loads(r.read())
+        for key in ("usage", "subscriptions", "devices", "generated_at"):
+            self.assertIn(key, snap)
+        self.assertNotIn("error", snap["usage"])                 # a real summary, not an error section
+        self.assertIsInstance(snap["usage"]["total_routes"], int)   # read-only roll-up (count varies with the shared temp home)
+        self.assertIn("by_band", snap["usage"])
+        self.assertEqual(snap["devices"]["status"], "pending")   # no fleet config here: device telemetry not sampled
+        self.assertIsInstance(snap["subscriptions"], dict)
+
+    def test_resources_endpoint_needs_a_token(self):
+        req = urllib.request.Request(self.url + "/resources")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(cm.exception.code, 401)
 
 
 class RoutedEndpointTests(EndpointTests):

@@ -484,13 +484,13 @@ def _policy() -> dict[str, Any]:
         return {}
 
 
-def lane_health() -> dict[str, dict[str, Any]]:
+def lane_health(*, refresh: bool = True) -> dict[str, dict[str, Any]]:
     """Health = measured subscription scarcity (scarcity.py: % used vs % of the window elapsed, per vendor usage screen).
     ok=False only when a window is spent or the vendor is refusing; everything softer is a ranking signal, not a gate.
     `pools` holds the separately metered pools of a lane (Claude Fable week, Cursor models vs other models, …): see candidate_health."""
     sc = _scarcity_module()
     out: dict[str, dict[str, Any]] = {}
-    for lane, v in sc.lane_scarcity().items():
+    for lane, v in sc.lane_scarcity(refresh=refresh).items():
         out[lane] = {**_health_row(v.get("scarcity"), v.get("tightest"), v.get("expiring_pct"), v.get("refusing")),
                      "pools": {p: _health_row(pv.get("scarcity"), pv.get("tightest"), pv.get("expiring_pct"), pv.get("spent")) for p, pv in (v.get("pools") or {}).items()},
                      "config_dir": v.get("config_dir")}   # the login this reading was sampled from (account identity, not the positional lane name)
@@ -969,6 +969,51 @@ def recent(n: int = 8) -> list[dict[str, Any]]:
                                                "FROM routes ORDER BY ts DESC LIMIT ?", (n,))]
         finally:
             c.close()
+
+
+def usage_summary(limit: int = 12) -> dict[str, Any]:
+    """A roll-up of logged routes for the dashboard: counts by band and chosen lane, the degraded rate, S1 latency
+    percentiles, and the most recent turns. Read-only and bounded: it opens a read-only connection to router.db (never
+    creating or migrating it, never taking the write lock), aggregates in SQL, and fetches only the N recent rows and the
+    handful of order statistics it needs — so a dashboard poll neither blocks logging nor grows with history. No
+    subscription CLI is opened. Request text is never included."""
+    import math
+    empty = {"total_routes": 0, "by_band": {}, "by_lane": {}, "degraded": {"count": 0, "of": 0}, "s1_latency_ms": {}, "recent": []}
+    path = STATE / "router.db"
+    if not path.exists():
+        return empty
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        return {**empty, "error": f"{type(exc).__name__}: {exc}"}
+    conn.row_factory = sqlite3.Row
+    LAT_WINDOW = 500                                        # S1 latency is read over the most recent turns, so work is bounded, not O(history)
+    try:
+        if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='routes'").fetchone():
+            return empty                                   # a db that exists but has no routes table yet: no data, not an error
+        total = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
+        by_band = {r["band"]: r["n"] for r in conn.execute("SELECT band, COUNT(*) AS n FROM routes WHERE band IS NOT NULL GROUP BY band")}
+        by_lane = {f'{r["lane"]}/{r["model"]}': r["n"] for r in conn.execute("SELECT lane, model, COUNT(*) AS n FROM routes WHERE lane IS NOT NULL GROUP BY lane, model")}
+        degraded = conn.execute("SELECT COALESCE(SUM(degraded), 0) FROM routes").fetchone()[0]
+        window = [dict(r) for r in conn.execute("SELECT ts, platform, band, lane, model, degraded, engine_ms, turn_ms, "
+                                                "response_chars FROM routes ORDER BY ts DESC LIMIT ?", (max(limit, LAT_WINDOW),))]
+    except sqlite3.Error as exc:
+        return {**empty, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        conn.close()
+    ems = sorted(r["engine_ms"] for r in window if r["engine_ms"] is not None)
+    if ems:
+        n = len(ems)
+        median = ems[n // 2] if n % 2 else (ems[n // 2 - 1] + ems[n // 2]) / 2
+        lat = {"median": median, "p90": ems[min(n - 1, max(0, math.ceil(0.9 * n) - 1))],
+               "p90_convention": "nearest-rank", "window": n}
+    else:
+        lat = {}
+    recent = [{"ts": r["ts"], "platform": r["platform"], "band": r["band"], "lane": r["lane"], "model": r["model"],
+               "degraded": bool(r["degraded"]), "turn_ms": r["turn_ms"], "response_chars": r["response_chars"]}
+              for r in window[:limit]]
+    return {"total_routes": total, "by_band": by_band, "by_lane": by_lane,
+            "degraded": {"count": int(degraded), "of": total}, "s1_latency_ms": lat, "recent": recent}
 
 
 if __name__ == "__main__":
