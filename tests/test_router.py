@@ -128,6 +128,27 @@ class ScoredSelection(unittest.TestCase):
     def test_scarcity_moves_the_choice(self):
         core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": 0.9, "expiring_pct": 0, "tightest": {}, "pools": {}}}
         self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["model"], "mid2")      # 0.9 × 30 points outweighs 6 of surplus
+
+    def test_expiring_window_beats_a_far_under_pace_sibling(self):
+        # claude's weekly window is near reset with credit unspent (expiring_pct=34); codex is more under-pace overall
+        # (scarcity -1.0) but its reset is far (expiring_pct=0). Reserve-by-reset spends the near-reset credit first.
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.39, "expiring_pct": 34, "tightest": {"window": "week", "resets_at": "x"}, "pools": {}},
+                                    "codex": {"ok": True, "why": None, "scarcity": -1.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["lane"], "claude")
+
+    def test_without_the_expiring_signal_the_under_pace_sibling_wins(self):
+        # control: with neither lane near reset, the most under-pace lane still wins — so the flip above is the expiring term's doing
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": -0.39, "expiring_pct": 0, "tightest": {}, "pools": {}},
+                                    "codex": {"ok": True, "why": None, "scarcity": -1.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["lane"], "codex")
+
+    def test_a_scarce_now_window_suppresses_the_expiring_discount(self):
+        # claude's weekly credit is expiring (expiring_pct=33) but its tightest window is scarce NOW (scarcity 0.8, e.g. the
+        # 5-hour session nearly spent). The deadline discount must not route work onto a lane with no immediate room; codex,
+        # which has room now, wins. (Codex review 2026-10-26)
+        core.lane_health = lambda: {"claude": {"ok": True, "why": None, "scarcity": 0.8, "expiring_pct": 33, "tightest": {"window": "5-hour session", "resets_at": "x"}, "pools": {}},
+                                    "codex": {"ok": True, "why": None, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}}}
+        self.assertEqual(core.resolve(dec(steps=3, ambiguity=2, novelty=1, work_kind="code"))["chosen"]["lane"], "codex")
     def test_secondary_source_only_when_native_spent(self):
         ms = {"use_cases": {"code": ""}, "reference_index": ScoredSelection.MS["reference_index"],
               "models": [{"family": "claude-opus-5", "ceiling": False, "proxy": False, "index": {"general": 80, "code": 85},
