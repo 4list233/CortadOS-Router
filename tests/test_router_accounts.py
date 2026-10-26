@@ -386,3 +386,14 @@ class DefaultNamedTransitionTests(unittest.TestCase):
         health = {"claude": {"ok": True, "scarcity": 0.0, "expiring_pct": 0, "tightest": {}, "pools": {}, "config_dir": None}}
         cand = {"lane": "claude", "model": "claude-x"}
         self.assertTrue(core.candidate_health(cand, health)["ok"])                  # both default: the reading applies
+
+
+class SiblingContextCeilingTests(unittest.TestCase):
+    """Codex review pass 10: a per-account lane inherits the base vendor's context ceiling (incl. [1m]); a sibling must
+    not lose a large-context request to the reserve account over a ceiling mismatch."""
+    def test_sibling_lane_inherits_claude_1m_ceiling(self):
+        self.assertEqual(core.lane_ceiling("claude#b", "claude-sonnet-5[1m]"),
+                         core.lane_ceiling("claude", "claude-sonnet-5[1m]"))
+        self.assertEqual(core.lane_ceiling("claude#b", "claude-sonnet-5"),
+                         core.lane_ceiling("claude", "claude-sonnet-5"))
+        self.assertGreater(core.lane_ceiling("claude#b", "claude-sonnet-5[1m]"), 200000)

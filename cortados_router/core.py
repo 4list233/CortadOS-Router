@@ -518,15 +518,16 @@ def turn_tokens(history_chars: int) -> int:
 
 
 def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> int:
+    b = _base_lane(lane)   # a per-account lane (claude#b) inherits its vendor's context limits, including [1m]
     # A transport-keyed ceiling applies only to the transport that measured it (the Donna
     # model gateway's calibrated fit); unknown or absent transports keep the lane ceiling.
-    by_transport = (_context_cfg().get("ceiling_tokens_by_transport") or {}).get(lane) or {}
+    by_transport = (_context_cfg().get("ceiling_tokens_by_transport") or {}).get(b) or {}
     if transport is not None and transport in by_transport:
         return int(by_transport[transport])
     cx = _context_cfg().get("ceiling_tokens") or {}
-    if lane == "claude" and "[1m]" in (model or ""):
+    if b == "claude" and "[1m]" in (model or ""):
         return int(cx.get("claude[1m]", 1000000))
-    return int(cx.get(lane, 200000))
+    return int(cx.get(b, 200000))
 
 
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
