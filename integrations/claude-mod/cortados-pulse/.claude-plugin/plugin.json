@@ -2,10 +2,24 @@
   "name": "cortados-pulse",
   "version": "0.1.0",
   "description": "A pane beside the chat with the CortadOS router's live resource pool: usage, subscription scarcity, online devices and model fit.",
+  "author": {
+    "name": "Forest Li",
+    "url": "https://github.com/4list233"
+  },
   "types": "./types/index.d.ts",
   "hooks": "./hooks/hooks.json",
   "userConfig": {
-    "providerUrl": { "type": "string", "title": "Provider URL", "default": "http://127.0.0.1:8432", "description": "CortadOS provider base URL (e.g. the Air on the tailnet)" },
-    "providerToken": { "type": "string", "title": "Provider token", "sensitive": true, "description": "CORTADOS_PROVIDER_TOKEN for the provider" }
+    "providerUrl": {
+      "type": "string",
+      "title": "Provider URL",
+      "default": "http://127.0.0.1:8432",
+      "description": "CortadOS provider base URL (e.g. the Air on the tailnet)"
+    },
+    "providerToken": {
+      "type": "string",
+      "title": "Provider token",
+      "sensitive": true,
+      "description": "CORTADOS_PROVIDER_TOKEN for the provider"
+    }
   }
 }
