@@ -1,0 +1,60 @@
+{
+  "name": "cortados-routed-subagents",
+  "version": "0.1.0",
+  "description": "Routes every subagent spawned from this session through the CortadOS provider: S1 picks the cheapest capable model, it runs headless on the provider host, and its tool calls are bridged back to run on this machine. The main session stays on direct Claude.",
+  "author": {
+    "name": "Forest Li",
+    "url": "https://github.com/4list233"
+  },
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "providerUrl": {
+      "type": "string",
+      "title": "Provider URL",
+      "default": "http://127.0.0.1:8432",
+      "description": "CortadOS provider base URL that subagents route through (e.g. the Air on the tailnet)."
+    },
+    "providerTokenFile": {
+      "type": "string",
+      "title": "Provider token file",
+      "default": "~/.config/cortados/provider-token",
+      "description": "Path to a file holding CORTADOS_PROVIDER_TOKEN. Read fresh at spawn time so the token is never stored in settings. A leading ~ is expanded to $HOME."
+    },
+    "providerToken": {
+      "type": "string",
+      "title": "Provider token (inline override)",
+      "sensitive": true,
+      "description": "Optional inline token. When set it overrides providerTokenFile. Prefer the file so the token is not kept in settings."
+    },
+    "model": {
+      "type": "string",
+      "title": "Routed model id",
+      "default": "cortados",
+      "description": "The model id sent to the provider. 'cortados' lets S1 route; a concrete id pins one lane."
+    },
+    "permissionMode": {
+      "type": "string",
+      "title": "Permission mode for routed subagents",
+      "default": "bypassPermissions",
+      "description": "Headless permission mode. 'bypassPermissions' lets a routed subagent run Bash/edits unattended (full agentic, highest blast radius). 'acceptEdits' auto-approves file edits but blocks unattended Bash. 'default' blocks anything that needs a prompt."
+    },
+    "allowedTools": {
+      "type": "string",
+      "title": "Allowed tools (comma-separated)",
+      "default": "Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit",
+      "description": "The tools a routed subagent may use on this machine. These execute locally (bridged back from the routed model), so this is the real blast-radius control."
+    },
+    "claudeBin": {
+      "type": "string",
+      "title": "Claude binary",
+      "default": "claude",
+      "description": "The claude executable used to run each routed subagent. Must be on PATH or an absolute path."
+    },
+    "routeBackground": {
+      "type": "boolean",
+      "title": "Route background subagents too",
+      "default": false,
+      "description": "Off by default: background (run_in_background) subagents pass through to native handling, because a routed subagent runs under a 10-minute ceiling. Turn on only for short background tasks."
+    }
+  }
+}

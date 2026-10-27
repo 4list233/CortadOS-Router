@@ -9,6 +9,11 @@
       "name": "cortados-pulse",
       "source": "./integrations/claude-mod/cortados-pulse",
       "description": "A pane beside the chat with the CortadOS router's live resource pool: usage, subscription scarcity, online devices and model fit."
+    },
+    {
+      "name": "cortados-routed-subagents",
+      "source": "./integrations/claude-mod/cortados-routed-subagents",
+      "description": "Routes every subagent this session spawns through the CortadOS provider (S1 picks the model, it runs headless on the provider host, its tool calls run back here). The main session stays on direct Claude."
     }
   ]
 }
