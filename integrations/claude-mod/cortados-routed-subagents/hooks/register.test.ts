@@ -178,7 +178,12 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
     ANTHROPIC_API_KEY: 'tok',
     ANTHROPIC_AUTH_TOKEN: 'tok',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
+    ANTHROPIC_CUSTOM_HEADERS: '',
+    CLAUDE_CODE_USE_BEDROCK: '',
+    CLAUDE_CODE_USE_VERTEX: '',
   })
+  // The child loads no user/project settings, so a settings env block can't override the launch env above.
+  expect(recordedArgv).toContain('--setting-sources')
   // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
   expect(recordedArgv).toContain('--strict-mcp-config')
   const mcpIdx = recordedArgv.indexOf('--mcp-config')

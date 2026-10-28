@@ -248,6 +248,10 @@ export const register: Register = (on, options) => {
       '--tools', tools,
       '--allowedTools', tools,
       '--settings', JSON.stringify({ disableAllHooks: true }),
+      // Load NO user/project/local settings, as the provider's own bridge does: otherwise a settings `env` block
+      // could restore a conflicting ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL and override the launch env below, sending
+      // the provider token to the wrong endpoint or a stale key to the provider (Codex review, 2026-10-28).
+      '--setting-sources', '',
       '--strict-mcp-config',
       '--mcp-config', JSON.stringify({ mcpServers: {} }),
       '--output-format', 'json',
@@ -268,11 +272,18 @@ export const register: Register = (on, options) => {
           //      lets a saved key / apiKeyHelper load and be sent (Codex review, 2026-10-28). So set BOTH channels
           //      to the provider token: whichever the CLI selects, it is the provider token, and no inherited key
           //      leaks. The child only ever contacts the provider (ANTHROPIC_BASE_URL pins it), never the real API.
+          // Neutralize inherited vars that could override or redirect the child regardless of the above: a custom
+          // x-api-key header (ANTHROPIC_CUSTOM_HEADERS) is merged after the SDK credentials and would replace the
+          // provider key, and the Bedrock/Vertex selectors would send the turn to another transport entirely
+          // (Codex review, 2026-10-28). $.process.run only ADDS over the host env, so blanking is how these are cleared.
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
+            ANTHROPIC_CUSTOM_HEADERS: '',
+            CLAUDE_CODE_USE_BEDROCK: '',
+            CLAUDE_CODE_USE_VERTEX: '',
           },
           timeoutMs: 600000,
         },
