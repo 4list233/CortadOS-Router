@@ -42,6 +42,24 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under a 10-minute ceiling). |
+| `orchestratorMode` | `true` | Constrain the main session to planning + delegation (see **Orchestrator mode**). |
+| `orchestratorBlockedTools` | `Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch` | Tools the brain may not run itself on the main loop in orchestrator mode; it must delegate them. |
+
+## Orchestrator mode
+
+With `orchestratorMode` on (the default), the main session becomes a pure **planning brain**: whatever top-tier
+model you run it on (e.g. `--model fable`) plans and decides, and every actual task is delegated to a routed
+subagent. Two things enforce this, automatically, every session — no per-session instruction:
+
+- A standing **directive** is injected into the system prompt telling the model to decompose each request and
+  delegate via the Agent tool, and that it must not do the work itself.
+- The **doing tools** in `orchestratorBlockedTools` (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`,
+  `WebFetch`, `WebSearch`) are **refused on the main loop**, so the brain can't quietly start doing the work. It
+  keeps read-only tools (`Read`, `Grep`, `Glob`), `TodoWrite`, and the `Agent` tool so it can gather context,
+  plan, and delegate. Subagents are not gated — they run the full toolset (and are themselves routed).
+
+The result: the top model is the brain; all actual work flows through routed subagents. Turn it off by setting
+`orchestratorMode` to `false` (then the mod only routes subagents, without constraining the main session).
 
 ## Blast radius
 

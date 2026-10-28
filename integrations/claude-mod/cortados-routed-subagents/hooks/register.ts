@@ -31,6 +31,8 @@ type Cfg = {
   allowedTools: string
   claudeBin: string
   routeBackground: boolean
+  orchestratorMode: boolean
+  orchestratorBlockedTools: string
 }
 
 const FALLBACK: Cfg = {
@@ -42,6 +44,28 @@ const FALLBACK: Cfg = {
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
   routeBackground: false,
+  // Orchestrator mode: the main session (the "brain") only plans and delegates; all actual work is delegated to
+  // routed subagents. Read-only tools stay on the main loop so the brain can gather context to plan (hybrid).
+  orchestratorMode: true,
+  orchestratorBlockedTools: 'Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch',
+}
+
+/** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
+const ORCHESTRATOR_DIRECTIVE =
+  'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. You decide and delegate; you do ' +
+  'not do the work yourself. Decompose the request into self-contained subtasks and hand EACH to a subagent via the ' +
+  'Agent tool: those subagents are automatically routed to the CortadOS model pool and carry out the work on this ' +
+  'machine. You may read to plan (Read, Grep, Glob) and keep a plan (TodoWrite), but you must not edit files, run ' +
+  'shell commands, or fetch the web yourself — those tools are refused on this (main) loop and must be delegated. ' +
+  'Give each subagent a complete, standalone task (it cannot see this conversation or your context). When subagents ' +
+  'report back, synthesize their results and plan the next step.'
+
+/** Split a comma/space-separated tool list into clean names. */
+export function parseList(s: string): string[] {
+  return String(s)
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
 }
 
 /** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */
@@ -243,4 +267,29 @@ export const register: Register = (on, options) => {
       try { $.ui.status(undefined) } catch { /* ignore */ }
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+  // ---- Orchestrator mode: the main session only plans and delegates; routed subagents do the work. -----------
+  if (cfg.orchestratorMode) {
+    // Inject the standing directive so the brain delegates by default — no per-session instruction needed.
+    on('prompt.compose', async ($: any, e: any, next: any) => {
+      const r = await next(e)
+      const section = { id: 'cortados-routed-subagents:orchestrator', text: ORCHESTRATOR_DIRECTIVE, scope: 'session' }
+      return { sections: [...r.sections, section] }
+    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+    // Refuse the "doing" tools on the MAIN loop (agentId absent) so the brain cannot quietly do the work itself;
+    // subagents and any id-carrying engine loop are untouched. Read-only tools stay available for planning.
+    for (const toolName of parseList(cfg.orchestratorBlockedTools)) {
+      // toolName is an arbitrary config string, not the typed tool-name union; the matcher only string-compares.
+      on('tool.call', { tool: toolName } as any, async ($: any, e: any, next: any) => {
+        if (e.agentId) return next(e) // only the main loop is gated
+        return {
+          deny:
+            `Orchestrator mode: the brain plans and delegates — it does not run ${toolName} itself. ` +
+            `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
+            `instead of calling ${toolName} directly.`,
+        }
+      }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+    }
+  }
 }

@@ -1,5 +1,12 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList } from './register'
+
+test('parseList splits on commas and whitespace and drops empties', async () => {
+  expect(parseList('Write,Edit, Bash')).toEqual(['Write', 'Edit', 'Bash'])
+  expect(parseList('Write,,  Edit ,')).toEqual(['Write', 'Edit'])
+  expect(parseList('  Bash  ')).toEqual(['Bash'])
+  expect(parseList('')).toEqual([])
+})
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {
   const s = [
