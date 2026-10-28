@@ -311,6 +311,37 @@ class Handler(BaseHTTPRequestHandler):
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}
         self._json(200, {"result": result})
 
+    @staticmethod
+    def _api_pin(body: dict[str, Any]) -> str | None:
+        """A request pinned to the anthropic-api credit lane: model `api/<claude-model>` (or bare `api` for the
+        default). Returns the Claude model to run on the API lane, or None for a normal (S1-routed) request."""
+        m = (body.get("model") or "").strip()
+        if m == "api":
+            return "claude-opus-5-5"
+        if m.startswith("api/"):
+            return m[4:].strip() or "claude-opus-5-5"
+        return None
+
+    def _serve_api_lane(self, body: dict[str, Any], model: str, wire: Wire) -> None:
+        """Execute a pinned request on the anthropic-api credit lane: proxy to api.anthropic.com, meter the spend,
+        and refuse once the monthly credit is spent. Stateless — no session, no S1 (the pin is explicit)."""
+        from cortados_router import api_credits
+        from cortados_router.provider import anthropic_proxy
+        if not anthropic_proxy.configured():
+            return self._error(503, "overloaded_error",
+                               "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
+        now = time.time()
+        if api_credits.over_budget(now):
+            return self._error(429, "rate_limit_error",
+                               f"cortados: the anthropic-api monthly credit (${api_credits.budget_usd():.0f}) is "
+                               "spent; it resets on the 1st", wire)
+        logger.info("anthropic-api lane: proxying to %s (spent $%.2f of $%.0f this month)",
+                    model, api_credits.spent(now), api_credits.budget_usd())
+        try:
+            anthropic_proxy.serve(self, body, model, now)
+        except OSError as exc:
+            logger.info("anthropic-api proxy: client left (%s)", exc)
+
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
         reg = self.server.registry
@@ -319,6 +350,10 @@ class Handler(BaseHTTPRequestHandler):
             Path(dump).mkdir(parents=True, exist_ok=True)
             (Path(dump) / f"{time.time():.3f}.json").write_text(json.dumps(body, indent=1))
         try:
+            api_model = self._api_pin(body)
+            if api_model:
+                # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
+                return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
