@@ -42,7 +42,7 @@
       "type": "string",
       "title": "Allowed tools (comma-separated)",
       "default": "Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit",
-      "description": "The tools a routed subagent may use on this machine. These execute locally (bridged back from the routed model), so this is the real blast-radius control."
+      "description": "Built-in tools a routed subagent has on this machine, passed as both --tools (availability, the real boundary) and --allowedTools (permission). Tools execute locally (bridged back from the routed model), so this is the real blast-radius control. Built-in tools only; MCP tools are controlled separately."
     },
     "claudeBin": {
       "type": "string",

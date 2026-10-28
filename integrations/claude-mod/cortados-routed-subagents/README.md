@@ -39,7 +39,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `providerToken` | *(unset)* | Optional inline token override. Prefer the file. |
 | `model` | `cortados` | Model id sent to the provider. `cortados` lets S1 route; a concrete id pins one lane. |
 | `permissionMode` | `bypassPermissions` | Headless permission mode for each routed subagent (see **Blast radius**). |
-| `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | What a routed subagent may do **on this machine**. |
+| `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under a 10-minute ceiling). |
 
@@ -56,10 +56,17 @@ unattended Bash) or `default`.
 These pass through to a normal in-process subagent on your direct model:
 
 - **`fork`** — a fork inherits the parent's context and model and cannot run on another provider.
-- **teammates / resumed agents** — long-lived, not one-shot delegations.
+- **isolated agents** (`isolation: worktree` / `remote`) — the native runner owns the worktree/remote semantics;
+  routing locally would silently drop them and let parallel isolated agents clobber each other.
+- **named agents** (`Agent({ name })`, including teammates) — the parent registers the name for `SendMessage`; a
+  subprocess can't join that registry, so it would lose its messaging lifecycle.
 - **background subagents** — unless `routeBackground` is on, because the routed subprocess runs under a
   10-minute ceiling.
 - **when no provider token is available** — better a working native subagent than a failed call.
+
+Once a routed subagent has been launched it has already acted, so if it does not finish cleanly (nonzero exit, a
+terminal error, truncated output, or a result the Agent schema would reject) the mod returns a **refusal** with the
+reason — it never silently re-runs the task as a native subagent, which would duplicate any non-idempotent work.
 
 ## Notes
 

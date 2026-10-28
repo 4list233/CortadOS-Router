@@ -11,9 +11,14 @@
  *
  * Passes through to the native in-process subagent when the work cannot or should not be routed:
  *   - fork: inherits the parent's context and model; it cannot run on another provider.
- *   - teammate / resume: long-lived, not a one-shot delegation.
+ *   - isolation (worktree/remote): the native runner owns the worktree/remote semantics; routing locally would
+ *     silently drop them and let parallel isolated agents clobber one another.
+ *   - a named agent: the parent registers it for SendMessage; a subprocess cannot join that registry.
  *   - background (run_in_background): can outlive the subprocess's 10-minute ceiling, unless routeBackground is on.
  *   - no provider token available: better a working native subagent than a failed call.
+ *
+ * Once the child has been launched it has already acted, so the hook NEVER falls back to native after that point
+ * (that would re-run non-idempotent work). Any failure past the launch becomes a clean `deny`, not a re-dispatch.
  */
 import type { Register } from 'claude-code'
 
@@ -87,6 +92,27 @@ export function parseResult(stdout: string): ParsedRun {
   }
 }
 
+/** A completed routed run only when the child exited cleanly AND produced a result the Agent schema will accept:
+ * nonzero exit, a terminal error, truncated stdout, empty text, or a missing usage object all mean "not clean", so
+ * the caller refuses instead of returning a result that would be rejected (and then re-run natively). */
+export function cleanCompletion(exitCode: number, isStdoutTruncated: boolean, p: ParsedRun): boolean {
+  return (
+    exitCode === 0 &&
+    !p.isError &&
+    !isStdoutTruncated &&
+    typeof p.text === 'string' &&
+    p.text.length > 0 &&
+    !!p.usage &&
+    Object.keys(p.usage).length > 0
+  )
+}
+
+/** Replace the provider token with *** anywhere it appears in model-visible text. Only a token long enough to be a
+ * real secret is scrubbed, so a short/empty token never mangles ordinary words. */
+export function scrubToken(s: string, token: string): string {
+  return token && token.length >= 8 ? s.split(token).join('***') : s
+}
+
 let routedSeq = 0
 
 /** Read the provider token: the inline override if set, otherwise the token file (with ~ expanded to $HOME). */
@@ -109,62 +135,72 @@ export const register: Register = (on, options) => {
     const prompt = String(e.prompt ?? '')
     const description = String(e.description ?? 'routed subagent')
 
+    // Pass through BEFORE launching anything — these cannot or should not be routed. After the launch below the
+    // hook never returns next(e), because the child will already have acted and native would re-run it.
     if (subagentType === 'fork' || !prompt.trim()) return next(e)
     if (background && !cfg.routeBackground) return next(e)
+    if (e.isolation) return next(e) // worktree/remote: let the native runner own isolation
+    if (e.name) return next(e) // a named agent stays addressable by SendMessage only if the parent spawns it
 
     let token: string
     try {
       token = await resolveToken($, cfg)
     } catch (err) {
-      $.ui.toast(`routed-subagents: no provider token (${err}); running natively`)
+      $.ui.toast(`routed-subagents: no provider token (${scrubToken(String(err), '')}); running natively`)
       return next(e)
     }
     if (!token) return next(e)
 
-    // --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
+    // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
+    // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
+    const tools = String(cfg.allowedTools)
     const args = [
       '-p', prompt,
       '--model', String(cfg.model),
       '--permission-mode', String(cfg.permissionMode),
-      '--allowedTools', String(cfg.allowedTools),
+      '--tools', tools,
+      '--allowedTools', tools,
       '--settings', JSON.stringify({ disableAllHooks: true }),
       '--output-format', 'json',
     ]
 
     $.ui.status(`↗ routed subagent (${description})`)
-    let res: { exitCode: number; stdout: string; stderr: string }
     try {
-      res = await $.process.run([String(cfg.claudeBin), ...args], {
-        // Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the routed token, not an API key
-        // the parent session happened to carry (the provider bridge strips it for the same reason).
-        env: { ANTHROPIC_BASE_URL: String(cfg.providerUrl), ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_API_KEY: '' },
-        timeoutMs: 600000,
-      })
+      const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
+        [String(cfg.claudeBin), ...args],
+        {
+          // Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the routed token, not an API key
+          // the parent session happened to carry (the provider bridge strips it for the same reason).
+          env: { ANTHROPIC_BASE_URL: String(cfg.providerUrl), ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_API_KEY: '' },
+          timeoutMs: 600000,
+        },
+      )
+      const p = parseResult(res.stdout)
+      if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+        // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
+        const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
+        const detail = scrubToken((p.text || res.stderr || res.stdout || '').slice(-500), token)
+        return { deny: `routed subagent did not complete cleanly (${why}): ${detail}` }
+      }
+      const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
+      // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.
+      return {
+        result: {
+          content: [{ type: 'text', text: scrubToken(header + (p.text as string), token) }],
+          agentId: p.sessionId || `routed-${(routedSeq += 1)}`,
+          status: 'completed',
+          prompt,
+          totalToolUseCount: p.totalToolUseCount,
+          totalDurationMs: p.totalDurationMs,
+          totalTokens: p.totalTokens,
+          usage: p.usage,
+        },
+      }
     } catch (err) {
+      // Launch/runtime failure: the child may have started, so refuse cleanly instead of re-dispatching natively.
+      return { deny: scrubToken(`routed subagent failed: ${err}`, token) }
+    } finally {
       $.ui.status(undefined)
-      return { deny: `routed subagent failed to start: ${err}` }
-    }
-    $.ui.status(undefined)
-
-    const p = parseResult(res.stdout)
-    if (res.exitCode !== 0 && !p.text) {
-      return { deny: `routed subagent exited ${res.exitCode}: ${(res.stderr || res.stdout).slice(-500)}` }
-    }
-    const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
-    const body = p.text ?? res.stdout.trim()
-    // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.
-    return {
-      result: {
-        content: [{ type: 'text', text: header + (body || '(the routed subagent returned no text)') }],
-        agentId: p.sessionId || `routed-${(routedSeq += 1)}`,
-        status: 'completed',
-        prompt,
-        totalToolUseCount: p.totalToolUseCount,
-        totalDurationMs: p.totalDurationMs,
-        totalTokens: p.totalTokens,
-        usage: p.usage,
-        ...(p.isError ? { isError: true } : {}),
-      },
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 }
