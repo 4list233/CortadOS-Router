@@ -80,12 +80,25 @@ test('normalizeUsage always yields every required key, coercing junk', async () 
     expect(u.cache_creation).toBe(null)
     expect('server_tool_use' in u).toBe(true)
   }
+  // non-finite numbers are coerced away (the CLI validator rejects Infinity/NaN)
+  const nf = normalizeUsage({ input_tokens: Infinity, output_tokens: NaN, cache_read_input_tokens: -Infinity })
+  expect(nf.input_tokens).toBe(0)
+  expect(nf.output_tokens).toBe(0)
+  expect(nf.cache_read_input_tokens).toBe(null)
 })
 
-test('scrubToken redacts a real token everywhere but leaves short/empty tokens alone', async () => {
+test('parseResult keeps totalTokens finite even when terms overflow', async () => {
+  const p = parseResult(JSON.stringify({ result: 'x', usage: { input_tokens: 1e308, output_tokens: 1e308 } }))
+  expect(Number.isFinite(p.totalTokens)).toBe(true)
+  expect(p.totalTokens).toBe(0) // 1e308 + 1e308 overflows to Infinity -> guarded to 0
+})
+
+test('scrubToken redacts any non-empty token everywhere; empty token is a no-op', async () => {
   const tok = 'abcdef0123456789abcdef0123456789'
   expect(scrubToken(`auth failed: ${tok} at line 3 (${tok})`, tok)).toBe('auth failed: *** at line 3 (***)')
   expect(scrubToken('nothing secret here', tok)).toBe('nothing secret here')
-  expect(scrubToken('the word short appears', 'short')).toBe('the word short appears') // < 8 chars, not scrubbed
+  // short tokens ARE now scrubbed (a configured credential is redacted regardless of length)
+  expect(scrubToken('the word short appears', 'short')).toBe('the word *** appears')
+  // empty token must never split the string into characters
   expect(scrubToken('anything', '')).toBe('anything')
 })

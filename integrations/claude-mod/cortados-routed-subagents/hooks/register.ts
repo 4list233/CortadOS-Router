@@ -72,10 +72,12 @@ export function parseResult(stdout: string): ParsedRun {
   if (!line) return empty
   try {
     const d = JSON.parse(line) as Record<string, any>
-    const n = (x: unknown): number => (typeof x === 'number' ? x : 0)
+    // Only finite numbers; Infinity/NaN (e.g. JSON 1e400) would be rejected by the CLI's numeric validator.
+    const n = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? x : 0)
     const usage = d.usage && typeof d.usage === 'object' ? (d.usage as Record<string, unknown>) : {}
     const u = usage as Record<string, unknown>
-    const totalTokens = n(u.input_tokens) + n(u.output_tokens) + n(u.cache_read_input_tokens) + n(u.cache_creation_input_tokens)
+    const sum = n(u.input_tokens) + n(u.output_tokens) + n(u.cache_read_input_tokens) + n(u.cache_creation_input_tokens)
+    const totalTokens = Number.isFinite(sum) ? sum : 0 // guard overflow to Infinity from huge finite terms
     const mu = d.modelUsage && typeof d.modelUsage === 'object' ? Object.keys(d.modelUsage)[0] : undefined
     return {
       text: typeof d.result === 'string' ? d.result : null,
@@ -114,8 +116,9 @@ export type AgentUsage = {
 /** Coerce whatever the child reported into the exact usage shape the Agent result schema requires, so a completed
  * result is always accepted by core (a rejected result would be dropped and the task re-run natively). */
 export function normalizeUsage(raw: unknown): AgentUsage {
-  const num = (x: unknown): number => (typeof x === 'number' ? x : 0)
-  const numOrNull = (x: unknown): number | null => (typeof x === 'number' ? x : null)
+  // Finite only: a non-finite number (Infinity/NaN) in the result's usage is rejected by the CLI's validator.
+  const num = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? x : 0)
+  const numOrNull = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? x : null)
   const obj = (x: unknown): Record<string, unknown> | null =>
     x && typeof x === 'object' && !Array.isArray(x) ? (x as Record<string, unknown>) : null
   const u = obj(raw) ?? {}
@@ -136,10 +139,11 @@ export function normalizeUsage(raw: unknown): AgentUsage {
   }
 }
 
-/** Replace the provider token with *** anywhere it appears in model-visible text. Only a token long enough to be a
- * real secret is scrubbed, so a short/empty token never mangles ordinary words. */
+/** Replace the provider token with *** anywhere it appears in model-visible text. Any non-empty token is scrubbed
+ * regardless of length — a configured credential is redacted even if short; mangling a coincidental word is an
+ * acceptable price for never surfacing the secret. (An empty token is a no-op; split('') would shatter the string.) */
 export function scrubToken(s: string, token: string): string {
-  return token && token.length >= 8 ? s.split(token).join('***') : s
+  return token ? s.split(token).join('***') : s
 }
 
 let routedSeq = 0
@@ -208,8 +212,10 @@ export const register: Register = (on, options) => {
       if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
         const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
-        // Scrub BEFORE truncating, so a token near the 500-char boundary cannot survive as a partial match.
-        const detail = scrubToken(p.text || res.stderr || res.stdout || '', token).slice(-500)
+        // Surface only the parsed result text (a complete JSON field — never cut mid-token), scrubbed. Raw stdout/
+        // stderr are NOT surfaced: the CLI truncates them at a byte boundary that could split a token past the
+        // exact-match scrubber. They remain in the child's on-disk logs for debugging.
+        const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
         return { deny: `routed subagent did not complete cleanly (${why}): ${detail}` }
       }
       const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
