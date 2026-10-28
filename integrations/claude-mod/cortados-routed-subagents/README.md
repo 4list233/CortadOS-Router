@@ -42,6 +42,9 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under a 10-minute ceiling). |
+
+Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
+The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
 | `orchestratorMode` | `true` | Constrain the main session to planning + delegation (see **Orchestrator mode**). |
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist of tools the brain may run itself on the main loop; everything else is refused and must be delegated. |
 

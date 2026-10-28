@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, register } from './register'
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
   expect(validToolName('Read')).toBe(true)
@@ -145,4 +145,53 @@ test('scrubToken redacts any non-empty token everywhere; empty token is a no-op'
   expect(scrubToken('the word short appears', 'short')).toBe('the word *** appears')
   // empty token must never split the string into characters
   expect(scrubToken('anything', '')).toBe('anything')
+})
+
+test('the routed child is started with the provider credentials and CLAUDE_CODE_ENTRYPOINT=cli', async () => {
+  // Capture the Agent tool.call handler the hook registers; orchestrator mode off keeps the registration minimal.
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false } as any)
+  expect(agentHandler).not.toBe(null)
+
+  let recordedEnv: Record<string, string> | null = null
+  let recordedArgv: string[] = []
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        recordedEnv = opts.env
+        recordedArgv = argv
+        return { exitCode: 0, stdout: JSON.stringify({ result: 'pong', model: 'm' }), stderr: '', isStdoutTruncated: false }
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast() {} },
+  }
+  const next = async () => 'native'
+  const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, next)
+  expect(out.result.status).toBe('completed')
+  expect(recordedEnv).toEqual({
+    ANTHROPIC_BASE_URL: 'http://provider.test:8432',
+    ANTHROPIC_API_KEY: 'tok',
+    ANTHROPIC_AUTH_TOKEN: 'tok',
+    CLAUDE_CODE_ENTRYPOINT: 'cli',
+    ANTHROPIC_CUSTOM_HEADERS: '',
+    ANTHROPIC_UNIX_SOCKET: '',
+    CLAUDE_CODE_USE_BEDROCK: '',
+    CLAUDE_CODE_USE_VERTEX: '',
+    CLAUDE_CODE_USE_FOUNDRY: '',
+    CLAUDE_CODE_USE_MANTLE: '',
+    CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
+  })
+  // The child loads no user/project settings, so a settings env block can't override the launch env above.
+  expect(recordedArgv).toContain('--setting-sources')
+  // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
+  expect(recordedArgv).toContain('--strict-mcp-config')
+  const mcpIdx = recordedArgv.indexOf('--mcp-config')
+  expect(mcpIdx).toBeGreaterThan(-1)
+  expect(recordedArgv[mcpIdx + 1]).toBe('{"mcpServers":{}}')
 })

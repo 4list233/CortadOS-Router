@@ -236,6 +236,10 @@ export const register: Register = (on, options) => {
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
+    // --strict-mcp-config + an empty --mcp-config start the child with NO MCP servers: otherwise it inherits the
+    // user's MCP servers and advertises their tools to the provider, and a Codex lane refuses a thread whose dynamic
+    // tools include a reserved name (seen 2026-10-28: "dynamic tool name is reserved: mcp__cortados-route__route_task",
+    // code -32600). Routed subagents are built-in-tools-only by design (README).
     const tools = String(cfg.allowedTools)
     const args = [
       '-p', prompt,
@@ -244,6 +248,15 @@ export const register: Register = (on, options) => {
       '--tools', tools,
       '--allowedTools', tools,
       '--settings', JSON.stringify({ disableAllHooks: true }),
+      // Load NO user/project/local settings, as the provider's own bridge does: otherwise a settings `env` block
+      // could restore a conflicting ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL and override the launch env below, sending
+      // the provider token to the wrong endpoint or a stale key to the provider (Codex review, 2026-10-28).
+      // Known residual (defense-in-depth): a managed-settings `env` block or a legacy global `env` in ~/.claude.json
+      // can still apply over the launch env even with no setting sources. Fully closing that needs an isolated
+      // CLAUDE_CONFIG_DIR; it does not apply to a fleet without managed settings or a global env block.
+      '--setting-sources', '',
+      '--strict-mcp-config',
+      '--mcp-config', JSON.stringify({ mcpServers: {} }),
       '--output-format', 'json',
     ]
 
@@ -252,9 +265,34 @@ export const register: Register = (on, options) => {
       const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
         [String(cfg.claudeBin), ...args],
         {
-          // Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the routed token, not an API key
-          // the parent session happened to carry (the provider bridge strips it for the same reason).
-          env: { ANTHROPIC_BASE_URL: String(cfg.providerUrl), ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_API_KEY: '' },
+          // The child inherits the parent's environment and credentials. Two things there can make it send the
+          // wrong token to the provider and get a 401:
+          //   1. Under the desktop app, CLAUDE_CODE_ENTRYPOINT=claude-desktop makes the CLI authenticate with the
+          //      host's claude.ai OAuth session and ignore the env token (found 2026-10-28 with a header sniffer).
+          //      Forcing the entrypoint to `cli` stops that.
+          //   2. The CLI resolves credentials over BOTH channels — x-api-key (ANTHROPIC_API_KEY, a saved Console
+          //      key, or apiKeyHelper output) and bearer (ANTHROPIC_AUTH_TOKEN). An empty ANTHROPIC_API_KEY still
+          //      lets a saved key / apiKeyHelper load and be sent (Codex review, 2026-10-28). So set BOTH channels
+          //      to the provider token: whichever the CLI selects, it is the provider token, and no inherited key
+          //      leaks. The child only ever contacts the provider (ANTHROPIC_BASE_URL pins it), never the real API.
+          // Neutralize inherited vars that could override or redirect the child regardless of the above: a custom
+          // x-api-key header (ANTHROPIC_CUSTOM_HEADERS) is merged after the SDK credentials and would replace the
+          // provider key, and the Bedrock/Vertex selectors would send the turn to another transport entirely
+          // (Codex review, 2026-10-28). $.process.run only ADDS over the host env, so blanking is how these are cleared.
+          env: {
+            ANTHROPIC_BASE_URL: String(cfg.providerUrl),
+            ANTHROPIC_API_KEY: token,
+            ANTHROPIC_AUTH_TOKEN: token,
+            CLAUDE_CODE_ENTRYPOINT: 'cli',
+            ANTHROPIC_CUSTOM_HEADERS: '',
+            ANTHROPIC_UNIX_SOCKET: '',
+            CLAUDE_CODE_USE_BEDROCK: '',
+            CLAUDE_CODE_USE_VERTEX: '',
+            CLAUDE_CODE_USE_FOUNDRY: '',
+            CLAUDE_CODE_USE_MANTLE: '',
+            CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+            CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
+          },
           timeoutMs: 600000,
         },
       )
