@@ -70,10 +70,20 @@ def request_text(messages: list[dict[str, Any]], *, standalone: bool = False) ->
 
 
 class _NoClaudeWhenDegraded:
-    """`core` for execution_routing.select, except that a degraded decision cannot resolve to a Claude route."""
+    """`core` for execution_routing.select, with two route gates layered on resolve:
 
-    def __init__(self, core):
+      * degraded (the hard invariant): a degraded decision cannot resolve to a Claude route.
+      * tool-bearing turns: when the request carries tools (an agentic turn) and the decision is NOT degraded, keep
+        it on the Claude lane only. The Codex lane serves the client's tools as experimental `codex app-server`
+        dynamic tools (codex_bridge.py), which do not reliably reach the routed model, so an agentic turn sent there
+        comes back as text with no tool call; the Claude bridge (bridge.py + mcp_shim) is the proven tool path.
+        Tool-less turns (a plain route_task delegation) still route across every lane for cost. The degraded gate
+        wins, so a degraded agentic turn stays off Claude (invariant) and takes its chances on Codex.
+    """
+
+    def __init__(self, core, *, has_tools: bool = False):
         self._core = core
+        self._has_tools = has_tools
 
     def __getattr__(self, name):
         return getattr(self._core, name)
@@ -81,6 +91,8 @@ class _NoClaudeWhenDegraded:
     def resolve(self, decision, *args, allowed_routes=None, **kw):
         if decision.get("degraded") or not decision.get("answers"):
             allowed_routes = tuple(p for p in (allowed_routes or ()) if _base_provider(p[0]) not in CLAUDE_PROVIDERS)
+        elif self._has_tools:
+            allowed_routes = tuple(p for p in (allowed_routes or ()) if _base_provider(p[0]) in CLAUDE_PROVIDERS)
         return self._core.resolve(decision, *args, allowed_routes=allowed_routes, **kw)
 
 
@@ -105,7 +117,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     fit = {"known": True, "assembled": True, "input_tokens": len(raw) // 4, "input_bytes": len(raw.encode()),
            "source": "provider_request_estimate"}         # chars / 4; the CLI's own tokenizer is not reachable here
     r = execution_routing.select(
-        _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
+        _NoClaudeWhenDegraded(core, has_tools=bool(body.get("tools"))),
+        prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
         constraints={"allowed_routes": list(served_routes(core))},
         credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
