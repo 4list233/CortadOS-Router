@@ -92,19 +92,48 @@ export function parseResult(stdout: string): ParsedRun {
   }
 }
 
-/** A completed routed run only when the child exited cleanly AND produced a result the Agent schema will accept:
- * nonzero exit, a terminal error, truncated stdout, empty text, or a missing usage object all mean "not clean", so
- * the caller refuses instead of returning a result that would be rejected (and then re-run natively). */
+/** A completed routed run only when the child exited cleanly AND produced usable text: nonzero exit, a terminal
+ * error, truncated stdout, or empty text all mean "not clean", so the caller refuses instead of returning a
+ * result (which, for a child that already acted, must never fall back to a native re-run). The usage object is
+ * not gated here because normalizeUsage() always builds a schema-valid one. */
 export function cleanCompletion(exitCode: number, isStdoutTruncated: boolean, p: ParsedRun): boolean {
-  return (
-    exitCode === 0 &&
-    !p.isError &&
-    !isStdoutTruncated &&
-    typeof p.text === 'string' &&
-    p.text.length > 0 &&
-    !!p.usage &&
-    Object.keys(p.usage).length > 0
-  )
+  return exitCode === 0 && !p.isError && !isStdoutTruncated && typeof p.text === 'string' && p.text.length > 0
+}
+
+/** The Agent result's `usage` object, every required key present (nullable ones may be null). */
+export type AgentUsage = {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number | null
+  cache_read_input_tokens: number | null
+  server_tool_use: { web_search_requests: number; web_fetch_requests: number } | null
+  service_tier: string | null
+  cache_creation: { ephemeral_1h_input_tokens: number; ephemeral_5m_input_tokens: number } | null
+}
+
+/** Coerce whatever the child reported into the exact usage shape the Agent result schema requires, so a completed
+ * result is always accepted by core (a rejected result would be dropped and the task re-run natively). */
+export function normalizeUsage(raw: unknown): AgentUsage {
+  const num = (x: unknown): number => (typeof x === 'number' ? x : 0)
+  const numOrNull = (x: unknown): number | null => (typeof x === 'number' ? x : null)
+  const obj = (x: unknown): Record<string, unknown> | null =>
+    x && typeof x === 'object' && !Array.isArray(x) ? (x as Record<string, unknown>) : null
+  const u = obj(raw) ?? {}
+  const stu = obj(u.server_tool_use)
+  const cc = obj(u.cache_creation)
+  return {
+    input_tokens: num(u.input_tokens),
+    output_tokens: num(u.output_tokens),
+    cache_creation_input_tokens: numOrNull(u.cache_creation_input_tokens),
+    cache_read_input_tokens: numOrNull(u.cache_read_input_tokens),
+    server_tool_use: stu
+      ? { web_search_requests: num(stu.web_search_requests), web_fetch_requests: num(stu.web_fetch_requests) }
+      : null,
+    service_tier: typeof u.service_tier === 'string' ? u.service_tier : null,
+    cache_creation: cc
+      ? { ephemeral_1h_input_tokens: num(cc.ephemeral_1h_input_tokens), ephemeral_5m_input_tokens: num(cc.ephemeral_5m_input_tokens) }
+      : null,
+  }
 }
 
 /** Replace the provider token with *** anywhere it appears in model-visible text. Only a token long enough to be a
@@ -179,7 +208,8 @@ export const register: Register = (on, options) => {
       if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
         const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
-        const detail = scrubToken((p.text || res.stderr || res.stdout || '').slice(-500), token)
+        // Scrub BEFORE truncating, so a token near the 500-char boundary cannot survive as a partial match.
+        const detail = scrubToken(p.text || res.stderr || res.stdout || '', token).slice(-500)
         return { deny: `routed subagent did not complete cleanly (${why}): ${detail}` }
       }
       const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
@@ -187,20 +217,24 @@ export const register: Register = (on, options) => {
       return {
         result: {
           content: [{ type: 'text', text: scrubToken(header + (p.text as string), token) }],
-          agentId: p.sessionId || `routed-${(routedSeq += 1)}`,
+          agentId: scrubToken(p.sessionId || `routed-${(routedSeq += 1)}`, token),
           status: 'completed',
           prompt,
           totalToolUseCount: p.totalToolUseCount,
           totalDurationMs: p.totalDurationMs,
           totalTokens: p.totalTokens,
-          usage: p.usage,
+          usage: normalizeUsage(p.usage),
+          // This routed child has no entry in the parent's agent registry, so it cannot be continued by SendMessage.
+          canContinueAgent: false,
         },
       }
     } catch (err) {
       // Launch/runtime failure: the child may have started, so refuse cleanly instead of re-dispatching natively.
       return { deny: scrubToken(`routed subagent failed: ${err}`, token) }
     } finally {
-      $.ui.status(undefined)
+      // Guarded: a throw here would escape to the outer .catch and trigger a native re-dispatch (replay). Never
+      // let clearing the status line do that.
+      try { $.ui.status(undefined) } catch { /* ignore */ }
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 }

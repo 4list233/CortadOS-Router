@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage } from './register'
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {
   const s = [
@@ -45,7 +45,7 @@ const good: Parameters<typeof cleanCompletion>[2] = {
   totalTokens: 1, totalToolUseCount: 0, totalDurationMs: 0, sessionId: 's',
 }
 
-test('cleanCompletion requires clean exit, real text and a usage object', async () => {
+test('cleanCompletion requires clean exit, no error, no truncation and real text', async () => {
   expect(cleanCompletion(0, false, good)).toBe(true)
   // nonzero exit, even with good text, is not a completion (no native replay, caller denies)
   expect(cleanCompletion(1, false, good)).toBe(false)
@@ -55,8 +55,31 @@ test('cleanCompletion requires clean exit, real text and a usage object', async 
   expect(cleanCompletion(0, true, good)).toBe(false)
   // empty text
   expect(cleanCompletion(0, false, { ...good, text: '' })).toBe(false)
-  // missing usage would be rejected by the Agent schema -> not clean
-  expect(cleanCompletion(0, false, { ...good, usage: {} })).toBe(false)
+  // usage shape is NOT gated here (normalizeUsage fixes it), so a thin usage is still a clean completion
+  expect(cleanCompletion(0, false, { ...good, usage: {} })).toBe(true)
+})
+
+test('normalizeUsage always yields every required key, coercing junk', async () => {
+  const full = normalizeUsage({
+    input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 3, cache_creation_input_tokens: 0,
+    server_tool_use: { web_search_requests: 1, web_fetch_requests: 2 }, service_tier: 'standard',
+    cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 4 },
+  })
+  expect(full.input_tokens).toBe(10)
+  expect(full.server_tool_use).toEqual({ web_search_requests: 1, web_fetch_requests: 2 })
+  expect(full.cache_creation).toEqual({ ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 4 })
+  // junk / empty / array all produce a schema-valid object with nullable keys present
+  for (const bad of [{}, [1], null, 'x', undefined]) {
+    const u = normalizeUsage(bad)
+    expect(u.input_tokens).toBe(0)
+    expect(u.output_tokens).toBe(0)
+    expect(u.cache_creation_input_tokens).toBe(null)
+    expect(u.cache_read_input_tokens).toBe(null)
+    expect(u.server_tool_use).toBe(null)
+    expect(u.service_tier).toBe(null)
+    expect(u.cache_creation).toBe(null)
+    expect('server_tool_use' in u).toBe(true)
+  }
 })
 
 test('scrubToken redacts a real token everywhere but leaves short/empty tokens alone', async () => {
