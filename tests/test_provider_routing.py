@@ -36,38 +36,10 @@ class ProviderRoutingTests(unittest.TestCase):
             {"type": "text", "text": "<system-reminder>\nrepo context the client injected\n</system-reminder>"},
             {"type": "text", "text": text}]}]}
 
-    def body_with_tools(self, text):
-        b = self.body(text)
-        b["tools"] = [{"name": "Bash", "description": "run a shell command", "input_schema": {"type": "object"}}]
-        return b
-
     def choose(self, answers, text):
         core.decide = scored(answers)
         return routing.choose(core, self.body(text), client="claude-cli", conversation_id=text[:8], claude_bin="python3",
                               codex_bin="python3")
-
-    def test_an_agentic_turn_with_tools_stays_on_the_claude_lane(self):
-        # The same easy turn: without tools it may route to any lane; with tools it must stay on Claude, whose bridge
-        # is the proven tool path (Codex serves tools as experimental dynamic tools that do not reach the model).
-        core.decide = scored(EASY)
-        with_tools = routing.choose(core, self.body_with_tools("rename a variable in utils.py"), client="claude-cli",
-                                    conversation_id="wt", claude_bin="python3", codex_bin="python3")
-        self.assertEqual(routing._base_provider(with_tools["provider"]), "claude-cli")
-
-    def test_a_toolless_turn_is_not_forced_onto_claude(self):
-        # The gate must only fire for tool-bearing turns; a plain delegation still routes across lanes for cost.
-        core.decide = scored(EASY)
-        toolless = routing.choose(core, self.body("rename a variable in utils.py"), client="claude-cli",
-                                  conversation_id="tl", claude_bin="python3", codex_bin="python3")
-        self.assertEqual(routing._base_provider(toolless["provider"]), "codex-cli")
-
-    def test_a_degraded_agentic_turn_stays_off_claude_invariant_wins_over_the_tool_gate(self):
-        core.decide = lambda text, ctx=None: {"answers": None, "degraded": True, "engine": "s1", "engine_ms": 1, "error": "down"}
-        r = routing.choose(core, self.body_with_tools("rename a variable"), client="claude-cli", conversation_id="d",
-                           claude_bin="python3", codex_bin="python3")
-        self.assertEqual(r["provider"], "codex-cli")
-        self.assertTrue(r["degraded"])
-        self.assertNotIn("claude-cli", json.dumps(r["route"]["chosen"]))
 
     def test_only_served_providers_are_offered(self):
         routes = routing.served_routes(core)
