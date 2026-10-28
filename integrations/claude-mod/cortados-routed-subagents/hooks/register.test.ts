@@ -175,8 +175,8 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   expect(out.result.status).toBe('completed')
   expect(recordedEnv).toEqual({
     ANTHROPIC_BASE_URL: 'http://provider.test:8432',
+    ANTHROPIC_API_KEY: 'tok',
     ANTHROPIC_AUTH_TOKEN: 'tok',
-    ANTHROPIC_API_KEY: '',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
   })
   // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
