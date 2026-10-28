@@ -1,5 +1,27 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet } from './register'
+
+test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
+  expect(validToolName('Read')).toBe(true)
+  expect(validToolName('mcp__server__tool')).toBe(true)
+  expect(validToolName('[Read')).toBe(false)
+  expect(validToolName('Bash!')).toBe(false)
+  expect(validToolName('Read|Grep')).toBe(false)
+})
+
+test('resolveAllowSet drops malformed tokens and falls back to defaults when empty', async () => {
+  const a = resolveAllowSet('Read, Glob, Bash!')
+  expect(a.has('Read')).toBe(true)
+  expect(a.has('Glob')).toBe(true)
+  expect(a.has('Bash!')).toBe(false)
+  // all-malformed -> fallback to the default set (so Read/Grep/Agent still work)
+  const fb = resolveAllowSet('[Read,Grep]')
+  expect(fb.has('Read')).toBe(true)
+  expect(fb.has('Grep')).toBe(true)
+  expect(fb.has('Agent')).toBe(true)
+  // whitespace-only -> fallback
+  expect(resolveAllowSet('   ').has('Agent')).toBe(true)
+})
 
 test('parseList splits on commas and whitespace and drops empties', async () => {
   expect(parseList('Write,Edit, Bash')).toEqual(['Write', 'Edit', 'Bash'])

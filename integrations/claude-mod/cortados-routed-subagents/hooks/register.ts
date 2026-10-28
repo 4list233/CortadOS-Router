@@ -73,6 +73,19 @@ export function parseList(s: string): string[] {
     .filter(Boolean)
 }
 
+/** A well-formed tool name: built-ins are PascalCase alphanumerics, MCP tools are mcp__server__tool — both are
+ * [A-Za-z0-9_] only. Anything else (brackets, pipes, punctuation from a fat-fingered config) is not a tool name. */
+export function validToolName(s: string): boolean {
+  return /^[A-Za-z0-9_]+$/.test(s)
+}
+
+/** Build the main-loop allowlist from config: drop malformed tokens, and fall back to the default set when nothing
+ * valid remains (so a mistyped value can never silently block reading and delegation). */
+export function resolveAllowSet(configStr: string): Set<string> {
+  const parsed = parseList(configStr).filter(validToolName)
+  return new Set(parsed.length ? parsed : parseList(FALLBACK.orchestratorAllowedTools))
+}
+
 /** Whether a tool call may run on the MAIN loop under orchestrator mode. True = allow, false = refuse (delegate).
  * Off-mode and any non-main loop (agentId present) always allow; Agent is always allowed so delegation works. */
 export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
@@ -283,10 +296,9 @@ export const register: Register = (on, options) => {
 
   // ---- Orchestrator mode: the main session only plans and delegates; routed subagents do the work. -----------
   if (cfg.orchestratorMode) {
-    // An empty/invalid allowlist would lock out every tool (including Agent); fall back to the default set so the
-    // brain can always at least read and delegate.
-    const parsed = parseList(cfg.orchestratorAllowedTools)
-    const allow: ReadonlySet<string> = new Set(parsed.length ? parsed : parseList(FALLBACK.orchestratorAllowedTools))
+    // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
+    // tokens and falls back to the default set so the brain can always at least read and delegate.
+    const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
 
     // Inject the standing directive so the brain delegates by default — no per-session instruction needed. Only on
     // the main render: a teammate render is a different in-process worker that keeps its tools and must not be told
