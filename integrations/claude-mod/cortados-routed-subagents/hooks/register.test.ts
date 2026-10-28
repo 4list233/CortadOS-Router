@@ -179,8 +179,13 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
     ANTHROPIC_AUTH_TOKEN: 'tok',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
     ANTHROPIC_CUSTOM_HEADERS: '',
+    ANTHROPIC_UNIX_SOCKET: '',
     CLAUDE_CODE_USE_BEDROCK: '',
     CLAUDE_CODE_USE_VERTEX: '',
+    CLAUDE_CODE_USE_FOUNDRY: '',
+    CLAUDE_CODE_USE_MANTLE: '',
+    CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
   })
   // The child loads no user/project settings, so a settings env block can't override the launch env above.
   expect(recordedArgv).toContain('--setting-sources')

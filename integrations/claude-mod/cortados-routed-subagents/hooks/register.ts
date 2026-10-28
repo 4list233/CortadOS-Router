@@ -251,6 +251,9 @@ export const register: Register = (on, options) => {
       // Load NO user/project/local settings, as the provider's own bridge does: otherwise a settings `env` block
       // could restore a conflicting ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL and override the launch env below, sending
       // the provider token to the wrong endpoint or a stale key to the provider (Codex review, 2026-10-28).
+      // Known residual (defense-in-depth): a managed-settings `env` block or a legacy global `env` in ~/.claude.json
+      // can still apply over the launch env even with no setting sources. Fully closing that needs an isolated
+      // CLAUDE_CONFIG_DIR; it does not apply to a fleet without managed settings or a global env block.
       '--setting-sources', '',
       '--strict-mcp-config',
       '--mcp-config', JSON.stringify({ mcpServers: {} }),
@@ -282,8 +285,13 @@ export const register: Register = (on, options) => {
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
             ANTHROPIC_CUSTOM_HEADERS: '',
+            ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',
+            CLAUDE_CODE_USE_FOUNDRY: '',
+            CLAUDE_CODE_USE_MANTLE: '',
+            CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+            CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
           },
           timeoutMs: 600000,
         },
