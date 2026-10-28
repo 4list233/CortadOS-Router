@@ -31,6 +31,8 @@ type Cfg = {
   allowedTools: string
   claudeBin: string
   routeBackground: boolean
+  orchestratorMode: boolean
+  orchestratorAllowedTools: string
 }
 
 const FALLBACK: Cfg = {
@@ -42,6 +44,54 @@ const FALLBACK: Cfg = {
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
   routeBackground: false,
+  // Orchestrator mode: the main session (the "brain") only plans and delegates; all actual work is delegated to
+  // routed subagents. An ALLOWLIST (not a denylist) gates the main loop, so any mutating/executing tool — including
+  // ones a denylist would miss (Monitor, memory_write, ExitWorktree, any mcp__ tool, future tools) — is refused
+  // unless explicitly listed. Read-only + planning + delegation tools are allowed so the brain can plan (hybrid).
+  orchestratorMode: true,
+  orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
+}
+
+// Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
+const ALWAYS_ALLOWED = ['Agent']
+
+/** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
+const ORCHESTRATOR_DIRECTIVE =
+  'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. You decide and delegate; you do ' +
+  'not do the work yourself. Decompose the request into self-contained subtasks and hand EACH to a subagent via the ' +
+  'Agent tool: those subagents are automatically routed to the CortadOS model pool and carry out the work on this ' +
+  'machine. You may read to plan (Read, Grep, Glob) and keep a plan (TodoWrite), but you must not edit files, run ' +
+  'shell commands, fetch the web, or otherwise act yourself — every such tool is refused on this (main) loop and ' +
+  'must be delegated. Give each subagent a complete, standalone task (it cannot see this conversation or your ' +
+  'context). When subagents report back, synthesize their results and plan the next step.'
+
+/** Split a comma/space-separated tool list into clean names. */
+export function parseList(s: string): string[] {
+  return String(s)
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+}
+
+/** A well-formed tool name: built-ins are PascalCase alphanumerics, MCP tools are mcp__server__tool — both are
+ * [A-Za-z0-9_] only. Anything else (brackets, pipes, punctuation from a fat-fingered config) is not a tool name. */
+export function validToolName(s: string): boolean {
+  return /^[A-Za-z0-9_]+$/.test(s)
+}
+
+/** Build the main-loop allowlist from config: drop malformed tokens, and fall back to the default set when nothing
+ * valid remains (so a mistyped value can never silently block reading and delegation). */
+export function resolveAllowSet(configStr: string): Set<string> {
+  const parsed = parseList(configStr).filter(validToolName)
+  return new Set(parsed.length ? parsed : parseList(FALLBACK.orchestratorAllowedTools))
+}
+
+/** Whether a tool call may run on the MAIN loop under orchestrator mode. True = allow, false = refuse (delegate).
+ * Off-mode and any non-main loop (agentId present) always allow; Agent is always allowed so delegation works. */
+export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
+  if (!orchestratorMode) return true
+  if (agentId != null) return true // not the main loop (subagent/teammate/engine fork)
+  return ALWAYS_ALLOWED.includes(tool) || allow.has(tool)
 }
 
 /** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */
@@ -243,4 +293,41 @@ export const register: Register = (on, options) => {
       try { $.ui.status(undefined) } catch { /* ignore */ }
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+  // ---- Orchestrator mode: the main session only plans and delegates; routed subagents do the work. -----------
+  if (cfg.orchestratorMode) {
+    // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
+    // tokens and falls back to the default set so the brain can always at least read and delegate.
+    const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
+
+    // Inject the standing directive so the brain delegates by default — no per-session instruction needed. Only on
+    // the main render: a teammate render is a different in-process worker that keeps its tools and must not be told
+    // to delegate everything.
+    on('prompt.compose', async ($: any, e: any, next: any) => {
+      const r = await next(e)
+      if (Array.isArray(e?.traits) && e.traits.includes('teammate')) return r
+      const section = { id: 'cortados-routed-subagents:orchestrator', text: ORCHESTRATOR_DIRECTIVE, scope: 'session' }
+      return { sections: [...r.sections, section] }
+    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+    // Gate EVERY tool call on the main loop against the allowlist (a denylist would miss Monitor/memory_write/
+    // ExitWorktree/mcp__ tools/future tools). Non-main loops and allowed tools pass straight through.
+    on('tool.call', async ($: any, e: any, next: any) => {
+      if (mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
+      return {
+        deny:
+          `Orchestrator mode: the brain plans and delegates — it does not run ${e.tool} itself. ` +
+          `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
+          `instead of calling ${e.tool} directly.`,
+      }
+      // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
+      // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
+    }).catch(($: any, e: any, next: any) =>
+      next.called
+        ? undefined
+        : mainLoopAllows(String(e.tool), e.agentId, allow, true)
+          ? next(e)
+          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
+    )
+  }
 }

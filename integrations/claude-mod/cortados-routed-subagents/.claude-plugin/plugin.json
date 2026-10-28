@@ -55,6 +55,18 @@
       "title": "Route background subagents too",
       "default": false,
       "description": "Off by default: background (run_in_background) subagents pass through to native handling, because a routed subagent runs under a 10-minute ceiling. Turn on only for short background tasks."
+    },
+    "orchestratorMode": {
+      "type": "boolean",
+      "title": "Orchestrator mode (brain only plans and delegates)",
+      "default": true,
+      "description": "When on, the main session is constrained to planning and delegation: a standing directive tells it to decompose every task and delegate to routed subagents, and every tool NOT in orchestratorAllowedTools is refused on the main loop. The allowlist (not a denylist) is used so any mutating/executing tool is caught, including ones a denylist would miss. Subagents are unaffected."
+    },
+    "orchestratorAllowedTools": {
+      "type": "string",
+      "title": "Tools the brain MAY use itself on the main loop",
+      "default": "Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
+      "description": "Comma/space-separated allowlist of tools the orchestrator may run on the main loop (read-to-plan + delegate + interact). Everything else — edits, shell, web, memory writes, worktree ops, MCP tools, future tools — is refused and must be delegated to a routed subagent. The Agent tool is always allowed so delegation can never be locked out. An empty/invalid value falls back to the default. Only the main loop is gated; subagents keep their full toolset."
     }
   }
 }

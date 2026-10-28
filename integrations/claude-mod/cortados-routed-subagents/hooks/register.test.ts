@@ -1,5 +1,49 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet } from './register'
+
+test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
+  expect(validToolName('Read')).toBe(true)
+  expect(validToolName('mcp__server__tool')).toBe(true)
+  expect(validToolName('[Read')).toBe(false)
+  expect(validToolName('Bash!')).toBe(false)
+  expect(validToolName('Read|Grep')).toBe(false)
+})
+
+test('resolveAllowSet drops malformed tokens and falls back to defaults when empty', async () => {
+  const a = resolveAllowSet('Read, Glob, Bash!')
+  expect(a.has('Read')).toBe(true)
+  expect(a.has('Glob')).toBe(true)
+  expect(a.has('Bash!')).toBe(false)
+  // all-malformed -> fallback to the default set (so Read/Grep/Agent still work)
+  const fb = resolveAllowSet('[Read,Grep]')
+  expect(fb.has('Read')).toBe(true)
+  expect(fb.has('Grep')).toBe(true)
+  expect(fb.has('Agent')).toBe(true)
+  // whitespace-only -> fallback
+  expect(resolveAllowSet('   ').has('Agent')).toBe(true)
+})
+
+test('parseList splits on commas and whitespace and drops empties', async () => {
+  expect(parseList('Write,Edit, Bash')).toEqual(['Write', 'Edit', 'Bash'])
+  expect(parseList('Write,,  Edit ,')).toEqual(['Write', 'Edit'])
+  expect(parseList('  Bash  ')).toEqual(['Bash'])
+  expect(parseList('')).toEqual([])
+})
+
+test('mainLoopAllows gates only the main loop, allowlist-style, with Agent always allowed', async () => {
+  const allow = new Set(['Read', 'Grep', 'TodoWrite'])
+  // main loop (no agentId): allowlisted -> allow; non-listed work tool -> deny
+  expect(mainLoopAllows('Read', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('Bash', undefined, allow, true)).toBe(false)
+  expect(mainLoopAllows('Monitor', undefined, allow, true)).toBe(false) // denylist would have missed this
+  expect(mainLoopAllows('mcp__x__write', undefined, allow, true)).toBe(false) // and this
+  // Agent is always allowed so delegation is never locked out, even if absent from the allowlist
+  expect(mainLoopAllows('Agent', undefined, allow, true)).toBe(true)
+  // a non-main loop (agentId present) is never gated
+  expect(mainLoopAllows('Bash', 'agent-123', allow, true)).toBe(true)
+  // mode off -> everything allowed
+  expect(mainLoopAllows('Bash', undefined, allow, false)).toBe(true)
+})
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {
   const s = [
