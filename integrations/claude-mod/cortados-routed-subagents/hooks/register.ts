@@ -252,9 +252,19 @@ export const register: Register = (on, options) => {
       const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
         [String(cfg.claudeBin), ...args],
         {
-          // Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the routed token, not an API key
-          // the parent session happened to carry (the provider bridge strips it for the same reason).
-          env: { ANTHROPIC_BASE_URL: String(cfg.providerUrl), ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_API_KEY: '' },
+          // The child inherits the parent's environment. Under the desktop app that includes
+          // CLAUDE_CODE_ENTRYPOINT=claude-desktop, which makes the CLI authenticate with the host's claude.ai OAuth
+          // session and ignore ANTHROPIC_AUTH_TOKEN, so the provider sees an OAuth bearer it does not know and
+          // answers 401 (found 2026-10-28 with a header sniffer). Forcing the entrypoint to `cli` makes the child
+          // send the provider token. Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the
+          // routed token, not an API key the parent session happened to carry (the provider bridge strips it for
+          // the same reason).
+          env: {
+            ANTHROPIC_BASE_URL: String(cfg.providerUrl),
+            ANTHROPIC_AUTH_TOKEN: token,
+            ANTHROPIC_API_KEY: '',
+            CLAUDE_CODE_ENTRYPOINT: 'cli',
+          },
           timeoutMs: 600000,
         },
       )
