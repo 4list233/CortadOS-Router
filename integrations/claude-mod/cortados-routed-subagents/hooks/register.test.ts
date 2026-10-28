@@ -158,10 +158,12 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   expect(agentHandler).not.toBe(null)
 
   let recordedEnv: Record<string, string> | null = null
+  let recordedArgv: string[] = []
   const $ = {
     process: {
-      run: async (_argv: string[], opts: any) => {
+      run: async (argv: string[], opts: any) => {
         recordedEnv = opts.env
+        recordedArgv = argv
         return { exitCode: 0, stdout: JSON.stringify({ result: 'pong', model: 'm' }), stderr: '', isStdoutTruncated: false }
       },
     },
@@ -177,4 +179,9 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
     ANTHROPIC_API_KEY: '',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
   })
+  // The child starts with no MCP servers: built-in tools only, nothing of the parent's exposed to the provider.
+  expect(recordedArgv).toContain('--strict-mcp-config')
+  const mcpIdx = recordedArgv.indexOf('--mcp-config')
+  expect(mcpIdx).toBeGreaterThan(-1)
+  expect(recordedArgv[mcpIdx + 1]).toBe('{"mcpServers":{}}')
 })

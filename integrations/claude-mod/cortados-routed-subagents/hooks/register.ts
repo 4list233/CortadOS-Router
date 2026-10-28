@@ -236,6 +236,10 @@ export const register: Register = (on, options) => {
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
+    // --strict-mcp-config + an empty --mcp-config start the child with NO MCP servers: otherwise it inherits the
+    // user's MCP servers and advertises their tools to the provider, and a Codex lane refuses a thread whose dynamic
+    // tools include a reserved name (seen 2026-10-28: "dynamic tool name is reserved: mcp__cortados-route__route_task",
+    // code -32600). Routed subagents are built-in-tools-only by design (README).
     const tools = String(cfg.allowedTools)
     const args = [
       '-p', prompt,
@@ -244,6 +248,8 @@ export const register: Register = (on, options) => {
       '--tools', tools,
       '--allowedTools', tools,
       '--settings', JSON.stringify({ disableAllHooks: true }),
+      '--strict-mcp-config',
+      '--mcp-config', JSON.stringify({ mcpServers: {} }),
       '--output-format', 'json',
     ]
 
