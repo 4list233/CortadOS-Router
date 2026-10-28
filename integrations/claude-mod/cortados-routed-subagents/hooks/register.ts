@@ -252,9 +252,19 @@ export const register: Register = (on, options) => {
       const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
         [String(cfg.claudeBin), ...args],
         {
-          // Blank any inherited ANTHROPIC_API_KEY so the child authenticates with the routed token, not an API key
-          // the parent session happened to carry (the provider bridge strips it for the same reason).
-          env: { ANTHROPIC_BASE_URL: String(cfg.providerUrl), ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_API_KEY: '' },
+          // Send the provider token as ANTHROPIC_API_KEY (x-api-key): the provider accepts it (the route_task MCP
+          // authenticates the same way), and ANTHROPIC_API_KEY is first in Claude Code's credential precedence
+          // (ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > OAuth profile), so it overrides whatever the parent session
+          // was signed in with. The competing sources are blanked so an inherited OAuth login or key — as on a
+          // desktop app signed in via subscription — can't shadow it and make the child send the wrong credential
+          // (the "401 bad or missing token" the provider returns otherwise). env only ADDS over the host
+          // environment, so blanking is how these inherited values are neutralized.
+          env: {
+            ANTHROPIC_BASE_URL: String(cfg.providerUrl),
+            ANTHROPIC_API_KEY: token,
+            ANTHROPIC_AUTH_TOKEN: '',
+            CLAUDE_CODE_OAUTH_TOKEN: '',
+          },
           timeoutMs: 600000,
         },
       )
