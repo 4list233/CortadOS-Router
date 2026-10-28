@@ -60,13 +60,13 @@
       "type": "boolean",
       "title": "Orchestrator mode (brain only plans and delegates)",
       "default": true,
-      "description": "When on, the main session is constrained to planning and delegation: a standing directive tells it to decompose every task and delegate to routed subagents, and the 'doing' tools (orchestratorBlockedTools) are refused on the main loop. Read-only tools stay available so the brain can gather context to plan (hybrid). Subagents are unaffected."
+      "description": "When on, the main session is constrained to planning and delegation: a standing directive tells it to decompose every task and delegate to routed subagents, and every tool NOT in orchestratorAllowedTools is refused on the main loop. The allowlist (not a denylist) is used so any mutating/executing tool is caught, including ones a denylist would miss. Subagents are unaffected."
     },
-    "orchestratorBlockedTools": {
+    "orchestratorAllowedTools": {
       "type": "string",
-      "title": "Tools refused on the main loop in orchestrator mode",
-      "default": "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch",
-      "description": "Comma/space-separated tools the brain may NOT run itself in orchestrator mode; it must delegate them to routed subagents. Read/Grep/Glob/TodoWrite and the Agent (delegate) tool are intentionally not blocked. Only the main loop is gated; subagents keep their full toolset."
+      "title": "Tools the brain MAY use itself on the main loop",
+      "default": "Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
+      "description": "Comma/space-separated allowlist of tools the orchestrator may run on the main loop (read-to-plan + delegate + interact). Everything else — edits, shell, web, memory writes, worktree ops, MCP tools, future tools — is refused and must be delegated to a routed subagent. The Agent tool is always allowed so delegation can never be locked out. An empty/invalid value falls back to the default. Only the main loop is gated; subagents keep their full toolset."
     }
   }
 }

@@ -1,11 +1,26 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows } from './register'
 
 test('parseList splits on commas and whitespace and drops empties', async () => {
   expect(parseList('Write,Edit, Bash')).toEqual(['Write', 'Edit', 'Bash'])
   expect(parseList('Write,,  Edit ,')).toEqual(['Write', 'Edit'])
   expect(parseList('  Bash  ')).toEqual(['Bash'])
   expect(parseList('')).toEqual([])
+})
+
+test('mainLoopAllows gates only the main loop, allowlist-style, with Agent always allowed', async () => {
+  const allow = new Set(['Read', 'Grep', 'TodoWrite'])
+  // main loop (no agentId): allowlisted -> allow; non-listed work tool -> deny
+  expect(mainLoopAllows('Read', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('Bash', undefined, allow, true)).toBe(false)
+  expect(mainLoopAllows('Monitor', undefined, allow, true)).toBe(false) // denylist would have missed this
+  expect(mainLoopAllows('mcp__x__write', undefined, allow, true)).toBe(false) // and this
+  // Agent is always allowed so delegation is never locked out, even if absent from the allowlist
+  expect(mainLoopAllows('Agent', undefined, allow, true)).toBe(true)
+  // a non-main loop (agentId present) is never gated
+  expect(mainLoopAllows('Bash', 'agent-123', allow, true)).toBe(true)
+  // mode off -> everything allowed
+  expect(mainLoopAllows('Bash', undefined, allow, false)).toBe(true)
 })
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {

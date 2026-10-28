@@ -43,7 +43,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under a 10-minute ceiling). |
 | `orchestratorMode` | `true` | Constrain the main session to planning + delegation (see **Orchestrator mode**). |
-| `orchestratorBlockedTools` | `Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch` | Tools the brain may not run itself on the main loop in orchestrator mode; it must delegate them. |
+| `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist of tools the brain may run itself on the main loop; everything else is refused and must be delegated. |
 
 ## Orchestrator mode
 
@@ -53,10 +53,13 @@ subagent. Two things enforce this, automatically, every session — no per-sessi
 
 - A standing **directive** is injected into the system prompt telling the model to decompose each request and
   delegate via the Agent tool, and that it must not do the work itself.
-- The **doing tools** in `orchestratorBlockedTools` (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`,
-  `WebFetch`, `WebSearch`) are **refused on the main loop**, so the brain can't quietly start doing the work. It
-  keeps read-only tools (`Read`, `Grep`, `Glob`), `TodoWrite`, and the `Agent` tool so it can gather context,
-  plan, and delegate. Subagents are not gated — they run the full toolset (and are themselves routed).
+- Every tool **not** in `orchestratorAllowedTools` is **refused on the main loop**, so the brain can't quietly
+  start doing the work. The allowlist (default `Read`, `Grep`, `Glob`, `TodoWrite`, `Agent`, `AskUserQuestion`,
+  `ExitPlanMode`, `Skill`, `ToolSearch`) lets it read, plan, interact, and delegate — but everything else (edits,
+  shell, web, memory writes, worktree ops, **any MCP tool**, future tools) must be delegated. An allowlist is used
+  precisely because a denylist would miss mutating tools like `Monitor`, `memory_write`, or `ExitWorktree`. The
+  `Agent` tool is always allowed so delegation can never be locked out. Subagents are not gated — they run the full
+  toolset (and are themselves routed).
 
 The result: the top model is the brain; all actual work flows through routed subagents. Turn it off by setting
 `orchestratorMode` to `false` (then the mod only routes subagents, without constraining the main session).
