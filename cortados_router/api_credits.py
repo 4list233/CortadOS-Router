@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import calendar
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -135,12 +136,99 @@ def meter_path() -> Path:
 
 
 def budget_usd() -> float:
+    """The PER-ORG budget: each configured credit org (key) has its own window of this size (default $200). The
+    lane total is this times the number of configured orgs (`total_budget_usd`)."""
     raw = os.environ.get("CORTADOS_API_CREDIT_BUDGET_USD")
     try:
         v = float(raw) if raw not in (None, "") else DEFAULT_BUDGET_USD
     except (TypeError, ValueError):
         return DEFAULT_BUDGET_USD
     return v if v > 0 else DEFAULT_BUDGET_USD
+
+
+# Each credit org is one API key with its own included-credit window. Keys come from CORTADOS_ANTHROPIC_API_KEY
+# (primary), then _API_KEY_2, _3, … (contiguous — the scan stops at the first gap). An org's IDENTITY in the ledger
+# is a short, non-reversible fingerprint of its KEY, never the slot position and never the key value itself (so no
+# secret is written to disk, and spend stays bound to the key that incurred it). Keying by the key's fingerprint
+# means: the same key in two slots is ONE org (one window, not a phantom second allowance); swapping the keys
+# between slots does not move either org's spend; and rotating a key starts a fresh window for the new key (correct —
+# it is a different credit pool), while the old key's recorded spend stays under its own fingerprint. The org's
+# overage-off setting is the authoritative hard cap on real spend; this meter is the pacing/admission guard on top.
+def _org_id(key: str) -> str:
+    """Stable, non-reversible org identity for a key (a truncated SHA-256; not the key, safe to persist)."""
+    return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
+
+
+def configured_orgs() -> list[tuple[str, str]]:
+    """Ordered (org-id, key) for every DISTINCT configured credit org, in config order (primary first). Admission
+    drains them in this order. A key configured in more than one slot appears once. Empty when no key is set."""
+    raw: list[str] = []
+    primary = (os.environ.get("CORTADOS_ANTHROPIC_API_KEY") or "").strip()
+    if primary:
+        raw.append(primary)
+    i = 2
+    while True:
+        k = (os.environ.get(f"CORTADOS_ANTHROPIC_API_KEY_{i}") or "").strip()
+        if not k:
+            break
+        raw.append(k)
+        i += 1
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key in raw:
+        oid = _org_id(key)
+        if oid in seen:            # same key in two slots -> one org, not two allowances
+            continue
+        seen.add(oid)
+        out.append((oid, key))
+    return out
+
+
+def _legacy_owner() -> str:
+    """The org a legacy single-org ledger migrates into: the one configured key's id. A legacy ledger was written by
+    a single-key deployment, so it belongs to that key — but the old format did not record WHICH key, so ownership
+    is only unambiguous while exactly one key is configured. Fail closed otherwise, rather than guess:
+      * no key -> legacy spend can be neither attributed nor safely discarded;
+      * more than one key -> ownership is ambiguous, and guessing (e.g. 'the current primary') would free the real
+        owner's spent window if the keys were ordered differently than when the ledger was written.
+    The natural upgrade path never hits the ambiguous case: ship with the single existing key (the first request
+    migrates the meter to the nested shape), then add the second key — by then the file is no longer legacy."""
+    orgs = configured_orgs()
+    if not orgs:
+        raise LedgerError("cannot read a legacy api-credit ledger with no key configured")
+    if len(orgs) > 1:
+        raise LedgerError("refusing to migrate a legacy api-credit ledger while multiple keys are configured "
+                          "(ambiguous ownership); run once with only the original key to upgrade the meter first")
+    return orgs[0][0]
+
+
+def total_budget_usd() -> float:
+    """The whole lane's budget: per-org budget times the number of DISTINCT configured orgs (two $200 keys = $400)."""
+    return budget_usd() * len(configured_orgs())
+
+
+def _org_of(res_id: str) -> tuple[str | None, str]:
+    """(org-id, period) for a reservation id. New ids are 'orgid|period:hex'. A legacy id (no '|') carries no org —
+    its owner is not knowable from the id, so this returns (None, period) and settle finds it by searching."""
+    prefix = (res_id or "").split(":", 1)[0]
+    if "|" in prefix:
+        oid, period = prefix.split("|", 1)
+        return oid, period
+    return None, prefix
+
+
+def key_for_reservation(res_id: str) -> str | None:
+    """The API key for a NEW-format reservation's org (the only ids reserve() mints and the only ids that reach
+    dispatch), or None if that org's key is no longer configured. Bound to the key's fingerprint, so it returns the
+    SAME key the reservation was debited to regardless of slot order or swaps. A legacy id resolves to None (it is
+    never produced by reserve() and never dispatched; settle, not dispatch, reconciles any such straggler)."""
+    oid, _ = _org_of(res_id)
+    if oid is None:
+        return None
+    for o, key in configured_orgs():
+        if o == oid:
+            return key
+    return None
 
 
 def reset_day() -> int:
@@ -271,9 +359,12 @@ def period_bounds(now: float) -> tuple[float, float]:
     return start.timestamp(), nxt.timestamp()
 
 
-# ------------------------------------------------------------------ locked per-period ledger
+# ------------------------------------------------------------------ locked per-org, per-period ledger
+# Shape: {"orgs": {"<slot>": {"periods": {"<yyyy-mm>": {"spent_usd": f, "reserved": {rid: f}}}, "pruned_through": s}}}.
+# Each org (key slot) has its own independent set of billing periods and prune cursor, so one org's spend and
+# pruning never touch another's. A legacy single-org file ({"periods": {...}}) is migrated to slot "1" on read.
 def _blank() -> dict[str, Any]:
-    return {"periods": {}}
+    return {"orgs": {}}
 
 
 def _finite_nonneg(x: Any) -> bool:
@@ -281,17 +372,42 @@ def _finite_nonneg(x: Any) -> bool:
 
 
 def _validate(data: Any) -> dict[str, Any]:
-    """Strict schema check shared by reads and mutations: periods is a dict; each period has a finite non-negative
-    spent_usd and a reserved map of finite non-negative amounts. Anything else is a LedgerError (fail closed)."""
-    if not isinstance(data, dict) or not isinstance(data.get("periods"), dict):
+    """Strict schema check shared by reads and mutations, normalising the legacy single-org shape to slot '1'. Each
+    org is a dict with a periods map; each period has a finite non-negative spent_usd and a reserved map of finite
+    non-negative amounts. Anything else is a LedgerError (fail closed). Returns the (possibly migrated) data."""
+    if not isinstance(data, dict):
         raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
-    for period, led in data["periods"].items():
-        if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
-            raise LedgerError(f"api-credit ledger period {period!r} is invalid")
-        for rid, amt in led["reserved"].items():
-            if not _finite_nonneg(amt):
-                raise LedgerError(f"api-credit ledger reservation {rid!r} is invalid")
+    if "orgs" not in data and isinstance(data.get("periods"), dict):
+        # A prune cursor that is PRESENT but not a string (int, null, …) must fail closed, never be dropped:
+        # dropping it would let an already-pruned period reopen blank and re-admit its spent budget. Absent is fine
+        # (fresh ledger). Checked by key presence, so an explicit JSON null is rejected like any other bad value.
+        if "pruned_through" in data and not isinstance(data["pruned_through"], str):
+            raise LedgerError("api-credit ledger has an invalid prune cursor")
+        legacy: dict[str, Any] = {"periods": data["periods"]}
+        if isinstance(data.get("pruned_through"), str):
+            legacy["pruned_through"] = data["pruned_through"]
+        data = {"orgs": {_legacy_owner(): legacy}}   # the primary key; raises if none is configured
+    if not isinstance(data.get("orgs"), dict):
+        raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
+    for label, od in data["orgs"].items():
+        if not isinstance(od, dict) or not isinstance(od.get("periods"), dict):
+            raise LedgerError(f"api-credit ledger org {label!r} is invalid")
+        if "pruned_through" in od and not isinstance(od["pruned_through"], str):
+            raise LedgerError(f"api-credit ledger org {label!r} has an invalid prune cursor")
+        for period, led in od["periods"].items():
+            if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
+                raise LedgerError(f"api-credit ledger org {label!r} period {period!r} is invalid")
+            for rid, amt in led["reserved"].items():
+                if not _finite_nonneg(amt):
+                    raise LedgerError(f"api-credit ledger reservation {rid!r} is invalid")
     return data
+
+
+def _org_ledger(data: dict[str, Any], label: str) -> dict[str, Any]:
+    """The per-org sub-ledger ({"periods": ..., "pruned_through": ...}) for a slot, created blank if absent."""
+    od = data.setdefault("orgs", {}).setdefault(label, {"periods": {}})
+    od.setdefault("periods", {})
+    return od
 
 
 def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
@@ -332,8 +448,10 @@ def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
             lock.close()
 
 
-def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
-    periods = data.setdefault("periods", {})
+def _ledger_for(org: dict[str, Any], period: str) -> dict[str, Any]:
+    """The period ledger within ONE org's sub-ledger, pruning that org's resolved periods. Scoped to the org, so
+    pruning and the prune cursor are per-org and never affect another org's periods."""
+    periods = org.setdefault("periods", {})
     led = periods.setdefault(period, {"spent_usd": 0.0, "reserved": {}})
     led.setdefault("spent_usd", 0.0)
     led.setdefault("reserved", {})
@@ -349,31 +467,53 @@ def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
     if pruned:
         # Remember the latest period we have discarded. Its spent balance is gone, so a later reserve must not
         # reopen it as a blank ledger (which would let a clock rollback / stale timestamp double-spend that month).
-        data["pruned_through"] = max([data.get("pruned_through", "")] + pruned)
+        org["pruned_through"] = max([org.get("pruned_through", "")] + pruned)
     return led
 
 
 def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None:
-    """Reserve `max_cost` against this period's remaining credit, atomically. Returns a reservation id to settle
-    later, or None if the reservation would exceed the budget (the caller then refuses the request). Raises
-    LedgerError if accounting is unavailable (fail closed)."""
+    """Reserve `max_cost` against a configured org's remaining credit for this period, atomically, draining orgs in
+    configured order (org 1 until its window is full, then org 2, …). Returns a reservation id (whose prefix names
+    the org) to settle later, or None if NO org has room (the caller then refuses the request). Raises LedgerError
+    if accounting is unavailable (fail closed). All orgs are tried under one lock, so the choice is atomic."""
     p = path or meter_path()
     period = period_key(now)
-    budget = budget_usd()
+    budget = budget_usd()                         # per-org window size
     cost = max(0.0, float(max_cost))
+    orgs = configured_orgs()
+    lane_budget = budget * len(orgs)              # == total_budget_usd(); the hard aggregate cap
+
+    def _org_committed(data: dict[str, Any], oid: str) -> float:
+        led = (data.get("orgs", {}).get(oid, {}).get("periods") or {}).get(period) or {}
+        return float(led.get("spent_usd") or 0.0) + sum(float(v) for v in (led.get("reserved") or {}).values())
 
     def fn(data: dict[str, Any]) -> str | None:
-        if period not in data.get("periods", {}) and period <= data.get("pruned_through", ""):
-            # Reopening a period we already pruned (its spent balance is lost) -> refuse rather than start it blank.
-            # Only a clock rollback / stale timestamp reaches here; the live path always reserves the CURRENT period.
-            return None
-        led = _ledger_for(data, period)
-        committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
-        if committed + cost > budget:
-            return None
-        rid = f"{period}:{uuid.uuid4().hex}"
-        led["reserved"][rid] = round(cost, 6)
-        return rid
+        # Lane-wide prune guard FIRST: if the requested period has been pruned from ANY configured org, that org's
+        # spend for it is gone, so the lane aggregate for the period is understated and cannot be trusted -> refuse
+        # the whole reservation rather than admit another org into a period we can no longer total. The live path
+        # always reserves the CURRENT period (never pruned: pruning keeps the current and two most recent), so only
+        # a clock rollback / stale timestamp reaches here.
+        for oid, _k in orgs:
+            od0 = data.get("orgs", {}).get(oid, {})
+            if period not in (od0.get("periods") or {}) and period <= od0.get("pruned_through", ""):
+                return None
+        # Two gates, both under this lock: the lane AGGREGATE must not exceed the total, AND the chosen org's own
+        # window must not exceed its per-org budget. The aggregate gate matters because a settled OVERRUN on one org
+        # (actual > reserved, recorded un-clamped) can eat the lane's headroom while another org's window still looks
+        # open; without it, the sum of admitted reservations could pass total_budget_usd().
+        lane_committed = sum(_org_committed(data, oid) for oid, _k in orgs)
+        if lane_committed + cost > lane_budget:
+            return None                            # lane total would be exceeded (e.g. an overrun ate the headroom)
+        for oid, _key in orgs:
+            od = _org_ledger(data, oid)
+            led = _ledger_for(od, period)
+            committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
+            if committed + cost > budget:
+                continue                           # this org's window is full -> try the next org
+            rid = f"{oid}|{period}:{uuid.uuid4().hex}"
+            led["reserved"][rid] = round(cost, 6)
+            return rid
+        return None                                # every configured org is full (or there are none)
 
     return _locked(p, fn)
 
@@ -384,35 +524,55 @@ def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path
     right period. Idempotent: the charge is recorded only while the reservation is still outstanding, so a retried
     or duplicated settle cannot double-charge. Raises LedgerError on accounting failure."""
     p = path or meter_path()
-    period = res_id.split(":", 1)[0]
+    oid, period = _org_of(res_id)
     actual = max(0.0, float(actual_cost))
 
+    def _apply(led: dict[str, Any]) -> None:
+        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
+        led["spent_usd"] = round(float(led.get("spent_usd") or 0.0) + actual, 6)   # the ACTUAL — overruns not hidden
+
     def fn(data: dict[str, Any]) -> None:
-        if period not in data.get("periods", {}) and period <= data.get("pruned_through", ""):
+        if oid is None:
+            # A legacy reservation id carries no org. Find whichever org actually holds it (it was migrated under
+            # the primary configured when the ledger upgraded), so a late settle lands on its true owner regardless
+            # of which key is primary now. Ids are unique, so at most one org matches.
+            for _label, od in data.get("orgs", {}).items():
+                led = (od.get("periods") or {}).get(period)
+                if isinstance(led, dict) and res_id in (led.get("reserved") or {}):
+                    _apply(led)
+                    return
+            return   # not found in any org -> already settled / pruned -> idempotent no-op
+        od = _org_ledger(data, oid)
+        if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):
             return   # the period was pruned; any reservation in it is long gone -> nothing to settle, do not reopen it
-        led = _ledger_for(data, period)
+        led = _ledger_for(od, period)
         if res_id not in led["reserved"]:
             return   # already settled (or never reserved here) -> idempotent no-op, never a second charge
-        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
-        led["spent_usd"] = round(float(led["spent_usd"]) + actual, 6)     # record the ACTUAL — overruns are not hidden
+        _apply(led)
 
     _locked(p, fn)
 
 
 def _current(now: float, path: Path | None = None) -> dict[str, float]:
+    """This period's spend and outstanding reservations summed across all configured orgs (the whole lane)."""
     p = path or meter_path()
     period = period_key(now)
+    labels = [lbl for lbl, _ in configured_orgs()]
     try:
         if not p.exists():
             return {"spent_usd": 0.0, "reserved": 0.0}
         data = _validate(json.loads(p.read_text()))
-        led = data["periods"].get(period) or {"spent_usd": 0.0, "reserved": {}}
-        return {"spent_usd": float(led.get("spent_usd") or 0.0),
-                "reserved": sum(float(v) for v in (led.get("reserved") or {}).values())}
+        spent_total = reserved_total = 0.0
+        for lbl in labels:
+            od = data["orgs"].get(lbl) or {}
+            led = (od.get("periods") or {}).get(period) or {}
+            spent_total += float(led.get("spent_usd") or 0.0)
+            reserved_total += sum(float(v) for v in (led.get("reserved") or {}).values())
+        return {"spent_usd": spent_total, "reserved": reserved_total}
     except (LedgerError, ValueError, OSError, TypeError, AttributeError):
-        # A read-only view that cannot validate treats the period as fully committed, so pacing fails safe (the
+        # A read-only view that cannot validate treats the lane as fully committed, so pacing fails safe (the
         # authoritative admission path, reserve(), raises instead).
-        return {"spent_usd": budget_usd(), "reserved": 0.0}
+        return {"spent_usd": total_budget_usd(), "reserved": 0.0}
 
 
 def spent(now: float, path: Path | None = None) -> float:
@@ -426,16 +586,17 @@ def committed(now: float, path: Path | None = None) -> float:
 
 
 def remaining(now: float, path: Path | None = None) -> float:
-    return max(0.0, budget_usd() - committed(now, path))
+    return max(0.0, total_budget_usd() - committed(now, path))
 
 
 def over_budget(now: float, path: Path | None = None) -> bool:
-    return committed(now, path) >= budget_usd()
+    return committed(now, path) >= total_budget_usd()
 
 
 def window_numbers(now: float, path: Path | None = None) -> tuple[float, float, float]:
-    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view — committed dollars over the billing window."""
+    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view — committed dollars over the lane's whole
+    billing window (all configured orgs summed)."""
     start, nxt = period_bounds(now)
-    b = budget_usd()
+    b = total_budget_usd()
     used_pct = min(100.0, 100.0 * committed(now, path) / b) if b else 100.0
     return used_pct, nxt, nxt - start

@@ -104,8 +104,11 @@ class TestPeriod(unittest.TestCase):
 class TestAdmission(unittest.TestCase):
     def setUp(self):
         self.meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"})
+        # One configured org ($10 window). A key must be configured for reserve() to have an org to charge.
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                                 "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False)
         self.env.start()
+        os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)   # ensure a single org for this class
 
     def tearDown(self):
         self.env.stop()
@@ -192,6 +195,190 @@ class TestAdmission(unittest.TestCase):
         used_pct, reset_at, window_s = ac.window_numbers(T, self.meter)
         self.assertEqual(used_pct, 90.0)
         self.assertGreater(reset_at, T)
+
+
+class TestTwoOrgs(unittest.TestCase):
+    """Two credit orgs (two keys), each with its own $10 window — $20 total. Admission drains org 1 first."""
+    def setUp(self):
+        self.meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                                 "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1",
+                                                 "CORTADOS_ANTHROPIC_API_KEY_2": "sk-org-2"}, clear=False)
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def test_configured_orgs_and_total_budget(self):
+        self.assertEqual(ac.configured_orgs(),
+                         [(ac._org_id("sk-org-1"), "sk-org-1"), (ac._org_id("sk-org-2"), "sk-org-2")])
+        self.assertEqual(ac.budget_usd(), 10.0)          # per org
+        self.assertEqual(ac.total_budget_usd(), 20.0)    # both orgs
+
+    def test_reserve_drains_org1_then_overflows_to_org2(self):
+        r1 = ac.reserve(8.0, T, self.meter)
+        self.assertEqual(ac.key_for_reservation(r1), "sk-org-1")   # first org
+        r2 = ac.reserve(8.0, T, self.meter)                        # org 1 would exceed $10 -> org 2
+        self.assertEqual(ac.key_for_reservation(r2), "sk-org-2")
+        self.assertEqual(ac.committed(T, self.meter), 16.0)        # summed across both orgs
+        self.assertIsNone(ac.reserve(8.0, T, self.meter))          # both orgs full ($8 of $10 each) -> refused
+
+    def test_key_for_reservation_routes_to_the_right_org(self):
+        r1 = ac.reserve(8.0, T, self.meter)
+        r2 = ac.reserve(8.0, T, self.meter)
+        self.assertEqual(ac.key_for_reservation(r1), "sk-org-1")
+        self.assertEqual(ac.key_for_reservation(r2), "sk-org-2")
+
+    def test_settle_charges_only_its_own_org(self):
+        r_org1 = ac.reserve(8.0, T, self.meter)          # first reserve -> org 1
+        self.assertEqual(ac.key_for_reservation(r_org1), "sk-org-1")
+        ac.reserve(9.0, T, self.meter)                   # org 1 full (8+9>10) -> org 2
+        self.assertEqual(ac.committed(T, self.meter), 17.0)
+        ac.settle(r_org1, 2.0, T, self.meter)            # settle org 1; org 2's reservation is untouched
+        self.assertAlmostEqual(ac.spent(T, self.meter), 2.0, places=4)
+        self.assertAlmostEqual(ac.committed(T, self.meter), 2.0 + 9.0, places=4)   # spent 2 (org1) + 9 reserved (org2)
+
+    def test_deconfigured_org_has_no_key(self):
+        r_org1 = ac.reserve(8.0, T, self.meter)          # org 1
+        self.assertEqual(ac.key_for_reservation(r_org1), "sk-org-1")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            # an org-2 reservation now has no key (that org was removed from config)
+            r_org2 = ac._org_id("sk-org-2") + "|" + ac.period_key(T) + ":deadbeef"
+            self.assertIsNone(ac.key_for_reservation(r_org2))
+            self.assertEqual(ac.key_for_reservation(r_org1), "sk-org-1")   # org 1 still configured
+
+    def test_key_swap_between_slots_keeps_spend_with_its_key(self):
+        # Codex P1 regression: fully spend org A, then swap the keys between slots. A second reservation must NOT
+        # grant A a fresh window — spend stays bound to the key, not the slot.
+        rA = ac.reserve(10.0, T, self.meter)             # org 1 == key A, fully reserved
+        ac.settle(rA, 10.0, T, self.meter)               # A's $10 window is spent
+        self.assertEqual(ac.key_for_reservation(rA), "sk-org-1")
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk-org-2",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "sk-org-1"}, clear=False):
+            r2 = ac.reserve(10.0, T, self.meter)         # key A is exhausted wherever it sits -> lands on key B
+            self.assertIsNotNone(r2)
+            self.assertEqual(ac.key_for_reservation(r2), "sk-org-2")   # dispatched with B, not A
+            self.assertEqual(ac.key_for_reservation(rA), "sk-org-1")   # A's old reservation still maps to A
+            self.assertIsNone(ac.reserve(1.0, T, self.meter))          # now both keys spent -> refused ($20 total cap)
+
+    def test_overrun_on_one_org_cannot_push_the_lane_over_total(self):
+        # Codex round-3: a settled overrun on org A (actual > reserved, recorded un-clamped) eats the lane's
+        # headroom; a later reservation on org B must be refused once the AGGREGATE would exceed the $20 total,
+        # even though B's own $10 window still looks open.
+        r = ac.reserve(6.0, T, self.meter)               # org A
+        ac.settle(r, 11.0, T, self.meter)                # A overran to $11 (recorded in full)
+        self.assertAlmostEqual(ac.committed(T, self.meter), 11.0, places=4)
+        self.assertIsNone(ac.reserve(10.0, T, self.meter))   # would make the lane $21 > $20 -> refused
+        self.assertLessEqual(ac.committed(T, self.meter), ac.total_budget_usd())
+        self.assertIsNotNone(ac.reserve(9.0, T, self.meter))  # $11 + $9 = $20 exactly still fits (on org B)
+
+    def test_pruned_period_cannot_be_reopened_through_another_org(self):
+        # Codex round-4 P2: once org A's October is pruned, a stale-timestamp reserve into October must fail closed
+        # for the WHOLE lane (A's pruned spend is missing from the aggregate), never be admitted on org B.
+        a = ac.reserve(6.0, T, self.meter)
+        ac.settle(a, 11.0, T, self.meter)                # A's October overran to $11, resolved (no outstanding res)
+        for d in (40, 75, 110):                          # three newer resolved periods on A age October out
+            r = ac.reserve(1.0, T + d * 86400, self.meter)
+            ac.settle(r, 1.0, T + d * 86400, self.meter)
+        # October is now pruned from A; a stale-timestamp reserve into it is refused, not admitted on B
+        self.assertIsNone(ac.reserve(10.0, T, self.meter))
+        self.assertEqual(ac.spent(T, self.meter), 0.0)   # October reads empty (pruned), and no B reservation landed
+
+    def test_same_key_in_two_slots_is_one_org(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "dup",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "dup"}, clear=False):
+            self.assertEqual(ac.configured_orgs(), [(ac._org_id("dup"), "dup")])   # collapses to one org
+            self.assertEqual(ac.total_budget_usd(), 10.0)                          # NOT $20 for one key
+            r = ac.reserve(10.0, T, self.meter)
+            self.assertIsNotNone(r)
+            self.assertIsNone(ac.reserve(1.0, T, self.meter))                      # one $10 window, no phantom second
+
+
+class TestLegacyMigration(unittest.TestCase):
+    def test_legacy_single_org_file_is_read_as_org_1(self):
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 3.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            self.assertEqual(ac.spent(T, meter), 3.0)               # legacy spend read under the primary org
+            r = ac.reserve(2.0, T, meter)                           # a new reservation migrates the file in place
+            self.assertEqual(ac.key_for_reservation(r), "sk-org-1")
+            ac.settle(r, 2.0, T, meter)
+            self.assertEqual(ac.spent(T, meter), 5.0)               # 3 legacy + 2 new
+            # a legacy reservation id (no org prefix) carries no org; settle finds its owner by searching
+            self.assertEqual(ac._org_of("%s:abc123" % period), (None, period))
+            data = json.loads(meter.read_text())
+            self.assertIn("orgs", data)                             # persisted in the nested shape
+            self.assertIn(ac._org_id("sk-org-1"), data["orgs"])     # keyed by the primary key's fingerprint
+
+    def test_malformed_prune_cursor_fails_closed(self):
+        # Round-1/2 regression: a prune cursor that is PRESENT but not a string (int OR explicit null) must RAISE,
+        # never be dropped (which would let an already-pruned period reopen blank and re-admit its spent budget).
+        for bad in (202610, None):                                 # int, and JSON null
+            meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+            period = ac.period_key(T)
+            meter.parent.mkdir(parents=True, exist_ok=True)
+            meter.write_text(json.dumps({"periods": {period: {"spent_usd": 1.0, "reserved": {}}},
+                                         "pruned_through": bad}))
+            with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                              "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False):
+                os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+                with self.assertRaises(ac.LedgerError):
+                    ac.reserve(1.0, T, meter)
+                self.assertTrue(ac.over_budget(T, meter))           # read-only view also fails safe (fully committed)
+
+    def test_legacy_ledger_with_no_key_fails_closed(self):
+        # Codex round-2: with NO key configured, a legacy ledger cannot be attributed to an org -> fail closed
+        # rather than parking spend under a sentinel that a later-restored key would not see (a freed window).
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 5.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY", None)
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            with self.assertRaises(ac.LedgerError):
+                ac.reserve(1.0, T, meter)
+
+    def test_legacy_file_with_multiple_keys_fails_closed(self):
+        # Codex round-2 P1: a legacy (unattributable) ledger must NOT be migrated once >1 key is configured —
+        # guessing the owner could free the real owner's spent window. Fail closed until it is upgraded single-key.
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 10.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-B",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "sk-A"}, clear=False):
+            with self.assertRaises(ac.LedgerError):
+                ac.reserve(10.0, T, meter)
+            self.assertTrue(ac.over_budget(T, meter))              # read-only view fails safe too
+
+    def test_legacy_reservation_settles_on_its_true_owner_after_swap(self):
+        # Codex round-2 P2: a legacy reservation id (no org) must settle on whichever org actually holds it, found
+        # by search, even after the primary key changes — not follow the current primary into the wrong org.
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        legacy_rid = "%s:old-turn" % period
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 0.0, "reserved": {legacy_rid: 6.0}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-A"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            ac.reserve(1.0, T, meter)                              # persists the migration under A's fingerprint
+        # now the keys change: A is demoted to slot 2, B becomes primary
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-B",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "sk-A"}, clear=False):
+            ac.settle(legacy_rid, 4.0, T, meter)                  # must find the reservation under A and settle it
+            data = json.loads(meter.read_text())
+            a_led = data["orgs"][ac._org_id("sk-A")]["periods"][period]
+            self.assertNotIn(legacy_rid, a_led["reserved"])        # the stuck reservation was released
+            self.assertAlmostEqual(a_led["spent_usd"], 4.0, places=4)   # A's actual $4 recorded on A, not lost
 
 
 class TestBudgetEnv(unittest.TestCase):

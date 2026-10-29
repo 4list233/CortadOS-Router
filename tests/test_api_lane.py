@@ -7,6 +7,9 @@ from unittest import mock
 from cortados_router import api_credits
 from cortados_router.provider.server import Handler
 
+# A realistic reservation id for the test key "sk": its org fingerprint, so key_for_reservation() resolves to "sk".
+RID = api_credits._org_id("sk") + "|2026-11:abc"
+
 
 class TestApiPin(unittest.TestCase):
     def test_pin_detection(self):
@@ -64,7 +67,7 @@ class TestServeApiLane(unittest.TestCase):
         h = self._handler()
         usage = {"input_tokens": 1_000_000, "output_tokens": 0}   # opus-5-5 input -> $4 already observed on the wire
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
-             mock.patch("cortados_router.api_credits.reserve", return_value="2026-11:abc"), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
              mock.patch("cortados_router.api_credits.estimate_max_cost", return_value=1.0), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=(usage, "unknown")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
@@ -75,7 +78,7 @@ class TestServeApiLane(unittest.TestCase):
         h = self._handler()
         usage = {"input_tokens": 1_000_000, "output_tokens": 0}  # opus-5-5 input -> $4
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
-             mock.patch("cortados_router.api_credits.reserve", return_value="2026-11:abc"), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=(usage, "completed")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
             h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
@@ -86,7 +89,7 @@ class TestServeApiLane(unittest.TestCase):
     def test_unknown_outcome_settles_the_full_reservation(self):
         h = self._handler()
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
-             mock.patch("cortados_router.api_credits.reserve", return_value="2026-11:abc"), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
              mock.patch("cortados_router.api_credits.estimate_max_cost", return_value=12.34), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({"input_tokens": 1000}, "unknown")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
@@ -96,11 +99,25 @@ class TestServeApiLane(unittest.TestCase):
     def test_rejected_turn_settles_zero(self):
         h = self._handler()
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
-             mock.patch("cortados_router.api_credits.reserve", return_value="2026-11:abc"), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
              mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({}, "rejected")), \
              mock.patch("cortados_router.api_credits.settle") as settle:
             h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
             self.assertEqual(settle.call_args[0][1], 0.0)   # the API rejected it; nothing billed
+
+    def test_reserved_org_deconfigured_releases_and_refuses(self):
+        # reserve succeeded against an org whose key is no longer configured (res_id org != any configured key):
+        # release the reservation (settle 0) and refuse, never dispatch with a different org's key.
+        h = self._handler()
+        orphan = api_credits._org_id("sk-GONE") + "|2026-11:abc"
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=orphan), \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve") as served, \
+             mock.patch("cortados_router.api_credits.settle") as settle:
+            h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
+            served.assert_not_called()                      # never dispatched with the wrong key
+            self.assertEqual(settle.call_args[0][1], 0.0)   # reservation released
+        self.assertEqual(h.errors[0][0], 503)
 
 
 if __name__ == "__main__":
