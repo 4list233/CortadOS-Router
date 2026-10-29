@@ -127,6 +127,22 @@ def has_usable_usage(usage: Any) -> bool:
     return False
 
 
+def invalid_header(headers: dict[str, str]) -> str | None:
+    """The NAME of the first outbound header whose value the HTTP layer would reject (contains CR/LF/NUL, or is not
+    latin-1 encodable), else None. Checked BEFORE dispatch so a malformed header (a bad beta, or a mis-configured
+    credit key) is a certain pre-dispatch rejection. Returns the name only — never the value — so the credit key is
+    never echoed back to the client."""
+    for k, v in headers.items():
+        s = v if isinstance(v, str) else str(v)
+        if any(c in s for c in ("\r", "\n", "\x00")):
+            return k
+        try:
+            s.encode("latin-1")
+        except UnicodeEncodeError:
+            return k
+    return None
+
+
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
           urlopen: Callable[..., Any] | None = None) -> tuple[dict[str, Any], str]:
     """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
@@ -138,14 +154,12 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
     key = (key if key is not None else api_key()).strip()
     open_fn = urlopen or _OPENER.open
     url, data, headers = build_upstream(body, model, key)   # raises on a non-Anthropic origin
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    streaming = bool(body.get("stream"))
-    try:
-        resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
-    except ValueError as exc:
-        # The stdlib rejects a malformed outbound request (e.g. an invalid header value from a client-supplied beta)
-        # BEFORE sending anything, so nothing is billed. Relay a 400 and settle zero.
-        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": f"cortados: request rejected before dispatch: {exc}"}}).encode()
+    bad_header = invalid_header(headers)
+    if bad_header is not None:
+        # A malformed outbound header (a client-supplied beta, or a mis-configured credit key) means nothing is sent,
+        # so nothing is billed -> a certain pre-dispatch rejection. Relay a 400 naming the header (never its value).
+        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                          "message": f"cortados: outbound header {bad_header!r} is malformed; request not dispatched"}}).encode()
         try:
             handler.send_response(400)
             handler.send_header("content-type", "application/json")
@@ -155,6 +169,10 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         except OSError:
             pass
         return {}, "rejected"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    streaming = bool(body.get("stream"))
+    try:
+        resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
         # The API REJECTED the turn: nothing is billed, regardless of whether we can read or relay the error body.
         try:
@@ -181,6 +199,20 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         except OSError:
             pass
         return {}, "unknown"   # dispatch may have reached the API; settle conservatively
+    except Exception as exc:
+        # Headers were validated above, so this is NOT a pre-dispatch rejection: the POST may well have been sent
+        # (e.g. the stdlib raised parsing the response headers). The spend is uncertain -> "unknown", never a $0
+        # rejection. Best-effort 502 to the client.
+        msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": "cortados: upstream response could not be read"}}).encode()
+        try:
+            handler.send_response(502)
+            handler.send_header("content-type", "application/json")
+            handler.send_header("content-length", str(len(msg)))
+            handler.end_headers()
+            handler.wfile.write(msg)
+        except OSError:
+            pass
+        return {}, "unknown"
 
     try:
         if not streaming:
@@ -231,9 +263,10 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                     break  # client gone: stop relaying; the billing outcome is decided by what we already parsed
         except (OSError, http.client.HTTPException):
             pass   # an upstream read failed mid-stream; keep whatever usage/terminal state we already captured
-        # If the terminal event was parsed, the full turn was received and billed regardless of a later client or
-        # upstream failure -> "completed". Otherwise the turn did not terminate for us -> "unknown" (conservative).
-        return usage, ("completed" if completed else "unknown")
+        # "completed" only when the terminal event was parsed AND the captured usage is usable (a null/absent-usage
+        # stream cannot be settled, so it keeps the conservative "unknown" charge). A parsed terminal event means the
+        # full turn was received and billed regardless of a later client/upstream failure.
+        return usage, ("completed" if completed and has_usable_usage(usage) else "unknown")
     finally:
         try:
             resp.close()

@@ -358,6 +358,10 @@ class Handler(BaseHTTPRequestHandler):
             usage, outcome = anthropic_proxy.serve(self, body, model, now)
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", exc)
+        except Exception as exc:
+            # Any other failure out of serve() (e.g. a response-parse error after the POST was dispatched) leaves the
+            # spend genuinely unknown -> keep outcome "unknown" so we settle conservatively rather than crash/undercharge.
+            logger.error("anthropic-api proxy failed after dispatch (settling conservatively): %s", exc)
         finally:
             if outcome == "rejected":
                 charge = 0.0                       # the API returned an error; nothing was billed

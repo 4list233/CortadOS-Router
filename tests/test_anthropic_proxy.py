@@ -218,15 +218,49 @@ class TestServe(unittest.TestCase):
         self.assertEqual(outcome, "completed")
         self.assertEqual(usage.get("output_tokens"), 7)
 
-    def test_invalid_outbound_header_is_rejected_without_charge(self):
-        # a client-supplied beta with CRLF makes the stdlib raise ValueError BEFORE anything is sent -> rejected
-        def boom(req, timeout=0):
-            raise ValueError("Invalid header value")
+    def test_invalid_outbound_header_is_rejected_before_dispatch(self):
+        # a client-supplied beta with CRLF is caught by pre-validation; nothing is dispatched and the injected value
+        # is not echoed back to the client
+        called = []
+        def must_not_dispatch(req, timeout=0):
+            called.append(1)
+            raise AssertionError("must not dispatch")
         h = FakeHandler()
         usage, outcome = ap.serve(h, {"model": "cortados", "betas": ["bad\r\nx-injected: true"]}, "claude-opus-5-5", 0.0,
-                                  key="sk", urlopen=boom)
+                                  key="sk", urlopen=must_not_dispatch)
         self.assertEqual((usage, outcome), ({}, "rejected"))
         self.assertEqual(h.status, 400)
+        self.assertEqual(called, [])                                   # never sent
+        self.assertNotIn(b"x-injected", h.wfile.buf.getvalue())        # injected value not reflected
+
+    def test_malformed_credit_key_is_not_echoed_to_the_client(self):
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0,
+                                  key="sk-ant-SECRET\r\nwrapped", urlopen=lambda req, timeout=0: None)
+        self.assertEqual(outcome, "rejected")
+        body = h.wfile.buf.getvalue()
+        self.assertNotIn(b"SECRET", body)                              # the credit key value is never disclosed
+        self.assertIn(b"x-api-key", body)                             # only the header NAME is reported
+
+    def test_post_dispatch_opener_error_is_unknown_not_rejected(self):
+        # a failure raised by the opener AFTER headers validated (e.g. response-header parse) -> dispatch uncertain,
+        # so "unknown" (conservative full reservation), never a $0 rejection
+        def opener_raises(req, timeout=0):
+            raise UnicodeError("bad response header")   # a ValueError subclass, as the stdlib raises
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk", urlopen=opener_raises)
+        self.assertEqual((usage, outcome), ({}, "unknown"))
+
+    def test_stream_null_usage_is_unknown_not_completed_zero(self):
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":null,"output_tokens":null}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":null}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "unknown")   # parsed message_stop but no usable usage -> conservative
 
     def test_nonstream_null_usage_counts_is_unknown(self):
         body = json.dumps({"type": "message", "usage": {"input_tokens": None, "output_tokens": None}}).encode()

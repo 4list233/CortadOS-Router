@@ -61,12 +61,14 @@ DEFAULT_SERVER_TOOL_USES = 20  # a declared web-search tool with no max_uses: re
 # Server tools the API itself EXECUTES and bills. The credit lane admits a request using one only when it can both
 # BOUND the cost up front and reconcile it from usage afterwards. Keyed by the tool-type prefix, since Anthropic
 # suffixes a date (e.g. "web_search_20250305"). An ordinary client-executed tool is not listed here and is fine.
-#   metered   -> per-request charge, bounded by an enforced max_uses and settled from usage.server_tool_use
-#   unbounded -> cost the meter cannot bound in advance -> refuse admission. web_fetch is here because the fetched
-#                page content lands in the turn's INPUT tokens, which the serialized request cannot bound (its
-#                $0 per-request charge is not the issue); code_execution is billed per server-side container-hour.
+#   unbounded -> cost the meter cannot bound in advance from the serialized request -> refuse admission.
+# Every server-EXECUTED tool is currently unbounded: web_search and web_fetch both pull external content into the
+# turn's INPUT tokens (the serialized request cannot bound that, so a reservation can never cover it; the per-request
+# fee is not the issue), and code_execution is billed per server-side container-hour. Ordinary client tools (bridged,
+# executed client-side, no server charge) are NOT listed here and pass. When a server tool's result cost becomes
+# bounded in advance (e.g. an enforced content-token cap reserved up front), move it out of this set.
 _SERVER_TOOL_KIND: dict[str, str] = {
-    "web_search": "metered",
+    "web_search": "unbounded",
     "web_fetch": "unbounded",
     "code_execution": "unbounded",
 }
@@ -341,8 +343,13 @@ def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
     # Also always keep the period being fetched: reserve() adds its reservation AFTER this returns, so pruning it
     # here would detach `led` from the ledger and the reservation (and its later settle) would be lost.
     keep = set(sorted(periods)[-2:]) | {p for p, l in periods.items() if l.get("reserved")} | {period}
-    for stale in [p for p in list(periods) if p not in keep]:
+    pruned = [p for p in list(periods) if p not in keep]
+    for stale in pruned:
         periods.pop(stale, None)
+    if pruned:
+        # Remember the latest period we have discarded. Its spent balance is gone, so a later reserve must not
+        # reopen it as a blank ledger (which would let a clock rollback / stale timestamp double-spend that month).
+        data["pruned_through"] = max([data.get("pruned_through", "")] + pruned)
     return led
 
 
@@ -356,6 +363,10 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
     cost = max(0.0, float(max_cost))
 
     def fn(data: dict[str, Any]) -> str | None:
+        if period not in data.get("periods", {}) and period <= data.get("pruned_through", ""):
+            # Reopening a period we already pruned (its spent balance is lost) -> refuse rather than start it blank.
+            # Only a clock rollback / stale timestamp reaches here; the live path always reserves the CURRENT period.
+            return None
         led = _ledger_for(data, period)
         committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
         if committed + cost > budget:
@@ -377,6 +388,8 @@ def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path
     actual = max(0.0, float(actual_cost))
 
     def fn(data: dict[str, Any]) -> None:
+        if period not in data.get("periods", {}) and period <= data.get("pruned_through", ""):
+            return   # the period was pruned; any reservation in it is long gone -> nothing to settle, do not reopen it
         led = _ledger_for(data, period)
         if res_id not in led["reserved"]:
             return   # already settled (or never reserved here) -> idempotent no-op, never a second charge

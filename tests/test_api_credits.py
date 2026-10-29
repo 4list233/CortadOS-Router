@@ -64,12 +64,12 @@ class TestPricing(unittest.TestCase):
 
 
 class TestServerToolAdmission(unittest.TestCase):
-    def test_unbounded_server_tools_flags_code_execution_and_web_fetch(self):
-        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
-                         ["code_execution_20250522"])
-        # web_fetch pulls unbounded page content into input tokens -> refused on the credit lane
+    def test_every_server_executed_tool_is_refused(self):
+        # web_search and web_fetch both pull unbounded external content into input tokens; code_execution bills by
+        # container-hour -> all three are refused on the credit lane. Only client tools pass.
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "code_execution_20250522"}]}), ["code_execution_20250522"])
         self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_fetch_20250910"}]}), ["web_fetch_20250910"])
-        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_search_20250305"}]}), [])   # metered + capped -> allowed
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_search_20250305"}]}), ["web_search_20250305"])
         self.assertEqual(ac.unbounded_server_tools({"tools": [{"name": "my_tool", "input_schema": {}}]}), [])  # a client tool
         self.assertEqual(ac.unbounded_server_tools({}), [])
 
@@ -160,6 +160,16 @@ class TestAdmission(unittest.TestCase):
         self.assertIsNotNone(late)
         ac.settle(late, 2.0, T, self.meter)
         self.assertEqual(ac.spent(T, self.meter), 6.0)          # 4 + 2 both recorded; nothing vanished
+
+    def test_reserve_into_a_pruned_historical_period_is_refused(self):
+        p0 = ac.reserve(5.0, T, self.meter)
+        ac.settle(p0, 5.0, T, self.meter)                                   # period 0, fully resolved
+        for d in (40, 75, 110):                                             # three newer, resolved periods
+            r = ac.reserve(1.0, T + d * 86400, self.meter)
+            ac.settle(r, 1.0, T + d * 86400, self.meter)
+        # period 0 has aged past the retained window and been pruned; a stale-timestamp reserve must NOT reopen it
+        self.assertIsNone(ac.reserve(5.0, T, self.meter))
+        self.assertEqual(ac.spent(T, self.meter), 0.0)                      # reads empty (pruned), not its old $5
 
     def test_late_settle_lands_in_its_own_period(self):
         old = ac.reserve(5.0, T, self.meter)                        # period A
