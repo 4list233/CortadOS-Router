@@ -481,8 +481,20 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
     budget = budget_usd()                         # per-org window size
     cost = max(0.0, float(max_cost))
     orgs = configured_orgs()
+    lane_budget = budget * len(orgs)              # == total_budget_usd(); the hard aggregate cap
+
+    def _org_committed(data: dict[str, Any], oid: str) -> float:
+        led = (data.get("orgs", {}).get(oid, {}).get("periods") or {}).get(period) or {}
+        return float(led.get("spent_usd") or 0.0) + sum(float(v) for v in (led.get("reserved") or {}).values())
 
     def fn(data: dict[str, Any]) -> str | None:
+        # Two gates, both under this lock: the lane AGGREGATE must not exceed the total, AND the chosen org's own
+        # window must not exceed its per-org budget. The aggregate gate matters because a settled OVERRUN on one org
+        # (actual > reserved, recorded un-clamped) can eat the lane's headroom while another org's window still looks
+        # open; without it, the sum could pass total_budget_usd().
+        lane_committed = sum(_org_committed(data, oid) for oid, _k in orgs)
+        if lane_committed + cost > lane_budget:
+            return None                            # lane total would be exceeded (e.g. an overrun ate the headroom)
         for oid, _key in orgs:
             od = _org_ledger(data, oid)
             if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):

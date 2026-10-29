@@ -262,6 +262,17 @@ class TestTwoOrgs(unittest.TestCase):
             self.assertEqual(ac.key_for_reservation(rA), "sk-org-1")   # A's old reservation still maps to A
             self.assertIsNone(ac.reserve(1.0, T, self.meter))          # now both keys spent -> refused ($20 total cap)
 
+    def test_overrun_on_one_org_cannot_push_the_lane_over_total(self):
+        # Codex round-3: a settled overrun on org A (actual > reserved, recorded un-clamped) eats the lane's
+        # headroom; a later reservation on org B must be refused once the AGGREGATE would exceed the $20 total,
+        # even though B's own $10 window still looks open.
+        r = ac.reserve(6.0, T, self.meter)               # org A
+        ac.settle(r, 11.0, T, self.meter)                # A overran to $11 (recorded in full)
+        self.assertAlmostEqual(ac.committed(T, self.meter), 11.0, places=4)
+        self.assertIsNone(ac.reserve(10.0, T, self.meter))   # would make the lane $21 > $20 -> refused
+        self.assertLessEqual(ac.committed(T, self.meter), ac.total_budget_usd())
+        self.assertIsNotNone(ac.reserve(9.0, T, self.meter))  # $11 + $9 = $20 exactly still fits (on org B)
+
     def test_same_key_in_two_slots_is_one_org(self):
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "dup",
                                           "CORTADOS_ANTHROPIC_API_KEY_2": "dup"}, clear=False):
