@@ -1,46 +1,61 @@
-"""Anthropic API-credit lane: a dollar-metered monthly window for the router's resource pool.
+"""Anthropic API-credit lane: a dollar-metered, admission-controlled monthly window for the router's resource pool.
 
-A prepaid API credit (default $200, resets on the 1st of the month) is modeled as a one-month budget WINDOW, so it
-reuses the same pacing every other lane uses (`scarcity.window_view`): % of the window spent vs % of its time
-elapsed, use-it-or-lose-it as the reset nears, and scarcity 1.0 once it is spent. The only difference is the unit:
-dollars, for this one window (Forest's "scarcity is subscription units, never dollars" holds for the plan lanes).
+A prepaid API credit (default $200, resets on the billing day) funds a credit lane. This module owns the ACCOUNTING
+for that budget — it does not itself talk to the network. Design points (hardened after a Codex money-path review):
 
-This module owns, stdlib only so it imports nothing from the package:
-  - PRICES: USD per million tokens per model (from the claude-api skill, cached 2026-10-06),
-  - cost_usd / cost_from_usage: dollars for one API call from its response usage,
-  - a self-metered spend file (~/.cortados/api-credit-meter.json), {"month": "YYYY-MM", "spent_usd": float},
-    which zeroes when the month rolls over,
-  - record / spent / remaining / over_budget: the provider's hard cap (never bill past the credit),
-  - window_numbers(now): (used_pct, reset_at_epoch, window_s) for scarcity.window_view.
+  * Admission control, not after-the-fact counting. A request reserves a CONSERVATIVE maximum cost under a file
+    lock BEFORE it is dispatched (`reserve`), and settles the actual cost after (`settle`, full reservation if the
+    actual is unknown — e.g. the client disconnected). So concurrent requests cannot all pass the same check and
+    overshoot, and a dropped turn never under-charges.
+  * File-locked, per-period ledger. The meter file holds one sub-ledger per billing period; `fcntl.flock`
+    serializes read-modify-write across the threading HTTP server AND across processes. A late settle lands in its
+    own period, never erasing the new one. Writes use a unique temp file, so two writers cannot collide.
+  * Fail closed. If the ledger cannot be read or written, the operation RAISES — the caller then refuses admission
+    rather than spending blind. A genuinely-absent ledger is fresh (zero), a corrupt one is an error.
+  * Conservative pricing, but the Anthropic API is the AUTHORITATIVE hard cap. With the credit org set to
+    overage-off, the API itself rejects calls past the included credit; this meter is a conservative PACING guard
+    and use-it-or-lose-it signal on top of that. Cache writes are priced at the 1-hour rate and unknown models at
+    the most-expensive tier, so the pacing guard does not under-count.
 
-Spend is priced CONSERVATIVELY — an unknown model and cache-write tokens are rounded UP (to the most expensive
-model / input×1.25) — so the cap stops a little early rather than overspending real credits. Scarcity readings can
-lag the meter between samples; the provider enforces the cap from the live meter at call time, so the lag is safe.
+Stdlib only.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import math
 import os
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-# USD per 1,000,000 tokens. cache_write ≈ input × 1.25 (5-minute write); cache_read per the published rate.
+
+def _entry(inp: float, out: float) -> dict[str, float]:
+    # cache_write at the 1-hour rate (input x2, the higher write rate); cache_read bounded above by input x0.1.
+    return {"input": inp, "output": out, "cache_read": round(inp * 0.1, 4), "cache_write": inp * 2}
+
+
+# USD per 1,000,000 tokens (claude-api skill, cached 2026-10-06), priced conservatively.
 PRICES: dict[str, dict[str, float]] = {
-    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
-    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
-    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
-    "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.20, "cache_write": 5.0},
-    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_read": 0.25, "cache_write": 6.25},
-    "claude-opus-4-8": {"input": 5.0, "output": 25.0, "cache_read": 0.25, "cache_write": 6.25},
-    "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_read": 0.20, "cache_write": 2.5},
-    "claude-sonnet-5": {"input": 2.0, "output": 10.0, "cache_read": 0.20, "cache_write": 2.5},
-    "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cache_read": 0.02, "cache_write": 0.125},
+    "claude-fable-5-1": _entry(10.0, 50.0),
+    "claude-fable-5": _entry(10.0, 50.0),
+    "claude-mythos-5-1": _entry(10.0, 50.0),
+    "claude-opus-5-5": _entry(4.0, 20.0),
+    "claude-opus-5": _entry(5.0, 25.0),
+    "claude-opus-4-8": _entry(5.0, 25.0),
+    "claude-sonnet-5-5": _entry(2.0, 10.0),
+    "claude-sonnet-5": _entry(2.0, 10.0),
+    "claude-haiku-5-5": _entry(0.50, 2.50),  # the >100k-token tier, so the guard never under-counts Haiku
 }
-# Most expensive tier, so an unrecognized model is OVER-counted toward the cap, never under-counted.
-DEFAULT_PRICE: dict[str, float] = {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5}
+DEFAULT_PRICE = _entry(10.0, 50.0)  # unknown model -> most expensive tier
 
 DEFAULT_BUDGET_USD = 200.0
+
+
+class LedgerError(RuntimeError):
+    """The ledger could not be read or written; the caller must fail closed (refuse admission)."""
 
 
 def _state_dir() -> Path:
@@ -52,8 +67,6 @@ def meter_path() -> Path:
 
 
 def budget_usd() -> float:
-    """The monthly credit in dollars; CORTADOS_API_CREDIT_BUDGET_USD overrides the $200 default. Non-positive or
-    unparseable values fall back to the default rather than disabling the cap."""
     raw = os.environ.get("CORTADOS_API_CREDIT_BUDGET_USD")
     try:
         v = float(raw) if raw not in (None, "") else DEFAULT_BUDGET_USD
@@ -62,9 +75,17 @@ def budget_usd() -> float:
     return v if v > 0 else DEFAULT_BUDGET_USD
 
 
+def reset_day() -> int:
+    """Day of the month the included credit renews (the billing day). Default 1; clamped to 1..28."""
+    raw = os.environ.get("CORTADOS_API_CREDIT_RESET_DAY")
+    try:
+        d = int(raw) if raw not in (None, "") else 1
+    except (TypeError, ValueError):
+        return 1
+    return min(28, max(1, d))
+
+
 def price_for(model: str) -> dict[str, float]:
-    """Prices for a model id: exact match, else a prefix match (a dated/suffixed id resolves to its base), else the
-    most-expensive default so an unknown model is never under-priced."""
     m = (model or "").strip().lower()
     if m in PRICES:
         return PRICES[m]
@@ -74,92 +95,189 @@ def price_for(model: str) -> dict[str, float]:
     return DEFAULT_PRICE
 
 
-def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cache_read_tokens: float = 0, cache_creation_tokens: float = 0) -> float:
-    """Dollars for one call's token counts. Negative/non-finite counts are treated as 0."""
-    def n(x: Any) -> float:
-        try:
-            v = float(x)
-        except (TypeError, ValueError):
-            return 0.0
-        return v if v == v and v not in (float("inf"), float("-inf")) and v > 0 else 0.0  # NaN/inf/negative -> 0
+def _n(x: Any) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
 
+
+def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cache_read_tokens: float = 0, cache_creation_tokens: float = 0) -> float:
     p = price_for(model)
-    return (n(input_tokens) * p["input"] + n(output_tokens) * p["output"] + n(cache_read_tokens) * p["cache_read"] + n(cache_creation_tokens) * p["cache_write"]) / 1_000_000.0
+    total = _n(input_tokens) * p["input"] + _n(output_tokens) * p["output"] + _n(cache_read_tokens) * p["cache_read"] + _n(cache_creation_tokens) * p["cache_write"]
+    return total / 1_000_000.0
 
 
 def cost_from_usage(model: str, usage: dict[str, Any] | None) -> float:
-    """Dollars for one call, reading the Anthropic response `usage` block's standard token fields."""
     u = usage if isinstance(usage, dict) else {}
-    return cost_usd(
-        model,
-        input_tokens=u.get("input_tokens", 0),
-        output_tokens=u.get("output_tokens", 0),
-        cache_read_tokens=u.get("cache_read_input_tokens", 0),
-        cache_creation_tokens=u.get("cache_creation_input_tokens", 0),
-    )
+    return cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0))
 
 
-def month_key(now: float) -> str:
-    return datetime.fromtimestamp(now).astimezone().strftime("%Y-%m")
+def estimate_max_cost(body: dict[str, Any], model: str) -> float:
+    """A CONSERVATIVE upper bound on what one request can cost: every prompt byte counted as a (cached-miss) input
+    token at the full input rate, plus max_tokens at the output rate. Used to reserve credit before dispatch."""
+    p = price_for(model)
+    raw = json.dumps(body) if isinstance(body, dict) else ""
+    input_tokens = len(raw.encode()) / 3.0  # ~3 bytes/token, deliberately low (more tokens = larger reservation)
+    try:
+        max_out = int(body.get("max_tokens") or 0) if isinstance(body, dict) else 0
+    except (TypeError, ValueError):
+        max_out = 0
+    if max_out <= 0:
+        max_out = 64000  # no cap given: assume a large output
+    return (input_tokens * p["input"] + max_out * p["output"]) / 1_000_000.0
 
 
-def month_bounds(now: float) -> tuple[float, float]:
-    """(start_epoch, next_start_epoch) of the local calendar month containing `now`: the window's edges."""
+# ------------------------------------------------------------------ billing period
+def period_key(now: float) -> str:
+    """The billing period `now` falls in, as 'YYYY-MM', where a period runs from reset_day to the next reset_day."""
     dt = datetime.fromtimestamp(now).astimezone()
-    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    y, m = (dt.year, dt.month) if dt.day >= reset_day() else (dt.year, dt.month - 1)
+    if m < 1:
+        y, m = y - 1, 12
+    return f"{y:04d}-{m:02d}"
+
+
+def period_bounds(now: float) -> tuple[float, float]:
+    """(start_epoch, next_start_epoch) of the billing period containing `now`."""
+    dt = datetime.fromtimestamp(now).astimezone()
+    d = reset_day()
+    start = dt.replace(day=d, hour=0, minute=0, second=0, microsecond=0)
+    if dt.day < d:
+        start = start.replace(year=start.year - 1, month=12) if start.month == 1 else start.replace(month=start.month - 1)
     nxt = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
     return start.timestamp(), nxt.timestamp()
 
 
-def _read_meter(path: Path) -> dict[str, Any]:
-    try:
-        d = json.loads(path.read_text())
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+# ------------------------------------------------------------------ locked per-period ledger
+def _blank() -> dict[str, Any]:
+    return {"periods": {}}
 
 
-def _write_meter(path: Path, data: dict[str, Any]) -> None:
+def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
+    """Run fn on the ledger under an exclusive file lock, persisting whatever fn leaves in `data`. Fail closed:
+    any read/parse/write error raises LedgerError so the caller refuses admission instead of spending blind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(path)
+    try:
+        lock = open(path.with_suffix(".lock"), "w")
+    except OSError as exc:
+        raise LedgerError(f"cannot open the api-credit lock: {exc}") from exc
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict) or "periods" not in data:
+                    raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
+            except (ValueError, OSError) as exc:
+                raise LedgerError(f"api-credit ledger unreadable: {exc}") from exc
+        else:
+            data = _blank()
+        out = fn(data)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(data))
+            tmp.replace(path)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise LedgerError(f"api-credit ledger write failed: {exc}") from exc
+        return out
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
+    periods = data.setdefault("periods", {})
+    led = periods.setdefault(period, {"spent_usd": 0.0, "reserved": {}})
+    led.setdefault("spent_usd", 0.0)
+    led.setdefault("reserved", {})
+    # prune ledgers older than the two most recent, so the file does not grow without bound
+    for stale in sorted(periods)[:-2]:
+        periods.pop(stale, None)
+    return led
+
+
+def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None:
+    """Reserve `max_cost` against this period's remaining credit, atomically. Returns a reservation id to settle
+    later, or None if the reservation would exceed the budget (the caller then refuses the request). Raises
+    LedgerError if accounting is unavailable (fail closed)."""
+    p = path or meter_path()
+    period = period_key(now)
+    budget = budget_usd()
+    cost = max(0.0, float(max_cost))
+
+    def fn(data: dict[str, Any]) -> str | None:
+        led = _ledger_for(data, period)
+        committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
+        if committed + cost > budget:
+            return None
+        rid = f"{period}:{uuid.uuid4().hex}"
+        led["reserved"][rid] = round(cost, 6)
+        return rid
+
+    return _locked(p, fn)
+
+
+def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path | None = None) -> None:
+    """Replace a reservation with the actual spend (clamped to the reserved max). The reservation's own period is
+    read from its id, so a late settle lands in the right period. Raises LedgerError on accounting failure."""
+    p = path or meter_path()
+    period = res_id.split(":", 1)[0]
+    actual = max(0.0, float(actual_cost))
+
+    def fn(data: dict[str, Any]) -> None:
+        led = _ledger_for(data, period)
+        held = led["reserved"].pop(res_id, None)
+        charge = min(actual, float(held)) if held is not None else actual
+        led["spent_usd"] = round(float(led["spent_usd"]) + charge, 6)
+
+    _locked(p, fn)
+
+
+def _current(now: float, path: Path | None = None) -> dict[str, float]:
+    p = path or meter_path()
+    period = period_key(now)
+    try:
+        if not p.exists():
+            return {"spent_usd": 0.0, "reserved": 0.0}
+        data = json.loads(p.read_text())
+        led = (data.get("periods") or {}).get(period) or {}
+        return {"spent_usd": float(led.get("spent_usd") or 0.0),
+                "reserved": sum(float(v) for v in (led.get("reserved") or {}).values())}
+    except (ValueError, OSError, TypeError):
+        # A read-only view that cannot parse treats the period as fully committed, so pacing fails safe (the
+        # authoritative admission path, reserve(), raises instead).
+        return {"spent_usd": budget_usd(), "reserved": 0.0}
 
 
 def spent(now: float, path: Path | None = None) -> float:
-    """Dollars spent in the current month. A meter from an earlier month reads as 0 (the window reset); the stored
-    file is left as-is until the next record() rewrites it."""
-    d = _read_meter(path or meter_path())
-    if d.get("month") != month_key(now):
-        return 0.0
-    try:
-        return max(0.0, float(d.get("spent_usd") or 0.0))
-    except (TypeError, ValueError):
-        return 0.0
+    return _current(now, path)["spent_usd"]
 
 
-def record(model: str, usage: dict[str, Any] | None, now: float, path: Path | None = None) -> float:
-    """Add one call's cost to this month's meter (resetting it if the month rolled over) and return the new total."""
-    p = path or meter_path()
-    d = _read_meter(p)
-    key = month_key(now)
-    base = spent(now, p)  # 0 across a month boundary, else the stored total
-    total = round(base + cost_from_usage(model, usage), 6)
-    _write_meter(p, {"month": key, "spent_usd": total})
-    return total
+def committed(now: float, path: Path | None = None) -> float:
+    """Spent plus outstanding reservations — what admission and pacing both read against the budget."""
+    c = _current(now, path)
+    return c["spent_usd"] + c["reserved"]
 
 
 def remaining(now: float, path: Path | None = None) -> float:
-    return max(0.0, budget_usd() - spent(now, path))
+    return max(0.0, budget_usd() - committed(now, path))
 
 
 def over_budget(now: float, path: Path | None = None) -> bool:
-    """The hard cap the provider checks before each call: true once the month's credit is spent."""
-    return spent(now, path) >= budget_usd()
+    return committed(now, path) >= budget_usd()
 
 
 def window_numbers(now: float, path: Path | None = None) -> tuple[float, float, float]:
-    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view — the credit lane's single 1-month window."""
-    start, nxt = month_bounds(now)
-    used_pct = min(100.0, 100.0 * spent(now, path) / budget_usd()) if budget_usd() else 100.0
+    """(used_pct, reset_at_epoch, window_s) for scarcity.window_view — committed dollars over the billing window."""
+    start, nxt = period_bounds(now)
+    b = budget_usd()
+    used_pct = min(100.0, 100.0 * committed(now, path) / b) if b else 100.0
     return used_pct, nxt, nxt - start

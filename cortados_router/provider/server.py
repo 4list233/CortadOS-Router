@@ -323,24 +323,47 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _serve_api_lane(self, body: dict[str, Any], model: str, wire: Wire) -> None:
-        """Execute a pinned request on the anthropic-api credit lane: proxy to api.anthropic.com, meter the spend,
-        and refuse once the monthly credit is spent. Stateless — no session, no S1 (the pin is explicit)."""
+        """Execute a pinned request on the anthropic-api credit lane under admission control: reserve a conservative
+        max cost BEFORE dispatch, proxy to api.anthropic.com, then settle the actual cost (the full reservation if
+        the actual is unknown). Refuse when the credit is spent, and fail closed if accounting is unavailable.
+        Stateless — no session, no S1 (the pin is explicit)."""
         from cortados_router import api_credits
         from cortados_router.provider import anthropic_proxy
         if not anthropic_proxy.configured():
             return self._error(503, "overloaded_error",
                                "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
         now = time.time()
-        if api_credits.over_budget(now):
-            return self._error(429, "rate_limit_error",
-                               f"cortados: the anthropic-api monthly credit (${api_credits.budget_usd():.0f}) is "
-                               "spent; it resets on the 1st", wire)
-        logger.info("anthropic-api lane: proxying to %s (spent $%.2f of $%.0f this month)",
-                    model, api_credits.spent(now), api_credits.budget_usd())
+        max_cost = api_credits.estimate_max_cost(body, model)
         try:
-            anthropic_proxy.serve(self, body, model, now)
+            res_id = api_credits.reserve(max_cost, now)
+        except api_credits.LedgerError as exc:
+            logger.error("anthropic-api accounting unavailable, refusing to spend blind: %s", exc)
+            return self._error(503, "overloaded_error",
+                               "cortados: the anthropic-api lane's accounting is unavailable; refusing", wire)
+        if res_id is None:
+            return self._error(429, "rate_limit_error",
+                               f"cortados: the anthropic-api credit (${api_credits.budget_usd():.0f}) is spent or "
+                               "fully reserved this period; it resets on the billing day", wire)
+        logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
+                    max_cost, model, api_credits.committed(now), api_credits.budget_usd())
+        usage: dict[str, Any] | None = None
+        try:
+            usage = anthropic_proxy.serve(self, body, model, now)
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", exc)
+        finally:
+            if usage is None:
+                charge = max_cost                 # serve raised; charge the full reservation (conservative)
+            elif not usage:
+                charge = 0.0                       # upstream rejected the request; nothing was billed
+            elif usage.get("output_tokens") is not None:
+                charge = api_credits.cost_from_usage(model, usage)   # a complete turn
+            else:
+                charge = max_cost                 # incomplete (e.g. a mid-stream disconnect); conservative
+            try:
+                api_credits.settle(res_id, charge, now)
+            except api_credits.LedgerError as exc:
+                logger.error("anthropic-api settle failed for %s (reservation retained, pacing stays safe): %s", res_id, exc)
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""

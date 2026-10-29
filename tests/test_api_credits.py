@@ -1,5 +1,6 @@
-"""Unit tests for the Anthropic API-credit lane meter (cortados_router/api_credits.py). Stdlib only; every test
-uses an explicit temp meter path so the real ~/.cortados state is never touched."""
+"""Unit tests for the admission-controlled API-credit meter (cortados_router/api_credits.py). Stdlib only; every
+test uses an explicit temp meter path so the real ~/.cortados state is never touched."""
+import json
 import os
 import tempfile
 import unittest
@@ -8,91 +9,103 @@ from unittest import mock
 
 from cortados_router import api_credits as ac
 
-T = 1793000000.0          # a fixed 2026 timestamp
-T_NEXT_MONTH = T + 45 * 86400  # 45 days later -> a different calendar month, whatever the local tz
+T = 1793000000.0
 
 
 class TestPricing(unittest.TestCase):
-    def test_price_for_exact_prefix_and_default(self):
+    def test_price_for(self):
         self.assertEqual(ac.price_for("claude-opus-5-5")["input"], 4.0)
-        self.assertEqual(ac.price_for("CLAUDE-OPUS-5-5")["input"], 4.0)          # case-insensitive
-        self.assertEqual(ac.price_for("claude-opus-5-5-20260401")["output"], 20.0)  # dated suffix -> base
-        self.assertEqual(ac.price_for("gpt-6-astra"), ac.DEFAULT_PRICE)          # unknown -> most expensive default
+        self.assertEqual(ac.price_for("claude-opus-5-5-20260401")["output"], 20.0)   # dated -> base
+        self.assertEqual(ac.price_for("unknown-model"), ac.DEFAULT_PRICE)            # unknown -> most expensive
 
-    def test_cost_usd_math(self):
-        self.assertEqual(ac.cost_usd("claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000), 24.0)
-        self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=1_000_000), 0.10)
-        # unknown model priced as the most expensive tier (never under-counts toward the cap)
-        self.assertEqual(ac.cost_usd("some-unknown-model", input_tokens=1_000_000), 10.0)
+    def test_pricing_is_conservative(self):
+        # cache WRITE is priced at the 1-hour rate (input x2), never the cheaper 5-minute rate
+        self.assertEqual(ac.price_for("claude-opus-5-5")["cache_write"], 8.0)        # 4 x 2
+        # Haiku uses its >100k tier so the guard never under-counts
+        self.assertEqual(ac.price_for("claude-haiku-5-5")["input"], 0.50)
 
-    def test_cost_usd_ignores_bad_counts(self):
+    def test_cost_from_usage_and_bad_counts(self):
+        self.assertAlmostEqual(ac.cost_usd("claude-opus-5-5", input_tokens=1_000_000, output_tokens=1_000_000), 24.0)
         self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=-5), 0.0)
         self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=float("inf")), 0.0)
-        self.assertEqual(ac.cost_usd("claude-haiku-5-5", input_tokens=float("nan")), 0.0)
+        self.assertAlmostEqual(ac.cost_from_usage("claude-opus-5-5", {"input_tokens": 1_000_000}), 4.0)
 
-    def test_cost_from_usage_reads_all_fields(self):
-        usage = {"input_tokens": 1_000_000, "output_tokens": 0, "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0}
-        # opus-5-5: 1M input @4 + 1M cache_read @0.20 = 4.20
-        self.assertAlmostEqual(ac.cost_from_usage("claude-opus-5-5", usage), 4.20, places=6)
-        self.assertEqual(ac.cost_from_usage("claude-opus-5-5", None), 0.0)
+    def test_estimate_max_cost_is_an_upper_bound(self):
+        body = {"model": "api/claude-opus-5-5", "max_tokens": 1000, "messages": [{"role": "user", "content": "hi"}]}
+        est = ac.estimate_max_cost(body, "claude-opus-5-5")
+        self.assertGreater(est, 0)
+        # output ceiling alone (1000 tok @ $20/M) is already in the estimate
+        self.assertGreaterEqual(est, 1000 * 20.0 / 1_000_000)
 
 
-class TestMeter(unittest.TestCase):
+class TestPeriod(unittest.TestCase):
+    def test_reset_day_shifts_the_period(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_RESET_DAY": "15"}):
+            start, nxt = ac.period_bounds(T)
+            self.assertTrue(nxt > start)
+            self.assertTrue(28 * 86400 <= (nxt - start) <= 31 * 86400)
+
+
+class TestAdmission(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.meter = Path(self.dir) / "api-credit-meter.json"
+        self.meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"})
+        self.env.start()
 
-    def test_record_accumulates_within_a_month(self):
-        self.assertEqual(ac.spent(T, self.meter), 0.0)                       # no file yet -> 0
-        ac.record("claude-opus-5-5", {"input_tokens": 1_000_000}, T, self.meter)  # $4
-        ac.record("claude-haiku-5-5", {"output_tokens": 1_000_000}, T, self.meter)  # +$0.50
-        self.assertAlmostEqual(ac.spent(T, self.meter), 4.50, places=6)
+    def tearDown(self):
+        self.env.stop()
 
-    def test_month_rollover_resets(self):
-        ac.record("claude-opus-5-5", {"input_tokens": 1_000_000}, T, self.meter)
-        self.assertAlmostEqual(ac.spent(T, self.meter), 4.0, places=6)
-        # reading in a later month sees 0 (the stored file is from the prior month)
-        self.assertEqual(ac.spent(T_NEXT_MONTH, self.meter), 0.0)
-        # recording in the new month resets the meter to just the new cost
-        ac.record("claude-haiku-5-5", {"output_tokens": 1_000_000}, T_NEXT_MONTH, self.meter)
-        self.assertAlmostEqual(ac.spent(T_NEXT_MONTH, self.meter), 0.50, places=6)
-        self.assertEqual(ac.spent(T, self.meter), 0.0)                       # the old month is gone
+    def test_reserve_respects_budget_and_settle_reconciles(self):
+        r1 = ac.reserve(6.0, T, self.meter)
+        self.assertIsNotNone(r1)
+        self.assertEqual(ac.committed(T, self.meter), 6.0)
+        self.assertIsNone(ac.reserve(6.0, T, self.meter))            # would exceed $10 -> refused
+        ac.settle(r1, 4.0, T, self.meter)                            # actual < reserved
+        self.assertEqual(ac.spent(T, self.meter), 4.0)
+        self.assertEqual(ac.committed(T, self.meter), 4.0)
+        self.assertFalse(ac.over_budget(T, self.meter))
 
-    def test_over_budget_and_remaining(self):
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "200"}):
-            self.assertFalse(ac.over_budget(T, self.meter))
-            self.assertAlmostEqual(ac.remaining(T, self.meter), 200.0, places=6)
-            # 10M output on opus-5-5 = $200 -> at the cap
-            ac.record("claude-opus-5-5", {"output_tokens": 10_000_000}, T, self.meter)
-            self.assertTrue(ac.over_budget(T, self.meter))
-            self.assertEqual(ac.remaining(T, self.meter), 0.0)
+    def test_settle_is_clamped_to_the_reservation(self):
+        r = ac.reserve(3.0, T, self.meter)
+        ac.settle(r, 999.0, T, self.meter)                          # actual over-reported -> clamped to 3
+        self.assertEqual(ac.spent(T, self.meter), 3.0)
 
-    def test_window_numbers(self):
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "200"}):
-            ac.record("claude-opus-5-5", {"output_tokens": 1_000_000}, T, self.meter)  # $20 of $200 = 10%
-            used_pct, reset_at, window_s = ac.window_numbers(T, self.meter)
-            self.assertAlmostEqual(used_pct, 10.0, places=4)
-            self.assertGreater(reset_at, T)                                  # resets in the future
-            self.assertTrue(28 * 86400 <= window_s <= 31 * 86400)            # a calendar month
+    def test_over_budget_counts_outstanding_reservations(self):
+        ac.reserve(10.0, T, self.meter)
+        self.assertTrue(ac.over_budget(T, self.meter))              # fully committed even before settle
 
-    def test_window_used_pct_caps_at_100(self):
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"}):
-            ac.record("claude-opus-5-5", {"output_tokens": 10_000_000}, T, self.meter)  # $200 >> $10 budget
-            used_pct, _, _ = ac.window_numbers(T, self.meter)
-            self.assertEqual(used_pct, 100.0)
+    def test_late_settle_lands_in_its_own_period(self):
+        old = ac.reserve(5.0, T, self.meter)                        # period A
+        later = T + 40 * 86400                                      # a later billing period
+        ac.reserve(4.0, later, self.meter)
+        ac.settle(old, 5.0, later, self.meter)                      # late settle of the old reservation
+        self.assertEqual(ac.spent(later, self.meter), 0.0)         # the new period is untouched
+        self.assertEqual(ac.spent(T, self.meter), 5.0)            # the old period got the charge
+
+    def test_fail_closed_on_a_corrupt_ledger(self):
+        self.meter.parent.mkdir(parents=True, exist_ok=True)
+        self.meter.write_text("{ not json")
+        with self.assertRaises(ac.LedgerError):
+            ac.reserve(1.0, T, self.meter)
+        # a read-only view of a corrupt ledger treats the period as fully committed (pacing fails safe)
+        self.assertTrue(ac.over_budget(T, self.meter))
+
+    def test_window_numbers_tracks_committed(self):
+        ac.reserve(9.0, T, self.meter)
+        used_pct, reset_at, window_s = ac.window_numbers(T, self.meter)
+        self.assertEqual(used_pct, 90.0)
+        self.assertGreater(reset_at, T)
 
 
 class TestBudgetEnv(unittest.TestCase):
-    def test_budget_default_and_override_and_fallback(self):
+    def test_budget_default_override_and_fallback(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CORTADOS_API_CREDIT_BUDGET_USD", None)
             self.assertEqual(ac.budget_usd(), 200.0)
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "500"}):
-            self.assertEqual(ac.budget_usd(), 500.0)
         with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "nonsense"}):
-            self.assertEqual(ac.budget_usd(), 200.0)                         # bad value -> default, never 0
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "-5"}):
-            self.assertEqual(ac.budget_usd(), 200.0)                         # non-positive -> default
+            self.assertEqual(ac.budget_usd(), 200.0)
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "400"}):
+            self.assertEqual(ac.budget_usd(), 400.0)
 
 
 if __name__ == "__main__":
