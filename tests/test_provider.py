@@ -630,6 +630,32 @@ class RevealModelTests(unittest.TestCase):
         self.assertNotIn("fable", pools)                 # A's spent Fable window must NOT cross into B's reading
         self.assertNotIn("per_model", read)              # nothing carried from a different login -> no rate-limit note
 
+    def test_carry_forward_skips_an_unpinnable_token_login(self):
+        # finding 1 (round 5): an OAuth-token override makes claude_login_identity None; two DIFFERENT token logins both
+        # read None, so a None current login must not be carried onto (None==None is not a confirmed same login).
+        sc = core._scarcity_module()
+        prev = {"config_dir": None, "login": "/tmp/login-A",
+                "windows": [self.win("week", 20), self.win("week-fable", 99, pool="fable")]}
+        with mock.patch.object(sc, "claude_login_identity", lambda env: None), \
+                mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used\nCurrent week (Opus) 10% used"), \
+                mock.patch.object(sc, "parse_claude_usage", lambda _t: [self.win("week", 20), self.win("week-opus", 10, pool="opus")]):
+            read = sc._claude(prev, None)
+        self.assertNotIn("fable", {w.get("pool") for w in read["windows"]})   # unpinnable login -> no carry
+        self.assertNotIn("per_model", read)
+
+    def test_carry_forward_keeps_a_pre_upgrade_named_account(self):
+        # finding 2 (round 5): a named account IS pinned by its config_dir; a pre-upgrade previous reading with NO login
+        # stamp must still be carried (the account identity is unambiguous), matching main.
+        sc = core._scarcity_module()
+        prev = {"config_dir": "/tmp/named-B",            # no "login" field (pre-upgrade data)
+                "windows": [self.win("week", 20), self.win("week-fable", 99, pool="fable")]}
+        with mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used"), \
+                mock.patch.object(sc, "parse_claude_usage", lambda _t: [self.win("week", 20)]):
+            read = sc._claude(prev, "/tmp/named-B")
+        fable = next((w for w in read["windows"] if w.get("pool") == "fable"), None)
+        self.assertIsNotNone(fable)                      # the named account's spent window is carried (unambiguous id)
+        self.assertTrue(fable.get("stale"))
+
     def test_the_default_login_is_an_identity_of_its_own(self):
         # A default-login route (no account) must not show a reading sampled for a named account, nor a named route the
         # default login's reading; only a matching identity is trusted. A route config_dir without an account runs on

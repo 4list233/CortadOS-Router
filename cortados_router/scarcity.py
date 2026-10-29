@@ -390,14 +390,22 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     # `login`: the login this CLI EFFECTIVELY ran on (its env, not just the explicit config_dir arg, which is None both
     # for "the default login" and for an inherited CLAUDE_CONFIG_DIR): what a reader confirms before showing the %.
     out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir, "login": claude_login_identity(env)}
-    if (prev or {}).get("config_dir") == config_dir and (prev or {}).get("login") == out["login"]:
-        # Carry forward EACH separately-metered pool a past read saw but THIS read did not (its per-model panel was
-        # rate-limited) — not only when ALL per-model panels are missing. Kept `stale` until its own reset passes, so
-        # a model whose pool is temporarily absent is still known to HAVE a separate pool (a reader then withholds its
-        # %, rather than let it fall back to the looser general pool). Only for the SAME EFFECTIVE LOGIN: the positional
-        # lane key (and the config_dir arg, None for both the default login and an inherited CLAUDE_CONFIG_DIR) is not
-        # enough — a different CLAUDE_CODE / CLAUDE_CONFIG_DIR means a different account whose spent windows must not
-        # cross over (it would otherwise change routing, not just the cosmetic %). The login match is the real guard.
+    prevr = prev or {}
+    # Carry forward EACH separately-metered pool a past read saw but THIS read did not (its per-model panel was rate-
+    # limited) — not only when ALL per-model panels are missing. Kept `stale` until its own reset passes, so a model
+    # whose pool is temporarily absent is still known to HAVE a separate pool (a reader then withholds its %, rather
+    # than let it fall back to the looser general pool). Carrying feeds ROUTING too, so cross-login contamination
+    # changes routing, not just the cosmetic % — the carry must be for the SAME login:
+    #   * a named account (config_dir set) IS its own login: its config_dir pins it and the ambient OAuth token is
+    #     popped above, so a config_dir match is the identity (an unstamped pre-upgrade reading is still carried);
+    #   * the default login (config_dir None, which also covers an inherited CLAUDE_CONFIG_DIR) must be a PINNED dir
+    #     login this read (a real path, not None) AND the previous login must be unknown (pre-upgrade) or the same path.
+    #     A None current login (an OAuth-token override, which claude_login_identity cannot pin to one stored login)
+    #     is NOT carried onto: two different token logins both read as None and must not cross over.
+    carry_ok = prevr.get("config_dir") == config_dir and (
+        config_dir is not None
+        or (out["login"] is not None and prevr.get("login") in (None, out["login"])))
+    if carry_ok:
         seen_pools = {w.get("pool") for w in wins if w.get("pool", "all") != "all"}
         now_str = time.strftime("%Y-%m-%d %H:%M")
         carried = False
