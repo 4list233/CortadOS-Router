@@ -37,6 +37,25 @@ class TestPricing(unittest.TestCase):
         # output ceiling alone (1000 tok @ $20/M) is already in the estimate
         self.assertGreaterEqual(est, 1000 * 20.0 / 1_000_000)
 
+    def test_server_tool_charges_are_counted(self):
+        # a completed turn that ran 10 web searches is billed $0.01 each on top of tokens
+        usage = {"input_tokens": 1_000_000, "server_tool_use": {"web_search_requests": 10}}
+        self.assertAlmostEqual(ac.cost_from_usage("claude-opus-5-5", usage), 4.0 + 0.10, places=4)
+        self.assertEqual(ac.server_tool_cost({"server_tool_use": {"web_search_requests": 3}}), 0.03)
+        self.assertEqual(ac.server_tool_cost({}), 0.0)
+
+    def test_estimate_reserves_for_declared_web_search(self):
+        # the per-tool allowance is exactly max_uses x $0.01; no cap -> a conservative default count
+        self.assertAlmostEqual(ac._server_tool_allowance([{"type": "web_search_20250305", "name": "web_search", "max_uses": 7}]), 0.07, places=4)
+        self.assertAlmostEqual(ac._server_tool_allowance([{"type": "web_search_20250305"}]),
+                               ac.DEFAULT_SERVER_TOOL_USES * 0.01, places=4)
+        self.assertEqual(ac._server_tool_allowance([{"type": "bash_20250124"}]), 0.0)   # not a billed server tool
+        # and the allowance is actually folded into the reservation (tool body also lifts the token estimate)
+        plain = {"model": "api/claude-opus-5-5", "max_tokens": 10, "messages": []}
+        withtool = dict(plain, tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 7}])
+        self.assertGreaterEqual(ac.estimate_max_cost(withtool, "claude-opus-5-5"),
+                                ac.estimate_max_cost(plain, "claude-opus-5-5") + 0.07)
+
 
 class TestPeriod(unittest.TestCase):
     def test_reset_day_shifts_the_period(self):

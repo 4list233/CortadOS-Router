@@ -51,6 +51,13 @@ PRICES: dict[str, dict[str, float]] = {
 }
 DEFAULT_PRICE = _entry(10.0, 50.0)  # unknown model -> most expensive tier
 
+# Per-request charges the API bills for server-side tools ON TOP OF tokens (USD each), priced conservatively.
+# Anthropic bills web search at $10 / 1,000 requests = $0.01 each; the count comes back in usage.server_tool_use.
+SERVER_TOOL_USD: dict[str, float] = {
+    "web_search_requests": 0.01,
+}
+DEFAULT_SERVER_TOOL_USES = 20  # a declared server tool with no max_uses: reserve this many calls (conservative)
+
 DEFAULT_BUDGET_USD = 200.0
 
 
@@ -110,10 +117,22 @@ def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cach
     return total / 1_000_000.0
 
 
+def server_tool_cost(usage: dict[str, Any] | None) -> float:
+    """Per-request charges the API billed for server-side tools (e.g. web search), read from usage.server_tool_use.
+    These are flat per-call charges on top of tokens, so fast mode's 2x on tokens does not apply to them."""
+    u = usage if isinstance(usage, dict) else {}
+    stu = u.get("server_tool_use")
+    if not isinstance(stu, dict):
+        return 0.0
+    return sum(SERVER_TOOL_USD.get(k, 0.0) * _n(v) for k, v in stu.items())
+
+
 def cost_from_usage(model: str, usage: dict[str, Any] | None) -> float:
     u = usage if isinstance(usage, dict) else {}
     base = cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0))
-    return base * 2 if str(u.get("speed") or "").lower() == "fast" else base  # fast mode is billed at 2x
+    if str(u.get("speed") or "").lower() == "fast":
+        base *= 2  # fast mode is billed at 2x (tokens only)
+    return base + server_tool_cost(u)  # server-tool charges are flat per call, added after the fast multiplier
 
 
 def estimate_max_cost(body: dict[str, Any], model: str) -> float:
@@ -135,7 +154,31 @@ def estimate_max_cost(body: dict[str, Any], model: str) -> float:
     in_rate, out_rate = max(p["input"], p["cache_write"]), p["output"]
     if isinstance(body, dict) and str(body.get("speed") or "").lower() == "fast":
         in_rate, out_rate = in_rate * 2, out_rate * 2
-    return (input_tokens * in_rate + max_out * out_rate) / 1_000_000.0
+    token_cost = (input_tokens * in_rate + max_out * out_rate) / 1_000_000.0
+    return token_cost + _server_tool_allowance(tools)
+
+
+def _server_tool_allowance(tools: Any) -> float:
+    """Conservative dollar reserve for any server-side tool the request declares (e.g. web search): its max_uses
+    at the per-request rate, or a default call count when no cap is given. Reserved up front so a burst of searches
+    cannot overrun the budget between reservation and settlement."""
+    if not isinstance(tools, list):
+        return 0.0
+    allow = 0.0
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        ttype = str(t.get("type") or t.get("name") or "").lower()
+        if "web_search" not in ttype:
+            continue
+        try:
+            uses = int(t.get("max_uses") or 0)
+        except (TypeError, ValueError):
+            uses = 0
+        if uses <= 0:
+            uses = DEFAULT_SERVER_TOOL_USES
+        allow += uses * SERVER_TOOL_USD["web_search_requests"]
+    return allow
 
 
 # ------------------------------------------------------------------ billing period
@@ -261,8 +304,9 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
 
 
 def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path | None = None) -> None:
-    """Replace a reservation with the actual spend (clamped to the reserved max). The reservation's own period is
-    read from its id, so a late settle lands in the right period. Raises LedgerError on accounting failure."""
+    """Replace a reservation with the actual spend (recorded in full — an overrun past the reserved max is NOT
+    clamped, so it stays visible). The reservation's own period is read from its id, so a late settle lands in the
+    right period. Raises LedgerError on accounting failure."""
     p = path or meter_path()
     period = res_id.split(":", 1)[0]
     actual = max(0.0, float(actual_cost))

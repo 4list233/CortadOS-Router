@@ -92,6 +92,20 @@ class TestServe(unittest.TestCase):
         self.assertEqual(usage.get("output_tokens"), 5)
         self.assertEqual(outcome, "completed")
 
+    def test_stream_message_stop_substring_in_text_is_not_completion(self):
+        # a text delta that merely CONTAINS the string "message_stop", then the upstream ends with no terminal
+        # event -> must stay "unknown" (the old substring check wrongly settled this as completed)
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
+            b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"the event is message_stop"}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(usage.get("output_tokens"), 5)
+        self.assertEqual(outcome, "unknown")   # no parsed message_stop event -> conservative
+
     def test_stream_disconnect_is_unknown_with_captured_usage(self):
         chunks = [
             b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',

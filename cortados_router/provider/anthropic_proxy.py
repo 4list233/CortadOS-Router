@@ -68,8 +68,10 @@ def extract_usage(message: Any) -> dict[str, Any]:
     return u if isinstance(u, dict) else {}
 
 
-def _update_usage_from_sse(usage: dict[str, Any], text: str) -> None:
-    """Fold any usage carried by the SSE lines in `text` into `usage` (message_start = input/cache, delta = output)."""
+def _update_usage_from_sse(usage: dict[str, Any], text: str) -> bool:
+    """Fold any usage carried by the SSE lines in `text` into `usage` (message_start = input/cache, delta = output).
+    Returns True iff a PARSED terminal `message_stop` event was seen (a substring in generated text does not count)."""
+    saw_stop = False
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -81,14 +83,18 @@ def _update_usage_from_sse(usage: dict[str, Any], text: str) -> None:
             ev = json.loads(payload)
         except ValueError:
             continue
-        if ev.get("type") == "message_start":
+        t = ev.get("type")
+        if t == "message_start":
             u = (ev.get("message") or {}).get("usage") or {}
             if isinstance(u, dict):
                 usage.update(u)
-        elif ev.get("type") == "message_delta":
+        elif t == "message_delta":
             u = ev.get("usage") or {}
             if isinstance(u, dict):
                 usage.update({k: v for k, v in u.items() if v is not None})
+        elif t == "message_stop":
+            saw_stop = True
+    return saw_stop
 
 
 def usage_from_sse(text: str) -> dict[str, Any]:
@@ -154,8 +160,7 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         disconnected = False
         for chunk in resp:
             text = chunk.decode("utf-8", "replace")
-            _update_usage_from_sse(usage, text)
-            if "message_stop" in text:
+            if _update_usage_from_sse(usage, text):   # True only on a PARSED message_stop event
                 completed = True
             try:
                 handler.wfile.write(chunk)
