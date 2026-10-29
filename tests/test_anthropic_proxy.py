@@ -218,6 +218,52 @@ class TestServe(unittest.TestCase):
         self.assertEqual(outcome, "completed")
         self.assertEqual(usage.get("output_tokens"), 7)
 
+    def test_invalid_outbound_header_is_rejected_without_charge(self):
+        # a client-supplied beta with CRLF makes the stdlib raise ValueError BEFORE anything is sent -> rejected
+        def boom(req, timeout=0):
+            raise ValueError("Invalid header value")
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "betas": ["bad\r\nx-injected: true"]}, "claude-opus-5-5", 0.0,
+                                  key="sk", urlopen=boom)
+        self.assertEqual((usage, outcome), ({}, "rejected"))
+        self.assertEqual(h.status, 400)
+
+    def test_nonstream_null_usage_counts_is_unknown(self):
+        body = json.dumps({"type": "message", "usage": {"input_tokens": None, "output_tokens": None}}).encode()
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=body))
+        self.assertEqual((usage, outcome), ({}, "unknown"))   # non-empty usage but no usable counts -> conservative
+
+    def test_nonstream_zero_usage_counts_is_completed(self):
+        body = json.dumps({"type": "message", "usage": {"input_tokens": 0, "output_tokens": 0}}).encode()
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=body))
+        self.assertEqual(outcome, "completed")   # legitimate zero counts are usable
+
+    def test_stream_malformed_event_after_message_stop_keeps_completed(self):
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            b'data: []\n\n',   # a well-formed JSON non-object must not raise and discard the known completion
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(usage.get("output_tokens"), 5)
+
+    def test_has_usable_usage(self):
+        self.assertTrue(ap.has_usable_usage({"input_tokens": 0}))
+        self.assertTrue(ap.has_usable_usage({"output_tokens": 7}))
+        self.assertFalse(ap.has_usable_usage({"input_tokens": None, "output_tokens": None}))
+        self.assertFalse(ap.has_usable_usage({"speed": "standard"}))
+        self.assertFalse(ap.has_usable_usage({"input_tokens": True}))   # bool is not a token count
+        self.assertFalse(ap.has_usable_usage({}))
+        self.assertFalse(ap.has_usable_usage(None))
+
     def test_http_error_is_relayed_and_rejected(self):
         err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))
         h = FakeHandler()

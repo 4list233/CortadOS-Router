@@ -84,9 +84,12 @@ def _update_usage_from_sse(usage: dict[str, Any], text: str) -> bool:
             ev = json.loads(payload)
         except ValueError:
             continue
+        if not isinstance(ev, dict):
+            continue   # a well-formed JSON non-object (e.g. `data: []`) carries no usage and must not raise here
         t = ev.get("type")
         if t == "message_start":
-            u = (ev.get("message") or {}).get("usage") or {}
+            msg = ev.get("message")
+            u = msg.get("usage") if isinstance(msg, dict) else None
             if isinstance(u, dict):
                 usage.update(u)
         elif t == "message_delta":
@@ -104,6 +107,26 @@ def usage_from_sse(text: str) -> dict[str, Any]:
     return usage
 
 
+_USAGE_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def has_usable_usage(usage: Any) -> bool:
+    """True iff `usage` carries at least one token count as a real (finite, non-bool) number. A usage block whose
+    counts are all null/missing/non-numeric is NOT usable: its cost cannot be settled, so the turn must stay
+    'unknown' rather than settle as a completed $0. Legitimate zero counts are accepted."""
+    if not isinstance(usage, dict):
+        return False
+    for f in _USAGE_TOKEN_FIELDS:
+        v = usage.get(f)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            try:
+                if v == v and v not in (float("inf"), float("-inf")):   # finite, not NaN
+                    return True
+            except TypeError:
+                continue
+    return False
+
+
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
           urlopen: Callable[..., Any] | None = None) -> tuple[dict[str, Any], str]:
     """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
@@ -119,6 +142,19 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
     streaming = bool(body.get("stream"))
     try:
         resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
+    except ValueError as exc:
+        # The stdlib rejects a malformed outbound request (e.g. an invalid header value from a client-supplied beta)
+        # BEFORE sending anything, so nothing is billed. Relay a 400 and settle zero.
+        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": f"cortados: request rejected before dispatch: {exc}"}}).encode()
+        try:
+            handler.send_response(400)
+            handler.send_header("content-type", "application/json")
+            handler.send_header("content-length", str(len(msg)))
+            handler.end_headers()
+            handler.wfile.write(msg)
+        except OSError:
+            pass
+        return {}, "rejected"
     except urllib.error.HTTPError as exc:
         # The API REJECTED the turn: nothing is billed, regardless of whether we can read or relay the error body.
         try:
@@ -158,10 +194,10 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                 parsed = None
             # "completed" ONLY for a terminal message carrying usable usage. A truncated or malformed body (its cost
             # is real but unreadable) stays "unknown", so it keeps the conservative reservation instead of settling 0.
-            if isinstance(parsed, dict) and parsed.get("type") == "message" and isinstance(parsed.get("usage"), dict) and parsed["usage"]:
+            if isinstance(parsed, dict) and parsed.get("type") == "message" and has_usable_usage(parsed.get("usage")):
                 usage, outcome = parsed["usage"], "completed"
             else:
-                usage, outcome = {}, "unknown"
+                usage, outcome = {}, "unknown"   # malformed body, or usage with no usable numeric counts -> conservative
             try:
                 handler.send_response(200)
                 handler.send_header("content-type", "application/json")

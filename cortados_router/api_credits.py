@@ -62,11 +62,12 @@ DEFAULT_SERVER_TOOL_USES = 20  # a declared web-search tool with no max_uses: re
 # BOUND the cost up front and reconcile it from usage afterwards. Keyed by the tool-type prefix, since Anthropic
 # suffixes a date (e.g. "web_search_20250305"). An ordinary client-executed tool is not listed here and is fine.
 #   metered   -> per-request charge, bounded by an enforced max_uses and settled from usage.server_tool_use
-#   free      -> no per-request charge (tokens only)
-#   unbounded -> billed by server-side time/resource the meter cannot bound or reconcile yet -> refuse admission
+#   unbounded -> cost the meter cannot bound in advance -> refuse admission. web_fetch is here because the fetched
+#                page content lands in the turn's INPUT tokens, which the serialized request cannot bound (its
+#                $0 per-request charge is not the issue); code_execution is billed per server-side container-hour.
 _SERVER_TOOL_KIND: dict[str, str] = {
     "web_search": "metered",
-    "web_fetch": "free",
+    "web_fetch": "unbounded",
     "code_execution": "unbounded",
 }
 
@@ -337,7 +338,9 @@ def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
     # Prune resolved ledgers beyond the two most recent, so the file does not grow without bound. NEVER drop a
     # period that still holds outstanding reservations: a later settle reads its period from the reservation id, and
     # a pruned period would be recreated empty, losing the charge. Keep such periods until their reservations settle.
-    keep = set(sorted(periods)[-2:]) | {p for p, l in periods.items() if l.get("reserved")}
+    # Also always keep the period being fetched: reserve() adds its reservation AFTER this returns, so pruning it
+    # here would detach `led` from the ledger and the reservation (and its later settle) would be lost.
+    keep = set(sorted(periods)[-2:]) | {p for p, l in periods.items() if l.get("reserved")} | {period}
     for stale in [p for p in list(periods) if p not in keep]:
         periods.pop(stale, None)
     return led

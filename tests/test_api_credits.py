@@ -64,10 +64,12 @@ class TestPricing(unittest.TestCase):
 
 
 class TestServerToolAdmission(unittest.TestCase):
-    def test_unbounded_server_tools_flags_only_code_execution(self):
+    def test_unbounded_server_tools_flags_code_execution_and_web_fetch(self):
         self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
                          ["code_execution_20250522"])
-        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_search_20250305"}, {"type": "web_fetch_20250910"}]}), [])
+        # web_fetch pulls unbounded page content into input tokens -> refused on the credit lane
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_fetch_20250910"}]}), ["web_fetch_20250910"])
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_search_20250305"}]}), [])   # metered + capped -> allowed
         self.assertEqual(ac.unbounded_server_tools({"tools": [{"name": "my_tool", "input_schema": {}}]}), [])  # a client tool
         self.assertEqual(ac.unbounded_server_tools({}), [])
 
@@ -146,6 +148,18 @@ class TestAdmission(unittest.TestCase):
         ac.reserve(1.0, T + 75 * 86400, self.meter)                # period C (A is now older than the 2 most recent)
         ac.settle(old, 4.0, T, self.meter)                         # A was not pruned (it had a reservation) -> charge lands
         self.assertEqual(ac.spent(T, self.meter), 4.0)
+
+    def test_reserve_into_an_older_resolved_period_persists(self):
+        # a delayed caller (or clock rollback) reserves into an OLD period that newer periods have aged past and
+        # that was already settled; the new reservation must not be lost to a detached, pruned ledger.
+        aug = ac.reserve(6.0, T, self.meter)
+        ac.reserve(1.0, T + 40 * 86400, self.meter)
+        ac.reserve(1.0, T + 75 * 86400, self.meter)
+        ac.settle(aug, 4.0, T, self.meter)                      # August resolved (no outstanding reservation)
+        late = ac.reserve(2.0, T, self.meter)                   # reserve AGAIN into the old, now-resolved period
+        self.assertIsNotNone(late)
+        ac.settle(late, 2.0, T, self.meter)
+        self.assertEqual(ac.spent(T, self.meter), 6.0)          # 4 + 2 both recorded; nothing vanished
 
     def test_late_settle_lands_in_its_own_period(self):
         old = ac.reserve(5.0, T, self.meter)                        # period A
