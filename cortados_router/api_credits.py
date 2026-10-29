@@ -184,11 +184,22 @@ def configured_orgs() -> list[tuple[str, str]]:
     return out
 
 
-def _primary_org_id() -> str:
-    """The org id a legacy (single-org) ledger and legacy reservation ids belong to: the primary key's, or a fixed
-    sentinel if no key is configured (so a read with no config attributes nothing rather than guessing)."""
+def _legacy_owner() -> str:
+    """The org a legacy single-org ledger migrates into: the one configured key's id. A legacy ledger was written by
+    a single-key deployment, so it belongs to that key — but the old format did not record WHICH key, so ownership
+    is only unambiguous while exactly one key is configured. Fail closed otherwise, rather than guess:
+      * no key -> legacy spend can be neither attributed nor safely discarded;
+      * more than one key -> ownership is ambiguous, and guessing (e.g. 'the current primary') would free the real
+        owner's spent window if the keys were ordered differently than when the ledger was written.
+    The natural upgrade path never hits the ambiguous case: ship with the single existing key (the first request
+    migrates the meter to the nested shape), then add the second key — by then the file is no longer legacy."""
     orgs = configured_orgs()
-    return orgs[0][0] if orgs else "legacy"
+    if not orgs:
+        raise LedgerError("cannot read a legacy api-credit ledger with no key configured")
+    if len(orgs) > 1:
+        raise LedgerError("refusing to migrate a legacy api-credit ledger while multiple keys are configured "
+                          "(ambiguous ownership); run once with only the original key to upgrade the meter first")
+    return orgs[0][0]
 
 
 def total_budget_usd() -> float:
@@ -196,20 +207,24 @@ def total_budget_usd() -> float:
     return budget_usd() * len(configured_orgs())
 
 
-def _org_of(res_id: str) -> tuple[str, str]:
-    """(org-id, period) a reservation id belongs to. New ids are 'orgid|period:hex'; a legacy id with no '|' belongs
-    to the primary org (the only org that existed when such an id was minted)."""
+def _org_of(res_id: str) -> tuple[str | None, str]:
+    """(org-id, period) for a reservation id. New ids are 'orgid|period:hex'. A legacy id (no '|') carries no org —
+    its owner is not knowable from the id, so this returns (None, period) and settle finds it by searching."""
     prefix = (res_id or "").split(":", 1)[0]
     if "|" in prefix:
         oid, period = prefix.split("|", 1)
         return oid, period
-    return _primary_org_id(), prefix
+    return None, prefix
 
 
 def key_for_reservation(res_id: str) -> str | None:
-    """The API key for a reservation's org, or None if that org's key is no longer configured. Bound to the key's
-    fingerprint, so it returns the SAME key the reservation was debited to regardless of slot order or swaps."""
+    """The API key for a NEW-format reservation's org (the only ids reserve() mints and the only ids that reach
+    dispatch), or None if that org's key is no longer configured. Bound to the key's fingerprint, so it returns the
+    SAME key the reservation was debited to regardless of slot order or swaps. A legacy id resolves to None (it is
+    never produced by reserve() and never dispatched; settle, not dispatch, reconciles any such straggler)."""
     oid, _ = _org_of(res_id)
+    if oid is None:
+        return None
     for o, key in configured_orgs():
         if o == oid:
             return key
@@ -363,22 +378,21 @@ def _validate(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
     if "orgs" not in data and isinstance(data.get("periods"), dict):
-        pt = data.get("pruned_through")
-        if pt is not None and not isinstance(pt, str):
-            # A present-but-malformed prune cursor must fail closed, never be dropped: dropping it would let a
-            # already-pruned period reopen blank and re-admit its spent budget. (Absent is fine: fresh ledger.)
+        # A prune cursor that is PRESENT but not a string (int, null, …) must fail closed, never be dropped:
+        # dropping it would let an already-pruned period reopen blank and re-admit its spent budget. Absent is fine
+        # (fresh ledger). Checked by key presence, so an explicit JSON null is rejected like any other bad value.
+        if "pruned_through" in data and not isinstance(data["pruned_through"], str):
             raise LedgerError("api-credit ledger has an invalid prune cursor")
         legacy: dict[str, Any] = {"periods": data["periods"]}
-        if isinstance(pt, str):
-            legacy["pruned_through"] = pt
-        data = {"orgs": {_primary_org_id(): legacy}}
+        if isinstance(data.get("pruned_through"), str):
+            legacy["pruned_through"] = data["pruned_through"]
+        data = {"orgs": {_legacy_owner(): legacy}}   # the primary key; raises if none is configured
     if not isinstance(data.get("orgs"), dict):
         raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
     for label, od in data["orgs"].items():
         if not isinstance(od, dict) or not isinstance(od.get("periods"), dict):
             raise LedgerError(f"api-credit ledger org {label!r} is invalid")
-        pt = od.get("pruned_through")
-        if pt is not None and not isinstance(pt, str):
+        if "pruned_through" in od and not isinstance(od["pruned_through"], str):
             raise LedgerError(f"api-credit ledger org {label!r} has an invalid prune cursor")
         for period, led in od["periods"].items():
             if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
@@ -494,18 +508,31 @@ def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path
     right period. Idempotent: the charge is recorded only while the reservation is still outstanding, so a retried
     or duplicated settle cannot double-charge. Raises LedgerError on accounting failure."""
     p = path or meter_path()
-    label, period = _org_of(res_id)
+    oid, period = _org_of(res_id)
     actual = max(0.0, float(actual_cost))
 
+    def _apply(led: dict[str, Any]) -> None:
+        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
+        led["spent_usd"] = round(float(led.get("spent_usd") or 0.0) + actual, 6)   # the ACTUAL — overruns not hidden
+
     def fn(data: dict[str, Any]) -> None:
-        od = _org_ledger(data, label)
+        if oid is None:
+            # A legacy reservation id carries no org. Find whichever org actually holds it (it was migrated under
+            # the primary configured when the ledger upgraded), so a late settle lands on its true owner regardless
+            # of which key is primary now. Ids are unique, so at most one org matches.
+            for _label, od in data.get("orgs", {}).items():
+                led = (od.get("periods") or {}).get(period)
+                if isinstance(led, dict) and res_id in (led.get("reserved") or {}):
+                    _apply(led)
+                    return
+            return   # not found in any org -> already settled / pruned -> idempotent no-op
+        od = _org_ledger(data, oid)
         if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):
             return   # the period was pruned; any reservation in it is long gone -> nothing to settle, do not reopen it
         led = _ledger_for(od, period)
         if res_id not in led["reserved"]:
             return   # already settled (or never reserved here) -> idempotent no-op, never a second charge
-        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
-        led["spent_usd"] = round(float(led["spent_usd"]) + actual, 6)     # record the ACTUAL — overruns are not hidden
+        _apply(led)
 
     _locked(p, fn)
 

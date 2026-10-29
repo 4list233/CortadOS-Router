@@ -286,26 +286,76 @@ class TestLegacyMigration(unittest.TestCase):
             self.assertEqual(ac.key_for_reservation(r), "sk-org-1")
             ac.settle(r, 2.0, T, meter)
             self.assertEqual(ac.spent(T, meter), 5.0)               # 3 legacy + 2 new
-            # a legacy reservation id (no org prefix) still settles against the primary org
-            self.assertEqual(ac._org_of("%s:abc123" % period), (ac._org_id("sk-org-1"), period))
+            # a legacy reservation id (no org prefix) carries no org; settle finds its owner by searching
+            self.assertEqual(ac._org_of("%s:abc123" % period), (None, period))
             data = json.loads(meter.read_text())
             self.assertIn("orgs", data)                             # persisted in the nested shape
             self.assertIn(ac._org_id("sk-org-1"), data["orgs"])     # keyed by the primary key's fingerprint
 
     def test_malformed_prune_cursor_fails_closed(self):
-        # Codex P2 regression: a present-but-invalid prune cursor must RAISE, never be dropped (which would let an
-        # already-pruned period reopen blank and re-admit its spent budget).
+        # Round-1/2 regression: a prune cursor that is PRESENT but not a string (int OR explicit null) must RAISE,
+        # never be dropped (which would let an already-pruned period reopen blank and re-admit its spent budget).
+        for bad in (202610, None):                                 # int, and JSON null
+            meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+            period = ac.period_key(T)
+            meter.parent.mkdir(parents=True, exist_ok=True)
+            meter.write_text(json.dumps({"periods": {period: {"spent_usd": 1.0, "reserved": {}}},
+                                         "pruned_through": bad}))
+            with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                              "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False):
+                os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+                with self.assertRaises(ac.LedgerError):
+                    ac.reserve(1.0, T, meter)
+                self.assertTrue(ac.over_budget(T, meter))           # read-only view also fails safe (fully committed)
+
+    def test_legacy_ledger_with_no_key_fails_closed(self):
+        # Codex round-2: with NO key configured, a legacy ledger cannot be attributed to an org -> fail closed
+        # rather than parking spend under a sentinel that a later-restored key would not see (a freed window).
         meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
         period = ac.period_key(T)
         meter.parent.mkdir(parents=True, exist_ok=True)
-        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 1.0, "reserved": {}}},
-                                     "pruned_through": 202610}))    # int, not a string
-        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
-                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False):
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 5.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY", None)
             os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
             with self.assertRaises(ac.LedgerError):
                 ac.reserve(1.0, T, meter)
-            self.assertTrue(ac.over_budget(T, meter))               # read-only view also fails safe (fully committed)
+
+    def test_legacy_file_with_multiple_keys_fails_closed(self):
+        # Codex round-2 P1: a legacy (unattributable) ledger must NOT be migrated once >1 key is configured —
+        # guessing the owner could free the real owner's spent window. Fail closed until it is upgraded single-key.
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 10.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-B",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "sk-A"}, clear=False):
+            with self.assertRaises(ac.LedgerError):
+                ac.reserve(10.0, T, meter)
+            self.assertTrue(ac.over_budget(T, meter))              # read-only view fails safe too
+
+    def test_legacy_reservation_settles_on_its_true_owner_after_swap(self):
+        # Codex round-2 P2: a legacy reservation id (no org) must settle on whichever org actually holds it, found
+        # by search, even after the primary key changes — not follow the current primary into the wrong org.
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        legacy_rid = "%s:old-turn" % period
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 0.0, "reserved": {legacy_rid: 6.0}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-A"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            ac.reserve(1.0, T, meter)                              # persists the migration under A's fingerprint
+        # now the keys change: A is demoted to slot 2, B becomes primary
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-B",
+                                          "CORTADOS_ANTHROPIC_API_KEY_2": "sk-A"}, clear=False):
+            ac.settle(legacy_rid, 4.0, T, meter)                  # must find the reservation under A and settle it
+            data = json.loads(meter.read_text())
+            a_led = data["orgs"][ac._org_id("sk-A")]["periods"][period]
+            self.assertNotIn(legacy_rid, a_led["reserved"])        # the stuck reservation was released
+            self.assertAlmostEqual(a_led["spent_usd"], 4.0, places=4)   # A's actual $4 recorded on A, not lost
 
 
 class TestBudgetEnv(unittest.TestCase):
