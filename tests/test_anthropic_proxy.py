@@ -308,6 +308,30 @@ class TestServe(unittest.TestCase):
                                   urlopen=lambda req, timeout=0: FakeResp(body=body))
         self.assertEqual((usage, outcome), ({}, "unknown"))   # input cost unknown -> not a completed $0
 
+    def test_stream_null_final_output_delta_overrides_initial_is_unknown(self):
+        # message_start carries an initial output_tokens:1; the final message_delta nulls it -> the real final count
+        # is unknown, so settle "unknown", NOT a completed charge on the stale initial 1.
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000,"output_tokens":1}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":null}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "unknown")
+
+    def test_stream_missing_final_output_delta_is_unknown(self):
+        # message_stop but NO message_delta carrying the final output -> only the start estimate exists -> unknown
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000,"output_tokens":1}}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "unknown")
+
     def test_stream_partial_usage_is_unknown(self):
         chunks = [
             b'data: {"type":"message_start","message":{"usage":{"input_tokens":null,"output_tokens":0}}}\n\n',

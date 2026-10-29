@@ -70,10 +70,16 @@ def extract_usage(message: Any) -> dict[str, Any]:
     return u if isinstance(u, dict) else {}
 
 
-def _update_usage_from_sse(usage: dict[str, Any], text: str) -> bool:
-    """Fold any usage carried by the SSE lines in `text` into `usage` (message_start = input/cache, delta = output).
-    Returns True iff a PARSED terminal `message_stop` event was seen (a substring in generated text does not count)."""
+def _update_usage_from_sse(usage: dict[str, Any], text: str) -> tuple[bool, bool]:
+    """Fold any usage carried by the SSE lines in `text` into `usage` (message_start = input/cache + an INITIAL
+    output estimate, message_delta = the FINAL output count). Returns (saw_message_stop, saw_valid_final_output):
+      * saw_message_stop        -- a PARSED terminal message_stop event (a substring in generated text does not count)
+      * saw_valid_final_output  -- a message_delta carried a valid (finite, non-negative) output_tokens, i.e. the
+                                   real final count arrived. Without it, output_tokens is only the start estimate.
+    A message_delta is applied AS-IS (not None-filtered), so a null/invalid final OVERWRITES the initial estimate
+    and has_usable_usage() can then reject it, rather than the stale estimate being settled."""
     saw_stop = False
+    saw_final_output = False
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -94,12 +100,14 @@ def _update_usage_from_sse(usage: dict[str, Any], text: str) -> bool:
             if isinstance(u, dict):
                 usage.update(u)
         elif t == "message_delta":
-            u = ev.get("usage") or {}
+            u = ev.get("usage")
             if isinstance(u, dict):
-                usage.update({k: v for k, v in u.items() if v is not None})
+                usage.update(u)   # the final counts, applied as-is so a null final overwrites the initial estimate
+                if _valid_count(u.get("output_tokens")):
+                    saw_final_output = True
         elif t == "message_stop":
             saw_stop = True
-    return saw_stop
+    return saw_stop, saw_final_output
 
 
 def usage_from_sse(text: str) -> dict[str, Any]:
@@ -269,11 +277,13 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         handler.close_connection = True
         usage = {}
         completed = False
+        final_output = False
         try:
             for chunk in resp:
                 text = chunk.decode("utf-8", "replace")
-                if _update_usage_from_sse(usage, text):   # True only on a PARSED message_stop event
-                    completed = True
+                saw_stop, saw_final = _update_usage_from_sse(usage, text)
+                completed = completed or saw_stop        # a PARSED message_stop event
+                final_output = final_output or saw_final  # a message_delta supplied the real final output count
                 try:
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
@@ -281,10 +291,11 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                     break  # client gone: stop relaying; the billing outcome is decided by what we already parsed
         except (OSError, http.client.HTTPException):
             pass   # an upstream read failed mid-stream; keep whatever usage/terminal state we already captured
-        # "completed" only when the terminal event was parsed AND the captured usage is usable (a null/absent-usage
-        # stream cannot be settled, so it keeps the conservative "unknown" charge). A parsed terminal event means the
-        # full turn was received and billed regardless of a later client/upstream failure.
-        return usage, ("completed" if completed and has_usable_usage(usage) else "unknown")
+        # "completed" only when the terminal event was parsed, the real final output count arrived (not just the
+        # message_start estimate), AND the merged usage is usable. Otherwise the cost is not reliably known, so the
+        # turn stays "unknown" and keeps the conservative reservation. A parsed terminal event means the full turn
+        # was received and billed regardless of a later client/upstream failure.
+        return usage, ("completed" if completed and final_output and has_usable_usage(usage) else "unknown")
     finally:
         try:
             resp.close()
