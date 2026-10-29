@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import urllib.error
 import urllib.parse
@@ -107,24 +108,25 @@ def usage_from_sse(text: str) -> dict[str, Any]:
     return usage
 
 
-_USAGE_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+_REQUIRED_USAGE_FIELDS = ("input_tokens", "output_tokens")
+_OPTIONAL_USAGE_FIELDS = ("cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _valid_count(v: Any) -> bool:
+    """A usable token count: a finite, non-negative, non-bool number (a legitimate zero is fine)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
 
 
 def has_usable_usage(usage: Any) -> bool:
-    """True iff `usage` carries at least one token count as a real (finite, non-bool) number. A usage block whose
-    counts are all null/missing/non-numeric is NOT usable: its cost cannot be settled, so the turn must stay
-    'unknown' rather than settle as a completed $0. Legitimate zero counts are accepted."""
+    """True iff `usage` can be settled accurately: BOTH input_tokens and output_tokens are present as finite
+    non-negative numbers, and any present cache field is likewise valid. A real completed response always carries
+    both counts, so this never downgrades a genuine completion; a null / negative / missing count (its true cost is
+    unknown, not zero) keeps the turn 'unknown' and the conservative charge instead of settling a completed $0."""
     if not isinstance(usage, dict):
         return False
-    for f in _USAGE_TOKEN_FIELDS:
-        v = usage.get(f)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            try:
-                if v == v and v not in (float("inf"), float("-inf")):   # finite, not NaN
-                    return True
-            except TypeError:
-                continue
-    return False
+    if not all(_valid_count(usage.get(f)) for f in _REQUIRED_USAGE_FIELDS):
+        return False
+    return all(_valid_count(usage[f]) for f in _OPTIONAL_USAGE_FIELDS if f in usage)
 
 
 def invalid_header(headers: dict[str, str]) -> str | None:
@@ -153,7 +155,23 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
     Usage is parsed before each client write, so a disconnect cannot lose it."""
     key = (key if key is not None else api_key()).strip()
     open_fn = urlopen or _OPENER.open
-    url, data, headers = build_upstream(body, model, key)   # raises on a non-Anthropic origin
+    try:
+        url, data, headers = build_upstream(body, model, key)
+    except ValueError as exc:
+        # A pre-dispatch construction/validation error (e.g. a misconfigured non-HTTPS/non-Anthropic upstream): the
+        # request is NOT built and nothing is sent, so nothing is billed -> a certain rejection (settle zero). This
+        # catch is scoped to build_upstream ONLY, so it never masks a post-dispatch opener/response error as rejected.
+        msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                          "message": f"cortados: request not dispatched ({exc})"}}).encode()
+        try:
+            handler.send_response(400)
+            handler.send_header("content-type", "application/json")
+            handler.send_header("content-length", str(len(msg)))
+            handler.end_headers()
+            handler.wfile.write(msg)
+        except OSError:
+            pass
+        return {}, "rejected"
     bad_header = invalid_header(headers)
     if bad_header is not None:
         # A malformed outbound header (a client-supplied beta, or a mis-configured credit key) means nothing is sent,

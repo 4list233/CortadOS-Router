@@ -290,13 +290,43 @@ class TestServe(unittest.TestCase):
         self.assertEqual(usage.get("output_tokens"), 5)
 
     def test_has_usable_usage(self):
-        self.assertTrue(ap.has_usable_usage({"input_tokens": 0}))
-        self.assertTrue(ap.has_usable_usage({"output_tokens": 7}))
-        self.assertFalse(ap.has_usable_usage({"input_tokens": None, "output_tokens": None}))
+        self.assertTrue(ap.has_usable_usage({"input_tokens": 0, "output_tokens": 0}))               # legit zeros
+        self.assertTrue(ap.has_usable_usage({"input_tokens": 10, "output_tokens": 7, "cache_read_input_tokens": 3}))
+        self.assertFalse(ap.has_usable_usage({"input_tokens": 10}))                                 # output missing
+        self.assertFalse(ap.has_usable_usage({"input_tokens": None, "output_tokens": 0}))           # input null, cost unknown
+        self.assertFalse(ap.has_usable_usage({"input_tokens": -1, "output_tokens": -1}))            # negative
+        self.assertFalse(ap.has_usable_usage({"input_tokens": 10, "output_tokens": 7, "cache_read_input_tokens": None}))  # bad optional
+        self.assertFalse(ap.has_usable_usage({"input_tokens": True, "output_tokens": 1}))           # bool is not a count
         self.assertFalse(ap.has_usable_usage({"speed": "standard"}))
-        self.assertFalse(ap.has_usable_usage({"input_tokens": True}))   # bool is not a token count
         self.assertFalse(ap.has_usable_usage({}))
         self.assertFalse(ap.has_usable_usage(None))
+
+    def test_nonstream_partial_usage_is_unknown(self):
+        body = json.dumps({"type": "message", "usage": {"input_tokens": None, "output_tokens": 0}}).encode()
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=body))
+        self.assertEqual((usage, outcome), ({}, "unknown"))   # input cost unknown -> not a completed $0
+
+    def test_stream_partial_usage_is_unknown(self):
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":null,"output_tokens":0}}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "unknown")
+
+    def test_prebuild_origin_error_is_a_zero_charge_rejection(self):
+        # a misconfigured upstream makes build_upstream raise BEFORE dispatch -> rejected (settle 0), never "unknown"
+        h = FakeHandler()
+        with mock.patch("cortados_router.provider.anthropic_proxy.build_upstream",
+                        side_effect=ValueError("anthropic-api lane refuses a non-Anthropic/insecure upstream")):
+            usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                      urlopen=lambda req, timeout=0: FakeResp(body=b"{}"))
+        self.assertEqual((usage, outcome), ({}, "rejected"))
+        self.assertEqual(h.status, 400)
 
     def test_http_error_is_relayed_and_rejected(self):
         err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))
