@@ -468,11 +468,32 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
         # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
         tpp = uc.get("tokens_per_pct")
-        # the model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g. Fable),
-        # so use the min headroom across both, not general alone.
-        relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
-        headroom = min((w.get("headroom_pct") for w in relevant if w.get("headroom_pct") is not None), default=None)
+        headroom = _min_headroom_pct(lane, pool)
         return float(tpp) * float(headroom) if tpp and headroom is not None else None
+    except Exception:
+        return None
+
+
+def _min_headroom_pct(lane: dict[str, Any], pool: str) -> float | None:
+    """The model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g.
+    Fable), so the MIN headroom across both, not general alone (and not the pacing-tightest window)."""
+    relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
+    return min((float(w["headroom_pct"]) for w in relevant if w.get("headroom_pct") is not None), default=None)
+
+
+def headroom_pct_for(c: dict[str, Any], *, refresh: bool = False) -> float | None:
+    """% left in the pool this route draws on, from the cached reading (refresh=False: never opens a vendor CLI).
+    None when unknown: no reading, a failed one, or one sampled for a DIFFERENT login — the same identity rule as
+    candidate_health/_tokens_left_for, where the default login's config_dir None is an identity of its own."""
+    try:
+        sc = _scarcity_module()
+        lane = (sc.current(refresh=refresh).get("lanes") or {}).get(c["lane"]) or {}
+        if not lane or lane.get("error"):
+            return None
+        if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+            return None
+        pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
+        return _min_headroom_pct(lane, pool)
     except Exception:
         return None
 

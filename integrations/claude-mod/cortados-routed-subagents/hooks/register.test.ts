@@ -178,7 +178,7 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
     ANTHROPIC_API_KEY: 'tok',
     ANTHROPIC_AUTH_TOKEN: 'tok',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
-    ANTHROPIC_CUSTOM_HEADERS: '',
+    ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1',
     ANTHROPIC_UNIX_SOCKET: '',
     CLAUDE_CODE_USE_BEDROCK: '',
     CLAUDE_CODE_USE_VERTEX: '',

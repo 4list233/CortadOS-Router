@@ -116,6 +116,76 @@ def _base_provider(p: str) -> str:
     return (p or "").split("#", 1)[0]
 
 
+# Request header a routed subagent sends (the cortados-routed-subagents mod) to be told the real routed model and its
+# lane's remaining window in the response's `model` field. Absent, every response names `cortados` as before.
+REVEAL_HEADER = "x-cortados-reveal"
+# Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
+# lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
+_PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
+# Lanes whose cached reading carries no login identity, so it cannot be confirmed to be the executing login's: the
+# Codex /status sample runs on the sampler's CODEX_HOME, the backend on --codex-home / CODEX_HOME / ~/.codex. Their
+# reveal names the model only, never another login's %.
+_UNIDENTIFIED_LANES = {"codex"}
+
+
+def _route_lane(route: dict) -> str | None:
+    """The scarcity lane a route draws on: the resolved candidate's own lane (per-account: claude#b), else the
+    provider's vendor lane with its account suffix kept (claude-cli#b -> claude#b)."""
+    chosen = (route.get("route") or {}).get("chosen") or {}
+    if chosen.get("lane"):
+        return chosen["lane"]
+    base, _, acct = (route.get("provider") or "").partition("#")
+    lane = _PROVIDER_LANES.get(base)
+    return f"{lane}#{acct}" if lane and acct else lane
+
+
+def _route_pct_left(route: dict) -> float | None:
+    """% left in the pool the route's model draws on, via core.headroom_pct_for (the min headroom across the lane's
+    general windows and the model's own pool, identity-checked against the login the route EXECUTES on: its
+    config_dir, None for the default login). None when unknown or unconfirmable."""
+    from cortados_router import core
+    lane = _route_lane(route)
+    if not lane or lane.split("#", 1)[0] in _UNIDENTIFIED_LANES:
+        return None
+    chosen = (route.get("route") or {}).get("chosen") or {}
+    return core.headroom_pct_for({"lane": lane, "model": str(route["model"]), "config_dir": route.get("config_dir"),
+                                  "pool": chosen.get("pool"), "family": chosen.get("family")})
+
+
+def _pct_label(model: str, pct_left: float | None) -> str:
+    return model if pct_left is None else f"{model} · {round(pct_left)}% left"
+
+
+def reveal_model(route: dict | None) -> str | None:
+    """`<model> · <pct>% left` for a revealing client, `<model>` when the % is unknown, None (answer `cortados`) when
+    there is no route or it is degraded. Never raises: a reveal is cosmetic and must not fail a turn."""
+    try:
+        if not route or route.get("degraded") or route.get("error") or not route.get("model"):
+            return None
+        model = str(route["model"])
+        try:
+            left = _route_pct_left(route)
+        except Exception:
+            logger.debug("reveal: lane %% unavailable for %s", model, exc_info=True)
+            left = None
+        return _pct_label(model, left)
+    except Exception:
+        logger.debug("reveal failed", exc_info=True)
+        return None
+
+
+def api_reveal_suffix() -> str | None:
+    """` · <pct>% left` of the anthropic-api credit window, for an api/-pinned request that asked to reveal. The
+    upstream response already names the real model; this only adds the %. None when the meter cannot be read."""
+    try:
+        from cortados_router import api_credits
+        used = float(api_credits.window_numbers(time.time())[0])
+        return f" · {round(100 - max(0.0, min(100.0, used)))}% left"
+    except Exception:
+        logger.debug("reveal: anthropic-api meter unavailable", exc_info=True)
+        return None
+
+
 def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> BridgeSession:
     return BridgeSession(gateway_url=reg.gateway_url, token=reg.token, claude_bin=reg.claude_bin,
                          config_dir=config_dir, **kw)
@@ -338,6 +408,9 @@ class Handler(BaseHTTPRequestHandler):
                                f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
                                f"{', '.join(sorted(set(bad)))} (billed by server-side time); not permitted on this lane", wire)
         body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
+        # A revealing client (the routed-subagents mod) also sees the credit window's % left after the real model the
+        # upstream response names; read BEFORE this turn reserves. Without the header nothing about the relay changes.
+        reveal = (api_reveal_suffix() if self._wants_reveal() else None)
         now = time.time()
         max_cost = api_credits.estimate_max_cost(body, model)
         try:
@@ -362,7 +435,8 @@ class Handler(BaseHTTPRequestHandler):
         usage: dict[str, Any] = {}
         outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
         try:
-            usage, outcome = anthropic_proxy.serve(self, body, model, now, key=key)
+            usage, outcome = anthropic_proxy.serve(self, body, model, now, key=key,
+                                                   **({"model_suffix": reveal} if reveal else {}))
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", exc)
         except Exception as exc:
@@ -448,6 +522,9 @@ class Handler(BaseHTTPRequestHandler):
                 logger.warning("backend start failed: %s", exc)
                 return self._error(502, "api_error", str(exc), wire)
         msg_id = wire.new_message_id()
+        # The model this response names: what the client asked for, unless it asked to see the real route (the
+        # routed-subagents mod does; the main session does not and keeps seeing `cortados`).
+        model = (self._reveal(session) if self._wants_reveal() else None) or turn.model
         if turn.stream:
             try:
                 self.send_response(200)
@@ -457,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                self.wfile.write(wire.stream_start(msg_id, turn.model))
+                self.wfile.write(wire.stream_start(msg_id, model))
                 self.wfile.flush()
             except OSError as exc:
                 # The client left before the first byte. A one-shot's backend lives nowhere but here, and a session
@@ -548,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
                 if client_gone:
                     return
                 if turn.stream:
-                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(outcome["stale"])))
+                    self.wfile.write(wire.stream_error(msg_id, model, str(outcome["stale"])))
                     return
                 return self._error(409, "invalid_request_error", str(outcome["stale"]), wire)
             if "error" in outcome:
@@ -558,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
                 if client_gone:
                     return
                 if turn.stream:
-                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(outcome["error"])))
+                    self.wfile.write(wire.stream_error(msg_id, model, str(outcome["error"])))
                     return
                 return self._error(502, "api_error", str(outcome["error"]), wire)
             blocks, stop, usage = outcome["turn"]
@@ -567,11 +644,11 @@ class Handler(BaseHTTPRequestHandler):
             if not client_gone:
                 try:
                     if turn.stream:
-                        for chunk in wire.stream_body(msg_id, turn.model, blocks, stop, usage):
+                        for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
                             self.wfile.write(chunk)
                         self.wfile.flush()
                     else:
-                        self._json(200, wire.message_json(msg_id, turn.model, blocks, stop, usage), session=session)
+                        self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=session)
                 except OSError as exc:
                     client_gone = True
                     logger.info("conversation %s: client gone while the reply was written (%s)", session.id[:8], exc)
@@ -589,6 +666,18 @@ class Handler(BaseHTTPRequestHandler):
         """The calling tool, from its User-Agent ("claude-cli/2.1.304 (external, cli)" → "claude-cli",
         "codex_exec/0.163.0 (Mac OS 27.0.1; arm64)" → "codex_exec"); it names the route log's platform."""
         return (self.headers.get("user-agent") or "unknown").split("/")[0].strip() or "unknown"
+
+    def _wants_reveal(self) -> bool:
+        try:                                            # cosmetic: never raises into a turn (or the api lane's money path)
+            return (self.headers.get(REVEAL_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            return False
+
+    def _reveal(self, session) -> str | None:   # api/-pinned requests reveal in _serve_api_lane (api_reveal_suffix)
+        try:
+            return reveal_model(getattr(session, "route", None))
+        except Exception:                               # reveal_model already never raises; belt and braces
+            return None
 
     def _route_header(self, session) -> None:
         r = getattr(session, "route", None)

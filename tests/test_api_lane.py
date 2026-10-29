@@ -21,8 +21,10 @@ class TestApiPin(unittest.TestCase):
 
 
 class TestServeApiLane(unittest.TestCase):
-    def _handler(self):
+    def _handler(self, headers=None):
         h = Handler.__new__(Handler)
+        if headers is not None:
+            h.headers = headers
         h.errors = []
         h._error = lambda code, kind, msg, w: h.errors.append((code, msg))
         return h
@@ -118,6 +120,28 @@ class TestServeApiLane(unittest.TestCase):
             served.assert_not_called()                      # never dispatched with the wrong key
             self.assertEqual(settle.call_args[0][1], 0.0)   # reservation released
         self.assertEqual(h.errors[0][0], 503)
+
+
+
+class TestApiLaneReveal(unittest.TestCase):
+    """x-cortados-reveal on an api/-pinned request adds the credit window's % left to the upstream's real model."""
+
+    def _serve(self, headers):
+        h = TestServeApiLane._handler(None, headers)
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+             mock.patch("cortados_router.api_credits.reserve", return_value=RID), \
+             mock.patch("cortados_router.api_credits.window_numbers", lambda now: (40.4, now + 1, 2.0)), \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({}, "rejected")) as served, \
+             mock.patch("cortados_router.api_credits.settle"):
+            h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
+        return served.call_args
+
+    def test_reveal_passes_the_percent_suffix(self):
+        self.assertEqual(self._serve({"x-cortados-reveal": "1"}).kwargs.get("model_suffix"), " · 60% left")
+
+    def test_without_the_header_the_proxy_call_is_unchanged(self):
+        self.assertNotIn("model_suffix", self._serve({}).kwargs)
+        self.assertNotIn("model_suffix", self._serve(None).kwargs)      # no headers at all: never raises
 
 
 if __name__ == "__main__":
