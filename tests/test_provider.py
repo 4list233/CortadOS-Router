@@ -593,10 +593,12 @@ class RevealModelTests(unittest.TestCase):
     def test_a_dropped_per_model_pool_is_carried_forward_when_another_pool_shows(self):
         # finding 2: one per-model panel (Fable) shows this read but another (Opus) is rate-limited. The sampler must
         # carry the dropped Opus pool forward (stale), so that model is still known to HAVE a separate pool and its %
-        # is withheld — while a general-pool model (Sonnet) still shows its %.
+        # is withheld — while a fresh pool (Fable) and the general pool (Sonnet) still show their %.
         sc = core._scarcity_module()
-        prev = {"config_dir": None, "windows": [self.win("week", 20), self.win("week-opus", 99, pool="opus")]}
-        with mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used\nCurrent week (Fable) 10% used"), \
+        prev = {"config_dir": None, "login": "/tmp/login-A",
+                "windows": [self.win("week", 20), self.win("week-opus", 99, pool="opus")]}
+        with mock.patch.object(sc, "claude_login_identity", lambda env: "/tmp/login-A"), \
+                mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used\nCurrent week (Fable) 10% used"), \
                 mock.patch.object(sc, "parse_claude_usage", lambda _t: [self.win("week", 20), self.win("week-fable", 10, pool="fable")]):
             read = sc._claude(prev, None)
         opus = next((w for w in read["windows"] if w.get("pool") == "opus"), None)
@@ -608,8 +610,25 @@ class RevealModelTests(unittest.TestCase):
         with self.lanes({"claude": read}):
             opus_route = {"provider": "claude-cli", "model": "claude-opus-5", "route": {"chosen": {"lane": "claude", "pool": "opus"}}}
             self.assertEqual(server.reveal_model(opus_route), "claude-opus-5")                 # withheld: stale Opus pool
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-fable-5"}),
+                             "claude-fable-5 · 80% left")      # fresh Fable still shown (per_model is not a blanket block)
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
                              "claude-sonnet-5 · 80% left")                                     # general pool: still shown
+
+    def test_carry_forward_requires_login_continuity_not_just_config_dir(self):
+        # finding 1 (round 4): config_dir is None for BOTH the default login and an inherited CLAUDE_CONFIG_DIR, so a
+        # carry keyed on config_dir alone would cross a DIFFERENT login's spent window over — and because the sampler
+        # feeds routing, that changes routing, not just the cosmetic %. The EFFECTIVE login must match to carry.
+        sc = core._scarcity_module()
+        prev = {"config_dir": None, "login": "/tmp/login-A",
+                "windows": [self.win("week", 20), self.win("week-fable", 99, pool="fable")]}
+        with mock.patch.object(sc, "claude_login_identity", lambda env: "/tmp/login-B"), \
+                mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used\nCurrent week (Opus) 10% used"), \
+                mock.patch.object(sc, "parse_claude_usage", lambda _t: [self.win("week", 20), self.win("week-opus", 10, pool="opus")]):
+            read = sc._claude(prev, None)
+        pools = {w.get("pool") for w in read["windows"]}
+        self.assertNotIn("fable", pools)                 # A's spent Fable window must NOT cross into B's reading
+        self.assertNotIn("per_model", read)              # nothing carried from a different login -> no rate-limit note
 
     def test_the_default_login_is_an_identity_of_its_own(self):
         # A default-login route (no account) must not show a reading sampled for a named account, nor a named route the

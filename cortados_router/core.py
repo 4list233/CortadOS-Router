@@ -529,11 +529,15 @@ def headroom_pct_for(c: dict[str, Any], *, refresh: bool = False) -> float | Non
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         relevant = [w for w in windows if w.get("pool", "all") in ("all", pool)]
         if any(w.get("stale") for w in relevant):
-            return None                                              # part of the picture is a carried-forward old read
-        if pool != "all" and (lane.get("per_model") or not any(
-                w.get("pool") == pool and w.get("headroom_pct") is not None for w in relevant)):
-            return None                                              # the model's OWN separate pool is not observed
-                                                                     # this read (rate-limited / carried forward)
+            return None                                              # part of THIS model's picture is a carried old read
+        if pool != "all" and not any(
+                w.get("pool") == pool and w.get("headroom_pct") is not None for w in relevant):
+            return None                                              # the model's OWN separate pool is not observed this
+                                                                     # read. NOTE: `per_model` (set when ANY pool was
+                                                                     # carried) is NOT a blanket block here — a pool that
+                                                                     # DID show fresh is bound by its own fresh window
+                                                                     # above; the stale check already withholds a model
+                                                                     # whose own pool was only carried forward.
         return _min_headroom_pct(lane, pool)
     except Exception:
         return None
