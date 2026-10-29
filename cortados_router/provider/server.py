@@ -346,20 +346,19 @@ class Handler(BaseHTTPRequestHandler):
                                "fully reserved this period; it resets on the billing day", wire)
         logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
                     max_cost, model, api_credits.committed(now), api_credits.budget_usd())
-        usage: dict[str, Any] | None = None
+        usage: dict[str, Any] = {}
+        outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
         try:
-            usage = anthropic_proxy.serve(self, body, model, now)
+            usage, outcome = anthropic_proxy.serve(self, body, model, now)
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", exc)
         finally:
-            if usage is None:
-                charge = max_cost                 # serve raised; charge the full reservation (conservative)
-            elif not usage:
-                charge = 0.0                       # upstream rejected the request; nothing was billed
-            elif usage.get("output_tokens") is not None:
-                charge = api_credits.cost_from_usage(model, usage)   # a complete turn
+            if outcome == "rejected":
+                charge = 0.0                       # the API returned an error; nothing was billed
+            elif outcome == "completed":
+                charge = api_credits.cost_from_usage(model, usage)   # a terminal response: settle the actual cost
             else:
-                charge = max_cost                 # incomplete (e.g. a mid-stream disconnect); conservative
+                charge = max_cost                 # unknown (timeout / transport error / mid-stream disconnect)
             try:
                 api_credits.settle(res_id, charge, now)
             except api_credits.LedgerError as exc:

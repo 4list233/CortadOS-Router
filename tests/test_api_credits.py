@@ -43,7 +43,15 @@ class TestPeriod(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_RESET_DAY": "15"}):
             start, nxt = ac.period_bounds(T)
             self.assertTrue(nxt > start)
-            self.assertTrue(28 * 86400 <= (nxt - start) <= 31 * 86400)
+            self.assertTrue(28 <= round((nxt - start) / 86400) <= 31)   # a calendar month (DST may add an hour)
+
+    def test_reset_day_31_clamps_to_short_months(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_RESET_DAY": "31"}):
+            self.assertEqual(ac.reset_day(), 31)
+            # Feb has no 31st, so the effective boundary is its last day; no crash, still a ~month window.
+            feb = __import__("datetime").datetime(2026, 2, 10).astimezone().timestamp()
+            start, nxt = ac.period_bounds(feb)
+            self.assertTrue(28 <= round((nxt - start) / 86400) <= 31)
 
 
 class TestAdmission(unittest.TestCase):
@@ -65,10 +73,17 @@ class TestAdmission(unittest.TestCase):
         self.assertEqual(ac.committed(T, self.meter), 4.0)
         self.assertFalse(ac.over_budget(T, self.meter))
 
-    def test_settle_is_clamped_to_the_reservation(self):
+    def test_settle_records_the_actual_even_above_the_reservation(self):
         r = ac.reserve(3.0, T, self.meter)
-        ac.settle(r, 999.0, T, self.meter)                          # actual over-reported -> clamped to 3
-        self.assertEqual(ac.spent(T, self.meter), 3.0)
+        ac.settle(r, 5.0, T, self.meter)                            # actual exceeded the $3 reservation -> recorded in full, not clamped
+        self.assertEqual(ac.spent(T, self.meter), 5.0)
+
+    def test_fail_closed_on_a_non_finite_balance(self):
+        self.meter.parent.mkdir(parents=True, exist_ok=True)
+        self.meter.write_text('{"periods": {"2026-10": {"spent_usd": Infinity, "reserved": {}}}}')
+        with self.assertRaises(ac.LedgerError):                     # a non-finite balance must not pass validation
+            ac.reserve(1.0, T, self.meter)
+        self.assertTrue(ac.over_budget(T, self.meter))             # read-only view of invalid state -> fully committed
 
     def test_over_budget_counts_outstanding_reservations(self):
         ac.reserve(10.0, T, self.meter)

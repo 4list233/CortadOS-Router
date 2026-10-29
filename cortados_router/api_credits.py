@@ -21,11 +21,11 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
 import json
 import math
 import os
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -76,13 +76,14 @@ def budget_usd() -> float:
 
 
 def reset_day() -> int:
-    """Day of the month the included credit renews (the billing day). Default 1; clamped to 1..28."""
+    """Day of the month the included credit renews (the billing day). Default 1; accepts 1..31 (a day past a given
+    month's length is clamped to that month's last day where the boundary is computed)."""
     raw = os.environ.get("CORTADOS_API_CREDIT_RESET_DAY")
     try:
         d = int(raw) if raw not in (None, "") else 1
     except (TypeError, ValueError):
         return 1
-    return min(28, max(1, d))
+    return min(31, max(1, d))
 
 
 def price_for(model: str) -> dict[str, float]:
@@ -111,48 +112,82 @@ def cost_usd(model: str, input_tokens: float = 0, output_tokens: float = 0, cach
 
 def cost_from_usage(model: str, usage: dict[str, Any] | None) -> float:
     u = usage if isinstance(usage, dict) else {}
-    return cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0))
+    base = cost_usd(model, u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0))
+    return base * 2 if str(u.get("speed") or "").lower() == "fast" else base  # fast mode is billed at 2x
 
 
 def estimate_max_cost(body: dict[str, Any], model: str) -> float:
-    """A CONSERVATIVE upper bound on what one request can cost: every prompt byte counted as a (cached-miss) input
-    token at the full input rate, plus max_tokens at the output rate. Used to reserve credit before dispatch."""
+    """A CONSERVATIVE upper bound on one request's cost, used to reserve credit before dispatch: the prompt bytes as
+    input tokens (deliberately low bytes/token), PLUS the API-added overhead the body doesn't carry (system prompt
+    and the rendered tool schemas), priced at the CACHE-WRITE rate (the most expensive input treatment), plus
+    max_tokens (or the 128k ceiling) at the output rate, doubled for fast mode."""
     p = price_for(model)
     raw = json.dumps(body) if isinstance(body, dict) else ""
-    input_tokens = len(raw.encode()) / 3.0  # ~3 bytes/token, deliberately low (more tokens = larger reservation)
+    tools = body.get("tools") if isinstance(body, dict) else None
+    n_tools = len(tools) if isinstance(tools, list) else 0
+    input_tokens = len(raw.encode()) / 3.0 + 4000 + 1500 * n_tools
     try:
         max_out = int(body.get("max_tokens") or 0) if isinstance(body, dict) else 0
     except (TypeError, ValueError):
         max_out = 0
     if max_out <= 0:
-        max_out = 64000  # no cap given: assume a large output
-    return (input_tokens * p["input"] + max_out * p["output"]) / 1_000_000.0
+        max_out = 128000  # no cap given: assume the model's max output
+    in_rate, out_rate = max(p["input"], p["cache_write"]), p["output"]
+    if isinstance(body, dict) and str(body.get("speed") or "").lower() == "fast":
+        in_rate, out_rate = in_rate * 2, out_rate * 2
+    return (input_tokens * in_rate + max_out * out_rate) / 1_000_000.0
 
 
 # ------------------------------------------------------------------ billing period
-def period_key(now: float) -> str:
-    """The billing period `now` falls in, as 'YYYY-MM', where a period runs from reset_day to the next reset_day."""
+def _effective_reset(year: int, month: int) -> int:
+    """The reset day for a given month, clamped to that month's last day (so a 31st billing day is the 28th/30th in
+    shorter months)."""
+    return min(reset_day(), calendar.monthrange(year, month)[1])
+
+
+def _start_month(now: float) -> tuple[int, int]:
     dt = datetime.fromtimestamp(now).astimezone()
-    y, m = (dt.year, dt.month) if dt.day >= reset_day() else (dt.year, dt.month - 1)
-    if m < 1:
-        y, m = y - 1, 12
+    if dt.day >= _effective_reset(dt.year, dt.month):
+        return dt.year, dt.month
+    return (dt.year - 1, 12) if dt.month == 1 else (dt.year, dt.month - 1)
+
+
+def period_key(now: float) -> str:
+    """The billing period `now` falls in, labelled 'YYYY-MM' by the month the period starts in."""
+    y, m = _start_month(now)
     return f"{y:04d}-{m:02d}"
 
 
 def period_bounds(now: float) -> tuple[float, float]:
-    """(start_epoch, next_start_epoch) of the billing period containing `now`."""
-    dt = datetime.fromtimestamp(now).astimezone()
-    d = reset_day()
-    start = dt.replace(day=d, hour=0, minute=0, second=0, microsecond=0)
-    if dt.day < d:
-        start = start.replace(year=start.year - 1, month=12) if start.month == 1 else start.replace(month=start.month - 1)
-    nxt = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
+    """(start_epoch, next_start_epoch) of the billing period containing `now`, on each month's effective reset day."""
+    sy, sm = _start_month(now)
+    ny, nm = (sy + 1, 1) if sm == 12 else (sy, sm + 1)
+    start = datetime(sy, sm, _effective_reset(sy, sm)).astimezone()
+    nxt = datetime(ny, nm, _effective_reset(ny, nm)).astimezone()
     return start.timestamp(), nxt.timestamp()
 
 
 # ------------------------------------------------------------------ locked per-period ledger
 def _blank() -> dict[str, Any]:
     return {"periods": {}}
+
+
+def _finite_nonneg(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+
+
+def _validate(data: Any) -> dict[str, Any]:
+    """Strict schema check shared by reads and mutations: periods is a dict; each period has a finite non-negative
+    spent_usd and a reserved map of finite non-negative amounts. Anything else is a LedgerError (fail closed)."""
+    if not isinstance(data, dict) or not isinstance(data.get("periods"), dict):
+        raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
+    for period, led in data["periods"].items():
+        if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
+            raise LedgerError(f"api-credit ledger period {period!r} is invalid")
+        for rid, amt in led["reserved"].items():
+            if not _finite_nonneg(amt):
+                raise LedgerError(f"api-credit ledger reservation {rid!r} is invalid")
+    return data
 
 
 def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
@@ -167,10 +202,10 @@ def _locked(path: Path, fn: Callable[[dict[str, Any]], Any]) -> Any:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if path.exists():
             try:
-                data = json.loads(path.read_text())
-                if not isinstance(data, dict) or "periods" not in data:
-                    raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
-            except (ValueError, OSError) as exc:
+                data = _validate(json.loads(path.read_text()))
+            except LedgerError:
+                raise
+            except (ValueError, OSError, TypeError, AttributeError) as exc:
                 raise LedgerError(f"api-credit ledger unreadable: {exc}") from exc
         else:
             data = _blank()
@@ -234,9 +269,8 @@ def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path
 
     def fn(data: dict[str, Any]) -> None:
         led = _ledger_for(data, period)
-        held = led["reserved"].pop(res_id, None)
-        charge = min(actual, float(held)) if held is not None else actual
-        led["spent_usd"] = round(float(led["spent_usd"]) + charge, 6)
+        led["reserved"].pop(res_id, None)                                 # release the reservation
+        led["spent_usd"] = round(float(led["spent_usd"]) + actual, 6)     # record the ACTUAL — overruns are not hidden
 
     _locked(p, fn)
 
@@ -247,12 +281,12 @@ def _current(now: float, path: Path | None = None) -> dict[str, float]:
     try:
         if not p.exists():
             return {"spent_usd": 0.0, "reserved": 0.0}
-        data = json.loads(p.read_text())
-        led = (data.get("periods") or {}).get(period) or {}
+        data = _validate(json.loads(p.read_text()))
+        led = data["periods"].get(period) or {"spent_usd": 0.0, "reserved": {}}
         return {"spent_usd": float(led.get("spent_usd") or 0.0),
                 "reserved": sum(float(v) for v in (led.get("reserved") or {}).values())}
-    except (ValueError, OSError, TypeError):
-        # A read-only view that cannot parse treats the period as fully committed, so pacing fails safe (the
+    except (LedgerError, ValueError, OSError, TypeError, AttributeError):
+        # A read-only view that cannot validate treats the period as fully committed, so pacing fails safe (the
         # authoritative admission path, reserve(), raises instead).
         return {"spent_usd": budget_usd(), "reserved": 0.0}
 

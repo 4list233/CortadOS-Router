@@ -70,34 +70,47 @@ class TestOrigin(unittest.TestCase):
 
 
 class TestServe(unittest.TestCase):
-    def test_nonstream_returns_usage_and_relays_body(self):
+    def test_nonstream_returns_completed_usage_and_relays_body(self):
         msg = {"id": "m1", "type": "message", "usage": {"input_tokens": 1000, "output_tokens": 7}}
         h = FakeHandler()
-        usage = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
-                         urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode()))
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode()))
         self.assertEqual(h.status, 200)
         self.assertEqual(json.loads(h.wfile.buf.getvalue())["id"], "m1")
         self.assertEqual(usage["output_tokens"], 7)
+        self.assertEqual(outcome, "completed")
 
-    def test_stream_captures_usage_before_each_write(self):
+    def test_stream_completed_when_message_stop_seen(self):
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(usage.get("output_tokens"), 5)
+        self.assertEqual(outcome, "completed")
+
+    def test_stream_disconnect_is_unknown_with_captured_usage(self):
         chunks = [
             b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
             b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
         ]
-        # the write fails after the FIRST chunk; usage from the first chunk must still be captured
+        # the write fails after the FIRST chunk; usage is captured but the turn did not terminate -> unknown
         h = FakeHandler(fail_write_after=1)
-        usage = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
-                         urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
-        self.assertEqual(h.status, 200)
-        self.assertEqual(usage.get("input_tokens"), 1000)   # captured even though the client dropped
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(usage.get("input_tokens"), 1000)
+        self.assertEqual(outcome, "unknown")
 
-    def test_http_error_is_relayed_and_returns_no_usage(self):
+    def test_http_error_is_relayed_and_rejected(self):
         err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))
         h = FakeHandler()
-        usage = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
-                         urlopen=mock.Mock(side_effect=err))
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
         self.assertEqual(h.status, 400)
-        self.assertEqual(usage, {})                          # upstream rejected -> nothing to settle
+        self.assertEqual((usage, outcome), ({}, "rejected"))   # the API rejected it -> nothing to settle
 
 
 if __name__ == "__main__":

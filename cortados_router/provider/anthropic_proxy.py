@@ -98,9 +98,13 @@ def usage_from_sse(text: str) -> dict[str, Any]:
 
 
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
-          urlopen: Callable[..., Any] | None = None) -> dict[str, Any]:
-    """Proxy one turn to the real API and relay the response to the client. Returns the captured `usage` dict (empty
-    on an upstream error; possibly partial on a mid-stream client disconnect). The caller settles the reservation."""
+          urlopen: Callable[..., Any] | None = None) -> tuple[dict[str, Any], str]:
+    """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
+      * ("completed"): a terminal response was received — settle the actual cost from `usage`.
+      * ("rejected"):  the API returned an HTTP error — it was not billed, settle zero.
+      * ("unknown"):   the turn did not terminate for us (timeout, transport error, or a mid-stream disconnect) —
+                       the spend is unknown, so the caller settles the FULL reservation (conservative).
+    Usage is parsed before each client write, so a disconnect cannot lose it."""
     key = (key if key is not None else api_key()).strip()
     open_fn = urlopen or _OPENER.open
     url, data, headers = build_upstream(body, model, key)   # raises on a non-Anthropic origin
@@ -115,7 +119,7 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         handler.send_header("content-length", str(len(payload)))
         handler.end_headers()
         handler.wfile.write(payload)
-        return {}
+        return {}, "rejected"
     except (urllib.error.URLError, OSError) as exc:
         msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"cortados: upstream API unreachable: {exc}"}}).encode()
         handler.send_response(502)
@@ -123,14 +127,13 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         handler.send_header("content-length", str(len(msg)))
         handler.end_headers()
         handler.wfile.write(msg)
-        return {}
+        return {}, "unknown"   # dispatch may have reached the API; settle conservatively
 
     with resp:
         if not streaming:
             raw = resp.read()
-            usage: dict[str, Any] = {}
             try:
-                usage = extract_usage(json.loads(raw))
+                usage: dict[str, Any] = extract_usage(json.loads(raw))
             except ValueError:
                 usage = {}
             handler.send_response(200)
@@ -138,8 +141,8 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
             handler.send_header("content-length", str(len(raw)))
             handler.end_headers()
             handler.wfile.write(raw)
-            return usage
-        # Streaming: parse usage from each chunk BEFORE writing it, so a disconnect cannot lose captured usage.
+            return usage, "completed"
+        # Streaming: parse usage (and watch for the terminal message_stop) from each chunk BEFORE writing it.
         handler.send_response(200)
         handler.send_header("content-type", "text/event-stream")
         handler.send_header("cache-control", "no-cache")
@@ -147,11 +150,17 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         handler.end_headers()
         handler.close_connection = True
         usage = {}
+        completed = False
+        disconnected = False
         for chunk in resp:
-            _update_usage_from_sse(usage, chunk.decode("utf-8", "replace"))
+            text = chunk.decode("utf-8", "replace")
+            _update_usage_from_sse(usage, text)
+            if "message_stop" in text:
+                completed = True
             try:
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
             except OSError:
-                break  # client gone; usage captured up to here is returned for settlement
-        return usage
+                disconnected = True
+                break  # client gone
+        return usage, ("completed" if completed and not disconnected else "unknown")
