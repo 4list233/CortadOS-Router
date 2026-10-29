@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import calendar
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -145,48 +146,72 @@ def budget_usd() -> float:
     return v if v > 0 else DEFAULT_BUDGET_USD
 
 
-# Each credit org is one API key with its own included-credit window. The primary key is slot "1"; a second org's
-# key is CORTADOS_ANTHROPIC_API_KEY_2, a third _3, and so on (contiguous — the scan stops at the first gap). The
-# ledger keys spend by this SLOT LABEL, never by the key value (no secret is written to disk). Rotating the key in a
-# slot resets that slot's pacing meter, which is harmless: the org's overage-off setting is the authoritative hard
-# cap on real spend, and this meter is only a pacing/admission guard on top of it.
+# Each credit org is one API key with its own included-credit window. Keys come from CORTADOS_ANTHROPIC_API_KEY
+# (primary), then _API_KEY_2, _3, … (contiguous — the scan stops at the first gap). An org's IDENTITY in the ledger
+# is a short, non-reversible fingerprint of its KEY, never the slot position and never the key value itself (so no
+# secret is written to disk, and spend stays bound to the key that incurred it). Keying by the key's fingerprint
+# means: the same key in two slots is ONE org (one window, not a phantom second allowance); swapping the keys
+# between slots does not move either org's spend; and rotating a key starts a fresh window for the new key (correct —
+# it is a different credit pool), while the old key's recorded spend stays under its own fingerprint. The org's
+# overage-off setting is the authoritative hard cap on real spend; this meter is the pacing/admission guard on top.
+def _org_id(key: str) -> str:
+    """Stable, non-reversible org identity for a key (a truncated SHA-256; not the key, safe to persist)."""
+    return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
+
+
 def configured_orgs() -> list[tuple[str, str]]:
-    """Ordered (slot-label, key) for every configured credit org: slot "1" is CORTADOS_ANTHROPIC_API_KEY, slot "2"
-    is …_API_KEY_2, etc. Admission drains them in this order (org 1 first). Empty when no key is set."""
-    orgs: list[tuple[str, str]] = []
+    """Ordered (org-id, key) for every DISTINCT configured credit org, in config order (primary first). Admission
+    drains them in this order. A key configured in more than one slot appears once. Empty when no key is set."""
+    raw: list[str] = []
     primary = (os.environ.get("CORTADOS_ANTHROPIC_API_KEY") or "").strip()
     if primary:
-        orgs.append(("1", primary))
+        raw.append(primary)
     i = 2
     while True:
         k = (os.environ.get(f"CORTADOS_ANTHROPIC_API_KEY_{i}") or "").strip()
         if not k:
             break
-        orgs.append((str(i), k))
+        raw.append(k)
         i += 1
-    return orgs
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key in raw:
+        oid = _org_id(key)
+        if oid in seen:            # same key in two slots -> one org, not two allowances
+            continue
+        seen.add(oid)
+        out.append((oid, key))
+    return out
+
+
+def _primary_org_id() -> str:
+    """The org id a legacy (single-org) ledger and legacy reservation ids belong to: the primary key's, or a fixed
+    sentinel if no key is configured (so a read with no config attributes nothing rather than guessing)."""
+    orgs = configured_orgs()
+    return orgs[0][0] if orgs else "legacy"
 
 
 def total_budget_usd() -> float:
-    """The whole lane's budget: per-org budget times the number of configured orgs (so two $200 orgs make $400)."""
+    """The whole lane's budget: per-org budget times the number of DISTINCT configured orgs (two $200 keys = $400)."""
     return budget_usd() * len(configured_orgs())
 
 
 def _org_of(res_id: str) -> tuple[str, str]:
-    """(slot-label, period) a reservation id belongs to. New ids are 'label|period:hex'; a legacy id with no '|' is
-    the single primary org, slot '1'."""
+    """(org-id, period) a reservation id belongs to. New ids are 'orgid|period:hex'; a legacy id with no '|' belongs
+    to the primary org (the only org that existed when such an id was minted)."""
     prefix = (res_id or "").split(":", 1)[0]
     if "|" in prefix:
-        label, period = prefix.split("|", 1)
-        return label, period
-    return "1", prefix
+        oid, period = prefix.split("|", 1)
+        return oid, period
+    return _primary_org_id(), prefix
 
 
 def key_for_reservation(res_id: str) -> str | None:
-    """The API key for a reservation's org, or None if that org is no longer configured."""
-    label, _ = _org_of(res_id)
-    for lbl, key in configured_orgs():
-        if lbl == label:
+    """The API key for a reservation's org, or None if that org's key is no longer configured. Bound to the key's
+    fingerprint, so it returns the SAME key the reservation was debited to regardless of slot order or swaps."""
+    oid, _ = _org_of(res_id)
+    for o, key in configured_orgs():
+        if o == oid:
             return key
     return None
 
@@ -338,15 +363,23 @@ def _validate(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
     if "orgs" not in data and isinstance(data.get("periods"), dict):
+        pt = data.get("pruned_through")
+        if pt is not None and not isinstance(pt, str):
+            # A present-but-malformed prune cursor must fail closed, never be dropped: dropping it would let a
+            # already-pruned period reopen blank and re-admit its spent budget. (Absent is fine: fresh ledger.)
+            raise LedgerError("api-credit ledger has an invalid prune cursor")
         legacy: dict[str, Any] = {"periods": data["periods"]}
-        if isinstance(data.get("pruned_through"), str):
-            legacy["pruned_through"] = data["pruned_through"]
-        data = {"orgs": {"1": legacy}}
+        if isinstance(pt, str):
+            legacy["pruned_through"] = pt
+        data = {"orgs": {_primary_org_id(): legacy}}
     if not isinstance(data.get("orgs"), dict):
         raise LedgerError("api-credit ledger is corrupt (unexpected shape)")
     for label, od in data["orgs"].items():
         if not isinstance(od, dict) or not isinstance(od.get("periods"), dict):
             raise LedgerError(f"api-credit ledger org {label!r} is invalid")
+        pt = od.get("pruned_through")
+        if pt is not None and not isinstance(pt, str):
+            raise LedgerError(f"api-credit ledger org {label!r} has an invalid prune cursor")
         for period, led in od["periods"].items():
             if not isinstance(led, dict) or not _finite_nonneg(led.get("spent_usd")) or not isinstance(led.get("reserved"), dict):
                 raise LedgerError(f"api-credit ledger org {label!r} period {period!r} is invalid")
@@ -436,8 +469,8 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
     orgs = configured_orgs()
 
     def fn(data: dict[str, Any]) -> str | None:
-        for label, _key in orgs:
-            od = _org_ledger(data, label)
+        for oid, _key in orgs:
+            od = _org_ledger(data, oid)
             if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):
                 # Reopening a period this org already pruned (its spent balance is lost) -> skip it rather than start
                 # it blank. Only a clock rollback / stale timestamp reaches here; the live path reserves the CURRENT
@@ -447,7 +480,7 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
             committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
             if committed + cost > budget:
                 continue                           # this org's window is full -> try the next org
-            rid = f"{label}|{period}:{uuid.uuid4().hex}"
+            rid = f"{oid}|{period}:{uuid.uuid4().hex}"
             led["reserved"][rid] = round(cost, 6)
             return rid
         return None                                # every configured org is full (or there are none)
