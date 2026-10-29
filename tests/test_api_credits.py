@@ -273,6 +273,18 @@ class TestTwoOrgs(unittest.TestCase):
         self.assertLessEqual(ac.committed(T, self.meter), ac.total_budget_usd())
         self.assertIsNotNone(ac.reserve(9.0, T, self.meter))  # $11 + $9 = $20 exactly still fits (on org B)
 
+    def test_pruned_period_cannot_be_reopened_through_another_org(self):
+        # Codex round-4 P2: once org A's October is pruned, a stale-timestamp reserve into October must fail closed
+        # for the WHOLE lane (A's pruned spend is missing from the aggregate), never be admitted on org B.
+        a = ac.reserve(6.0, T, self.meter)
+        ac.settle(a, 11.0, T, self.meter)                # A's October overran to $11, resolved (no outstanding res)
+        for d in (40, 75, 110):                          # three newer resolved periods on A age October out
+            r = ac.reserve(1.0, T + d * 86400, self.meter)
+            ac.settle(r, 1.0, T + d * 86400, self.meter)
+        # October is now pruned from A; a stale-timestamp reserve into it is refused, not admitted on B
+        self.assertIsNone(ac.reserve(10.0, T, self.meter))
+        self.assertEqual(ac.spent(T, self.meter), 0.0)   # October reads empty (pruned), and no B reservation landed
+
     def test_same_key_in_two_slots_is_one_org(self):
         with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "dup",
                                           "CORTADOS_ANTHROPIC_API_KEY_2": "dup"}, clear=False):

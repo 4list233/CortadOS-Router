@@ -488,20 +488,24 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
         return float(led.get("spent_usd") or 0.0) + sum(float(v) for v in (led.get("reserved") or {}).values())
 
     def fn(data: dict[str, Any]) -> str | None:
+        # Lane-wide prune guard FIRST: if the requested period has been pruned from ANY configured org, that org's
+        # spend for it is gone, so the lane aggregate for the period is understated and cannot be trusted -> refuse
+        # the whole reservation rather than admit another org into a period we can no longer total. The live path
+        # always reserves the CURRENT period (never pruned: pruning keeps the current and two most recent), so only
+        # a clock rollback / stale timestamp reaches here.
+        for oid, _k in orgs:
+            od0 = data.get("orgs", {}).get(oid, {})
+            if period not in (od0.get("periods") or {}) and period <= od0.get("pruned_through", ""):
+                return None
         # Two gates, both under this lock: the lane AGGREGATE must not exceed the total, AND the chosen org's own
         # window must not exceed its per-org budget. The aggregate gate matters because a settled OVERRUN on one org
         # (actual > reserved, recorded un-clamped) can eat the lane's headroom while another org's window still looks
-        # open; without it, the sum could pass total_budget_usd().
+        # open; without it, the sum of admitted reservations could pass total_budget_usd().
         lane_committed = sum(_org_committed(data, oid) for oid, _k in orgs)
         if lane_committed + cost > lane_budget:
             return None                            # lane total would be exceeded (e.g. an overrun ate the headroom)
         for oid, _key in orgs:
             od = _org_ledger(data, oid)
-            if period not in od.get("periods", {}) and period <= od.get("pruned_through", ""):
-                # Reopening a period this org already pruned (its spent balance is lost) -> skip it rather than start
-                # it blank. Only a clock rollback / stale timestamp reaches here; the live path reserves the CURRENT
-                # period. Try the next org (which has its own, independent prune cursor).
-                continue
             led = _ledger_for(od, period)
             committed = float(led["spent_usd"]) + sum(float(v) for v in led["reserved"].values())
             if committed + cost > budget:
