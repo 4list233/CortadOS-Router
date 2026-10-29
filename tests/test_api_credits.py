@@ -37,6 +37,12 @@ class TestPricing(unittest.TestCase):
         # output ceiling alone (1000 tok @ $20/M) is already in the estimate
         self.assertGreaterEqual(est, 1000 * 20.0 / 1_000_000)
 
+    def test_client_tool_named_like_a_server_tool_gets_no_allowance(self):
+        # a CLIENT tool merely NAMED "web_search" must not receive the server web-search reservation (classify by type)
+        self.assertEqual(ac._server_tool_allowance([{"name": "web_search", "input_schema": {"type": "object"}}]), 0.0)
+        # the genuine server tool, identified by its `type`, still does
+        self.assertAlmostEqual(ac._server_tool_allowance([{"type": "web_search_20250305", "max_uses": 5}]), 0.05, places=4)
+
     def test_server_tool_charges_are_counted(self):
         # a completed turn that ran 10 web searches is billed $0.01 each on top of tokens
         usage = {"input_tokens": 1_000_000, "server_tool_use": {"web_search_requests": 10}}
@@ -127,6 +133,19 @@ class TestAdmission(unittest.TestCase):
     def test_over_budget_counts_outstanding_reservations(self):
         ac.reserve(10.0, T, self.meter)
         self.assertTrue(ac.over_budget(T, self.meter))              # fully committed even before settle
+
+    def test_settle_is_idempotent(self):
+        r = ac.reserve(6.0, T, self.meter)
+        ac.settle(r, 4.0, T, self.meter)
+        ac.settle(r, 4.0, T, self.meter)                            # a retried/duplicated settle must not double-charge
+        self.assertEqual(ac.spent(T, self.meter), 4.0)
+
+    def test_pruning_keeps_a_period_with_an_outstanding_reservation(self):
+        old = ac.reserve(6.0, T, self.meter)                        # period A, left outstanding
+        ac.reserve(1.0, T + 40 * 86400, self.meter)                # period B
+        ac.reserve(1.0, T + 75 * 86400, self.meter)                # period C (A is now older than the 2 most recent)
+        ac.settle(old, 4.0, T, self.meter)                         # A was not pruned (it had a reservation) -> charge lands
+        self.assertEqual(ac.spent(T, self.meter), 4.0)
 
     def test_late_settle_lands_in_its_own_period(self):
         old = ac.reserve(5.0, T, self.meter)                        # period A

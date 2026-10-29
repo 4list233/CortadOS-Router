@@ -1,5 +1,6 @@
 """Unit tests for the anthropic-api lane executor (cortados_router/provider/anthropic_proxy.py). No live API: the
 upstream is a fake opener. serve() does no accounting now — it returns the captured usage for the caller to settle."""
+import http.client
 import io
 import json
 import unittest
@@ -10,16 +11,25 @@ from cortados_router.provider import anthropic_proxy as ap
 
 
 class FakeResp:
-    def __init__(self, *, body=b"", chunks=None):
+    def __init__(self, *, body=b"", chunks=None, read_exc=None, raise_after_chunks=None, close_exc=None):
         self._body, self._chunks = body, chunks
+        self._read_exc, self._raise_after_chunks, self._close_exc = read_exc, raise_after_chunks, close_exc
     def __enter__(self):
         return self
     def __exit__(self, *a):
         return False
     def read(self):
+        if self._read_exc is not None:
+            raise self._read_exc
         return self._body
     def __iter__(self):
-        return iter(self._chunks or [])
+        for c in (self._chunks or []):
+            yield c
+        if self._raise_after_chunks is not None:
+            raise self._raise_after_chunks   # upstream read fault AFTER the chunks were delivered
+    def close(self):
+        if self._close_exc is not None:
+            raise self._close_exc
 
 
 class FakeHandler:
@@ -146,6 +156,67 @@ class TestServe(unittest.TestCase):
         usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
                                   urlopen=mock.Mock(side_effect=err))
         self.assertEqual((usage, outcome), ({}, "rejected"))   # the API rejected it; a failed relay does not bill it
+
+    def test_stream_upstream_read_fault_after_message_stop_stays_completed(self):
+        # all SSE events (incl. message_stop) arrive, THEN the upstream read raises -> the parsed terminal state is
+        # kept, so the turn settles as completed with its real usage, not the conservative full reservation.
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks, raise_after_chunks=ConnectionResetError("reset")))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(usage.get("output_tokens"), 5)
+
+    def test_stream_upstream_read_fault_before_completion_is_unknown(self):
+        # usage arrives but no terminal event; an IncompleteRead then ends the stream -> unknown, usage preserved
+        chunks = [b'data: {"type":"message_start","message":{"usage":{"input_tokens":100000}}}\n\n']
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks, raise_after_chunks=http.client.IncompleteRead(b"")))
+        self.assertEqual(outcome, "unknown")
+        self.assertEqual(usage.get("input_tokens"), 100000)
+
+    def test_nonstream_malformed_body_is_unknown_not_completed_zero(self):
+        # a truncated 200 body cannot be parsed -> the turn's real cost is unreadable, so keep it "unknown"
+        # (conservative full reservation) rather than settling completed-for-zero.
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=b'{"type":"message","usage":{"input_tokens":1000'))
+        self.assertEqual((usage, outcome), ({}, "unknown"))
+
+    def test_nonstream_message_without_usage_is_unknown(self):
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps({"type": "message", "id": "m"}).encode()))
+        self.assertEqual((usage, outcome), ({}, "unknown"))
+
+    def test_nonstream_upstream_read_fault_is_unknown(self):
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(read_exc=http.client.IncompleteRead(b"")))
+        self.assertEqual((usage, outcome), ({}, "unknown"))
+
+    def test_http_error_body_read_fault_stays_rejected(self):
+        # the error body declares more bytes than it supplies; reading it raises, but the turn was still REJECTED
+        err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"},
+                                     io.BufferedReader(io.BytesIO(b'{"error"')))
+        err.read = mock.Mock(side_effect=http.client.IncompleteRead(b'{"error"'))
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((usage, outcome), ({}, "rejected"))
+
+    def test_response_close_fault_does_not_mask_the_outcome(self):
+        msg = {"id": "m1", "type": "message", "usage": {"input_tokens": 1000, "output_tokens": 7}}
+        h = FakeHandler()
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode(), close_exc=OSError("close")))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(usage.get("output_tokens"), 7)
 
     def test_http_error_is_relayed_and_rejected(self):
         err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))

@@ -202,7 +202,7 @@ def estimate_max_cost(body: dict[str, Any], model: str) -> float:
     raw = json.dumps(body) if isinstance(body, dict) else ""
     tools = body.get("tools") if isinstance(body, dict) else None
     n_tools = len(tools) if isinstance(tools, list) else 0
-    input_tokens = len(raw.encode()) / 3.0 + 4000 + 1500 * n_tools
+    input_tokens = len(raw.encode()) / 2.0 + 4000 + 1500 * n_tools   # ~2 bytes/token is a conservative upper bound
     try:
         max_out = int(body.get("max_tokens") or 0) if isinstance(body, dict) else 0
     except (TypeError, ValueError):
@@ -226,7 +226,7 @@ def _server_tool_allowance(tools: Any) -> float:
     for t in tools:
         if not isinstance(t, dict):
             continue
-        ttype = str(t.get("type") or t.get("name") or "").lower()
+        ttype = str(t.get("type") or "").lower()   # a server tool is identified by `type`, never a client tool's name
         if "web_search" not in ttype:
             continue
         try:
@@ -334,8 +334,11 @@ def _ledger_for(data: dict[str, Any], period: str) -> dict[str, Any]:
     led = periods.setdefault(period, {"spent_usd": 0.0, "reserved": {}})
     led.setdefault("spent_usd", 0.0)
     led.setdefault("reserved", {})
-    # prune ledgers older than the two most recent, so the file does not grow without bound
-    for stale in sorted(periods)[:-2]:
+    # Prune resolved ledgers beyond the two most recent, so the file does not grow without bound. NEVER drop a
+    # period that still holds outstanding reservations: a later settle reads its period from the reservation id, and
+    # a pruned period would be recreated empty, losing the charge. Keep such periods until their reservations settle.
+    keep = set(sorted(periods)[-2:]) | {p for p, l in periods.items() if l.get("reserved")}
+    for stale in [p for p in list(periods) if p not in keep]:
         periods.pop(stale, None)
     return led
 
@@ -364,14 +367,17 @@ def reserve(max_cost: float, now: float, path: Path | None = None) -> str | None
 def settle(res_id: str, actual_cost: float, now: float | None = None, path: Path | None = None) -> None:
     """Replace a reservation with the actual spend (recorded in full — an overrun past the reserved max is NOT
     clamped, so it stays visible). The reservation's own period is read from its id, so a late settle lands in the
-    right period. Raises LedgerError on accounting failure."""
+    right period. Idempotent: the charge is recorded only while the reservation is still outstanding, so a retried
+    or duplicated settle cannot double-charge. Raises LedgerError on accounting failure."""
     p = path or meter_path()
     period = res_id.split(":", 1)[0]
     actual = max(0.0, float(actual_cost))
 
     def fn(data: dict[str, Any]) -> None:
         led = _ledger_for(data, period)
-        led["reserved"].pop(res_id, None)                                 # release the reservation
+        if res_id not in led["reserved"]:
+            return   # already settled (or never reserved here) -> idempotent no-op, never a second charge
+        led["reserved"].pop(res_id)                                       # release the reservation, exactly once
         led["spent_usd"] = round(float(led["spent_usd"]) + actual, 6)     # record the ACTUAL — overruns are not hidden
 
     _locked(p, fn)

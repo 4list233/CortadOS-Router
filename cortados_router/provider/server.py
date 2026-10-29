@@ -367,10 +367,21 @@ class Handler(BaseHTTPRequestHandler):
                 # unknown (timeout / transport error / mid-stream disconnect): the full reservation, but never below
                 # the cost we already observed on the wire, so a partial-but-expensive turn cannot under-settle.
                 charge = max(max_cost, api_credits.cost_from_usage(model, usage))
-            try:
-                api_credits.settle(res_id, charge, now)
-            except api_credits.LedgerError as exc:
-                logger.error("anthropic-api settle failed for %s (reservation retained, pacing stays safe): %s", res_id, exc)
+            # Settle, retrying on a transient ledger failure (settle is idempotent, so a retry cannot double-charge).
+            settled = False
+            for attempt in range(3):
+                try:
+                    api_credits.settle(res_id, charge, now)
+                    settled = True
+                    break
+                except api_credits.LedgerError as exc:
+                    logger.error("anthropic-api settle attempt %d/3 failed for %s: %s", attempt + 1, res_id, exc)
+            if not settled:
+                # The reservation ($%.4f) is retained, so pacing stays safe UNLESS the observed charge exceeded it
+                # (estimate_max_cost is a conservative upper bound, so that is rare); the API's overage-off credit
+                # cap is the authoritative hard backstop in every case.
+                logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
+                             "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""

@@ -12,6 +12,7 @@ Stateless; the client sends full history each turn. Stdlib only.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -119,7 +120,11 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
     try:
         resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
-        payload = exc.read()
+        # The API REJECTED the turn: nothing is billed, regardless of whether we can read or relay the error body.
+        try:
+            payload = exc.read()
+        except (OSError, http.client.HTTPException):
+            payload = b'{"type":"error","error":{"type":"api_error","message":"cortados: upstream rejected the request"}}'
         try:
             handler.send_response(exc.code)
             handler.send_header("content-type", (exc.headers.get("content-type") if exc.headers else None) or "application/json")
@@ -127,24 +132,36 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
             handler.end_headers()
             handler.wfile.write(payload)
         except OSError:
-            pass   # the API REJECTED the turn (nothing billed) whether or not we could relay the rejection
+            pass
         return {}, "rejected"
     except (urllib.error.URLError, OSError) as exc:
         msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"cortados: upstream API unreachable: {exc}"}}).encode()
-        handler.send_response(502)
-        handler.send_header("content-type", "application/json")
-        handler.send_header("content-length", str(len(msg)))
-        handler.end_headers()
-        handler.wfile.write(msg)
+        try:
+            handler.send_response(502)
+            handler.send_header("content-type", "application/json")
+            handler.send_header("content-length", str(len(msg)))
+            handler.end_headers()
+            handler.wfile.write(msg)
+        except OSError:
+            pass
         return {}, "unknown"   # dispatch may have reached the API; settle conservatively
 
-    with resp:
+    try:
         if not streaming:
-            raw = resp.read()
             try:
-                usage: dict[str, Any] = extract_usage(json.loads(raw))
+                raw = resp.read()
+            except (OSError, http.client.HTTPException):
+                return {}, "unknown"   # the turn may have been billed, but we have no usable response -> conservative
+            try:
+                parsed: Any = json.loads(raw)
             except ValueError:
-                usage = {}
+                parsed = None
+            # "completed" ONLY for a terminal message carrying usable usage. A truncated or malformed body (its cost
+            # is real but unreadable) stays "unknown", so it keeps the conservative reservation instead of settling 0.
+            if isinstance(parsed, dict) and parsed.get("type") == "message" and isinstance(parsed.get("usage"), dict) and parsed["usage"]:
+                usage, outcome = parsed["usage"], "completed"
+            else:
+                usage, outcome = {}, "unknown"
             try:
                 handler.send_response(200)
                 handler.send_header("content-type", "application/json")
@@ -152,26 +169,37 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                 handler.end_headers()
                 handler.wfile.write(raw)
             except OSError:
-                pass   # a full response was received and billed; a client write failure does not change the outcome
-            return usage, "completed"
+                pass   # a full response was received; a client write failure does not change the billing outcome
+            return usage, outcome
         # Streaming: parse usage (and watch for the terminal message_stop) from each chunk BEFORE writing it.
-        handler.send_response(200)
-        handler.send_header("content-type", "text/event-stream")
-        handler.send_header("cache-control", "no-cache")
-        handler.send_header("connection", "close")
-        handler.end_headers()
+        try:
+            handler.send_response(200)
+            handler.send_header("content-type", "text/event-stream")
+            handler.send_header("cache-control", "no-cache")
+            handler.send_header("connection", "close")
+            handler.end_headers()
+        except OSError:
+            return {}, "unknown"   # client gone before the stream even started; the turn may still have been billed
         handler.close_connection = True
         usage = {}
         completed = False
-        for chunk in resp:
-            text = chunk.decode("utf-8", "replace")
-            if _update_usage_from_sse(usage, text):   # True only on a PARSED message_stop event
-                completed = True
-            try:
-                handler.wfile.write(chunk)
-                handler.wfile.flush()
-            except OSError:
-                break  # client gone: stop relaying, but the billing outcome is decided by what we already parsed
-        # If the terminal event was parsed, the full turn was received and billed regardless of a late client
-        # disconnect -> "completed". Otherwise the turn did not terminate for us -> "unknown" (settle conservatively).
+        try:
+            for chunk in resp:
+                text = chunk.decode("utf-8", "replace")
+                if _update_usage_from_sse(usage, text):   # True only on a PARSED message_stop event
+                    completed = True
+                try:
+                    handler.wfile.write(chunk)
+                    handler.wfile.flush()
+                except OSError:
+                    break  # client gone: stop relaying; the billing outcome is decided by what we already parsed
+        except (OSError, http.client.HTTPException):
+            pass   # an upstream read failed mid-stream; keep whatever usage/terminal state we already captured
+        # If the terminal event was parsed, the full turn was received and billed regardless of a later client or
+        # upstream failure -> "completed". Otherwise the turn did not terminate for us -> "unknown" (conservative).
         return usage, ("completed" if completed else "unknown")
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
