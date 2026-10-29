@@ -37,7 +37,7 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, responses_wire
-from cortados_router.provider.bridge import BridgeError, BridgeSession
+from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
 DEFAULT_PORT = 8432                                     # next to S1's 8431
@@ -141,14 +141,18 @@ def _route_lane(route: dict) -> str | None:
 
 def _route_pct_left(route: dict) -> float | None:
     """% left in the pool the route's model draws on, via core.headroom_pct_for (the min headroom across the lane's
-    general windows and the model's own pool, identity-checked against the login the route EXECUTES on: its
-    config_dir, None for the default login). None when unknown or unconfirmable."""
+    general windows and the model's own pool; None unless the reading is fresh, for the login the route EXECUTES on,
+    and observes that pool). The login is what Registry.new runs the session on: the route's config_dir only when it
+    names an account, else the default login, stated as the effective login of the env the bridge would start the CLI
+    with (bridge.claude_env), so an inherited CLAUDE_CONFIG_DIR / token is never mistaken for the sampler's."""
     from cortados_router import core
     lane = _route_lane(route)
     if not lane or lane.split("#", 1)[0] in _UNIDENTIFIED_LANES:
         return None
+    cfg = route.get("config_dir") if route.get("account") else None
     chosen = (route.get("route") or {}).get("chosen") or {}
-    return core.headroom_pct_for({"lane": lane, "model": str(route["model"]), "config_dir": route.get("config_dir"),
+    return core.headroom_pct_for({"lane": lane, "model": str(route["model"]), "config_dir": cfg,
+                                  "login": core.claude_login_identity(claude_env(cfg)),
                                   "pool": chosen.get("pool"), "family": chosen.get("family")})
 
 

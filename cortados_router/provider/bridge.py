@@ -33,6 +33,16 @@ SETTLE_S = 0.3
 logger = logging.getLogger(__name__)
 
 
+def claude_env(config_dir: str | None) -> dict[str, str]:
+    """The env a headless Claude CLI runs with: this process's, minus STRIPPED_ENV, on the routed account's login when
+    one is named. One builder, so the login a session runs on can be stated (server reveal) without starting one."""
+    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)    # an inherited ambient token would override the account's stored login: drop it so config_dir wins
+    return env
+
+
 class BridgeError(RuntimeError):
     """The CLI died, timed out or reported an error; the server answers 502 (or 409 for a lost session)."""
 
@@ -95,10 +105,7 @@ class BridgeSession:
                 args += ["--strict-mcp-config"]
             if model:
                 args += ["--model", model]
-            env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
-            if config_dir:
-                env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
-                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)    # an inherited ambient token would override the account's stored login: drop it so config_dir wins
+            env = claude_env(config_dir)
             env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

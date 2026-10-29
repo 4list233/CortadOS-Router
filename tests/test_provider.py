@@ -345,11 +345,39 @@ class StalledCliTests(unittest.TestCase):
             s.close()
 
 
+# The default login, pinned for the reveal tests: the env a bridged CLI (and the sampler) would see, so the effective login
+# a reading is stamped with is predictable whatever the developer's own env holds.
+DEFAULT_LOGIN_DIR = "/tmp/cortados-test-default-login"
+PINNED_ENV = {"CLAUDE_CONFIG_DIR": DEFAULT_LOGIN_DIR, "CLAUDE_CODE_OAUTH_TOKEN": "", "ANTHROPIC_API_KEY": "",
+              "ANTHROPIC_AUTH_TOKEN": "", "ANTHROPIC_BASE_URL": "", "CLAUDE_CODE_USE_BEDROCK": "", "CLAUDE_CODE_USE_VERTEX": ""}
+
+
+def login_of(config_dir=None):
+    """The effective login a session on `config_dir` (None: the default login) runs on, as reveal states it."""
+    return core.claude_login_identity(server.claude_env(config_dir))
+
+
+def reading(windows, config_dir=None, age_s=60.0, **kw):
+    """A fresh, successful Claude reading sampled on `config_dir`'s effective login (overridable through kw)."""
+    now = time.time()
+    return {"config_dir": config_dir, "login": login_of(config_dir), "fetched_at": now - age_s, "tried_at": now - age_s,
+            "error": None, "windows": windows, **kw}
+
+
 class RevealTests(unittest.TestCase):
     """A routed subagent sends x-cortados-reveal and is told the real routed model and its lane's remaining window in
     `model`; every other client keeps seeing `cortados`. The scarcity cache is faked: no real ~/.cortados is read."""
 
-    setUp, tearDown, post = EndpointTests.setUp, EndpointTests.tearDown, EndpointTests.post
+    post = EndpointTests.post
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, PINNED_ENV)
+        env.start()
+        self.addCleanup(env.stop)
+        EndpointTests.setUp(self)
+
+    def tearDown(self):
+        EndpointTests.tearDown(self)
 
     def route(self, **kw):
         def router(body, client):
@@ -375,8 +403,18 @@ class RevealTests(unittest.TestCase):
 
     def claude_lane(self, used_5h=10.0, used_week=42.0):
         now = time.time()
-        return {"claude": {"windows": [scarcity.window_view("5-hour", used_5h, now + 3600, 5 * 3600, now),
-                                       scarcity.window_view("week", used_week, now + 3 * 86400, 7 * 86400, now)]}}
+        return {"claude": reading([scarcity.window_view("5-hour", used_5h, now + 3600, 5 * 3600, now),
+                                   scarcity.window_view("week", used_week, now + 3 * 86400, 7 * 86400, now)])}
+
+    def test_a_stale_reading_reveals_the_model_alone(self):
+        self.route()
+        body = {"model": "cortados", "messages": [{"role": "user", "content": "hi"}]}
+        lanes = self.claude_lane()
+        lanes["claude"].update(fetched_at=time.time() - 7 * 3600, tried_at=time.time() - 7 * 3600)
+        with self.fake_lanes(lanes):
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    self.assertEqual(self.send(dict(body, stream=stream)), "claude-sonnet-5")
 
     def test_reveal_names_the_routed_model_and_its_lanes_remaining_percent(self):
         self.route()
@@ -422,6 +460,11 @@ class RevealTests(unittest.TestCase):
 class RevealModelTests(unittest.TestCase):
     """reveal_model's lane mapping against a faked scarcity cache (core.headroom_pct_for reads it)."""
 
+    def setUp(self):
+        env = mock.patch.dict(os.environ, PINNED_ENV)
+        env.start()
+        self.addCleanup(env.stop)
+
     def lanes(self, lanes):
         return mock.patch.object(core._scarcity_module(), "current", lambda *a, **kw: {"lanes": lanes})
 
@@ -431,16 +474,17 @@ class RevealModelTests(unittest.TestCase):
         return {**w, "pool": pool} if pool else w
 
     def test_a_per_account_route_reads_its_own_lane(self):
-        with self.lanes({"claude": {"windows": [self.win("week", 90)]}, "claude#b": {"windows": [self.win("week", 20)]}}):
-            self.assertEqual(server.reveal_model({"provider": "claude-cli#b", "model": "claude-sonnet-5"}),
-                             "claude-sonnet-5 · 80% left")
-            chosen = {"provider": "claude-cli#b", "model": "claude-sonnet-5", "route": {"chosen": {"lane": "claude#b"}}}
+        with self.lanes({"claude": reading([self.win("week", 90)]), "claude#b": reading([self.win("week", 20)], "/b")}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli#b", "model": "claude-sonnet-5", "account": "b",
+                                                  "config_dir": "/b"}), "claude-sonnet-5 · 80% left")
+            chosen = {"provider": "claude-cli#b", "model": "claude-sonnet-5", "account": "b", "config_dir": "/b",
+                      "route": {"chosen": {"lane": "claude#b"}}}
             self.assertEqual(server.reveal_model(chosen), "claude-sonnet-5 · 80% left")
 
     def test_a_codex_route_names_the_model_only_its_login_cannot_be_confirmed(self):
         # The Codex reading carries no login identity, and the backend may run on a dedicated --codex-home: never show
         # the sampled (possibly the default) login's % for it.
-        with self.lanes({"codex": {"windows": [self.win("week", 33.4)]}}):
+        with self.lanes({"codex": reading([self.win("week", 33.4)])}):
             self.assertEqual(server.reveal_model({"provider": "codex-cli", "model": "gpt-5.5"}), "gpt-5.5")
             chosen = {"provider": "codex-cli", "model": "gpt-5.5", "route": {"chosen": {"lane": "codex"}}}
             self.assertEqual(server.reveal_model(chosen), "gpt-5.5")
@@ -451,33 +495,105 @@ class RevealModelTests(unittest.TestCase):
         week = self.win("week", 50, reset_in_s=int(6.5 * 86400))
         five = self.win("5-hour", 85, reset_in_s=60, window_s=5 * 3600)
         self.assertIs(scarcity._roll([week, five])["tightest"], week)
-        with self.lanes({"claude": {"windows": [week, five]}}):
+        with self.lanes({"claude": reading([week, five])}):
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
                              "claude-sonnet-5 · 15% left")
 
     def test_a_separately_metered_pool_binds_when_it_is_tighter(self):
-        with self.lanes({"claude": {"windows": [self.win("week", 20), self.win("week-fable", 95, pool="fable")]}}):
+        with self.lanes({"claude": reading([self.win("week", 20), self.win("week-fable", 95, pool="fable")])}):
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-fable-5"}),
                              "claude-fable-5 · 5% left")
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
                              "claude-sonnet-5 · 80% left")      # a model off the pool is not bound by it
 
     def test_a_reading_for_another_login_or_a_failed_one_gives_no_percent(self):
-        with self.lanes({"claude": {"config_dir": "/a", "windows": [self.win("week", 20)]}}):
-            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m", "config_dir": "/b"}), "m")
-        with self.lanes({"claude": {"error": "timeout", "windows": [self.win("week", 20)]}}):
+        b = {"provider": "claude-cli", "model": "m", "account": "b", "config_dir": "/b"}
+        with self.lanes({"claude": reading([self.win("week", 20)], "/a")}):
+            self.assertEqual(server.reveal_model(b), "m")
+        with self.lanes({"claude": reading([self.win("week", 20)], error="timeout")}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+        failed_since = reading([self.win("week", 20)], age_s=600, error="Timeout", tried_at=time.time() - 30)
+        with self.lanes({"claude": failed_since}):
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
 
-    def test_the_default_login_is_an_identity_of_its_own(self):
-        # A default-login route (config_dir None) must not show a reading sampled for a named account, nor a named
-        # route the default login's reading; only a matching identity (both None, or equal) is trusted.
-        with self.lanes({"claude": {"config_dir": "/a", "windows": [self.win("week", 20)]}}):
+    def test_a_stale_reading_gives_no_percent(self):
+        # Older than the routing view's 6-hour freshness window (scarcity.reading_freshness, as lane_scarcity): unknown
+        # to routing, so no % either. Just inside it the % is shown.
+        with self.lanes({"claude": reading([self.win("week", 20)], age_s=6 * 3600 + 60)}):
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
-            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m", "config_dir": None}), "m")
-            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m", "config_dir": "/a"}),
-                             "m · 80% left")
-        with self.lanes({"claude": {"config_dir": None, "windows": [self.win("week", 20)]}}):
+            self.assertIsNone(core._scarcity_module().lane_scarcity(refresh=False)["claude"]["scarcity"])
+        with self.lanes({"claude": reading([self.win("week", 20)], age_s=6 * 3600 - 60)}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m · 80% left")
+        undated = reading([self.win("week", 20)])
+        del undated["fetched_at"]
+        with self.lanes({"claude": undated}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+
+    def test_an_unconfirmed_effective_login_gives_no_percent(self):
+        # Both explicit config_dirs are None, but the sampler ran on another CLAUDE_CONFIG_DIR than the provider's
+        # default login would: the None==None match must not show that login's %.
+        other = reading([self.win("week", 20)], login=os.path.realpath("/tmp/some-other-login"))
+        with self.lanes({"claude": other}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+        # a legacy reading with no recorded login, or one whose login could not be pinned (an ambient token)
+        legacy = reading([self.win("week", 20)])
+        del legacy["login"]
+        for r in (legacy, reading([self.win("week", 20)], login=None)):
+            with self.lanes({"claude": r}):
+                self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+        # the provider's own env cannot be pinned to a stored login (an ambient OAuth token): no %
+        with self.lanes({"claude": reading([self.win("week", 20)])}), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+        # the provider's CLAUDE_CONFIG_DIR changed since the sample: no longer the sampled login
+        with self.lanes({"claude": reading([self.win("week", 20)])}), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/tmp/cortados-test-elsewhere"}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
+
+    def test_the_sampler_stamps_the_login_it_effectively_ran_on(self):
+        sc = core._scarcity_module()
+        self.assertEqual(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x"}), os.path.realpath("/tmp/x"))
+        self.assertEqual(sc.claude_login_identity({"HOME": "/tmp/h"}), os.path.realpath("/tmp/h/.claude"))
+        self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x", "ANTHROPIC_API_KEY": "k"}))
+        seen = {}
+
+        def capture(argv, command, done, env, **kw):
+            seen["env"] = dict(env)
+            return "Current session 10% used\nCurrent week (all models) 20% used"
+        with mock.patch.object(sc, "tui_capture", capture), \
+                mock.patch.object(sc, "parse_claude_usage", lambda t: [{**self.win("week", 20), "pool": "all"}]):
+            self.assertEqual(sc._claude(None, None)["login"], sc.claude_login_identity(seen["env"]))
+            self.assertEqual(sc._claude(None, "/tmp/acct-b")["login"], os.path.realpath("/tmp/acct-b"))
+
+    def test_a_missing_separate_pool_reading_gives_no_percent(self):
+        # Fable is metered on its own pool; with its per-model panel rate-limited (no fable window, or only one carried
+        # forward from an earlier read) the general windows alone cannot bound it: the model name alone.
+        fable = {"provider": "claude-cli", "model": "claude-fable-5"}
+        with self.lanes({"claude": reading([self.win("week", 20)])}):
+            self.assertEqual(server.reveal_model(fable), "claude-fable-5")
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
+                             "claude-sonnet-5 · 80% left")
+        carried = reading([self.win("week", 20), {**self.win("week-fable", 30, pool="fable"), "stale": True}],
+                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+        with self.lanes({"claude": carried}):
+            self.assertEqual(server.reveal_model(fable), "claude-fable-5")
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
+                             "claude-sonnet-5 · 80% left")      # off the pool: the fresh general windows still count
+        chosen = {"provider": "claude-cli", "model": "claude-opus-5", "route": {"chosen": {"lane": "claude", "pool": "opus"}}}
+        with self.lanes({"claude": reading([self.win("week", 20)])}):
+            self.assertEqual(server.reveal_model(chosen), "claude-opus-5")
+
+    def test_the_default_login_is_an_identity_of_its_own(self):
+        # A default-login route (no account) must not show a reading sampled for a named account, nor a named route the
+        # default login's reading; only a matching identity is trusted. A route config_dir without an account runs on
+        # the default login (Registry.new), so it is the default login's reading that applies.
+        a = {"provider": "claude-cli", "model": "m", "account": "a", "config_dir": "/a"}
+        with self.lanes({"claude": reading([self.win("week", 20)], "/a")}):
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m")
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m", "config_dir": "/a"}), "m")
+            self.assertEqual(server.reveal_model(a), "m · 80% left")
+        with self.lanes({"claude": reading([self.win("week", 20)])}):
+            self.assertEqual(server.reveal_model(a), "m")
             self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "m"}), "m · 80% left")
 
     def test_the_api_lane_suffix_reads_its_dollar_meter(self):
