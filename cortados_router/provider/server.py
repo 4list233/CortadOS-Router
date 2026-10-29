@@ -332,6 +332,12 @@ class Handler(BaseHTTPRequestHandler):
         if not anthropic_proxy.configured():
             return self._error(503, "overloaded_error",
                                "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
+        bad = api_credits.unbounded_server_tools(body)
+        if bad:                                   # a server tool whose cost we cannot bound/reconcile -> never dispatch
+            return self._error(400, "invalid_request_error",
+                               f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
+                               f"{', '.join(sorted(set(bad)))} (billed by server-side time); not permitted on this lane", wire)
+        body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
         now = time.time()
         max_cost = api_credits.estimate_max_cost(body, model)
         try:
@@ -358,7 +364,9 @@ class Handler(BaseHTTPRequestHandler):
             elif outcome == "completed":
                 charge = api_credits.cost_from_usage(model, usage)   # a terminal response: settle the actual cost
             else:
-                charge = max_cost                 # unknown (timeout / transport error / mid-stream disconnect)
+                # unknown (timeout / transport error / mid-stream disconnect): the full reservation, but never below
+                # the cost we already observed on the wire, so a partial-but-expensive turn cannot under-settle.
+                charge = max(max_cost, api_credits.cost_from_usage(model, usage))
             try:
                 api_credits.settle(res_id, charge, now)
             except api_credits.LedgerError as exc:

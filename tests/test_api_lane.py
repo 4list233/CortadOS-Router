@@ -49,6 +49,28 @@ class TestServeApiLane(unittest.TestCase):
             served.assert_not_called()                 # never spend when accounting is unavailable
         self.assertEqual(h.errors[0][0], 503)
 
+    def test_refuses_an_unbounded_server_tool_before_dispatch(self):
+        h = self._handler()
+        body = {"model": "api", "tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+             mock.patch("cortados_router.api_credits.reserve") as reserve, \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve") as served:
+            h._serve_api_lane(body, "claude-opus-5-5", None)
+            reserve.assert_not_called()                # refused before any reservation or dispatch
+            served.assert_not_called()
+        self.assertEqual(h.errors[0][0], 400)
+
+    def test_unknown_outcome_never_settles_below_observed_cost(self):
+        h = self._handler()
+        usage = {"input_tokens": 1_000_000, "output_tokens": 0}   # opus-5-5 input -> $4 already observed on the wire
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+             mock.patch("cortados_router.api_credits.reserve", return_value="2026-11:abc"), \
+             mock.patch("cortados_router.api_credits.estimate_max_cost", return_value=1.0), \
+             mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=(usage, "unknown")), \
+             mock.patch("cortados_router.api_credits.settle") as settle:
+            h._serve_api_lane({"model": "api/claude-opus-5-5"}, "claude-opus-5-5", None)
+            self.assertAlmostEqual(settle.call_args[0][1], 4.0, places=4)   # max(reservation 1.0, observed 4.0)
+
     def test_completed_turn_settles_the_actual_cost(self):
         h = self._handler()
         usage = {"input_tokens": 1_000_000, "output_tokens": 0}  # opus-5-5 input -> $4

@@ -56,7 +56,65 @@ DEFAULT_PRICE = _entry(10.0, 50.0)  # unknown model -> most expensive tier
 SERVER_TOOL_USD: dict[str, float] = {
     "web_search_requests": 0.01,
 }
-DEFAULT_SERVER_TOOL_USES = 20  # a declared server tool with no max_uses: reserve this many calls (conservative)
+DEFAULT_SERVER_TOOL_USES = 20  # a declared web-search tool with no max_uses: reserve AND enforce this many calls
+
+# Server tools the API itself EXECUTES and bills. The credit lane admits a request using one only when it can both
+# BOUND the cost up front and reconcile it from usage afterwards. Keyed by the tool-type prefix, since Anthropic
+# suffixes a date (e.g. "web_search_20250305"). An ordinary client-executed tool is not listed here and is fine.
+#   metered   -> per-request charge, bounded by an enforced max_uses and settled from usage.server_tool_use
+#   free      -> no per-request charge (tokens only)
+#   unbounded -> billed by server-side time/resource the meter cannot bound or reconcile yet -> refuse admission
+_SERVER_TOOL_KIND: dict[str, str] = {
+    "web_search": "metered",
+    "web_fetch": "free",
+    "code_execution": "unbounded",
+}
+
+
+def unbounded_server_tools(body: dict[str, Any] | None) -> list[str]:
+    """The server-executed tools in `body` whose cost the meter cannot bound and reconcile. A request declaring one
+    must be refused on the credit lane (its spend is unknowable in advance and not recoverable from usage)."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list):
+        return []
+    bad: list[str] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        ttype = str(t.get("type") or "").lower()
+        for prefix, kind in _SERVER_TOOL_KIND.items():
+            if ttype.startswith(prefix) and kind == "unbounded":
+                bad.append(ttype)
+    return bad
+
+
+def enforce_server_tool_caps(body: dict[str, Any]) -> dict[str, Any]:
+    """Return `body` (a shallow copy if anything changed) with every metered server tool carrying an explicit cap
+    equal to what the meter reserves for it, so the API cannot run more billable calls than were paid for. A
+    web-search tool with no max_uses gets DEFAULT_SERVER_TOOL_USES; a declared max_uses is left as the client set
+    it (the API already enforces it, and the reservation matches)."""
+    if not isinstance(body, dict):
+        return body
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body
+    changed = False
+    new_tools: list[Any] = []
+    for t in tools:
+        if isinstance(t, dict) and "web_search" in str(t.get("type") or "").lower():
+            try:
+                uses = int(t.get("max_uses") or 0)
+            except (TypeError, ValueError):
+                uses = 0
+            if uses <= 0:
+                t = dict(t, max_uses=DEFAULT_SERVER_TOOL_USES)
+                changed = True
+        new_tools.append(t)
+    if not changed:
+        return body
+    out = dict(body)
+    out["tools"] = new_tools
+    return out
 
 DEFAULT_BUDGET_USD = 200.0
 

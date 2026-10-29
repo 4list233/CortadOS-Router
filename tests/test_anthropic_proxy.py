@@ -118,6 +118,35 @@ class TestServe(unittest.TestCase):
         self.assertEqual(usage.get("input_tokens"), 1000)
         self.assertEqual(outcome, "unknown")
 
+    def test_stream_completed_survives_a_late_client_write_failure(self):
+        # writes 1-2 succeed; the write of the message_stop chunk fails. message_stop was parsed first, so the full
+        # turn was received and billed -> "completed", not downgraded to "unknown" by the client disconnect.
+        chunks = [
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":1000}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        h = FakeHandler(fail_write_after=2)
+        usage, outcome = ap.serve(h, {"model": "cortados", "stream": True}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(chunks=chunks))
+        self.assertEqual(outcome, "completed")
+        self.assertEqual(usage.get("output_tokens"), 5)
+
+    def test_nonstream_completed_survives_a_client_write_failure(self):
+        msg = {"id": "m1", "type": "message", "usage": {"input_tokens": 1000, "output_tokens": 7}}
+        h = FakeHandler(fail_write_after=0)   # the body write fails outright
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: FakeResp(body=json.dumps(msg).encode()))
+        self.assertEqual(outcome, "completed")   # a full response was received and billed regardless
+        self.assertEqual(usage.get("output_tokens"), 7)
+
+    def test_http_error_stays_rejected_even_if_relay_write_fails(self):
+        err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))
+        h = FakeHandler(fail_write_after=0)
+        usage, outcome = ap.serve(h, {"model": "cortados"}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=mock.Mock(side_effect=err))
+        self.assertEqual((usage, outcome), ({}, "rejected"))   # the API rejected it; a failed relay does not bill it
+
     def test_http_error_is_relayed_and_rejected(self):
         err = urllib.error.HTTPError("u", 400, "Bad", {"content-type": "application/json"}, io.BytesIO(b'{"error":"x"}'))
         h = FakeHandler()

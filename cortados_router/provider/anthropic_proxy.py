@@ -120,11 +120,14 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         resp = open_fn(req, timeout=UPSTREAM_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
         payload = exc.read()
-        handler.send_response(exc.code)
-        handler.send_header("content-type", (exc.headers.get("content-type") if exc.headers else None) or "application/json")
-        handler.send_header("content-length", str(len(payload)))
-        handler.end_headers()
-        handler.wfile.write(payload)
+        try:
+            handler.send_response(exc.code)
+            handler.send_header("content-type", (exc.headers.get("content-type") if exc.headers else None) or "application/json")
+            handler.send_header("content-length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+        except OSError:
+            pass   # the API REJECTED the turn (nothing billed) whether or not we could relay the rejection
         return {}, "rejected"
     except (urllib.error.URLError, OSError) as exc:
         msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"cortados: upstream API unreachable: {exc}"}}).encode()
@@ -142,11 +145,14 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                 usage: dict[str, Any] = extract_usage(json.loads(raw))
             except ValueError:
                 usage = {}
-            handler.send_response(200)
-            handler.send_header("content-type", "application/json")
-            handler.send_header("content-length", str(len(raw)))
-            handler.end_headers()
-            handler.wfile.write(raw)
+            try:
+                handler.send_response(200)
+                handler.send_header("content-type", "application/json")
+                handler.send_header("content-length", str(len(raw)))
+                handler.end_headers()
+                handler.wfile.write(raw)
+            except OSError:
+                pass   # a full response was received and billed; a client write failure does not change the outcome
             return usage, "completed"
         # Streaming: parse usage (and watch for the terminal message_stop) from each chunk BEFORE writing it.
         handler.send_response(200)
@@ -157,7 +163,6 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         handler.close_connection = True
         usage = {}
         completed = False
-        disconnected = False
         for chunk in resp:
             text = chunk.decode("utf-8", "replace")
             if _update_usage_from_sse(usage, text):   # True only on a PARSED message_stop event
@@ -166,6 +171,7 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
             except OSError:
-                disconnected = True
-                break  # client gone
-        return usage, ("completed" if completed and not disconnected else "unknown")
+                break  # client gone: stop relaying, but the billing outcome is decided by what we already parsed
+        # If the terminal event was parsed, the full turn was received and billed regardless of a late client
+        # disconnect -> "completed". Otherwise the turn did not terminate for us -> "unknown" (settle conservatively).
+        return usage, ("completed" if completed else "unknown")

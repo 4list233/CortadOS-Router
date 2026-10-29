@@ -57,6 +57,26 @@ class TestPricing(unittest.TestCase):
                                 ac.estimate_max_cost(plain, "claude-opus-5-5") + 0.07)
 
 
+class TestServerToolAdmission(unittest.TestCase):
+    def test_unbounded_server_tools_flags_only_code_execution(self):
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
+                         ["code_execution_20250522"])
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"type": "web_search_20250305"}, {"type": "web_fetch_20250910"}]}), [])
+        self.assertEqual(ac.unbounded_server_tools({"tools": [{"name": "my_tool", "input_schema": {}}]}), [])  # a client tool
+        self.assertEqual(ac.unbounded_server_tools({}), [])
+
+    def test_enforce_server_tool_caps_injects_and_matches_the_reserve(self):
+        body = {"tools": [{"type": "web_search_20250305", "name": "web_search"}]}
+        out = ac.enforce_server_tool_caps(body)
+        self.assertEqual(out["tools"][0]["max_uses"], ac.DEFAULT_SERVER_TOOL_USES)
+        self.assertIsNot(out, body)                               # copied; the original is not mutated
+        self.assertNotIn("max_uses", body["tools"][0])
+        # the enforced cap equals what the meter reserves for that tool, so admission is a real bound
+        self.assertAlmostEqual(ac._server_tool_allowance(out["tools"]), ac.DEFAULT_SERVER_TOOL_USES * 0.01, places=4)
+        declared = {"tools": [{"type": "web_search_20250305", "max_uses": 3}]}
+        self.assertIs(ac.enforce_server_tool_caps(declared), declared)   # already capped -> unchanged
+
+
 class TestPeriod(unittest.TestCase):
     def test_reset_day_shifts_the_period(self):
         with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_RESET_DAY": "15"}):
