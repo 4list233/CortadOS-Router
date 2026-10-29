@@ -46,7 +46,7 @@ STATE = Path(_env_get("CORTADOS_HOME") or _env_get("CORTADOS_HERMES_HOME") or Pa
 CACHE = STATE / "scarcity.json"
 HISTORY = STATE / "scarcity-history.jsonl"   # one line per sample: the series the unit-cost learner and the crons read
 PROBE_DIR = STATE / "usage-probe"            # empty folder the interactive CLIs are opened in
-MIN_INTERVAL = {"claude": 900, "codex": 900, "cursor": 1800, "antigravity": 1800, "local": 60}
+MIN_INTERVAL = {"claude": 900, "codex": 900, "cursor": 1800, "antigravity": 1800, "local": 60, "anthropic-api": 300}
 H5, D7 = 5 * 3600.0, 7 * 86400.0
 _lock = threading.Lock()
 _refreshing = threading.Event()
@@ -535,7 +535,18 @@ def finish(lane: str, rec: dict[str, Any]) -> dict[str, Any]:
         p: {**v, "scarcity": 1.0 if v["spent"] else v["scarcity"]} for p, v in pools.items()}}
 
 
-SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local}
+def _anthropic_api() -> dict[str, Any]:
+    """The API-credit lane: a dollar-metered 1-month window, read cheaply from the local meter (no PTY, no quota
+    spent). Reuses window_view so its pacing (use-it-or-lose-it, cap at spent) matches every other lane."""
+    from cortados_router import api_credits
+    now = time.time()
+    used_pct, reset_at, window_s = api_credits.window_numbers(now)
+    return {"source": "self-metered (api credits)", "budget_usd": api_credits.budget_usd(),
+            "spent_usd": round(api_credits.spent(now), 4), "windows": [window_view("1mo", used_pct, reset_at, window_s, now)]}
+
+
+SAMPLERS = {"claude": _claude, "antigravity": _antigravity, "codex": _codex, "cursor": _cursor, "local": _local,
+            "anthropic-api": _anthropic_api}
 
 
 def _plans() -> dict[str, str]:

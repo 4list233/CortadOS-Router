@@ -41,6 +41,16 @@
    "resource": "vram",
    "ram_gate_factor": 1.5,
    "note": "scarcity = memory pressure; 0 when the model is resident and the gate passes"
+  },
+  "anthropic-api": {
+   "plan": "Anthropic API credits ($200/mo)",
+   "windows": [
+    "1mo"
+   ],
+   "usage_source": "self-metered: cortados_router/api_credits.py sums response-usage cost into ~/.cortados/api-credit-meter.json",
+   "budget_usd": 200,
+   "spend_down": true,
+   "note": "The one DOLLAR-denominated window (Forest's 'scarcity is subscription units, never dollars' holds for the subscription plans). A credit-funded Claude lane: use-it-or-lose-it via the 1mo window, hard-capped at the budget so it never bills past the included credits. Prices per model live in api_credits.py (from the claude-api skill, cached 2026-10-06)."
   }
  },
  "policy": {

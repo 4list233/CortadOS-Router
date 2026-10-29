@@ -311,6 +311,82 @@ class Handler(BaseHTTPRequestHandler):
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}
         self._json(200, {"result": result})
 
+    @staticmethod
+    def _api_pin(body: dict[str, Any]) -> str | None:
+        """A request pinned to the anthropic-api credit lane: model `api/<claude-model>` (or bare `api` for the
+        default). Returns the Claude model to run on the API lane, or None for a normal (S1-routed) request."""
+        m = (body.get("model") or "").strip()
+        if m == "api":
+            return "claude-opus-5-5"
+        if m.startswith("api/"):
+            return m[4:].strip() or "claude-opus-5-5"
+        return None
+
+    def _serve_api_lane(self, body: dict[str, Any], model: str, wire: Wire) -> None:
+        """Execute a pinned request on the anthropic-api credit lane under admission control: reserve a conservative
+        max cost BEFORE dispatch, proxy to api.anthropic.com, then settle the actual cost (the full reservation if
+        the actual is unknown). Refuse when the credit is spent, and fail closed if accounting is unavailable.
+        Stateless — no session, no S1 (the pin is explicit)."""
+        from cortados_router import api_credits
+        from cortados_router.provider import anthropic_proxy
+        if not anthropic_proxy.configured():
+            return self._error(503, "overloaded_error",
+                               "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
+        bad = api_credits.unbounded_server_tools(body)
+        if bad:                                   # a server tool whose cost we cannot bound/reconcile -> never dispatch
+            return self._error(400, "invalid_request_error",
+                               f"cortados: the anthropic-api credit lane cannot bound the cost of server tool(s) "
+                               f"{', '.join(sorted(set(bad)))} (billed by server-side time); not permitted on this lane", wire)
+        body = api_credits.enforce_server_tool_caps(body)   # cap metered tools to what we reserve, so admission is a real bound
+        now = time.time()
+        max_cost = api_credits.estimate_max_cost(body, model)
+        try:
+            res_id = api_credits.reserve(max_cost, now)
+        except api_credits.LedgerError as exc:
+            logger.error("anthropic-api accounting unavailable, refusing to spend blind: %s", exc)
+            return self._error(503, "overloaded_error",
+                               "cortados: the anthropic-api lane's accounting is unavailable; refusing", wire)
+        if res_id is None:
+            return self._error(429, "rate_limit_error",
+                               f"cortados: the anthropic-api credit (${api_credits.budget_usd():.0f}) is spent or "
+                               "fully reserved this period; it resets on the billing day", wire)
+        logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
+                    max_cost, model, api_credits.committed(now), api_credits.budget_usd())
+        usage: dict[str, Any] = {}
+        outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
+        try:
+            usage, outcome = anthropic_proxy.serve(self, body, model, now)
+        except OSError as exc:
+            logger.info("anthropic-api proxy: client left (%s)", exc)
+        except Exception as exc:
+            # Any other failure out of serve() (e.g. a response-parse error after the POST was dispatched) leaves the
+            # spend genuinely unknown -> keep outcome "unknown" so we settle conservatively rather than crash/undercharge.
+            logger.error("anthropic-api proxy failed after dispatch (settling conservatively): %s", exc)
+        finally:
+            if outcome == "rejected":
+                charge = 0.0                       # the API returned an error; nothing was billed
+            elif outcome == "completed":
+                charge = api_credits.cost_from_usage(model, usage)   # a terminal response: settle the actual cost
+            else:
+                # unknown (timeout / transport error / mid-stream disconnect): the full reservation, but never below
+                # the cost we already observed on the wire, so a partial-but-expensive turn cannot under-settle.
+                charge = max(max_cost, api_credits.cost_from_usage(model, usage))
+            # Settle, retrying on a transient ledger failure (settle is idempotent, so a retry cannot double-charge).
+            settled = False
+            for attempt in range(3):
+                try:
+                    api_credits.settle(res_id, charge, now)
+                    settled = True
+                    break
+                except api_credits.LedgerError as exc:
+                    logger.error("anthropic-api settle attempt %d/3 failed for %s: %s", attempt + 1, res_id, exc)
+            if not settled:
+                # The reservation ($%.4f) is retained, so pacing stays safe UNLESS the observed charge exceeded it
+                # (estimate_max_cost is a conservative upper bound, so that is rare); the API's overage-off credit
+                # cap is the authoritative hard backstop in every case.
+                logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
+                             "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
+
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
         reg = self.server.registry
@@ -319,6 +395,10 @@ class Handler(BaseHTTPRequestHandler):
             Path(dump).mkdir(parents=True, exist_ok=True)
             (Path(dump) / f"{time.time():.3f}.json").write_text(json.dumps(body, indent=1))
         try:
+            api_model = self._api_pin(body)
+            if api_model:
+                # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
+                return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
