@@ -104,8 +104,11 @@ class TestPeriod(unittest.TestCase):
 class TestAdmission(unittest.TestCase):
     def setUp(self):
         self.meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10"})
+        # One configured org ($10 window). A key must be configured for reserve() to have an org to charge.
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                                 "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False)
         self.env.start()
+        os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)   # ensure a single org for this class
 
     def tearDown(self):
         self.env.stop()
@@ -192,6 +195,78 @@ class TestAdmission(unittest.TestCase):
         used_pct, reset_at, window_s = ac.window_numbers(T, self.meter)
         self.assertEqual(used_pct, 90.0)
         self.assertGreater(reset_at, T)
+
+
+class TestTwoOrgs(unittest.TestCase):
+    """Two credit orgs (two keys), each with its own $10 window — $20 total. Admission drains org 1 first."""
+    def setUp(self):
+        self.meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                                 "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1",
+                                                 "CORTADOS_ANTHROPIC_API_KEY_2": "sk-org-2"}, clear=False)
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def test_configured_orgs_and_total_budget(self):
+        self.assertEqual(ac.configured_orgs(), [("1", "sk-org-1"), ("2", "sk-org-2")])
+        self.assertEqual(ac.budget_usd(), 10.0)          # per org
+        self.assertEqual(ac.total_budget_usd(), 20.0)    # both orgs
+
+    def test_reserve_drains_org1_then_overflows_to_org2(self):
+        r1 = ac.reserve(8.0, T, self.meter)
+        self.assertTrue(r1.startswith("1|"))             # first org
+        r2 = ac.reserve(8.0, T, self.meter)              # org 1 would exceed $10 -> org 2
+        self.assertTrue(r2.startswith("2|"))
+        self.assertEqual(ac.committed(T, self.meter), 16.0)   # summed across both orgs
+        self.assertIsNone(ac.reserve(8.0, T, self.meter))     # both orgs full ($8 of $10 each) -> refused
+
+    def test_key_for_reservation_routes_to_the_right_org(self):
+        r1 = ac.reserve(8.0, T, self.meter)
+        r2 = ac.reserve(8.0, T, self.meter)
+        self.assertEqual(ac.key_for_reservation(r1), "sk-org-1")
+        self.assertEqual(ac.key_for_reservation(r2), "sk-org-2")
+
+    def test_settle_charges_only_its_own_org(self):
+        r_org1 = ac.reserve(8.0, T, self.meter)          # first reserve -> org 1
+        self.assertTrue(r_org1.startswith("1|"))
+        ac.reserve(9.0, T, self.meter)                   # org 1 full (8+9>10) -> org 2
+        self.assertEqual(ac.committed(T, self.meter), 17.0)
+        ac.settle(r_org1, 2.0, T, self.meter)            # settle org 1; org 2's reservation is untouched
+        self.assertAlmostEqual(ac.spent(T, self.meter), 2.0, places=4)
+        self.assertAlmostEqual(ac.committed(T, self.meter), 2.0 + 9.0, places=4)   # spent 2 (org1) + 9 reserved (org2)
+
+    def test_deconfigured_org_has_no_key(self):
+        r_org1 = ac.reserve(8.0, T, self.meter)          # org 1
+        self.assertTrue(r_org1.startswith("1|"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            # an org-2 reservation now has no key (that org was removed from config)
+            r_org2 = "2|" + ac.period_key(T) + ":deadbeef"
+            self.assertIsNone(ac.key_for_reservation(r_org2))
+            self.assertEqual(ac.key_for_reservation(r_org1), "sk-org-1")   # org 1 still configured
+
+
+class TestLegacyMigration(unittest.TestCase):
+    def test_legacy_single_org_file_is_read_as_org_1(self):
+        meter = Path(tempfile.mkdtemp()) / "api-credit-meter.json"
+        period = ac.period_key(T)
+        meter.parent.mkdir(parents=True, exist_ok=True)
+        meter.write_text(json.dumps({"periods": {period: {"spent_usd": 3.0, "reserved": {}}}}))
+        with mock.patch.dict(os.environ, {"CORTADOS_API_CREDIT_BUDGET_USD": "10",
+                                          "CORTADOS_ANTHROPIC_API_KEY": "sk-org-1"}, clear=False):
+            os.environ.pop("CORTADOS_ANTHROPIC_API_KEY_2", None)
+            self.assertEqual(ac.spent(T, meter), 3.0)               # legacy spend read under org 1
+            r = ac.reserve(2.0, T, meter)                           # a new reservation migrates the file in place
+            self.assertTrue(r.startswith("1|"))
+            ac.settle(r, 2.0, T, meter)
+            self.assertEqual(ac.spent(T, meter), 5.0)               # 3 legacy + 2 new
+            # a legacy reservation id (no org prefix) still settles against org 1
+            self.assertEqual(ac._org_of("%s:abc123" % period), ("1", period))
+        data = json.loads(meter.read_text())
+        self.assertIn("orgs", data)                                 # persisted in the nested shape
+        self.assertIn("1", data["orgs"])
 
 
 class TestBudgetEnv(unittest.TestCase):

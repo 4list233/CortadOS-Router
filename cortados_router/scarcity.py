@@ -541,7 +541,7 @@ def _anthropic_api() -> dict[str, Any]:
     from cortados_router import api_credits
     now = time.time()
     used_pct, reset_at, window_s = api_credits.window_numbers(now)
-    return {"source": "self-metered (api credits)", "budget_usd": api_credits.budget_usd(),
+    return {"source": "self-metered (api credits)", "budget_usd": api_credits.total_budget_usd(),
             "spent_usd": round(api_credits.spent(now), 4), "windows": [window_view("1mo", used_pct, reset_at, window_s, now)]}
 
 

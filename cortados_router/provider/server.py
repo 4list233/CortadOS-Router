@@ -329,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         Stateless — no session, no S1 (the pin is explicit)."""
         from cortados_router import api_credits
         from cortados_router.provider import anthropic_proxy
-        if not anthropic_proxy.configured():
+        if not api_credits.configured_orgs():
             return self._error(503, "overloaded_error",
                                "cortados: the anthropic-api lane has no key (set CORTADOS_ANTHROPIC_API_KEY)", wire)
         bad = api_credits.unbounded_server_tools(body)
@@ -348,14 +348,21 @@ class Handler(BaseHTTPRequestHandler):
                                "cortados: the anthropic-api lane's accounting is unavailable; refusing", wire)
         if res_id is None:
             return self._error(429, "rate_limit_error",
-                               f"cortados: the anthropic-api credit (${api_credits.budget_usd():.0f}) is spent or "
+                               f"cortados: the anthropic-api credit (${api_credits.total_budget_usd():.0f}) is spent or "
                                "fully reserved this period; it resets on the billing day", wire)
+        key = api_credits.key_for_reservation(res_id)
+        if not key:
+            # The reservation's org was deconfigured between reserve and dispatch (rare). Release it and refuse
+            # rather than fall back to another org's key, which would misattribute the spend.
+            api_credits.settle(res_id, 0.0, now)
+            return self._error(503, "overloaded_error",
+                               "cortados: the anthropic-api lane's reserved org is no longer configured", wire)
         logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
-                    max_cost, model, api_credits.committed(now), api_credits.budget_usd())
+                    max_cost, model, api_credits.committed(now), api_credits.total_budget_usd())
         usage: dict[str, Any] = {}
         outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
         try:
-            usage, outcome = anthropic_proxy.serve(self, body, model, now)
+            usage, outcome = anthropic_proxy.serve(self, body, model, now, key=key)
         except OSError as exc:
             logger.info("anthropic-api proxy: client left (%s)", exc)
         except Exception as exc:
