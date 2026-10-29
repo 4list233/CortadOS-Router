@@ -501,9 +501,13 @@ def headroom_pct_for(c: dict[str, Any], *, refresh: bool = False) -> float | Non
       - it is this candidate's login: candidate_health's config_dir rule (_reading_for_other_login) AND the EFFECTIVE
         login the reading was sampled on (its `login`) equals the one the caller executes on (c["login"]), since
         config_dir None only says "no explicit account", not which CLAUDE_CONFIG_DIR / token either process inherited;
-      - when the model draws on a separately metered pool (Fable, …), a current window of THAT pool is in the reading:
-        the general windows alone cannot bound it (a rate-limited per-model panel, or one only carried forward from an
-        earlier read, `stale`, gives no %)."""
+      - a current general ("all") window is present (shared session/weekly capacity, which constrains every model):
+        a reading of a per-model panel alone cannot bound the model;
+      - when the model draws on a separately metered pool (Fable, …), a current window of THAT pool is in the reading
+        (not rate-limited `per_model`, nor one only carried forward from an earlier read, `stale`).
+    A relative CLAUDE_CONFIG_DIR also yields no login match (scarcity.claude_login_identity), so no % there either.
+    (Known limit: only Fable is treated as separately metered on Claude; a model that resolved to the general pool is
+    assumed to truly use it. If the vendor ever meters another model separately, add it to scarcity.pool_for.)"""
     try:
         sc = _scarcity_module()
         lane = (sc.current(refresh=refresh).get("lanes") or {}).get(c["lane"])
@@ -516,13 +520,20 @@ def headroom_pct_for(c: dict[str, Any], *, refresh: bool = False) -> float | Non
             return None
         if not c.get("login") or lane.get("login") != c["login"]:
             return None                                              # effective login unconfirmed (or unknowable)
+        windows = lane.get("windows") or []
+        if not any(w.get("pool", "all") == "all" and w.get("headroom_pct") is not None and not w.get("stale")
+                   for w in windows):
+            return None                                              # the general ("all") windows that ALSO constrain
+                                                                     # every model are missing/stale -> shared capacity
+                                                                     # is unknown, so no % (finding 3)
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
-        relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
+        relevant = [w for w in windows if w.get("pool", "all") in ("all", pool)]
         if any(w.get("stale") for w in relevant):
             return None                                              # part of the picture is a carried-forward old read
         if pool != "all" and (lane.get("per_model") or not any(
                 w.get("pool") == pool and w.get("headroom_pct") is not None for w in relevant)):
-            return None                                              # the model's own pool is not observed this read
+            return None                                              # the model's OWN separate pool is not observed
+                                                                     # this read (rate-limited / carried forward)
         return _min_headroom_pct(lane, pool)
     except Exception:
         return None

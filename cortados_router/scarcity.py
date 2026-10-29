@@ -348,8 +348,17 @@ def claude_login_identity(env: dict[str, str]) -> str | None:
     $HOME/.claude). None when the env cannot be pinned to one stored login (an override above is set)."""
     if any(env.get(k) for k in _LOGIN_OVERRIDES):
         return None
-    d = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude")
-    return os.path.realpath(os.path.expanduser(d))
+    ccd = env.get("CLAUDE_CONFIG_DIR")
+    if ccd:
+        d = os.path.expanduser(ccd)
+        if not os.path.isabs(d):
+            return None                 # a relative CLAUDE_CONFIG_DIR resolves against each process's cwd, which the
+                                        # sampler and the bridge do not share -> cannot pin one login, so do not claim one
+        return os.path.realpath(d)
+    home = env.get("HOME") or os.path.expanduser("~")
+    if not os.path.isabs(home):
+        return None
+    return os.path.realpath(os.path.join(home, ".claude"))
 
 
 def _ensure_trust(config_dir: str) -> None:
@@ -381,13 +390,22 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     # `login`: the login this CLI EFFECTIVELY ran on (its env, not just the explicit config_dir arg, which is None both
     # for "the default login" and for an inherited CLAUDE_CONFIG_DIR): what a reader confirms before showing the %.
     out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir, "login": claude_login_identity(env)}
-    if not any(w["pool"] != "all" for w in wins) and (prev or {}).get("config_dir") == config_dir:
-        # carry the last per-model reading forward only when it was sampled for THIS same account (config_dir): after a
-        # reorder, the positional lane key may now point to a different login, and its old windows must not cross over.
-        out["per_model"] = "not shown this read (vendor rate limit on the per-model panel)"
-        for w in (prev or {}).get("windows") or []:          # keep the last per-model reading until its own reset passes
-            if w.get("pool", "all") != "all" and w.get("resets_at") and w["resets_at"] > time.strftime("%Y-%m-%d %H:%M"):
+    if (prev or {}).get("config_dir") == config_dir:
+        # Carry forward EACH separately-metered pool a past read saw but THIS read did not (its per-model panel was
+        # rate-limited) — not only when ALL per-model panels are missing. Kept `stale` until its own reset passes, so
+        # a model whose pool is temporarily absent is still known to HAVE a separate pool (a reader then withholds its
+        # %, rather than let it fall back to the looser general pool). Only for the SAME account (config_dir): after a
+        # reorder the positional lane key may point to a different login, whose old windows must not cross over.
+        seen_pools = {w.get("pool") for w in wins if w.get("pool", "all") != "all"}
+        now_str = time.strftime("%Y-%m-%d %H:%M")
+        carried = False
+        for w in (prev or {}).get("windows") or []:          # keep each missing per-model reading until its reset
+            pool = w.get("pool", "all")
+            if pool != "all" and pool not in seen_pools and w.get("resets_at") and w["resets_at"] > now_str:
                 wins.append({**w, "stale": True})
+                carried = True
+        if carried:
+            out["per_model"] = "not shown this read (vendor rate limit on the per-model panel)"
     return {**out, "windows": wins}
 
 

@@ -555,6 +555,9 @@ class RevealModelTests(unittest.TestCase):
         self.assertEqual(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x"}), os.path.realpath("/tmp/x"))
         self.assertEqual(sc.claude_login_identity({"HOME": "/tmp/h"}), os.path.realpath("/tmp/h/.claude"))
         self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x", "ANTHROPIC_API_KEY": "k"}))
+        # a RELATIVE config dir resolves against each process's cwd (sampler vs bridge differ) -> no pinned login
+        self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "../../login"}))
+        self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "rel/login"}))
         seen = {}
 
         def capture(argv, command, done, env, **kw):
@@ -582,6 +585,31 @@ class RevealModelTests(unittest.TestCase):
         chosen = {"provider": "claude-cli", "model": "claude-opus-5", "route": {"chosen": {"lane": "claude", "pool": "opus"}}}
         with self.lanes({"claude": reading([self.win("week", 20)])}):
             self.assertEqual(server.reveal_model(chosen), "claude-opus-5")
+        # a reading with ONLY a per-model (fable) window and NO general window: shared session/weekly capacity is
+        # unknown, so even the fable model gets its name alone, never a % from the pool window in isolation (finding 3)
+        with self.lanes({"claude": reading([self.win("week-fable", 10, pool="fable")])}):
+            self.assertEqual(server.reveal_model(fable), "claude-fable-5")
+
+    def test_a_dropped_per_model_pool_is_carried_forward_when_another_pool_shows(self):
+        # finding 2: one per-model panel (Fable) shows this read but another (Opus) is rate-limited. The sampler must
+        # carry the dropped Opus pool forward (stale), so that model is still known to HAVE a separate pool and its %
+        # is withheld — while a general-pool model (Sonnet) still shows its %.
+        sc = core._scarcity_module()
+        prev = {"config_dir": None, "windows": [self.win("week", 20), self.win("week-opus", 99, pool="opus")]}
+        with mock.patch.object(sc, "tui_capture", lambda *a, **k: "Current week (all models) 20% used\nCurrent week (Fable) 10% used"), \
+                mock.patch.object(sc, "parse_claude_usage", lambda _t: [self.win("week", 20), self.win("week-fable", 10, pool="fable")]):
+            read = sc._claude(prev, None)
+        opus = next((w for w in read["windows"] if w.get("pool") == "opus"), None)
+        self.assertIsNotNone(opus)                       # the dropped Opus pool is carried forward, not forgotten
+        self.assertTrue(opus.get("stale"))               # marked stale: known to exist, but not this read's number
+        self.assertIn("per_model", read)
+        # stamp the freshness/login fields the cache layer adds around the sampler, then check reveal on the result
+        read.update({"fetched_at": time.time(), "tried_at": time.time(), "error": None, "login": login_of(None)})
+        with self.lanes({"claude": read}):
+            opus_route = {"provider": "claude-cli", "model": "claude-opus-5", "route": {"chosen": {"lane": "claude", "pool": "opus"}}}
+            self.assertEqual(server.reveal_model(opus_route), "claude-opus-5")                 # withheld: stale Opus pool
+            self.assertEqual(server.reveal_model({"provider": "claude-cli", "model": "claude-sonnet-5"}),
+                             "claude-sonnet-5 · 80% left")                                     # general pool: still shown
 
     def test_the_default_login_is_an_identity_of_its_own(self):
         # A default-login route (no account) must not show a reading sampled for a named account, nor a named route the
