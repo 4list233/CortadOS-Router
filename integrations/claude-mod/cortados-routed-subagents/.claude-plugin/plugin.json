@@ -60,13 +60,25 @@
       "type": "boolean",
       "title": "Orchestrator mode (brain only plans and delegates)",
       "default": true,
-      "description": "When on, the main session is constrained to planning and delegation: a standing directive tells it to decompose every task and delegate to routed subagents, and every tool NOT in orchestratorAllowedTools is refused on the main loop. The allowlist (not a denylist) is used so any mutating/executing tool is caught, including ones a denylist would miss. Subagents are unaffected."
+      "description": "When on, a standing directive tells the main session to plan and delegate work to routed subagents. It is guidance, not a cage: the brain keeps its tools and may act directly when delegating is clearly wasteful, and it does browser/MCP steps itself (routed subagents have only built-in tools). Turn on orchestratorEnforce for a hard tool block. Subagents are unaffected."
+    },
+    "orchestratorEnforce": {
+      "type": "boolean",
+      "title": "Orchestrator enforce (hard-block non-allowlisted tools)",
+      "default": false,
+      "description": "Off by default. When on together with orchestratorMode, every main-loop tool outside orchestratorAllowedTools is refused, so the brain cannot act even if it tried. Leave off unless you want a strict plan-only brain; it also blocks browser and connector tools the brain may need."
     },
     "orchestratorAllowedTools": {
       "type": "string",
       "title": "Tools the brain MAY use itself on the main loop",
-      "default": "Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
-      "description": "Comma/space-separated allowlist of tools the orchestrator may run on the main loop (read-to-plan + delegate + interact). Everything else — edits, shell, web, memory writes, worktree ops, MCP tools, future tools — is refused and must be delegated to a routed subagent. The Agent tool is always allowed so delegation can never be locked out. An empty/invalid value falls back to the default. Only the main loop is gated; subagents keep their full toolset."
+      "default": "Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch",
+      "description": "Used only when orchestratorEnforce is on: comma/space-separated allowlist of tools the main loop may run itself. Everything else (edits, shell, web, MCP tools, future tools) is refused and must be delegated. Agent and route_task are always allowed, and the desktop app's turn plumbing (update_plan, wrap_up, mark_chapter) is never blocked. An empty/invalid value falls back to the default."
+    },
+    "subagentTimeoutMs": {
+      "type": "number",
+      "title": "Routed subagent timeout (ms)",
+      "default": 600000,
+      "description": "How long a routed subagent may run before it is aborted. Max 600000 (10 min), Claude Code's own limit for a mod's process; larger values are clamped, fractions are rounded down, invalid values use the default."
     }
   }
 }
