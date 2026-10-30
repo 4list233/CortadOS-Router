@@ -169,8 +169,8 @@ def _resolve_token() -> str:
     try:
         with open(path) as f:
             return f.read().strip()
-    except OSError:
-        return ""
+    except (OSError, ValueError):                       # unreadable, or undecodable (UnicodeDecodeError is a ValueError):
+        return ""                                       # never crash the stdio server; route_task reports 'not configured'
 
 
 def _resolve_url() -> str:

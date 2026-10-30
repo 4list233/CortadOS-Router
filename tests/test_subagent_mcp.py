@@ -281,6 +281,16 @@ class ConfigResolutionTests(unittest.TestCase):
         with self._mock.patch.dict(self._os.environ, env_clear, clear=True):
             self.assertEqual(m._resolve_token(), "file-token")
 
+    def test_token_undecodable_file_is_empty_not_a_crash(self):
+        d = self._tempfile.mkdtemp()
+        path = self._os.path.join(d, "provider-token")
+        with open(path, "wb") as f:
+            f.write(b"\xff\xfe\x00\xd8bad")                      # not valid UTF-8
+        env_clear = {k: v for k, v in self._os.environ.items() if k != "CORTADOS_PROVIDER_TOKEN"}
+        env_clear["CORTADOS_PROVIDER_TOKEN_FILE"] = path
+        with self._mock.patch.dict(self._os.environ, env_clear, clear=True):
+            self.assertEqual(m._resolve_token(), "")
+
     def test_token_missing_file_is_empty(self):
         env_clear = {k: v for k, v in self._os.environ.items() if k != "CORTADOS_PROVIDER_TOKEN"}
         env_clear["CORTADOS_PROVIDER_TOKEN_FILE"] = "/nonexistent/cortados/provider-token"
