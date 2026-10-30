@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, register } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, register } from './register'
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
   expect(validToolName('Read')).toBe(true)
@@ -43,6 +43,22 @@ test('mainLoopAllows gates only the main loop, allowlist-style, with Agent alway
   expect(mainLoopAllows('Bash', 'agent-123', allow, true)).toBe(true)
   // mode off -> everything allowed
   expect(mainLoopAllows('Bash', undefined, allow, false)).toBe(true)
+})
+
+test('route_task is a delegation primitive, always allowed on the brain even if not in the allowlist', async () => {
+  const allow = new Set(['Read', 'Grep'])                       // route_task deliberately absent from this set
+  expect(mainLoopAllows('mcp__cortados-route__route_task', undefined, allow, true)).toBe(true)
+  // the default allow-set also lists it, so a default config advertises it
+  expect(resolveAllowSet('').has('mcp__cortados-route__route_task')).toBe(true)
+})
+
+test('resolveTimeoutMs takes a positive finite value and falls back otherwise', async () => {
+  expect(resolveTimeoutMs(900000)).toBe(900000)
+  expect(resolveTimeoutMs('1200000')).toBe(1200000)            // JSON config may deliver a string
+  expect(resolveTimeoutMs(1_800_000)).toBe(1_800_000)          // the default, passed through
+  for (const bad of [0, -5, NaN, Infinity, undefined, null, 'soon', {}]) {
+    expect(resolveTimeoutMs(bad)).toBe(1_800_000)              // never 0/negative/NaN -> would disable the cap
+  }
 })
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {

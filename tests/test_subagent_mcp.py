@@ -251,3 +251,42 @@ class EmbeddedNewlineTokenTests(unittest.TestCase):
             return FakeResp({"content": [{"type": "text", "text": "ok"}]})
         m.route_task("http://x", "cortados-provider-token-0123456789", "task", urlopen=_open)
         self.assertEqual(seen["token"], "cortados-provider-token-0123456789")   # printable token passes the check
+
+
+class ConfigResolutionTests(unittest.TestCase):
+    """How main() resolves the provider URL and token: env first, then the token file; an unexpanded ${VAR} URL is
+    treated as unconfigured (a clear 'not configured' error rather than 'unknown url type')."""
+    import os as _os
+    import tempfile as _tempfile
+    from unittest import mock as _mock
+
+    def test_url_drops_unexpanded_placeholder(self):
+        with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "${CORTADOS_PROVIDER_URL}"}):
+            self.assertEqual(m._resolve_url(), "")                     # literal placeholder -> unconfigured
+        with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "  http://host:8432 "}):
+            self.assertEqual(m._resolve_url(), "http://host:8432")     # stripped
+
+    def test_token_env_takes_precedence(self):
+        with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_TOKEN": "  env-token  "}):
+            self.assertEqual(m._resolve_token(), "env-token")
+
+    def test_token_falls_back_to_the_file(self):
+        d = self._tempfile.mkdtemp()
+        path = self._os.path.join(d, "provider-token")
+        with open(path, "w") as f:
+            f.write("file-token\n")
+        env = {"CORTADOS_PROVIDER_TOKEN_FILE": path}
+        env_clear = {k: v for k, v in self._os.environ.items() if k != "CORTADOS_PROVIDER_TOKEN"}
+        env_clear.update(env)
+        with self._mock.patch.dict(self._os.environ, env_clear, clear=True):
+            self.assertEqual(m._resolve_token(), "file-token")
+
+    def test_token_missing_file_is_empty(self):
+        env_clear = {k: v for k, v in self._os.environ.items() if k != "CORTADOS_PROVIDER_TOKEN"}
+        env_clear["CORTADOS_PROVIDER_TOKEN_FILE"] = "/nonexistent/cortados/provider-token"
+        with self._mock.patch.dict(self._os.environ, env_clear, clear=True):
+            self.assertEqual(m._resolve_token(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

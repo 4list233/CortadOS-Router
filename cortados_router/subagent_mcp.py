@@ -8,10 +8,10 @@ Stdlib only; runs standalone (the MCP client launches it as a subprocess over st
 package. It forwards to the provider — it does NOT need to sit next to S1 or the provider; it only needs to reach the
 provider URL.
 
-Register with Claude Code, e.g.:
+Register with Claude Code, e.g. (the token is read from ~/.config/cortados/provider-token by default, so only the URL
+need be set; CORTADOS_PROVIDER_TOKEN or CORTADOS_PROVIDER_TOKEN_FILE override it):
   claude mcp add cortados-route \\
     --env CORTADOS_PROVIDER_URL=http://<provider-ip>:8432 \\
-    --env CORTADOS_PROVIDER_TOKEN=<token> \\
     -- python3 /path/to/cortados_router/subagent_mcp.py
 """
 from __future__ import annotations
@@ -158,8 +158,31 @@ def _dispatch(msg, cfg, write=_write) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+def _resolve_token() -> str:
+    """The provider token: CORTADOS_PROVIDER_TOKEN if set, else the token file (CORTADOS_PROVIDER_TOKEN_FILE, default
+    ~/.config/cortados/provider-token) — the same file the routed-subagents mod reads, so route_task needs only the URL
+    configured, not the secret inlined in .mcp.json."""
+    tok = (os.environ.get("CORTADOS_PROVIDER_TOKEN") or "").strip()
+    if tok:
+        return tok
+    path = os.path.expanduser(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or "~/.config/cortados/provider-token")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _resolve_url() -> str:
+    """The provider URL, or "" when it is unset or still an unexpanded ${VAR} placeholder (a shell that did not export
+    the var leaves the literal, which would otherwise become an 'unknown url type' error instead of a clear 'not
+    configured' one)."""
+    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip()
+    return "" if url.startswith("${") else url
+
+
 def main() -> None:
-    cfg = {"url": os.environ.get("CORTADOS_PROVIDER_URL", ""), "token": os.environ.get("CORTADOS_PROVIDER_TOKEN", "")}
+    cfg = {"url": _resolve_url(), "token": _resolve_token()}
     for line in sys.stdin:
         if not line.strip():
             continue

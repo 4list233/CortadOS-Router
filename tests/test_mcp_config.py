@@ -25,7 +25,9 @@ class McpProjectConfigTests(unittest.TestCase):
     def test_env_values_are_bare_placeholders_never_literals_or_fallbacks(self):
         env = self.server.get("env", {})
         self.assertEqual(env.get("CORTADOS_PROVIDER_URL"), "${CORTADOS_PROVIDER_URL}")
-        self.assertEqual(env.get("CORTADOS_PROVIDER_TOKEN"), "${CORTADOS_PROVIDER_TOKEN}")
+        # The token is NOT inlined here: subagent_mcp reads it from ~/.config/cortados/provider-token (or an env
+        # override), so a public checkout ships no credential at all. Any env value present must still be a bare
+        # ${VAR} placeholder — never a literal or a ':-' fallback that could smuggle a secret in.
         for key, value in env.items():
             self.assertRegex(value, BARE_PLACEHOLDER,
                              f"{key} must be a bare ${{VAR}} placeholder: no literal value, no ':-' fallback default")
