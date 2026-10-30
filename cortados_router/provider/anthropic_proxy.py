@@ -153,14 +153,41 @@ def invalid_header(headers: dict[str, str]) -> str | None:
     return None
 
 
+def _with_model_suffix(message: Any, suffix: str) -> bool:
+    """Append `suffix` to a message's `model` in place; False (left untouched) when it names none."""
+    if isinstance(message, dict) and isinstance(message.get("model"), str):
+        message["model"] += suffix
+        return True
+    return False
+
+
+def _reveal_chunk(chunk: bytes, suffix: str) -> tuple[bytes, bool]:
+    """The chunk with its message_start event's model suffixed, and whether it was. Any other chunk, or one that does
+    not parse, is returned byte-for-byte: the reveal is cosmetic and never alters the relayed content."""
+    if b"message_start" not in chunk:
+        return chunk, False
+    try:
+        lines = chunk.split(b"\n")
+        for i, line in enumerate(lines):
+            if line.startswith(b"data: ") and b"message_start" in line:
+                event = json.loads(line[6:])
+                if event.get("type") == "message_start" and _with_model_suffix(event.get("message"), suffix):
+                    lines[i] = b"data: " + json.dumps(event).encode()
+                    return b"\n".join(lines), True
+    except Exception:
+        pass
+    return chunk, False
+
+
 def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: str | None = None,
-          urlopen: Callable[..., Any] | None = None) -> tuple[dict[str, Any], str]:
+          urlopen: Callable[..., Any] | None = None, model_suffix: str | None = None) -> tuple[dict[str, Any], str]:
     """Proxy one turn to the real API and relay the response to the client. Returns (usage, outcome):
       * ("completed"): a terminal response was received — settle the actual cost from `usage`.
       * ("rejected"):  the API returned an HTTP error — it was not billed, settle zero.
       * ("unknown"):   the turn did not terminate for us (timeout, transport error, or a mid-stream disconnect) —
                        the spend is unknown, so the caller settles the FULL reservation (conservative).
-    Usage is parsed before each client write, so a disconnect cannot lose it."""
+    Usage is parsed before each client write, so a disconnect cannot lose it. `model_suffix` (a revealing client
+    only) is appended to the success response's `model`; usage and billing always read the upstream bytes as sent."""
     key = (key if key is not None else api_key()).strip()
     open_fn = urlopen or _OPENER.open
     try:
@@ -256,6 +283,12 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
                 usage, outcome = parsed["usage"], "completed"
             else:
                 usage, outcome = {}, "unknown"   # malformed body, or usage with no usable numeric counts -> conservative
+            if model_suffix and isinstance(parsed, dict) and parsed.get("type") == "message":
+                try:
+                    if _with_model_suffix(parsed, model_suffix):
+                        raw = json.dumps(parsed).encode()
+                except Exception:
+                    pass
             try:
                 handler.send_response(200)
                 handler.send_header("content-type", "application/json")
@@ -278,12 +311,15 @@ def serve(handler: Any, body: dict[str, Any], model: str, now: float, *, key: st
         usage = {}
         completed = False
         final_output = False
+        revealed = not model_suffix
         try:
             for chunk in resp:
                 text = chunk.decode("utf-8", "replace")
                 saw_stop, saw_final = _update_usage_from_sse(usage, text)
                 completed = completed or saw_stop        # a PARSED message_stop event
                 final_output = final_output or saw_final  # a message_delta supplied the real final output count
+                if not revealed:
+                    chunk, revealed = _reveal_chunk(chunk, model_suffix)
                 try:
                     handler.wfile.write(chunk)
                     handler.wfile.flush()

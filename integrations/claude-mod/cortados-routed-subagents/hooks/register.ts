@@ -279,12 +279,15 @@ export const register: Register = (on, options) => {
           // x-api-key header (ANTHROPIC_CUSTOM_HEADERS) is merged after the SDK credentials and would replace the
           // provider key, and the Bedrock/Vertex selectors would send the turn to another transport entirely
           // (Codex review, 2026-10-28). $.process.run only ADDS over the host env, so blanking is how these are cleared.
+          // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
+          // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
+          // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: '',
+            ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1',
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',

@@ -361,5 +361,39 @@ class TestServe(unittest.TestCase):
         self.assertEqual((usage, outcome), ({}, "rejected"))   # the API rejected it -> nothing to settle
 
 
+class TestModelSuffix(unittest.TestCase):
+    """A revealing client's api/ response names the upstream's real model plus the credit window's % left; without
+    model_suffix the relayed bytes are exactly the upstream's."""
+    MSG = {"id": "m1", "type": "message", "model": "claude-opus-5-5", "usage": {"input_tokens": 1000, "output_tokens": 7}}
+    CHUNKS = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":1000}}}\n\n',
+        b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    def run_serve(self, stream, **kw):
+        h = FakeHandler()
+        src = FakeResp(chunks=self.CHUNKS) if stream else FakeResp(body=json.dumps(self.MSG).encode())
+        usage, outcome = ap.serve(h, {"model": "api", "stream": stream}, "claude-opus-5-5", 0.0, key="sk",
+                                  urlopen=lambda req, timeout=0: src, **kw)
+        return h.wfile.buf.getvalue(), usage, outcome
+
+    def test_nonstream_suffix(self):
+        raw, usage, outcome = self.run_serve(False, model_suffix=" · 60% left")
+        self.assertEqual(json.loads(raw)["model"], "claude-opus-5-5 · 60% left")
+        self.assertEqual((usage["output_tokens"], outcome), (7, "completed"))   # billing reads the upstream as sent
+
+    def test_stream_suffix_on_message_start_only(self):
+        raw, usage, outcome = self.run_serve(True, model_suffix=" · 60% left")
+        events = [json.loads(l[6:]) for l in raw.decode().splitlines() if l.startswith("data: ")]
+        self.assertEqual(events[0]["message"]["model"], "claude-opus-5-5 · 60% left")
+        self.assertEqual(raw.split(b"\n\n", 1)[1], b"".join(self.CHUNKS).split(b"\n\n", 1)[1])   # the rest untouched
+        self.assertEqual((usage.get("output_tokens"), outcome), (5, "completed"))
+
+    def test_without_a_suffix_the_relay_is_byte_identical(self):
+        self.assertEqual(self.run_serve(False)[0], json.dumps(self.MSG).encode())
+        self.assertEqual(self.run_serve(True)[0], b"".join(self.CHUNKS))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -457,7 +457,7 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
     try:
         sc = _scarcity_module()
         lane = (sc.current().get("lanes") or {}).get(c["lane"]) or {}
-        if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+        if _reading_for_other_login(lane, c):
             return None                                              # cached reading is for a different login (reorder or default<->named): no capacity credit
         pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
         key = {("claude", "all"): "claude:all", ("claude", "fable"): "claude:fable", ("codex", "all"): "codex:all", ("antigravity", "gemini"): "antigravity:gemini",
@@ -468,11 +468,77 @@ def _tokens_left_for(c: dict[str, Any]) -> float | None:
         # A sibling account shares the base pool-SIZE estimate (tokens_per_pct) but NOT its remaining quota: derive this
         # account's remaining from its OWN window headroom, or unitcost.learn's bare-lane remaining would be reused for both.
         tpp = uc.get("tokens_per_pct")
-        # the model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g. Fable),
-        # so use the min headroom across both, not general alone.
-        relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
-        headroom = min((w.get("headroom_pct") for w in relevant if w.get("headroom_pct") is not None), default=None)
+        headroom = _min_headroom_pct(lane, pool)
         return float(tpp) * float(headroom) if tpp and headroom is not None else None
+    except Exception:
+        return None
+
+
+def _min_headroom_pct(lane: dict[str, Any], pool: str) -> float | None:
+    """The model is as scarce as the tightest window it draws on: the lane's general windows AND its own pool (e.g.
+    Fable), so the MIN headroom across both, not general alone (and not the pacing-tightest window)."""
+    relevant = [w for w in (lane.get("windows") or []) if w.get("pool", "all") in ("all", pool)]
+    return min((float(w["headroom_pct"]) for w in relevant if w.get("headroom_pct") is not None), default=None)
+
+
+def _reading_for_other_login(reading: dict[str, Any], c: dict[str, Any]) -> bool:
+    """The cached reading under this positional lane key was sampled from a DIFFERENT login than the candidate's
+    (accounts reordered, or a default<->named transition: the default login's config_dir None is a distinct identity).
+    The one identity rule of candidate_health, _tokens_left_for and headroom_pct_for."""
+    return "config_dir" in reading and reading.get("config_dir") != c.get("config_dir")
+
+
+def claude_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Claude CLI started with `env` runs on (scarcity's rule, which also stamps each reading's `login`)."""
+    return _scarcity_module().claude_login_identity(env)
+
+
+def headroom_pct_for(c: dict[str, Any], *, refresh: bool = False) -> float | None:
+    """% left in the pool this route draws on, from the cached reading (refresh=False: never opens a vendor CLI).
+    STRICTLY conservative (cosmetic; a wrong % is worse than none): a number only when the reading is trustworthy by the
+    standard routing uses, else None:
+      - the reading exists, is fresh and its last try did not fail (scarcity.reading_freshness, lane_scarcity's rule);
+      - it is this candidate's login: candidate_health's config_dir rule (_reading_for_other_login) AND the EFFECTIVE
+        login the reading was sampled on (its `login`) equals the one the caller executes on (c["login"]), since
+        config_dir None only says "no explicit account", not which CLAUDE_CONFIG_DIR / token either process inherited;
+      - a current general ("all") window is present (shared session/weekly capacity, which constrains every model):
+        a reading of a per-model panel alone cannot bound the model;
+      - when the model draws on a separately metered pool (Fable, …), a current window of THAT pool is in the reading
+        (not rate-limited `per_model`, nor one only carried forward from an earlier read, `stale`).
+    A relative CLAUDE_CONFIG_DIR also yields no login match (scarcity.claude_login_identity), so no % there either.
+    (Known limit: only Fable is treated as separately metered on Claude; a model that resolved to the general pool is
+    assumed to truly use it. If the vendor ever meters another model separately, add it to scarcity.pool_for.)"""
+    try:
+        sc = _scarcity_module()
+        lane = (sc.current(refresh=refresh).get("lanes") or {}).get(c["lane"])
+        if not isinstance(lane, dict) or not lane or lane.get("error"):
+            return None
+        fresh, failed = sc.reading_freshness(c["lane"], lane)
+        if not fresh or failed:
+            return None
+        if _reading_for_other_login(lane, c):
+            return None
+        if not c.get("login") or lane.get("login") != c["login"]:
+            return None                                              # effective login unconfirmed (or unknowable)
+        windows = lane.get("windows") or []
+        if not any(w.get("pool", "all") == "all" and w.get("headroom_pct") is not None and not w.get("stale")
+                   for w in windows):
+            return None                                              # the general ("all") windows that ALSO constrain
+                                                                     # every model are missing/stale -> shared capacity
+                                                                     # is unknown, so no % (finding 3)
+        pool = c.get("pool") or sc.pool_for(c["lane"], c.get("family") or c["model"], list(lane.get("pools") or {})) or "all"
+        relevant = [w for w in windows if w.get("pool", "all") in ("all", pool)]
+        if any(w.get("stale") for w in relevant):
+            return None                                              # part of THIS model's picture is a carried old read
+        if pool != "all" and not any(
+                w.get("pool") == pool and w.get("headroom_pct") is not None for w in relevant):
+            return None                                              # the model's OWN separate pool is not observed this
+                                                                     # read. NOTE: `per_model` (set when ANY pool was
+                                                                     # carried) is NOT a blanket block here — a pool that
+                                                                     # DID show fresh is bound by its own fresh window
+                                                                     # above; the stale check already withholds a model
+                                                                     # whose own pool was only carried forward.
+        return _min_headroom_pct(lane, pool)
     except Exception:
         return None
 
@@ -509,7 +575,7 @@ def _health_row(s, w, expiring, spent) -> dict[str, Any]:
 def candidate_health(c: dict[str, Any], health: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """A model is as scarce as the tightest pool it draws on: the lane's general windows plus its own pool when it has one."""
     lane = health.get(c["lane"]) or {}
-    if "config_dir" in lane and lane.get("config_dir") != c.get("config_dir"):
+    if _reading_for_other_login(lane, c):
         # the cached reading under this positional lane key was sampled from a DIFFERENT login (accounts reordered, or a
         # default<->named transition — the default login's config_dir is None, a distinct identity). Do not trust it
         # either way: unavailable until a fresh same-identity sample, rather than risk routing to a spent login.

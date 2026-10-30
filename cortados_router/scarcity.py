@@ -337,6 +337,34 @@ def claude_lanes() -> list[tuple[str, str | None]]:
     return lanes
 
 
+# Env that makes a Claude CLI authenticate as something other than the login stored in its config dir, or send the turn
+# to another transport/provider: with any of them set, the config dir no longer names the effective login. Kept in step
+# with what the routed-subagents mod blanks on the child (a custom x-api-key header, a Unix socket, the alternative-
+# provider selectors), since any of them means the reading cannot be pinned to one stored login.
+_LOGIN_OVERRIDES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
+                    "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD")
+
+
+def claude_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Claude CLI started with `env` runs on: its resolved config dir (CLAUDE_CONFIG_DIR, else
+    $HOME/.claude). None when the env cannot be pinned to one stored login (an override above is set)."""
+    if any(env.get(k) for k in _LOGIN_OVERRIDES):
+        return None
+    ccd = env.get("CLAUDE_CONFIG_DIR")
+    if ccd:
+        d = os.path.expanduser(ccd)
+        if not os.path.isabs(d):
+            return None                 # a relative CLAUDE_CONFIG_DIR resolves against each process's cwd, which the
+                                        # sampler and the bridge do not share -> cannot pin one login, so do not claim one
+        return os.path.realpath(d)
+    home = env.get("HOME") or os.path.expanduser("~")
+    if not os.path.isabs(home):
+        return None
+    return os.path.realpath(os.path.join(home, ".claude"))
+
+
 def _ensure_trust(config_dir: str) -> None:
     """A fresh per-account CLAUDE_CONFIG_DIR has not accepted the workspace-trust dialog, which blocks the /usage TUI on
     the folder the probe runs in. Pre-accept it for the home folder so the probe reaches the usage screen."""
@@ -363,10 +391,15 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
     wins = parse_claude_usage(text)
     if not wins:
         raise RuntimeError("no '% used' lines on the /usage screen: " + text[-200:].replace("\n", " "))
-    out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir}
+    # `login`: the login this CLI EFFECTIVELY ran on (its env, not just the explicit config_dir arg, which is None both
+    # for "the default login" and for an inherited CLAUDE_CONFIG_DIR): what a reader confirms before showing the %.
+    out: dict[str, Any] = {"source": "claude /usage (pty)", "config_dir": config_dir, "login": claude_login_identity(env)}
     if not any(w["pool"] != "all" for w in wins) and (prev or {}).get("config_dir") == config_dir:
         # carry the last per-model reading forward only when it was sampled for THIS same account (config_dir): after a
         # reorder, the positional lane key may now point to a different login, and its old windows must not cross over.
+        # (This is main's behaviour, kept byte-for-byte so the cosmetic reveal never changes a routing input: it carries
+        # ONLY when no per-model panel showed at all. The reveal's % is withheld for any model whose own separate pool
+        # is not observed this read; it does not need a routing-visible carry to do that.)
         out["per_model"] = "not shown this read (vendor rate limit on the per-model panel)"
         for w in (prev or {}).get("windows") or []:          # keep the last per-model reading until its own reset passes
             if w.get("pool", "all") != "all" and w.get("resets_at") and w["resets_at"] > time.strftime("%Y-%m-%d %H:%M"):
@@ -724,22 +757,28 @@ def _sample_local_managed() -> dict[str, Any]:
     return _write_cache({"local": rec}, None)
 
 
+def reading_freshness(lane: str, v: dict[str, Any], max_reading_age_s: int = 6 * 3600, now: float | None = None) -> tuple[bool, bool]:
+    """(fresh, failed) of one lane's cached reading: the routing view's freshness rule (lane_scarcity), shared so every
+    reader of a reading (core.headroom_pct_for) trusts it by the same standard routing does."""
+    now = time.time() if now is None else now
+    if lane == "local" and bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG")):
+        # A managed local reading expires with its node telemetry: `expires_at` is the earliest member node's sample
+        # plus the configured max_age_s (local_resources.sample), never later than the sampler's own 120-second cap.
+        fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
+    else:
+        fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
+    # A try that failed after the last good reading (the parser refused the screen, the CLI did not boot) makes the
+    # lane stale in the routing view at once; the reading stays on disk for diagnostics (Codex adversarial review
+    # 2026-10-21: a refused screen had kept a 15-minute-old reading "fresh" for up to six hours).
+    failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
+    return fresh and not failed, failed
+
+
 def lane_scarcity(max_reading_age_s: int = 6 * 3600, *, refresh: bool = True) -> dict[str, dict[str, Any]]:
     out = {}
     managed_local = bool(_env_get("CORTADOS_LOCAL_RESOURCES_CONFIG"))
     for lane, v in (current(refresh=refresh).get("lanes") or {}).items():
-        now = time.time()
-        if lane == "local" and managed_local:
-            # A managed local reading expires with its node telemetry: `expires_at` is the earliest member node's sample
-            # plus the configured max_age_s (local_resources.sample), never later than the sampler's own 120-second cap.
-            fresh = 0 <= now - float(v.get("fetched_at") or 0) < min(max_reading_age_s, 120) and now < float(v.get("expires_at") or 0)
-        else:
-            fresh = 0 <= now - float(v.get("fetched_at") or 0) < max_reading_age_s
-        # A try that failed after the last good reading (the parser refused the screen, the CLI did not boot) makes the
-        # lane stale in the routing view at once; the reading stays on disk for diagnostics (Codex adversarial review
-        # 2026-10-21: a refused screen had kept a 15-minute-old reading "fresh" for up to six hours).
-        failed = bool(v.get("error")) and float(v.get("tried_at") or 0) > float(v.get("fetched_at") or 0)
-        fresh = fresh and not failed
+        fresh, failed = reading_freshness(lane, v, max_reading_age_s)
         general = [w for w in v.get("windows") or [] if w.get("pool", "all") == "all"] or (v.get("windows") or [])
         # Every routing signal goes with freshness: a stale lane's window and expiring credit are as unknown as its
         # scarcity (second adversarial review: a refused sample still won on its old "expiring unused" bonus).
