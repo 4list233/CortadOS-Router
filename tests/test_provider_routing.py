@@ -195,6 +195,72 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertIn("api/claude-opus-5-5", r["error"])
         self.assertFalse(r.get("client_error"))
 
+    def test_oversized_pinned_request_is_refused_and_a_normal_one_passes(self):
+        # the same assembled chars/4 estimate core.resolve gates on in execution mode; one over the ceiling is refused
+        cap = core.lane_ceiling("claude", "claude-opus-5-5")
+        body = {"model": "sub/opus", "tools": [{"name": "Read"}], "messages": [{"role": "user", "content": "x"}]}
+        body["messages"][0]["content"] = "x" * ((cap + 25) * 4 - len(json.dumps(body)) + 1)
+        self.assertEqual(routing.request_fit(body)["input_tokens"], cap + 25)
+        r = routing.choose(core, body, client="claude-cli", conversation_id="conv", claude_bin="python3")
+        self.assertIn("does not fit", r.get("error", ""))
+        self.assertFalse(r.get("client_error"))             # 503, not 400: nothing in the model name is wrong
+        self.assertNotIn("route_id", r)                       # refused before a routes row is written
+        self.assertFalse((core.STATE / "router.db").exists())
+        self.assertNotIn("error", self.pin("sub/opus"))
+
+    def health(self, a, b):
+        core.lane_health = lambda: {"claude": {"ok": True, "pools": {}, "config_dir": "/x/a", **a},
+                                    "claude#b": {"ok": True, "pools": {}, "config_dir": "/x/b", **b}}
+
+    def test_expiring_credit_beats_lower_scarcity_as_in_resolve(self):
+        self.two_accounts()
+        self.health({"scarcity": -0.4, "expiring_pct": 0}, {"scarcity": -0.05, "expiring_pct": 60})
+        self.assertEqual(self.pin("sub/sonnet")["provider"], "claude-cli#b")
+        # resolve's static path ranks the same two accounts the same way (one canonical ranking, core.static_scarcity_rank)
+        keep = core.scored_candidates
+        core.scored_candidates = lambda *a, **k: None
+        try:
+            r = core.resolve({"answers": None, "degraded": True, "engine": "s1", "engine_ms": 0}, execution=True,
+                             accounts_aware=True, allowed_routes=(("claude-cli", "claude-sonnet-5"), ("claude-cli#b", "claude-sonnet-5")))
+        finally:
+            core.scored_candidates = keep
+        self.assertEqual(r["chosen"]["provider"], "claude-cli#b")
+
+    def test_reserve_account_is_used_only_when_the_non_reserve_one_is_spent(self):
+        core._vendor_accounts = lambda *a: [
+            {"lane": "claude", "provider": "claude-cli", "account": "a", "reserve": True, "config_dir": "/x/a"},
+            {"lane": "claude#b", "provider": "claude-cli#b", "account": "b", "reserve": False, "config_dir": "/x/b"}]
+        self.health({"scarcity": -0.4, "expiring_pct": 60}, {"scarcity": 0.3})
+        self.assertEqual(self.pin("sub/opus")["provider"], "claude-cli#b")
+        self.health({"scarcity": -0.4}, {"ok": False, "why": "week 100% used"})
+        self.assertEqual(self.pin("sub/opus")["provider"], "claude-cli")
+
+    def test_toolless_pinned_call_logs_its_own_last_user_message(self):
+        # a title/summary call: no tools, so what is on record is the call itself, not the conversation's first task
+        body = {"model": "sub/haiku", "messages": [{"role": "user", "content": "refactor the billing module"},
+                                                   {"role": "assistant", "content": "done"},
+                                                   {"role": "user", "content": "write a 5-word title"}]}
+        r = routing.choose(core, body, client="claude-cli", conversation_id="conv", claude_bin="python3")
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            row = db.execute("SELECT request FROM routes WHERE turn_id=?", (r["route_id"],)).fetchone()
+        self.assertEqual(row, ("write a 5-word title",))
+
+    def test_pin_rows_stay_out_of_s1_health_metrics(self):
+        for _ in range(3):
+            self.assertNotIn("error", self.pin("sub/opus"))
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM routes WHERE engine='pin' AND engine_ms IS NULL").fetchone()[0], 3)
+        scored = {"band": "R2", "chosen": {"lane": "codex", "provider": "codex-cli", "model": "gpt-5.6-terra"},
+                  "answers": None, "subagents": 0, "verifier": False, "hard_rules": []}
+        core.log_route("scored-1", {"session_id": "s", "platform": "provider:claude-cli", "request": "x"},
+                       {"answers": None, "degraded": True, "engine": "s1", "engine_ms": 1000}, scored)
+        s = core.usage_summary()
+        self.assertEqual(s["total_routes"], 4)                                  # pins stay in the route totals
+        self.assertEqual(s["by_band"], {"pin": 3, "R2": 1})
+        self.assertEqual(s["by_lane"], {"claude/claude-opus-5-5": 3, "codex/gpt-5.6-terra": 1})
+        self.assertEqual(s["degraded"], {"count": 1, "of": 1})                  # only the scored row
+        self.assertEqual((s["s1_latency_ms"]["median"], s["s1_latency_ms"]["window"]), (1000, 1))
+
     def test_broken_accounts_config_refuses_claude(self):
         def broken(*a):
             raise core.AccountsConfigError("accounts.json unreadable")

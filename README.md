@@ -174,6 +174,8 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 
 A `sub/` pin still writes a `routes` row (engine `pin`), so a pinned planner's usage is on record next to the routed workers'. Use it for an orchestrating main session whose first message is too thin to score well, with the routed-subagents mod sending the workers through S1. When every subscription account is spent the pin is refused with a pointer to the `api/` pin; it never falls over to API credit on its own.
 
+The `sub/` and `api/` pins are for Claude Code clients (`/v1/messages`); Codex clients (`/v1/responses`) use `cortados`.
+
 | setting | default | purpose |
 |---|---|---|
 | `CORTADOS_HOME` | `~/.cortados` | state: `router.db`, `scarcity.json`, `unit-cost.json`, `reviews.db` |
