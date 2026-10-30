@@ -90,6 +90,16 @@ class CodexEndpointTests(unittest.TestCase):
     def inbound(self):
         return [json.loads(l) for l in Path(self.log_file).read_text().splitlines() if l.strip()]
 
+    def test_a_route_flagged_client_error_answers_400_not_503(self):
+        # a sub/ pin naming a model this endpoint does not serve is the client's to fix (routing.choose_pinned)
+        self.route = {"error": "sub/x is not a Claude model this endpoint serves", "client_error": True}
+        code, msg = self.error_of({"model": "sub/x", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 400)
+        self.assertIn("not a Claude model", msg)
+        self.route = {"error": "every Claude subscription account is spent"}
+        code, _ = self.error_of({"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 503)
+
     def test_a_plain_turn_echoes_through_the_app_server(self):
         header, r = self.raw({"model": "cortados", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(header, "codex-cli/gpt-test band=R2 id=r1")

@@ -164,6 +164,16 @@ ANTHROPIC_BASE_URL=http://<provider-ip>:8432 ANTHROPIC_AUTH_TOKEN=<token> claude
 
 Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER-PLAN.md`.
 
+**Pin a model instead of routing.** The model name picks the path:
+
+| `--model` | runs on | S1 |
+|---|---|---|
+| `cortados` | the cheapest capable route S1 and the tables pick, fixed for the conversation | scores the first user message |
+| `sub/<claude-model>` (or `sub/opus`, `sub/sonnet`, `sub/haiku`, `sub/fable`; bare `sub` = Opus) | that model on a Claude **subscription** account: the least-scarce configured account whose quota is not spent | skipped |
+| `api/<claude-model>` (bare `api` = Opus) | that model on the dollar-metered Anthropic **API credit** lane | skipped |
+
+A `sub/` pin still writes a `routes` row (engine `pin`), so a pinned planner's usage is on record next to the routed workers'. Use it for an orchestrating main session whose first message is too thin to score well, with the routed-subagents mod sending the workers through S1. When every subscription account is spent the pin is refused with a pointer to the `api/` pin; it never falls over to API credit on its own.
+
 | setting | default | purpose |
 |---|---|---|
 | `CORTADOS_HOME` | `~/.cortados` | state: `router.db`, `scarcity.json`, `unit-cost.json`, `reviews.db` |

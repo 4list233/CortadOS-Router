@@ -8,12 +8,15 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
+  sub/ pin          a client that names `sub/<claude model>` chose the model itself: S1 and the band are skipped, but
+                    the served-model, account, capacity and route-log rules still apply (choose_pinned).
 """
 from __future__ import annotations
 
 import json
 import re
 import shutil
+import uuid
 from typing import Any, Callable
 
 from cortados_router import execution_routing
@@ -98,9 +101,82 @@ def _credentials(claude_bin: str, codex_bin: str) -> Callable[..., None]:
     return check
 
 
+SUB_PREFIX = "sub/"
+SUB_DEFAULT = "claude-opus-5-5"
+# Short names a person types (`claude --model sub/opus`); each must name a model the tables serve on claude-cli.
+SUB_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5-20251001",
+               "fable": "claude-fable-5-1"}
+
+
+def sub_pin(body: dict[str, Any]) -> str | None:
+    """A request pinned to a Claude subscription model: model `sub/<claude-model or alias>` (bare `sub` for the
+    default). Returns the requested model name (unvalidated), or None for a normal S1-routed request."""
+    m = (body.get("model") or "").strip()
+    if m == "sub":
+        return SUB_DEFAULT
+    if m.startswith(SUB_PREFIX):
+        name = m[len(SUB_PREFIX):].strip()
+        return SUB_ALIASES.get(name, name) or SUB_DEFAULT
+    return None
+
+
+def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
+                  claude_bin: str = "claude") -> dict[str, Any]:
+    """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
+    (a pin that the band would refuse still runs; that is what pinning is for). What stays is the router's accounting
+    and safety: only a model the tables serve on claude-cli, only a configured account whose subscription is not spent
+    (non-reserve first, then the least scarce), the binary on PATH, and a routes row so the usage is on record (engine
+    `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for labelling).
+    Claude only for now: the Codex lane is paused (Forest, 2026-10-30)."""
+    # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport it as an unknown model.
+    try:
+        accounts = core._vendor_accounts("claude", "claude", "claude-cli")
+    except core.AccountsConfigError as exc:         # broken accounts config refuses Claude, never an ambient login
+        return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
+    claude = sorted({m for p, m in served_routes(core) if _base_provider(p) == "claude-cli"})
+    if model not in claude:
+        return {"router": execution_routing.ROUTER, "client_error": True,
+                "error": f"sub/{model} is not a Claude model this endpoint serves; pin one of: {', '.join(claude)}"}
+    try:
+        _credentials(claude_bin, "codex")(requested="claude-cli", target_model=model)
+    except execution_routing.CredentialsUnavailable as exc:
+        return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
+    health = core.lane_health()
+    live, spent = [], []
+    for a in accounts:
+        cand = {"lane": a["lane"], "provider": a["provider"], "model": model, "account": a["account"],
+                "config_dir": a["config_dir"], "reserve": a["reserve"]}
+        h = core.candidate_health(cand, health)
+        if h.get("ok", True):
+            live.append((a["reserve"], h.get("scarcity") if h.get("scarcity") is not None else 0.0, len(live), cand, h))
+        else:
+            spent.append(f"{a['provider']}: {h.get('why') or 'capacity unavailable'}")
+    if not live:
+        return {"router": execution_routing.ROUTER,
+                "error": f"sub/{model}: every Claude subscription account is spent ({'; '.join(spent)}); "
+                         f"pin api/{model} to spend API credit instead"}
+    _, _, _, chosen, h = min(live, key=lambda t: t[:3])
+    chosen = {**chosen, "pool": h.get("pool")}
+    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+    route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
+             "hard_rules": [f"pinned by the client: sub/{model}"] + spent, "skipped": spent or None}
+    decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": 0}
+    core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}", "unit_kind": "interactive",
+                              "actual_model": None, "request": request_text(body.get("messages") or [])[:8000]},
+                   decision, route)
+    return {"router": execution_routing.ROUTER, "provider": chosen["provider"], "model": model,
+            "account": chosen["account"], "config_dir": chosen["config_dir"],
+            "context_length": core.lane_ceiling(chosen["lane"], model), "route_id": route_id, "api_request_id": "",
+            "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
+
+
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex") -> dict[str, Any]:
-    """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error."""
+    """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
+    A `sub/`-pinned request skips S1 (choose_pinned)."""
+    pinned = sub_pin(body)
+    if pinned:
+        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
     raw = json.dumps(body)
     fit = {"known": True, "assembled": True, "input_tokens": len(raw) // 4, "input_bytes": len(raw.encode()),
            "source": "provider_request_estimate"}         # chars / 4; the CLI's own tokenizer is not reachable here
