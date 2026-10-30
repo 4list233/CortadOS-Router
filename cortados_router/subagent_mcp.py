@@ -82,7 +82,9 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = ": " + (json.loads(exc.read()).get("error", {}).get("message") or "")[:300]
+            # Scrub the FULL message before truncating: cutting first could split the token at the 300-char boundary,
+            # leaving a prefix of it that the whole-token scrub no longer matches (and so would leak).
+            detail = ": " + scrub(str(json.loads(exc.read()).get("error", {}).get("message") or ""))[:300]
         except Exception:
             pass
         return _err(scrub(f"cortados route_task: provider returned HTTP {exc.code}{detail}"))
@@ -92,7 +94,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         return _err(scrub(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})"))
     if not isinstance(data, dict) or data.get("type") == "error" or data.get("error"):
         msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        return _err(f"cortados route_task: routing error: {msg or data}")
+        # The provider's error text is not ours to trust: it may echo the request's credential, so scrub it too.
+        return _err(scrub(f"cortados route_task: routing error: {msg or data}"))
     blocks = [b.get("text", "") for b in (data.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
     text = "\n".join(b for b in blocks if b).strip()
     model = data.get("model") or "?"

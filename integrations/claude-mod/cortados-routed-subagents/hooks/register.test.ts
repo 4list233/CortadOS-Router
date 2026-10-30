@@ -52,23 +52,68 @@ test('route_task is a delegation primitive, always allowed on the brain even if 
   expect(resolveAllowSet('').has('mcp__cortados-route__route_task')).toBe(true)
 })
 
-test('host-app plumbing (desktop turn/session UI tools) is never gated, even when enforced', async () => {
+test('host-app plumbing: only the exact desktop turn tools pass an enforced gate', async () => {
   const allow = new Set(['Read'])
-  expect(mainLoopAllows('mcp__ccd_turn__wrap_up', undefined, allow, true)).toBe(true)
   expect(mainLoopAllows('mcp__ccd_turn__update_plan', undefined, allow, true)).toBe(true)
-  expect(mainLoopAllows('mcp__ccd_session__spawn_task', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('mcp__ccd_turn__wrap_up', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('mcp__ccd_session__mark_chapter', undefined, allow, true)).toBe(true)
+  // a similarly named server does NOT ride the ccd_ name past the gate (exact names, not a prefix)
+  expect(mainLoopAllows('mcp__ccd_external__execute_shell', undefined, allow, true)).toBe(false)
+  expect(mainLoopAllows('mcp__ccd_session_mgmt__send_message', undefined, allow, true)).toBe(false)
   // a real work MCP tool is still refused under enforcement
   expect(mainLoopAllows('mcp__claude-in-chrome__tabs_context_mcp', undefined, allow, true)).toBe(false)
 })
 
-test('resolveTimeoutMs takes a positive finite value and falls back otherwise', async () => {
-  expect(resolveTimeoutMs(900000)).toBe(900000)
-  expect(resolveTimeoutMs('1200000')).toBe(1200000)            // JSON config may deliver a string
-  expect(resolveTimeoutMs(1_800_000)).toBe(1_800_000)          // the default, passed through
-  for (const bad of [0, -5, NaN, Infinity, undefined, null, 'soon', {}]) {
-    expect(resolveTimeoutMs(bad)).toBe(1_800_000)              // never 0/negative/NaN -> would disable the cap
+test('resolveTimeoutMs keeps the timeout an integer inside the host range 1..600000', async () => {
+  expect(resolveTimeoutMs(undefined)).toBe(600_000)            // the default is the host's cap
+  expect(resolveTimeoutMs(300_000)).toBe(300_000)
+  expect(resolveTimeoutMs('120000')).toBe(120_000)             // JSON config may deliver a string
+  expect(resolveTimeoutMs(1)).toBe(1)
+  expect(resolveTimeoutMs(1_800_000)).toBe(600_000)            // above the host's cap -> clamped, never rejected
+  expect(resolveTimeoutMs(Infinity)).toBe(600_000)
+  expect(resolveTimeoutMs(1234.9)).toBe(1234)                  // fractional -> integer
+  expect(Number.isInteger(resolveTimeoutMs(0.5))).toBe(true)
+  expect(resolveTimeoutMs(0.5)).toBe(1)                        // floors to 0, clamped up into range
+  for (const bad of [0, -5, -Infinity, NaN, null, 'soon', '', {}, [], true]) {
+    expect(resolveTimeoutMs(bad)).toBe(600_000)                // never 0/negative/NaN/non-number -> default
   }
 })
+
+/** A $.process stub that validates timeoutMs the way the host does (Claude Code 2.1.314: integer in 1..600000). */
+function hostLikeProcess(seen: { timeoutMs?: unknown }) {
+  return {
+    run: async (_argv: string[], opts: any) => {
+      const t = opts?.timeoutMs
+      seen.timeoutMs = t
+      if (t !== undefined && !(Number.isInteger(t) && t >= 1 && t <= 600_000)) {
+        throw new Error(`$.process.run: timeoutMs must be an integer from 1 to 600000 (got ${t})`)
+      }
+      return { exitCode: 0, stdout: JSON.stringify({ result: 'pong', model: 'm' }), stderr: '', isStdoutTruncated: false }
+    },
+  }
+}
+
+for (const [label, timeout, expected] of [
+  ['the default timeout', undefined, 600_000],
+  ['a configured 1_800_000 (clamped)', 1_800_000, 600_000],
+  ['a fractional timeout', 90_000.7, 90_000],
+] as const) {
+  test(`a routed subagent launches under the host's timeout validator with ${label}`, async () => {
+    let agentHandler: any = null
+    const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+      if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+      return { catch() {} }
+    }
+    const opts: any = { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false }
+    if (timeout !== undefined) opts.subagentTimeoutMs = timeout
+    register(on as any, opts)
+    const seen: { timeoutMs?: unknown } = {}
+    const $ = { process: hostLikeProcess(seen), fs: { read: async () => 'unused' }, ui: { status() {}, toast() {} } }
+    const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+    expect(seen.timeoutMs).toBe(expected)
+    expect(out.result.status).toBe('completed')
+  })
+}
 
 test('lastJsonLine returns the final brace-delimited line past leading warnings', async () => {
   const s = [
@@ -189,7 +234,7 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
       run: async (argv: string[], opts: any) => {
         recordedEnv = opts.env
         recordedArgv = argv
-        return { exitCode: 0, stdout: JSON.stringify({ result: 'pong', model: 'm' }), stderr: '', isStdoutTruncated: false }
+        return hostLikeProcess({}).run(argv, opts) // rejects an out-of-range timeoutMs like the host does
       },
     },
     fs: { read: async () => 'unused' },

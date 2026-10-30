@@ -195,6 +195,53 @@ class TokenSafetyTests(unittest.TestCase):
         m.route_task("http://x", "tok\n", "task", urlopen=_open)
         self.assertEqual(seen["token"], "tok")
 
+    @staticmethod
+    def _http_error(message):
+        import urllib.error
+
+        def _open(req, timeout=None):
+            body = io.BytesIO(json.dumps({"type": "error", "error": {"message": message}}).encode())
+            raise urllib.error.HTTPError("http://x/v1/messages", 401, "Unauthorized", {}, body)
+        return _open
+
+    def _assert_no_token_trace(self, text, tok):
+        # Neither the whole token nor any 8+-char prefix of it may surface (a prefix is what a bad cut leaks).
+        self.assertNotIn(tok, text)
+        for k in range(8, len(tok) + 1):
+            self.assertNotIn(tok[:k], text, f"token prefix of length {k} leaked")
+
+    def test_http_error_body_with_the_token_is_scrubbed(self):
+        tok = "synthetic-provider-secret-0123456789"
+        r = m.route_task("http://x", tok, "task", urlopen=self._http_error(f"bad key {tok} rejected"))
+        self.assertTrue(r["isError"])
+        text = r["content"][0]["text"]
+        self.assertIn("HTTP 401", text)
+        self.assertIn("***", text)
+        self._assert_no_token_trace(text, tok)
+
+    def test_http_error_token_straddling_the_300_char_cut_is_not_leaked(self):
+        tok = "synthetic-provider-secret-0123456789"
+        msg = "x" * 290 + tok + " trailing"          # the token spans chars 290..325, across the 300-char cut
+        r = m.route_task("http://x", tok, "task", urlopen=self._http_error(msg))
+        self.assertTrue(r["isError"])
+        self._assert_no_token_trace(r["content"][0]["text"], tok)
+
+    def test_routing_error_message_with_the_token_is_scrubbed(self):
+        tok = "synthetic-provider-secret-0123456789"
+        prov = ok_provider({"type": "error", "error": {"message": f"lane refused key {tok}"}})
+        r = m.route_task("http://x", tok, "task", urlopen=prov)
+        self.assertTrue(r["isError"])
+        text = r["content"][0]["text"]
+        self.assertIn("routing error", text)
+        self.assertIn("***", text)
+        self._assert_no_token_trace(text, tok)
+
+    def test_routing_error_payload_without_a_message_is_scrubbed(self):
+        tok = "synthetic-provider-secret-0123456789"
+        r = m.route_task("http://x", tok, "task", urlopen=ok_provider(["echo", tok]))   # non-dict payload, echoed raw
+        self.assertTrue(r["isError"])
+        self._assert_no_token_trace(r["content"][0]["text"], tok)
+
 
 class DeepNestCrashTests(unittest.TestCase):
     def test_deeply_nested_line_does_not_crash_the_server(self):

@@ -58,19 +58,31 @@ const FALLBACK: Cfg = {
   // answer), so it belongs with Agent in the brain's allowed set: a lightweight text delegation should not have to pay
   // for a full routed-subagent subprocess. Listed here for visibility; ALWAYS_ALLOWED guarantees it regardless of config.
   orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
-  // How long a routed subagent subprocess may run before it is aborted. 30 min by default (was a hard 600 s, which
-  // killed long legitimate routed work such as an adversarial code review). Background routed work is separate.
-  subagentTimeoutMs: 1_800_000,
+  // How long a routed subagent subprocess may run before it is aborted. The default is the host's own ceiling
+  // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
+  // Background routed work is separate.
+  subagentTimeoutMs: 600_000,
 }
+
+// The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
+// 1..600000, and rejects anything outside it, so a routed subagent with a larger timeout fails to launch at all.
+// resolveTimeoutMs clamps into this range rather than passing an out-of-range value through.
+const MIN_SUBAGENT_TIMEOUT_MS = 1
+const MAX_SUBAGENT_TIMEOUT_MS = 600_000
 
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
 // Both the Agent tool and the route_task MCP tool are delegation primitives.
 const ALWAYS_ALLOWED = ['Agent', 'mcp__cortados-route__route_task']
 
-// Host-app plumbing, not work: the Claude desktop app's own turn/session UI tools (plan updates, wrap-up, chapters,
-// widgets). Refusing them breaks the app's turn handling ("Wrapping up — Failed", seen 2026-10-30), so even an
-// enforced gate lets them through.
-const HOST_PLUMBING_PREFIXES = ['mcp__ccd_']
+// Host-app plumbing, not work: the Claude desktop app's turn tools that the main loop must call itself (a subagent
+// cannot update the parent's plan or end its turn). Seen 2026-10-30: the strict gate refused wrap_up and the desktop
+// turn showed "Wrapping up — Failed". So even an enforced gate lets these through. Exact names, not a prefix: a
+// prefix such as `mcp__ccd_` would let any similarly named MCP server (e.g. `ccd_external`) bypass the gate.
+const HOST_PLUMBING_TOOLS: ReadonlySet<string> = new Set([
+  'mcp__ccd_turn__update_plan',
+  'mcp__ccd_turn__wrap_up',
+  'mcp__ccd_session__mark_chapter',
+])
 
 /** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
 const ORCHESTRATOR_DIRECTIVE =
@@ -115,7 +127,7 @@ export function resolveAllowSet(configStr: string): Set<string> {
 export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
   if (!orchestratorMode) return true
   if (agentId != null) return true // not the main loop (subagent/teammate/engine fork)
-  return ALWAYS_ALLOWED.includes(tool) || HOST_PLUMBING_PREFIXES.some((p) => tool.startsWith(p)) || allow.has(tool)
+  return ALWAYS_ALLOWED.includes(tool) || HOST_PLUMBING_TOOLS.has(tool) || allow.has(tool)
 }
 
 /** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */
@@ -233,10 +245,13 @@ async function resolveToken($: any, cfg: Cfg): Promise<string> {
   return (await $.fs.read(path)).trim()
 }
 
-/** A positive, finite subagent timeout from config, else the default (a mistyped/negative value never disables the cap). */
+/** The subagent timeout from config as an integer the host accepts (1..600000 ms, see MAX_SUBAGENT_TIMEOUT_MS):
+ * a non-number, NaN or non-positive value falls back to the default (a mistyped value never disables the cap), a
+ * fractional value is floored (the host requires an integer), and anything above the host's cap is clamped to it. */
 export function resolveTimeoutMs(v: unknown): number {
-  const n = Number(v)
-  return Number.isFinite(n) && n > 0 ? n : FALLBACK.subagentTimeoutMs
+  const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN // JSON config may deliver a string
+  if (Number.isNaN(n) || n <= 0) return FALLBACK.subagentTimeoutMs
+  return Math.min(MAX_SUBAGENT_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
 }
 
 export const register: Register = (on, options) => {

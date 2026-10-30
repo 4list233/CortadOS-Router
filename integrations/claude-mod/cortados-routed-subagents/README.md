@@ -42,7 +42,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under the `subagentTimeoutMs` ceiling). |
-| `subagentTimeoutMs` | `1800000` (30 min) | How long a routed subagent subprocess may run before it is aborted. Raise it for long routed work (e.g. a code review or a big build); a non-positive/invalid value falls back to the default. |
+| `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
