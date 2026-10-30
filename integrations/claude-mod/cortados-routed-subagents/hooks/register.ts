@@ -67,6 +67,11 @@ const FALLBACK: Cfg = {
 // Both the Agent tool and the route_task MCP tool are delegation primitives.
 const ALWAYS_ALLOWED = ['Agent', 'mcp__cortados-route__route_task']
 
+// Host-app plumbing, not work: the Claude desktop app's own turn/session UI tools (plan updates, wrap-up, chapters,
+// widgets). Refusing them breaks the app's turn handling ("Wrapping up — Failed", seen 2026-10-30), so even an
+// enforced gate lets them through.
+const HOST_PLUMBING_PREFIXES = ['mcp__ccd_']
+
 /** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
 const ORCHESTRATOR_DIRECTIVE =
   'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. Your job is to decide and ' +
@@ -77,7 +82,10 @@ const ORCHESTRATOR_DIRECTIVE =
   'DELEGATE BY DEFAULT for anything substantive: editing or writing files beyond a trivial touch, running commands, ' +
   'building, broad searching, web access, long analyses. You MAY act directly when delegating would clearly be ' +
   'wasteful or slower — a one-line edit, your own planning and bookkeeping, a quick read or check — but treat that ' +
-  'as the exception, and never let it become a habit of quietly doing the work yourself. Give each subagent a ' +
+  'as the exception, and never let it become a habit of quietly doing the work yourself. IMPORTANT: routed subagents ' +
+  'have ONLY built-in tools (files, shell, web search/fetch) — no MCP tools: no browser/Chrome, no connectors (Slack, ' +
+  'Gmail, Drive, …), no app tools. Any step that needs one of those (e.g. driving the signed-in browser) cannot be ' +
+  'delegated; do that step yourself and delegate only the rest. Give each subagent a ' +
   'complete, standalone task (it cannot see this conversation or your context). When subagents report back, ' +
   'synthesize their results and plan the next step.'
 
@@ -107,7 +115,7 @@ export function resolveAllowSet(configStr: string): Set<string> {
 export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
   if (!orchestratorMode) return true
   if (agentId != null) return true // not the main loop (subagent/teammate/engine fork)
-  return ALWAYS_ALLOWED.includes(tool) || allow.has(tool)
+  return ALWAYS_ALLOWED.includes(tool) || HOST_PLUMBING_PREFIXES.some((p) => tool.startsWith(p)) || allow.has(tool)
 }
 
 /** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */

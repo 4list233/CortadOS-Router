@@ -52,6 +52,15 @@ test('route_task is a delegation primitive, always allowed on the brain even if 
   expect(resolveAllowSet('').has('mcp__cortados-route__route_task')).toBe(true)
 })
 
+test('host-app plumbing (desktop turn/session UI tools) is never gated, even when enforced', async () => {
+  const allow = new Set(['Read'])
+  expect(mainLoopAllows('mcp__ccd_turn__wrap_up', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('mcp__ccd_turn__update_plan', undefined, allow, true)).toBe(true)
+  expect(mainLoopAllows('mcp__ccd_session__spawn_task', undefined, allow, true)).toBe(true)
+  // a real work MCP tool is still refused under enforcement
+  expect(mainLoopAllows('mcp__claude-in-chrome__tabs_context_mcp', undefined, allow, true)).toBe(false)
+})
+
 test('resolveTimeoutMs takes a positive finite value and falls back otherwise', async () => {
   expect(resolveTimeoutMs(900000)).toBe(900000)
   expect(resolveTimeoutMs('1200000')).toBe(1200000)            // JSON config may deliver a string
