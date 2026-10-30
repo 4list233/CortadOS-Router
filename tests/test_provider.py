@@ -555,6 +555,10 @@ class RevealModelTests(unittest.TestCase):
         self.assertEqual(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x"}), os.path.realpath("/tmp/x"))
         self.assertEqual(sc.claude_login_identity({"HOME": "/tmp/h"}), os.path.realpath("/tmp/h/.claude"))
         self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x", "ANTHROPIC_API_KEY": "k"}))
+        # any auth/transport override the mod blanks also unpins the login (a custom x-api-key header, an alt provider)
+        for override in ("ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
+                         "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_ANTHROPIC_AWS"):
+            self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "/tmp/x", override: "1"}))
         # a RELATIVE config dir resolves against each process's cwd (sampler vs bridge differ) -> no pinned login
         self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "../../login"}))
         self.assertIsNone(sc.claude_login_identity({"CLAUDE_CONFIG_DIR": "rel/login"}))

@@ -337,10 +337,14 @@ def claude_lanes() -> list[tuple[str, str | None]]:
     return lanes
 
 
-# Env that makes a Claude CLI authenticate as something other than the login stored in its config dir (or bill another
-# way): with any of them set, the config dir no longer names the login.
+# Env that makes a Claude CLI authenticate as something other than the login stored in its config dir, or send the turn
+# to another transport/provider: with any of them set, the config dir no longer names the effective login. Kept in step
+# with what the routed-subagents mod blanks on the child (a custom x-api-key header, a Unix socket, the alternative-
+# provider selectors), since any of them means the reading cannot be pinned to one stored login.
 _LOGIN_OVERRIDES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+                    "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
+                    "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD")
 
 
 def claude_login_identity(env: dict[str, str]) -> str | None:
