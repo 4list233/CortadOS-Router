@@ -8,10 +8,10 @@ Stdlib only; runs standalone (the MCP client launches it as a subprocess over st
 package. It forwards to the provider — it does NOT need to sit next to S1 or the provider; it only needs to reach the
 provider URL.
 
-Register with Claude Code, e.g.:
+Register with Claude Code, e.g. (the token is read from ~/.config/cortados/provider-token by default, so only the URL
+need be set; CORTADOS_PROVIDER_TOKEN or CORTADOS_PROVIDER_TOKEN_FILE override it):
   claude mcp add cortados-route \\
     --env CORTADOS_PROVIDER_URL=http://<provider-ip>:8432 \\
-    --env CORTADOS_PROVIDER_TOKEN=<token> \\
     -- python3 /path/to/cortados_router/subagent_mcp.py
 """
 from __future__ import annotations
@@ -28,6 +28,7 @@ PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
 TIMEOUT_S = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", "300"))   # a routed subtask can take a while (cold lane, large output)
 DEFAULT_MAX_TOKENS = 8000
+MIN_TOKEN_LEN = 8                 # shorter is not a provider token (see route_task)
 
 TOOL = {
     "name": "route_task",
@@ -56,15 +57,21 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                urlopen=urllib.request.urlopen) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
     provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
-    # Never let the token reach model-visible text. Only a token long enough to be a real secret is scrubbed; a short
-    # token is not a credential and scrubbing it would mangle ordinary words (a real provider token is a long random string).
-    scrub = (lambda s: s.replace(token, "***")) if (token and len(token) >= 8) else (lambda s: s)
+    # Never let the token reach model-visible text: every error below is scrubbed. A token too short to be a provider
+    # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
+    # leaking a short credential and mangling ordinary words that happen to contain it.
+    scrub = lambda s: s.replace(token, "***") if token else s
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
-    if any(ord(c) < 32 or ord(c) == 127 for c in token):
-        # Reject a token with control chars (e.g. an embedded newline from a wrapped paste) BEFORE building the request:
-        # urllib's header validator would otherwise raise with the token's escaped bytes, which the raw-string scrub misses.
-        return _err("cortados route_task: CORTADOS_PROVIDER_TOKEN contains control characters (e.g. an embedded newline); fix it")
+    if len(token) < MIN_TOKEN_LEN:
+        return _err(f"cortados route_task: the provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
+                    f"provider token (check CORTADOS_PROVIDER_TOKEN or the token file)")
+    if not (token.isascii() and token.isprintable()):
+        # Reject a token that is not printable ASCII (control chars such as an embedded newline from a wrapped paste, or
+        # non-ASCII) BEFORE building the request: urllib's header validator / latin-1 encoder would otherwise raise with
+        # the token's escaped bytes or one of its characters, which the whole-token scrub misses.
+        return _err("cortados route_task: CORTADOS_PROVIDER_TOKEN must be printable ASCII (no control characters such as "
+                    "an embedded newline, no non-ASCII); fix it")
     if not (task and str(task).strip()):
         return _err("route_task requires a non-empty 'task'")
     prompt = str(task) if not context else f"{task}\n\nContext:\n{context}"
@@ -82,7 +89,12 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = ": " + (json.loads(exc.read()).get("error", {}).get("message") or "")[:300]
+            # Scrub the FULL message before truncating: cutting first could split the token at the 300-char boundary,
+            # leaving a prefix of it that the whole-token scrub no longer matches (and so would leak).
+            # Only a plain string message is passed on (as for routing errors below): str() of a list or dict is its
+            # repr, whose escaping could carry the token past the scrub.
+            msg = json.loads(exc.read()).get("error", {}).get("message")
+            detail = (": " + scrub(msg)[:300]) if isinstance(msg, str) and msg else ""
         except Exception:
             pass
         return _err(scrub(f"cortados route_task: provider returned HTTP {exc.code}{detail}"))
@@ -91,13 +103,21 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         # urllib's header validation, whose message would otherwise echo the token (scrubbed above).
         return _err(scrub(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})"))
     if not isinstance(data, dict) or data.get("type") == "error" or data.get("error"):
-        msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        return _err(f"cortados route_task: routing error: {msg or data}")
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else None
+        # The provider's error text is not ours to trust: it may echo the request's credential, so scrub it. Only a plain
+        # string message is passed on; a raw payload is never formatted into the result, because repr/str escaping
+        # (backslashes, quotes) would carry a token in a form the scrub no longer matches.
+        if isinstance(msg, str) and msg:
+            return _err("cortados route_task: routing error: " + scrub(msg)[:400])   # scrub, then truncate
+        return _err(f"cortados route_task: routing error: unexpected provider response ({type(data).__name__})")
     blocks = [b.get("text", "") for b in (data.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
     text = "\n".join(b for b in blocks if b).strip()
-    model = data.get("model") or "?"
-    return {"content": [{"type": "text", "text": text or "(the delegate returned no text)"}],
-            "_meta": {"cortados/routed_model": model}}
+    model = data.get("model")
+    model = model if isinstance(model, str) and model else "?"    # a non-string would be repr'd past the scrub
+    # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
+    return {"content": [{"type": "text", "text": scrub(text) or "(the delegate returned no text)"}],
+            "_meta": {"cortados/routed_model": scrub(model)}}
 
 
 def handle(msg: dict, cfg: dict) -> dict | None:
@@ -150,16 +170,40 @@ def _dispatch(msg, cfg, write=_write) -> None:
     def run():
         try:
             reply = handle(msg, cfg)
-        except Exception as exc:                        # never let one bad request kill the session
+        except Exception as exc:                        # never let one bad request kill the session; the reply names only
+                                                        # the exception type, as its text is unscrubbed and may echo config
             mid = msg.get("id") if isinstance(msg, dict) else None
-            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error: {exc}"}} if mid is not None else None
+            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error ({type(exc).__name__})"}} if mid is not None else None
         if reply is not None:
             write(reply)
     threading.Thread(target=run, daemon=True).start()
 
 
+def _resolve_token() -> str:
+    """The provider token: CORTADOS_PROVIDER_TOKEN if set, else the token file (CORTADOS_PROVIDER_TOKEN_FILE, default
+    ~/.config/cortados/provider-token) — the same file the routed-subagents mod reads, so route_task needs only the URL
+    configured, not the secret inlined in .mcp.json."""
+    tok = (os.environ.get("CORTADOS_PROVIDER_TOKEN") or "").strip()
+    if tok:
+        return tok
+    path = os.path.expanduser(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or "~/.config/cortados/provider-token")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, ValueError):                       # unreadable, or undecodable (UnicodeDecodeError is a ValueError):
+        return ""                                       # never crash the stdio server; route_task reports 'not configured'
+
+
+def _resolve_url() -> str:
+    """The provider URL, or "" when it is unset or still an unexpanded ${VAR} placeholder (a shell that did not export
+    the var leaves the literal, which would otherwise become an 'unknown url type' error instead of a clear 'not
+    configured' one)."""
+    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip()
+    return "" if url.startswith("${") else url
+
+
 def main() -> None:
-    cfg = {"url": os.environ.get("CORTADOS_PROVIDER_URL", ""), "token": os.environ.get("CORTADOS_PROVIDER_TOKEN", "")}
+    cfg = {"url": _resolve_url(), "token": _resolve_token()}
     for line in sys.stdin:
         if not line.strip():
             continue

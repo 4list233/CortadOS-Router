@@ -14,7 +14,7 @@
  *   - isolation (worktree/remote): the native runner owns the worktree/remote semantics; routing locally would
  *     silently drop them and let parallel isolated agents clobber one another.
  *   - a named agent: the parent registers it for SendMessage; a subprocess cannot join that registry.
- *   - background (run_in_background): can outlive the subprocess's 10-minute ceiling, unless routeBackground is on.
+ *   - background (run_in_background): can outlive the subprocess timeout (subagentTimeoutMs), unless routeBackground is on.
  *   - no provider token available: better a working native subagent than a failed call.
  *
  * Once the child has been launched it has already acted, so the hook NEVER falls back to native after that point
@@ -32,7 +32,9 @@ type Cfg = {
   claudeBin: string
   routeBackground: boolean
   orchestratorMode: boolean
+  orchestratorEnforce: boolean
   orchestratorAllowedTools: string
+  subagentTimeoutMs: number
 }
 
 const FALLBACK: Cfg = {
@@ -44,26 +46,60 @@ const FALLBACK: Cfg = {
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
   routeBackground: false,
-  // Orchestrator mode: the main session (the "brain") only plans and delegates; all actual work is delegated to
-  // routed subagents. An ALLOWLIST (not a denylist) gates the main loop, so any mutating/executing tool — including
-  // ones a denylist would miss (Monitor, memory_write, ExitWorktree, any mcp__ tool, future tools) — is refused
-  // unless explicitly listed. Read-only + planning + delegation tools are allowed so the brain can plan (hybrid).
+  // Orchestrator mode: the main session (the "brain") is DIRECTED to plan and delegate work to routed subagents,
+  // via a standing system-prompt directive. By default this is GUIDANCE, not a cage: the brain keeps its tools and
+  // may act directly when that is clearly the sensible choice (a trivial edit, its own bookkeeping) — delegation is
+  // the strong default, not an absolute rule. Turn on `orchestratorEnforce` to additionally HARD-BLOCK every tool
+  // outside `orchestratorAllowedTools` on the main loop (an allowlist, so even Monitor / memory_write / mcp__ tools /
+  // future tools are refused) for a strict brain that cannot act even if it tried.
   orchestratorMode: true,
-  orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
+  orchestratorEnforce: false,
+  // route_task is a delegation primitive too (it hands a self-contained text subtask to the router and returns the
+  // answer), so it belongs with Agent in the brain's allowed set: a lightweight text delegation should not have to pay
+  // for a full routed-subagent subprocess. Listed here for visibility; ALWAYS_ALLOWED guarantees it regardless of config.
+  orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
+  // How long a routed subagent subprocess may run before it is aborted. The default is the host's own ceiling
+  // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
+  // Background routed work is separate.
+  subagentTimeoutMs: 600_000,
 }
 
+// The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
+// 1..600000, and rejects anything outside it, so a routed subagent with a larger timeout fails to launch at all.
+// resolveTimeoutMs clamps into this range rather than passing an out-of-range value through.
+const MIN_SUBAGENT_TIMEOUT_MS = 1
+const MAX_SUBAGENT_TIMEOUT_MS = 600_000
+
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
-const ALWAYS_ALLOWED = ['Agent']
+// Both the Agent tool and the route_task MCP tool are delegation primitives.
+const ALWAYS_ALLOWED = ['Agent', 'mcp__cortados-route__route_task']
+
+// Host-app plumbing, not work: the Claude desktop app's turn tools that the main loop must call itself (a subagent
+// cannot update the parent's plan or end its turn). Seen 2026-10-30: the strict gate refused wrap_up and the desktop
+// turn showed "Wrapping up — Failed". So even an enforced gate lets these through. Exact names, not a prefix: a
+// prefix such as `mcp__ccd_` would let any similarly named MCP server (e.g. `ccd_external`) bypass the gate.
+const HOST_PLUMBING_TOOLS: ReadonlySet<string> = new Set([
+  'mcp__ccd_turn__update_plan',
+  'mcp__ccd_turn__wrap_up',
+  'mcp__ccd_session__mark_chapter',
+])
 
 /** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
 const ORCHESTRATOR_DIRECTIVE =
-  'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. You decide and delegate; you do ' +
-  'not do the work yourself. Decompose the request into self-contained subtasks and hand EACH to a subagent via the ' +
-  'Agent tool: those subagents are automatically routed to the CortadOS model pool and carry out the work on this ' +
-  'machine. You may read to plan (Read, Grep, Glob) and keep a plan (TodoWrite), but you must not edit files, run ' +
-  'shell commands, fetch the web, or otherwise act yourself — every such tool is refused on this (main) loop and ' +
-  'must be delegated. Give each subagent a complete, standalone task (it cannot see this conversation or your ' +
-  'context). When subagents report back, synthesize their results and plan the next step.'
+  'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. Your job is to decide and ' +
+  'DELEGATE: decompose the request into self-contained subtasks and hand EACH to a subagent via the Agent tool (or a ' +
+  'self-contained text subtask via route_task). Those subagents are automatically routed to the CortadOS model pool ' +
+  'and carry out the work on this machine, so pushing work to them — instead of doing it yourself — is the whole ' +
+  'point of this mode: it keeps the expensive brain model free and runs each piece on the cheapest capable model. ' +
+  'DELEGATE BY DEFAULT for anything substantive: editing or writing files beyond a trivial touch, running commands, ' +
+  'building, broad searching, web access, long analyses. You MAY act directly when delegating would clearly be ' +
+  'wasteful or slower — a one-line edit, your own planning and bookkeeping, a quick read or check — but treat that ' +
+  'as the exception, and never let it become a habit of quietly doing the work yourself. IMPORTANT: routed subagents ' +
+  'have ONLY built-in tools (files, shell, web search/fetch) — no MCP tools: no browser/Chrome, no connectors (Slack, ' +
+  'Gmail, Drive, …), no app tools. Any step that needs one of those (e.g. driving the signed-in browser) cannot be ' +
+  'delegated; do that step yourself and delegate only the rest. Give each subagent a ' +
+  'complete, standalone task (it cannot see this conversation or your context). When subagents report back, ' +
+  'synthesize their results and plan the next step.'
 
 /** Split a comma/space-separated tool list into clean names. */
 export function parseList(s: string): string[] {
@@ -91,7 +127,7 @@ export function resolveAllowSet(configStr: string): Set<string> {
 export function mainLoopAllows(tool: string, agentId: string | null | undefined, allow: ReadonlySet<string>, orchestratorMode: boolean): boolean {
   if (!orchestratorMode) return true
   if (agentId != null) return true // not the main loop (subagent/teammate/engine fork)
-  return ALWAYS_ALLOWED.includes(tool) || allow.has(tool)
+  return ALWAYS_ALLOWED.includes(tool) || HOST_PLUMBING_TOOLS.has(tool) || allow.has(tool)
 }
 
 /** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */
@@ -209,8 +245,18 @@ async function resolveToken($: any, cfg: Cfg): Promise<string> {
   return (await $.fs.read(path)).trim()
 }
 
+/** The subagent timeout from config as an integer the host accepts (1..600000 ms, see MAX_SUBAGENT_TIMEOUT_MS):
+ * a non-number, NaN or non-positive value falls back to the default (a mistyped value never disables the cap), a
+ * fractional value is floored (the host requires an integer), and anything above the host's cap is clamped to it. */
+export function resolveTimeoutMs(v: unknown): number {
+  const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN // JSON config may deliver a string
+  if (Number.isNaN(n) || n <= 0) return FALLBACK.subagentTimeoutMs
+  return Math.min(MAX_SUBAGENT_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
+}
+
 export const register: Register = (on, options) => {
   const cfg: Cfg = { ...FALLBACK, ...(options as Partial<Cfg>) }
+  const subagentTimeoutMs = resolveTimeoutMs(cfg.subagentTimeoutMs)
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
     const subagentType = String(e.subagent_type ?? '')
@@ -296,7 +342,7 @@ export const register: Register = (on, options) => {
             CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
             CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
           },
-          timeoutMs: 600000,
+          timeoutMs: subagentTimeoutMs,
         },
       )
       const p = parseResult(res.stdout)
@@ -335,15 +381,11 @@ export const register: Register = (on, options) => {
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
-  // ---- Orchestrator mode: the main session only plans and delegates; routed subagents do the work. -----------
+  // ---- Orchestrator mode: direct the main session to plan and delegate; routed subagents do the work. ----------
   if (cfg.orchestratorMode) {
-    // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
-    // tokens and falls back to the default set so the brain can always at least read and delegate.
-    const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
-
     // Inject the standing directive so the brain delegates by default — no per-session instruction needed. Only on
     // the main render: a teammate render is a different in-process worker that keeps its tools and must not be told
-    // to delegate everything.
+    // to delegate everything. This directive is the GUIDANCE; it is always on under orchestratorMode.
     on('prompt.compose', async ($: any, e: any, next: any) => {
       const r = await next(e)
       if (Array.isArray(e?.traits) && e.traits.includes('teammate')) return r
@@ -351,24 +393,31 @@ export const register: Register = (on, options) => {
       return { sections: [...r.sections, section] }
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
-    // Gate EVERY tool call on the main loop against the allowlist (a denylist would miss Monitor/memory_write/
-    // ExitWorktree/mcp__ tools/future tools). Non-main loops and allowed tools pass straight through.
-    on('tool.call', async ($: any, e: any, next: any) => {
-      if (mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
-      return {
-        deny:
-          `Orchestrator mode: the brain plans and delegates — it does not run ${e.tool} itself. ` +
-          `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
-          `instead of calling ${e.tool} directly.`,
-      }
-      // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
-      // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
-    }).catch(($: any, e: any, next: any) =>
-      next.called
-        ? undefined
-        : mainLoopAllows(String(e.tool), e.agentId, allow, true)
-          ? next(e)
-          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
-    )
+    // HARD ENFORCEMENT is opt-in (orchestratorEnforce). By default the directive above is trusted and the brain keeps
+    // full tool access — it may act directly when that is clearly sensible. With enforce on, EVERY tool call on the
+    // main loop is gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/
+    // mcp__ tools/future tools are refused unless listed). Non-main loops and allowed tools pass straight through.
+    if (cfg.orchestratorEnforce) {
+      // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
+      // tokens and falls back to the default set so the brain can always at least read and delegate.
+      const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
+      on('tool.call', async ($: any, e: any, next: any) => {
+        if (mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
+        return {
+          deny:
+            `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${e.tool} itself. ` +
+            `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
+            `instead of calling ${e.tool} directly.`,
+        }
+        // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
+        // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
+      }).catch(($: any, e: any, next: any) =>
+        next.called
+          ? undefined
+          : mainLoopAllows(String(e.tool), e.agentId, allow, true)
+            ? next(e)
+            : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
+      )
+    }
   }
 }
