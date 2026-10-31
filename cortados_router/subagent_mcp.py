@@ -89,7 +89,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         try:
             # Scrub the FULL message before truncating: cutting first could split the token at the 300-char boundary,
             # leaving a prefix of it that the whole-token scrub no longer matches (and so would leak).
-            detail = ": " + scrub(str(json.loads(exc.read()).get("error", {}).get("message") or ""))[:300]
+            # Only a plain string message is passed on (as for routing errors below): str() of a list or dict is its
+            # repr, whose escaping could carry the token past the scrub.
+            msg = json.loads(exc.read()).get("error", {}).get("message")
+            detail = (": " + scrub(msg)[:300]) if isinstance(msg, str) and msg else ""
         except Exception:
             pass
         return _err(scrub(f"cortados route_task: provider returned HTTP {exc.code}{detail}"))
@@ -109,8 +112,9 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     blocks = [b.get("text", "") for b in (data.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
     text = "\n".join(b for b in blocks if b).strip()
     model = data.get("model") or "?"
-    return {"content": [{"type": "text", "text": text or "(the delegate returned no text)"}],
-            "_meta": {"cortados/routed_model": model}}
+    # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
+    return {"content": [{"type": "text", "text": scrub(text) or "(the delegate returned no text)"}],
+            "_meta": {"cortados/routed_model": scrub(str(model))}}
 
 
 def handle(msg: dict, cfg: dict) -> dict | None:
@@ -163,9 +167,10 @@ def _dispatch(msg, cfg, write=_write) -> None:
     def run():
         try:
             reply = handle(msg, cfg)
-        except Exception as exc:                        # never let one bad request kill the session
+        except Exception as exc:                        # never let one bad request kill the session; the reply names only
+                                                        # the exception type, as its text is unscrubbed and may echo config
             mid = msg.get("id") if isinstance(msg, dict) else None
-            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error: {exc}"}} if mid is not None else None
+            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal error ({type(exc).__name__})"}} if mid is not None else None
         if reply is not None:
             write(reply)
     threading.Thread(target=run, daemon=True).start()

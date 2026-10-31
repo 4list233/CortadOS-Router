@@ -205,6 +205,35 @@ class TokenSafetyTests(unittest.TestCase):
             self.assertIn("unexpected provider response", text)
             self.assertNotIn("backslashes", text)
 
+    def test_a_structured_http_error_message_is_dropped_not_formatted(self):
+        tok = "tok\\with\\backslash-0001"
+        r = m.route_task("http://x", tok, "task", urlopen=self._http_error(["leak " + tok]))
+        text = r["content"][0]["text"]
+        self.assertIn("HTTP 401", text)
+        self.assertNotIn("backslash", text)
+
+    def test_the_success_path_scrubs_an_echoed_token(self):
+        tok = "tok-success-echo-0001"
+        r = m.route_task("http://x", tok, "task", urlopen=ok_provider(
+            {"model": "m " + tok, "content": [{"type": "text", "text": "the key is " + tok}]}))
+        self.assertNotIn(tok, r["content"][0]["text"])
+        self.assertNotIn(tok, r["_meta"]["cortados/routed_model"])
+
+    def test_an_internal_error_reply_names_only_the_exception_type(self):
+        out = []
+        keep = m.handle
+        m.handle = lambda msg, cfg: (_ for _ in ()).throw(RuntimeError("secret-config-detail"))
+        try:
+            m._dispatch({"jsonrpc": "2.0", "id": 1, "method": "ping"}, {}, out.append)
+            import time
+            for _ in range(100):
+                if out:
+                    break
+                time.sleep(0.01)
+        finally:
+            m.handle = keep
+        self.assertEqual(out[0]["error"]["message"], "internal error (RuntimeError)")
+
     def test_token_whitespace_is_stripped_from_the_header(self):
         seen = {}
 
