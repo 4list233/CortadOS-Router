@@ -219,6 +219,18 @@ class TokenSafetyTests(unittest.TestCase):
         self.assertNotIn(tok, r["content"][0]["text"])
         self.assertNotIn(tok, r["_meta"]["cortados/routed_model"])
 
+    def test_a_non_string_model_is_not_repr_d_into_meta(self):
+        tok = "tok\\back-slash-0001"
+        r = m.route_task("http://x", tok, "task", urlopen=ok_provider({"model": [tok], "content": [{"type": "text", "text": "ok"}]}))
+        self.assertEqual(r["_meta"]["cortados/routed_model"], "?")
+
+    def test_a_non_ascii_token_is_refused_before_any_request(self):
+        sent = []
+        r = m.route_task("http://x", "tok-\u00e9-unicode-0001", "task", urlopen=lambda req, timeout=None: sent.append(req))
+        self.assertIn("printable ASCII", r["content"][0]["text"])
+        self.assertNotIn("unicode", r["content"][0]["text"])
+        self.assertEqual(sent, [])
+
     def test_an_internal_error_reply_names_only_the_exception_type(self):
         out = []
         keep = m.handle

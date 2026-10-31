@@ -66,10 +66,12 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     if len(token) < MIN_TOKEN_LEN:
         return _err(f"cortados route_task: the provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
                     f"provider token (check CORTADOS_PROVIDER_TOKEN or the token file)")
-    if any(ord(c) < 32 or ord(c) == 127 for c in token):
-        # Reject a token with control chars (e.g. an embedded newline from a wrapped paste) BEFORE building the request:
-        # urllib's header validator would otherwise raise with the token's escaped bytes, which the raw-string scrub misses.
-        return _err("cortados route_task: CORTADOS_PROVIDER_TOKEN contains control characters (e.g. an embedded newline); fix it")
+    if not (token.isascii() and token.isprintable()):
+        # Reject a token that is not printable ASCII (control chars such as an embedded newline from a wrapped paste, or
+        # non-ASCII) BEFORE building the request: urllib's header validator / latin-1 encoder would otherwise raise with
+        # the token's escaped bytes or one of its characters, which the whole-token scrub misses.
+        return _err("cortados route_task: CORTADOS_PROVIDER_TOKEN must be printable ASCII (no control characters such as "
+                    "an embedded newline, no non-ASCII); fix it")
     if not (task and str(task).strip()):
         return _err("route_task requires a non-empty 'task'")
     prompt = str(task) if not context else f"{task}\n\nContext:\n{context}"
@@ -111,10 +113,11 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         return _err(f"cortados route_task: routing error: unexpected provider response ({type(data).__name__})")
     blocks = [b.get("text", "") for b in (data.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
     text = "\n".join(b for b in blocks if b).strip()
-    model = data.get("model") or "?"
+    model = data.get("model")
+    model = model if isinstance(model, str) and model else "?"    # a non-string would be repr'd past the scrub
     # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
     return {"content": [{"type": "text", "text": scrub(text) or "(the delegate returned no text)"}],
-            "_meta": {"cortados/routed_model": scrub(str(model))}}
+            "_meta": {"cortados/routed_model": scrub(model)}}
 
 
 def handle(msg: dict, cfg: dict) -> dict | None:
