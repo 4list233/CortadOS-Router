@@ -523,6 +523,8 @@ class Handler(BaseHTTPRequestHandler):
                 if route.get("error"):
                     if route.get("client_error"):       # a pin naming a model this endpoint does not serve: the client's to fix
                         return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire)
+                    if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
+                        return self._error(413, "request_too_large", f"cortados: {route['error']}", wire)
                     return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire)
                 logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")

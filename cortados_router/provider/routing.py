@@ -158,16 +158,23 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     cands = [{"lane": a["lane"], "provider": a["provider"], "model": model, "account": a["account"],
               "config_dir": a["config_dir"], "reserve": a["reserve"]} for a in accounts]
     ch_of = {id(c): core.candidate_health(c, health) for c in cands}
+    byte_caps = core.lane_byte_ceilings()
     too_big = []
     for c in cands:
         cap = core.lane_ceiling(c["lane"], model)
+        bcap = byte_caps.get(core._base_lane(c["lane"]))
+        why = None
         if need > cap:
-            ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"turn ≈{need // 1000}k tokens exceeds {c['lane']} ceiling {cap // 1000}k"}
+            why = f"turn ≈{need // 1000}k tokens exceeds {c['lane']} ceiling {cap // 1000}k"
+        elif bcap is not None and int(fit["input_bytes"]) > int(bcap):   # resolve's byte gate, same table
+            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {bcap}"
+        if why:
+            ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
             too_big.append(c)
     if cands and len(too_big) == len(cands):
         return {"router": execution_routing.ROUTER, "fit_blocked": True,
-                "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any Claude account's context "
-                         f"ceiling ({ch_of[id(too_big[0])]['why']})"}
+                "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any Claude account's "
+                         f"input ceiling ({ch_of[id(too_big[0])]['why']})"}
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     # Account choice is core's static ranking (core.resolve's unscored path): reserves spared while a non-reserve sibling
     # has room, then expiring credit first and scarce last, then configured order.

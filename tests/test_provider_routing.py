@@ -203,10 +203,24 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertEqual(routing.request_fit(body)["input_tokens"], cap + 25)
         r = routing.choose(core, body, client="claude-cli", conversation_id="conv", claude_bin="python3")
         self.assertIn("does not fit", r.get("error", ""))
-        self.assertFalse(r.get("client_error"))             # 503, not 400: nothing in the model name is wrong
+        self.assertFalse(r.get("client_error"))             # not a 400: nothing in the model name is wrong
+        self.assertTrue(r.get("fit_blocked"))                 # the server answers 413: retrying unchanged cannot succeed
         self.assertNotIn("route_id", r)                       # refused before a routes row is written
         self.assertFalse((core.STATE / "router.db").exists())
         self.assertNotIn("error", self.pin("sub/opus"))
+
+    def test_a_configured_byte_ceiling_refuses_a_pin_as_it_refuses_resolve(self):
+        # the pin and core.resolve share core.lane_byte_ceilings: a byte cap on the claude lane gates both
+        keep = core._context_cfg
+        core._context_cfg = lambda: {**keep(), "ceiling_bytes": {"claude": 500}}
+        try:
+            body = {"model": "sub/opus", "tools": [{"name": "Read"}], "messages": [{"role": "user", "content": "x" * 600}]}
+            r = routing.choose(core, body, client="claude-cli", conversation_id="conv", claude_bin="python3")
+            self.assertTrue(r.get("fit_blocked"))
+            self.assertIn("byte ceiling 500", r["error"])
+            self.assertEqual(core.lane_byte_ceilings()["claude"], 500)
+        finally:
+            core._context_cfg = keep
 
     def health(self, a, b):
         core.lane_health = lambda: {"claude": {"ok": True, "pools": {}, "config_dir": "/x/a", **a},

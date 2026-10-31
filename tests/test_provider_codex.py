@@ -99,6 +99,10 @@ class CodexEndpointTests(unittest.TestCase):
         self.route = {"error": "every Claude subscription account is spent"}
         code, _ = self.error_of({"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(code, 503)
+        self.route = {"error": "sub/opus: the request does not fit any Claude account's input ceiling", "fit_blocked": True}
+        code, msg = self.error_of({"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 413)                          # deterministic: a retry of the same input cannot succeed
+        self.assertIn("does not fit", msg)
 
     def pin_router(self):
         # a stand-in for routing.choose: a sub/ pin runs the pinned model, anything else S1's route

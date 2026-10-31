@@ -607,6 +607,13 @@ def turn_tokens(history_chars: int) -> int:
     return int((int(cx.get("harness_tokens", 31000)) + history_chars // 4) * float(cx.get("headroom", 1.2)))
 
 
+def lane_byte_ceilings(cx: dict[str, Any] | None = None) -> dict[str, int]:
+    """Per-lane input byte ceilings (base lane -> bytes) on top of the token ceiling: transports that cap the raw
+    request size. Shared by core.resolve and the provider's sub/ pin so the two fit gates cannot drift."""
+    cx = _context_cfg() if cx is None else cx
+    return {'antigravity': 180000, **(cx.get('ceiling_bytes') or {})}
+
+
 def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> int:
     b = _base_lane(lane)   # a per-account lane (claude#b) inherits its vendor's context limits, including [1m]
     # A transport-keyed ceiling applies only to the transport that measured it (the Donna
@@ -729,7 +736,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     need = (int(fit['input_tokens']) if execution and fit.get('assembled') is True
             else max(turn_tokens(history_chars), int(fit.get('input_tokens') or 0)))
     cx = _context_cfg()
-    byte_caps = {'antigravity': 180000, **(cx.get('ceiling_bytes') or {})}
+    byte_caps = lane_byte_ceilings(cx)
     transport_rejected = set()
     for c in cands:
         cap = lane_ceiling(c['lane'], c['model'], fit.get('transport'))
