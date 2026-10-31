@@ -8,12 +8,15 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
+  sub/ pin          a client that names `sub/<claude model>` chose the model itself: S1 and the band are skipped, but
+                    the served-model, account, capacity and route-log rules still apply (choose_pinned).
 """
 from __future__ import annotations
 
 import json
 import re
 import shutil
+import uuid
 from typing import Any, Callable
 
 from cortados_router import execution_routing
@@ -98,12 +101,133 @@ def _credentials(claude_bin: str, codex_bin: str) -> Callable[..., None]:
     return check
 
 
+def request_fit(body: dict[str, Any]) -> dict[str, Any]:
+    """The input-fit estimate for a whole client request (core.resolve's `input_fit`, assembled: the client sends the
+    full conversation every turn). Used by both the S1 path and the sub/ pin so the two gate on the same number."""
+    raw = json.dumps(body)
+    return {"known": True, "assembled": True, "input_tokens": len(raw) // 4, "input_bytes": len(raw.encode()),
+            "source": "provider_request_estimate"}         # chars / 4; the CLI's own tokenizer is not reachable here
+
+
+SUB_PREFIX = "sub/"
+SUB_DEFAULT = "claude-opus-5-5"
+# Short names a person types (`claude --model sub/opus`); each must name a model the tables serve on claude-cli.
+SUB_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5-20251001",
+               "fable": "claude-fable-5-1"}
+
+
+def sub_pin(body: dict[str, Any]) -> str | None:
+    """A request pinned to a Claude subscription model: model `sub/<claude-model or alias>` (bare `sub` for the
+    default). Returns the requested model name (unvalidated), or None for a normal S1-routed request."""
+    m = (body.get("model") or "").strip()
+    if m == "sub":
+        return SUB_DEFAULT
+    if m.startswith(SUB_PREFIX):
+        name = m[len(SUB_PREFIX):].strip()
+        return SUB_ALIASES.get(name, name) or SUB_DEFAULT
+    return None
+
+
+def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
+                  claude_bin: str = "claude") -> dict[str, Any]:
+    """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
+    (a pin that the band would refuse still runs; that is what pinning is for). What stays is the router's accounting
+    and safety: only a model the tables serve on claude-cli, only a configured account whose subscription is not spent
+    (ranked by core's static account ranking: reserves spared, expiring credit first, scarce last), a request that
+    fits the account's context ceiling, the binary on PATH, and a routes row so the usage is on record (engine
+    `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for labelling).
+    Claude only for now: the Codex lane is paused (Forest, 2026-10-30)."""
+    # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport it as an unknown model.
+    try:
+        accounts = core._vendor_accounts("claude", "claude", "claude-cli")
+    except core.AccountsConfigError as exc:         # broken accounts config refuses Claude, never an ambient login
+        return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
+    claude = sorted({m for p, m in served_routes(core) if _base_provider(p) == "claude-cli"})
+    if model not in claude:
+        return {"router": execution_routing.ROUTER, "client_error": True,
+                "error": f"sub/{model} is not a Claude model this endpoint serves; pin one of: {', '.join(claude)}"}
+    try:
+        _credentials(claude_bin, "codex")(requested="claude-cli", target_model=model)
+    except execution_routing.CredentialsUnavailable as exc:
+        return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
+    # The same input-fit gate core.resolve applies in execution mode: an assembled request's estimate must fit the
+    # chosen lane's ceiling, or the CLI would truncate or reject the conversation after quota was committed to it.
+    fit = request_fit(body)
+    need = int(fit["input_tokens"])
+    health = core.lane_health()
+    cands = [{"lane": a["lane"], "provider": a["provider"], "model": model, "account": a["account"],
+              "config_dir": a["config_dir"], "reserve": a["reserve"]} for a in accounts]
+    ch_of = {id(c): core.candidate_health(c, health) for c in cands}
+    byte_caps = core.lane_byte_ceilings()
+    too_big = []
+    for c in cands:
+        cap = core.lane_ceiling(c["lane"], model)
+        bcap = byte_caps.get(core._base_lane(c["lane"]))
+        why = None
+        if need > cap:
+            why = f"turn ≈{need // 1000}k tokens exceeds {c['lane']} ceiling {cap // 1000}k"
+        elif bcap is not None and int(fit["input_bytes"]) > int(bcap):   # resolve's byte gate, same table
+            why = f"input estimate {fit['input_bytes']} bytes exceeds {c['lane']} byte ceiling {bcap}"
+        if why:
+            ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
+            too_big.append(c)
+    if cands and len(too_big) == len(cands):
+        return {"router": execution_routing.ROUTER, "fit_blocked": True,
+                "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any Claude account's "
+                         f"input ceiling ({ch_of[id(too_big[0])]['why']})"}
+    ok_of = lambda c: ch_of[id(c)].get("ok", True)
+    # Account choice is core's static ranking (core.resolve's unscored path): reserves spared while a non-reserve sibling
+    # has room, then expiring credit first and scarce last, then configured order.
+    for c in core.spared_reserves(cands, ok_of):
+        ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {model} with room"}
+    demote, expiring = core.static_thresholds()
+    base = {id(c): i for i, c in enumerate(cands)}
+    ranked = sorted(cands, key=lambda c: core.static_scarcity_rank(ch_of[id(c)], demote, expiring) + (base[id(c)],))
+    live = [c for c in ranked if ok_of(c)]
+    excluded = [c for c in cands if not ok_of(c)]
+    why_of = lambda c: ch_of[id(c)].get("why") or "capacity unavailable"
+    if not live:
+        # Name what actually excluded each account. Only an account that fit but had no capacity left (not one that was
+        # too big, nor one whose cached reading came from a different login) is a reason to point at the API-credit
+        # lane: when every account was excluded for fit, the same request would not fit api/ either.
+        big = {id(c) for c in too_big}
+        stale = [c for c in excluded if id(c) not in big and why_of(c).startswith("stale cross-account")]
+        spent = [c for c in excluded if id(c) not in big and id(c) not in {id(s) for s in stale}]
+        parts = []
+        for label, group in (("no capacity left", spent), (f"request (≈{need // 1000}k tokens) too large", too_big),
+                             ("usage reading came from a different login, awaiting a fresh sample", stale)):
+            if group:
+                parts.append(f"{label}: " + "; ".join(f"{c['provider']} ({why_of(c)})" for c in group))
+        hint = f"; pin api/{model} to spend API credit instead" if spent else ""
+        return {"router": execution_routing.ROUTER,
+                "error": f"sub/{model}: no Claude subscription account can take this request ({' | '.join(parts)}){hint}"}
+    chosen = {**live[0], "pool": ch_of[id(live[0])].get("pool")}
+    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+    # skipped has core.resolve's shape ({lane, model, pool, why}): core.footer and s1/outcome/run.py read it as dicts.
+    skipped = [{"lane": c["lane"], "model": model, "pool": ch_of[id(c)].get("pool"), "why": why_of(c)} for c in excluded]
+    route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
+             "hard_rules": [f"pinned by the client: sub/{model}"] + [f"{c['provider']}: {why_of(c)}" for c in excluded],
+             "skipped": skipped or None}
+    # engine_ms None, not 0: S1 was never asked, so the row carries no S1 latency (core.usage_summary skips pin rows).
+    decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": None}
+    core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}", "unit_kind": "interactive",
+                              "actual_model": None,
+                              "request": request_text(body.get("messages") or [], standalone=not body.get("tools"))[:8000]},
+                   decision, route)
+    return {"router": execution_routing.ROUTER, "provider": chosen["provider"], "model": model,
+            "account": chosen["account"], "config_dir": chosen["config_dir"],
+            "context_length": core.lane_ceiling(chosen["lane"], model), "route_id": route_id, "api_request_id": "",
+            "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
+
+
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex") -> dict[str, Any]:
-    """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error."""
-    raw = json.dumps(body)
-    fit = {"known": True, "assembled": True, "input_tokens": len(raw) // 4, "input_bytes": len(raw.encode()),
-           "source": "provider_request_estimate"}         # chars / 4; the CLI's own tokenizer is not reachable here
+    """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
+    A `sub/`-pinned request skips S1 (choose_pinned)."""
+    pinned = sub_pin(body)
+    if pinned:
+        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
+    fit = request_fit(body)
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,

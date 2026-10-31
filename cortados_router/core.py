@@ -25,7 +25,7 @@ import urllib.error
 import http.client
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cortados_router.paths import s1_current, tables_dir
 
@@ -607,6 +607,13 @@ def turn_tokens(history_chars: int) -> int:
     return int((int(cx.get("harness_tokens", 31000)) + history_chars // 4) * float(cx.get("headroom", 1.2)))
 
 
+def lane_byte_ceilings(cx: dict[str, Any] | None = None) -> dict[str, int]:
+    """Per-lane input byte ceilings (base lane -> bytes) on top of the token ceiling: transports that cap the raw
+    request size. Shared by core.resolve and the provider's sub/ pin so the two fit gates cannot drift."""
+    cx = _context_cfg() if cx is None else cx
+    return {'antigravity': 180000, **(cx.get('ceiling_bytes') or {})}
+
+
 def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> int:
     b = _base_lane(lane)   # a per-account lane (claude#b) inherits its vendor's context limits, including [1m]
     # A transport-keyed ceiling applies only to the transport that measured it (the Donna
@@ -618,6 +625,29 @@ def lane_ceiling(lane: str, model: str = "", transport: str | None = None) -> in
     if b == "claude" and "[1m]" in (model or ""):
         return int(cx.get("claude[1m]", 1000000))
     return int(cx.get(b, 200000))
+
+
+def static_thresholds(pol: dict[str, Any] | None = None) -> tuple[float, float]:
+    """(demote_above, prefer_expiring_headroom_pct) from budgets.json's policy: the two thresholds of the static
+    (unscored) account ranking. Shared by resolve and the provider's sub/ pin so both rank accounts the same way."""
+    pol = _policy() if pol is None else pol
+    return float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
+
+
+def spared_reserves(cands: list[dict[str, Any]], ok_of: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+    """Reserve accounts (accounts.json "reserve": true) to hold back: each one whose SAME model on the same base lane has
+    an available non-reserve sibling. A reserve account is used once every non-reserve sibling for that model is spent.
+    Only non-reserve siblings are consulted, so marking the returned ones unavailable does not change the answer."""
+    return [c for c in cands
+            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
+                                        and not k.get("reserve") and ok_of(k) for k in cands)]
+
+
+def static_scarcity_rank(h: dict[str, Any], demote: float, expiring: float) -> tuple[int, int]:
+    """The scarcity part of the static ranking for one candidate's health: first an account whose expiring credit would
+    otherwise be lost (and that is not scarce), last a scarce (demoted) one. Lower sorts first."""
+    sc, exp = h.get("scarcity") or 0.0, h.get("expiring_pct") or 0
+    return (0 if exp >= expiring and sc < demote else 1, 1 if sc >= demote else 0)
 
 
 def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_chars: int = 0, sticky: dict[str, Any] | None = None,
@@ -656,7 +686,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     # candidates: table order, work-kind preference first; then subscription scarcity re-ranks them (never below the band):
     #   spent / refusing lane → skipped · lane burning faster than its window → behind the others · lane whose headroom expires soon → first
     health, pol = lane_health(), _policy()
-    demote, expiring = float(pol.get("demote_above", 0.5)), float(pol.get("prefer_expiring_headroom_pct", 10))
+    demote, expiring = static_thresholds(pol)
     pref = (t.get("work_kind_preference") or {}).get(ans.get("work_kind") or "", [])
     scored = scored_candidates(t, band, ans.get("work_kind"), accounts_aware)
     # The static band list carries no account metadata; expand it too, so a missing/unreadable score catalog still binds
@@ -706,7 +736,7 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
     need = (int(fit['input_tokens']) if execution and fit.get('assembled') is True
             else max(turn_tokens(history_chars), int(fit.get('input_tokens') or 0)))
     cx = _context_cfg()
-    byte_caps = {'antigravity': 180000, **(cx.get('ceiling_bytes') or {})}
+    byte_caps = lane_byte_ceilings(cx)
     transport_rejected = set()
     for c in cands:
         cap = lane_ceiling(c['lane'], c['model'], fit.get('transport'))
@@ -738,10 +768,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
         # reserve accounts (accounts.json "reserve": true): spared only while the SAME model on a non-reserve sibling is
         # available, so account A stays in reserve while B can serve this model, but A is used when B's pool for it is spent
         # (never letting the reserve preference pick an underqualified model). Applied on BOTH the scored and static paths.
-        for c in cands:
-            if c.get("reserve") and any(k.get("model") == c.get("model") and _base_lane(k["lane"]) == _base_lane(c["lane"])
-                                        and not k.get("reserve") and ok_of(k) for k in cands):
-                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
+        for c in spared_reserves(cands, ok_of):
+            ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {c['model']} with room"}
 
     if scored:
         sel = t["selection"]
@@ -848,8 +876,8 @@ def resolve(decision: dict[str, Any], unit_kind: str = "interactive", history_ch
             rules.append(f"no available model reaches {req}: strongest available ({best_avail}) taken")
     else:
         apply_reserve()      # the static/fallback path honours the reserve policy too, not only scored selection
-        cands.sort(key=lambda c: (0 if exp_of(c) >= expiring and sc_of(c) < demote else 1, 1 if sc_of(c) >= demote else 0,
-                                  pref.index(c["lane"]) if c["lane"] in pref else len(pref), base[id(c)]))
+        cands.sort(key=lambda c: static_scarcity_rank(ch_of[id(c)], demote, expiring)
+                   + (pref.index(c["lane"]) if c["lane"] in pref else len(pref), base[id(c)]))
     usable = [c for c in cands if ok_of(c)]
     skipped = [{"lane": c["lane"], "model": c["model"], "pool": ch_of[id(c)].get("pool"), "why": ch_of[id(c)].get("why")} for c in cands if not ok_of(c) and not (ch_of[id(c)].get("why") or "").startswith("secondary")][:8]
     fitting = [c for c in cands if id(c) not in transport_rejected and not ch_of[id(c)].get("resource_rejected")]
@@ -1044,6 +1072,11 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
     handful of order statistics it needs — so a dashboard poll neither blocks logging nor grows with history. No
     subscription CLI is opened. Request text is never included."""
     import math
+    # A negative LIMIT is "no limit" to SQLite: clamp, so a bad caller value cannot turn the bounded read unbounded.
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 0
     empty = {"total_routes": 0, "by_band": {}, "by_lane": {}, "degraded": {"count": 0, "of": 0}, "s1_latency_ms": {}, "recent": []}
     path = STATE / "router.db"
     if not path.exists():
@@ -1060,14 +1093,21 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
         total = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
         by_band = {r["band"]: r["n"] for r in conn.execute("SELECT band, COUNT(*) AS n FROM routes WHERE band IS NOT NULL GROUP BY band")}
         by_lane = {f'{r["lane"]}/{r["model"]}': r["n"] for r in conn.execute("SELECT lane, model, COUNT(*) AS n FROM routes WHERE lane IS NOT NULL GROUP BY lane, model")}
-        degraded = conn.execute("SELECT COALESCE(SUM(degraded), 0) FROM routes").fetchone()[0]
-        window = [dict(r) for r in conn.execute("SELECT ts, platform, band, lane, model, degraded, engine_ms, turn_ms, "
-                                                "response_chars FROM routes ORDER BY ts DESC LIMIT ?", (max(limit, LAT_WINDOW),))]
+        # S1 health (degraded rate, latency) is measured over SCORED rows only: a client pin (engine 'pin', the provider's
+        # sub/ path) never asked S1, so counting it would dilute the degraded rate and pull latency toward zero. Pins stay
+        # in the route totals above. A routes table without an engine column (pre-DDL fixture) cannot hold pin rows.
+        has_engine = any(r[1] == "engine" for r in conn.execute("PRAGMA table_info(routes)"))
+        scored_only = "WHERE COALESCE(engine, '') != 'pin'" if has_engine else ""
+        degraded, scored = conn.execute(f"SELECT COALESCE(SUM(degraded), 0), COUNT(*) FROM routes {scored_only}").fetchone()
+        ems = sorted(r[0] for r in conn.execute(
+            f"SELECT engine_ms FROM routes {scored_only or 'WHERE 1'} AND engine_ms IS NOT NULL ORDER BY ts DESC LIMIT ?",
+            (LAT_WINDOW,)))
+        window = [dict(r) for r in conn.execute("SELECT ts, platform, band, lane, model, degraded, turn_ms, "
+                                                "response_chars FROM routes ORDER BY ts DESC LIMIT ?", (limit,))]
     except sqlite3.Error as exc:
         return {**empty, "error": f"{type(exc).__name__}: {exc}"}
     finally:
         conn.close()
-    ems = sorted(r["engine_ms"] for r in window if r["engine_ms"] is not None)
     if ems:
         n = len(ems)
         median = ems[n // 2] if n % 2 else (ems[n // 2 - 1] + ems[n // 2]) / 2
@@ -1079,7 +1119,7 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
                "degraded": bool(r["degraded"]), "turn_ms": r["turn_ms"], "response_chars": r["response_chars"]}
               for r in window[:limit]]
     return {"total_routes": total, "by_band": by_band, "by_lane": by_lane,
-            "degraded": {"count": int(degraded), "of": total}, "s1_latency_ms": lat, "recent": recent}
+            "degraded": {"count": int(degraded), "of": scored}, "s1_latency_ms": lat, "recent": recent}
 
 
 if __name__ == "__main__":
@@ -1092,4 +1132,4 @@ if __name__ == "__main__":
         t = table(); print("table v", t.get("version"), "ok" if not _table_error else _table_error)
     else:
         for x in recent(20):
-            print(f"{time.strftime('%m-%d %H:%M', time.localtime(x['ts']))} {x['platform'] or '':8s} {x['band']:3s} {str(x['lane']):11s} {str(x['model'])[:26]:26s} sub={x['subagents']} D={x['D']} {x['engine_ms']}ms {'DEGRADED ' if x['degraded'] else ''}| {x['request']}")
+            print(f"{time.strftime('%m-%d %H:%M', time.localtime(x['ts']))} {x['platform'] or '':8s} {x['band']:3s} {str(x['lane']):11s} {str(x['model'])[:26]:26s} sub={x['subagents']} D={x['D']} {'-' if x['engine_ms'] is None else x['engine_ms']}ms {'DEGRADED ' if x['degraded'] else ''}| {x['request']}")

@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from cortados_router.provider import codex_bridge, codex_isolation
+from cortados_router.provider import codex_bridge, codex_isolation, routing
 from cortados_router.provider import server as provider_server
 from cortados_router.provider.bridge import BridgeError
 from cortados_router.provider.server import ProviderServer, Registry
@@ -89,6 +89,65 @@ class CodexEndpointTests(unittest.TestCase):
 
     def inbound(self):
         return [json.loads(l) for l in Path(self.log_file).read_text().splitlines() if l.strip()]
+
+    def test_a_route_flagged_client_error_answers_400_not_503(self):
+        # a sub/ pin naming a model this endpoint does not serve is the client's to fix (routing.choose_pinned)
+        self.route = {"error": "sub/x is not a Claude model this endpoint serves", "client_error": True}
+        code, msg = self.error_of({"model": "sub/x", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 400)
+        self.assertIn("not a Claude model", msg)
+        self.route = {"error": "every Claude subscription account is spent"}
+        code, _ = self.error_of({"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 503)
+        self.route = {"error": "sub/opus: the request does not fit any Claude account's input ceiling", "fit_blocked": True}
+        code, msg = self.error_of({"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 413)                          # deterministic: a retry of the same input cannot succeed
+        self.assertIn("does not fit", msg)
+
+    def pin_router(self):
+        # a stand-in for routing.choose: a sub/ pin runs the pinned model, anything else S1's route
+        def route(body, client):
+            p = routing.sub_pin(body)
+            return dict(CODEX_ROUTE, model=p, band="pin", pinned=True) if p else dict(CODEX_ROUTE)
+        self.reg.router = route
+
+    def continuation(self, first_model, next_model):
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"model": first_model, "tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        return {"model": next_model, "tools": [READ_TOOL], "messages": history}
+
+    def test_a_pinned_conversation_continues_under_the_same_pin_or_cortados(self):
+        self.pin_router()
+        body = self.continuation("sub/opus", "sub/claude-opus-5-5")     # alias and full name are the same pin
+        r2 = self.post(body)
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
+        [session] = self.reg.sessions.values()
+        self.assertEqual(session.route["model"], "claude-opus-5-5")
+        # `cortados` on a pinned conversation continues: the pinned model keeps running
+        body = dict(body, model="cortados", messages=body["messages"] + [
+            {"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "thanks"}])
+        self.assertEqual(self.post(body)["content"], [{"type": "text", "text": "echo: thanks"}])
+        self.assertEqual(session.route["model"], "claude-opus-5-5")
+
+    def test_switching_the_pinned_model_mid_conversation_is_refused(self):
+        self.pin_router()
+        code, msg = self.error_of(self.continuation("sub/opus", "sub/sonnet"))
+        self.assertEqual(code, 409)
+        self.assertIn("fixed per conversation", msg)
+        self.assertIn("sub/claude-opus-5-5", msg)
+        self.assertIn("sub/claude-sonnet-5", msg)
+        [session] = self.reg.sessions.values()                          # the conversation itself is kept
+        self.assertEqual(session.route["model"], "claude-opus-5-5")
+
+    def test_pinning_an_s1_routed_conversation_is_refused(self):
+        self.pin_router()
+        code, msg = self.error_of(self.continuation("cortados", "sub/opus"))
+        self.assertEqual(code, 409)
+        self.assertIn("routed by S1 to gpt-test", msg)
+        self.assertIn("new conversation", msg)
 
     def test_a_plain_turn_echoes_through_the_app_server(self):
         header, r = self.raw({"model": "cortados", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})

@@ -36,7 +36,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
-from cortados_router.provider import anthropic_wire, responses_wire
+from cortados_router.provider import anthropic_wire, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
@@ -480,7 +480,10 @@ class Handler(BaseHTTPRequestHandler):
             Path(dump).mkdir(parents=True, exist_ok=True)
             (Path(dump) / f"{time.time():.3f}.json").write_text(json.dumps(body, indent=1))
         try:
-            api_model = self._api_pin(body)
+            # The api/ lane relays the body verbatim to the Anthropic Messages API, so only a Messages-wire body can be
+            # pinned to it; on /v1/responses an api/ (or sub/) name falls through to parse_request, which refuses any
+            # model but `cortados` with a 400 (Codex compares the echoed model to the one it asked for).
+            api_model = self._api_pin(body) if wire is ANTHROPIC else None
             if api_model:
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
@@ -503,6 +506,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid_request_error", str(exc), wire)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
+        changed = self._model_change(session, body) if session is not None else None
+        if changed:
+            return self._error(409, "invalid_request_error", changed, wire)
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
             route = None
@@ -515,6 +521,10 @@ class Handler(BaseHTTPRequestHandler):
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire)
                 if route.get("error"):
+                    if route.get("client_error"):       # a pin naming a model this endpoint does not serve: the client's to fix
+                        return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire)
+                    if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
+                        return self._error(413, "request_too_large", f"cortados: {route['error']}", wire)
                     return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire)
                 logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
@@ -676,6 +686,24 @@ class Handler(BaseHTTPRequestHandler):
             return (self.headers.get(REVEAL_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             return False
+
+    @staticmethod
+    def _model_change(session, body: dict[str, Any]) -> str | None:
+        """Why a continuation must be refused for naming a different model than its conversation runs, or None.
+        The route is fixed when the conversation opens (the running CLI cannot change model without losing its session
+        and prompt cache), so a `sub/` pin on a continuation must name the model the conversation was pinned to; a
+        different one, or a pin on an S1-routed conversation, is refused rather than silently served on the old route
+        while the response echoes the new name. A continuation naming `cortados` (or any non-pin name) continues on
+        whatever the conversation runs: on a pinned conversation the pinned model keeps running."""
+        pinned = routing.sub_pin(body)
+        if not pinned:
+            return None
+        r = getattr(session, "route", None) or {}
+        if r.get("pinned") and r.get("model") == pinned:
+            return None
+        now = f"pinned to sub/{r.get('model')}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
+        return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
+                f"sub/{pinned}; start a new conversation to change models")
 
     def _reveal(self, session) -> str | None:   # api/-pinned requests reveal in _serve_api_lane (api_reveal_suffix)
         try:
