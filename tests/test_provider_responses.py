@@ -239,6 +239,15 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual((code, sorted(body)), (400, ["error"]))
         self.no_backend_started()
 
+    def test_sub_and_api_pins_are_refused_on_the_responses_wire(self):
+        # the pins are Messages-wire only: a Responses client naming one gets a 400 before routing or the API lane
+        for model in ("sub/opus", "sub", "api/claude-opus-5-5", "api"):
+            code, body = self.error_of(dict(request(user("x")), model=model))
+            self.assertEqual((code, body["error"]["type"]), (400, "invalid_request_error"), model)
+            self.assertIn("model must be 'cortados'", body["error"]["message"])
+        self.assertEqual(self.clients, [])                             # never routed
+        self.no_backend_started()
+
     def test_a_json_body_that_is_not_an_object_is_a_400_not_a_dropped_connection(self):
         for raw in (b"[]", b"1", b'"cortados"', b"null"):
             code, body = self.error_of(raw)

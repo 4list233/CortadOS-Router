@@ -170,22 +170,37 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
                          f"ceiling ({ch_of[id(too_big[0])]['why']})"}
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     # Account choice is core's static ranking (core.resolve's unscored path): reserves spared while a non-reserve sibling
-    # has room, then expiring credit first and scarce accounts last, then configured order.
+    # has room, then expiring credit first and scarce last, then configured order.
     for c in core.spared_reserves(cands, ok_of):
         ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": f"reserve account; a non-reserve account has {model} with room"}
     demote, expiring = core.static_thresholds()
     base = {id(c): i for i, c in enumerate(cands)}
     ranked = sorted(cands, key=lambda c: core.static_scarcity_rank(ch_of[id(c)], demote, expiring) + (base[id(c)],))
     live = [c for c in ranked if ok_of(c)]
-    spent = [f"{c['provider']}: {ch_of[id(c)].get('why') or 'capacity unavailable'}" for c in cands if not ok_of(c)]
+    excluded = [c for c in cands if not ok_of(c)]
+    why_of = lambda c: ch_of[id(c)].get("why") or "capacity unavailable"
     if not live:
+        # Name what actually excluded each account. Only an account that fit but had no capacity left (not one that was
+        # too big, nor one whose cached reading came from a different login) is a reason to point at the API-credit
+        # lane: when every account was excluded for fit, the same request would not fit api/ either.
+        big = {id(c) for c in too_big}
+        stale = [c for c in excluded if id(c) not in big and why_of(c).startswith("stale cross-account")]
+        spent = [c for c in excluded if id(c) not in big and id(c) not in {id(s) for s in stale}]
+        parts = []
+        for label, group in (("no capacity left", spent), (f"request (≈{need // 1000}k tokens) too large", too_big),
+                             ("usage reading came from a different login, awaiting a fresh sample", stale)):
+            if group:
+                parts.append(f"{label}: " + "; ".join(f"{c['provider']} ({why_of(c)})" for c in group))
+        hint = f"; pin api/{model} to spend API credit instead" if spent else ""
         return {"router": execution_routing.ROUTER,
-                "error": f"sub/{model}: every Claude subscription account is spent ({'; '.join(spent)}); "
-                         f"pin api/{model} to spend API credit instead"}
+                "error": f"sub/{model}: no Claude subscription account can take this request ({' | '.join(parts)}){hint}"}
     chosen = {**live[0], "pool": ch_of[id(live[0])].get("pool")}
     route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+    # skipped has core.resolve's shape ({lane, model, pool, why}): core.footer and s1/outcome/run.py read it as dicts.
+    skipped = [{"lane": c["lane"], "model": model, "pool": ch_of[id(c)].get("pool"), "why": why_of(c)} for c in excluded]
     route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
-             "hard_rules": [f"pinned by the client: sub/{model}"] + spent, "skipped": spent or None}
+             "hard_rules": [f"pinned by the client: sub/{model}"] + [f"{c['provider']}: {why_of(c)}" for c in excluded],
+             "skipped": skipped or None}
     # engine_ms None, not 0: S1 was never asked, so the row carries no S1 latency (core.usage_summary skips pin rows).
     decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": None}
     core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}", "unit_kind": "interactive",

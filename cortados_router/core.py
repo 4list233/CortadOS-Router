@@ -1065,6 +1065,11 @@ def usage_summary(limit: int = 12) -> dict[str, Any]:
     handful of order statistics it needs — so a dashboard poll neither blocks logging nor grows with history. No
     subscription CLI is opened. Request text is never included."""
     import math
+    # A negative LIMIT is "no limit" to SQLite: clamp, so a bad caller value cannot turn the bounded read unbounded.
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 0
     empty = {"total_routes": 0, "by_band": {}, "by_lane": {}, "degraded": {"count": 0, "of": 0}, "s1_latency_ms": {}, "recent": []}
     path = STATE / "router.db"
     if not path.exists():

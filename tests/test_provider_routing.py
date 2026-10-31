@@ -261,6 +261,102 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertEqual(s["degraded"], {"count": 1, "of": 1})                  # only the scored row
         self.assertEqual((s["s1_latency_ms"]["median"], s["s1_latency_ms"]["window"]), (1000, 1))
 
+    def test_account_with_a_cross_login_reading_is_skipped(self):
+        # the reading cached under lane `claude` was sampled from another login (config_dir differs): not trusted
+        self.two_accounts()
+        core.lane_health = lambda: {"claude": {"ok": True, "scarcity": -0.9, "pools": {}, "config_dir": "/x/other"},
+                                    "claude#b": {"ok": True, "scarcity": 0.4, "pools": {}, "config_dir": "/x/b"}}
+        r = self.pin("sub/opus")
+        self.assertEqual((r["provider"], r["account"]), ("claude-cli#b", "b"))
+        [s] = r["route"]["skipped"]
+        self.assertEqual((s["lane"], s["model"]), ("claude", "claude-opus-5-5"))
+        self.assertIn("stale cross-account reading", s["why"])
+
+    def test_fable_pin_refuses_an_account_whose_fable_pool_is_spent(self):
+        self.two_accounts()
+        fable_spent = {"ok": True, "scarcity": 0.1, "config_dir": "/x/a",
+                       "pools": {"fable": {"ok": False, "scarcity": 1.0, "why": "fable pool 100% used"}}}
+        core.lane_health = lambda: {"claude": fable_spent,
+                                    "claude#b": {"ok": True, "scarcity": 0.6, "config_dir": "/x/b",
+                                                 "pools": {"fable": {"ok": True, "scarcity": 0.6}}}}
+        r = self.pin("sub/fable")
+        self.assertEqual((r["provider"], r["model"]), ("claude-cli#b", "claude-fable-5-1"))
+        self.assertEqual(r["route"]["skipped"][0]["pool"], "fable")
+        # alone, the account with general-window room but a spent Fable pool is refused, not used
+        core._vendor_accounts = lambda *a: [
+            {"lane": "claude", "provider": "claude-cli", "account": "a", "reserve": False, "config_dir": "/x/a"}]
+        core.lane_health = lambda: {"claude": fable_spent}
+        r = self.pin("sub/fable")
+        self.assertIn("fable pool 100% used", r["error"])
+        self.assertIn("api/claude-fable-5-1", r["error"])
+
+    def test_refusal_names_stale_readings_and_does_not_suggest_the_api_pin_for_them(self):
+        self.two_accounts()
+        core.lane_health = lambda: {"claude": {"ok": True, "pools": {}, "config_dir": "/x/other"},
+                                    "claude#b": {"ok": True, "pools": {}, "config_dir": "/x/other"}}
+        r = self.pin("sub/opus")
+        self.assertIn("different login", r["error"])
+        self.assertNotIn("spent", r["error"])
+        self.assertNotIn("api/", r["error"])
+
+    def test_refusal_for_fit_plus_spent_names_both_and_suggests_api_for_the_spent_one(self):
+        self.two_accounts()
+        keep = core.lane_ceiling
+        core.lane_ceiling = lambda lane, model="", transport=None: 10 if lane == "claude" else keep(lane, model, transport)
+        try:
+            core.lane_health = lambda: {"claude": {"ok": True, "pools": {}, "config_dir": "/x/a"},
+                                        "claude#b": {"ok": False, "why": "week 100% used", "pools": {}, "config_dir": "/x/b"}}
+            r = self.pin("sub/opus")
+            self.assertIn("too large", r["error"])
+            self.assertIn("no capacity left", r["error"])
+            self.assertIn("week 100% used", r["error"])
+            self.assertIn("pin api/claude-opus-5-5", r["error"])
+            # fit + stale only: nothing was spent, so api/ is not offered
+            core.lane_health = lambda: {"claude": {"ok": True, "pools": {}, "config_dir": "/x/a"},
+                                        "claude#b": {"ok": True, "pools": {}, "config_dir": "/x/other"}}
+            r = self.pin("sub/opus")
+            self.assertIn("too large", r["error"])
+            self.assertIn("different login", r["error"])
+            self.assertNotIn("api/", r["error"])
+        finally:
+            core.lane_ceiling = keep
+
+    def test_pin_route_skipped_has_resolves_shape_and_renders_in_the_footer(self):
+        self.two_accounts()
+        core.lane_health = lambda: {"claude": {"ok": False, "why": "week 100% used", "pools": {}, "config_dir": "/x/a"},
+                                    "claude#b": {"ok": True, "scarcity": 0.4, "pools": {}, "config_dir": "/x/b"}}
+        r = self.pin("sub/opus")
+        self.assertEqual(r["route"]["skipped"], [{"lane": "claude", "model": "claude-opus-5-5", "pool": None,
+                                                  "why": "week 100% used"}])
+        line = core.footer(r["route"], r["decision"])
+        self.assertIn("skipped claude/claude-opus-5-5 (week 100% used)", line)
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            stored = json.loads(db.execute("SELECT skipped FROM routes WHERE turn_id=?", (r["route_id"],)).fetchone()[0])
+        self.assertEqual(stored, r["route"]["skipped"])
+
+    def test_usage_summary_clamps_a_negative_limit(self):
+        for _ in range(3):
+            self.assertNotIn("error", self.pin("sub/opus"))
+        self.assertEqual(core.usage_summary(limit=-1)["recent"], [])     # SQLite LIMIT -1 would be unlimited
+        self.assertEqual(core.usage_summary(limit=0)["recent"], [])
+        self.assertEqual(len(core.usage_summary(limit=2)["recent"]), 2)
+
+    def test_usage_summary_on_a_routes_table_without_an_engine_column(self):
+        core.STATE.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            db.execute("CREATE TABLE routes (ts REAL, platform TEXT, band TEXT, lane TEXT, model TEXT, degraded INTEGER, "
+                       "engine_ms INTEGER, turn_ms INTEGER, response_chars INTEGER)")
+            db.executemany("INSERT INTO routes VALUES (?,?,?,?,?,?,?,?,?)",
+                           [(1.0, "cli", "R1", "codex", "m", 0, 100, None, None),
+                            (2.0, "cli", "R2", "codex", "m", 1, 300, None, None),
+                            (3.0, "cli", "R2", "codex", "m", 0, None, None, None)])
+        s = core.usage_summary()
+        self.assertNotIn("error", s)
+        self.assertEqual(s["total_routes"], 3)
+        self.assertEqual(s["degraded"], {"count": 1, "of": 3})
+        self.assertEqual((s["s1_latency_ms"]["median"], s["s1_latency_ms"]["window"]), (200, 2))
+        self.assertEqual(len(s["recent"]), 3)
+
     def test_broken_accounts_config_refuses_claude(self):
         def broken(*a):
             raise core.AccountsConfigError("accounts.json unreadable")
