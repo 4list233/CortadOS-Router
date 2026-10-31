@@ -28,6 +28,7 @@ PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
 TIMEOUT_S = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", "300"))   # a routed subtask can take a while (cold lane, large output)
 DEFAULT_MAX_TOKENS = 8000
+MIN_TOKEN_LEN = 8                 # shorter is not a provider token (see route_task)
 
 TOOL = {
     "name": "route_task",
@@ -56,11 +57,15 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                urlopen=urllib.request.urlopen) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
     provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
-    # Never let the token reach model-visible text. Only a token long enough to be a real secret is scrubbed; a short
-    # token is not a credential and scrubbing it would mangle ordinary words (a real provider token is a long random string).
-    scrub = (lambda s: s.replace(token, "***")) if (token and len(token) >= 8) else (lambda s: s)
+    # Never let the token reach model-visible text: every error below is scrubbed. A token too short to be a provider
+    # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
+    # leaking a short credential and mangling ordinary words that happen to contain it.
+    scrub = lambda s: s.replace(token, "***") if token else s
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
+    if len(token) < MIN_TOKEN_LEN:
+        return _err(f"cortados route_task: the provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
+                    f"provider token (check CORTADOS_PROVIDER_TOKEN or the token file)")
     if any(ord(c) < 32 or ord(c) == 127 for c in token):
         # Reject a token with control chars (e.g. an embedded newline from a wrapped paste) BEFORE building the request:
         # urllib's header validator would otherwise raise with the token's escaped bytes, which the raw-string scrub misses.
@@ -93,9 +98,14 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
         # urllib's header validation, whose message would otherwise echo the token (scrubbed above).
         return _err(scrub(f"cortados route_task: could not reach the provider ({type(exc).__name__}: {exc})"))
     if not isinstance(data, dict) or data.get("type") == "error" or data.get("error"):
-        msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        # The provider's error text is not ours to trust: it may echo the request's credential, so scrub it too.
-        return _err(scrub(f"cortados route_task: routing error: {msg or data}"))
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else None
+        # The provider's error text is not ours to trust: it may echo the request's credential, so scrub it. Only a plain
+        # string message is passed on; a raw payload is never formatted into the result, because repr/str escaping
+        # (backslashes, quotes) would carry a token in a form the scrub no longer matches.
+        if isinstance(msg, str) and msg:
+            return _err("cortados route_task: routing error: " + scrub(msg)[:400])   # scrub, then truncate
+        return _err(f"cortados route_task: routing error: unexpected provider response ({type(data).__name__})")
     blocks = [b.get("text", "") for b in (data.get("content") or []) if isinstance(b, dict) and b.get("type") == "text"]
     text = "\n".join(b for b in blocks if b).strip()
     model = data.get("model") or "?"

@@ -31,7 +31,7 @@ class RouteTaskTests(unittest.TestCase):
     def test_returns_the_routed_models_text(self):
         prov = ok_provider({"type": "message", "model": "gpt-6.1-sol",
                             "content": [{"type": "text", "text": "the answer"}]})
-        r = m.route_task("http://x:8432", "tok", "do a thing", urlopen=prov)
+        r = m.route_task("http://x:8432", "tok-test-0001", "do a thing", urlopen=prov)
         self.assertNotIn("isError", r)
         self.assertEqual(r["content"][0]["text"], "the answer")
         self.assertEqual(r["_meta"]["cortados/routed_model"], "gpt-6.1-sol")
@@ -44,35 +44,35 @@ class RouteTaskTests(unittest.TestCase):
             seen["token"] = req.headers.get("X-api-key")
             seen["body"] = json.loads(req.data)
             return FakeResp({"content": [{"type": "text", "text": "ok"}]})
-        m.route_task("http://host:8432/", "secret", "task text", context="extra", urlopen=_open)
+        m.route_task("http://host:8432/", "secret-test-0001", "task text", context="extra", urlopen=_open)
         self.assertEqual(seen["url"], "http://host:8432/v1/messages")
-        self.assertEqual(seen["token"], "secret")
+        self.assertEqual(seen["token"], "secret-test-0001")
         self.assertEqual(seen["body"]["model"], "cortados")
         self.assertIn("task text", seen["body"]["messages"][0]["content"][0]["text"])
         self.assertIn("extra", seen["body"]["messages"][0]["content"][0]["text"])
 
     def test_empty_task_is_an_error(self):
-        self.assertTrue(m.route_task("http://x", "t", "   ", urlopen=ok_provider({}))["isError"])
+        self.assertTrue(m.route_task("http://x", "t-test-0001", "   ", urlopen=ok_provider({}))["isError"])
 
     def test_unconfigured_is_an_error(self):
         self.assertTrue(m.route_task("", "", "task", urlopen=ok_provider({}))["isError"])
 
     def test_provider_error_payload_surfaces(self):
         prov = ok_provider({"type": "error", "error": {"message": "S1 unavailable; no Codex lane"}})
-        r = m.route_task("http://x", "t", "task", urlopen=prov)
+        r = m.route_task("http://x", "t-test-0001", "task", urlopen=prov)
         self.assertTrue(r["isError"])
         self.assertIn("S1 unavailable", r["content"][0]["text"])
 
     def test_unreachable_provider_is_an_error(self):
         def _boom(req, timeout=None):
             raise OSError("connection refused")
-        r = m.route_task("http://x", "t", "task", urlopen=_boom)
+        r = m.route_task("http://x", "t-test-0001", "task", urlopen=_boom)
         self.assertTrue(r["isError"])
         self.assertIn("could not reach", r["content"][0]["text"])
 
 
 class ProtocolTests(unittest.TestCase):
-    CFG = {"url": "http://x:8432", "token": "t"}
+    CFG = {"url": "http://x:8432", "token": "t-test-0001"}
 
     def test_initialize_lists_capabilities(self):
         r = m.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, self.CFG)
@@ -107,14 +107,14 @@ import time
 
 
 class RobustnessTests(unittest.TestCase):
-    CFG = {"url": "http://x:8432", "token": "t"}
+    CFG = {"url": "http://x:8432", "token": "t-test-0001"}
 
     def test_truncated_response_is_an_error_not_a_crash(self):
         class Trunc:
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def read(self): raise http.client.IncompleteRead(b"partial")
-        r = m.route_task("http://x", "t", "task", urlopen=lambda req, timeout=None: Trunc())
+        r = m.route_task("http://x", "t-test-0001", "task", urlopen=lambda req, timeout=None: Trunc())
         self.assertTrue(r["isError"])
         self.assertIn("could not reach", r["content"][0]["text"])
 
@@ -149,9 +149,9 @@ class ResponsivenessTests(unittest.TestCase):
                 out.append(reply)
         try:
             m._dispatch({"jsonrpc": "2.0", "id": "call", "method": "tools/call",
-                         "params": {"name": "route_task", "arguments": {"task": "slow"}}}, {"url": "u", "token": "t"}, write)
+                         "params": {"name": "route_task", "arguments": {"task": "slow"}}}, {"url": "u", "token": "t-test-0001"}, write)
             time.sleep(0.05)
-            m._dispatch({"jsonrpc": "2.0", "id": "p", "method": "ping"}, {"url": "u", "token": "t"}, write)
+            m._dispatch({"jsonrpc": "2.0", "id": "p", "method": "ping"}, {"url": "u", "token": "t-test-0001"}, write)
             deadline = time.time() + 2
             while not any(r["id"] == "p" for r in out) and time.time() < deadline:
                 time.sleep(0.01)
@@ -186,14 +186,33 @@ class TokenSafetyTests(unittest.TestCase):
         self.assertNotIn(tok, r["content"][0]["text"])
         self.assertIn("***", r["content"][0]["text"])
 
+    def test_a_short_token_is_refused_not_sent(self):
+        # too short to be a provider token: refused before any request, so it can neither leak nor mangle the scrub
+        sent = []
+        r = m.route_task("http://x", "abc123", "task", urlopen=lambda req, timeout=None: sent.append(req))
+        self.assertTrue(r["isError"])
+        self.assertIn("shorter than", r["content"][0]["text"])
+        self.assertNotIn("abc123", r["content"][0]["text"])
+        self.assertEqual(sent, [])
+
+    def test_a_structured_error_payload_is_never_formatted_into_the_result(self):
+        # repr/str escaping (backslashes) would carry the token in a form the scrub no longer matches
+        tok = "tok\\with\\backslashes-0001"
+        for payload in ({"error": {"message": {"nested": tok}}}, {"type": "error", "error": [tok]}, [tok]):
+            r = m.route_task("http://x", tok, "task", urlopen=ok_provider(payload))
+            self.assertTrue(r["isError"])
+            text = r["content"][0]["text"]
+            self.assertIn("unexpected provider response", text)
+            self.assertNotIn("backslashes", text)
+
     def test_token_whitespace_is_stripped_from_the_header(self):
         seen = {}
 
         def _open(req, timeout=None):
             seen["token"] = req.headers.get("X-api-key")
             return FakeResp({"content": [{"type": "text", "text": "ok"}]})
-        m.route_task("http://x", "tok\n", "task", urlopen=_open)
-        self.assertEqual(seen["token"], "tok")
+        m.route_task("http://x", "tok-test-0001\n", "task", urlopen=_open)
+        self.assertEqual(seen["token"], "tok-test-0001")
 
     @staticmethod
     def _http_error(message):
@@ -245,7 +264,7 @@ class TokenSafetyTests(unittest.TestCase):
 
 class DeepNestCrashTests(unittest.TestCase):
     def test_deeply_nested_line_does_not_crash_the_server(self):
-        env = {**os.environ, "CORTADOS_PROVIDER_URL": "http://127.0.0.1:1", "CORTADOS_PROVIDER_TOKEN": "t"}
+        env = {**os.environ, "CORTADOS_PROVIDER_URL": "http://127.0.0.1:1", "CORTADOS_PROVIDER_TOKEN": "t-test-0001"}
         p = subprocess.Popen([sys.executable, str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              env=env, text=True, bufsize=1)
         got = {"msg": None}
