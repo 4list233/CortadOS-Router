@@ -79,6 +79,12 @@
       "title": "Routed subagent timeout (ms)",
       "default": 600000,
       "description": "How long a routed subagent may run before it is aborted. Max 600000 (10 min), Claude Code's own limit for a mod's process; larger values are clamped, fractions are rounded down, invalid values use the default."
+    },
+    "excludeBuilderOnReview": {
+      "type": "boolean",
+      "title": "Keep reviews off the builder's model",
+      "default": true,
+      "description": "When on, a review subagent (description matching 'review', or a review subagent type) is sent with x-cortados-exclude-model set to the MAIN SESSION's own model, keeping that review off that one model only — not off whichever model a routed subagent may have written the code on (not tracked yet). If the session model can't be read, or the session is itself routed ('cortados'), no exclusion is sent and a toast says so."
     }
   }
 }

@@ -23,6 +23,7 @@ import argparse
 import hmac
 import json
 import logging
+import re
 import secrets
 import sys
 import threading
@@ -119,6 +120,21 @@ def _base_provider(p: str) -> str:
 # Request header a routed subagent sends (the cortados-routed-subagents mod) to be told the real routed model and its
 # lane's remaining window in the response's `model` field. Absent, every response names `cortados` as before.
 REVEAL_HEADER = "x-cortados-reveal"
+# Request header naming a model a new conversation must not route to: an independent review never runs on the model
+# that built the work (the builder never approves its own work). Read once, when the route is chosen.
+EXCLUDE_MODEL_HEADER = "x-cortados-exclude-model"
+# What the header may carry: a model id (`claude-opus-5-5[1m]`, `sub/opus`, `api/claude-sonnet-5`), nothing else.
+# Checked before it reaches the router, a log line or an error message.
+_EXCLUDE_MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,128}")
+_EXCLUDE_MODEL_BAD = "cortados: x-cortados-exclude-model is not a model id"
+
+
+def _exclude_model_header(headers) -> tuple[str | None, bool]:
+    """The x-cortados-exclude-model header, stripped: (value or None when absent/empty, valid)."""
+    v = (headers.get(EXCLUDE_MODEL_HEADER) or "").strip()
+    if not v:
+        return None, True
+    return v, bool(_EXCLUDE_MODEL_RE.fullmatch(v))
 # Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
 # lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
 _PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
@@ -205,7 +221,7 @@ SESSION_FACTORIES: dict[str, Callable[..., Any]] = {"claude-cli": _claude_sessio
 
 
 class Registry:
-    """`router(body, client)` picks the route of a new conversation (routing.choose); without one every conversation
+    """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
     records that a route really ran (core.log_execution), once per conversation."""
 
@@ -485,6 +501,20 @@ class Handler(BaseHTTPRequestHandler):
             # model but `cortados` with a 400 (Codex compares the echoed model to the one it asked for).
             api_model = self._api_pin(body) if wire is ANTHROPIC else None
             if api_model:
+                # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
+                # (the router, which applies it otherwise, is never called for this lane).
+                raw, valid = _exclude_model_header(self.headers)
+                if not valid:
+                    return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
+                excluded = routing.normalize_model(raw)
+                if excluded == "":                    # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
+                    return self._error(400, "invalid_request_error",
+                                       f"cortados: x-cortados-exclude-model: {raw} names no model this endpoint "
+                                       "serves; the review could not be kept off it", wire)
+                if excluded and routing.model_key(excluded) == routing.model_key(routing.normalize_model(api_model)):
+                    return self._error(400, "invalid_request_error",
+                                       f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
+                                       "pin another model or use cortados", wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)
@@ -515,13 +545,17 @@ class Handler(BaseHTTPRequestHandler):
             if reg.router:
                 # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
                 # the CLI session and its prompt cache.
+                exclude, valid = _exclude_model_header(self.headers)   # read for a new conversation only
+                if not valid:
+                    return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
                 try:
-                    route = reg.router(wire.routing_body(body), self._client())
+                    route = reg.router(wire.routing_body(body), self._client(),
+                                       **({"exclude_model": exclude} if exclude else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire)
                 if route.get("error"):
-                    if route.get("client_error"):       # a pin naming a model this endpoint does not serve: the client's to fix
+                    if route.get("client_error"):       # a bad pin or exclusion (unserved model, emptied pool): the client's to fix
                         return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire)
                     if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
                         return self._error(413, "request_too_large", f"cortados: {route['error']}", wire)
@@ -732,9 +766,9 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client):
+        def router(body, client, exclude_model=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin)
+                                  codex_bin=codex_bin, exclude_model=exclude_model)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])

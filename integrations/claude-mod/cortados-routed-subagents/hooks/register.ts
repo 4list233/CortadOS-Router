@@ -35,6 +35,7 @@ type Cfg = {
   orchestratorEnforce: boolean
   orchestratorAllowedTools: string
   subagentTimeoutMs: number
+  excludeBuilderOnReview: boolean
 }
 
 const FALLBACK: Cfg = {
@@ -62,12 +63,17 @@ const FALLBACK: Cfg = {
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
   // Background routed work is separate.
   subagentTimeoutMs: 600_000,
+  // A review subagent is kept off the MAIN SESSION's own model (x-cortados-exclude-model) — not off whichever model
+  // a routed subagent happened to write the code on, which this does not track yet.
+  excludeBuilderOnReview: true,
 }
 
 // The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
 // 1..600000, and rejects anything outside it, so a routed subagent with a larger timeout fails to launch at all.
 // resolveTimeoutMs clamps into this range rather than passing an out-of-range value through.
 const MIN_SUBAGENT_TIMEOUT_MS = 1
+// A retry with less than this left cannot start `claude -p` and finish a turn; it would only fail on its own timeout.
+const MIN_RETRY_MS = 30_000
 const MAX_SUBAGENT_TIMEOUT_MS = 600_000
 
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
@@ -232,6 +238,56 @@ export function scrubToken(s: string, token: string): string {
   return token ? s.split(token).join('***') : s
 }
 
+/** Whether a delegated subagent is a review. A matching review is kept off the main session's own model (see
+ * builderModelToExclude) — not off whichever model actually wrote the code, if that was a routed subagent. */
+export function isReview(description: string, subagentType: string): boolean {
+  return /\breview/i.test(String(description ?? '')) || /review/i.test(String(subagentType ?? ''))
+}
+
+/** A model id the provider accepts in x-cortados-exclude-model — exactly the server's rule: 1..128 chars of
+ * [A-Za-z0-9._/[]:-]. Anything else (CR/LF that could inject a header, spaces, non-ASCII) is refused here, since the
+ * provider would answer it with HTTP 400 anyway. */
+export function headerSafeModel(model: unknown): boolean {
+  return typeof model === 'string' && model.length <= 128 && /^[A-Za-z0-9._\/\[\]:-]+$/.test(model)
+}
+
+/** When a review run that sent x-cortados-exclude-model failed with the provider's own 400 refusal of that header (not a
+ * served model id, not a model id at all, or excluding it left nothing usable), a short reason; otherwise null (no
+ * retry). Only the provider's exact refusal phrasings next to a 400 count: a mere mention of the header name is not
+ * enough, since a review of code that talks about the header quotes it (Sonnet 5 review, 2026-11-01). */
+export function excludeRefusalReason(text: string): string | null {
+  if (!/\b400\b|invalid_request_error/.test(text)) return null
+  if (/x-cortados-exclude-model: \S+ names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
+  if (/x-cortados-exclude-model is not a model id/.test(text)) return 'header refused'
+  if (/\(the client excluded \S+ via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
+  // The mod's own `model` option is a sub/ or api/ pin on the excluded model.
+  if (/\bis the excluded model \(x-cortados-exclude-model\)/.test(text)) return 'this mod is pinned to that model'
+  return null
+}
+
+/** The model to keep a review off: the main session's own model, or null (with a toast) when it cannot be enforced. */
+async function builderModelToExclude($: any): Promise<string | null> {
+  let model: unknown
+  try {
+    model = await $.session.model()
+  } catch {
+    model = ''
+  }
+  if (typeof model !== 'string' || !model) {
+    $.ui.toast('routed-subagents: could not read the session model; review not kept off it')
+    return null
+  }
+  if (model === 'cortados') {
+    $.ui.toast("routed-subagents: this session is itself routed (model 'cortados'); the review's independence from the builder can't be enforced")
+    return null
+  }
+  if (!headerSafeModel(model)) {
+    $.ui.toast('routed-subagents: session model id is not a safe header value; review not kept off it')
+    return null
+  }
+  return model
+}
+
 let routedSeq = 0
 
 /** Read the provider token: the inline override if set, otherwise the token file (with ~ expanded to $HOME). */
@@ -280,6 +336,15 @@ export const register: Register = (on, options) => {
     }
     if (!token) return next(e)
 
+    // A review must not run on the main session's own model: ask the router to keep it off that model only (a
+    // routed subagent's model, if one wrote the code under orchestrator mode, is not excluded here).
+    let customHeaders = 'x-cortados-reveal: 1'
+    let excludedModel: string | null = null
+    if (cfg.excludeBuilderOnReview && isReview(description, subagentType)) {
+      excludedModel = await builderModelToExclude($)
+      if (excludedModel) customHeaders += '\nx-cortados-exclude-model: ' + excludedModel
+    }
+
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
     // --strict-mcp-config + an empty --mcp-config start the child with NO MCP servers: otherwise it inherits the
@@ -307,8 +372,10 @@ export const register: Register = (on, options) => {
     ]
 
     $.ui.status(`↗ routed subagent (${description})`)
-    try {
-      const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
+    type RunRes = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }
+    const startedAt = Date.now()
+    const runChild = (headers: string, timeoutMs: number): Promise<RunRes> =>
+      $.process.run(
         [String(cfg.claudeBin), ...args],
         {
           // The child inherits the parent's environment and credentials. Two things there can make it send the
@@ -328,12 +395,14 @@ export const register: Register = (on, options) => {
           // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
           // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
           // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
+          // For a review it also carries `x-cortados-exclude-model: <session model>` (newline-separated), which keeps
+          // the routed review off the MAIN SESSION's own model (see isReview) — not off a routed subagent's model.
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1',
+            ANTHROPIC_CUSTOM_HEADERS: headers,
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',
@@ -342,10 +411,29 @@ export const register: Register = (on, options) => {
             CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
             CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
           },
-          timeoutMs: subagentTimeoutMs,
+          timeoutMs,
         },
       )
-      const p = parseResult(res.stdout)
+    try {
+      let res = await runChild(customHeaders, subagentTimeoutMs)
+      let p = parseResult(res.stdout)
+      let note = ''
+      // Fallback: the provider refuses (HTTP 400) an exclude header naming no model it serves — e.g. after a model
+      // rename — or one that leaves nothing usable. Without this every review would fail. Retry ONCE without the
+      // exclusion, and tell the user and the parent model that independence was NOT enforced. The refusal comes on
+      // the request, normally the first one, so the child has not acted yet; only a pool change mid-run could make a
+      // later request fail this way. The retry gets the REMAINING share of subagentTimeoutMs (one overall budget).
+      if (excludedModel && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+        // Only an error result or stderr is read: a successful-looking result text is the child's own words.
+        const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
+        const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
+        if (reason && remainingMs >= MIN_RETRY_MS) {
+          $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedModel} (${reason}); ran it without the exclusion`)
+          note = `[review NOT kept off ${excludedModel}: ${reason}]\n`
+          res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))
+          p = parseResult(res.stdout)
+        }
+      }
       if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
         const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
@@ -353,9 +441,9 @@ export const register: Register = (on, options) => {
         // stderr are NOT surfaced: the CLI truncates them at a byte boundary that could split a token past the
         // exact-match scrubber. They remain in the child's on-disk logs for debugging.
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
-        return { deny: `routed subagent did not complete cleanly (${why}): ${detail}` }
+        return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}` }
       }
-      const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
+      const header = note + (p.model ? `[routed via CortadOS → ${p.model}]\n\n` : note ? '\n' : '')
       // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.
       return {
         result: {

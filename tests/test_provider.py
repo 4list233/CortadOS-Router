@@ -348,8 +348,10 @@ class StalledCliTests(unittest.TestCase):
 # The default login, pinned for the reveal tests: the env a bridged CLI (and the sampler) would see, so the effective login
 # a reading is stamped with is predictable whatever the developer's own env holds.
 DEFAULT_LOGIN_DIR = "/tmp/cortados-test-default-login"
-PINNED_ENV = {"CLAUDE_CONFIG_DIR": DEFAULT_LOGIN_DIR, "CLAUDE_CODE_OAUTH_TOKEN": "", "ANTHROPIC_API_KEY": "",
-              "ANTHROPIC_AUTH_TOKEN": "", "ANTHROPIC_BASE_URL": "", "CLAUDE_CODE_USE_BEDROCK": "", "CLAUDE_CODE_USE_VERTEX": ""}
+# Blank EVERY login override scarcity knows (not a hand-copied subset): a test run from inside a routed Claude Code
+# session inherits e.g. ANTHROPIC_CUSTOM_HEADERS (the x-cortados-reveal header), which unpins the login -> no % left.
+PINNED_ENV = {"CLAUDE_CONFIG_DIR": DEFAULT_LOGIN_DIR,
+              **{k: "" for k in core._scarcity_module()._LOGIN_OVERRIDES}}
 
 
 def login_of(config_dir=None):

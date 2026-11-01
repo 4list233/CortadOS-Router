@@ -158,7 +158,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
             failures.append(f'{provider}/{model}: capacity unavailable')
             continue
         route_id = route_id or 'execution:' + face + ':' + (api_request_id or 'call') + ':' + uuid.uuid4().hex[:12]
-        route['hard_rules'].extend(failures + [f'execution entrypoint={entrypoint}',
+        route['hard_rules'].extend(failures + list((constraints or {}).get('notes') or [])
+                                   + [f'execution entrypoint={entrypoint}',
                                   'scoring context=' + _json(projection)])
         core.log_route(route_id, {'session_id': session_id, 'platform': log_platform or 'execution-' + (platform or entrypoint),
                        'unit_kind': unit, 'actual_model': None, 'request': str(prompt)[:8000],

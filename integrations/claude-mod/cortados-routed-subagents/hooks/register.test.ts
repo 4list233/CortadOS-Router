@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, register } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register } from './register'
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
   expect(validToolName('Read')).toBe(true)
@@ -264,4 +264,170 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   const mcpIdx = recordedArgv.indexOf('--mcp-config')
   expect(mcpIdx).toBeGreaterThan(-1)
   expect(recordedArgv[mcpIdx + 1]).toBe('{"mcpServers":{}}')
+})
+
+test('isReview matches a review description (word start) or a review subagent type', async () => {
+  expect(isReview('Review the diff', 'general-purpose')).toBe(true)
+  expect(isReview('code REVIEWER pass', '')).toBe(true)
+  expect(isReview('d', 'code-reviewer')).toBe(true)
+  expect(isReview('Build the feature', 'general-purpose')).toBe(false)
+  expect(isReview('preview the page', 'general-purpose')).toBe(false) // \b: "preview" is not a review
+  expect(isReview('', '')).toBe(false)
+})
+
+test('headerSafeModel accepts exactly the server rule: <=128 chars of [A-Za-z0-9._/[]:-]', async () => {
+  expect(headerSafeModel('claude-opus-5-5[1m]')).toBe(true)
+  expect(headerSafeModel('api/claude-opus-4-1-20250805')).toBe(true)
+  expect(headerSafeModel('ollama:qwen3.5_coder')).toBe(true)
+  expect(headerSafeModel('a'.repeat(128))).toBe(true)
+  expect(headerSafeModel('a'.repeat(129))).toBe(false)
+  expect(headerSafeModel('opus 4')).toBe(false) // space is printable but not in the server's id charset
+  expect(headerSafeModel('opus,sonnet')).toBe(false)
+  expect(headerSafeModel('opus;x')).toBe(false)
+  expect(headerSafeModel(42)).toBe(false)
+  expect(headerSafeModel('opus\r\nx-api-key: evil')).toBe(false)
+  expect(headerSafeModel('opus\n')).toBe(false)
+  expect(headerSafeModel('opus\u00e9')).toBe(false)
+  expect(headerSafeModel('opus\t')).toBe(false)
+  expect(headerSafeModel('')).toBe(false)
+})
+
+/** Run one Agent call through the hook and return the child's ANTHROPIC_CUSTOM_HEADERS, the toasts, and how many
+ * times the session model was read. */
+async function customHeadersFor(call: { description: string; subagent_type: string }, sessionModel: () => Promise<string>, extraOpts: any = {}) {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, ...extraOpts } as any)
+  let headers: string | undefined
+  const toasts: string[] = []
+  let modelReads = 0
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        headers = opts.env.ANTHROPIC_CUSTOM_HEADERS
+        return hostLikeProcess({}).run(argv, opts)
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast(m: string) { toasts.push(m) } },
+    session: { model: async () => { modelReads += 1; return sessionModel() } },
+  }
+  const out = await agentHandler($, { prompt: 'check it', ...call }, async () => 'native')
+  expect(out.result.status).toBe('completed')
+  return { headers, toasts, modelReads }
+}
+
+test('a review call keeps the routed child off the session model via x-cortados-exclude-model', async () => {
+  const r = await customHeadersFor({ description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'claude-opus-5-5[1m]')
+  expect(r.headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5[1m]')
+  expect(r.toasts).toEqual([])
+})
+
+test('a non-review call sends no exclude header and never reads the session model', async () => {
+  const r = await customHeadersFor({ description: 'Build the feature', subagent_type: 'general-purpose' }, async () => 'claude-opus-5-5')
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.modelReads).toBe(0)
+})
+
+test('a routed session (model cortados) sends no exclude header and toasts', async () => {
+  const r = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => 'cortados')
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.toasts.length).toBe(1)
+  expect(r.toasts[0]).toContain("can't be enforced")
+})
+
+test('an unreadable, empty or unsafe session model sends no exclude header', async () => {
+  const thrown = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => { throw new Error('nope') })
+  expect(thrown.headers).toBe('x-cortados-reveal: 1')
+  expect(thrown.toasts).toEqual(['routed-subagents: could not read the session model; review not kept off it'])
+  const empty = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => '')
+  expect(empty.headers).toBe('x-cortados-reveal: 1')
+  expect(empty.toasts).toEqual(['routed-subagents: could not read the session model; review not kept off it'])
+  const crlf = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => 'opus\r\nx-api-key: evil')
+  expect(crlf.headers).toBe('x-cortados-reveal: 1')
+})
+
+test('excludeBuilderOnReview off sends no exclude header even for a review', async () => {
+  const r = await customHeadersFor({ description: 'Review the change', subagent_type: 'code-reviewer' }, async () => 'claude-opus-5-5', { excludeBuilderOnReview: false })
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.modelReads).toBe(0)
+})
+
+test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the exclude header', async () => {
+  expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: foo names no model this endpoint serves; the review could not be kept off it')).toBe('it serves no model by that name')
+  expect(excludeRefusalReason('API Error: 400 no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe('no other usable model')
+  expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
+  expect(excludeRefusalReason('API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  expect(excludeRefusalReason('API Error: 400 cortados: api/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  expect(excludeRefusalReason('API Error: 529 overloaded')).toBe(null)
+  // A failure that merely quotes the header (e.g. a review of code about it) is not a refusal: no retry.
+  expect(excludeRefusalReason('API Error: 529 overloaded while reviewing x-cortados-exclude-model handling')).toBe(null)
+  expect(excludeRefusalReason('no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe(null)
+})
+
+/** Run a review through the hook where each child call is answered by `replies` in turn; record each call's headers
+ * and timeout. */
+async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, subagentTimeoutMs: 300_000 } as any)
+  const calls: Array<{ headers: string; timeoutMs: number }> = []
+  const toasts: string[] = []
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        calls.push({ headers: opts.env.ANTHROPIC_CUSTOM_HEADERS, timeoutMs: opts.timeoutMs })
+        await hostLikeProcess({}).run(argv, opts) // host timeout validation
+        const r = replies[calls.length - 1]
+        return { ...r, isStdoutTruncated: false }
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast(m: string) { toasts.push(m) } },
+    session: { model: async () => 'claude-opus-5-5' },
+  }
+  const out = await agentHandler($, { prompt: 'check it', description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'native')
+  return { out, calls, toasts }
+}
+
+test('a review whose exclude header is refused is retried once without it, with a note', async () => {
+  const refused = JSON.stringify({ is_error: true, result: 'API Error: 400 {"error":{"message":"x-cortados-exclude-model: claude-opus-5-5 names no model this endpoint serves; the review could not be kept off it"}}' })
+  const { out, calls, toasts } = await reviewWithReplies([
+    { exitCode: 1, stdout: refused, stderr: '' },
+    { exitCode: 0, stdout: JSON.stringify({ result: 'looks good', model: 'gpt-x' }), stderr: '' },
+  ])
+  expect(calls.length).toBe(2)
+  expect(calls[0].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5')
+  expect(calls[1].headers).toBe('x-cortados-reveal: 1')
+  expect(calls[1].timeoutMs).toBeLessThanOrEqual(300_000)
+  expect(calls[1].timeoutMs).toBeGreaterThan(290_000)
+  expect(out.result.status).toBe('completed')
+  const text = out.result.content[0].text
+  expect(text.startsWith('[review NOT kept off claude-opus-5-5: it serves no model by that name]\n')).toBe(true)
+  expect(text).toContain('looks good')
+  expect(toasts).toEqual(['routed-subagents: the router refused to keep this review off claude-opus-5-5 (it serves no model by that name); ran it without the exclusion'])
+})
+
+test('a refusal named only on stderr also triggers the retry', async () => {
+  const { out, calls } = await reviewWithReplies([
+    { exitCode: 1, stdout: '', stderr: 'error: 400 ... (the client excluded claude-opus-5-5 via x-cortados-exclude-model)' },
+    { exitCode: 0, stdout: JSON.stringify({ result: 'ok', model: 'm' }), stderr: '' },
+  ])
+  expect(calls.length).toBe(2)
+  expect(out.result.content[0].text).toContain('[review NOT kept off claude-opus-5-5: no other usable model]')
+})
+
+test('a review failure that does not mention the exclude header is not retried', async () => {
+  const { out, calls, toasts } = await reviewWithReplies([
+    { exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 529 overloaded' }), stderr: 'boom' },
+  ])
+  expect(calls.length).toBe(1)
+  expect(out.deny).toContain('did not complete cleanly')
+  expect(toasts).toEqual([])
 })
