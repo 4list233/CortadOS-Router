@@ -4,6 +4,8 @@ Starts the `bridge` MCP server from --mcp-config like the real CLI, then for eac
   - "use two tools": one assistant message with two tool_use blocks for the first tool, called serially;
   - "use tool": one tool_use (input {"file_path": "f0.md"}), called through MCP with _meta.claudecode/toolUseId;
     either way it then answers "tool said: <result texts>";
+  - "garbled" first emits a tool_use of a tool that does not exist and answers it with the CLI's own tool error,
+    then carries on as above;
   - otherwise it answers "echo: <text>".
 Every turn ends with a result event. Writes its argv and relevant env to $FAKE_CLAUDE_ARGV when set.
 With $FAKE_CLAUDE_STALL set it never reads stdin (a hung CLI).
@@ -58,6 +60,12 @@ for line in sys.stdin:
     msg = json.loads(line)["message"]
     text = " ".join(b.get("text", "") for b in msg["content"] if b.get("type") == "text")
     n = 2 if "use two tools" in text else 1 if "use tool" in text else 0
+    if "garbled" in text:
+        # A model calls a tool that does not exist; the real CLI answers it with a tool error and the model goes on.
+        bad = "toolu_" + uuid.uuid4().hex[:12]
+        assistant([{"type": "tool_use", "id": bad, "name": "mcp__bashbridge__Bash", "input": {"command": "ls"}}])
+        out({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": bad,
+             "is_error": True, "content": "<tool_use_error>Error: No such tool available: mcp__bashbridge__Bash</tool_use_error>"}]}})
     if n and tools:
         uses = [{"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:12], "name": "mcp__bridge__" + tools[0],
                  "input": {"file_path": f"f{i}.md"}} for i in range(n)]

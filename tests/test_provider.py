@@ -133,6 +133,29 @@ class EndpointTests(EndpointHarness):
         r2 = self.post({"tools": [READ_TOOL], "messages": history})
         self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: a | ERR b"}])
 
+    def test_a_garbled_tool_name_is_skipped_not_fatal(self):
+        history = [{"role": "user", "content": "garbled"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertIn("mcp__bashbridge__Bash", "\n".join(logs.output))
+        self.assertEqual(r1["stop_reason"], "end_turn")
+        self.assertEqual(r1["content"], [{"type": "text", "text": "echo: garbled"}])
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "thanks"}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})     # the conversation lives on
+        self.assertEqual(r2["content"], [{"type": "text", "text": "echo: thanks"}])
+
+    def test_only_the_bridged_tool_use_after_a_garbled_one_is_forwarded(self):
+        history = [{"role": "user", "content": "garbled, then use tool"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING"):
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(r1["stop_reason"], "tool_use")
+        uses = [b for b in r1["content"] if b["type"] == "tool_use"]
+        self.assertEqual([(u["name"], u["input"]) for u in uses], [("Read", {"file_path": "f0.md"})])
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "hi"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hi"}])
+
     def test_streaming_response_is_valid_sse(self):
         raw = self.post({"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
         events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]

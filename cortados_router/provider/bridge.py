@@ -206,7 +206,14 @@ class BridgeSession:
                     elif b.get("type") == "tool_use":
                         name = b.get("name", "")
                         if not name.startswith(TOOL_PREFIX):
-                            raise BridgeError(f"the headless CLI used a non-bridged tool {name!r}")
+                            # A model can garble a tool name (seen live: mcp__bashbridge__Bash). Nothing can run it:
+                            # the CLI has no built-in tools (--tools "") and no MCP server but the bridge
+                            # (--strict-mcp-config), so it answers the call itself with a tool error and the model
+                            # goes on. So skip the block (not forwarded, never pending or emitted) instead of killing
+                            # the conversation. This tolerance relies on both flags: revisit it if either changes.
+                            logger.warning("cortados bridge %s: skipped a tool_use of non-bridged tool %r",
+                                           self.id[:8], name)
+                            continue
                         blocks.append({"type": "tool_use", "id": b["id"], "name": name[len(TOOL_PREFIX):],
                                        "input": b.get("input") or {}})
                         pending.add(b["id"])
