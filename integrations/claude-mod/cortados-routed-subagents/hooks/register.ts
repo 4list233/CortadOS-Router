@@ -63,8 +63,8 @@ const FALLBACK: Cfg = {
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
   // Background routed work is separate.
   subagentTimeoutMs: 600_000,
-  // A review subagent is kept off the MAIN SESSION's own model (x-cortados-exclude-model) — not off whichever model
-  // a routed subagent happened to write the code on, which this does not track yet.
+  // A review subagent is kept off the MAIN SESSION's own model AND the models routed (non-review) subagents ran on
+  // since the last review (x-cortados-exclude-model, a comma-separated list; see workerModels).
   excludeBuilderOnReview: true,
 }
 
@@ -238,8 +238,8 @@ export function scrubToken(s: string, token: string): string {
   return token ? s.split(token).join('***') : s
 }
 
-/** Whether a delegated subagent is a review. A matching review is kept off the main session's own model (see
- * builderModelToExclude) — not off whichever model actually wrote the code, if that was a routed subagent. */
+/** Whether a delegated subagent is a review. A matching review is kept off the main session's own model and the
+ * models routed subagents ran on since the last review (see modelsToExclude). */
 export function isReview(description: string, subagentType: string): boolean {
   return /\breview/i.test(String(description ?? '')) || /review/i.test(String(subagentType ?? ''))
 }
@@ -257,36 +257,153 @@ export function headerSafeModel(model: unknown): boolean {
  * enough, since a review of code that talks about the header quotes it (Sonnet 5 review, 2026-11-01). */
 export function excludeRefusalReason(text: string): string | null {
   if (!/\b400\b|invalid_request_error/.test(text)) return null
-  if (/x-cortados-exclude-model: \S+ names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
+  // Each phrasing is matched in its single- and multi-model form ("a" or "a, b": the provider joins names with ", ").
+  if (/x-cortados-exclude-model: \S+(?:, \S+)* names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
   if (/x-cortados-exclude-model is not a model id/.test(text)) return 'header refused'
-  if (/\(the client excluded \S+ via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
+  if (/\(the client excluded \S+(?:, \S+)* via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
   // The mod's own `model` option is a sub/ or api/ pin on the excluded model.
   if (/\bis the excluded model \(x-cortados-exclude-model\)/.test(text)) return 'this mod is pinned to that model'
   return null
 }
 
-/** The model to keep a review off: the main session's own model, or null (with a toast) when it cannot be enforced. */
-async function builderModelToExclude($: any): Promise<string | null> {
+/** The provider's cap on x-cortados-exclude-model entries. */
+const MAX_EXCLUDED_MODELS = 8
+/** How many worker models are remembered between reviews. */
+const MAX_WORKER_MODELS = 3
+
+/** Models the routed NON-review subagents built with since the last review (distinct, most recent last, at most
+ * MAX_WORKER_MODELS), from each run's provider record (see builderModelsOf). Each entry carries the sequence number of
+ * its latest tracking, so a review forgets only what it was kept off AS OF ITS DISPATCH — a worker that finishes on
+ * the same model mid-review re-tracks it with a newer seq and survives. Module-level, so it resets on mod reload —
+ * acceptable: a reload only loses the exclusion for the next review, it never mis-routes anything. */
+let workerModels: Array<{ model: string; seq: number }> = []
+let workerSeq = 0
+
+/** Test hook: forget the tracked worker models. */
+export function resetWorkerModels(): void {
+  workerModels = []
+}
+
+/** Note the models a non-review run built with: each moves to the end (most recent) with a fresh seq, the oldest
+ * drop past the cap. Pass builderModelsOf(record), so the run's primary model comes last and is the last to be evicted. */
+export function trackWorkerModels(models: readonly string[]): void {
+  for (const m of models) {
+    if (!headerSafeModel(m) || m === 'cortados') continue
+    workerModels = workerModels.filter((x) => x.model !== m)
+    workerModels.push({ model: m, seq: (workerSeq += 1) })
+  }
+  if (workerModels.length > MAX_WORKER_MODELS) workerModels = workerModels.slice(-MAX_WORKER_MODELS)
+}
+
+/** The highest seq tracked so far (a review's dispatch-time watermark for untrackWorkerModels). */
+export function workerModelsWatermark(): number {
+  return workerSeq
+}
+
+/** Forget the given models (those a completed review was kept off) as tracked at or before `upToSeq` (the review's
+ * dispatch-time watermark), keeping any tracked later — e.g. by a worker that finished, even on the same model,
+ * while the review ran. */
+export function untrackWorkerModels(models: readonly string[], upToSeq: number = Infinity): void {
+  workerModels = workerModels.filter((e) => !(e.seq <= upToSeq && models.includes(e.model)))
+}
+
+/** The models a run built with, primary LAST: the record's `builder_models` (models of its tool-bearing requests)
+ * when the provider sends them, else just the primary `model` — never the side calls (title/summary one-shots)
+ * in `models`, which would otherwise evict the real builder from the capped list. */
+export function builderModelsOf(record: RunRecord): string[] {
+  const primary = record.model
+  const out = (record.builder_models ?? []).filter((m) => m !== primary)
+  if (primary) out.push(primary)
+  return out
+}
+
+/** The tracked worker models (a copy). */
+export function trackedWorkerModels(): string[] {
+  return workerModels.map((e) => e.model)
+}
+
+/** The main session's own model when it can be excluded, else null with the reason it can't. */
+async function sessionModelToExclude($: any): Promise<{ model: string | null; problem: string | null }> {
   let model: unknown
   try {
     model = await $.session.model()
   } catch {
     model = ''
   }
-  if (typeof model !== 'string' || !model) {
-    $.ui.toast('routed-subagents: could not read the session model; review not kept off it')
-    return null
-  }
-  if (model === 'cortados') {
-    $.ui.toast("routed-subagents: this session is itself routed (model 'cortados'); the review's independence from the builder can't be enforced")
-    return null
-  }
-  if (!headerSafeModel(model)) {
-    $.ui.toast('routed-subagents: session model id is not a safe header value; review not kept off it')
-    return null
-  }
-  return model
+  if (typeof model !== 'string' || !model) return { model: null, problem: 'unreadable' }
+  if (model === 'cortados') return { model: null, problem: 'routed' }
+  if (!headerSafeModel(model)) return { model: null, problem: 'unsafe' }
+  return { model, problem: null }
 }
+
+/** The models to keep a review off: the main session's own model plus the tracked worker models (distinct, each
+ * header-safe, at most MAX_EXCLUDED_MODELS). Toasts when the session model is left out; the "not enforced" toasts
+ * only when NOTHING can be excluded. */
+async function modelsToExclude($: any): Promise<string[]> {
+  const { model, problem } = await sessionModelToExclude($)
+  const out: string[] = []
+  for (const m of [model, ...workerModels.map((e) => e.model)]) {
+    if (m && headerSafeModel(m) && m !== 'cortados' && !out.includes(m)) out.push(m)
+  }
+  const list = out.slice(0, MAX_EXCLUDED_MODELS)
+  if (!list.length) {
+    if (problem === 'unreadable') $.ui.toast('routed-subagents: could not read the session model; review not kept off it')
+    else if (problem === 'routed') $.ui.toast("routed-subagents: this session is itself routed (model 'cortados'); the review's independence from the builder can't be enforced")
+    else if (problem === 'unsafe') $.ui.toast('routed-subagents: session model id is not a safe header value; review not kept off it')
+  } else if (problem === 'unreadable' || problem === 'unsafe') {
+    $.ui.toast(`routed-subagents: could not use the session model; review kept off the worker models only (${list.join(', ')})`)
+  }
+  return list
+}
+
+/** A fresh id for one routed run, matching the provider's ^[A-Za-z0-9_-]{8,64}$ (not a secret). */
+export function newRunId(): string {
+  return ('r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
+}
+
+export type RunRecord = { label: string | null; model: string | null; models: string[]; builder_models: string[] | null }
+
+/** Parse the provider's run record body; null when it is not a usable record. Labels/models are kept to one short
+ * printable line (they end up in the model-visible result header). */
+export function parseRunRecord(text: string): RunRecord | null {
+  let d: any
+  try {
+    d = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null
+  const line = (x: unknown): string | null => {
+    if (typeof x !== 'string') return null
+    const s = x.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 200)
+    return s || null
+  }
+  const models = Array.isArray(d.models) ? d.models.filter((m: unknown) => headerSafeModel(m)) as string[] : []
+  // builder_models: absent (null) on an older provider.
+  const builder_models = Array.isArray(d.builder_models) ? d.builder_models.filter((m: unknown) => headerSafeModel(m)) as string[] : null
+  return { label: line(d.label), model: line(d.model), models, builder_models }
+}
+
+/** Fetch the provider's record of one routed run, or null on any failure (never throws). $.http.fetch takes no
+ * timeout, so it races a short timer. */
+async function fetchRunRecord($: any, cfg: Cfg, token: string, runId: string): Promise<RunRecord | null> {
+  let timer: any
+  try {
+    const url = String(cfg.providerUrl).replace(/\/+$/, '') + '/v1/cortados/runs/' + encodeURIComponent(runId)
+    const req = Promise.resolve($.http.fetch(url, { method: 'GET', headers: { 'x-api-key': token, Authorization: `Bearer ${token}` } }))
+    req.catch(() => {}) // a late rejection after the timeout must not go unhandled
+    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), RUN_RECORD_TIMEOUT_MS) })
+    const res: any = await Promise.race([req, timeout])
+    if (!res || !res.ok || typeof res.text !== 'string') return null
+    return parseRunRecord(res.text)
+  } catch {
+    return null
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+const RUN_RECORD_TIMEOUT_MS = 3_000
 
 let routedSeq = 0
 
@@ -336,14 +453,18 @@ export const register: Register = (on, options) => {
     }
     if (!token) return next(e)
 
-    // A review must not run on the main session's own model: ask the router to keep it off that model only (a
-    // routed subagent's model, if one wrote the code under orchestrator mode, is not excluded here).
+    // A review must not run on a model that built the code: ask the router to keep it off the main session's own
+    // model and the models routed (non-review) subagents ran on since the last review.
+    const review = isReview(description, subagentType)
     let customHeaders = 'x-cortados-reveal: 1'
-    let excludedModel: string | null = null
-    if (cfg.excludeBuilderOnReview && isReview(description, subagentType)) {
-      excludedModel = await builderModelToExclude($)
-      if (excludedModel) customHeaders += '\nx-cortados-exclude-model: ' + excludedModel
+    let excluded: string[] = []
+    // Dispatch-time watermark: on completion the review forgets only entries tracked up to here (see untrackWorkerModels).
+    const excludedUpToSeq = workerModelsWatermark()
+    if (cfg.excludeBuilderOnReview && review) {
+      excluded = await modelsToExclude($)
+      if (excluded.length) customHeaders += '\nx-cortados-exclude-model: ' + excluded.join(',')
     }
+    const excludedNames = excluded.join(', ')
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
@@ -374,8 +495,11 @@ export const register: Register = (on, options) => {
     $.ui.status(`↗ routed subagent (${description})`)
     type RunRes = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }
     const startedAt = Date.now()
-    const runChild = (headers: string, timeoutMs: number): Promise<RunRes> =>
-      $.process.run(
+    // Each run (the retry too) carries a fresh x-cortados-run-id, so its provider record can be fetched afterwards.
+    let runId = ''
+    const runChild = (headers: string, timeoutMs: number): Promise<RunRes> => {
+      runId = newRunId()
+      return $.process.run(
         [String(cfg.claudeBin), ...args],
         {
           // The child inherits the parent's environment and credentials. Two things there can make it send the
@@ -395,14 +519,15 @@ export const register: Register = (on, options) => {
           // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
           // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
           // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
-          // For a review it also carries `x-cortados-exclude-model: <session model>` (newline-separated), which keeps
-          // the routed review off the MAIN SESSION's own model (see isReview) — not off a routed subagent's model.
+          // For a review it also carries `x-cortados-exclude-model: <models>` (newline-separated line, comma-separated
+          // ids): the main session's model and the tracked worker models (see modelsToExclude). Every run also
+          // carries `x-cortados-run-id: <id>`, used to fetch the run's record (the real routed model) afterwards.
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: headers,
+            ANTHROPIC_CUSTOM_HEADERS: headers + '\nx-cortados-run-id: ' + runId,
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',
@@ -414,6 +539,16 @@ export const register: Register = (on, options) => {
           timeoutMs,
         },
       )
+    }
+    /** The provider's record of the last run, or null; tracks a non-review run's models. Never throws. */
+    const recordLastRun = async (): Promise<RunRecord | null> => {
+      if (!runId) return null
+      const record = await fetchRunRecord($, cfg, token, runId)
+      try {
+        if (record && !review) trackWorkerModels(builderModelsOf(record))
+      } catch { /* never fail the subagent over bookkeeping */ }
+      return record
+    }
     try {
       let res = await runChild(customHeaders, subagentTimeoutMs)
       let p = parseResult(res.stdout)
@@ -423,17 +558,19 @@ export const register: Register = (on, options) => {
       // exclusion, and tell the user and the parent model that independence was NOT enforced. The refusal comes on
       // the request, normally the first one, so the child has not acted yet; only a pool change mid-run could make a
       // later request fail this way. The retry gets the REMAINING share of subagentTimeoutMs (one overall budget).
-      if (excludedModel && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+      if (excluded.length && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // Only an error result or stderr is read: a successful-looking result text is the child's own words.
         const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
         const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
         if (reason && remainingMs >= MIN_RETRY_MS) {
-          $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedModel} (${reason}); ran it without the exclusion`)
-          note = `[review NOT kept off ${excludedModel}: ${reason}]\n`
+          $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
+          note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
           res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))
           p = parseResult(res.stdout)
         }
       }
+      // Success or failure, ask the provider which model really ran (p.model is just the requested `cortados`).
+      const record = await recordLastRun()
       if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
         const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
@@ -443,7 +580,13 @@ export const register: Register = (on, options) => {
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
         return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}` }
       }
-      const header = note + (p.model ? `[routed via CortadOS → ${p.model}]\n\n` : note ? '\n' : '')
+      // A completed review has checked the work of the models it was kept off: forget exactly those entries (as of
+      // dispatch), keeping workers that finished while it ran — even on the same model. A failed review keeps the
+      // list, so the retried review is still kept off them; so does a review that ran WITHOUT the exclusion (`note`:
+      // the router refused it), since it was not kept off them — the next review still is.
+      if (review && !note) untrackWorkerModels(excluded, excludedUpToSeq)
+      const routedTo = record?.label || record?.model || p.model
+      const header = note + (routedTo ? `[routed via CortadOS → ${routedTo}]\n\n` : note ? '\n' : '')
       // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.
       return {
         result: {

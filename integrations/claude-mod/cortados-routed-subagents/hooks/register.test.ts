@@ -1,5 +1,15 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf } from './register'
+
+const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
+
+/** Split ANTHROPIC_CUSTOM_HEADERS into the lines before the trailing run-id line, and the run id (asserted well-formed). */
+function splitRunId(h: string | undefined): { base: string; runId: string } {
+  const m = /^([\s\S]*)\nx-cortados-run-id: (\S+)$/.exec(String(h))
+  expect(m).not.toBe(null)
+  expect(RUN_ID.test(m![2])).toBe(true)
+  return { base: m![1], runId: m![2] }
+}
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
   expect(validToolName('Read')).toBe(true)
@@ -243,12 +253,13 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   const next = async () => 'native'
   const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, next)
   expect(out.result.status).toBe('completed')
+  const { runId } = splitRunId(recordedEnv!.ANTHROPIC_CUSTOM_HEADERS)
   expect(recordedEnv).toEqual({
     ANTHROPIC_BASE_URL: 'http://provider.test:8432',
     ANTHROPIC_API_KEY: 'tok',
     ANTHROPIC_AUTH_TOKEN: 'tok',
     CLAUDE_CODE_ENTRYPOINT: 'cli',
-    ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1',
+    ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1\nx-cortados-run-id: ' + runId,
     ANTHROPIC_UNIX_SOCKET: '',
     CLAUDE_CODE_USE_BEDROCK: '',
     CLAUDE_CODE_USE_VERTEX: '',
@@ -307,7 +318,7 @@ async function customHeadersFor(call: { description: string; subagent_type: stri
   const $ = {
     process: {
       run: async (argv: string[], opts: any) => {
-        headers = opts.env.ANTHROPIC_CUSTOM_HEADERS
+        headers = splitRunId(opts.env.ANTHROPIC_CUSTOM_HEADERS).base
         return hostLikeProcess({}).run(argv, opts)
       },
     },
@@ -362,6 +373,14 @@ test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the 
   expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
   expect(excludeRefusalReason('API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
   expect(excludeRefusalReason('API Error: 400 cortados: api/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  // multi-model forms (the provider joins excluded names with ", ")
+  expect(excludeRefusalReason('API Error: 400 no usable model (the client excluded claude-opus-5-5, claude-sonnet-5 via x-cortados-exclude-model)')).toBe('no other usable model')
+  expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: claude-opus-5-5, claude-sonnet-5 names no model this endpoint serves; the review could not be kept off it')).toBe('it serves no model by that name')
+  expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: foo names no model this endpoint serves')).toBe('it serves no model by that name')
+  // with several models sent, the pin and bad-id refusals still name one item
+  expect(excludeRefusalReason('API Error: 400 sub/claude-sonnet-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
+  expect(excludeRefusalReason('no usable model (the client excluded a, b via x-cortados-exclude-model)')).toBe(null)
   expect(excludeRefusalReason('API Error: 529 overloaded')).toBe(null)
   // A failure that merely quotes the header (e.g. a review of code about it) is not a refusal: no retry.
   expect(excludeRefusalReason('API Error: 529 overloaded while reviewing x-cortados-exclude-model handling')).toBe(null)
@@ -382,7 +401,7 @@ async function reviewWithReplies(replies: Array<{ exitCode: number; stdout: stri
   const $ = {
     process: {
       run: async (argv: string[], opts: any) => {
-        calls.push({ headers: opts.env.ANTHROPIC_CUSTOM_HEADERS, timeoutMs: opts.timeoutMs })
+        calls.push({ headers: splitRunId(opts.env.ANTHROPIC_CUSTOM_HEADERS).base, timeoutMs: opts.timeoutMs })
         await hostLikeProcess({}).run(argv, opts) // host timeout validation
         const r = replies[calls.length - 1]
         return { ...r, isStdoutTruncated: false }
@@ -430,4 +449,212 @@ test('a review failure that does not mention the exclude header is not retried',
   expect(calls.length).toBe(1)
   expect(out.deny).toContain('did not complete cleanly')
   expect(toasts).toEqual([])
+})
+
+test('newRunId matches the provider rule and differs per call', async () => {
+  const a = newRunId(), b = newRunId()
+  expect(RUN_ID.test(a)).toBe(true)
+  expect(a).not.toBe(b)
+})
+
+test('parseRunRecord keeps one-line label/model and only header-safe models', async () => {
+  const r = parseRunRecord(JSON.stringify({ run_id: 'x', model: 'm1', label: 'm1 · 5% left\nX', models: ['m1', 'bad id', 'm2'] }))
+  expect(r).toEqual({ label: 'm1 · 5% left X', model: 'm1', models: ['m1', 'm2'], builder_models: null })
+  expect(parseRunRecord(JSON.stringify({ model: 'm1', models: ['m1', 'm2'], builder_models: ['m1', 'bad id'] }))?.builder_models).toEqual(['m1'])
+  expect(parseRunRecord('nope')).toBe(null)
+  expect(parseRunRecord('[1]')).toBe(null)
+})
+
+/** One harness for several Agent calls sharing one registered mod: each child returns `reply`, each run-record fetch
+ * is answered by `records[runId]` (looked up by the id the child was sent), or `fetchImpl` when given. */
+function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any) => Promise<any>) {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432/', orchestratorMode: false } as any)
+  const calls: Array<{ headers: string; runId: string }> = []
+  const fetches: Array<{ url: string; init: any }> = []
+  const toasts: string[] = []
+  let nextModels: string[] = []
+  let nextBuilders: string[] | undefined
+  let nextLabel = ''
+  let duringRun: (() => Promise<void>) | null = null
+  let childReply = { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '' }
+  const queued: Array<typeof childReply> = []
+  const records: Record<string, any> = {}
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        const { base, runId } = splitRunId(opts.env.ANTHROPIC_CUSTOM_HEADERS)
+        calls.push({ headers: base, runId })
+        records[runId] = { run_id: runId, model: nextModels[0], label: nextLabel, provider: 'p', models: nextModels }
+        if (nextBuilders) records[runId].builder_models = nextBuilders
+        if (duringRun) { const f = duringRun; duringRun = null; await f() }
+        await hostLikeProcess({}).run(argv, opts)
+        return { ...(queued.shift() ?? childReply), isStdoutTruncated: false }
+      },
+    },
+    http: {
+      fetch: async (url: string, init: any) => {
+        fetches.push({ url, init })
+        if (fetchImpl) return fetchImpl(url, init)
+        const id = url.split('/').pop() as string
+        const rec = records[id]
+        return rec ? { status: 200, ok: true, headers: {}, text: JSON.stringify(rec) } : { status: 404, ok: false, headers: {}, text: '{}' }
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast(m: string) { toasts.push(m) } },
+    session: { model: async () => sessionModel },
+  }
+  return {
+    calls, fetches, toasts,
+    reply(r: typeof childReply) { childReply = r },
+    /** Use `r` for the next child run only (queued, before the default reply). */
+    replyOnce(r: typeof childReply) { queued.push(r) },
+    /** Run `f` inside the next child run (after its record is stored), e.g. a worker finishing mid-review. */
+    during(f: () => Promise<void>) { duringRun = f },
+    async run(description: string, models: string[], label = '', builders?: string[]) {
+      nextModels = models
+      nextBuilders = builders
+      nextLabel = label
+      return agentHandler($, { prompt: 'do it', description, subagent_type: 'general-purpose' }, async () => 'native')
+    },
+  }
+}
+
+test('each run sends a well-formed run id and the label comes from the fetched run record', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  const out = await h.run('Build it', ['claude-sonnet-5'], 'claude-sonnet-5 · 62% left')
+  expect(out.result.status).toBe('completed')
+  expect(out.result.content[0].text.startsWith('[routed via CortadOS → claude-sonnet-5 · 62% left]\n\ndone')).toBe(true)
+  expect(h.calls[0].headers).toBe('x-cortados-reveal: 1')
+  expect(h.fetches.length).toBe(1)
+  expect(h.fetches[0].url).toBe('http://provider.test:8432/v1/cortados/runs/' + h.calls[0].runId)
+  expect(h.fetches[0].init.headers).toEqual({ 'x-api-key': 'tok', Authorization: 'Bearer tok' })
+  // no label -> the record's model
+  const out2 = await h.run('Build more', ['gpt-x'], '')
+  expect(out2.result.content[0].text.startsWith('[routed via CortadOS → gpt-x]')).toBe(true)
+  expect(h.calls[1].runId).not.toBe(h.calls[0].runId)
+  resetWorkerModels()
+})
+
+test('a run-record fetch failure falls back to p.model and the subagent still succeeds', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5', async () => { throw new Error('connect ECONNREFUSED tok') })
+  const out = await h.run('Build it', ['claude-sonnet-5'])
+  expect(out.result.status).toBe('completed')
+  expect(out.result.content[0].text.startsWith('[routed via CortadOS → cortados]\n\ndone')).toBe(true)
+  expect(trackedWorkerModels()).toEqual([])
+  const h404 = routedHarness('claude-opus-5-5', async () => ({ status: 404, ok: false, headers: {}, text: '{}' }))
+  const out404 = await h404.run('Build it', ['x'])
+  expect(out404.result.content[0].text.startsWith('[routed via CortadOS → cortados]')).toBe(true)
+})
+
+test('worker models are excluded on the next review with the session model, then cleared', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  // older provider (no builder_models): only the primary model counts, not the side call on m-a
+  await h.run('Build B', ['m-b', 'm-a'])
+  await h.run('Build C', ['m-c'])
+  await h.run('Build D', ['m-d'])
+  expect(trackedWorkerModels()).toEqual(['m-b', 'm-c', 'm-d'])
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(h.calls[4].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-b,m-c,m-d')
+  // the review's own model is not tracked, and the list is cleared after it
+  expect(trackedWorkerModels()).toEqual([])
+  await h.run('Review again', ['m-z'])
+  expect(h.calls[5].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5')
+})
+
+test('a failed review keeps the tracked worker models for the next review', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.reply({ exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 529 overloaded' }), stderr: '' })
+  const failed = await h.run('Review it', [])
+  expect(failed.deny).toContain('did not complete cleanly')
+  expect(trackedWorkerModels()).toEqual(['m-a'])
+  resetWorkerModels()
+})
+
+test('session model cortados + a tracked worker model -> the header has only the worker model, no toast', async () => {
+  resetWorkerModels()
+  const h = routedHarness('cortados')
+  await h.run('Build A', ['m-a'])
+  await h.run('Review the change', [])
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: m-a')
+  expect(h.toasts).toEqual([])
+  expect(trackedWorkerModels()).toEqual([])
+})
+
+test('builderModelsOf: builder_models with the primary last, else only the primary; side calls never evict it', async () => {
+  expect(builderModelsOf({ label: null, model: 'p', models: ['p', 's1', 's2', 's3'], builder_models: null })).toEqual(['p'])
+  expect(builderModelsOf({ label: null, model: 'p', models: ['p', 'b2', 's1'], builder_models: ['p', 'b2'] })).toEqual(['b2', 'p'])
+  expect(builderModelsOf({ label: null, model: null, models: [], builder_models: null })).toEqual([])
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-main', 's1', 's2', 's3'], '', ['m-main', 'b2', 'b3', 'b4'])
+  expect(trackedWorkerModels()).toEqual(['b3', 'b4', 'm-main'])
+  resetWorkerModels()
+})
+
+test('a worker model added while a review runs survives the review', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.during(async () => { await h.run('Build E', ['m-e']) })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual(['m-e'])
+  resetWorkerModels()
+})
+
+test('a review retried WITHOUT the exclusion keeps the worker models for the next review', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.replyOnce({ exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 400 x-cortados-exclude-model: claude-opus-5-5, m-a names no model this endpoint serves; the review could not be kept off it' }), stderr: '' })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(rev.result.content[0].text.startsWith('[review NOT kept off claude-opus-5-5, m-a: it serves no model by that name]\n')).toBe(true)
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(h.calls[2].headers).toBe('x-cortados-reveal: 1')
+  expect(trackedWorkerModels()).toEqual(['m-a'])
+  const next = await h.run('Review again', ['m-z'])
+  expect(next.result.status).toBe('completed')
+  expect(h.calls[3].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual([])
+  resetWorkerModels()
+})
+
+test('a worker that finishes on the SAME model mid-review keeps that model tracked', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.during(async () => { await h.run('Build B', ['m-a']) })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual(['m-a'])
+  await h.run('Review again', ['m-z'])
+  expect(h.calls[3].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual([])
+  resetWorkerModels()
+})
+
+test('re-tracking a model moves it to the end; the cap still applies', async () => {
+  resetWorkerModels()
+  trackWorkerModels(['a', 'b', 'c'])
+  trackWorkerModels(['a'])
+  expect(trackedWorkerModels()).toEqual(['b', 'c', 'a'])
+  trackWorkerModels(['d'])
+  expect(trackedWorkerModels()).toEqual(['c', 'a', 'd'])
+  resetWorkerModels()
 })

@@ -68,7 +68,10 @@ class WireTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t"], {"content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}], "isError": True})
 
 
-class EndpointTests(unittest.TestCase):
+class EndpointHarness(unittest.TestCase):
+    """The provider endpoint over the fake CLI: setUp/tearDown and request helpers only, no tests (so a subclass
+    reuses the harness without re-running inherited tests)."""
+
     def setUp(self):
         self.scratch = tempfile.mkdtemp()
         self.argv_file = os.path.join(self.scratch, "argv.json")
@@ -100,6 +103,8 @@ class EndpointTests(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code
 
+
+class EndpointTests(EndpointHarness):
     def test_a_bridged_tool_call_round_trips_through_the_client(self):
         history = [{"role": "user", "content": "please use tool"}]
         r1 = self.post({"model": "cortados", "tools": [READ_TOOL], "messages": history})
@@ -127,6 +132,47 @@ class EndpointTests(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": uses[1]["id"], "content": "b", "is_error": True}]}]
         r2 = self.post({"tools": [READ_TOOL], "messages": history})
         self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: a | ERR b"}])
+
+    def test_a_garbled_tool_name_is_skipped_not_fatal(self):
+        history = [{"role": "user", "content": "garbled"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertIn("mcp__bashbridge__Bash", "\n".join(logs.output))
+        self.assertEqual(r1["stop_reason"], "end_turn")
+        self.assertEqual(r1["content"], [{"type": "text", "text": "echo: garbled"}])
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "thanks"}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})     # the conversation lives on
+        self.assertEqual(r2["content"], [{"type": "text", "text": "echo: thanks"}])
+
+    def test_only_the_bridged_tool_use_after_a_garbled_one_is_forwarded(self):
+        history = [{"role": "user", "content": "garbled, then use tool"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING"):
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(r1["stop_reason"], "tool_use")
+        uses = [b for b in r1["content"] if b["type"] == "tool_use"]
+        self.assertEqual([(u["name"], u["input"]) for u in uses], [("Read", {"file_path": "f0.md"})])
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "hi"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hi"}])
+
+    def test_a_wrong_tool_under_the_bridge_prefix_is_skipped_too(self):
+        history = [{"role": "user", "content": "misnamed, then use tool"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertIn("mcp__bridge__Bsh", "\n".join(logs.output))
+        self.assertEqual(r1["stop_reason"], "tool_use")
+        uses = [b for b in r1["content"] if b["type"] == "tool_use"]
+        self.assertEqual([u["name"] for u in uses], ["Read"])
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "hi"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual((r2["stop_reason"], r2["content"]), ("end_turn", [{"type": "text", "text": "tool said: hi"}]))
+
+    def test_a_skipped_tool_use_the_cli_ran_itself_fails_the_conversation(self):
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "garbled but ran locally"}]}
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
 
     def test_streaming_response_is_valid_sse(self):
         raw = self.post({"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
@@ -236,8 +282,8 @@ class EndpointTests(unittest.TestCase):
         self.assertIn("/resources", body)                    # it fetches the resources endpoint for its data
 
 
-class RoutedEndpointTests(EndpointTests):
-    """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
+class RoutedHarness(EndpointHarness):
+    """The endpoint with a stub router (every route is claude-cli/claude-test-model); harness only, no tests."""
 
     def setUp(self):
         super().setUp()
@@ -255,6 +301,10 @@ class RoutedEndpointTests(EndpointTests):
                                               "user-agent": "claude-cli/2.1.304 (external, cli)"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.headers.get("x-cortados-route"), json.loads(r.read())
+
+
+class RoutedEndpointTests(RoutedHarness, EndpointTests):
+    """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
 
     def test_a_conversation_is_routed_once_and_runs_on_the_chosen_model(self):
         history = [{"role": "user", "content": "please use tool"}]
@@ -314,6 +364,165 @@ class RoutedEndpointTests(EndpointTests):
         self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"}]}), 503)
         self.assertEqual(self.reg.sessions, {})
         self.assertFalse(Path(self.argv_file).exists())
+
+
+class RunRecordTests(RoutedHarness):
+    """x-cortados-run-id: each routed request of a client run is recorded; GET /v1/cortados/runs/<id> names the model."""
+
+    def send(self, body, run_id, token=TOKEN):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}",
+                                              "x-cortados-run-id": run_id})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())["error"]
+
+    def lookup(self, run_id, token=TOKEN):
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/" + run_id,
+                                     headers={"authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_a_malformed_run_id_is_a_400_before_routing(self):
+        for bad in ("short", "x" * 65, "has space1", "semi;colon1", "dots.dots.dots"):
+            code, err = self.send({"messages": [{"role": "user", "content": "hi"}]}, bad)
+            self.assertEqual((code, err["type"]), (400, "invalid_request_error"), bad)
+            self.assertEqual(err["message"], "cortados: x-cortados-run-id is not a run id")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.lookup("short")[0], 400)
+
+    def test_a_routed_request_is_retrievable_by_run_id(self):
+        code, _ = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
+                            "run_abc-123")
+        self.assertEqual(code, 200)
+        code, got = self.lookup("run_abc-123")
+        self.assertEqual(code, 200)
+        self.assertEqual(got, {"run_id": "run_abc-123", "model": "claude-test-model", "label": "claude-test-model",
+                               "provider": "claude-cli", "models": ["claude-test-model"],
+                               "builder_models": ["claude-test-model"]})
+
+    def test_the_primary_is_the_first_request_with_tools(self):
+        models = iter(["title-model", "worker-model", "other-model"])
+        self.reg.router = lambda body, client: {"provider": "claude-cli", "model": next(models), "band": "R2",
+                                                "route_id": "r"}
+        self.send({"messages": [{"role": "user", "content": "a title"}]}, "run-primary")   # tool-less one-shot
+        self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]}, "run-primary")
+        self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool again"}]},
+                  "run-primary")
+        code, got = self.lookup("run-primary")
+        self.assertEqual(code, 200)
+        self.assertEqual(got["model"], "worker-model")
+        self.assertEqual(got["models"], ["title-model", "worker-model", "other-model"])
+        # the tool-less title call wrote nothing: it is in `models` (compatibility) but not a builder
+        self.assertEqual(got["builder_models"], ["worker-model", "other-model"])
+
+    def test_a_run_of_only_toolless_calls_has_no_builder_models(self):
+        self.send({"messages": [{"role": "user", "content": "a title"}]}, "run-titles")
+        code, got = self.lookup("run-titles")
+        self.assertEqual((code, got["models"], got["builder_models"]), (200, ["claude-test-model"], []))
+
+    def test_a_continuation_under_a_second_run_id_adds_no_entry(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        code, r1 = self.send({"tools": [READ_TOOL], "messages": history}, "run-opener")
+        self.assertEqual((code, r1["stop_reason"]), (200, "tool_use"))
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
+        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        self.assertEqual((code, r2["content"][0]["text"]), (200, "tool said: x"))
+        self.assertEqual(self.lookup("run-continuer")[0], 404)        # routed when it opened, not by this request
+        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)
+
+    def test_a_backend_start_failure_leaves_no_record(self):
+        self.reg.claude_bin = [os.path.join(self.scratch, "no-such-claude")]
+        code, err = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
+                              "run-nostart")
+        self.assertEqual((code, err["type"]), (502, "api_error"))
+        self.assertEqual(len(self.calls), 1)                          # it was routed, then the backend failed
+        self.assertEqual(self.lookup("run-nostart")[0], 404)
+
+    def test_the_api_lane_records_its_label(self):
+        from types import SimpleNamespace
+        from cortados_router import api_credits
+        from cortados_router.provider.server import Handler, RunRecords
+        rid = api_credits._org_id("sk") + "|2026-11:abc"     # resolves to the test key "sk" (as in test_api_lane)
+        runs = RunRecords()
+
+        def serve(headers, body):
+            h = Handler.__new__(Handler)
+            h.headers, h.server = headers, SimpleNamespace(registry=SimpleNamespace(runs=runs))
+            h._error = lambda *a: self.fail(f"refused: {a}")
+            with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+                 mock.patch("cortados_router.api_credits.reserve", return_value=rid), \
+                 mock.patch("cortados_router.api_credits.window_numbers", lambda now: (40.4, now + 1, 2.0)), \
+                 mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({}, "rejected")), \
+                 mock.patch("cortados_router.api_credits.settle"):
+                h._serve_api_lane(body, "claude-opus-5-5", None)
+
+        serve({"x-cortados-run-id": "run-api-reveal", "x-cortados-reveal": "1"},
+              {"model": "api/claude-opus-5-5", "tools": [READ_TOOL]})
+        self.assertEqual(runs.summary("run-api-reveal"),
+                         {"run_id": "run-api-reveal", "model": "claude-opus-5-5", "label": "claude-opus-5-5 · 60% left",
+                          "provider": "anthropic-api", "models": ["claude-opus-5-5"],
+                          "builder_models": ["claude-opus-5-5"]})
+        serve({"x-cortados-run-id": "run-api-plain"}, {"model": "api/claude-opus-5-5"})   # no reveal, no tools
+        got = runs.summary("run-api-plain")
+        self.assertEqual((got["label"], got["provider"], got["builder_models"]),
+                         ("claude-opus-5-5", "anthropic-api", []))
+        serve({}, {"model": "api/claude-opus-5-5"})                                         # no run id: nothing kept
+        self.assertEqual(len(runs._runs), 2)
+
+    def test_a_full_run_still_keeps_a_later_tool_bearing_entry(self):
+        from cortados_router.provider.server import RunRecords
+        runs = RunRecords()
+        for i in range(RunRecords.PER_RUN + 5):                    # tool-less side calls fill the run, then overflow
+            runs.record("run-crowded", provider="p", model=f"side{i}", label="x", tools=False)
+        runs.record("run-crowded", provider="p", model="builder", label="builder-label", tools=True)
+        entries = runs._runs["run-crowded"]
+        self.assertEqual(len(entries), RunRecords.PER_RUN)
+        self.assertEqual([e["model"] for e in entries[:2]], ["side1", "side2"])   # the oldest tool-less one went
+        got = runs.summary("run-crowded")
+        self.assertEqual((got["model"], got["label"], got["builder_models"]), ("builder", "builder-label", ["builder"]))
+        # further tool-less calls are dropped, never displacing the builder
+        runs.record("run-crowded", provider="p", model="late-side", label="x", tools=False)
+        self.assertNotIn("late-side", runs.summary("run-crowded")["models"])
+        self.assertEqual(runs.summary("run-crowded")["builder_models"], ["builder"])
+        # a run already full of tool-bearing entries keeps its first PER_RUN
+        for i in range(RunRecords.PER_RUN + 3):
+            runs.record("run-builders", provider="p", model=f"b{i}", label="x", tools=True)
+        self.assertEqual(runs.summary("run-builders")["builder_models"], [f"b{i}" for i in range(RunRecords.PER_RUN)])
+
+    def test_an_unknown_run_is_a_404(self):
+        code, err = self.lookup("never-seen-run")
+        self.assertEqual(code, 404)
+        self.assertEqual(err["error"]["type"], "not_found_error")
+
+    def test_the_run_lookup_needs_the_token(self):
+        self.send({"messages": [{"role": "user", "content": "hi"}]}, "run-authed")
+        self.assertEqual(self.lookup("run-authed", token="wrong")[0], 401)
+        self.assertEqual(self.lookup("run-authed")[0], 200)
+
+    def test_the_records_are_bounded(self):
+        from cortados_router.provider.server import RunRecords
+        runs = RunRecords()
+        for i in range(RunRecords.MAX_RUNS + 10):
+            runs.record(f"run-{i:05d}", provider="p", model="m", label="m", tools=False)
+        self.assertIsNone(runs.summary("run-00000"))
+        self.assertIsNotNone(runs.summary(f"run-{RunRecords.MAX_RUNS + 9:05d}"))
+        self.assertEqual(len(runs._runs), RunRecords.MAX_RUNS)
+        # a lookup refreshes recency: the oldest run, once looked up, survives the next evictions
+        runs.summary("run-00010")
+        for i in range(40):
+            runs.record("run-many", provider="p", model=f"m{i}", label="x", tools=False)   # evicts run-00011
+        self.assertEqual(len(runs._runs["run-many"]), RunRecords.PER_RUN)
+        runs.record("run-newest", provider="p", model="m", label="m", tools=False)          # evicts run-00012
+        self.assertIsNotNone(runs.summary("run-00010"))
+        self.assertIsNone(runs.summary("run-00011"))
+        self.assertIsNone(runs.summary("run-00012"))
 
 
 class StartFailureTests(unittest.TestCase):

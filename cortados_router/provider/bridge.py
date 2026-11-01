@@ -43,6 +43,15 @@ def claude_env(config_dir: str | None) -> dict[str, str]:
     return env
 
 
+def _result_text(content: Any) -> str:
+    """The text of a tool_result's content: a string or a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict) and isinstance(c.get("text"), str))
+    return ""
+
+
 class BridgeError(RuntimeError):
     """The CLI died, timed out or reported an error; the server answers 502 (or 409 for a lost session)."""
 
@@ -81,6 +90,8 @@ class BridgeSession:
         self.emitted: set[str] = set()                  # tool_use ids handed to the client
         self.history: list[str] = []                    # reply_fingerprint of each reply, in order
         self._results: dict[str, dict[str, Any]] = {}
+        self.tool_names: set[str] = {t["name"] for t in tools}   # the only tools the shim serves (and the CLI has)
+        self._skipped: set[str] = set()                 # ids of skipped non-bridged tool_uses, awaiting the CLI's error
         self._waiting: set[str] = set()                 # tool_use ids a shim call is blocked on
         self._cv = threading.Condition()
         self._closed = False
@@ -205,8 +216,20 @@ class BridgeSession:
                         blocks.append({"type": "text", "text": b["text"]})
                     elif b.get("type") == "tool_use":
                         name = b.get("name", "")
-                        if not name.startswith(TOOL_PREFIX):
-                            raise BridgeError(f"the headless CLI used a non-bridged tool {name!r}")
+                        if not (name.startswith(TOOL_PREFIX) and name[len(TOOL_PREFIX):] in self.tool_names):
+                            # A model can garble a tool name, in the server part (seen live: mcp__bashbridge__Bash) or
+                            # in the tool part (mcp__bridge__Bsh). Nothing can run it: the CLI has no built-in tools
+                            # (--tools "") and no MCP server but the bridge (--strict-mcp-config), whose shim serves
+                            # exactly self.tool_names, so the CLI answers the call itself with a tool error and the
+                            # model goes on. So skip the block (not forwarded, never pending or emitted) instead of
+                            # killing the conversation: forwarding it would let the client answer a call the CLI has
+                            # already answered. This tolerance relies on both flags: revisit it if either changes; the
+                            # tool_result check on "user" events below enforces it at runtime.
+                            logger.warning("cortados bridge %s: skipped a tool_use of non-bridged tool %r",
+                                           self.id[:8], name)
+                            if b.get("id"):
+                                self._skipped.add(b["id"])
+                            continue
                         blocks.append({"type": "tool_use", "id": b["id"], "name": name[len(TOOL_PREFIX):],
                                        "input": b.get("input") or {}})
                         pending.add(b["id"])
@@ -215,6 +238,18 @@ class BridgeSession:
                     settle_until = time.time() + SETTLE_S
                 elif settle_until:
                     settle_until = time.time() + SETTLE_S
+            elif ev.get("type") == "user":
+                # The runtime safety net for the rule that the headless CLI never runs a tool itself. A skipped
+                # tool_use must come back from the CLI as its own tool error ("No such tool available"); a non-error
+                # result means something executed it locally (a built-in tool or a stray MCP server got through),
+                # which must not happen, so fail the conversation instead of letting the model build on it.
+                for b in (ev.get("message") or {}).get("content") or []:
+                    if not isinstance(b, dict) or b.get("type") != "tool_result" or b.get("tool_use_id") not in self._skipped:
+                        continue
+                    self._skipped.discard(b["tool_use_id"])
+                    if not (b.get("is_error") or "No such tool available" in _result_text(b.get("content"))):
+                        raise BridgeError(f"the headless CLI ran a non-bridged tool itself (tool_use {b['tool_use_id']}); "
+                                          "it must have no tools but the bridge's")
             elif ev.get("type") == "result":
                 if ev.get("is_error"):
                     raise BridgeError(f"the headless CLI reported an error: {ev.get('result') or ev.get('subtype')}")

@@ -84,7 +84,7 @@
       "type": "boolean",
       "title": "Keep reviews off the builder's model",
       "default": true,
-      "description": "When on, a review subagent (description matching 'review', or a review subagent type) is sent with x-cortados-exclude-model set to the MAIN SESSION's own model, keeping that review off that one model only — not off whichever model a routed subagent may have written the code on (not tracked yet). If the session model can't be read, or the session is itself routed ('cortados'), no exclusion is sent and a toast says so."
+      "description": "When on, a review subagent (description matching 'review', or a review subagent type) is sent with x-cortados-exclude-model listing the MAIN SESSION's own model plus the models routed non-review subagents ran on since the last review (up to 3, read from the provider's run record; the list resets on mod reload and after a completed review). If the session model can't be read or the session is itself routed ('cortados'), only the worker models are excluded; if nothing can be excluded, no header is sent and a toast says so."
     }
   }
 }

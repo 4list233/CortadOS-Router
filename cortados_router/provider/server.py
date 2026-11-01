@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -127,14 +128,79 @@ EXCLUDE_MODEL_HEADER = "x-cortados-exclude-model"
 # Checked before it reaches the router, a log line or an error message.
 _EXCLUDE_MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,128}")
 _EXCLUDE_MODEL_BAD = "cortados: x-cortados-exclude-model is not a model id"
+# A review may need to stay off several models (every builder of the work), so the header is a comma list; capped so
+# a header cannot fan out into an unbounded exclusion set (or empty the pool by sheer length).
+EXCLUDE_MODEL_MAX = 8
 
 
 def _exclude_model_header(headers) -> tuple[str | None, bool]:
-    """The x-cortados-exclude-model header, stripped: (value or None when absent/empty, valid)."""
-    v = (headers.get(EXCLUDE_MODEL_HEADER) or "").strip()
-    if not v:
+    """The x-cortados-exclude-model header: (its items, stripped and comma-joined, or None when absent/empty, valid).
+    Empty items are ignored; each item must be a model id, and more than EXCLUDE_MODEL_MAX items is invalid."""
+    items = [i.strip() for i in (headers.get(EXCLUDE_MODEL_HEADER) or "").split(",")]
+    items = [i for i in items if i]
+    if not items:
         return None, True
-    return v, bool(_EXCLUDE_MODEL_RE.fullmatch(v))
+    valid = len(items) <= EXCLUDE_MODEL_MAX and all(_EXCLUDE_MODEL_RE.fullmatch(i) for i in items)
+    return ",".join(items), valid
+
+
+# Request header naming the client's run (the routed-subagents mod runs each subagent as a headless `claude -p`, whose
+# JSON output names only `cortados`): every routed request of the run is recorded under it, and
+# GET /v1/cortados/runs/<id> tells the client which model really ran (to label it, and to keep a later review off it).
+RUN_ID_HEADER = "x-cortados-run-id"
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_RUN_ID_BAD = "cortados: x-cortados-run-id is not a run id"
+RUNS_PATH = "/v1/cortados/runs/"
+
+
+class RunRecords:
+    """What each client run was routed to, in memory: run id -> up to PER_RUN entries {provider, model, label, tools}.
+    Bounded (LRU over MAX_RUNS ids) because the ids are client-chosen; a restart forgets them, which only costs the
+    client its label. Locked: the server is threaded and a run's requests may arrive concurrently.
+    Client-influenced, so advisory: any holder of the shared token can add entries under any run id it names. That
+    is inside the token's existing trust boundary (the same holder can already route and spend); the record only
+    labels runs and steers reviews, and never authorizes anything."""
+    MAX_RUNS = 512
+    PER_RUN = 16
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._runs: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+
+    def record(self, run_id: str, *, provider: str, model: str, label: str, tools: bool) -> None:
+        entry = {"provider": provider, "model": model, "label": label, "tools": bool(tools)}
+        with self._lock:
+            entries = self._runs.pop(run_id, [])
+            if len(entries) < self.PER_RUN:
+                entries.append(entry)
+            elif entry["tools"]:
+                # Full: a tool-bearing entry (one that can write code) is always kept, so tool-less side calls (titles,
+                # summaries) can never crowd out the builder. It replaces the oldest tool-less entry, if there is one;
+                # a run already full of tool-bearing entries keeps its first PER_RUN. A tool-less entry beyond the
+                # cap is dropped.
+                oldest_toolless = next((i for i, e in enumerate(entries) if not e["tools"]), None)
+                if oldest_toolless is not None:
+                    del entries[oldest_toolless]
+                    entries.append(entry)
+            self._runs[run_id] = entries
+            while len(self._runs) > self.MAX_RUNS:
+                self._runs.popitem(last=False)
+
+    def summary(self, run_id: str) -> dict[str, Any] | None:
+        """The run's answer: the primary entry (the first that had tools, the agent's own loop, else the first), the
+        distinct models in order (`models`, every entry, tool-less side calls included) and the distinct models of the
+        entries that had tools (`builder_models`: the ones that could have written code; empty if none); None for an
+        unknown (or evicted) id."""
+        with self._lock:
+            entries = self._runs.get(run_id)
+            if entries is None:
+                return None
+            self._runs.move_to_end(run_id)
+            entries = list(entries)
+        primary = next((e for e in entries if e["tools"]), entries[0])
+        return {"run_id": run_id, "model": primary["model"], "label": primary["label"],
+                "provider": primary["provider"], "models": list(dict.fromkeys(e["model"] for e in entries)),
+                "builder_models": list(dict.fromkeys(e["model"] for e in entries if e["tools"]))}
 # Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
 # lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
 _PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
@@ -236,6 +302,7 @@ class Registry:
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
+        self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
 
     def claude_config_dir(self, account: str | None) -> str | None:
         """The CLAUDE_CONFIG_DIR for a routed Claude account id, from tables/accounts.json; None (the default login)
@@ -367,6 +434,16 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0].startswith(RUNS_PATH):
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            run_id = self.path.split("?")[0][len(RUNS_PATH):]
+            if not _RUN_ID_RE.fullmatch(run_id):
+                return self._error(400, "invalid_request_error", _RUN_ID_BAD)
+            found = self.server.registry.runs.summary(run_id)
+            if found is None:
+                return self._error(404, "not_found_error", f"cortados: no routed request recorded for run {run_id}")
+            return self._json(200, found)
         self._error(404, "not_found_error", self.path)
 
     def do_POST(self):
@@ -383,6 +460,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:                       # JSON, but not an object
             return self._error(400, "invalid_request_error", str(exc), w)
         if path in WIRES:
+            if not self._run_id()[1]:                   # checked before any routing or spend, like the exclude header
+                return self._error(400, "invalid_request_error", _RUN_ID_BAD, w)
             return self._messages(body, w)
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
@@ -452,6 +531,10 @@ class Handler(BaseHTTPRequestHandler):
                                "cortados: the anthropic-api lane's reserved org is no longer configured", wire)
         logger.info("anthropic-api lane: reserved $%.2f for %s (committed $%.2f of $%.0f)",
                     max_cost, model, api_credits.committed(now), api_credits.total_budget_usd())
+        # Recorded once admitted (it is about to run). The label is the reveal the response carries when one was asked
+        # for; otherwise the model (the meter is not read just for the record).
+        self._record_run(provider="anthropic-api", model=model, label=model + reveal if reveal else model,
+                         tools=bool(body.get("tools")))
         usage: dict[str, Any] = {}
         outcome = "unknown"                       # if serve raises, we do not know what was billed -> conservative
         try:
@@ -506,15 +589,17 @@ class Handler(BaseHTTPRequestHandler):
                 raw, valid = _exclude_model_header(self.headers)
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
-                excluded = routing.normalize_model(raw)
-                if excluded == "":                    # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
-                    return self._error(400, "invalid_request_error",
-                                       f"cortados: x-cortados-exclude-model: {raw} names no model this endpoint "
-                                       "serves; the review could not be kept off it", wire)
-                if excluded and routing.model_key(excluded) == routing.model_key(routing.normalize_model(api_model)):
-                    return self._error(400, "invalid_request_error",
-                                       f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
-                                       "pin another model or use cortados", wire)
+                pinned_key = routing.model_key(routing.normalize_model(api_model))
+                for item in (raw.split(",") if raw else []):   # each listed model, the same rules as choose
+                    excluded = routing.normalize_model(item)
+                    if excluded == "":                # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
+                        return self._error(400, "invalid_request_error",
+                                           f"cortados: x-cortados-exclude-model: {item} names no model this endpoint "
+                                           "serves; the review could not be kept off it", wire)
+                    if excluded and routing.model_key(excluded) == pinned_key:
+                        return self._error(400, "invalid_request_error",
+                                           f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
+                                           "pin another model or use cortados", wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)
@@ -572,7 +657,15 @@ class Handler(BaseHTTPRequestHandler):
         msg_id = wire.new_message_id()
         # The model this response names: what the client asked for, unless it asked to see the real route (the
         # routed-subagents mod does; the main session does not and keeps seeing `cortados`).
-        model = (self._reveal(session) if self._wants_reveal() else None) or turn.model
+        revealed = self._reveal(session) if self._wants_reveal() else None
+        model = revealed or turn.model
+        routed = getattr(session, "route", None) if created else None
+        if routed and routed.get("model"):
+            # Routed by this request (S1 or a sub/ pin; a continuation was routed when it opened, and is already on
+            # record). The label is the reveal this response carries, or the model when none was asked for: the lane %
+            # is not read just for the record.
+            self._record_run(provider=str(routed.get("provider") or ""), model=str(routed["model"]),
+                             label=revealed or str(routed["model"]), tools=not one_shot)
         if turn.stream:
             try:
                 self.send_response(200)
@@ -714,6 +807,21 @@ class Handler(BaseHTTPRequestHandler):
         """The calling tool, from its User-Agent ("claude-cli/2.1.304 (external, cli)" → "claude-cli",
         "codex_exec/0.163.0 (Mac OS 27.0.1; arm64)" → "codex_exec"); it names the route log's platform."""
         return (self.headers.get("user-agent") or "unknown").split("/")[0].strip() or "unknown"
+
+    def _run_id(self) -> tuple[str | None, bool]:
+        """The x-cortados-run-id header: (id or None when absent/empty, valid)."""
+        v = (self.headers.get(RUN_ID_HEADER) or "").strip()
+        return (v or None), (not v or bool(_RUN_ID_RE.fullmatch(v)))
+
+    def _record_run(self, *, provider: str, model: str, label: str | None, tools: bool) -> None:
+        """Record a routed request under its run id, if it carries one. Bookkeeping only: never fails a turn."""
+        try:
+            run_id, valid = self._run_id()
+            if run_id and valid:
+                self.server.registry.runs.record(run_id, provider=provider, model=model, label=label or model,
+                                                 tools=tools)
+        except Exception:
+            logger.debug("run record failed", exc_info=True)
 
     def _wants_reveal(self) -> bool:
         try:                                            # cosmetic: never raises into a turn (or the api lane's money path)

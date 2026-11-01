@@ -560,6 +560,41 @@ class ExcludeModelTests(unittest.TestCase):
         routing.choose(core, self.body(), client="claude-cli", conversation_id="c")
         self.assertNotIn("excluded_routes", self.seen["constraints"])
 
+    def test_a_comma_list_excludes_every_listed_model(self):
+        r = self.choose("claude-opus-5-5, ,sonnet")
+        self.assertNotIn("error", r)
+        excluded = {m for _, m in self.seen["constraints"]["excluded_routes"]}
+        self.assertEqual(excluded, {"claude-opus-5-5", "claude-sonnet-5"})
+        self.assertEqual(self.seen["constraints"]["notes"], ["excluded by client: claude-opus-5-5, claude-sonnet-5"])
+
+    def test_an_unmatched_listed_model_is_a_client_error(self):
+        r = self.choose("claude-opus-5-5,no-such-model")
+        self.assertTrue(r["client_error"])
+        self.assertEqual(r["error"], "x-cortados-exclude-model: no-such-model names no model this endpoint serves; "
+                                     "the review could not be kept off it")
+        self.assertEqual(self.seen, {})
+
+    def test_a_route_onto_any_listed_model_is_refused(self):
+        routing.execution_routing.select = lambda core_, **kw: {"router": "x", "provider": "claude-cli",
+                                                                "model": "claude-sonnet-5", "route": {"hard_rules": []}}
+        r = self.choose("claude-opus-5-5,claude-sonnet-5")
+        self.assertTrue(r["error"].startswith("internal: routed to the excluded model claude-sonnet-5"))
+
+    def test_an_emptied_pool_names_every_listed_model(self):
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = self.choose("opus,sonnet")
+        self.assertTrue(r["client_error"])
+        self.assertTrue(r["error"].endswith(
+            "(the client excluded claude-opus-5-5, claude-sonnet-5 via x-cortados-exclude-model)"))
+
+    def test_pin_on_the_second_listed_model_is_a_client_error(self):
+        r = routing.choose(core, self.body("sub/opus"), client="claude-cli", conversation_id="c",
+                           exclude_model="claude-sonnet-5,claude-opus-5-5")
+        self.assertTrue(r["client_error"])
+        self.assertEqual(r["error"], "sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); "
+                                     "pin another model or use cortados")
+        self.assertEqual(self.seen, {})
+
     def test_pin_on_the_excluded_model_is_a_client_error(self):
         r = routing.choose(core, self.body("sub/opus"), client="claude-cli", conversation_id="c",
                            exclude_model="claude-opus-5-5")
