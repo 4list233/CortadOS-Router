@@ -488,6 +488,13 @@ class Handler(BaseHTTPRequestHandler):
             # model but `cortados` with a 400 (Codex compares the echoed model to the one it asked for).
             api_model = self._api_pin(body) if wire is ANTHROPIC else None
             if api_model:
+                # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
+                # (the router, which applies it otherwise, is never called for this lane).
+                excluded = routing.normalize_model(self.headers.get(EXCLUDE_MODEL_HEADER))
+                if excluded and routing.model_key(excluded) == routing.model_key(routing.normalize_model(api_model)):
+                    return self._error(400, "invalid_request_error",
+                                       f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
+                                       "pin another model or use cortados", wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)

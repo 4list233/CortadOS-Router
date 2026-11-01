@@ -41,6 +41,22 @@ class ProviderRoutingTests(unittest.TestCase):
         return routing.choose(core, self.body(text), client="claude-cli", conversation_id=text[:8], claude_bin="python3",
                               codex_bin="python3")
 
+    def test_the_exclusion_note_is_in_the_logged_route(self):
+        # the real select (no fake): the note is in the hard_rules core.log_route records
+        logged = []
+        keep = core.log_route
+        core.log_route = lambda rid, meta, decision, route: logged.append(list(route["hard_rules"]))
+        try:
+            core.decide = scored(EASY)
+            r = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="x",
+                               claude_bin="python3", codex_bin="python3", exclude_model="claude-opus-5-5")
+        finally:
+            core.log_route = keep
+        self.assertNotIn("error", r)
+        self.assertNotEqual(r["model"], "claude-opus-5-5")
+        self.assertEqual(len(logged), 1)
+        self.assertIn("excluded by client: claude-opus-5-5", logged[0])
+
     def test_only_served_providers_are_offered(self):
         routes = routing.served_routes(core)
         self.assertTrue(routes)
@@ -410,7 +426,37 @@ class ExcludeModelTests(unittest.TestCase):
         self.assertTrue(excluded)
         self.assertEqual(excluded, {(p, m) for p, m in served if m == "claude-opus-5-5"})
         self.assertFalse({m for _, m in excluded} - {"claude-opus-5-5"})
-        self.assertIn("excluded by client: claude-opus-5-5", r["route"]["hard_rules"])
+        self.assertEqual(self.seen["constraints"]["notes"], ["excluded by client: claude-opus-5-5"])
+
+    def test_dated_and_undated_ids_match_both_ways(self):
+        self.assertEqual(routing.model_key("claude-haiku-4-5-20251001"), "claude-haiku-4-5")
+        served = {m for _, m in routing.served_routes(core)}
+        self.assertIn("claude-haiku-4-5-20251001", served)
+        for header in ("claude-haiku-4-5", "claude-haiku-4-5-20251001"):
+            routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model=header)
+            excluded = {m for _, m in self.seen["constraints"]["excluded_routes"]}
+            self.assertEqual(excluded, {"claude-haiku-4-5-20251001"}, header)
+        # the other way round: a dated header against an undated served id
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c",
+                           exclude_model="claude-opus-5-5-20260101")
+        self.assertEqual({m for _, m in self.seen["constraints"]["excluded_routes"]}, {"claude-opus-5-5"})
+        self.assertNotIn("error", r)
+        self.seen.clear()
+        r = routing.choose(core, self.body("sub/opus"), client="claude-cli", conversation_id="c",
+                           exclude_model="claude-opus-5-5-20260101")
+        self.assertTrue(r["client_error"])
+
+    def test_an_unmatched_exclusion_warns_and_routes(self):
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="no-such-model")
+        self.assertIn("no-such-model", logs.output[0])
+        self.assertEqual(self.seen["constraints"]["excluded_routes"], [])
+        self.assertEqual(r["provider"], "codex-cli")
+
+    def test_an_emptied_pool_says_the_client_excluded_the_model(self):
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="opus")
+        self.assertTrue(r["error"].endswith("(the client excluded claude-opus-5-5 via x-cortados-exclude-model)"))
 
     def test_no_exclusion_without_the_header(self):
         routing.choose(core, self.body(), client="claude-cli", conversation_id="c")

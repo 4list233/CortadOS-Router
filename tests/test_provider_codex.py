@@ -104,6 +104,33 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(code, 413)                          # deterministic: a retry of the same input cannot succeed
         self.assertIn("does not fit", msg)
 
+    def test_the_exclude_header_reaches_the_router_and_refuses_an_api_pin_on_that_model(self):
+        seen = {}
+
+        def router(body, client, exclude_model=None):
+            seen["exclude_model"] = exclude_model
+            return dict(self.route)
+        self.reg.router = router
+        headers = {"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                   provider_server.EXCLUDE_MODEL_HEADER: "claude-opus-5-5[1m]"}
+
+        def send(body):
+            req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                         headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())["error"]["message"]
+        code, _ = send({"model": "cortados", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 200)
+        self.assertEqual(seen["exclude_model"], "claude-opus-5-5[1m]")
+        seen.clear()
+        code, msg = send({"model": "api/claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 400)
+        self.assertIn("api/claude-opus-5-5 is the excluded model", msg)
+        self.assertEqual(seen, {})                           # refused before any routing or spend
+
     def pin_router(self):
         # a stand-in for routing.choose: a sub/ pin runs the pinned model, anything else S1's route
         def route(body, client):

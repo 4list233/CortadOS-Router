@@ -14,6 +14,7 @@ Owner of two rules:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import uuid
@@ -21,6 +22,8 @@ from typing import Any, Callable
 
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
+
+logger = logging.getLogger("cortados.provider")
 
 # The Claude CLI (P1, bridge.py) and the Codex CLI (P2, codex_bridge.py). Local models need the 2026-09-28 "no local
 # routes" ruling lifted and local entries in the generated model scores. `openai-codex` is deliberately absent: it is
@@ -145,6 +148,12 @@ def normalize_model(name: str | None) -> str | None:
     return SUB_ALIASES.get(m, m)
 
 
+def model_key(name: str | None) -> str | None:
+    """A model id with a trailing `-YYYYMMDD` release date dropped, so `claude-haiku-4-5` and the served
+    `claude-haiku-4-5-20251001` compare equal (exclusion and pin checks match on this key)."""
+    return re.sub(r"-\d{8}$", "", name) if name else name
+
+
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
                   claude_bin: str = "claude") -> dict[str, Any]:
     """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
@@ -245,13 +254,18 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     excluded_model = normalize_model(exclude_model)
     pinned = sub_pin(body)
     if pinned:
-        if excluded_model and pinned == excluded_model:
+        if excluded_model and model_key(pinned) == model_key(excluded_model):
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
-    if excluded_model:   # removing nothing (an unserved model) still routes normally
-        constraints["excluded_routes"] = [[p, m] for p, m in constraints["allowed_routes"] if m == excluded_model]
+    if excluded_model:   # removing nothing (an unserved model) still routes normally, with a warning
+        constraints["excluded_routes"] = [[p, m] for p, m in constraints["allowed_routes"]
+                                          if model_key(m) == model_key(excluded_model)]
+        if not constraints["excluded_routes"]:
+            logger.warning("x-cortados-exclude-model names %s, which no served route matches; routing normally",
+                           excluded_model)
+        constraints["notes"] = [f"excluded by client: {excluded_model}"]   # select logs it with the route
     fit = request_fit(body)
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
@@ -262,6 +276,6 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
-    if excluded_model and isinstance((r.get("route") or {}).get("hard_rules"), list):
-        r["route"]["hard_rules"].append(f"excluded by client: {excluded_model}")
+    if excluded_model and r.get("error"):
+        r["error"] += f" (the client excluded {excluded_model} via x-cortados-exclude-model)"
     return r
