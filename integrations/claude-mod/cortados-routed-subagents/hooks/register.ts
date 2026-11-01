@@ -72,6 +72,8 @@ const FALLBACK: Cfg = {
 // 1..600000, and rejects anything outside it, so a routed subagent with a larger timeout fails to launch at all.
 // resolveTimeoutMs clamps into this range rather than passing an out-of-range value through.
 const MIN_SUBAGENT_TIMEOUT_MS = 1
+// A retry with less than this left cannot start `claude -p` and finish a turn; it would only fail on its own timeout.
+const MIN_RETRY_MS = 30_000
 const MAX_SUBAGENT_TIMEOUT_MS = 600_000
 
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
@@ -249,14 +251,16 @@ export function headerSafeModel(model: unknown): boolean {
   return typeof model === 'string' && model.length <= 128 && /^[A-Za-z0-9._\/\[\]:-]+$/.test(model)
 }
 
-/** When a review run that sent x-cortados-exclude-model failed and its output names that header, the provider refused
- * the exclusion (header not a served model id, or excluding it left nothing usable). Returns a short reason, or null
- * when the failure is not about the header (then no retry). */
+/** When a review run that sent x-cortados-exclude-model failed with the provider's own 400 refusal of that header (not a
+ * served model id, not a model id at all, or excluding it left nothing usable), a short reason; otherwise null (no
+ * retry). Only the provider's exact refusal phrasings next to a 400 count: a mere mention of the header name is not
+ * enough, since a review of code that talks about the header quotes it (Sonnet 5 review, 2026-11-01). */
 export function excludeRefusalReason(text: string): string | null {
-  if (!/x-cortados-exclude-model/i.test(text)) return null
-  if (/names no model/i.test(text)) return 'it serves no model by that name'
-  if (/excluded .* via x-cortados-exclude-model/i.test(text)) return 'no other usable model'
-  return 'header refused'
+  if (!/\b400\b|invalid_request_error/.test(text)) return null
+  if (/x-cortados-exclude-model: \S+ names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
+  if (/x-cortados-exclude-model is not a model id/.test(text)) return 'header refused'
+  if (/\(the client excluded \S+ via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
+  return null
 }
 
 /** The model to keep a review off: the main session's own model, or null (with a toast) when it cannot be enforced. */
@@ -418,9 +422,10 @@ export const register: Register = (on, options) => {
       // the request, normally the first one, so the child has not acted yet; only a pool change mid-run could make a
       // later request fail this way. The retry gets the REMAINING share of subagentTimeoutMs (one overall budget).
       if (excludedModel && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
-        const reason = excludeRefusalReason(`${p.text ?? ''}\n${res.stdout}\n${res.stderr}`)
+        // Only an error result or stderr is read: a successful-looking result text is the child's own words.
+        const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
         const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
-        if (reason && remainingMs >= MIN_SUBAGENT_TIMEOUT_MS) {
+        if (reason && remainingMs >= MIN_RETRY_MS) {
           $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedModel} (${reason}); ran it without the exclusion`)
           note = `[review NOT kept off ${excludedModel}: ${reason}]\n`
           res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))

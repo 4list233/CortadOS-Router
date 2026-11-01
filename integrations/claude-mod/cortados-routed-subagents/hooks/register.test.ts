@@ -356,11 +356,14 @@ test('excludeBuilderOnReview off sends no exclude header even for a review', asy
   expect(r.modelReads).toBe(0)
 })
 
-test('excludeRefusalReason only fires on output that names the exclude header', async () => {
+test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the exclude header', async () => {
   expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: foo names no model this endpoint serves; the review could not be kept off it')).toBe('it serves no model by that name')
-  expect(excludeRefusalReason('no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe('no other usable model')
-  expect(excludeRefusalReason('bad x-cortados-exclude-model value')).toBe('header refused')
+  expect(excludeRefusalReason('API Error: 400 no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe('no other usable model')
+  expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
   expect(excludeRefusalReason('API Error: 529 overloaded')).toBe(null)
+  // A failure that merely quotes the header (e.g. a review of code about it) is not a refusal: no retry.
+  expect(excludeRefusalReason('API Error: 529 overloaded while reviewing x-cortados-exclude-model handling')).toBe(null)
+  expect(excludeRefusalReason('no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe(null)
 })
 
 /** Run a review through the hook where each child call is answered by `replies` in turn; record each call's headers

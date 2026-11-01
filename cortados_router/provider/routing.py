@@ -253,8 +253,9 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
 
 def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, codex_bin: str) -> bool | None:
     """Whether any excluded route would itself have served this request had it not been excluded: its binary on PATH,
-    its lane (and pool) healthy by core.candidate_health, and the request within its context ceiling, the checks
-    execution_routing.select applies to a chosen route. None when that cannot be told (an unknown lane, a broken
+    its lane (and pool) healthy by core.candidate_health, and the request within its token ceiling. That is a subset
+    of resolve's fit gates: the byte ceilings and unknown-fit gates are skipped because no lane this endpoint serves
+    has one today; give it them if `ceiling_bytes` ever gains a claude/codex entry. None when that cannot be told (an unknown lane, a broken
     accounts config, a failing health read): the caller then falls back to the coarser rule."""
     try:
         rows = [r for m in (core.model_scores() or {}).get("models", []) for r in m.get("reach", [])]
