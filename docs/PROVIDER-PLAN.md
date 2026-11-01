@@ -391,6 +391,18 @@ The M5 Max Pro is the stronger trainer but is in daily use; the Studio is always
 - **Per-machine services:** the Studio stops and restarts the S1 scorer around its own training; the Pro has no
   scorer to stop and skips that step.
 
+## Routed-run record (2026-11-01)
+
+A headless `claude -p` subagent's JSON output names only `cortados`, so the routed-subagents mod sends
+`x-cortados-run-id: <id>` (`^[A-Za-z0-9_-]{8,64}$`, else 400). Every request of the run that is routed (a new
+conversation via S1, a `sub/` pin, an `api/` lane request) is recorded in memory under the id: provider, real model,
+reveal label (the label the reveal would show, or the model when the request did not ask for a reveal), and whether
+it had tools. Limits: 512 run ids (least recently used dropped first) and 16 entries per run; a restart forgets them.
+`GET /v1/cortados/runs/<id>` (needs the token) returns `{run_id, model, label, provider, models}`, where the primary
+entry is the first one with tools, else the first entry. It answers 404 for an unknown id and 400 for an invalid one.
+`x-cortados-exclude-model` now takes a comma list of up to 8 model ids (empty items are ignored). Each listed model is
+excluded under the single-model rules, and a pin on any of them is refused.
+
 ## Open
 
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.

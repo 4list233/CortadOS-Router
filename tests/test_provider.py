@@ -316,6 +316,87 @@ class RoutedEndpointTests(EndpointTests):
         self.assertFalse(Path(self.argv_file).exists())
 
 
+class RunRecordTests(RoutedEndpointTests):
+    """x-cortados-run-id: each routed request of a client run is recorded; GET /v1/cortados/runs/<id> names the model."""
+
+    def send(self, body, run_id, token=TOKEN):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}",
+                                              "x-cortados-run-id": run_id})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())["error"]
+
+    def lookup(self, run_id, token=TOKEN):
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/" + run_id,
+                                     headers={"authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_a_malformed_run_id_is_a_400_before_routing(self):
+        for bad in ("short", "x" * 65, "has space1", "semi;colon1", "dots.dots.dots"):
+            code, err = self.send({"messages": [{"role": "user", "content": "hi"}]}, bad)
+            self.assertEqual((code, err["type"]), (400, "invalid_request_error"), bad)
+            self.assertEqual(err["message"], "cortados: x-cortados-run-id is not a run id")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.lookup("short")[0], 400)
+
+    def test_a_routed_request_is_retrievable_by_run_id(self):
+        code, _ = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
+                            "run_abc-123")
+        self.assertEqual(code, 200)
+        code, got = self.lookup("run_abc-123")
+        self.assertEqual(code, 200)
+        self.assertEqual(got, {"run_id": "run_abc-123", "model": "claude-test-model", "label": "claude-test-model",
+                               "provider": "claude-cli", "models": ["claude-test-model"]})
+
+    def test_the_primary_is_the_first_request_with_tools(self):
+        models = iter(["title-model", "worker-model", "other-model"])
+        self.reg.router = lambda body, client: {"provider": "claude-cli", "model": next(models), "band": "R2",
+                                                "route_id": "r"}
+        self.send({"messages": [{"role": "user", "content": "a title"}]}, "run-primary")   # tool-less one-shot
+        self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]}, "run-primary")
+        self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool again"}]},
+                  "run-primary")
+        code, got = self.lookup("run-primary")
+        self.assertEqual(code, 200)
+        self.assertEqual(got["model"], "worker-model")
+        self.assertEqual(got["models"], ["title-model", "worker-model", "other-model"])
+
+    def test_an_unknown_run_is_a_404(self):
+        code, err = self.lookup("never-seen-run")
+        self.assertEqual(code, 404)
+        self.assertEqual(err["error"]["type"], "not_found_error")
+
+    def test_the_run_lookup_needs_the_token(self):
+        self.send({"messages": [{"role": "user", "content": "hi"}]}, "run-authed")
+        self.assertEqual(self.lookup("run-authed", token="wrong")[0], 401)
+        self.assertEqual(self.lookup("run-authed")[0], 200)
+
+    def test_the_records_are_bounded(self):
+        from cortados_router.provider.server import RunRecords
+        runs = RunRecords()
+        for i in range(RunRecords.MAX_RUNS + 10):
+            runs.record(f"run-{i:05d}", provider="p", model="m", label="m", tools=False)
+        self.assertIsNone(runs.summary("run-00000"))
+        self.assertIsNotNone(runs.summary(f"run-{RunRecords.MAX_RUNS + 9:05d}"))
+        self.assertEqual(len(runs._runs), RunRecords.MAX_RUNS)
+        # a lookup refreshes recency: the oldest run, once looked up, survives the next evictions
+        runs.summary("run-00010")
+        for i in range(40):
+            runs.record("run-many", provider="p", model=f"m{i}", label="x", tools=False)   # evicts run-00011
+        self.assertEqual(len(runs._runs["run-many"]), RunRecords.PER_RUN)
+        runs.record("run-newest", provider="p", model="m", label="m", tools=False)          # evicts run-00012
+        self.assertIsNotNone(runs.summary("run-00010"))
+        self.assertIsNone(runs.summary("run-00011"))
+        self.assertIsNone(runs.summary("run-00012"))
+
+
 class StartFailureTests(unittest.TestCase):
     def test_a_cli_that_cannot_start_is_a_bridge_error_and_leaks_no_scratch_dir(self):
         # Registry.new and _messages map BridgeError to 502; an OSError out of popen would instead drop the client's

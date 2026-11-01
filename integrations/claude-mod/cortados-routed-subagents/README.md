@@ -49,7 +49,7 @@ The child starts with an empty MCP config (built-in tools only); the parent's MC
 | `orchestratorMode` | `true` | Direct the main session to plan and delegate (see **Orchestrator mode**). Guidance by default; keeps full tool access. |
 | `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted. |
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. `Agent` and `route_task` (both delegation primitives) are always allowed regardless. |
-| `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model: <main session's model>` to the provider, so that one review is kept off the **main session's own model** on every lane. |
+| `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents ran on since the last review (up to 3), so that review is kept off them on every lane. |
 
 ## Orchestrator mode
 
@@ -75,17 +75,24 @@ false` (the mod then only routes subagents, without directing the main session a
 
 With `excludeBuilderOnReview` on (the default), a delegated Agent call that looks like a review — its `description`
 matches `/\breview/i`, or its `subagent_type` matches `/review/i` — is sent to the provider with
-`x-cortados-exclude-model: <main session's model>`. The provider keeps that review's routed conversation off that
-model on every lane (date suffixes and case ignored; a `sub/`/`api/` pin on it, or an unknown model name, is
+`x-cortados-exclude-model: <models>` (comma-separated): the main session's own model plus the **worker models** — the
+backend models routed non-review subagents actually ran on since the last review. The provider keeps that review's
+routed conversation off those models on every lane (date suffixes and case ignored; a `sub/`/`api/` pin on it, or an unknown model name, is
 refused with 400; if excluding it would leave nothing that fits, the provider returns 400 rather than a retryable
 503). Say "review" in the Agent description if you want this to kick in.
 
 Honest limits:
 
-- **It only excludes the main session's own model.** In orchestrator mode the code under review was usually written
-  by a *routed subagent* on some other backend model, chosen by S1 — and that model is **not** excluded yet.
-  Tracking which models the routed subagents actually ran on, so a review can be kept off those too, is planned but
-  not built.
+- **How the builder is tracked.** Every routed run sends a fresh `x-cortados-run-id`; afterwards (success or
+  failure) the mod fetches `GET <providerUrl>/v1/cortados/runs/<id>` and remembers the record's `models` for each
+  non-review run: distinct, most recent last, **up to 3**. The next review excludes those plus the session model;
+  a review that completes clears the list (a failed one keeps it, so the retried review is still kept off them).
+  The list lives in memory and **resets when the mod reloads** (e.g. a Claude Code restart) — the first review after
+  that only excludes the session model. If the record can't be fetched (provider down, older provider, 3 s timeout)
+  that run's models are simply not tracked; the subagent itself is never failed over it. Work the main session did
+  itself is covered by excluding the session model; work done outside this mod (e.g. `route_task`) is not tracked.
+- **The result label shows the real routed model.** `[routed via CortadOS → …]` uses the run record's reveal label
+  (e.g. `claude-sonnet-5 · 62% left`), falling back to what the CLI reported (`cortados`) if the record is missing.
 - **Excluding can quietly cost strength.** The 400 for "nothing fits" only fires when excluding leaves *no usable
   model at all*. When the excluded model was the only one meeting the band's required strength, the router still
   routes the review to the strongest remaining model — possibly a weaker one — and notes that only in its route log,
@@ -94,11 +101,12 @@ Honest limits:
   stderr names `x-cortados-exclude-model` (e.g. the session model was renamed and the provider no longer serves that
   id, or nothing usable is left), the mod retries the review **once without the exclusion**, within what remains of
   `subagentTimeoutMs` (one budget for both runs). It shows a toast and prefixes the result with
-  `[review NOT kept off <model>: <reason>]` so the parent model knows independence was not enforced. Any other
+  `[review NOT kept off <models>: <reason>]` (naming the full excluded list) so the parent model knows independence was not enforced. Any other
   failure is not retried.
-- The session model is only sent if it matches the provider's id rule (at most 128 characters of
-  `A-Z a-z 0-9 . _ / [ ] : -`); otherwise, or if the session model can't be read, or the session is itself routed
-  (model `cortados`), nothing is excluded and a toast says so.
+- A model is only sent if it matches the provider's id rule (at most 128 characters of
+  `A-Z a-z 0-9 . _ / [ ] : -`). If the session model can't be read, isn't a safe id, or the session is itself routed
+  (model `cortados`), only the worker models are excluded; when nothing at all can be excluded, nothing is sent and a
+  toast says the review's independence isn't enforced.
 - `route_task` does not send this header at all — only the Agent tool does.
 - Detection is a plain keyword heuristic on the description/subagent type, not a semantic check.
 

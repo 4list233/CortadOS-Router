@@ -145,7 +145,7 @@ class CodexEndpointTests(unittest.TestCase):
         calls = []
         self.reg.router = lambda body, client, exclude_model=None: calls.append(exclude_model) or dict(self.route)
         h = provider_server.EXCLUDE_MODEL_HEADER
-        for bad in ("x" * 129, "claude opus", "opus;rm", "op%us", "a,b", "<opus>"):
+        for bad in ("x" * 129, "claude opus", "opus;rm", "op%us", "a,b c", "<opus>", ",".join(["m"] * 9)):
             for model in ("cortados", "api/claude-sonnet-5"):
                 code, err = self.send_with({"model": model, "tools": [READ_TOOL],
                                             "messages": [{"role": "user", "content": "hi"}]}, {h: bad})
@@ -156,6 +156,18 @@ class CodexEndpointTests(unittest.TestCase):
                                   "messages": [{"role": "user", "content": "hi"}]}, {h: "x" * 128})
         self.assertEqual(code, 200)                          # 128 characters is the limit, not over it
         self.assertEqual(calls, ["x" * 128])
+        calls.clear()
+        code, _ = self.send_with({"model": "cortados", "tools": [READ_TOOL],
+                                  "messages": [{"role": "user", "content": "hi"}]}, {h: " a , ,b," + ",m" * 6})
+        self.assertEqual(code, 200)                          # 8 items (empty ones ignored) is the limit
+        self.assertEqual(calls, ["a,b" + ",m" * 6])
+
+    def test_an_api_pin_on_any_listed_excluded_model_answers_400(self):
+        self.reg.router = lambda body, client, exclude_model=None: self.fail("an api/ pin is never routed")
+        code, err = self.send_with({"model": "api/claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]},
+                                   {provider_server.EXCLUDE_MODEL_HEADER: "claude-opus-5-5,sonnet"})
+        self.assertEqual(code, 400)
+        self.assertIn("api/claude-sonnet-5 is the excluded model", err["message"])
 
     def test_the_exclude_header_on_a_continuing_conversation_is_not_passed_to_the_router(self):
         calls = []

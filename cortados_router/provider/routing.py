@@ -297,31 +297,44 @@ def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex", exclude_model: str | None = None) -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
-    A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header) keeps the
-    conversation off that model on every lane, so a review never runs on the model that wrote the code."""
-    excluded_model = normalize_model(exclude_model)
-    if excluded_model == "":
-        # `api`, `sub/`, `api/`: a lane named without a model. Ignoring it would route the review freely, possibly onto
-        # its builder's model, so it is refused like any other header that names no served model.
-        return {"router": execution_routing.ROUTER, "client_error": True,
-                "error": f"x-cortados-exclude-model: {exclude_model.strip()} names no model this endpoint serves; "
-                         "the review could not be kept off it"}
+    A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
+    list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
+    code."""
+    items = [i.strip() for i in (exclude_model or "").split(",") if i.strip()]
+    excluded_models: list[str] = []
+    for item in items:
+        m = normalize_model(item)
+        if m == "":
+            # `api`, `sub/`, `api/`: a lane named without a model. Ignoring it would route the review freely, possibly onto
+            # its builder's model, so it is refused like any other header that names no served model.
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"x-cortados-exclude-model: {item} names no model this endpoint serves; "
+                             "the review could not be kept off it"}
+        if m and m not in excluded_models:
+            excluded_models.append(m)
+    excluded_keys = {model_key(m) for m in excluded_models}
+    names = ", ".join(excluded_models)            # one model: exactly the single-model wording
     pinned = sub_pin(body)
     if pinned:
-        if excluded_model and model_key(pinned) == model_key(excluded_model):
+        if model_key(pinned) in excluded_keys:
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
-    if excluded_model:
-        constraints["excluded_routes"] = [[p, m] for p, m in constraints["allowed_routes"]
-                                          if model_key(m) == model_key(excluded_model)]
-        if not constraints["excluded_routes"]:
-            # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
-            return {"router": execution_routing.ROUTER, "client_error": True,
-                    "error": f"x-cortados-exclude-model: {exclude_model.strip()} names no model this endpoint serves; "
-                             "the review could not be kept off it"}
-        constraints["notes"] = [f"excluded by client: {excluded_model}"]   # select logs it with the route
+    if excluded_models:
+        constraints["excluded_routes"] = []
+        for item in items:
+            m = normalize_model(item)
+            if not m:                              # `cortados`: names no model to stay off
+                continue
+            routes = [[p, r] for p, r in constraints["allowed_routes"] if model_key(r) == model_key(m)]
+            if not routes:
+                # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
+                return {"router": execution_routing.ROUTER, "client_error": True,
+                        "error": f"x-cortados-exclude-model: {item} names no model this endpoint serves; "
+                                 "the review could not be kept off it"}
+            constraints["excluded_routes"] += [r for r in routes if r not in constraints["excluded_routes"]]
+        constraints["notes"] = [f"excluded by client: {names}"]   # select logs it with the route
     fit = request_fit(body)
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
@@ -332,7 +345,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
-    if excluded_model and r.get("error"):
+    if excluded_models and r.get("error"):
         # A 400 only when the exclusion caused the refusal: S1 was up (a degraded result fails on its own, Claude
         # being withheld) and an excluded route would itself have served the request. Otherwise (S1 down, codex-cli
         # missing, every lane spent) the failure is the server's and stays a 503 the client may retry later.
@@ -341,14 +354,14 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         if usable is None:
             usable = not r.get("degraded")     # cannot tell: fall back to "not degraded"
         if usable:
-            r["error"] += f" (the client excluded {excluded_model} via x-cortados-exclude-model)"
+            r["error"] += f" (the client excluded {names} via x-cortados-exclude-model)"
             # Retrying with the same header cannot succeed, and a 503 would have the client CLI retry until it timed
             # out. It is the client's to change: 400.
             r["client_error"] = True
-    elif excluded_model and model_key(r.get("model")) == model_key(excluded_model):
-        # Defence in depth: excluded_routes should already keep select off this model, but the review guarantee must
+    elif excluded_models and model_key(r.get("model")) in excluded_keys:
+        # Defence in depth: excluded_routes should already keep select off these models, but the review guarantee must
         # not rest only on set arithmetic in another module (an account-expanded provider, a clone added after the
-        # allowlist filter, a future fallback). Refuse rather than serve the builder's own model.
+        # allowlist filter, a future fallback). Refuse rather than serve a builder's own model.
         return {"router": execution_routing.ROUTER,
                 "error": f"internal: routed to the excluded model {r.get('model')} ({r.get('provider')}); refused "
                          "(x-cortados-exclude-model)"}
