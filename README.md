@@ -250,7 +250,7 @@ A read-only `GET /resources` on the provider (same token) returns one JSON snaps
 - Shadow logging of every decision, and a `GET /resources` snapshot (usage, subscription scarcity, local devices, model-fit).
 - The `cortados-routed-subagents` Claude Code mod, `sub/`/`api/` pins, independent reviews via `x-cortados-exclude-model`, and the run record behind `x-cortados-reveal`/`x-cortados-run-id`.
 
-**Known limits:** `sub/`/`api/` pins and the routed-subagents mod are Claude Code CLI only, not the desktop app; a routed subagent has built-in tools only (no MCP, no browser) and runs under a 10-minute cap; worktree-isolated, remote, forked and named subagents pass through unrouted, not through the provider; and a Codex client on `/v1/responses` cannot use a `sub/`/`api/` pin (refused with 400) — it always routes through `cortados`.
+**Known limits:** pointing a whole session at the provider (`cortados`, `sub/`, `api/`) needs the Claude Code CLI, not the desktop app (the routed-subagents mod runs under both); a routed subagent has built-in tools only (no MCP, no browser) and runs under a 10-minute cap; worktree-isolated, remote, forked and named subagents pass through unrouted, not through the provider; and a Codex client on `/v1/responses` cannot use a `sub/`/`api/` pin (refused with 400) — it always routes through `cortados`.
 
 **Tests:** `python3 -B -m unittest discover -s tests -t .` runs **747 tests, OK, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
