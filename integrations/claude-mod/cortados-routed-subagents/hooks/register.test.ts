@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, builderModelsOf } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -482,6 +482,7 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
   let nextLabel = ''
   let duringRun: (() => Promise<void>) | null = null
   let childReply = { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '' }
+  const queued: Array<typeof childReply> = []
   const records: Record<string, any> = {}
   const $ = {
     process: {
@@ -492,7 +493,7 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
         if (nextBuilders) records[runId].builder_models = nextBuilders
         if (duringRun) { const f = duringRun; duringRun = null; await f() }
         await hostLikeProcess({}).run(argv, opts)
-        return { ...childReply, isStdoutTruncated: false }
+        return { ...(queued.shift() ?? childReply), isStdoutTruncated: false }
       },
     },
     http: {
@@ -511,6 +512,8 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
   return {
     calls, fetches, toasts,
     reply(r: typeof childReply) { childReply = r },
+    /** Use `r` for the next child run only (queued, before the default reply). */
+    replyOnce(r: typeof childReply) { queued.push(r) },
     /** Run `f` inside the next child run (after its record is stored), e.g. a worker finishing mid-review. */
     during(f: () => Promise<void>) { duringRun = f },
     async run(description: string, models: string[], label = '', builders?: string[]) {
@@ -610,5 +613,48 @@ test('a worker model added while a review runs survives the review', async () =>
   expect(rev.result.status).toBe('completed')
   expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
   expect(trackedWorkerModels()).toEqual(['m-e'])
+  resetWorkerModels()
+})
+
+test('a review retried WITHOUT the exclusion keeps the worker models for the next review', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.replyOnce({ exitCode: 1, stdout: JSON.stringify({ is_error: true, result: 'API Error: 400 x-cortados-exclude-model: claude-opus-5-5, m-a names no model this endpoint serves; the review could not be kept off it' }), stderr: '' })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(rev.result.content[0].text.startsWith('[review NOT kept off claude-opus-5-5, m-a: it serves no model by that name]\n')).toBe(true)
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(h.calls[2].headers).toBe('x-cortados-reveal: 1')
+  expect(trackedWorkerModels()).toEqual(['m-a'])
+  const next = await h.run('Review again', ['m-z'])
+  expect(next.result.status).toBe('completed')
+  expect(h.calls[3].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual([])
+  resetWorkerModels()
+})
+
+test('a worker that finishes on the SAME model mid-review keeps that model tracked', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.during(async () => { await h.run('Build B', ['m-a']) })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual(['m-a'])
+  await h.run('Review again', ['m-z'])
+  expect(h.calls[3].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual([])
+  resetWorkerModels()
+})
+
+test('re-tracking a model moves it to the end; the cap still applies', async () => {
+  resetWorkerModels()
+  trackWorkerModels(['a', 'b', 'c'])
+  trackWorkerModels(['a'])
+  expect(trackedWorkerModels()).toEqual(['b', 'c', 'a'])
+  trackWorkerModels(['d'])
+  expect(trackedWorkerModels()).toEqual(['c', 'a', 'd'])
   resetWorkerModels()
 })

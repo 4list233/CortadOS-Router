@@ -156,6 +156,24 @@ class EndpointTests(EndpointHarness):
         r2 = self.post({"tools": [READ_TOOL], "messages": history})
         self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hi"}])
 
+    def test_a_wrong_tool_under_the_bridge_prefix_is_skipped_too(self):
+        history = [{"role": "user", "content": "misnamed, then use tool"}]
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
+            r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertIn("mcp__bridge__Bsh", "\n".join(logs.output))
+        self.assertEqual(r1["stop_reason"], "tool_use")
+        uses = [b for b in r1["content"] if b["type"] == "tool_use"]
+        self.assertEqual([u["name"] for u in uses], ["Read"])
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "hi"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})
+        self.assertEqual((r2["stop_reason"], r2["content"]), ("end_turn", [{"type": "text", "text": "tool said: hi"}]))
+
+    def test_a_skipped_tool_use_the_cli_ran_itself_fails_the_conversation(self):
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "garbled but ran locally"}]}
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
+
     def test_streaming_response_is_valid_sse(self):
         raw = self.post({"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
         events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]

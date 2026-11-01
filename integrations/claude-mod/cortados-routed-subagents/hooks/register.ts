@@ -272,30 +272,39 @@ const MAX_EXCLUDED_MODELS = 8
 const MAX_WORKER_MODELS = 3
 
 /** Models the routed NON-review subagents built with since the last review (distinct, most recent last, at most
- * MAX_WORKER_MODELS), from each run's provider record (see builderModelsOf). Module-level, so it resets on mod reload — acceptable: a
- * reload only loses the exclusion for the next review, it never mis-routes anything. */
-let workerModels: string[] = []
+ * MAX_WORKER_MODELS), from each run's provider record (see builderModelsOf). Each entry carries the sequence number of
+ * its latest tracking, so a review forgets only what it was kept off AS OF ITS DISPATCH — a worker that finishes on
+ * the same model mid-review re-tracks it with a newer seq and survives. Module-level, so it resets on mod reload —
+ * acceptable: a reload only loses the exclusion for the next review, it never mis-routes anything. */
+let workerModels: Array<{ model: string; seq: number }> = []
+let workerSeq = 0
 
 /** Test hook: forget the tracked worker models. */
 export function resetWorkerModels(): void {
   workerModels = []
 }
 
-/** Note the models a non-review run built with: each moves to the end (most recent), the oldest drop past the cap.
- * Pass builderModelsOf(record), so the run's primary model comes last and is the last to be evicted. */
+/** Note the models a non-review run built with: each moves to the end (most recent) with a fresh seq, the oldest
+ * drop past the cap. Pass builderModelsOf(record), so the run's primary model comes last and is the last to be evicted. */
 export function trackWorkerModels(models: readonly string[]): void {
   for (const m of models) {
     if (!headerSafeModel(m) || m === 'cortados') continue
-    workerModels = workerModels.filter((x) => x !== m)
-    workerModels.push(m)
+    workerModels = workerModels.filter((x) => x.model !== m)
+    workerModels.push({ model: m, seq: (workerSeq += 1) })
   }
   if (workerModels.length > MAX_WORKER_MODELS) workerModels = workerModels.slice(-MAX_WORKER_MODELS)
 }
 
-/** Forget the given models (those a completed review was kept off), keeping any added meanwhile — e.g. by a worker
- * that finished while the review ran. */
-export function untrackWorkerModels(models: readonly string[]): void {
-  workerModels = workerModels.filter((m) => !models.includes(m))
+/** The highest seq tracked so far (a review's dispatch-time watermark for untrackWorkerModels). */
+export function workerModelsWatermark(): number {
+  return workerSeq
+}
+
+/** Forget the given models (those a completed review was kept off) as tracked at or before `upToSeq` (the review's
+ * dispatch-time watermark), keeping any tracked later — e.g. by a worker that finished, even on the same model,
+ * while the review ran. */
+export function untrackWorkerModels(models: readonly string[], upToSeq: number = Infinity): void {
+  workerModels = workerModels.filter((e) => !(e.seq <= upToSeq && models.includes(e.model)))
 }
 
 /** The models a run built with, primary LAST: the record's `builder_models` (models of its tool-bearing requests)
@@ -310,7 +319,7 @@ export function builderModelsOf(record: RunRecord): string[] {
 
 /** The tracked worker models (a copy). */
 export function trackedWorkerModels(): string[] {
-  return [...workerModels]
+  return workerModels.map((e) => e.model)
 }
 
 /** The main session's own model when it can be excluded, else null with the reason it can't. */
@@ -333,7 +342,7 @@ async function sessionModelToExclude($: any): Promise<{ model: string | null; pr
 async function modelsToExclude($: any): Promise<string[]> {
   const { model, problem } = await sessionModelToExclude($)
   const out: string[] = []
-  for (const m of [model, ...workerModels]) {
+  for (const m of [model, ...workerModels.map((e) => e.model)]) {
     if (m && headerSafeModel(m) && m !== 'cortados' && !out.includes(m)) out.push(m)
   }
   const list = out.slice(0, MAX_EXCLUDED_MODELS)
@@ -449,6 +458,8 @@ export const register: Register = (on, options) => {
     const review = isReview(description, subagentType)
     let customHeaders = 'x-cortados-reveal: 1'
     let excluded: string[] = []
+    // Dispatch-time watermark: on completion the review forgets only entries tracked up to here (see untrackWorkerModels).
+    const excludedUpToSeq = workerModelsWatermark()
     if (cfg.excludeBuilderOnReview && review) {
       excluded = await modelsToExclude($)
       if (excluded.length) customHeaders += '\nx-cortados-exclude-model: ' + excluded.join(',')
@@ -569,10 +580,11 @@ export const register: Register = (on, options) => {
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
         return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}` }
       }
-      // A completed review has checked the work of the models it was kept off: forget exactly those (snapshotted at
-      // dispatch), keeping workers that finished while it ran. (A failed review keeps the list, so the retried review
-      // is still kept off them.)
-      if (review) untrackWorkerModels(excluded)
+      // A completed review has checked the work of the models it was kept off: forget exactly those entries (as of
+      // dispatch), keeping workers that finished while it ran — even on the same model. A failed review keeps the
+      // list, so the retried review is still kept off them; so does a review that ran WITHOUT the exclusion (`note`:
+      // the router refused it), since it was not kept off them — the next review still is.
+      if (review && !note) untrackWorkerModels(excluded, excludedUpToSeq)
       const routedTo = record?.label || record?.model || p.model
       const header = note + (routedTo ? `[routed via CortadOS → ${routedTo}]\n\n` : note ? '\n' : '')
       // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.

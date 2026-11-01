@@ -88,8 +88,9 @@ Honest limits:
   models that built with tools — the record's `builder_models`, or just its primary `model` on an older provider
   that doesn't send them (side calls such as title/summary one-shots don't count) — distinct, most recent last,
   **up to 3**, each run's primary model added last so it is the last evicted. The next review excludes those plus
-  the session model; a review that completes forgets exactly the models it was kept off (workers that finished
-  while it ran stay tracked); a failed one keeps them, so the retried review is still kept off them.
+  the session model; a review that completes while kept off them forgets exactly those models as tracked at its
+  dispatch (a worker that finished while it ran stays tracked, even on the same model); a failed one — or one the
+  router refused and that was retried without the exclusion — keeps them, so the next review is still kept off them.
   The list lives in memory and **resets when the mod reloads** (e.g. a Claude Code restart) — the first review after
   that only excludes the session model. If the record can't be fetched (provider down, older provider, 3 s timeout)
   that run's models are simply not tracked; the subagent itself is never failed over it. Work the main session did
