@@ -242,9 +242,21 @@ export function isReview(description: string, subagentType: string): boolean {
   return /\breview/i.test(String(description ?? '')) || /review/i.test(String(subagentType ?? ''))
 }
 
-/** A model id safe to put in a header value: non-empty printable ASCII only (no CR/LF that could inject a header). */
+/** A model id the provider accepts in x-cortados-exclude-model — exactly the server's rule: 1..128 chars of
+ * [A-Za-z0-9._/[]:-]. Anything else (CR/LF that could inject a header, spaces, non-ASCII) is refused here, since the
+ * provider would answer it with HTTP 400 anyway. */
 export function headerSafeModel(model: unknown): boolean {
-  return typeof model === 'string' && model.length > 0 && /^[\x20-\x7e]+$/.test(model)
+  return typeof model === 'string' && model.length <= 128 && /^[A-Za-z0-9._\/\[\]:-]+$/.test(model)
+}
+
+/** When a review run that sent x-cortados-exclude-model failed and its output names that header, the provider refused
+ * the exclusion (header not a served model id, or excluding it left nothing usable). Returns a short reason, or null
+ * when the failure is not about the header (then no retry). */
+export function excludeRefusalReason(text: string): string | null {
+  if (!/x-cortados-exclude-model/i.test(text)) return null
+  if (/names no model/i.test(text)) return 'it serves no model by that name'
+  if (/excluded .* via x-cortados-exclude-model/i.test(text)) return 'no other usable model'
+  return 'header refused'
 }
 
 /** The model to keep a review off: the main session's own model, or null (with a toast) when it cannot be enforced. */
@@ -321,9 +333,10 @@ export const register: Register = (on, options) => {
     // A review must not run on the main session's own model: ask the router to keep it off that model only (a
     // routed subagent's model, if one wrote the code under orchestrator mode, is not excluded here).
     let customHeaders = 'x-cortados-reveal: 1'
+    let excludedModel: string | null = null
     if (cfg.excludeBuilderOnReview && isReview(description, subagentType)) {
-      const builder = await builderModelToExclude($)
-      if (builder) customHeaders += '\nx-cortados-exclude-model: ' + builder
+      excludedModel = await builderModelToExclude($)
+      if (excludedModel) customHeaders += '\nx-cortados-exclude-model: ' + excludedModel
     }
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
@@ -353,8 +366,10 @@ export const register: Register = (on, options) => {
     ]
 
     $.ui.status(`↗ routed subagent (${description})`)
-    try {
-      const res: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean } = await $.process.run(
+    type RunRes = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }
+    const startedAt = Date.now()
+    const runChild = (headers: string, timeoutMs: number): Promise<RunRes> =>
+      $.process.run(
         [String(cfg.claudeBin), ...args],
         {
           // The child inherits the parent's environment and credentials. Two things there can make it send the
@@ -381,7 +396,7 @@ export const register: Register = (on, options) => {
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+            ANTHROPIC_CUSTOM_HEADERS: headers,
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',
@@ -390,10 +405,28 @@ export const register: Register = (on, options) => {
             CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
             CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
           },
-          timeoutMs: subagentTimeoutMs,
+          timeoutMs,
         },
       )
-      const p = parseResult(res.stdout)
+    try {
+      let res = await runChild(customHeaders, subagentTimeoutMs)
+      let p = parseResult(res.stdout)
+      let note = ''
+      // Fallback: the provider refuses (HTTP 400) an exclude header naming no model it serves — e.g. after a model
+      // rename — or one that leaves nothing usable. Without this every review would fail. Retry ONCE without the
+      // exclusion, and tell the user and the parent model that independence was NOT enforced. The refusal comes on
+      // the request, normally the first one, so the child has not acted yet; only a pool change mid-run could make a
+      // later request fail this way. The retry gets the REMAINING share of subagentTimeoutMs (one overall budget).
+      if (excludedModel && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+        const reason = excludeRefusalReason(`${p.text ?? ''}\n${res.stdout}\n${res.stderr}`)
+        const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
+        if (reason && remainingMs >= MIN_SUBAGENT_TIMEOUT_MS) {
+          $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedModel} (${reason}); ran it without the exclusion`)
+          note = `[review NOT kept off ${excludedModel}: ${reason}]\n`
+          res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))
+          p = parseResult(res.stdout)
+        }
+      }
       if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
         // The child may already have acted; refuse rather than re-dispatch natively (which would replay the work).
         const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}`
@@ -401,9 +434,9 @@ export const register: Register = (on, options) => {
         // stderr are NOT surfaced: the CLI truncates them at a byte boundary that could split a token past the
         // exact-match scrubber. They remain in the child's on-disk logs for debugging.
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
-        return { deny: `routed subagent did not complete cleanly (${why}): ${detail}` }
+        return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}` }
       }
-      const header = p.model ? `[routed via CortadOS → ${p.model}]\n\n` : ''
+      const header = note + (p.model ? `[routed via CortadOS → ${p.model}]\n\n` : note ? '\n' : '')
       // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.
       return {
         result: {

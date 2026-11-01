@@ -410,8 +410,9 @@ class ExcludeModelTests(unittest.TestCase):
     """x-cortados-exclude-model: a new conversation stays off one model, so a review never runs on its builder's model."""
 
     def setUp(self):
-        self._keep = (core.STATE, routing.execution_routing.select)
+        self._keep = (core.STATE, routing.execution_routing.select, core.lane_health)
         core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-exclude-"))   # never the live router.db
+        core.lane_health = lambda: {}                        # never sample the vendor CLIs
         self.seen = {}
 
         def fake_select(core_, **kw):
@@ -420,7 +421,7 @@ class ExcludeModelTests(unittest.TestCase):
         routing.execution_routing.select = fake_select
 
     def tearDown(self):
-        core.STATE, routing.execution_routing.select = self._keep
+        core.STATE, routing.execution_routing.select, core.lane_health = self._keep
 
     def body(self, model="cortados"):
         return {"model": model, "messages": [{"role": "user", "content": "review the diff"}]}
@@ -428,7 +429,8 @@ class ExcludeModelTests(unittest.TestCase):
     def test_normalize_model(self):
         for raw, want in (("claude-opus-5-5[1m]", "claude-opus-5-5"), ("sub/opus", "claude-opus-5-5"),
                           ("opus", "claude-opus-5-5"), ("cortados", None), ("", None), (None, None),
-                          ("sub", routing.SUB_DEFAULT), ("api", None), ("api/claude-sonnet-5", "claude-sonnet-5"),
+                          ("sub", routing.SUB_DEFAULT), ("api", ""), ("API", ""), ("sub/", ""), ("api/", ""),
+                          ("api/ ", ""), ("api/claude-sonnet-5", "claude-sonnet-5"),
                           ("Claude-Opus-5-5[1M]", "claude-opus-5-5"), ("SUB/Opus", "claude-opus-5-5"), ("CORTADOS", None),
                           ("opusplan", "claude-opus-5-5"), ("OpusPlan", "claude-opus-5-5"),
                           ("default", routing.SUB_DEFAULT), ("Default", routing.SUB_DEFAULT)):
@@ -479,11 +481,75 @@ class ExcludeModelTests(unittest.TestCase):
                                      "the review could not be kept off it")
         self.assertEqual(self.seen, {})                      # select (and its route log) never ran
 
+    def choose(self, exclude, **kw):
+        return routing.choose(core, self.body(), client="claude-cli", conversation_id="c", claude_bin="python3",
+                              codex_bin="python3", exclude_model=exclude, **kw)
+
     def test_an_emptied_pool_says_the_client_excluded_the_model(self):
+        # the excluded model's only route was healthy: the exclusion caused the refusal
         routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
-        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="opus")
+        r = self.choose("opus")
         self.assertTrue(r["error"].endswith("(the client excluded claude-opus-5-5 via x-cortados-exclude-model)"))
         self.assertTrue(r["client_error"])                   # 400, not a 503 the client CLI would retry until timeout
+
+    def test_a_degraded_failure_with_an_exclusion_stays_a_server_error(self):
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits.",
+                                                                "degraded": True}
+        r = self.choose("opus")
+        self.assertNotIn("client_error", r)
+        self.assertIn("S1 is unavailable", r["error"])
+        self.assertNotIn("the client excluded", r["error"])
+
+    def test_excluding_a_spent_model_is_not_blamed_on_the_client(self):
+        # every lane spent: the excluded model could not have served it either, so the failure is the server's (503)
+        core.lane_health = lambda: {lane: {"ok": False, "why": "spent", "pools": {}}
+                                    for lane in ("claude", "codex", "cursor", "antigravity")}
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = self.choose("opus")
+        self.assertNotIn("client_error", r)
+        self.assertNotIn("the client excluded", r["error"])
+
+    def test_excluding_a_model_whose_binary_is_missing_is_not_blamed_on_the_client(self):
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c",
+                           claude_bin="no-such-binary-cortados", codex_bin="python3", exclude_model="opus")
+        self.assertNotIn("client_error", r)
+
+    def test_excluding_the_only_healthy_route_is_a_client_error(self):
+        # Claude healthy, Codex spent: excluding the Claude model is what emptied the pool
+        core.lane_health = lambda: {"codex": {"ok": False, "why": "spent", "pools": {}}}
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = self.choose("opus")
+        self.assertTrue(r["client_error"])
+
+    def test_an_unknown_health_falls_back_to_not_degraded(self):
+        def broken():
+            raise RuntimeError("sampler down")
+        core.lane_health = broken
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        self.assertTrue(self.choose("opus")["client_error"])
+
+    def test_a_lane_prefix_without_a_model_is_a_client_error(self):
+        for header in ("api", "API", "sub/", "api/"):
+            self.seen.clear()
+            r = self.choose(header)
+            self.assertTrue(r["client_error"], header)
+            self.assertEqual(r["error"], f"x-cortados-exclude-model: {header} names no model this endpoint serves; "
+                                         "the review could not be kept off it")
+            self.assertEqual(self.seen, {}, header)         # select never ran
+        # bare `sub` still names the default subscription model
+        r = self.choose("sub")
+        self.assertNotIn("error", r)
+        self.assertEqual({m for _, m in self.seen["constraints"]["excluded_routes"]}, {routing.SUB_DEFAULT})
+
+    def test_a_route_onto_the_excluded_model_is_refused_not_served(self):
+        # the guarantee holds even if select ignored excluded_routes
+        routing.execution_routing.select = lambda core_, **kw: {"router": "x", "provider": "claude-cli",
+                                                                "model": "claude-opus-5-5", "route": {"hard_rules": []}}
+        r = self.choose("Claude-Opus-5-5-20260101")
+        self.assertTrue(r["error"].startswith("internal: routed to the excluded model claude-opus-5-5"))
+        self.assertNotIn("client_error", r)                  # a server fault: 503
+        self.assertNotIn("provider", r)
 
     def test_a_routing_error_without_the_header_stays_a_server_error(self):
         routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}

@@ -86,8 +86,19 @@ Honest limits:
   by a *routed subagent* on some other backend model, chosen by S1 — and that model is **not** excluded yet.
   Tracking which models the routed subagents actually ran on, so a review can be kept off those too, is planned but
   not built.
-- If the session model can't be read, or the session is itself routed (model `cortados`), nothing is excluded and a
-  toast says so.
+- **Excluding can quietly cost strength.** The 400 for "nothing fits" only fires when excluding leaves *no usable
+  model at all*. When the excluded model was the only one meeting the band's required strength, the router still
+  routes the review to the strongest remaining model — possibly a weaker one — and notes that only in its route log,
+  not in the reply.
+- **Fallback when the provider refuses the header.** If a review run that sent the header fails and its output or
+  stderr names `x-cortados-exclude-model` (e.g. the session model was renamed and the provider no longer serves that
+  id, or nothing usable is left), the mod retries the review **once without the exclusion**, within what remains of
+  `subagentTimeoutMs` (one budget for both runs). It shows a toast and prefixes the result with
+  `[review NOT kept off <model>: <reason>]` so the parent model knows independence was not enforced. Any other
+  failure is not retried.
+- The session model is only sent if it matches the provider's id rule (at most 128 characters of
+  `A-Z a-z 0-9 . _ / [ ] : -`); otherwise, or if the session model can't be read, or the session is itself routed
+  (model `cortados`), nothing is excluded and a toast says so.
 - `route_task` does not send this header at all — only the Agent tool does.
 - Detection is a plain keyword heuristic on the description/subagent type, not a semantic check.
 

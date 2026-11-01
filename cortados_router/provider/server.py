@@ -507,6 +507,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
                 excluded = routing.normalize_model(raw)
+                if excluded == "":                    # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
+                    return self._error(400, "invalid_request_error",
+                                       f"cortados: x-cortados-exclude-model: {raw} names no model this endpoint "
+                                       "serves; the review could not be kept off it", wire)
                 if excluded and routing.model_key(excluded) == routing.model_key(routing.normalize_model(api_model)):
                     return self._error(400, "invalid_request_error",
                                        f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
