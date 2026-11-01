@@ -128,6 +128,23 @@ def sub_pin(body: dict[str, Any]) -> str | None:
     return None
 
 
+def normalize_model(name: str | None) -> str | None:
+    """A client-named model as the tables' id: `claude-opus-5-5[1m]`, `sub/opus` and `opus` all name claude-opus-5-5;
+    bare `sub` is SUB_DEFAULT (as sub_pin). None for empty, `cortados` or bare `api` (no model named)."""
+    m = (name or "").strip()
+    if m.endswith("]") and "[" in m:                 # Claude Code's context-window suffix, e.g. `[1m]`
+        m = m[:m.rindex("[")].strip()
+    if m == "sub":
+        return SUB_DEFAULT
+    for prefix in (SUB_PREFIX, "api/"):
+        if m.startswith(prefix):
+            m = m[len(prefix):].strip()
+            break
+    if m in ("", "cortados", "api"):
+        return None
+    return SUB_ALIASES.get(m, m)
+
+
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
                   claude_bin: str = "claude") -> dict[str, Any]:
     """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
@@ -221,20 +238,30 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
 
 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
-           codex_bin: str = "codex") -> dict[str, Any]:
+           codex_bin: str = "codex", exclude_model: str | None = None) -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
-    A `sub/`-pinned request skips S1 (choose_pinned)."""
+    A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header) keeps the
+    conversation off that model on every lane, so a review never runs on the model that wrote the code."""
+    excluded_model = normalize_model(exclude_model)
     pinned = sub_pin(body)
     if pinned:
+        if excluded_model and pinned == excluded_model:
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
+    constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
+    if excluded_model:   # removing nothing (an unserved model) still routes normally
+        constraints["excluded_routes"] = [[p, m] for p, m in constraints["allowed_routes"] if m == excluded_model]
     fit = request_fit(body)
     r = execution_routing.select(
         _NoClaudeWhenDegraded(core), prompt=request_text(body.get("messages") or [], standalone=not body.get("tools")),
         session_id=conversation_id, platform=PLATFORM, face="provider", entrypoint="provider", input_fit=fit,
-        constraints={"allowed_routes": list(served_routes(core))},
+        constraints=constraints,
         credential_resolver=_credentials(claude_bin, codex_bin), log_platform=f"provider:{client}",
         supports_accounts=True)   # this endpoint applies the routed account's login (server.Registry → bridge CLAUDE_CONFIG_DIR)
     if r.get("error") and r.get("degraded"):
         r["error"] = ("S1 is unavailable, and a degraded scorer never defaults to Claude; no Codex lane survived either "
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
+    if excluded_model and isinstance((r.get("route") or {}).get("hard_rules"), list):
+        r["route"]["hard_rules"].append(f"excluded by client: {excluded_model}")
     return r

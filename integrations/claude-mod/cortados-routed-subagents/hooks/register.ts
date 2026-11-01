@@ -35,6 +35,7 @@ type Cfg = {
   orchestratorEnforce: boolean
   orchestratorAllowedTools: string
   subagentTimeoutMs: number
+  excludeBuilderOnReview: boolean
 }
 
 const FALLBACK: Cfg = {
@@ -62,6 +63,9 @@ const FALLBACK: Cfg = {
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
   // Background routed work is separate.
   subagentTimeoutMs: 600_000,
+  // A review subagent is kept off the main session's own model (x-cortados-exclude-model), so the model that built
+  // the code is never the one that approves it.
+  excludeBuilderOnReview: true,
 }
 
 // The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
@@ -232,6 +236,40 @@ export function scrubToken(s: string, token: string): string {
   return token ? s.split(token).join('***') : s
 }
 
+/** Whether a delegated subagent is a review. Reviews are kept off the main session's model because the builder
+ * never approves its own work: an independent model must check it. */
+export function isReview(description: string, subagentType: string): boolean {
+  return /\breview/i.test(String(description ?? '')) || /review/i.test(String(subagentType ?? ''))
+}
+
+/** A model id safe to put in a header value: non-empty printable ASCII only (no CR/LF that could inject a header). */
+export function headerSafeModel(model: unknown): boolean {
+  return typeof model === 'string' && model.length > 0 && /^[\x20-\x7e]+$/.test(model)
+}
+
+/** The model to keep a review off: the main session's own model, or null (with a toast) when it cannot be enforced. */
+async function builderModelToExclude($: any): Promise<string | null> {
+  let model: unknown
+  try {
+    model = await $.session.model()
+  } catch {
+    model = ''
+  }
+  if (typeof model !== 'string' || !model) {
+    $.ui.toast('routed-subagents: could not read the session model; review not kept off it')
+    return null
+  }
+  if (model === 'cortados') {
+    $.ui.toast("routed-subagents: this session is itself routed (model 'cortados'); the review's independence from the builder can't be enforced")
+    return null
+  }
+  if (!headerSafeModel(model)) {
+    $.ui.toast('routed-subagents: session model id is not a safe header value; review not kept off it')
+    return null
+  }
+  return model
+}
+
 let routedSeq = 0
 
 /** Read the provider token: the inline override if set, otherwise the token file (with ~ expanded to $HOME). */
@@ -279,6 +317,13 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     if (!token) return next(e)
+
+    // A review must not run on the model that built the code: ask the router to keep it off the session's model.
+    let customHeaders = 'x-cortados-reveal: 1'
+    if (cfg.excludeBuilderOnReview && isReview(description, subagentType)) {
+      const builder = await builderModelToExclude($)
+      if (builder) customHeaders += '\nx-cortados-exclude-model: ' + builder
+    }
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
@@ -328,12 +373,14 @@ export const register: Register = (on, options) => {
           // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
           // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
           // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
+          // For a review it also carries `x-cortados-exclude-model: <session model>` (newline-separated), which keeps
+          // the routed review off the model that built the code (see isReview).
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: 'x-cortados-reveal: 1',
+            ANTHROPIC_CUSTOM_HEADERS: customHeaders,
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',

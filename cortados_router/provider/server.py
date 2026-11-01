@@ -119,6 +119,9 @@ def _base_provider(p: str) -> str:
 # Request header a routed subagent sends (the cortados-routed-subagents mod) to be told the real routed model and its
 # lane's remaining window in the response's `model` field. Absent, every response names `cortados` as before.
 REVEAL_HEADER = "x-cortados-reveal"
+# Request header naming a model a new conversation must not route to: an independent review never runs on the model
+# that built the work (the builder never approves its own work). Read once, when the route is chosen.
+EXCLUDE_MODEL_HEADER = "x-cortados-exclude-model"
 # Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
 # lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
 _PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
@@ -205,7 +208,7 @@ SESSION_FACTORIES: dict[str, Callable[..., Any]] = {"claude-cli": _claude_sessio
 
 
 class Registry:
-    """`router(body, client)` picks the route of a new conversation (routing.choose); without one every conversation
+    """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
     records that a route really ran (core.log_execution), once per conversation."""
 
@@ -516,7 +519,9 @@ class Handler(BaseHTTPRequestHandler):
                 # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
                 # the CLI session and its prompt cache.
                 try:
-                    route = reg.router(wire.routing_body(body), self._client())
+                    exclude = (self.headers.get(EXCLUDE_MODEL_HEADER) or "").strip()
+                    route = reg.router(wire.routing_body(body), self._client(),
+                                       **({"exclude_model": exclude} if exclude else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire)
@@ -732,9 +737,9 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client):
+        def router(body, client, exclude_model=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin)
+                                  codex_bin=codex_bin, exclude_model=exclude_model)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])

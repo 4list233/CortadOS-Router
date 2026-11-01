@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, register } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, register } from './register'
 
 test('validToolName accepts built-in and MCP names, rejects punctuation', async () => {
   expect(validToolName('Read')).toBe(true)
@@ -264,4 +264,86 @@ test('the routed child is started with the provider credentials and CLAUDE_CODE_
   const mcpIdx = recordedArgv.indexOf('--mcp-config')
   expect(mcpIdx).toBeGreaterThan(-1)
   expect(recordedArgv[mcpIdx + 1]).toBe('{"mcpServers":{}}')
+})
+
+test('isReview matches a review description (word start) or a review subagent type', async () => {
+  expect(isReview('Review the diff', 'general-purpose')).toBe(true)
+  expect(isReview('code REVIEWER pass', '')).toBe(true)
+  expect(isReview('d', 'code-reviewer')).toBe(true)
+  expect(isReview('Build the feature', 'general-purpose')).toBe(false)
+  expect(isReview('preview the page', 'general-purpose')).toBe(false) // \b: "preview" is not a review
+  expect(isReview('', '')).toBe(false)
+})
+
+test('headerSafeModel refuses CR/LF and non-printable-ASCII model ids', async () => {
+  expect(headerSafeModel('claude-opus-5-5[1m]')).toBe(true)
+  expect(headerSafeModel('opus\r\nx-api-key: evil')).toBe(false)
+  expect(headerSafeModel('opus\n')).toBe(false)
+  expect(headerSafeModel('opus\u00e9')).toBe(false)
+  expect(headerSafeModel('opus\t')).toBe(false)
+  expect(headerSafeModel('')).toBe(false)
+})
+
+/** Run one Agent call through the hook and return the child's ANTHROPIC_CUSTOM_HEADERS, the toasts, and how many
+ * times the session model was read. */
+async function customHeadersFor(call: { description: string; subagent_type: string }, sessionModel: () => Promise<string>, extraOpts: any = {}) {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, ...extraOpts } as any)
+  let headers: string | undefined
+  const toasts: string[] = []
+  let modelReads = 0
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        headers = opts.env.ANTHROPIC_CUSTOM_HEADERS
+        return hostLikeProcess({}).run(argv, opts)
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast(m: string) { toasts.push(m) } },
+    session: { model: async () => { modelReads += 1; return sessionModel() } },
+  }
+  const out = await agentHandler($, { prompt: 'check it', ...call }, async () => 'native')
+  expect(out.result.status).toBe('completed')
+  return { headers, toasts, modelReads }
+}
+
+test('a review call keeps the routed child off the session model via x-cortados-exclude-model', async () => {
+  const r = await customHeadersFor({ description: 'Review the change', subagent_type: 'general-purpose' }, async () => 'claude-opus-5-5[1m]')
+  expect(r.headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5[1m]')
+  expect(r.toasts).toEqual([])
+})
+
+test('a non-review call sends no exclude header and never reads the session model', async () => {
+  const r = await customHeadersFor({ description: 'Build the feature', subagent_type: 'general-purpose' }, async () => 'claude-opus-5-5')
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.modelReads).toBe(0)
+})
+
+test('a routed session (model cortados) sends no exclude header and toasts', async () => {
+  const r = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => 'cortados')
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.toasts.length).toBe(1)
+  expect(r.toasts[0]).toContain("can't be enforced")
+})
+
+test('an unreadable, empty or unsafe session model sends no exclude header', async () => {
+  const thrown = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => { throw new Error('nope') })
+  expect(thrown.headers).toBe('x-cortados-reveal: 1')
+  expect(thrown.toasts).toEqual(['routed-subagents: could not read the session model; review not kept off it'])
+  const empty = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => '')
+  expect(empty.headers).toBe('x-cortados-reveal: 1')
+  expect(empty.toasts).toEqual(['routed-subagents: could not read the session model; review not kept off it'])
+  const crlf = await customHeadersFor({ description: 'review', subagent_type: '' }, async () => 'opus\r\nx-api-key: evil')
+  expect(crlf.headers).toBe('x-cortados-reveal: 1')
+})
+
+test('excludeBuilderOnReview off sends no exclude header even for a review', async () => {
+  const r = await customHeadersFor({ description: 'Review the change', subagent_type: 'code-reviewer' }, async () => 'claude-opus-5-5', { excludeBuilderOnReview: false })
+  expect(r.headers).toBe('x-cortados-reveal: 1')
+  expect(r.modelReads).toBe(0)
 })

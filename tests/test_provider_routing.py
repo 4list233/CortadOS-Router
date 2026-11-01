@@ -378,5 +378,51 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertIn("unreadable", self.pin("sub/opus")["error"])
 
 
+class ExcludeModelTests(unittest.TestCase):
+    """x-cortados-exclude-model: a new conversation stays off one model, so a review never runs on its builder's model."""
+
+    def setUp(self):
+        self._keep = (core.STATE, routing.execution_routing.select)
+        core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-exclude-"))   # never the live router.db
+        self.seen = {}
+
+        def fake_select(core_, **kw):
+            self.seen.update(kw)
+            return {"provider": "codex-cli", "model": "gpt-x", "route": {"hard_rules": []}}
+        routing.execution_routing.select = fake_select
+
+    def tearDown(self):
+        core.STATE, routing.execution_routing.select = self._keep
+
+    def body(self, model="cortados"):
+        return {"model": model, "messages": [{"role": "user", "content": "review the diff"}]}
+
+    def test_normalize_model(self):
+        for raw, want in (("claude-opus-5-5[1m]", "claude-opus-5-5"), ("sub/opus", "claude-opus-5-5"),
+                          ("opus", "claude-opus-5-5"), ("cortados", None), ("", None), (None, None),
+                          ("sub", routing.SUB_DEFAULT), ("api", None), ("api/claude-sonnet-5", "claude-sonnet-5")):
+            self.assertEqual(routing.normalize_model(raw), want, raw)
+
+    def test_choose_excludes_every_served_route_of_the_model(self):
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="claude-opus-5-5[1m]")
+        excluded = {tuple(p) for p in self.seen["constraints"]["excluded_routes"]}
+        served = set(routing.served_routes(core))
+        self.assertTrue(excluded)
+        self.assertEqual(excluded, {(p, m) for p, m in served if m == "claude-opus-5-5"})
+        self.assertFalse({m for _, m in excluded} - {"claude-opus-5-5"})
+        self.assertIn("excluded by client: claude-opus-5-5", r["route"]["hard_rules"])
+
+    def test_no_exclusion_without_the_header(self):
+        routing.choose(core, self.body(), client="claude-cli", conversation_id="c")
+        self.assertNotIn("excluded_routes", self.seen["constraints"])
+
+    def test_pin_on_the_excluded_model_is_a_client_error(self):
+        r = routing.choose(core, self.body("sub/opus"), client="claude-cli", conversation_id="c",
+                           exclude_model="claude-opus-5-5")
+        self.assertTrue(r["client_error"])
+        self.assertIn("excluded model", r["error"])
+        self.assertEqual(self.seen, {})
+
+
 if __name__ == "__main__":
     unittest.main()
