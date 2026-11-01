@@ -10,7 +10,14 @@ It works in three steps:
 
 ## Two ways to use it
 
-**As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. See `docs/PROVIDER-PLAN.md`.
+**As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. A client can instead pin a model (`sub/<model>`, `api/<model>`; see the table below) and skip S1 entirely. See `docs/PROVIDER-PLAN.md`.
+
+Two more pieces build on the provider, both delegating work rather than routing a whole session:
+
+- **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`) intercepts every Agent-tool subagent the session spawns and runs it as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. An optional **orchestrator mode** directs the main session to plan and delegate rather than do substantive work itself (guidance by default; `orchestratorEnforce` makes it a hard allowlist). Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
+- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
+
+**Recommended setup:** pin the main session to a strong model with `claude --model sub/opus` against the provider, and let the routed-subagents mod send its workers through S1 (`model: cortados` in the mod config, the default). S1 only scores a conversation's first message and the route is then fixed for that conversation — good for a worker whose task is stated up front, not for an orchestrating session whose first message ("let's get started") is too thin to score well. Pinning the planner sidesteps that; routing the workers still gets each one the cheapest capable model.
 
 **As a decision library/CLI.** Call `core.decide` to get a routing decision for a request without running anything, for shadow logging or for a host that dispatches calls itself.
 
@@ -120,7 +127,8 @@ s1/                        CortadOS Router S1: dataset, label, build_sft, evalua
 tables/                    routing table, budgets, use cases, generated scores, benchmarks/, community/, inventory/,
                            s1-endpoints.example.json, resources.example.json, local-models.json
 integrations/hermes/       the frozen Hermes plugin (reference only)
-integrations/claude-mod/   cortados-pulse: a Claude Code pane that shows the resource pool beside the chat
+integrations/claude-mod/   cortados-routed-subagents: routes Agent-tool subagents through the provider; cortados-pulse:
+                           a Claude Code pane that shows the resource pool beside the chat
 tests/                     stdlib unittest suite; tests/integration needs a Hermes host and skips without it
 ```
 
@@ -193,6 +201,17 @@ The `sub/` and `api/` pins are for Claude Code clients (`/v1/messages`); Codex c
 
 Legacy `WANGCAI_*` names still work and log a deprecation warning.
 
+**Independent reviews.** A review should not run on the model that built the work it is reviewing. The routed-subagents mod detects a review by its description/subagent-type (`/review/i`) and sends `x-cortados-exclude-model` naming the main session's model plus the recent routed workers' backend models (up to 3, from the run record below); the provider refuses to route, or pin, that review onto any of them. Limits: it's a keyword heuristic, not a semantic check; excluding a model can route the review to a weaker remaining one if the excluded model was the only one meeting the band's required strength; and `route_task` never sends the header. Full detail in the mod's README (**Independent reviews**).
+
+**Provider headers**, sent by clients that want more than the routed text back:
+
+| header | direction | purpose |
+|---|---|---|
+| `x-cortados-reveal` | request | ask for the real routed model + the lane's % remaining in the response's `model` field, instead of `cortados` |
+| `x-cortados-exclude-model` | request | comma list (≤8) of model ids this conversation must not route or pin to (independent reviews) |
+| `x-cortados-run-id` | request | tag this request as part of a client-tracked run (`[A-Za-z0-9_-]{8,64}`), so later requests and `GET /v1/cortados/runs/<id>` can learn what it actually ran on |
+| `GET /v1/cortados/runs/<id>` | — | returns `{run_id, model, label, provider, models, builder_models}` for a tagged run (404 unknown id, 400 invalid); advisory, since any token holder can write to a run id |
+
 ## Delegating sub-agent work through the router
 
 Point a whole tool at `cortados` to route everything, or keep your main session on its own model and route only the
@@ -229,8 +248,11 @@ A read-only `GET /resources` on the provider (same token) returns one JSON snaps
 - Live per-turn routing, with mandatory routing for agent, cron, delegation and auxiliary calls when enabled.
 - The `cortados` provider endpoint with Claude and Codex backends (text), the Codex `/status` scarcity parser, local-hardware metering, and the S1 outcome loop.
 - Shadow logging of every decision, and a `GET /resources` snapshot (usage, subscription scarcity, local devices, model-fit).
+- The `cortados-routed-subagents` Claude Code mod, `sub/`/`api/` pins, independent reviews via `x-cortados-exclude-model`, and the run record behind `x-cortados-reveal`/`x-cortados-run-id`.
 
-**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **552 tests, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
+**Known limits:** pointing a whole session at the provider (`cortados`, `sub/`, `api/`) needs the Claude Code CLI, not the desktop app (the routed-subagents mod runs under both); a routed subagent has built-in tools only (no MCP, no browser) and runs under a 10-minute cap; worktree-isolated, remote, forked and named subagents pass through unrouted, not through the provider; and a Codex client on `/v1/responses` cannot use a `sub/`/`api/` pin (refused with 400) — it always routes through `cortados`.
+
+**Tests:** `python3 -B -m unittest discover -s tests -t .` runs **747 tests, OK, 7 skipped** (the Hermes integration suite, which needs an importable Hermes). The tests pin a benchmark catalog (`tests/fixtures/`), so the nightly table refresh cannot break them.
 
 ## License
 
