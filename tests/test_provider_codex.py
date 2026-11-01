@@ -131,6 +131,51 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertIn("api/claude-opus-5-5 is the excluded model", msg)
         self.assertEqual(seen, {})                           # refused before any routing or spend
 
+    def send_with(self, body, headers):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())["error"]
+
+    def test_an_exclude_header_that_is_not_a_model_id_answers_400(self):
+        calls = []
+        self.reg.router = lambda body, client, exclude_model=None: calls.append(exclude_model) or dict(self.route)
+        h = provider_server.EXCLUDE_MODEL_HEADER
+        for bad in ("x" * 129, "claude opus", "opus;rm", "op%us", "a,b", "<opus>"):
+            for model in ("cortados", "api/claude-sonnet-5"):
+                code, err = self.send_with({"model": model, "tools": [READ_TOOL],
+                                            "messages": [{"role": "user", "content": "hi"}]}, {h: bad})
+                self.assertEqual((code, err["type"]), (400, "invalid_request_error"), (bad, model))
+                self.assertIn("x-cortados-exclude-model is not a model id", err["message"])
+        self.assertEqual(calls, [])                          # refused before routing (or any api/ spend)
+        code, _ = self.send_with({"model": "cortados", "tools": [READ_TOOL],
+                                  "messages": [{"role": "user", "content": "hi"}]}, {h: "x" * 128})
+        self.assertEqual(code, 200)                          # 128 characters is the limit, not over it
+        self.assertEqual(calls, ["x" * 128])
+
+    def test_the_exclude_header_on_a_continuing_conversation_is_not_passed_to_the_router(self):
+        calls = []
+        self.reg.router = lambda body, client, exclude_model=None: calls.append(exclude_model) or dict(self.route)
+        body = self.continuation("cortados", "cortados")     # opens the conversation without the header
+        self.assertEqual(calls, [None])
+        code, r2 = self.send_with(body, {provider_server.EXCLUDE_MODEL_HEADER: "claude-opus-5-5"})
+        self.assertEqual(code, 200)
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
+        self.assertEqual(calls, [None])                      # the route was chosen once; the header did not re-route
+
+    def test_an_exclusion_client_error_answers_400(self):
+        self.reg.router = lambda body, client, exclude_model=None: {
+            "error": "No authenticated, available model fits. (the client excluded gpt-x via x-cortados-exclude-model)",
+            "client_error": True}
+        code, err = self.send_with({"model": "cortados", "tools": [READ_TOOL],
+                                    "messages": [{"role": "user", "content": "hi"}]},
+                                   {provider_server.EXCLUDE_MODEL_HEADER: "gpt-x"})
+        self.assertEqual((code, err["type"]), (400, "invalid_request_error"))
+
     def pin_router(self):
         # a stand-in for routing.choose: a sub/ pin runs the pinned model, anything else S1's route
         def route(body, client):

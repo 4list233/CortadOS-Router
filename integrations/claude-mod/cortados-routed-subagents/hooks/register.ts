@@ -63,8 +63,8 @@ const FALLBACK: Cfg = {
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
   // Background routed work is separate.
   subagentTimeoutMs: 600_000,
-  // A review subagent is kept off the main session's own model (x-cortados-exclude-model), so the model that built
-  // the code is never the one that approves it.
+  // A review subagent is kept off the MAIN SESSION's own model (x-cortados-exclude-model) — not off whichever model
+  // a routed subagent happened to write the code on, which this does not track yet.
   excludeBuilderOnReview: true,
 }
 
@@ -236,8 +236,8 @@ export function scrubToken(s: string, token: string): string {
   return token ? s.split(token).join('***') : s
 }
 
-/** Whether a delegated subagent is a review. Reviews are kept off the main session's model because the builder
- * never approves its own work: an independent model must check it. */
+/** Whether a delegated subagent is a review. A matching review is kept off the main session's own model (see
+ * builderModelToExclude) — not off whichever model actually wrote the code, if that was a routed subagent. */
 export function isReview(description: string, subagentType: string): boolean {
   return /\breview/i.test(String(description ?? '')) || /review/i.test(String(subagentType ?? ''))
 }
@@ -318,7 +318,8 @@ export const register: Register = (on, options) => {
     }
     if (!token) return next(e)
 
-    // A review must not run on the model that built the code: ask the router to keep it off the session's model.
+    // A review must not run on the main session's own model: ask the router to keep it off that model only (a
+    // routed subagent's model, if one wrote the code under orchestrator mode, is not excluded here).
     let customHeaders = 'x-cortados-reveal: 1'
     if (cfg.excludeBuilderOnReview && isReview(description, subagentType)) {
       const builder = await builderModelToExclude($)
@@ -374,7 +375,7 @@ export const register: Register = (on, options) => {
           // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
           // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
           // For a review it also carries `x-cortados-exclude-model: <session model>` (newline-separated), which keeps
-          // the routed review off the model that built the code (see isReview).
+          // the routed review off the MAIN SESSION's own model (see isReview) — not off a routed subagent's model.
           env: {
             ANTHROPIC_BASE_URL: String(cfg.providerUrl),
             ANTHROPIC_API_KEY: token,

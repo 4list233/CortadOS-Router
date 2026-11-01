@@ -57,6 +57,18 @@ class ProviderRoutingTests(unittest.TestCase):
         self.assertEqual(len(logged), 1)
         self.assertIn("excluded by client: claude-opus-5-5", logged[0])
 
+    def test_the_exclusion_displaces_the_model_the_request_would_have_routed_to(self):
+        # the real select: the same request, routed once freely and once with that route's model excluded
+        core.decide = scored(EASY)
+        free = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="free",
+                              claude_bin="python3", codex_bin="python3")
+        self.assertNotIn("error", free)
+        routing.execution_routing._scores.clear()
+        kept_off = routing.choose(core, self.body("rename a variable"), client="claude-cli", conversation_id="kept",
+                                  claude_bin="python3", codex_bin="python3", exclude_model=free["model"])
+        self.assertNotIn("error", kept_off)
+        self.assertNotEqual(routing.model_key(kept_off["model"]), routing.model_key(free["model"]))
+
     def test_only_served_providers_are_offered(self):
         routes = routing.served_routes(core)
         self.assertTrue(routes)
@@ -416,8 +428,21 @@ class ExcludeModelTests(unittest.TestCase):
     def test_normalize_model(self):
         for raw, want in (("claude-opus-5-5[1m]", "claude-opus-5-5"), ("sub/opus", "claude-opus-5-5"),
                           ("opus", "claude-opus-5-5"), ("cortados", None), ("", None), (None, None),
-                          ("sub", routing.SUB_DEFAULT), ("api", None), ("api/claude-sonnet-5", "claude-sonnet-5")):
+                          ("sub", routing.SUB_DEFAULT), ("api", None), ("api/claude-sonnet-5", "claude-sonnet-5"),
+                          ("Claude-Opus-5-5[1M]", "claude-opus-5-5"), ("SUB/Opus", "claude-opus-5-5"), ("CORTADOS", None),
+                          ("opusplan", "claude-opus-5-5"), ("OpusPlan", "claude-opus-5-5"),
+                          ("default", routing.SUB_DEFAULT), ("Default", routing.SUB_DEFAULT)):
             self.assertEqual(routing.normalize_model(raw), want, raw)
+        self.assertEqual(routing.model_key("Claude-Haiku-4-5-20251001"), "claude-haiku-4-5")
+
+    def test_case_and_claude_code_menu_names_match_served_routes(self):
+        for header, want in (("CLAUDE-OPUS-5-5", "claude-opus-5-5"), ("opusplan", "claude-opus-5-5"),
+                             ("default", routing.SUB_DEFAULT), ("Claude-Haiku-4-5", "claude-haiku-4-5-20251001"),
+                             ("GPT-5.6-Terra", "gpt-5.6-terra")):
+            self.seen.clear()
+            r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model=header)
+            self.assertNotIn("error", r, header)
+            self.assertEqual({m for _, m in self.seen["constraints"]["excluded_routes"]}, {want}, header)
 
     def test_choose_excludes_every_served_route_of_the_model(self):
         r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="claude-opus-5-5[1m]")
@@ -446,17 +471,24 @@ class ExcludeModelTests(unittest.TestCase):
                            exclude_model="claude-opus-5-5-20260101")
         self.assertTrue(r["client_error"])
 
-    def test_an_unmatched_exclusion_warns_and_routes(self):
-        with self.assertLogs("cortados.provider", level="WARNING") as logs:
-            r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="no-such-model")
-        self.assertIn("no-such-model", logs.output[0])
-        self.assertEqual(self.seen["constraints"]["excluded_routes"], [])
-        self.assertEqual(r["provider"], "codex-cli")
+    def test_an_unmatched_exclusion_is_a_client_error(self):
+        # loud beats silent: routing normally could put the review on its builder's (mistyped) model
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="no-such-model")
+        self.assertTrue(r["client_error"])
+        self.assertEqual(r["error"], "x-cortados-exclude-model: no-such-model names no model this endpoint serves; "
+                                     "the review could not be kept off it")
+        self.assertEqual(self.seen, {})                      # select (and its route log) never ran
 
     def test_an_emptied_pool_says_the_client_excluded_the_model(self):
         routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
         r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c", exclude_model="opus")
         self.assertTrue(r["error"].endswith("(the client excluded claude-opus-5-5 via x-cortados-exclude-model)"))
+        self.assertTrue(r["client_error"])                   # 400, not a 503 the client CLI would retry until timeout
+
+    def test_a_routing_error_without_the_header_stays_a_server_error(self):
+        routing.execution_routing.select = lambda core_, **kw: {"error": "No authenticated, available model fits."}
+        r = routing.choose(core, self.body(), client="claude-cli", conversation_id="c")
+        self.assertNotIn("client_error", r)
 
     def test_no_exclusion_without_the_header(self):
         routing.choose(core, self.body(), client="claude-cli", conversation_id="c")

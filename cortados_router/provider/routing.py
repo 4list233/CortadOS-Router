@@ -134,7 +134,7 @@ def sub_pin(body: dict[str, Any]) -> str | None:
 def normalize_model(name: str | None) -> str | None:
     """A client-named model as the tables' id: `claude-opus-5-5[1m]`, `sub/opus` and `opus` all name claude-opus-5-5;
     bare `sub` is SUB_DEFAULT (as sub_pin). None for empty, `cortados` or bare `api` (no model named)."""
-    m = (name or "").strip()
+    m = (name or "").strip().casefold()              # model ids are lower-case; `Opus` and `CLAUDE-OPUS-5-5` name the same model
     if m.endswith("]") and "[" in m:                 # Claude Code's context-window suffix, e.g. `[1m]`
         m = m[:m.rindex("[")].strip()
     if m == "sub":
@@ -145,13 +145,15 @@ def normalize_model(name: str | None) -> str | None:
             break
     if m in ("", "cortados", "api"):
         return None
-    return SUB_ALIASES.get(m, m)
+    # Claude Code's /model menu names: `opusplan` runs Opus (it plans on Opus), `default` is the account default. A
+    # builder reporting its model as one of these must still match, or the review would not be kept off it.
+    return {**SUB_ALIASES, "opusplan": SUB_ALIASES["opus"], "default": SUB_DEFAULT}.get(m, m)
 
 
 def model_key(name: str | None) -> str | None:
     """A model id with a trailing `-YYYYMMDD` release date dropped, so `claude-haiku-4-5` and the served
     `claude-haiku-4-5-20251001` compare equal (exclusion and pin checks match on this key)."""
-    return re.sub(r"-\d{8}$", "", name) if name else name
+    return re.sub(r"-\d{8}$", "", name.casefold()) if name else name
 
 
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
@@ -259,12 +261,14 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
-    if excluded_model:   # removing nothing (an unserved model) still routes normally, with a warning
+    if excluded_model:
         constraints["excluded_routes"] = [[p, m] for p, m in constraints["allowed_routes"]
                                           if model_key(m) == model_key(excluded_model)]
         if not constraints["excluded_routes"]:
-            logger.warning("x-cortados-exclude-model names %s, which no served route matches; routing normally",
-                           excluded_model)
+            # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
+            return {"router": execution_routing.ROUTER, "client_error": True,
+                    "error": f"x-cortados-exclude-model: {exclude_model.strip()} names no model this endpoint serves; "
+                             "the review could not be kept off it"}
         constraints["notes"] = [f"excluded by client: {excluded_model}"]   # select logs it with the route
     fit = request_fit(body)
     r = execution_routing.select(
@@ -278,4 +282,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                       "(codex-cli missing from PATH, or its capacity spent). " + r["error"])
     if excluded_model and r.get("error"):
         r["error"] += f" (the client excluded {excluded_model} via x-cortados-exclude-model)"
+        # The exclusion emptied (or helped empty) the pool: a 503 would have the client CLI retry until it timed out,
+        # and retrying with the same header cannot succeed. It is the client's to change: 400.
+        r["client_error"] = True
     return r
