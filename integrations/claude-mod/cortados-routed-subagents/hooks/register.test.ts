@@ -360,6 +360,8 @@ test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the 
   expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: foo names no model this endpoint serves; the review could not be kept off it')).toBe('it serves no model by that name')
   expect(excludeRefusalReason('API Error: 400 no usable model (the client excluded opus via x-cortados-exclude-model)')).toBe('no other usable model')
   expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
+  expect(excludeRefusalReason('API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  expect(excludeRefusalReason('API Error: 400 cortados: api/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
   expect(excludeRefusalReason('API Error: 529 overloaded')).toBe(null)
   // A failure that merely quotes the header (e.g. a review of code about it) is not a refusal: no retry.
   expect(excludeRefusalReason('API Error: 529 overloaded while reviewing x-cortados-exclude-model handling')).toBe(null)

@@ -260,6 +260,8 @@ export function excludeRefusalReason(text: string): string | null {
   if (/x-cortados-exclude-model: \S+ names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
   if (/x-cortados-exclude-model is not a model id/.test(text)) return 'header refused'
   if (/\(the client excluded \S+ via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
+  // The mod's own `model` option is a sub/ or api/ pin on the excluded model.
+  if (/\bis the excluded model \(x-cortados-exclude-model\)/.test(text)) return 'this mod is pinned to that model'
   return null
 }
 
