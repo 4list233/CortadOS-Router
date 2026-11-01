@@ -398,8 +398,15 @@ A headless `claude -p` subagent's JSON output names only `cortados`, so the rout
 conversation via S1, a `sub/` pin, an `api/` lane request) is recorded in memory under the id: provider, real model,
 reveal label (the label the reveal would show, or the model when the request did not ask for a reveal), and whether
 it had tools. Limits: 512 run ids (least recently used dropped first) and 16 entries per run; a restart forgets them.
-`GET /v1/cortados/runs/<id>` (needs the token) returns `{run_id, model, label, provider, models}`, where the primary
-entry is the first one with tools, else the first entry. It answers 404 for an unknown id and 400 for an invalid one.
+Once a run is full, a new entry with tools replaces the oldest tool-less entry, if there is one. A tool-less entry
+past the cap is dropped. This way title and summary side calls can never push out the builder's entry.
+`GET /v1/cortados/runs/<id>` (needs the token) returns `{run_id, model, label, provider, models, builder_models}`.
+The primary entry is the first one with tools, else the first entry. `models` lists the distinct models of every
+entry, including tool-less side calls. `builder_models` lists only the distinct models of entries that had tools,
+the ones that could have written code (empty if none). Reviews should be kept off `builder_models`. The endpoint
+answers 404 for an unknown id and 400 for an invalid one. The record is advisory, because the client influences it:
+any holder of the shared token can add entries under a run id it chooses. That stays inside the token's existing
+trust boundary, since the record only labels runs and steers reviews and never authorizes anything.
 `x-cortados-exclude-model` now takes a comma list of up to 8 model ids (empty items are ignored). Each listed model is
 excluded under the single-model rules, and a pin on any of them is refused.
 

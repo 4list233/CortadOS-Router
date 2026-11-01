@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, builderModelsOf } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -373,6 +373,14 @@ test('excludeRefusalReason fires only on the provider\'s own 400 refusal of the 
   expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
   expect(excludeRefusalReason('API Error: 400 sub/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
   expect(excludeRefusalReason('API Error: 400 cortados: api/claude-opus-5-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  // multi-model forms (the provider joins excluded names with ", ")
+  expect(excludeRefusalReason('API Error: 400 no usable model (the client excluded claude-opus-5-5, claude-sonnet-5 via x-cortados-exclude-model)')).toBe('no other usable model')
+  expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: claude-opus-5-5, claude-sonnet-5 names no model this endpoint serves; the review could not be kept off it')).toBe('it serves no model by that name')
+  expect(excludeRefusalReason('API Error: 400 x-cortados-exclude-model: foo names no model this endpoint serves')).toBe('it serves no model by that name')
+  // with several models sent, the pin and bad-id refusals still name one item
+  expect(excludeRefusalReason('API Error: 400 sub/claude-sonnet-5 is the excluded model (x-cortados-exclude-model); pin another model or use cortados')).toBe('this mod is pinned to that model')
+  expect(excludeRefusalReason('API Error: 400 cortados: x-cortados-exclude-model is not a model id')).toBe('header refused')
+  expect(excludeRefusalReason('no usable model (the client excluded a, b via x-cortados-exclude-model)')).toBe(null)
   expect(excludeRefusalReason('API Error: 529 overloaded')).toBe(null)
   // A failure that merely quotes the header (e.g. a review of code about it) is not a refusal: no retry.
   expect(excludeRefusalReason('API Error: 529 overloaded while reviewing x-cortados-exclude-model handling')).toBe(null)
@@ -451,7 +459,8 @@ test('newRunId matches the provider rule and differs per call', async () => {
 
 test('parseRunRecord keeps one-line label/model and only header-safe models', async () => {
   const r = parseRunRecord(JSON.stringify({ run_id: 'x', model: 'm1', label: 'm1 · 5% left\nX', models: ['m1', 'bad id', 'm2'] }))
-  expect(r).toEqual({ label: 'm1 · 5% left X', model: 'm1', models: ['m1', 'm2'] })
+  expect(r).toEqual({ label: 'm1 · 5% left X', model: 'm1', models: ['m1', 'm2'], builder_models: null })
+  expect(parseRunRecord(JSON.stringify({ model: 'm1', models: ['m1', 'm2'], builder_models: ['m1', 'bad id'] }))?.builder_models).toEqual(['m1'])
   expect(parseRunRecord('nope')).toBe(null)
   expect(parseRunRecord('[1]')).toBe(null)
 })
@@ -469,7 +478,9 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
   const fetches: Array<{ url: string; init: any }> = []
   const toasts: string[] = []
   let nextModels: string[] = []
+  let nextBuilders: string[] | undefined
   let nextLabel = ''
+  let duringRun: (() => Promise<void>) | null = null
   let childReply = { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '' }
   const records: Record<string, any> = {}
   const $ = {
@@ -478,6 +489,8 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
         const { base, runId } = splitRunId(opts.env.ANTHROPIC_CUSTOM_HEADERS)
         calls.push({ headers: base, runId })
         records[runId] = { run_id: runId, model: nextModels[0], label: nextLabel, provider: 'p', models: nextModels }
+        if (nextBuilders) records[runId].builder_models = nextBuilders
+        if (duringRun) { const f = duringRun; duringRun = null; await f() }
         await hostLikeProcess({}).run(argv, opts)
         return { ...childReply, isStdoutTruncated: false }
       },
@@ -498,8 +511,11 @@ function routedHarness(sessionModel: string, fetchImpl?: (url: string, init: any
   return {
     calls, fetches, toasts,
     reply(r: typeof childReply) { childReply = r },
-    async run(description: string, models: string[], label = '') {
+    /** Run `f` inside the next child run (after its record is stored), e.g. a worker finishing mid-review. */
+    during(f: () => Promise<void>) { duringRun = f },
+    async run(description: string, models: string[], label = '', builders?: string[]) {
       nextModels = models
+      nextBuilders = builders
       nextLabel = label
       return agentHandler($, { prompt: 'do it', description, subagent_type: 'general-purpose' }, async () => 'native')
     },
@@ -539,13 +555,14 @@ test('worker models are excluded on the next review with the session model, then
   resetWorkerModels()
   const h = routedHarness('claude-opus-5-5')
   await h.run('Build A', ['m-a'])
+  // older provider (no builder_models): only the primary model counts, not the side call on m-a
   await h.run('Build B', ['m-b', 'm-a'])
   await h.run('Build C', ['m-c'])
   await h.run('Build D', ['m-d'])
-  expect(trackedWorkerModels()).toEqual(['m-a', 'm-c', 'm-d'])
+  expect(trackedWorkerModels()).toEqual(['m-b', 'm-c', 'm-d'])
   const rev = await h.run('Review the change', ['m-z'])
   expect(rev.result.status).toBe('completed')
-  expect(h.calls[4].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a,m-c,m-d')
+  expect(h.calls[4].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-b,m-c,m-d')
   // the review's own model is not tracked, and the list is cleared after it
   expect(trackedWorkerModels()).toEqual([])
   await h.run('Review again', ['m-z'])
@@ -571,4 +588,27 @@ test('session model cortados + a tracked worker model -> the header has only the
   expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: m-a')
   expect(h.toasts).toEqual([])
   expect(trackedWorkerModels()).toEqual([])
+})
+
+test('builderModelsOf: builder_models with the primary last, else only the primary; side calls never evict it', async () => {
+  expect(builderModelsOf({ label: null, model: 'p', models: ['p', 's1', 's2', 's3'], builder_models: null })).toEqual(['p'])
+  expect(builderModelsOf({ label: null, model: 'p', models: ['p', 'b2', 's1'], builder_models: ['p', 'b2'] })).toEqual(['b2', 'p'])
+  expect(builderModelsOf({ label: null, model: null, models: [], builder_models: null })).toEqual([])
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-main', 's1', 's2', 's3'], '', ['m-main', 'b2', 'b3', 'b4'])
+  expect(trackedWorkerModels()).toEqual(['b3', 'b4', 'm-main'])
+  resetWorkerModels()
+})
+
+test('a worker model added while a review runs survives the review', async () => {
+  resetWorkerModels()
+  const h = routedHarness('claude-opus-5-5')
+  await h.run('Build A', ['m-a'])
+  h.during(async () => { await h.run('Build E', ['m-e']) })
+  const rev = await h.run('Review the change', ['m-z'])
+  expect(rev.result.status).toBe('completed')
+  expect(h.calls[1].headers).toBe('x-cortados-reveal: 1\nx-cortados-exclude-model: claude-opus-5-5,m-a')
+  expect(trackedWorkerModels()).toEqual(['m-e'])
+  resetWorkerModels()
 })

@@ -68,7 +68,10 @@ class WireTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t"], {"content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}], "isError": True})
 
 
-class EndpointTests(unittest.TestCase):
+class EndpointHarness(unittest.TestCase):
+    """The provider endpoint over the fake CLI: setUp/tearDown and request helpers only, no tests (so a subclass
+    reuses the harness without re-running inherited tests)."""
+
     def setUp(self):
         self.scratch = tempfile.mkdtemp()
         self.argv_file = os.path.join(self.scratch, "argv.json")
@@ -100,6 +103,8 @@ class EndpointTests(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code
 
+
+class EndpointTests(EndpointHarness):
     def test_a_bridged_tool_call_round_trips_through_the_client(self):
         history = [{"role": "user", "content": "please use tool"}]
         r1 = self.post({"model": "cortados", "tools": [READ_TOOL], "messages": history})
@@ -236,8 +241,8 @@ class EndpointTests(unittest.TestCase):
         self.assertIn("/resources", body)                    # it fetches the resources endpoint for its data
 
 
-class RoutedEndpointTests(EndpointTests):
-    """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
+class RoutedHarness(EndpointHarness):
+    """The endpoint with a stub router (every route is claude-cli/claude-test-model); harness only, no tests."""
 
     def setUp(self):
         super().setUp()
@@ -255,6 +260,10 @@ class RoutedEndpointTests(EndpointTests):
                                               "user-agent": "claude-cli/2.1.304 (external, cli)"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.headers.get("x-cortados-route"), json.loads(r.read())
+
+
+class RoutedEndpointTests(RoutedHarness, EndpointTests):
+    """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
 
     def test_a_conversation_is_routed_once_and_runs_on_the_chosen_model(self):
         history = [{"role": "user", "content": "please use tool"}]
@@ -316,7 +325,7 @@ class RoutedEndpointTests(EndpointTests):
         self.assertFalse(Path(self.argv_file).exists())
 
 
-class RunRecordTests(RoutedEndpointTests):
+class RunRecordTests(RoutedHarness):
     """x-cortados-run-id: each routed request of a client run is recorded; GET /v1/cortados/runs/<id> names the model."""
 
     def send(self, body, run_id, token=TOKEN):
@@ -353,7 +362,8 @@ class RunRecordTests(RoutedEndpointTests):
         code, got = self.lookup("run_abc-123")
         self.assertEqual(code, 200)
         self.assertEqual(got, {"run_id": "run_abc-123", "model": "claude-test-model", "label": "claude-test-model",
-                               "provider": "claude-cli", "models": ["claude-test-model"]})
+                               "provider": "claude-cli", "models": ["claude-test-model"],
+                               "builder_models": ["claude-test-model"]})
 
     def test_the_primary_is_the_first_request_with_tools(self):
         models = iter(["title-model", "worker-model", "other-model"])
@@ -367,6 +377,83 @@ class RunRecordTests(RoutedEndpointTests):
         self.assertEqual(code, 200)
         self.assertEqual(got["model"], "worker-model")
         self.assertEqual(got["models"], ["title-model", "worker-model", "other-model"])
+        # the tool-less title call wrote nothing: it is in `models` (compatibility) but not a builder
+        self.assertEqual(got["builder_models"], ["worker-model", "other-model"])
+
+    def test_a_run_of_only_toolless_calls_has_no_builder_models(self):
+        self.send({"messages": [{"role": "user", "content": "a title"}]}, "run-titles")
+        code, got = self.lookup("run-titles")
+        self.assertEqual((code, got["models"], got["builder_models"]), (200, ["claude-test-model"], []))
+
+    def test_a_continuation_under_a_second_run_id_adds_no_entry(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        code, r1 = self.send({"tools": [READ_TOOL], "messages": history}, "run-opener")
+        self.assertEqual((code, r1["stop_reason"]), (200, "tool_use"))
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": r1["content"][-1]["id"], "content": "x"}]}]
+        code, r2 = self.send({"tools": [READ_TOOL], "messages": history}, "run-continuer")
+        self.assertEqual((code, r2["content"][0]["text"]), (200, "tool said: x"))
+        self.assertEqual(self.lookup("run-continuer")[0], 404)        # routed when it opened, not by this request
+        self.assertEqual(len(self.reg.runs._runs["run-opener"]), 1)
+
+    def test_a_backend_start_failure_leaves_no_record(self):
+        self.reg.claude_bin = [os.path.join(self.scratch, "no-such-claude")]
+        code, err = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
+                              "run-nostart")
+        self.assertEqual((code, err["type"]), (502, "api_error"))
+        self.assertEqual(len(self.calls), 1)                          # it was routed, then the backend failed
+        self.assertEqual(self.lookup("run-nostart")[0], 404)
+
+    def test_the_api_lane_records_its_label(self):
+        from types import SimpleNamespace
+        from cortados_router import api_credits
+        from cortados_router.provider.server import Handler, RunRecords
+        rid = api_credits._org_id("sk") + "|2026-11:abc"     # resolves to the test key "sk" (as in test_api_lane)
+        runs = RunRecords()
+
+        def serve(headers, body):
+            h = Handler.__new__(Handler)
+            h.headers, h.server = headers, SimpleNamespace(registry=SimpleNamespace(runs=runs))
+            h._error = lambda *a: self.fail(f"refused: {a}")
+            with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": "sk"}), \
+                 mock.patch("cortados_router.api_credits.reserve", return_value=rid), \
+                 mock.patch("cortados_router.api_credits.window_numbers", lambda now: (40.4, now + 1, 2.0)), \
+                 mock.patch("cortados_router.provider.anthropic_proxy.serve", return_value=({}, "rejected")), \
+                 mock.patch("cortados_router.api_credits.settle"):
+                h._serve_api_lane(body, "claude-opus-5-5", None)
+
+        serve({"x-cortados-run-id": "run-api-reveal", "x-cortados-reveal": "1"},
+              {"model": "api/claude-opus-5-5", "tools": [READ_TOOL]})
+        self.assertEqual(runs.summary("run-api-reveal"),
+                         {"run_id": "run-api-reveal", "model": "claude-opus-5-5", "label": "claude-opus-5-5 · 60% left",
+                          "provider": "anthropic-api", "models": ["claude-opus-5-5"],
+                          "builder_models": ["claude-opus-5-5"]})
+        serve({"x-cortados-run-id": "run-api-plain"}, {"model": "api/claude-opus-5-5"})   # no reveal, no tools
+        got = runs.summary("run-api-plain")
+        self.assertEqual((got["label"], got["provider"], got["builder_models"]),
+                         ("claude-opus-5-5", "anthropic-api", []))
+        serve({}, {"model": "api/claude-opus-5-5"})                                         # no run id: nothing kept
+        self.assertEqual(len(runs._runs), 2)
+
+    def test_a_full_run_still_keeps_a_later_tool_bearing_entry(self):
+        from cortados_router.provider.server import RunRecords
+        runs = RunRecords()
+        for i in range(RunRecords.PER_RUN + 5):                    # tool-less side calls fill the run, then overflow
+            runs.record("run-crowded", provider="p", model=f"side{i}", label="x", tools=False)
+        runs.record("run-crowded", provider="p", model="builder", label="builder-label", tools=True)
+        entries = runs._runs["run-crowded"]
+        self.assertEqual(len(entries), RunRecords.PER_RUN)
+        self.assertEqual([e["model"] for e in entries[:2]], ["side1", "side2"])   # the oldest tool-less one went
+        got = runs.summary("run-crowded")
+        self.assertEqual((got["model"], got["label"], got["builder_models"]), ("builder", "builder-label", ["builder"]))
+        # further tool-less calls are dropped, never displacing the builder
+        runs.record("run-crowded", provider="p", model="late-side", label="x", tools=False)
+        self.assertNotIn("late-side", runs.summary("run-crowded")["models"])
+        self.assertEqual(runs.summary("run-crowded")["builder_models"], ["builder"])
+        # a run already full of tool-bearing entries keeps its first PER_RUN
+        for i in range(RunRecords.PER_RUN + 3):
+            runs.record("run-builders", provider="p", model=f"b{i}", label="x", tools=True)
+        self.assertEqual(runs.summary("run-builders")["builder_models"], [f"b{i}" for i in range(RunRecords.PER_RUN)])
 
     def test_an_unknown_run_is_a_404(self):
         code, err = self.lookup("never-seen-run")

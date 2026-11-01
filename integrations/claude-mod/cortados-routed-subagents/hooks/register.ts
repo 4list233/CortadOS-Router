@@ -257,9 +257,10 @@ export function headerSafeModel(model: unknown): boolean {
  * enough, since a review of code that talks about the header quotes it (Sonnet 5 review, 2026-11-01). */
 export function excludeRefusalReason(text: string): string | null {
   if (!/\b400\b|invalid_request_error/.test(text)) return null
-  if (/x-cortados-exclude-model: \S+ names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
+  // Each phrasing is matched in its single- and multi-model form ("a" or "a, b": the provider joins names with ", ").
+  if (/x-cortados-exclude-model: \S+(?:, \S+)* names no model this endpoint serves/.test(text)) return 'it serves no model by that name'
   if (/x-cortados-exclude-model is not a model id/.test(text)) return 'header refused'
-  if (/\(the client excluded \S+ via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
+  if (/\(the client excluded \S+(?:, \S+)* via x-cortados-exclude-model\)/.test(text)) return 'no other usable model'
   // The mod's own `model` option is a sub/ or api/ pin on the excluded model.
   if (/\bis the excluded model \(x-cortados-exclude-model\)/.test(text)) return 'this mod is pinned to that model'
   return null
@@ -270,8 +271,8 @@ const MAX_EXCLUDED_MODELS = 8
 /** How many worker models are remembered between reviews. */
 const MAX_WORKER_MODELS = 3
 
-/** Models the routed NON-review subagents ran on since the last review (distinct, most recent last, at most
- * MAX_WORKER_MODELS), from each run's provider record. Module-level, so it resets on mod reload — acceptable: a
+/** Models the routed NON-review subagents built with since the last review (distinct, most recent last, at most
+ * MAX_WORKER_MODELS), from each run's provider record (see builderModelsOf). Module-level, so it resets on mod reload — acceptable: a
  * reload only loses the exclusion for the next review, it never mis-routes anything. */
 let workerModels: string[] = []
 
@@ -280,7 +281,8 @@ export function resetWorkerModels(): void {
   workerModels = []
 }
 
-/** Note the models a non-review run used: each moves to the end (most recent), the oldest drop past the cap. */
+/** Note the models a non-review run built with: each moves to the end (most recent), the oldest drop past the cap.
+ * Pass builderModelsOf(record), so the run's primary model comes last and is the last to be evicted. */
 export function trackWorkerModels(models: readonly string[]): void {
   for (const m of models) {
     if (!headerSafeModel(m) || m === 'cortados') continue
@@ -288,6 +290,22 @@ export function trackWorkerModels(models: readonly string[]): void {
     workerModels.push(m)
   }
   if (workerModels.length > MAX_WORKER_MODELS) workerModels = workerModels.slice(-MAX_WORKER_MODELS)
+}
+
+/** Forget the given models (those a completed review was kept off), keeping any added meanwhile — e.g. by a worker
+ * that finished while the review ran. */
+export function untrackWorkerModels(models: readonly string[]): void {
+  workerModels = workerModels.filter((m) => !models.includes(m))
+}
+
+/** The models a run built with, primary LAST: the record's `builder_models` (models of its tool-bearing requests)
+ * when the provider sends them, else just the primary `model` — never the side calls (title/summary one-shots)
+ * in `models`, which would otherwise evict the real builder from the capped list. */
+export function builderModelsOf(record: RunRecord): string[] {
+  const primary = record.model
+  const out = (record.builder_models ?? []).filter((m) => m !== primary)
+  if (primary) out.push(primary)
+  return out
 }
 
 /** The tracked worker models (a copy). */
@@ -334,7 +352,7 @@ export function newRunId(): string {
   return ('r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
 }
 
-export type RunRecord = { label: string | null; model: string | null; models: string[] }
+export type RunRecord = { label: string | null; model: string | null; models: string[]; builder_models: string[] | null }
 
 /** Parse the provider's run record body; null when it is not a usable record. Labels/models are kept to one short
  * printable line (they end up in the model-visible result header). */
@@ -352,7 +370,9 @@ export function parseRunRecord(text: string): RunRecord | null {
     return s || null
   }
   const models = Array.isArray(d.models) ? d.models.filter((m: unknown) => headerSafeModel(m)) as string[] : []
-  return { label: line(d.label), model: line(d.model), models }
+  // builder_models: absent (null) on an older provider.
+  const builder_models = Array.isArray(d.builder_models) ? d.builder_models.filter((m: unknown) => headerSafeModel(m)) as string[] : null
+  return { label: line(d.label), model: line(d.model), models, builder_models }
 }
 
 /** Fetch the provider's record of one routed run, or null on any failure (never throws). $.http.fetch takes no
@@ -514,7 +534,7 @@ export const register: Register = (on, options) => {
       if (!runId) return null
       const record = await fetchRunRecord($, cfg, token, runId)
       try {
-        if (record && !review) trackWorkerModels(record.models)
+        if (record && !review) trackWorkerModels(builderModelsOf(record))
       } catch { /* never fail the subagent over bookkeeping */ }
       return record
     }
@@ -549,9 +569,10 @@ export const register: Register = (on, options) => {
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
         return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}` }
       }
-      // A completed review has checked the work so far: start tracking builders afresh. (A failed review keeps the
-      // list, so the retried review is still kept off them.)
-      if (review) workerModels = []
+      // A completed review has checked the work of the models it was kept off: forget exactly those (snapshotted at
+      // dispatch), keeping workers that finished while it ran. (A failed review keeps the list, so the retried review
+      // is still kept off them.)
+      if (review) untrackWorkerModels(excluded)
       const routedTo = record?.label || record?.model || p.model
       const header = note + (routedTo ? `[routed via CortadOS → ${routedTo}]\n\n` : note ? '\n' : '')
       // Match the Agent tool's "completed" result shape so core accepts it in place of a native subagent.

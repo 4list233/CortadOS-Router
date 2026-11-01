@@ -49,7 +49,7 @@ The child starts with an empty MCP config (built-in tools only); the parent's MC
 | `orchestratorMode` | `true` | Direct the main session to plan and delegate (see **Orchestrator mode**). Guidance by default; keeps full tool access. |
 | `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted. |
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. `Agent` and `route_task` (both delegation primitives) are always allowed regardless. |
-| `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents ran on since the last review (up to 3), so that review is kept off them on every lane. |
+| `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
 
 ## Orchestrator mode
 
@@ -76,7 +76,7 @@ false` (the mod then only routes subagents, without directing the main session a
 With `excludeBuilderOnReview` on (the default), a delegated Agent call that looks like a review — its `description`
 matches `/\breview/i`, or its `subagent_type` matches `/review/i` — is sent to the provider with
 `x-cortados-exclude-model: <models>` (comma-separated): the main session's own model plus the **worker models** — the
-backend models routed non-review subagents actually ran on since the last review. The provider keeps that review's
+backend models routed non-review subagents actually built with since the last review. The provider keeps that review's
 routed conversation off those models on every lane (date suffixes and case ignored; a `sub/`/`api/` pin on it, or an unknown model name, is
 refused with 400; if excluding it would leave nothing that fits, the provider returns 400 rather than a retryable
 503). Say "review" in the Agent description if you want this to kick in.
@@ -84,9 +84,12 @@ refused with 400; if excluding it would leave nothing that fits, the provider re
 Honest limits:
 
 - **How the builder is tracked.** Every routed run sends a fresh `x-cortados-run-id`; afterwards (success or
-  failure) the mod fetches `GET <providerUrl>/v1/cortados/runs/<id>` and remembers the record's `models` for each
-  non-review run: distinct, most recent last, **up to 3**. The next review excludes those plus the session model;
-  a review that completes clears the list (a failed one keeps it, so the retried review is still kept off them).
+  failure) the mod fetches `GET <providerUrl>/v1/cortados/runs/<id>` and remembers, for each non-review run, the
+  models that built with tools — the record's `builder_models`, or just its primary `model` on an older provider
+  that doesn't send them (side calls such as title/summary one-shots don't count) — distinct, most recent last,
+  **up to 3**, each run's primary model added last so it is the last evicted. The next review excludes those plus
+  the session model; a review that completes forgets exactly the models it was kept off (workers that finished
+  while it ran stay tracked); a failed one keeps them, so the retried review is still kept off them.
   The list lives in memory and **resets when the mod reloads** (e.g. a Claude Code restart) — the first review after
   that only excludes the session model. If the record can't be fetched (provider down, older provider, 3 s timeout)
   that run's models are simply not tracked; the subagent itself is never failed over it. Work the main session did

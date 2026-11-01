@@ -156,7 +156,10 @@ RUNS_PATH = "/v1/cortados/runs/"
 class RunRecords:
     """What each client run was routed to, in memory: run id -> up to PER_RUN entries {provider, model, label, tools}.
     Bounded (LRU over MAX_RUNS ids) because the ids are client-chosen; a restart forgets them, which only costs the
-    client its label. Locked: the server is threaded and a run's requests may arrive concurrently."""
+    client its label. Locked: the server is threaded and a run's requests may arrive concurrently.
+    Client-influenced, so advisory: any holder of the shared token can add entries under any run id it names. That
+    is inside the token's existing trust boundary (the same holder can already route and spend); the record only
+    labels runs and steers reviews, and never authorizes anything."""
     MAX_RUNS = 512
     PER_RUN = 16
 
@@ -165,17 +168,29 @@ class RunRecords:
         self._runs: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
 
     def record(self, run_id: str, *, provider: str, model: str, label: str, tools: bool) -> None:
+        entry = {"provider": provider, "model": model, "label": label, "tools": bool(tools)}
         with self._lock:
             entries = self._runs.pop(run_id, [])
-            if len(entries) < self.PER_RUN:       # the first entries decide the primary; later ones add nothing it reads
-                entries.append({"provider": provider, "model": model, "label": label, "tools": bool(tools)})
+            if len(entries) < self.PER_RUN:
+                entries.append(entry)
+            elif entry["tools"]:
+                # Full: a tool-bearing entry (one that can write code) is always kept, so tool-less side calls (titles,
+                # summaries) can never crowd out the builder. It replaces the oldest tool-less entry, if there is one;
+                # a run already full of tool-bearing entries keeps its first PER_RUN. A tool-less entry beyond the
+                # cap is dropped.
+                oldest_toolless = next((i for i, e in enumerate(entries) if not e["tools"]), None)
+                if oldest_toolless is not None:
+                    del entries[oldest_toolless]
+                    entries.append(entry)
             self._runs[run_id] = entries
             while len(self._runs) > self.MAX_RUNS:
                 self._runs.popitem(last=False)
 
     def summary(self, run_id: str) -> dict[str, Any] | None:
-        """The run's answer: the primary entry (the first that had tools, the agent's own loop, else the first) and
-        the distinct models in order; None for an unknown (or evicted) id."""
+        """The run's answer: the primary entry (the first that had tools, the agent's own loop, else the first), the
+        distinct models in order (`models`, every entry, tool-less side calls included) and the distinct models of the
+        entries that had tools (`builder_models`: the ones that could have written code; empty if none); None for an
+        unknown (or evicted) id."""
         with self._lock:
             entries = self._runs.get(run_id)
             if entries is None:
@@ -184,7 +199,8 @@ class RunRecords:
             entries = list(entries)
         primary = next((e for e in entries if e["tools"]), entries[0])
         return {"run_id": run_id, "model": primary["model"], "label": primary["label"],
-                "provider": primary["provider"], "models": list(dict.fromkeys(e["model"] for e in entries))}
+                "provider": primary["provider"], "models": list(dict.fromkeys(e["model"] for e in entries)),
+                "builder_models": list(dict.fromkeys(e["model"] for e in entries if e["tools"]))}
 # Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
 # lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
 _PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
