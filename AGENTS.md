@@ -76,3 +76,11 @@ repo, use an ordinary subagent, not `route_task`.
 
 It needs `CORTADOS_PROVIDER_URL` and `CORTADOS_PROVIDER_TOKEN` in the environment and the provider reachable. If the tool
 is unconfigured or the provider is unreachable it returns a clear error; fall back to an ordinary subagent then.
+
+## Delegating whole tasks from the Claude app
+The same server serves `start_task` / `task_status` / `wait_task` / `list_tasks` / `cancel_task`
+(`cortados_router/child_tasks.py`): each task runs as a separate headless Claude Code session on this machine through
+the provider (every child spends subscription quota). Child traffic carries `x-cortados-run-id: <task_id>`;
+lifecycle events go to `$CORTADOS_HOME/child-tasks.jsonl` (tests must use a throwaway `CORTADOS_HOME`). Registration snippets (desktop app and `claude mcp add -s user`)
+are in README.md under the same heading. Tests use a fake claude binary (`tests/test_child_tasks.py`); never launch a
+real child in tests.
