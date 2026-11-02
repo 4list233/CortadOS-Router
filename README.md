@@ -297,6 +297,45 @@ codex mcp add cortados-route \
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
 
+## Delegating whole tasks from the Claude app
+
+The same `cortados-route` server also hands off WHOLE tasks: each one runs as a separate headless Claude Code session
+on the machine that runs the server (`claude -p` launched through `cortados_router.session`, so the provider env, the
+`sub/<model>` pin and S1-routed native subagents are exactly those of a `cortados` session), with every tool and MCP
+server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
+
+Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?)` returns a `task_id` at once;
+`task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
+`orchestrator` is `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`, ...).
+`permission_mode` is one of `acceptEdits` (default), `default`, `plan`; `bypassPermissions` is deliberately not offered
+for unattended runs, so widen with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. State lives in
+`~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). Limits: 4 running children
+(`CORTADOS_CHILD_MAX_RUNNING`), 3 h per child (`CORTADOS_CHILD_MAX_S`), and a child cannot start children. The token is
+read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`); the desktop app starts servers with a
+thin PATH, so set `CORTADOS_CHILD_CLAUDE_BIN` to claude's absolute path.
+
+Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
+
+```json
+"cortados-route": {
+  "command": "python3",
+  "args": ["/ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py"],
+  "env": {
+    "CORTADOS_PROVIDER_URL": "http://<provider-host>:8432",
+    "CORTADOS_CHILD_CLAUDE_BIN": "/ABSOLUTE/PATH/TO/claude"
+  }
+}
+```
+
+Claude Code, user scope:
+
+```bash
+claude mcp add -s user cortados-route \
+  --env CORTADOS_PROVIDER_URL=http://<provider-host>:8432 \
+  --env CORTADOS_CHILD_CLAUDE_BIN="$(command -v claude)" \
+  -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
+```
+
 ## The resource pool at a glance
 
 A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (reachable from any device on the tailnet; it asks for the token and never embeds it), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.

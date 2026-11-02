@@ -82,7 +82,7 @@ class ProtocolTests(unittest.TestCase):
     def test_tools_list_has_route_task(self):
         r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.CFG)
         names = [t["name"] for t in r["result"]["tools"]]
-        self.assertEqual(names, ["route_task"])
+        self.assertEqual(names[0], "route_task")             # child-task tools follow (tests/test_child_tasks.py)
         self.assertIn("task", r["result"]["tools"][0]["inputSchema"]["required"])
 
     def test_notification_gets_no_reply(self):

@@ -4,7 +4,11 @@ calls this tool, which posts the subtask to the `cortados` provider endpoint (S1
 cheapest capable lane in the resource pool, and the chosen model answers), and returns the answer as text. It does not
 replace the session's model or touch its login.
 
-Stdlib only; runs standalone (the MCP client launches it as a subprocess over stdio), so it imports nothing from the
+It also serves the child-task tools (start_task, task_status, wait_task, list_tasks, cancel_task): whole tasks run as
+separate headless Claude Code sessions on this machine (see cortados_router/child_tasks.py, imported lazily because it
+needs the package; route_task does not).
+
+Stdlib only; runs standalone (the MCP client launches it as a subprocess over stdio); route_task imports nothing from the
 package. It forwards to the provider — it does NOT need to sit next to S1 or the provider; it only needs to reach the
 provider URL.
 
@@ -47,6 +51,83 @@ TOOL = {
         "required": ["task"],
     },
 }
+
+
+# Whole-task delegation: a separate headless Claude Code session on this machine (cortados_router/child_tasks.py).
+_MODES = ["acceptEdits", "default", "plan"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
+CHILD_TOOLS = [
+    {"name": "start_task",
+     "description": ("Start a WHOLE task as a separate headless Claude Code session on this machine, routed through "
+                     "CortadOS (S1 picks the model per turn unless an orchestrator model is pinned). The child has every "
+                     "tool and MCP server the user's Claude Code has, works in `cwd`, and runs unattended; only its "
+                     "final result comes back. Returns a task_id at once: poll with task_status or block with wait_task. "
+                     "Put everything the child needs in `task`: it does not see this conversation."),
+     "inputSchema": {"type": "object", "properties": {
+         "task": {"type": "string", "description": "The complete, self-contained task prompt."},
+         "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
+         "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
+                          "model such as fable, opus, sonnet, gpt-6.1-sol (pins the top loop; subagents still routed)."},
+         "permission_mode": {"type": "string", "enum": _MODES, "description": "acceptEdits (default): edits in cwd "
+                             "allowed, other approval-needing tools denied; default: approval-needing tools denied; "
+                             "plan: read-only. bypassPermissions is deliberately not offered."},
+         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
+                           "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
+         "required": ["task", "cwd"]}},
+    {"name": "task_status",
+     "description": "State of a child task (running/succeeded/failed/cancelled), elapsed time, models used, and the final "
+                    "result text when done (bounded; the full log path is included).",
+     "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "wait_task",
+     "description": "Block until a child task ends or timeout_s passes (max 540 s, under MCP client tool timeouts), then "
+                    "return what task_status returns. Call again to keep waiting.",
+     "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"},
+                                                      "timeout_s": {"type": "number", "description": "0-540, default 540"}},
+                     "required": ["task_id"]}},
+    {"name": "list_tasks",
+     "description": "Most recent child tasks, newest first, with state and a short preview.",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "1-200, default 20"}}}},
+    {"name": "cancel_task",
+     "description": "Terminate a running child task (its own process group only).",
+     "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+]
+_CHILD_NAMES = {t["name"] for t in CHILD_TOOLS}
+
+
+def _child_module():
+    """Import cortados_router.child_tasks. This file is normally launched as a script, so its directory, not the repo
+    root, is on sys.path; the root is added here, lazily, so route_task never depends on the package importing."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from cortados_router import child_tasks
+    return child_tasks
+
+
+def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
+    """Run one child-task tool. Errors come back as isError tool results; the provider token is scrubbed from every
+    model-visible string (a child could echo it)."""
+    token = (cfg.get("token") or "").strip()
+    scrub = (lambda s: s.replace(token, "***")) if len(token) >= MIN_TOKEN_LEN else (lambda s: s)
+    try:
+        ct = _child_module()
+    except ImportError as exc:
+        return _err(f"child tasks unavailable: cannot import cortados_router.child_tasks ({exc})")
+    try:
+        if name == "start_task":
+            out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
+                           a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
+                           cfg.get("url", ""), cfg.get("token_file"))
+        elif name == "task_status":
+            out = ct.status(a.get("task_id"), scrub)
+        elif name == "wait_task":
+            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), scrub)
+        elif name == "list_tasks":
+            out = {"tasks": ct.list_recent(a.get("limit", 20))}
+        else:
+            out = ct.cancel(a.get("task_id"))
+    except ct.TaskError as exc:
+        return _err(scrub(f"{name}: {exc}"))
+    return {"content": [{"type": "text", "text": scrub(json.dumps(out, indent=2))}]}
 
 
 def _err(text: str) -> dict:
@@ -141,13 +222,15 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         return {**base, "result": {"protocolVersion": version, "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "cortados-route", "version": "0"}}}
     if method == "tools/list":
-        return {**base, "result": {"tools": [TOOL]}}
+        return {**base, "result": {"tools": [TOOL] + CHILD_TOOLS}}
     if method == "tools/call":
-        if params.get("name") != "route_task":
-            return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
         a = params.get("arguments")
         if not isinstance(a, dict):
             a = {}
+        if params.get("name") in _CHILD_NAMES:
+            return {**base, "result": call_child_tool(params["name"], a, cfg)}
+        if params.get("name") != "route_task":
+            return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
                                               a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS))}
     if method == "ping":
@@ -203,7 +286,8 @@ def _resolve_url() -> str:
 
 
 def main() -> None:
-    cfg = {"url": _resolve_url(), "token": _resolve_token()}
+    cfg = {"url": _resolve_url(), "token": _resolve_token(),
+           "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}   # the child launcher reads the file
     for line in sys.stdin:
         if not line.strip():
             continue
