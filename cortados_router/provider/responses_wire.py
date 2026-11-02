@@ -16,7 +16,8 @@ import uuid
 from typing import Any, Iterator
 
 from cortados_router.provider import anthropic_wire
-from cortados_router.provider.anthropic_wire import ClientTurn, WireError, mcp_content, reply_fingerprint, sse
+from cortados_router.provider.anthropic_wire import (ClientTurn, WireError, check_tool_name, mcp_content,
+                                                    reply_fingerprint, sse)
 
 MODEL_ID = anthropic_wire.MODEL_ID
 # Item types Codex re-sends that this endpoint never produced and that carry no conversation content: they are
@@ -100,7 +101,8 @@ def _tool_use_block(item: dict[str, Any]) -> dict[str, Any]:
             raise WireError(f"function_call {call_id} arguments are not JSON: {exc}") from None
     if not isinstance(args, dict):
         raise WireError(f"function_call {call_id} arguments must be a JSON object")
-    return {"type": "tool_use", "id": call_id, "name": str(item.get("name") or ""), "input": args}
+    name = check_tool_name(str(item.get("name") or ""), "function_call name")
+    return {"type": "tool_use", "id": call_id, "name": name, "input": args}
 
 
 def _output_result(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -152,6 +154,7 @@ def _parse_tools(tools: Any) -> list[dict[str, Any]]:
             name = t.get("name")
             if not isinstance(name, str) or not name:
                 raise WireError("function tools must carry a name")
+            check_tool_name(name)
             # `strict` has no Anthropic equivalent and is dropped; a function without `parameters` takes no
             # arguments, which is the empty object schema.
             out.append({"name": name, "description": str(t.get("description") or ""),

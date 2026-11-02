@@ -960,6 +960,13 @@ class CodexSessionUnitTests(unittest.TestCase):
             stop.set()
             codex_bridge.CODEX_SETTLE_S = settle
 
+    def test_a_lone_surrogate_name_hashes_without_raising(self):
+        # The wires refuse such names; the encoder must still never raise if one gets past them.
+        aliases = codex_isolation.tool_aliases([{"name": "Re\ud800d"}, {"name": "Read"}])
+        [(wire_name, client)] = aliases.items()
+        self.assertEqual(client, "Re\ud800d")
+        self.assertTrue(codex_isolation.codex_safe(wire_name), wire_name)
+
     def test_tool_aliases_cover_the_codex_client_tool_set_and_hash_around_a_taken_alias(self):
         codex_client = [{"name": n} for n in ("exec_command", "write_stdin", "request_user_input", "view_image",
                                               "get_goal", "create_goal", "update_goal", "apply_patch", "update_plan")]

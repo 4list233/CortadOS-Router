@@ -153,6 +153,14 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaises(WireError):
             wire.parse_request(request(user("a"), {"type": "message", "role": "assistant", "content": "y"}))
 
+    def test_a_tool_name_with_a_lone_surrogate_is_a_wire_error(self):
+        bad = json.loads('"Re\\ud800d"')
+        with self.assertRaisesRegex(WireError, r"tool name .*not valid Unicode"):
+            wire.parse_request(request(user("a"), tools=({"type": "function", "name": bad},)))
+        with self.assertRaisesRegex(WireError, r"function_call name .*not valid Unicode"):
+            wire.parse_request(request(user("a"), {"type": "function_call", "call_id": "c", "name": bad, "arguments": "{}"},
+                                       {"type": "function_call_output", "call_id": "c", "output": "x"}))
+
     def test_bad_arguments_and_unknown_items_are_refused_by_name(self):
         with self.assertRaisesRegex(WireError, "not JSON"):
             wire.parse_request(request(user("a"), {"type": "function_call", "call_id": "c", "name": "R", "arguments": "{oops"},

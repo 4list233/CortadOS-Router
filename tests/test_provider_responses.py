@@ -257,6 +257,12 @@ class ResponsesEndpointTests(unittest.TestCase):
         self.assertEqual(code, 400)                                    # the Messages path answers too
         self.no_backend_started()
 
+    def test_a_lone_surrogate_tool_name_is_a_400_not_a_dropped_connection(self):
+        code, body = self.error_of(request(user("x"), tools=({"type": "function", "name": "Re\ud800d"},)))
+        self.assertEqual((code, body["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("not valid Unicode", body["error"]["message"])
+        self.no_backend_started()
+
     def test_a_bad_history_item_in_a_one_shot_is_a_400_not_a_dropped_connection(self):
         # parse_request validates only the new turn; the one-shot transcript re-reads the history, so a shape error
         # in an older user item surfaces there and must still answer in the wire's error shape.

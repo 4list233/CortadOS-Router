@@ -52,6 +52,12 @@ class WireTests(unittest.TestCase):
                 wire.parse_request({"tool_choice": choice, "messages": [{"role": "user", "content": "x"}]})
         wire.parse_request({"tool_choice": {"type": "auto"}, "messages": [{"role": "user", "content": "x"}]})
 
+    def test_a_tool_name_with_a_lone_surrogate_is_a_wire_error(self):
+        # json.loads accepts "\\ud800" and yields a str UTF-8 cannot encode; it must be refused here, not crash later.
+        body = json.loads('{"tools": [{"name": "Re\\ud800d", "input_schema": {}}], "messages": [{"role": "user", "content": "x"}]}')
+        with self.assertRaisesRegex(wire.WireError, r"tool name .*not valid Unicode"):
+            wire.parse_request(body)
+
     def test_mid_conversation_system_messages_join_the_new_turn(self):
         turn = wire.parse_request({"messages": [{"role": "user", "content": "do it"},
                                                 {"role": "system", "content": [{"type": "text", "text": "env: x"}]}]})
@@ -301,6 +307,11 @@ class RoutedHarness(EndpointHarness):
                                               "user-agent": "claude-cli/2.1.304 (external, cli)"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.headers.get("x-cortados-route"), json.loads(r.read())
+
+    def test_a_lone_surrogate_tool_name_is_a_400_not_a_dropped_connection(self):
+        body = {"model": "cortados", "tools": [{"name": "Re\ud800d", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "x"}]}
+        self.assertEqual(self.status_of(body), 400)
 
 
 class RoutedEndpointTests(RoutedHarness, EndpointTests):

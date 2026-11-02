@@ -191,7 +191,7 @@ def _encode(name: str, taken: set[str]) -> str:
     lossy = readable != base or len(readable) > MAX_TOOL_NAME
     if not lossy and readable not in taken:
         return readable
-    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()   # never raises, even on a lone surrogate
     # The suffix must stay shorter than MAX_TOOL_NAME (at most MAX - 2 hex digits plus "_"), or the slice below would
     # go negative and the name would exceed the limit Codex enforces.
     for n in range(8, min(len(digest), MAX_TOOL_NAME - 2) + 1):
