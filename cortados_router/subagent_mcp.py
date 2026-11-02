@@ -54,7 +54,7 @@ TOOL = {
 
 
 # Whole-task delegation: a separate headless Claude Code session on this machine (cortados_router/child_tasks.py).
-_MODES = ["auto", "acceptEdits", "default", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
+_MODES = ["auto", "acceptEdits", "manual", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
 CHILD_TOOLS = [
     {"name": "start_task",
      "description": ("Start a WHOLE task as a separate headless Claude Code session on this machine, routed through "
@@ -69,7 +69,7 @@ CHILD_TOOLS = [
                           "model such as fable, opus, sonnet, gpt-6.1-sol (pins the top loop; subagents still routed)."},
          "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default): a safety classifier "
                              "approves or denies each action; acceptEdits: edits in cwd allowed, other approval-needing "
-                             "tools denied; default: approval-needing tools denied; dontAsk: only pre-approved tools "
+                             "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
                     "acts in the user's real signed-in Chrome (each session gets its own tab group)."},
@@ -110,11 +110,23 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
     """Run one child-task tool. Errors come back as isError tool results; the provider token is scrubbed from every
     model-visible string (a child could echo it)."""
     token = (cfg.get("token") or "").strip()
-    scrub = (lambda s: s.replace(token, "***")) if len(token) >= MIN_TOKEN_LEN else (lambda s: s)
     try:
         ct = _child_module()
     except ImportError as exc:
         return _err(f"child tasks unavailable: cannot import cortados_router.child_tasks ({exc})")
+    # Scrub BOTH secrets: the env token (what route_task uses) and the token file's (what the child launcher uses);
+    # they can differ, and a child could echo the one it was given.
+    secrets_ = {token}
+    try:
+        secrets_.add(ct.session.read_token(cfg.get("token_file") or ct.session.DEFAULT_TOKEN_FILE))
+    except ct.session.SessionError:
+        pass                                    # no token file: nothing more to scrub (start_task reports it if needed)
+    secrets_ = sorted((t for t in secrets_ if len(t) >= MIN_TOKEN_LEN), key=len, reverse=True)
+
+    def scrub(s: str) -> str:
+        for t in secrets_:
+            s = s.replace(t, "***")
+        return s
     try:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",

@@ -17,16 +17,29 @@ from cortados_router import subagent_mcp as m
 
 FAKE = textwrap.dedent('''\
     #!{py}
-    import json, os, sys, time
+    import json, os, signal, subprocess, sys, time
     prompt = sys.stdin.read()
     mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
     with open(os.path.join(os.getcwd(), "fake-argv.json"), "w") as f:
         json.dump({{"argv": sys.argv[1:], "prompt": prompt, "nested": os.environ.get("CORTADOS_CHILD_TASK"),
                    "subagent": os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                    "claudecode": os.environ.get("CLAUDECODE"),
-                   "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS")}}, f)
+                   "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS"),
+                   "pythonpath": os.environ.get("PYTHONPATH")}}, f)
     if mode == "sleep":
         time.sleep(60)
+    if mode == "stubborn":
+        # ignores SIGTERM and leaves a grandchild that ignores it too: only a group SIGKILL stops them
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        g = subprocess.Popen([sys.executable, "-c",
+                              "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+        with open(os.path.join(os.getcwd(), "grandchild.pid"), "w") as f:
+            f.write(str(g.pid))
+        time.sleep(120)
+    if mode == "leak":
+        tok = open(os.environ["FAKE_LEAK_FILE"]).read().strip()
+        print(json.dumps({{"type": "result", "is_error": False, "result": "the token is " + tok}}))
+        sys.exit(0)
     if mode == "fail":
         sys.stderr.write("boom: something broke\\n")
         sys.exit(3)
@@ -54,9 +67,46 @@ def _events():
         return [json.loads(line) for line in f]
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_file(path, timeout=10):
+    end = time.time() + timeout
+    while not os.path.exists(path) and time.time() < end:
+        time.sleep(0.05)
+    return os.path.exists(path)
+
+
 def _load(path):
     with open(path) as f:
         return json.load(f)
+
+
+class InstalledClaudeTests(unittest.TestCase):
+    """The allowed modes must be choices of the installed claude (reads `claude --help` only; no session, no API call)."""
+
+    def test_permission_modes_are_claude_choices(self):
+        import re
+        import shutil
+        import subprocess
+        exe = shutil.which("claude")
+        if not exe:
+            self.skipTest("no claude on PATH")
+        try:
+            out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.skipTest(f"claude --help did not run: {exc}")
+        m_ = re.search(r"--permission-mode <mode>.*?\(choices:(.*?)\)", out, re.S)
+        if not m_:
+            self.skipTest("claude --help lists no --permission-mode choices")
+        choices = set(re.findall(r'"([A-Za-z]+)"', m_.group(1)))
+        self.assertTrue(set(ct.PERMISSION_MODES) <= choices, (ct.PERMISSION_MODES, choices))
+        self.assertIn("--permission-prompts", out)
 
 
 class ChildTaskTests(unittest.TestCase):
@@ -80,6 +130,9 @@ class ChildTaskTests(unittest.TestCase):
         self.env.start()
         os.environ.pop("CORTADOS_CHILD_TASK", None)
         self.addCleanup(self.env.stop)
+        g = mock.patch.object(ct, "KILL_GRACE_S", 1)
+        g.start()
+        self.addCleanup(g.stop)
         p = mock.patch.object(ct, "MANAGED_DIRS", (os.path.join(self.tmp, "no-managed"),))
         p.start()
         self.addCleanup(p.stop)
@@ -192,8 +245,12 @@ class ChildTaskTests(unittest.TestCase):
             os.mkdir(os.path.join(root, tid), 0o700)
         ct._write_json(os.path.join(root, old, "meta.json"), {"started_at": 1.0, "runner_pid": 0})
         ct._write_json(os.path.join(root, old, "result.json"), {"exit_code": 0, "ended_at": 2.0})
-        # a "running" old task: its runner pid is alive (this test process), so it is kept
+        # a "running" old task: something holds its runner lock (this test, standing in for a live runner): kept
         ct._write_json(os.path.join(root, live, "meta.json"), {"started_at": 1.0, "runner_pid": os.getpid()})
+        import fcntl
+        fd = os.open(os.path.join(root, live, "runner.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.start()
         names = os.listdir(root)
         self.assertNotIn(old, names)
@@ -259,6 +316,114 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(kinds.count("cancelled"), 6)
         self.assertEqual(kinds.count("started"), 6)
 
+    def test_permission_prompts_none_and_no_pythonpath_leak(self):
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        self.assertEqual(a[a.index("--permission-prompts") + 1], "none")
+        self.assertNotIn(str(ct.REPO_ROOT), seen["pythonpath"] or "")
+
+    def test_reused_pid_is_not_signalled(self):
+        # A task whose recorded runner pid now belongs to an unrelated live process (this test process) and whose
+        # lock nobody holds: not running, and cancel must refuse rather than signal that pid.
+        root = ct._private_root()
+        tid = "t20261102000000-0000abcd"
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": time.time() - 3600,
+                                                      "runner_pid": os.getpid()})
+        open(os.path.join(d, "runner.lock"), "w").close()
+        with open(os.path.join(d, "session-x.json"), "w") as f:
+            f.write("{}")
+        with mock.patch.object(ct.os, "kill") as kill, mock.patch.object(ct.os, "killpg") as killpg:
+            _, c = self.call("cancel_task", task_id=tid)
+            kill.assert_not_called()
+            killpg.assert_not_called()
+        self.assertFalse(c["cancelled"])
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        self.assertFalse(os.path.exists(os.path.join(d, "session-x.json")))
+
+    def test_cancel_refuses_live_lock_with_foreign_pid(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start()
+        d = ct.task_path(tid)
+        meta = _load(os.path.join(d, "meta.json"))
+        real = meta["runner_pid"]
+        meta["runner_pid"] = os.getpid()                       # lock held by the real runner, pid is someone else
+        ct._write_json(os.path.join(d, "meta.json"), meta)
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertFalse(c["cancelled"])
+        meta["runner_pid"] = real
+        ct._write_json(os.path.join(d, "meta.json"), meta)
+        _wait_file(os.path.join(self.work, "fake-argv.json"))
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertTrue(c["cancelled"])
+        self.call("wait_task", task_id=tid, timeout_s=30)
+
+    def test_cancel_kills_stubborn_child_and_grandchild(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stubborn"
+        tid = self.start()
+        gpath = os.path.join(self.work, "grandchild.pid")
+        self.assertTrue(_wait_file(gpath))
+        time.sleep(0.2)
+        with open(gpath) as f:
+            gpid = int(f.read())
+        _, c = self.call("cancel_task", task_id=tid)
+        self.assertTrue(c["cancelled"])
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "cancelled", w)
+        end = time.time() + 5
+        while _pid_alive(gpid) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(gpid), "grandchild survived the group SIGKILL")
+
+    def test_timeout_kills_group(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stubborn"
+        os.environ["CORTADOS_CHILD_MAX_S"] = "1"
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "failed")
+        self.assertTrue(w.get("timed_out"))
+        with open(os.path.join(self.work, "grandchild.pid")) as f:
+            gpid = int(f.read())
+        end = time.time() + 5
+        while _pid_alive(gpid) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(gpid))
+
+    def test_bad_max_s_names_the_variable(self):
+        os.environ["CORTADOS_CHILD_MAX_S"] = "soon"
+        r, _ = self.call("start_task", task="x", cwd=self.work)
+        self.assertIn("CORTADOS_CHILD_MAX_S", r["content"][0]["text"])
+        self.assertEqual(os.listdir(ct.tasks_dir()) if os.path.isdir(ct.tasks_dir()) else [], [])
+
+    def test_failed_start_leaves_no_dir(self):
+        with mock.patch.object(ct.session, "prepare", side_effect=ct.session.SessionError("nope")):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        self.assertTrue(r.get("isError"))
+        self.assertEqual([n for n in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(n)], [])
+
+    def test_metaless_old_dir_is_failed(self):
+        root = ct._private_root()
+        tid = "t20261102000000-0000beef"
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "running")             # fresh: start() may be mid-way
+        os.utime(d, (time.time() - 120, time.time() - 120))
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+
+    def test_token_file_token_is_scrubbed(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "leak"
+        os.environ["FAKE_LEAK_FILE"] = self.cfg["token_file"]
+        self.cfg["token"] = "env-token-different-0001"           # the env token differs from the file's
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertNotIn("tok-test-000000001", json.dumps(w))
+
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"
         tid = self.start()
@@ -283,7 +448,7 @@ class ChildTaskTests(unittest.TestCase):
         self.assertFalse(again["cancelled"])
 
     def test_bad_task_id(self):
-        for bad in ("../../etc", "t1", "", None, "t20261102000000-zzzzzzzz"):
+        for bad in ("../../etc", "t1", "", None, "t20261102000000-zzzzzzzz", "t20261102000000-0000000a\n"):
             r, _ = self.call("task_status", task_id=bad)
             self.assertTrue(r.get("isError"), bad)
         r, _ = self.call("cancel_task", task_id="t20261102000000-0000000a")
