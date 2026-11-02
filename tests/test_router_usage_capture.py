@@ -22,6 +22,19 @@ def codex_screen(left_pct):
 
 
 class Capture(unittest.TestCase):
+    def setUp(self):
+        # These tests are about the PTY capture, not about finding the CLI: pin discovery so they never read the host's
+        # PATH or /Applications (where a machine without Codex installed would raise "Codex CLI not found" instead).
+        self.real_codex_binary = scarcity._codex_binary
+        patcher = patch.object(scarcity, '_codex_binary', return_value=('codex', None))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def _real_discovery(self):
+        """Restore real discovery for the two tests that are about discovery, with no host bundles in the search."""
+        for p in (patch.object(scarcity, '_codex_binary', self.real_codex_binary),
+                  patch.object(scarcity, 'CODEX_APP_BUNDLES', ()), patch.object(scarcity, 'CODEX_APP_BINARIES', ())):
+            p.start(); self.addCleanup(p.stop)
+
     def test_startup_exit_retains_metadata_without_boot_text(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(scarcity, 'PROBE_DIR', Path(tmp)):
             diagnostic = {}
@@ -120,6 +133,7 @@ class Capture(unittest.TestCase):
 
     def test_codex_probe_survives_a_dead_configured_binary(self):
         # 2026-10-13: ChatGPT.app dropped Resources/codex while 13 profiles still pointed CORTADOS_CODEX_BIN at it.
+        self._real_discovery()
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / 'codex'
             fake.write_text('#!/bin/sh\n'); fake.chmod(0o755)
@@ -133,6 +147,7 @@ class Capture(unittest.TestCase):
                          'scarcity._codex: the fallback must stay visible in the reading')
 
     def test_codex_probe_keeps_a_working_configured_binary(self):
+        self._real_discovery()
         with patch.object(scarcity, '_cli_env', return_value={'CORTADOS_CODEX_BIN': sys.executable, 'PATH': ''}), \
              patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)) as call:
             result = scarcity._codex()

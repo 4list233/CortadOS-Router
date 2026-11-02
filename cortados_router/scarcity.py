@@ -445,41 +445,112 @@ def parse_codex_status(text: str, now: float | None = None) -> list[dict[str, An
     return wins
 
 
-# Where ChatGPT.app ships its Codex CLI, newest layout first. Until 2026-10 it was Resources/codex; since then it lives in
-# Resources/codex-cli/bin/codex (codex-package.json "entrypoint"). The Air has no `codex` on PATH, so the old single
-# default exec'd a missing file: the forked child exited 127 at once and every probe read "stage=boot, eof=True".
+# The app bundles that may ship a Codex CLI. Only the bundle roots are hardcoded: what lives inside them is read from
+# the bundle's own codex-package.json, so the next relocation inside Contents/Resources needs no code change here.
+CODEX_APP_BUNDLES = ("/Applications/ChatGPT.app", "~/Applications/ChatGPT.app", "/Applications/Codex.app")
+# Last resort only, for a bundle that ships no manifest. Until 2026-10 the CLI was Resources/codex; since then it lives in
+# Resources/codex-cli/bin/codex. The Air has no `codex` on PATH, so the old single default exec'd a missing file: the
+# forked child exited 127 at once and every probe read "stage=boot, eof=True".
 CODEX_APP_BINARIES = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
                       "/Applications/ChatGPT.app/Contents/Resources/codex")
 
 
-def _codex_binary(env: dict[str, str]) -> tuple[str | None, str | None]:
-    """The Codex CLI to run. Returns (binary or None, missing configured path or None): a set CORTADOS_CODEX_BIN that
-    exists wins; else `codex` on PATH; else the ChatGPT.app layouts. A dead configured path must not blind the probe."""
+def _is_exe(path: str | None) -> bool:
+    """An executable *file*. os.access(X_OK) alone is true for a directory named `codex`, which would then be forked."""
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _bundle_codex_candidates(bundles, note) -> list[str]:
+    """Codex binaries inside app bundles: each Contents/Resources/codex-package.json (or one directory below it) names
+    its CLI in "entrypoint", resolved against that manifest's own directory; then a bounded Resources/codex*/bin/codex
+    for a bundle that ships no manifest. Depth is bounded on purpose: an unbounded walk of a bundle is slow and would
+    happily find an unrelated `codex`. Every path considered and every unreadable manifest is recorded via note()."""
+    out: list[str] = []
+    for bundle in bundles:
+        res = Path(os.path.expanduser(bundle)) / "Contents" / "Resources"
+        try:
+            manifests = sorted(res.glob("codex-package.json")) + sorted(res.glob("*/codex-package.json"))
+            globbed = sorted(res.glob("codex*/bin/codex"))
+        except OSError as exc:          # an unreadable or disappearing bundle: skip it with a reason, never silently
+            note(f"{res}/ (unsearchable: {type(exc).__name__})")
+            continue
+        for manifest in manifests:
+            try:
+                entry = json.loads(manifest.read_text())
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                note(f"{manifest} (unreadable: {type(exc).__name__})")
+                continue
+            target = entry.get("entrypoint") if isinstance(entry, dict) else None
+            if not isinstance(target, str) or not target:
+                note(f'{manifest} (no "entrypoint")')
+                continue
+            out.append(os.path.normpath(os.path.join(str(manifest.parent), target)))
+        out.extend(str(p) for p in globbed)
+    return out
+
+
+def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None = None) -> tuple[str | None, str | None]:
+    """The Codex CLI to run, as (binary or None, missing configured path or None), appending everything considered to
+    `searched` so a failure can say where it looked.
+
+    Precedence: CORTADOS_CODEX_BIN > `codex` on PATH > an app bundle's codex-package.json "entrypoint" > a bounded
+    Resources/codex*/bin/codex glob > the legacy CODEX_APP_BINARIES tuple. PATH beats the bundle because an explicitly
+    installed CLI is the one the user maintains and upgrades, while the bundled copy moves whenever the app is rebuilt;
+    both read the same ~/.codex credentials and config, so the reading is the same either way. A dead configured path
+    must not blind the probe: it is reported, not obeyed."""
     import shutil
+    seen = searched if searched is not None else []
     configured = env.get("CORTADOS_CODEX_BIN")
-    if configured and os.access(configured, os.X_OK):
-        return configured, None
-    found = shutil.which("codex", path=env.get("PATH")) or next((b for b in CODEX_APP_BINARIES if os.access(b, os.X_OK)), None)
-    return found, configured
+    if configured:
+        if _is_exe(configured):
+            return configured, None
+        seen.append(f"CORTADOS_CODEX_BIN={configured} (not an executable file)")
+    on_path = shutil.which("codex", path=env.get("PATH"))
+    if _is_exe(on_path):
+        return on_path, configured
+    seen.append("`codex` on PATH")
+    cands = _bundle_codex_candidates(CODEX_APP_BUNDLES if bundles is None else bundles, seen.append)
+    for cand in cands + [b for b in CODEX_APP_BINARIES if b not in cands]:
+        if _is_exe(cand):
+            return cand, configured
+        seen.append(cand)
+    return None, configured
 
 
 def failure_kind(err: str) -> str:
     """A stable label for a failed reading (no counts, times or diagnostics), so the log line fires once per kind."""
-    msg = err.split(": ", 1)[-1]
+    head, _, rest = err.partition(": ")
+    msg = rest.strip() or head        # raise RuntimeError() with no message: label it by exception type, not "unknown"
     if msg.startswith("Codex /status empty"):
         m = re.search(r"stage=(\w+)", msg)
         b = re.search(r"boot_failure=(\w+)", msg)
         return "codex-status-empty:" + (m.group(1) if m else "?") + (f":{b.group(1)}" if b else "")
-    return re.sub(r"[^a-z0-9]+", "-", msg.split(":", 1)[0].lower()).strip("-")[:60] or "unknown"
+    # Drop digit runs before slugging: a version or a count in the first clause ("CLI v0.170.0", "3 nodes") would
+    # otherwise make a new kind of the same failure and re-log it on every attempt.
+    prefix = re.sub(r"\d+", "", msg.split(":", 1)[0].lower())
+    return re.sub(r"[^a-z0-9]+", "-", prefix).strip("-")[:60] or "unknown"
+
+
+def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) -> dict[str, Any]:
+    """One lane's failed try: keep the last good reading's values for diagnostics, stamp error + error_kind (which
+    makes the lane stale at once in the routing view), and log loudly once per kind rather than every attempt. Shared
+    by every sampler path so a failure looks the same, and is as visible, wherever it happened."""
+    old = old or {}
+    err = f"{type(exc).__name__}: {str(exc)[:200]}"
+    kind = failure_kind(err)
+    if kind != old.get("error_kind"):
+        print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
+    return {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
 
 
 def _codex() -> dict[str, Any]:
     env = _cli_env()
-    binary, missing_bin = _codex_binary(env)
+    searched: list[str] = []
+    binary, missing_bin = _codex_binary(env, searched=searched)
     if not binary:
-        # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen.
-        raise RuntimeError("Codex CLI not found: " + (f"CORTADOS_CODEX_BIN={missing_bin} is not executable; " if missing_bin else "")
-                           + "no `codex` on PATH and none of " + ", ".join(CODEX_APP_BINARIES))
+        # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen, and name
+        # every place looked so the next relocation is a one-line read of the error rather than a debugging session.
+        raise RuntimeError("Codex CLI not found: searched " + "; ".join(searched))
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -690,12 +761,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
                 rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
                 results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None, "error_kind": None}
             except Exception as exc:      # keep the last good reading, say so
-                old = lanes.get(lane) or {}
-                err = f"{type(exc).__name__}: {str(exc)[:200]}"
-                kind = failure_kind(err)
-                results[lane] = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
-                if kind != old.get("error_kind"):     # loud once per failure kind, not every 15-minute attempt
-                    print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
+                results[lane] = _failed_record(lane, lanes.get(lane), exc)
                 if lane == "claude":
                     try:
                         import traceback as _tb
@@ -777,7 +843,7 @@ def _sample_local_managed() -> dict[str, Any]:
             old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
         except Exception:
             old = {}
-        rec = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        rec = _failed_record("local", old, exc)      # same error_kind and once-per-kind log as the locked sampler
     rec["plan"] = _plans().get("local") or rec.get("plan")
     # No history line: the series feeds the unit-cost learner and the 24-hour change readout, both per window, and
     # local telemetry has no windows. A line a minute would only crowd the vendor samples out of the readout.
