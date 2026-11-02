@@ -47,6 +47,8 @@ TOOL = {
             "task": {"type": "string", "description": "The complete, self-contained subtask or question to delegate."},
             "context": {"type": "string", "description": "Optional extra input or background to include with the task."},
             "max_tokens": {"type": "integer", "description": f"Max tokens for the answer (default {DEFAULT_MAX_TOKENS})."},
+            "model": {"type": "string", "description": "Optional. Omitted or 'cortados': S1 routes the subtask. Otherwise "
+                      "a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*), sent as sub/<id> (no S1)."},
         },
         "required": ["task"],
     },
@@ -66,7 +68,8 @@ CHILD_TOOLS = [
          "task": {"type": "string", "description": "The complete, self-contained task prompt."},
          "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
-                          "model such as fable, opus, sonnet, gpt-6.1-sol (pins the top loop; subagents still routed)."},
+                          "model such as fable, opus, sonnet, gpt-6.1-sol: that pins the child's MAIN model; the "
+                          "child's subagents are still routed by S1."},
          "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default): a safety classifier "
                              "approves or denies each action; acceptEdits: edits in cwd allowed, other approval-needing "
                              "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
@@ -152,7 +155,7 @@ def _err(text: str) -> dict:
 
 
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
-               urlopen=urllib.request.urlopen) -> dict:
+               urlopen=urllib.request.urlopen, model=None) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
     provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
     # Never let the token reach model-visible text: every error below is scrubbed. A token too short to be a provider
@@ -172,12 +175,24 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                     "an embedded newline, no non-ASCII); fix it")
     if not (task and str(task).strip()):
         return _err("route_task requires a non-empty 'task'")
+    requested = "cortados"
+    if model not in (None, "", "cortados"):
+        # A pin: validated by the same function start_task's orchestrator uses (child_tasks.pin_model), so both tools
+        # accept exactly the same names. Only this path imports the package; plain route_task stays standalone.
+        try:
+            ct = _child_module()
+        except ImportError as exc:
+            return _err(f"route_task: model pins need cortados_router.child_tasks ({exc})")
+        try:
+            requested = ct.pin_model(model)
+        except ct.TaskError as exc:
+            return _err(f"route_task: {exc}")
     prompt = str(task) if not context else f"{task}\n\nContext:\n{context}"
     try:
         mx = int(max_tokens) if max_tokens else DEFAULT_MAX_TOKENS
     except (TypeError, ValueError):
         mx = DEFAULT_MAX_TOKENS
-    body = json.dumps({"model": "cortados", "max_tokens": mx,
+    body = json.dumps({"model": requested, "max_tokens": mx,
                        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]}).encode()
     req = urllib.request.Request(provider_url.rstrip("/") + "/v1/messages", data=body, method="POST",
                                  headers={"content-type": "application/json", "x-api-key": token})
@@ -215,7 +230,7 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     model = model if isinstance(model, str) and model else "?"    # a non-string would be repr'd past the scrub
     # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
     return {"content": [{"type": "text", "text": scrub(text) or "(the delegate returned no text)"}],
-            "_meta": {"cortados/routed_model": scrub(model)}}
+            "_meta": {"cortados/routed_model": scrub(model), "cortados/requested_model": requested}}
 
 
 def handle(msg: dict, cfg: dict) -> dict | None:
@@ -249,7 +264,8 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         if params.get("name") != "route_task":
             return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
-                                              a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS))}
+                                              a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS),
+                                              model=a.get("model"))}
     if method == "ping":
         return {**base, "result": {}}
     return {**base, "error": {"code": -32601, "message": f"method not found: {method}"}}

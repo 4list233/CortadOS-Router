@@ -3,6 +3,7 @@ No network — route_task takes a urlopen stand-in."""
 import io
 import json
 import unittest
+import unittest.mock
 
 from cortados_router import subagent_mcp as m
 
@@ -50,6 +51,45 @@ class RouteTaskTests(unittest.TestCase):
         self.assertEqual(seen["body"]["model"], "cortados")
         self.assertIn("task text", seen["body"]["messages"][0]["content"][0]["text"])
         self.assertIn("extra", seen["body"]["messages"][0]["content"][0]["text"])
+
+    def test_model_pin(self):
+        from cortados_router.provider import routing
+        seen = []
+
+        def _open(req, timeout=None):
+            seen.append(json.loads(req.data)["model"])
+            return FakeResp({"model": "claude-opus-backend", "content": [{"type": "text", "text": "ok"}]})
+        for given, want in ((None, "cortados"), ("cortados", "cortados"), ("opus", "sub/" + routing.SUB_ALIASES["opus"]),
+                            ("gpt-6.1-sol", "sub/gpt-6.1-sol"), ("sub/claude-x-1", "sub/claude-x-1")):
+            r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, model=given)
+            self.assertNotIn("isError", r, given)
+            self.assertEqual(seen[-1], want, given)
+            self.assertEqual(r["_meta"]["cortados/requested_model"], want)
+            self.assertEqual(r["_meta"]["cortados/routed_model"], "claude-opus-backend")
+        n = len(seen)
+        for bad in ("../etc", "has space", "x" * 90, 5):
+            r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, model=bad)
+            self.assertTrue(r.get("isError"), bad)
+        self.assertEqual(len(seen), n, "an invalid model is refused before any request")
+
+    def test_model_pin_via_tools_call_and_shared_validation(self):
+        from cortados_router import child_tasks as ct
+        real = m.route_task
+        seen = []
+
+        def spy(*a, **kw):                      # no network: the fake provider is passed explicitly
+            seen.append(kw.get("model"))
+            return real(*a, urlopen=ok_provider({"content": [{"type": "text", "text": "ok"}]}), model=kw.get("model"))
+        with unittest.mock.patch.object(m, "route_task", spy):
+            r = m.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                          "params": {"name": "route_task", "arguments": {"task": "t", "model": "fable"}}},
+                         {"url": "http://h:8432", "token": "secret-test-0001"})
+        self.assertNotIn("isError", r["result"])
+        self.assertEqual(seen, ["fable"])
+        self.assertEqual(r["result"]["_meta"]["cortados/requested_model"], ct.pin_model("fable"))
+        schema = [t for t in m.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {})["result"]["tools"]
+                  if t["name"] == "route_task"][0]["inputSchema"]["properties"]
+        self.assertIn("model", schema)
 
     def test_empty_task_is_an_error(self):
         self.assertTrue(m.route_task("http://x", "t-test-0001", "   ", urlopen=ok_provider({}))["isError"])

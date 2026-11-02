@@ -15,7 +15,7 @@ It works in three steps:
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
 - **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`) intercepts every Agent-tool subagent the session spawns and runs it as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. An optional **orchestrator mode** directs the main session to plan and delegate rather than do substantive work itself (guidance by default; `orchestratorEnforce` makes it a hard allowlist). Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
-- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
+- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?, model?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. `model` (optional) pins a model instead of S1: any name `start_task`'s `orchestrator` accepts (`fable`, `opus`, `claude-*`, `gpt-*`; one validation, `child_tasks.pin_model`), sent as `sub/<id>`; the result's `_meta` carries the requested and the routed model. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
 
 **Recommended setup:** pin the main session to a strong model with `claude --model sub/opus` against the provider, and let the routed-subagents mod send its workers through S1 (`model: cortados` in the mod config, the default). S1 only scores a conversation's first message and the route is then fixed for that conversation — good for a worker whose task is stated up front, not for an orchestrating session whose first message ("let's get started") is too thin to score well. Pinning the planner sidesteps that; routing the workers still gets each one the cheapest capable model.
 
@@ -307,7 +307,8 @@ server the user's Claude Code has. Only the result comes back; the calling orche
 Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?)` returns a `task_id` at once;
 `task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
 
-- `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`, ...).
+- `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
+  ...), which pins the child's MAIN model; the child's subagents are still routed by S1.
 - `permission_mode`: `auto` (default: a safety classifier approves or denies each action, so a child can run Bash and
   tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
   anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
