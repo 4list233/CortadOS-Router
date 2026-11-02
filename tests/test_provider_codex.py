@@ -1249,6 +1249,106 @@ class CodexSessionUnitTests(unittest.TestCase):
             stop.set()
             codex_bridge.CODEX_SETTLE_S = settle
 
+    def flood_session(self):
+        """A process-less session whose reader queue is pre-filled and kept non-empty by a producer thread; every event
+        carries a sequence number so loss or reordering shows. Replies are recorded, never written."""
+        s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
+        s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id = "unit", None, {}, {}, "t1"
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
+        s.route, s.last_used, s.dir = None, 0.0, Path(self.scratch)
+        s._ended.add("turn-0")
+        replies, seq, stop = [], [0], threading.Event()
+        s._reply = lambda rid, result=None, error=None, timeout=0: replies.append(rid)
+
+        def event(n):
+            if n % 50 == 7:                                     # a stale call of the ended turn, now and then
+                return ("request", {"method": "item/tool/call", "id": f"r{n}", "seq": n, "params": {
+                    "turnId": "turn-0", "callId": f"old-{n}", "tool": "Read", "arguments": {}}})
+            return ("notify", {"method": "item/agentMessage/delta", "seq": n, "params": {"delta": "x"}})
+
+        def put():
+            s._events.put(event(seq[0]))
+            seq[0] += 1
+        for _ in range(100000):
+            put()
+
+        def chatter():
+            while not stop.is_set():
+                put()
+        threading.Thread(target=chatter, daemon=True).start()
+
+        def left():
+            """Stop the producer; every event not yet consumed, backlog first, then the queue."""
+            stop.set()
+            time.sleep(0.05)
+            out = list(s._backlog)
+            while True:
+                try:
+                    out.append(s._events.get_nowait())
+                except queue.Empty:
+                    return out, seq[0]
+        return s, replies, left
+
+    def assert_all_kept_in_order(self, rest, produced, refused):
+        seqs = [m["seq"] for _, m in rest]
+        self.assertEqual(seqs, sorted(seqs))                    # FIFO kept
+        self.assertEqual(sorted(seqs + [int(r[1:]) for r in refused]), list(range(produced)))   # none lost, none twice
+
+    def test_deliver_keeps_its_deadline_under_a_notification_flood(self):
+        # Draining "until queue.Empty" never ends while the server streams; the drain is bounded by the queue length
+        # seen on entry and checks the deadline on every event. Expired before the drain finished, deliver cannot know
+        # whether a completion is queued, so it raises before writing any result; every event stays queued in order.
+        s, replies, left = self.flood_session()
+        s._pending, s.emitted = {"exec-1": 1}, {"exec-1"}
+        try:
+            t0 = time.time()
+            with self.assertRaisesRegex(BridgeError, "deadline passed while reading the queued events"):
+                s.deliver({"exec-1": {"content": [{"type": "text", "text": "r"}], "isError": False}}, timeout=0.02)
+            self.assertLess(time.time() - t0, 0.02 + 0.1)
+        finally:
+            rest, produced = left()
+        self.assertEqual(replies, [])
+        self.assertEqual(s._pending, {"exec-1": 1})             # still owed; nothing written to the cell
+        self.assert_all_kept_in_order(rest, produced, [])
+
+    def test_deliver_under_a_steady_stream_returns_after_the_events_queued_on_entry(self):
+        s, replies, left = self.flood_session()
+        while s._events.qsize() > 1000:                         # a short backlog, the producer still running
+            s._events.get_nowait()
+        s._backlog.clear()
+        try:
+            s._pending, s.emitted = {"exec-1": 1}, {"exec-1"}
+            t0 = time.time()
+            s.deliver({"exec-1": {"content": [{"type": "text", "text": "r"}], "isError": False}}, timeout=2.0)
+            self.assertLess(time.time() - t0, 0.5)              # not until the stream pauses
+        finally:
+            rest, _ = left()
+        self.assertEqual(replies, [1])                          # written once, to the live cell
+        seqs = [m["seq"] for _, m in rest]
+        self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))   # contiguous: nothing lost or reordered
+
+    def test_turn_start_servicing_keeps_its_deadline_under_a_notification_flood(self):
+        # _call(service=True) (turn/start) refuses stale calls while it waits; under a flood it must still give up at
+        # its deadline, refusing only stale calls and leaving everything else queued in order.
+        s, replies, left = self.flood_session()
+        s._next_id, s._replies, s._closed, s._exited, s._cv = 0, {}, False, None, threading.Condition()
+        s._write = lambda line, timeout: None
+        try:
+            with self.assertLogs(codex_bridge.logger, "WARNING"):   # the refusals log; keep them out of the run's output
+                t0 = time.time()
+                with self.assertRaisesRegex(BridgeError, "did not answer turn/start"):
+                    s._call("turn/start", {}, 0.05, service=True)
+                self.assertLess(time.time() - t0, 0.05 + 0.1)
+                t0 = time.time()
+                s._service_while_waiting(time.time() + 0.005)   # the helper alone, at the reproduced 5 ms
+                self.assertLess(time.time() - t0, 0.005 + 0.05)
+        finally:
+            rest, produced = left()
+        self.assertTrue(replies)                                # stale calls were refused while it waited
+        self.assertTrue(all(r.startswith("r") and int(r[1:]) % 50 == 7 for r in replies))
+        self.assert_all_kept_in_order(rest, produced, replies)
+
     def test_a_lone_surrogate_name_hashes_without_raising(self):
         # The wires refuse such names; the encoder must still never raise if one gets past them.
         aliases = codex_isolation.tool_aliases([{"name": "Re\ud800d"}, {"name": "Read"}])

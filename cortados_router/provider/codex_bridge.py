@@ -399,21 +399,45 @@ class CodexSession:
             raise BridgeError(f"codex app-server refused {method}: {err.get('message')} (code {err.get('code')})")
         return reply.get("result") or {}
 
-    def _service_while_waiting(self, deadline: float) -> None:
-        """Refuse item/tool/call requests of ended turns now, whether already in the backlog or still queued; every
-        other event keeps its order in the backlog."""
-        events, self._backlog = list(self._backlog), collections.deque()
-        while True:
+    def _drain_snapshot(self, deadline: float | None) -> bool:
+        """Move the events queued when this is called into the backlog, in order; False when the deadline passed
+        first. Bounded by the queue length seen on entry, not "until queue.Empty": a server that keeps streaming would
+        otherwise hold the session lock (and grow the backlog) for as long as it streams. Whatever is not moved stays
+        queued behind the backlog, so _next_event still sees every event once, in FIFO order."""
+        for _ in range(self._events.qsize()):
+            if deadline is not None and time.time() >= deadline:
+                return False
             try:
-                events.append(self._events.get_nowait())
+                self._backlog.append(self._events.get_nowait())
             except queue.Empty:
                 break
-        for kind, msg in events:
+        return True
+
+    def _service_while_waiting(self, deadline: float) -> None:
+        """Refuse item/tool/call requests of ended turns now, whether already in the backlog or queued on entry; every
+        other event keeps its order in the backlog. Each event is classified as it is taken, and only the events queued
+        on entry are taken (see _drain_snapshot). Best effort under the deadline: it only runs between polls for a
+        reply, so on expiry it stops cleanly and leaves the rest in order, the backlog's ahead of the queue's (_call
+        then reports its own timeout, and run_turn refuses any stale call it later meets); nothing here must complete."""
+        old, self._backlog = self._backlog, collections.deque()
+        snapshot = self._events.qsize()
+        while time.time() < deadline:
+            event = old.popleft() if old else None
+            if event is None:
+                if snapshot <= 0:
+                    break
+                snapshot -= 1
+                try:
+                    event = self._events.get_nowait()
+                except queue.Empty:
+                    break
+            kind, msg = event
             if (kind == "request" and msg.get("method") == "item/tool/call"
                     and (msg.get("params") or {}).get("turnId") in self._ended):
                 self._refuse_stale_call(msg, self._budget(deadline, "while refusing a stale tool call"))
             else:
-                self._backlog.append((kind, msg))
+                self._backlog.append(event)
+        self._backlog.extend(old)                       # not reached before the deadline: kept, in order
 
     # ------------------------------------------------------------------ client side
     def send_user(self, content: list[dict[str, Any]], timeout: float) -> None:
@@ -560,12 +584,15 @@ class CodexSession:
         Exactly-once for the results being delivered: the completion was emitted before this write could be, so the
         turn is over whether or not siblings came first, and every one of its calls is answered ENDED_AROUND by
         _end_turn; those results then go only as text in a follow-up turn/start, never also to the cell. With no
-        completion queued yet the results go to the live cells and nothing is classified early."""
-        while True:
-            try:
-                self._backlog.append(self._events.get_nowait())
-            except queue.Empty:
-                break
+        completion queued yet the results go to the live cells and nothing is classified early.
+
+        The drain covers the events queued on entry (a completion queued before this call is among them; one queued
+        later is the ordinary race _end_turn guards) and keeps the deadline. Unlike _service_while_waiting this must
+        complete: results written without having looked for a queued completion could reach an ended turn's cells. So
+        on expiry it raises the request-deadline BridgeError before any result is written, with every event not yet
+        classified kept in the backlog (or the queue) in order."""
+        if not self._drain_snapshot(deadline):
+            self._budget(deadline, "while reading the queued events before the tool results")
         if self._turn_id in self._ended:
             return
         events = list(self._backlog)
@@ -579,7 +606,10 @@ class CodexSession:
                        "follow-up turn, not to the turn's cell (%d earlier event(s) of the turn kept in order)",
                        self.id[:8], self._turn_id, boundary)
         self._backlog = collections.deque(events[boundary + 1:])
-        for kind, msg in events[:boundary + 1]:
+        for i, (kind, msg) in enumerate(events[:boundary + 1]):
+            if deadline is not None and time.time() >= deadline:
+                self._backlog.extendleft(reversed(events[i:boundary + 1]))   # unclassified, back in front, in order
+                self._budget(deadline, "while classifying the queued events before the tool results")
             self._handle_event(kind, msg, self._carried, deadline)
 
     def _end_turn(self, turn_id: str, deadline: float | None) -> None:
