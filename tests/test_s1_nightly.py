@@ -23,6 +23,7 @@ STUBS = {
     "label.py": (
         "import json, os, sys\n"
         "open('data/label-args', 'w').write(' '.join(sys.argv[1:]))\n"
+        "open('data/label-env', 'w').write(os.environ.get('CORTADOS_PROVIDER_URL', '<unset>'))\n"
         "p = 'data/labels.jsonl'\n"
         "have = sum(1 for _ in open(p)) if os.path.exists(p) else 0\n"
         "with open(p, 'a') as f:\n"
@@ -236,12 +237,36 @@ class NightlyEndToEnd(unittest.TestCase):
         ro.chmod(0o700)
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertEqual(rc, 0, log)
+        self.assertIn("pending promotion of runs/n1: re-evaluating", log)
         self.assertIn("PROMOTED (retry) runs/n1", log)
         self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertFalse((run2 / "adapter").exists(), "publishing the approved run needs no retraining")
         self.assertFalse((self.s1 / "data/pending-promotion").exists())
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertIn("skipped: no new labels", log)
+
+    def test_deferred_promotion_is_dropped_when_it_no_longer_promotes(self):
+        ro = self.tmp / "ro"; ro.mkdir(); pointer = ro / "current.json"
+        ro.chmod(0o500); self.addCleanup(ro.chmod, 0o700)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertIn("PROMOTION FAILED", log)
+        ro.chmod(0o700)
+        # same SFT data, but the holdout / incumbent changed: the re-evaluation no longer approves the run
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending runs/n1 no longer promotes", log)
+        self.assertFalse(pointer.exists(), "a stale approval must not be published")
+        self.assertFalse((self.s1 / "data/pending-promotion").exists())
+        self.assertFalse((run2 / "adapter").exists())
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertIn("skipped: no new labels", log)
+
+    def test_train_config_values_are_exported_and_not_logged(self):
+        (self.s1 / "data/train-config.env").write_text("# provider teacher\nCORTADOS_PROVIDER_URL=http://cfg.invalid:8432\n")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual((self.s1 / "data/label-env").read_text(), "http://cfg.invalid:8432")
+        self.assertIn("train-config sets: CORTADOS_PROVIDER_URL", log)
+        self.assertNotIn("cfg.invalid", log)
 
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
@@ -329,6 +354,50 @@ class EvaluatePointer(unittest.TestCase):
             self.assertEqual(ev.current_pointer(), S1 / "current.json")
         src = (S1 / "evaluate.py").read_text()
         self.assertNotIn('parent / "current.json").read_text()', src, "every incumbent read goes through current_pointer()")
+
+
+class EvaluateHoldoutGuards(unittest.TestCase):
+    def setUp(self):
+        import importlib.util, sys
+        sys.path.insert(0, str(S1))
+        spec = importlib.util.spec_from_file_location("s1_evaluate_guard", S1 / "evaluate.py")
+        self.ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.ev)
+        import common
+        self.common = common
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._data = common.DATA; common.DATA = self.tmp
+        self.addCleanup(setattr, common, "DATA", self._data)
+
+    def answers(self, steps=1):
+        return {"steps": steps, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0,
+                "outward": False, "work_kind": "conversation", "urgency": "now", "needs_clarification": False, "parts": 0, "diversity": False}
+
+    def test_partial_claude_backfill_leaves_too_small_a_holdout_to_promote(self):
+        reqs = {f"t{i}": {"id": f"t{i}", "split": "train", "unit_kind": "interactive", "request": "x"} for i in range(30)}
+        reqs.update({f"h{i}": {"id": f"h{i}", "split": "holdout", "unit_kind": "interactive", "request": "y"} for i in range(300)})
+        rows = [{"id": f"t{i}", "teacher": "claude-sonnet-5", "sample": 0, "answers": self.answers()} for i in range(30)]
+        rows += [{"id": f"h{i}", "teacher": "gpt-6.1-sol", "sample": 0, "answers": self.answers()} for i in range(300)]
+        rows += [{"id": f"h{i}", "teacher": "claude-opus-5", "sample": 0, "answers": self.answers()} for i in range(50)]  # quota-stopped backfill
+        (self.tmp / "labels.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        with mock.patch("sys.stderr"):
+            holdout, valid = self.ev.build_eval_sets(reqs, self.common.read_labels())
+        self.assertEqual(len(holdout), 50)
+        c = {"n": 50, "band_accuracy": 1.0, "under_routed": 0.0, "outward_recall": 1.0}
+        bar = {"band_accuracy": 1.0, "under_routed": 0.0, "outward_recall": 1.0}
+        self.assertEqual(self.ev.promote_decision(c, bar, None, None, False, holdout_rows=len(holdout)), (False, False))
+        self.assertEqual(self.ev.promote_decision(c, bar, None, None, False, holdout_rows=0)[0], False)   # zero rows: both "tie"
+        self.assertTrue(self.ev.promote_decision(c, bar, None, None, False, holdout_rows=self.ev.MIN_TEACHER_HOLDOUT)[0])
+
+    def test_cache_key_follows_the_teacher_labels_not_just_ids(self):
+        req = {"id": "h0", "split": "holdout", "unit_kind": "interactive", "request": "y"}
+        k1 = self.ev.holdout_key([(req, self.ev.teacher_view([self.answers(1)]))], 0.75, 0.25)
+        k2 = self.ev.holdout_key([(req, self.ev.teacher_view([self.answers(3)]))], 0.75, 0.25)   # same id, Codex sample removed
+        self.assertNotEqual(k1, k2)
+        self.assertNotEqual(k1, self.ev.holdout_key([(req, self.ev.teacher_view([self.answers(1)]))], 0.5, 0.25))
+        legacy = __import__("hashlib").sha1(("h0" + "|0.75|0.25").encode()).hexdigest()[:12]
+        self.assertNotEqual(k1, legacy, "a legacy id-only cache must miss")
+        src = (S1 / "evaluate.py").read_text()
+        self.assertNotIn('"|".join(sorted(r["id"] for r, _ in holdout))', src, "every teacher-bar cache uses holdout_key")
 
 
 class AtomicPointer(unittest.TestCase):

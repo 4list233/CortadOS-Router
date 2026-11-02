@@ -46,7 +46,9 @@ fi
 [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && { echo "nightly already running (pid $(cat "$PIDFILE"))"; exit 0; }
 echo $$ > "$PIDFILE"; rm -f "$STOPFLAG"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-[ -f data/train-config.env ] && . data/train-config.env
+# set -a: every assignment in the config is exported, so label.py / evaluate.py see CORTADOS_PROVIDER_URL and friends
+# (sourced without it they stayed shell-local and label.py exited 2, config error).
+if [ -f data/train-config.env ]; then set -a; . data/train-config.env; set +a; fi
 PY="${CORTADOS_S1_PY:-../.venv-mlx/bin/python}"
 LABEL_PY="${CORTADOS_S1_LABEL_PY:-python3}"
 TEACHER_ARGS="${CORTADOS_S1_TEACHER_ARGS:---workers 3}"   # label.py's own flags (--train-teacher, --holdout-teacher, --workers, --k, ...)
@@ -92,7 +94,8 @@ mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
 prune_unresumable_runs
-[ -f data/train-config.env ] && echo "train-config: $(grep -v '^#' data/train-config.env | tr '\n' ' ')"
+# names only: values can be an internal provider URL or a secret's path
+[ -f data/train-config.env ] && echo "train-config sets: $(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' data/train-config.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | tr '\n' ' ')"
 rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapters, reports) are untouched
   local old
   case "$LOG_KEEP" in ''|*[!0-9]*) echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14 ;; esac
@@ -110,6 +113,14 @@ gpu_share() {
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
 state() { python3 -B ./nightly_state.py "$@"; }
+evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
+  HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
+    $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
+}
+# The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
+# before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
+mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
+report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['promote'] else 1)" "$1/report.json"; }
 cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
 trap 'echo "stop requested"; touch "$STOPFLAG"; exit 130' TERM INT
@@ -182,10 +193,21 @@ fi
 # new data supersedes it (tonight trains a fresh candidate).
 if [ -f data/pending-promotion ]; then
   read -r p_hash p_run < data/pending-promotion
-  if [ "$p_hash" = "$sft_hash" ] && [ -f "$p_run/report.json" ]; then
+  if [ "$p_hash" = "$sft_hash" ] && [ -d "$p_run/adapter" ]; then
+    # The approval is from an earlier night: the holdout labels or the serving incumbent may have changed since. Re-grade
+    # against today's holdout and incumbent and publish only if the run still promotes.
+    echo "pending promotion of $p_run: re-evaluating against the current holdout and incumbent before publishing"
+    if ! evaluate_run "$p_run"; then
+      echo "re-evaluation of $p_run failed; publication retried next night"; state event "$STATUS" promotion_failure "$p_run (re-evaluation failed)"; exit 1
+    fi
+    if ! report_promotes "$p_run"; then
+      rm -f data/pending-promotion; mark_trained
+      state event "$STATUS" skip "pending $p_run no longer promotes"
+      echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
+      echo "=== $(date) nightly end"; exit 0
+    fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
-      rm -f data/pending-promotion; state event "$STATUS" promotion "$p_run (retried)";
-      echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels
+      rm -f data/pending-promotion; state event "$STATUS" promotion "$p_run (retried)"; mark_trained
       echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
     fi
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
@@ -287,13 +309,10 @@ while :; do
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
 gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
-HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --base "$BASE" --adapter "$RUN/adapter" --out "$RUN" --baseline || exit 1
+evaluate_run "$RUN" || exit 1
 echo "$labelled" > data/last-train-count
 state event "$STATUS" train "$RUN ($labelled labels)"
-# The no-new-data marker is committed only once tonight's outcome is final (published, or intentionally not promoted): saved
-# before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
-mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
-if python3 -c "import json,sys;sys.exit(0 if json.load(open('$RUN/report.json'))['promote'] else 1)"; then
+if report_promotes "$RUN"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
