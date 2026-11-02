@@ -176,7 +176,27 @@ def _parse_tools(tools: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _digest_blocks_of(content: Any) -> list[dict[str, Any]]:
+    """_blocks_of for the tombstone digest only (anthropic_wire._digest_blocks): content it refuses in an EARLIER item
+    is hashed as one opaque `_raw` block, so the digest never turns a conversation the endpoint served into a 400."""
+    try:
+        return _blocks_of(content)
+    except WireError:
+        return [{"type": "_raw", "raw": anthropic_wire.history_digest(content)}]
+
+
 def parse_request(body: dict[str, Any]) -> ClientTurn:
+    """The request as a ClientTurn, or WireError. The earlier-item digest walks client-nested content (json.dumps in
+    history_digest); a body nested close to json.loads' limit can exhaust a handler thread's stack, and a
+    RecursionError is not a WireError and would escape the handler, so it is answered as the request-shape error it is
+    (the same guard as anthropic_wire.parse_request)."""
+    try:
+        return _parse_request(body)
+    except RecursionError:
+        raise WireError("input content is nested too deeply") from None
+
+
+def _parse_request(body: dict[str, Any]) -> ClientTurn:
     if body.get("model") != MODEL_ID:
         # Codex checks the model the response echoes against the one it asked for; serving any other name would
         # fail on its side after the turn ran. Refuse first.
@@ -207,24 +227,41 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     # prompt, so it is passed as user text marked as the operator's, as the Messages wire does.
     start = max((i + 1 for i, (s, _) in enumerate(kept) if s == "assistant"), default=0)
     system_parts = [str(body["instructions"])] if body.get("instructions") else []
-    history, run = [], []
+    # `tokens`: the canonical conversation identity for the failed-session tombstone (anthropic_wire.conversation_digest
+    # documents the rule): user message content and function_call_output (call_id + canonical output) are in, as are
+    # the assistant reply fingerprints; `instructions`, developer/system items (Codex regenerates its base prompt,
+    # environment context and skills block), Codex's injected user context blocks and reasoning items (skipped by
+    # _classify: encrypted, client-optional) are out.
+    history, run, tokens = [], [], []
+
+    def end_run():
+        if run:
+            history.append(reply_fingerprint(run))
+            tokens.append(["a", history[-1]])
+            run.clear()
+
     for s, it in kept[:start]:
         if s == "system":
             system_parts += [b["text"] for b in _blocks_of(it.get("content")) if b["type"] == "text" and b["text"]]
-            if run:
-                # A developer item after a reply was served as its own turn (operator text, below), so the reply it
-                # follows ended there: without this boundary the two replies around it would merge into one
-                # fingerprint and a conversation this endpoint served would come back as a 409.
-                history.append(reply_fingerprint(run))
-                run = []
+            # A developer item after a reply was served as its own turn (operator text, below), so the reply it
+            # follows ended there: without this boundary the two replies around it would merge into one
+            # fingerprint and a conversation this endpoint served would come back as a 409.
+            end_run()
         elif s == "assistant":
             run += _blocks_of(it.get("content")) if it.get("type", "message") == "message" else [_tool_use_block(it)]
         else:
-            if run:
-                history.append(reply_fingerprint(run))
-                run = []
-    if run:
-        history.append(reply_fingerprint(run))
+            end_run()
+            if it.get("type") == "function_call_output":
+                output = it.get("output")
+                tokens.append(["r", str(it.get("call_id")), False, anthropic_wire.canonical_parts(
+                    _digest_blocks_of(output) if isinstance(output, (str, list)) else [])])
+            else:
+                # Codex's own context blocks (CODEX_INJECTED_PREFIXES: AGENTS.md, environment_context) are the
+                # client's, regenerated each turn (cwd, date, shell), so they are out of the identity as well.
+                tokens += anthropic_wire.canonical_parts(
+                    [b for b in _digest_blocks_of(it.get("content"))
+                     if not (b["type"] == "text" and b["text"].lstrip().startswith(CODEX_INJECTED_PREFIXES))])
+    end_run()
     content, results = [], {}
     for s, it in kept[start:]:
         if s == "system":
@@ -248,7 +285,8 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     if not content and not results:
         raise WireError("the new turn carries no user content and no tool outputs")
     return ClientTurn(system="\n\n".join(system_parts), tools=_parse_tools(body.get("tools")), content=content,
-                      tool_results=results, history=history, stream=stream, model=MODEL_ID)
+                      tool_results=results, history=history, stream=stream, model=MODEL_ID,
+                      prefix_digest=anthropic_wire.history_digest(tokens))
 
 
 def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, Any]]:
@@ -380,11 +418,19 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
                  response=_response(msg_id or new_message_id(), model, "completed", items, _usage_json(usage)))
 
 
-def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID, sequence: int = 1) -> bytes:
-    """response.failed; Codex shows response.error.message."""
+# The response.failed code of a failure retrying cannot fix. Codex retries a response.failed stream error, except
+# for the codes it maps to a fatal error; `invalid_prompt` is the one of those that means "this request will not be
+# served" (the others claim a context-window or quota problem, which would mislead). A Codex build that does not know
+# it falls back to its ordinary, bounded stream retry, and every retry gets the same answer.
+TERMINAL_CODE = "invalid_prompt"
+
+
+def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID, sequence: int = 1,
+              terminal: bool = False) -> bytes:
+    """response.failed; Codex shows response.error.message. `terminal`: the non-retried code (TERMINAL_CODE)."""
     return _event("response.failed", sequence,
                   response=_response(msg_id or new_message_id(), model, "failed", [], None,
-                                     error={"code": "server_error", "message": message}))
+                                     error={"code": TERMINAL_CODE if terminal else "server_error", "message": message}))
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:

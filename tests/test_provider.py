@@ -92,6 +92,77 @@ class WireTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t"], {"content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}], "isError": True})
 
 
+class ConversationDigestRobustnessTests(unittest.TestCase):
+    """The tombstone digest reads earlier messages the wire never used to parse; it must not refuse or crash on them."""
+
+    def test_malformed_earlier_user_content_is_still_served(self):
+        def turn(content):
+            return wire.parse_request({"messages": [
+                {"role": "user", "content": content}, {"role": "assistant", "content": "a"},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": content}]},
+                {"role": "assistant", "content": "b"}, {"role": "user", "content": "next"}]})
+        clean = turn("hi")
+        digests = {turn(bad).prefix_digest for bad in (None, 42, {"x": 1})}
+        self.assertEqual(len(digests), 3)
+        self.assertNotIn(clean.prefix_digest, digests)
+        self.assertEqual(turn(42).history, clean.history)
+        with self.assertRaises(wire.WireError):                 # the new turn itself is still checked
+            wire.parse_request({"messages": [{"role": "user", "content": 42}]})
+
+    def nested(self, depth, leaf="x"):
+        content: object = leaf
+        for i in range(depth):
+            content = [{"type": "tool_result", "tool_use_id": f"t{i}", "content": content}]
+        return content
+
+    def test_reminder_stripping_is_linear_and_matches_the_span_rule(self):
+        import random, re, time
+        # Quadratic before (a regex rescanning to the end for each unclosed opening): 32 000 unclosed openings in
+        # ~750 KB took 55 s. The scan must stay fast and keep the old rule's result.
+        poisoned = ("<system-reminder> " + "y" * 6) * 32000
+        t0 = time.time()
+        wire.conversation_digest([{"role": "user", "content": poisoned}])
+        self.assertLess(time.time() - t0, 2.0)
+        old = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+        parts = ["<system-reminder>", "</system-reminder>", "<system-", "reminder>", " ", "\n", "a", "b"]
+        rng = random.Random(7)
+        for _ in range(5000):
+            text = "".join(rng.choice(parts) for _ in range(rng.randint(0, 12)))
+            self.assertEqual(wire.canonical_text(text), " ".join(old.sub(" ", text).split()), text)
+
+    def test_deep_nesting_never_raises_recursion_error(self):
+        # The deepest tool_result nesting json.loads accepts here (about 490 levels, ~980 JSON levels): the deepest
+        # body the server can ever hand to parse_request. Built as text, since json.dumps has the same limit.
+        def text(depth):
+            head = "".join('[{"type": "tool_result", "tool_use_id": "t", "content": ' for _ in range(depth))
+            return ('{"messages": [{"role": "user", "content": ' + head + '"x"' + "}]" * depth + '}, '
+                    '{"role": "assistant", "content": "a"}, {"role": "user", "content": "next"}]}')
+        depth, body = 495, None
+        while body is None:
+            try:
+                body = json.loads(text(depth))
+            except RecursionError:
+                depth -= 5
+        self.assertGreater(depth, 400)
+
+        def from_deeper_stack(frames, b):           # a handler thread calls parse_request below its own frames
+            return from_deeper_stack(frames - 1, b) if frames else wire.parse_request(b)
+
+        for b, frames in ((body, 0), ({"messages": body["messages"][:1]}, 0), (body, 300)):
+            try:
+                from_deeper_stack(frames, b)
+            except wire.WireError:
+                pass
+            except RecursionError:
+                self.fail("parse_request raised RecursionError")
+
+    def test_content_past_the_depth_limit_still_changes_the_digest(self):
+        deep = wire.DIGEST_MAX_DEPTH + 5
+        a = wire.conversation_digest([{"role": "user", "content": self.nested(deep, "x")}])
+        b = wire.conversation_digest([{"role": "user", "content": self.nested(deep, "y")}])
+        self.assertNotEqual(a, b)
+
+
 class EndpointHarness(unittest.TestCase):
     """The provider endpoint over the fake CLI: setUp/tearDown and request helpers only, no tests (so a subclass
     reuses the harness without re-running inherited tests)."""
@@ -113,16 +184,19 @@ class EndpointHarness(unittest.TestCase):
             self.reg.drop(s)
         os.environ.pop("FAKE_CLAUDE_ARGV", None)
 
-    def post(self, body, token=TOKEN, path="/v1/messages"):
+    HEADERS: dict = {}                       # sent on every request of the helpers below (a subclass sets them)
+
+    def post(self, body, token=TOKEN, path="/v1/messages", headers=None):
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST",
-                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}",
+                                              **self.HEADERS, **(headers or {})})
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode()
             return json.loads(raw) if r.headers.get("content-type") == "application/json" else raw
 
-    def status_of(self, body, token=TOKEN):
+    def status_of(self, body, token=TOKEN, headers=None):
         try:
-            self.post(body, token=token)
+            self.post(body, token=token, headers=headers)
             return 200
         except urllib.error.HTTPError as e:
             return e.code
@@ -573,6 +647,424 @@ class RunRecordTests(RoutedHarness):
         self.assertIsNotNone(runs.summary("run-00010"))
         self.assertIsNone(runs.summary("run-00011"))
         self.assertIsNone(runs.summary("run-00012"))
+
+
+class FailedSessionTombstoneTests(EndpointHarness):
+    """A conversation dropped because its backend failed answers the next request on it (a retry of the failed request,
+    or a new message on the same history) with a terminal error naming the failure's category, not the 409 of a
+    conversation this endpoint never held; the tombstone belongs to that conversation and client only. Requests carry
+    Claude Code's X-Claude-Code-Session-Id (the conversation identity a tombstone needs) unless a test says otherwise."""
+
+    SID = "55fdfd5e-174a-4af2-acab-f4bc918051ab"
+    HEADERS = {"X-Claude-Code-Session-Id": SID}
+
+    def failed_conversation(self, first="hi", headers=None):
+        """Open a conversation, fail its second turn in the backend, and return the failed request's body."""
+        history = [{"role": "user", "content": first}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "backend failure"}]
+        body = {"tools": [READ_TOOL], "messages": history}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body, headers=headers), 502)
+        self.assertEqual(self.reg.sessions, {})                        # the failed conversation was dropped
+        return body
+
+    def send(self, body, headers=None):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **self.HEADERS, **(headers or {})})
+        return urllib.request.urlopen(req, timeout=30)
+
+    def lose_a_reply(self, headers):
+        """Conversation B: opens with "hi" (A's prefix, A's reply), advances its live session one turn, then retries as
+        a client that lost that turn's response would: the history no longer matches B's live session."""
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "next step"}]
+        retry = {"tools": [READ_TOOL], "messages": history}
+        self.post(retry, headers=headers)                              # B's session advances; the reply is "lost"
+        self.assertEqual(len(self.reg.sessions), 1)                    # B is healthy and live
+        return retry
+
+    def test_without_an_identity_an_independent_conversation_never_gets_another_ones_failure(self):
+        # The round-3 reproduction: A fails after "hi -> OK"; independent B (same prefix, same UA, no identity)
+        # advances, loses a response and retries. B must get the ordinary 409, never A's terminal failure.
+        none = {"X-Claude-Code-Session-Id": ""}
+        server._unkeyed_logged = False
+        with mock.patch.object(server.logger, "info") as info:
+            body = self.failed_conversation(headers=none)
+        lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
+        self.assertEqual(len(self.reg.tombstones), 0)                  # no identity: nothing published
+        self.assertEqual(self.error_of(body, none)[0], 409)            # A's own retry: the ordinary 409 too
+        code, err, _ = self.error_of(self.lose_a_reply(none), none)
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+
+    def test_the_missing_identity_is_logged_once_per_process(self):
+        none = {"X-Claude-Code-Session-Id": ""}
+        server._unkeyed_logged = False
+        with mock.patch.object(server.logger, "info") as info:
+            self.failed_conversation(headers=none)
+            self.failed_conversation("hello", headers=none)
+        lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
+
+    def test_identity_values_are_never_logged(self):
+        with mock.patch.object(server.logger, "info") as info:          # INFO: the level the brief forbids
+            body = self.failed_conversation()
+            self.error_of(body)
+        logged = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertTrue(logged)
+        self.assertFalse([line for line in logged if self.SID in line])
+
+    def test_distinct_identities_never_share_a_tombstone(self):
+        self.failed_conversation(headers={"X-Claude-Code-Session-Id": "session-a"})
+        b = {"X-Claude-Code-Session-Id": "session-b"}
+        code, err, _ = self.error_of(self.lose_a_reply(b), b)
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+
+    def test_a_sibling_sharing_the_session_id_retrying_a_lost_reply_gets_the_409_not_the_failure(self):
+        # Round-4 reproduction: Claude Code's main loop and subagents share one session id. Sibling A fails after
+        # "hi -> OK" (tombstone); sibling B, same id, UA and history, advances, loses that response and retries its
+        # previous history. B's live session strictly extends it: B gets the ordinary 409, never A's terminal error.
+        body = self.failed_conversation()
+        self.assertEqual(len(self.reg.tombstones), 1)
+        code, err, _ = self.error_of(self.lose_a_reply(self.HEADERS))
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+        self.assertEqual(len(self.reg.sessions), 1)                    # B is untouched and still live
+        self.assertEqual(self.error_of(body)[0], 409)                  # A's retry is indistinguishable from B's
+
+    def test_a_live_extension_under_another_identity_never_hides_the_failure(self):
+        # Control: the live session that extends the history belongs to another session id; A's retry keeps its
+        # terminal error.
+        body = self.failed_conversation()
+        self.lose_a_reply({"X-Claude-Code-Session-Id": "session-b"})
+        code, err, _ = self.error_of(body)
+        self.assertEqual(code, 400)
+        self.assertIn("failed at", err["error"]["message"])
+
+    def test_the_same_identity_and_history_gets_the_terminal_error(self):
+        body = self.failed_conversation()
+        self.assertEqual(len(self.reg.tombstones), 1)
+        code, err, _ = self.error_of(body)
+        self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("failed at", err["error"]["message"])
+        self.assertEqual(self.error_of(body, {"X-Claude-Code-Session-Id": ""})[0], 409)   # identity dropped: no match
+
+    def test_a_run_id_alone_is_an_identity(self):
+        run = {"X-Claude-Code-Session-Id": "", server.RUN_ID_HEADER: "run-00077"}
+        body = self.failed_conversation(headers=run)
+        self.assertEqual(self.error_of(body, run)[0], 400)
+
+    def error_of(self, body, headers=None):
+        try:
+            self.send(body, headers).close()
+            self.fail("expected an HTTP error")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read()), e.headers
+
+    def test_a_retry_of_the_failed_request_gets_a_terminal_error_not_a_409(self):
+        body = self.failed_conversation()
+        for _ in range(2):                                              # every retry, not only the first
+            code, err, headers = self.error_of(body)
+            # 400 invalid_request_error + x-should-retry: false: Claude Code / the SDK retry api_error and 5xx.
+            self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+            self.assertEqual(headers.get("x-should-retry"), "false")
+            msg = err["error"]["message"]
+            self.assertIn("backend_reported_error: the Claude backend reported an error (API status 400)", msg)
+            self.assertNotIn("cache TTL ordering", msg)                # backend text is never replayed
+            self.assertRegex(msg, r"^cortados: conversation [0-9a-f]{8} failed at \d\d:\d\d:\d\d .*start a new conversation$")
+            self.assertNotIn("no longer holds", msg)
+        self.assertEqual(self.reg.sessions, {})                        # a tombstone never restarts a backend
+
+    def test_a_new_message_on_the_failed_history_also_gets_the_terminal_error(self):
+        body = self.failed_conversation()
+        follow = dict(body, messages=body["messages"] + [{"role": "user", "content": "are you there?"}])
+        self.assertEqual(self.error_of(follow)[0], 400)
+
+    def test_a_streaming_retry_gets_a_terminal_sse_error(self):
+        body = self.failed_conversation()
+        raw = self.post(dict(body, stream=True))
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events], ["message_start", "error"])
+        self.assertEqual(events[-1]["error"]["type"], "invalid_request_error")
+        self.assertIn("backend_reported_error", events[-1]["error"]["message"])
+
+    def test_another_conversation_with_the_same_reply_never_gets_the_tombstone(self):
+        body = self.failed_conversation()
+        # Same assistant reply (same fingerprints), different earlier user message: another conversation.
+        other = dict(body, messages=[{"role": "user", "content": "a different question"}] + body["messages"][1:])
+        code, err, _ = self.error_of(other)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+
+    def test_client_churn_in_the_history_still_finds_the_tombstone(self):
+        # What a client re-renders between a request and its retry is not the conversation's identity: the system
+        # prompt, earlier <system-reminder> spans, thinking blocks, cache markers, mid-conversation system messages
+        # and whitespace. Each transformation alone must still meet the terminal error, never a retryable 409.
+        def first(reminder):
+            return [{"type": "text", "text": f"<system-reminder>\n{reminder}\n</system-reminder>"},
+                    {"type": "text", "text": "hi"}]
+        thinking = {"type": "thinking", "thinking": "let me see", "signature": "sig-1"}
+        body = self.failed_conversation(first("todo list: empty"))
+
+        def variant(edit):
+            msgs = json.loads(json.dumps(body["messages"]))
+            edit(msgs)
+            return dict(body, messages=msgs)
+
+        variants = {
+            "reminder changed": variant(lambda m: m[0].update(content=first("todo list: 3 items, date 2026-11-03"))),
+            "reminder removed": variant(lambda m: m[0].update(content=[{"type": "text", "text": "hi"}])),
+            "system changed": dict(body, system=[{"type": "text", "text": "a regenerated system prompt",
+                                                  "cache_control": {"type": "ephemeral"}}]),
+            "thinking added": variant(lambda m: m[1].update(content=[thinking] + m[1]["content"])),
+            "redacted thinking added": variant(lambda m: m[1].update(
+                content=[{"type": "redacted_thinking", "data": "opaque"}] + m[1]["content"])),
+            "cache_control changed": variant(lambda m: m[0]["content"][1].update(cache_control={"type": "ephemeral",
+                                                                                                "ttl": "1h"})),
+            "system message inserted": variant(lambda m: m.insert(1, {"role": "system", "content": "env: changed"})),
+            "whitespace changed": variant(lambda m: m[0]["content"][1].update(text="  hi \n")),
+        }
+        for name, retry in variants.items():
+            with self.subTest(name):
+                code, err, _ = self.error_of(retry)
+                self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+                self.assertIn("backend_reported_error", err["error"]["message"])
+
+    def test_thinking_removed_on_the_retry_still_finds_the_tombstone(self):
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        with_thinking = [{"type": "thinking", "thinking": "hmm", "signature": "s"}] + r1["content"]
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": with_thinking},
+                                                              {"role": "user", "content": "backend failure"}]}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
+        retry = dict(body, messages=history + [{"role": "assistant", "content": r1["content"]},
+                                               {"role": "user", "content": "backend failure"}])
+        self.assertEqual(self.error_of(retry)[0], 400)
+
+    def test_conversations_differing_only_in_real_user_text_do_not_collide(self):
+        body = self.failed_conversation([{"type": "text", "text": "<system-reminder>r</system-reminder>"},
+                                         {"type": "text", "text": "hi"}])
+        other = json.loads(json.dumps(body))
+        other["messages"][0]["content"][1]["text"] = "hi there"       # same reminder and reply, other user text
+        code, err, _ = self.error_of(other)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+
+    def test_a_busy_timeout_never_closes_or_tombstones_the_owners_session(self):
+        # Deterministic overlap: request A owns the session lock; request B (same history) times out waiting for it.
+        # B's timeout is request-local: a retryable 529 overloaded_error, the session stays live and unclosed, no
+        # tombstone. When A's backend then really fails, A's own diagnostic is the one recorded, not backend_timeout.
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r1["content"]},
+                                                              {"role": "user", "content": "overlap"}]}
+        in_turn, release = threading.Event(), threading.Event()
+        closes, real_close = [], s.close
+
+        def send_user(content, timeout):
+            in_turn.set()
+            self.assertTrue(release.wait(30))
+            raise BridgeError("the headless CLI exited with code 9; see /secret/dir")
+
+        def close():
+            closes.append(time.time())
+            real_close()
+        s.send_user, s.close = send_user, close
+        results = {}
+
+        def call(name):
+            results[name] = self.error_of(body)
+
+        with mock.patch.object(server, "TURN_TIMEOUT_S", 0.5), self.assertLogs("cortados.provider", "WARNING"):
+            a = threading.Thread(target=call, args=("a",))
+            a.start()
+            self.assertTrue(in_turn.wait(10))
+            call("b")                                                   # waits 0.5 s for A's lock, then gives up
+            self.assertEqual(results["b"][0], server.BUSY_STATUS)
+            self.assertEqual(results["b"][1]["error"]["type"], "overloaded_error")
+            self.assertIn("conversation busy", results["b"][1]["error"]["message"])
+            self.assertNotEqual(results["b"][2].get("x-should-retry"), "false")
+            self.assertIs(self.reg.get(s.id), s)                       # the owner's session survives B's timeout
+            self.assertEqual((closes, len(self.reg.tombstones)), ([], 0))
+            release.set()
+            a.join(10)
+        self.assertEqual(results["a"][0], 502)                         # A's real failure
+        self.assertEqual((self.reg.sessions, len(closes)), ({}, 1))
+        code, err, _ = self.error_of(body)                             # the retry sees A's diagnostic
+        self.assertEqual(code, 400)
+        self.assertIn("backend_exited", err["error"]["message"])
+        self.assertNotIn("backend_timeout", err["error"]["message"])
+
+    def test_another_client_or_run_with_the_same_history_never_gets_the_tombstone(self):
+        body = self.failed_conversation()
+        self.assertEqual(self.error_of(body)[0], 400)                  # the default client (Python-urllib)
+        self.assertEqual(self.error_of(body, {"user-agent": "claude-cli/2.1.0 (external, cli)"})[0], 409)
+        self.assertEqual(self.error_of(body, {server.RUN_ID_HEADER: "run-00042"})[0], 409)
+
+    def test_a_genuinely_unknown_history_is_still_a_409(self):
+        self.failed_conversation()
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"},
+                                                   {"role": "assistant", "content": "an answer from elsewhere"},
+                                                   {"role": "user", "content": "go on"}]}
+        code, err, _ = self.error_of(body)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+
+    def test_the_tombstone_expires_after_its_ttl(self):
+        body = self.failed_conversation()
+        later = time.time() + server.TOMBSTONE_TTL_S + 1
+        with mock.patch.object(server.time, "time", return_value=later):
+            self.assertEqual(self.error_of(body)[0], 409)
+        self.assertEqual(self.reg.tombstones, {})                      # pruned, not only ignored
+
+    def test_the_store_keeps_only_the_newest_entries(self):
+        class Dead:
+            def __init__(self, i):
+                self.id = f"{i:08x}-dead"
+            def close(self):
+                pass
+        with mock.patch.object(server, "TOMBSTONE_MAX", 3):
+            for i in range(5):
+                self.reg.fail(Dead(i), BridgeError("boom"), f"key-{i}")
+        self.assertEqual(list(self.reg.tombstones), ["key-2", "key-3", "key-4"])
+        self.reg.fail(Dead(9), BridgeError("boom"), None)              # an opening request: no tombstone
+        self.assertEqual(len(self.reg.tombstones), 3)
+
+    def test_the_replayed_reason_never_carries_tool_arguments_or_backend_text(self):
+        secret = "sk-live-SECRET123 /Users/someone/private.txt"
+        cases = {
+            "codex app-server sent a malformed item/tool/call: "
+            + json.dumps({"arguments": {"command": f"cat {secret}"}})[:300]: "backend_protocol_error",
+            f"the headless CLI reported an error: API Error: 400 {secret}": "backend_reported_error",
+            f"the Codex turn failed: {secret} (usageLimitExceeded)": "codex_turn_failed",
+            f"the Codex turn failed: boom ({secret})": "codex_turn_failed",
+            f"codex app-server refused client tool {secret}: {secret}": "backend_protocol_error",
+            f"the headless CLI exited with code 1; see {secret}": "backend_exited",
+            f"something nobody anticipated: {secret} {TOKEN}": "backend_error",
+        }
+        for text, kind in cases.items():
+            diag = server.failure_diagnostic(BridgeError(text))
+            self.assertTrue(diag.startswith(kind + ": "), (text, diag))
+            for leak in ("SECRET", "private", "someone", TOKEN, "cat "):
+                self.assertNotIn(leak, diag)
+        self.assertTrue(server.failure_diagnostic(BridgeError("the Codex turn failed: x (usageLimitExceeded)"))
+                        .endswith("(usageLimitExceeded)"))           # an allowlisted enum value is kept
+
+    def test_every_bridge_error_template_has_a_category(self):
+        # Drift guard: a new or reworded BridgeError in either bridge must land in a named category, not the generic
+        # backend_error. f-string placeholders are rendered as "1" (a count, a code, seconds, a status).
+        import ast
+
+        def render(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                return "".join(v.value if isinstance(v, ast.Constant) else "1" for v in node.values)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left, right = render(node.left), render(node.right)
+                return None if left is None or right is None else left + right
+            return None
+
+        provider_dir = Path(server.__file__).parent
+        seen = 0
+        for name in ("bridge.py", "codex_bridge.py"):
+            for node in ast.walk(ast.parse((provider_dir / name).read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "BridgeError" and node.args:
+                    text = render(node.args[0])
+                    self.assertIsNotNone(text, f"{name}:{node.lineno}: BridgeError message is not a literal template")
+                    diag = server.failure_diagnostic(BridgeError(text))
+                    self.assertFalse(diag.startswith("backend_error:"), f"{name}:{node.lineno}: {text!r} -> {diag}")
+                    seen += 1
+        self.assertGreater(seen, 30)
+
+    def test_an_unknown_codex_turn_status_keeps_its_detail(self):
+        diag = server.failure_diagnostic(BridgeError("the Codex turn cancelledByServer: quota (usageLimitExceeded)"))
+        self.assertEqual(diag, "codex_turn_failed: the Codex backend failed the turn (usageLimitExceeded)")
+        self.assertTrue(server.failure_diagnostic(BridgeError("the Codex turn completed with 1 tool call(s) unanswered"))
+                        .startswith("tool_result_mismatch: "))
+
+    def test_an_uncategorised_failure_is_logged_without_its_text(self):
+        with self.assertLogs("cortados.provider", level="INFO") as logs:
+            diag = server.failure_diagnostic(BridgeError("something new: sk-SECRET"))
+        self.assertEqual(diag, "backend_error: the backend failed")
+        self.assertIn("add a pattern to _FAILURE_CATEGORIES", logs.output[0])
+        self.assertNotIn("SECRET", "".join(logs.output))
+
+    def test_an_idle_closed_conversation_leaves_no_tombstone(self):
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        s.last_used = time.time() - 10_000
+        self.reg.reap(1)
+        self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
+        follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
+        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": follow}), 409)
+
+    def test_a_request_waiting_on_a_failing_turn_never_reaches_the_dead_backend(self):
+        # Deterministic overlap: request A holds the session lock and its backend fails; request B (a retry with the
+        # same history) found the session before A failed and waits for the lock. The session must be out of the
+        # registry and the tombstone in place at the same instant, before B gets the lock; B is then told the
+        # failure, terminally, and never drives the closed backend.
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r1["content"]},
+                                                              {"role": "user", "content": "overlap"}]}
+        in_turn, release = threading.Event(), threading.Event()
+        seen, b_waiting, sends = [], threading.Event(), []
+        real_acquire = s.lock.acquire
+
+        def send_user(content, timeout):
+            sends.append(content)
+            if len(sends) == 1:
+                in_turn.set()
+                release.wait(10)
+                with self.reg._lock:                                    # what any other request could observe now
+                    seen.append((s.id in self.reg.sessions, len(self.reg.tombstones)))
+                raise BridgeError("the headless CLI exited with code 9; see /secret/dir")
+            raise AssertionError("a request reached the failed backend")
+
+        class Lock:                                                     # signals when B starts waiting for the lock
+            def acquire(self_, timeout=-1):
+                if in_turn.is_set():
+                    b_waiting.set()
+                return real_acquire(timeout=timeout)
+            def release(self_):
+                s.lock_real.release()
+            def locked(self_):
+                return s.lock_real.locked()
+        s.lock_real, s.send_user = s.lock, send_user
+        s.lock = Lock()
+        results = {}
+
+        def call(name):
+            results[name] = self.error_of(body)
+
+        a = threading.Thread(target=call, args=("a",))
+        with self.assertLogs("cortados.provider", "WARNING"):
+            a.start()
+            self.assertTrue(in_turn.wait(10))
+            b = threading.Thread(target=call, args=("b",))
+            b.start()
+            self.assertTrue(b_waiting.wait(10))
+            release.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(seen, [(True, 0)])                           # while A's turn ran: live, no tombstone
+        self.assertEqual(len(sends), 1)                                # B never sent anything to the backend
+        self.assertEqual(results["a"][0], 502)                         # A gets its own failure
+        code, err, _ = results["b"]
+        self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("backend_exited", err["error"]["message"])
+        self.assertNotIn("secret", err["error"]["message"])
+        self.assertEqual((self.reg.sessions, len(self.reg.tombstones)), ({}, 1))
 
 
 class StartFailureTests(unittest.TestCase):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -27,6 +28,9 @@ class ClientTurn:
     history: list[str] = field(default_factory=list)   # reply_fingerprint of every earlier assistant message
     stream: bool = False
     model: str = MODEL_ID
+    # Canonical digest of the conversation before its new turn (conversation_digest): what the user and the tools
+    # said, plus the assistant fingerprints. It names the conversation itself, where `history` only proves the replies.
+    prefix_digest: str = ""
 
 
 def _system_text(system: Any) -> str:
@@ -85,6 +89,105 @@ def reply_fingerprint(blocks: Any) -> str:
     return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
 
 
+# Client-injected transient text inside user content. Claude Code wraps its reminders (todo state, file-change notes,
+# hook output) in <system-reminder> and re-renders earlier ones from turn to turn, so they say nothing about which
+# conversation a request belongs to. An unclosed tag is left alone (it is user text).
+_OPEN, _CLOSE = "<system-reminder>", "</system-reminder>"
+
+
+def canonical_text(text: Any) -> str:
+    """User or tool text with client-injected reminder spans removed and whitespace collapsed, so re-rendered
+    wrappers and spacing do not change a conversation's identity. Scanned with str.find, not a regex:
+    `<system-reminder>.*?</system-reminder>` rescans to the end of the string for every opening tag without a closing
+    one, which is quadratic in a client-sized tool result (a 368 KB body cost 4.7 s, paid again on every later turn).
+    An unclosed opening ends the scan: no later opening can have a closing tag after it either."""
+    s, out, i = str(text), [], 0
+    while True:
+        a = s.find(_OPEN, i)
+        if a < 0:
+            break
+        b = s.find(_CLOSE, a)
+        if b < 0:
+            break
+        out.append(s[i:a])
+        i = b + len(_CLOSE)
+    out.append(s[i:])
+    return " ".join(" ".join(out).split())
+
+
+# How deep canonical_parts follows tool_result content nested inside tool_result content. Real clients nest one level
+# (a tool_result holding text and images); 64 is far past any real shape. Past it the block is hashed whole
+# (history_digest) instead of recursed into, so the digest still covers every byte while its recursion stays bounded:
+# each level costs several Python frames, and a body json.loads accepted could otherwise raise RecursionError, which
+# is not a WireError and would escape the request handler.
+DIGEST_MAX_DEPTH = 64
+
+
+def _digest_blocks(content: Any) -> list[dict[str, Any]]:
+    """_blocks for the conversation digest only. Earlier messages were already served (or are the client's own
+    business), so content _blocks refuses (null, a number, an object) is hashed as one opaque `_raw` block instead of
+    turning a conversation the endpoint used to serve into a 400. The new turn still goes through _blocks."""
+    try:
+        return _blocks(content)
+    except WireError:
+        return [{"type": "_raw", "raw": history_digest(content)}]
+
+
+def canonical_parts(blocks: list[dict[str, Any]], depth: int = 0) -> list[list[Any]]:
+    """Anthropic-shaped user blocks as conversation_digest tokens. Kept: text (canonical_text, empty dropped), images
+    (by a hash of their source), tool_result ids with their canonical content and error flag, any other block as
+    its JSON (cache metadata already removed by _blocks). Dropped: thinking / redacted_thinking (signatures and
+    summaries the client may add or strip). A tool_result nested past DIGEST_MAX_DEPTH is hashed whole."""
+    out: list[list[Any]] = []
+    for b in blocks:
+        kind = b.get("type")
+        if kind == "text":
+            t = canonical_text(b.get("text", ""))
+            if t:
+                out.append(["t", t])
+        elif kind == "tool_result" and depth >= DIGEST_MAX_DEPTH:
+            out.append(["o", history_digest(b)])
+        elif kind == "tool_result":
+            out.append(["r", str(b.get("tool_use_id")), bool(b.get("is_error")),
+                        canonical_parts(_digest_blocks(b.get("content") if b.get("content") is not None else ""),
+                                        depth + 1)])
+        elif kind == "image":
+            out.append(["i", history_digest(b.get("source"))])
+        elif kind in ("thinking", "redacted_thinking"):
+            continue
+        else:
+            out.append(["o", history_digest(b)])
+    return out
+
+
+def conversation_digest(messages: list[dict[str, Any]]) -> str:
+    """The canonical identity of a conversation's history (the messages before the new turn), for the failed-session
+    tombstone key (server.Registry.failure_key). It must survive what a client re-renders between a request and its
+    retry, and still tell two conversations apart:
+    - user content: in, as canonical_parts (real user text and tool results are the conversation). Message
+      boundaries are not: a client may merge or split consecutive user messages.
+    - assistant messages: in, as reply_fingerprint (text + tool_use ids, which already omits thinking blocks).
+    - mid-conversation `system` messages and the top-level system prompt: out. Both are operator text the client
+      regenerates (date, git status, environment), so a retry would miss its tombstone; separation between clients
+      comes from the user content, the User-Agent and the run id (failure_key).
+    - cache_control: out (_blocks strips it; it moves every turn).
+    - content _blocks would refuse: hashed opaque (_digest_blocks), never a 400 for an earlier message."""
+    tokens: list[list[Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            tokens.append(["a", reply_fingerprint(m.get("content"))])
+        elif role == "user":
+            tokens += canonical_parts(_digest_blocks(m.get("content")))
+    return history_digest(tokens)
+
+
+def history_digest(*parts: Any) -> str:
+    """A stable digest of a request's conversation so far. Canonical JSON (sorted keys, ASCII escapes, so a lone
+    surrogate hashes too); the same request re-sent gives the same digest, any other content another."""
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
+
+
 def check_tool_name(name: str, what: str = "tool name") -> str:
     """`name` if it is a valid Unicode scalar string. JSON can carry a lone surrogate ("\\ud800"), which Python decodes
     into a str that cannot be encoded as UTF-8 and so cannot be hashed, logged or sent to a backend: refused here, at
@@ -99,6 +202,17 @@ def check_tool_name(name: str, what: str = "tool name") -> str:
 
 
 def parse_request(body: dict[str, Any]) -> ClientTurn:
+    """The request as a ClientTurn, or WireError. DIGEST_MAX_DEPTH bounds the digest's own recursion; the remaining
+    recursive steps (without_cache_control, json.dumps of a block) follow the client's nesting, and a body nested
+    close to json.loads' limit, arriving on a handler thread's deeper stack, can still exhaust it. A RecursionError
+    is not a WireError and would escape the handler, so it is answered as the request-shape error it is."""
+    try:
+        return _parse_request(body)
+    except RecursionError:
+        raise WireError("message content is nested too deeply") from None
+
+
+def _parse_request(body: dict[str, Any]) -> ClientTurn:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise WireError("messages must be a non-empty list")
@@ -142,7 +256,8 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools if t.get("name")],
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
-                      stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID))
+                      stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
+                      prefix_digest=conversation_digest(messages[:start]))
 
 
 def transcript_text(messages: list[dict[str, Any]]) -> str:
