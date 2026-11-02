@@ -54,7 +54,7 @@ TOOL = {
 
 
 # Whole-task delegation: a separate headless Claude Code session on this machine (cortados_router/child_tasks.py).
-_MODES = ["acceptEdits", "default", "plan"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
+_MODES = ["auto", "acceptEdits", "default", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
 CHILD_TOOLS = [
     {"name": "start_task",
      "description": ("Start a WHOLE task as a separate headless Claude Code session on this machine, routed through "
@@ -67,9 +67,12 @@ CHILD_TOOLS = [
          "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
                           "model such as fable, opus, sonnet, gpt-6.1-sol (pins the top loop; subagents still routed)."},
-         "permission_mode": {"type": "string", "enum": _MODES, "description": "acceptEdits (default): edits in cwd "
-                             "allowed, other approval-needing tools denied; default: approval-needing tools denied; "
-                             "plan: read-only. bypassPermissions is deliberately not offered."},
+         "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default): a safety classifier "
+                             "approves or denies each action; acceptEdits: edits in cwd allowed, other approval-needing "
+                             "tools denied; default: approval-needing tools denied; dontAsk: only pre-approved tools "
+                             "run; plan: read-only. bypassPermissions is deliberately not offered."},
+         "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
+                    "acts in the user's real signed-in Chrome. Only one chrome task may run at a time."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
                            "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
          "required": ["task", "cwd"]}},
@@ -116,11 +119,12 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
-                           cfg.get("url", ""), cfg.get("token_file"))
+                           cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False))
         elif name == "task_status":
-            out = ct.status(a.get("task_id"), scrub)
+            out = ct.status(a.get("task_id"), scrub, cfg.get("url", ""), token)
         elif name == "wait_task":
-            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), scrub)
+            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), scrub, provider_url=cfg.get("url", ""),
+                          token=token)
         elif name == "list_tasks":
             out = {"tasks": ct.list_recent(a.get("limit", 20))}
         else:

@@ -30,23 +30,38 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from cortados_router import session
+from cortados_router import paths, session
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
-TASK_ID_RE = re.compile(r"^t\d{14}-[0-9a-f]{8}$")      # strict: the id becomes a path component, so no traversal
-# Permission modes a child may run in. acceptEdits (default): file edits in cwd go through, other tool calls that need
-# approval are denied (nobody is there to approve). default: every approval-needing call is denied (read-mostly).
-# plan: read-only planning. bypassPermissions is NOT offered: an unattended session with unreviewed shell access and the
-# user's full MCP set is too much blast radius to enable by a tool argument; widen with `allowed_tools` instead.
-PERMISSION_MODES = ("acceptEdits", "default", "plan")
-DEFAULT_PERMISSION_MODE = "acceptEdits"
+# Strict: the id becomes a path component (no traversal), and it is the child's x-cortados-run-id, so it must also
+# match the provider's run-id pattern [A-Za-z0-9_-]{8,64} (it does: 24 chars of digits, hex and one '-').
+TASK_ID_RE = re.compile(r"^t\d{14}-[0-9a-f]{8}$")
+EVENT_LOG = "child-tasks.jsonl"     # under the router's state dir (paths.state_dir()): one line per lifecycle event
+RUN_FETCH_TIMEOUT_S = 10            # the run record is a small in-memory lookup; do not hold task_status hostage
+_urlopen = urllib.request.urlopen   # tests replace this
+# Permission modes a child may run in (claude 2.1.316 `--permission-mode`). Nobody is there to answer a prompt, so:
+#   auto (default): a safety classifier approves or denies each action, so an unattended child can run Bash/tests
+#                   without a blanket bypass;
+#   acceptEdits:    file edits in cwd go through, other approval-needing calls are denied;
+#   default:        every approval-needing call is denied (read-mostly);
+#   dontAsk:        anything not pre-approved by permission rules (or `allowed_tools`) is denied without asking;
+#   plan:           read-only planning.
+# bypassPermissions is NOT offered: an unattended session with unreviewed shell access and the user's full MCP set is
+# too much blast radius to enable by a tool argument; widen with `allowed_tools` instead.
+PERMISSION_MODES = ("auto", "acceptEdits", "default", "plan", "dontAsk")
+DEFAULT_PERMISSION_MODE = "auto"
+# claude.ai connectors are disabled in token-auth sessions (the child authenticates to the provider with a token), so
+# the servers behind the user's connectors are loaded directly from this MCP config file when it exists.
+CONNECTORS_CONFIG = "~/.config/cortados/connectors.mcp.json"
+PRUNE_AGE_S = 14 * 24 * 3600        # finished task dirs (logs, prompts) accumulate; drop them after two weeks
 MAX_TASK_CHARS = 200_000            # a prompt beyond this is a document dump, not a task; refuse rather than truncate
 MAX_ALLOWED_TOOLS = 64              # an allowlist longer than this is not a reviewed allowlist
 MAX_TOOL_PATTERN = 200
-MAX_RUNNING = int(os.environ.get("CORTADOS_CHILD_MAX_RUNNING", "4"))   # each child spends subscription quota
 CHILD_MAX_S = int(os.environ.get("CORTADOS_CHILD_MAX_S", str(3 * 3600)))  # an unattended child that never ends burns quota
 RESULT_CHARS = 20_000               # result text returned through MCP; MCP clients choke on huge tool results
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
@@ -141,31 +156,113 @@ def _new_id() -> str:
     return "t" + time.strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(4)
 
 
-def _running_count(root: str) -> int:
-    n = 0
+def connectors_config() -> str:
+    return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
+
+
+def prune(root: str, now: float | None = None) -> list:
+    """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids."""
+    cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
+    removed = []
     for name in os.listdir(root):
-        if TASK_ID_RE.match(name) and _state(os.path.join(root, name))[0] == "running":
-            n += 1
-    return n
+        d = os.path.join(root, name)
+        if not TASK_ID_RE.match(name) or os.path.islink(d) or not os.path.isdir(d):
+            continue
+        state, meta, _ = _state(d)
+        started = meta.get("started_at")
+        if not isinstance(started, (int, float)):
+            started = os.path.getmtime(d)
+        if state != "running" and started < cutoff:
+            shutil.rmtree(d)
+            removed.append(name)
+    return removed
+
+
+def _remove_settings(d: str) -> list:
+    """Delete the launcher's token-bearing settings file(s) in a task dir; returns the names removed."""
+    gone = []
+    for name in os.listdir(d):
+        if name.startswith("session-") and name.endswith(".json"):
+            try:
+                os.unlink(os.path.join(d, name))
+                gone.append(name)
+            except FileNotFoundError:
+                pass
+    return gone
+
+
+def log_event(event: str, **fields):
+    """Append one JSON line to $CORTADOS_HOME/child-tasks.jsonl. Only ids, settings, status and timings: never the prompt
+    or a secret. Returns None, or the error text (the caller records it; a log failure must not kill a task)."""
+    rec = {"ts": round(time.time(), 3), "event": event, **fields}
+    try:
+        d = paths.state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(d / EVENT_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")   # one short write per line: O_APPEND keeps lines whole
+    except OSError as exc:
+        return f"could not append to the child-task event log: {type(exc).__name__}: {exc}"
+    return None
+
+
+def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
+    """The provider's record of this run (GET /v1/cortados/runs/<id>): models and lanes it routed to. Failures come back
+    as {"error": ...}, never raised; the token never appears in the text."""
+    scrub = (lambda s: s.replace(token, "***")) if token else (lambda s: s)
+    if not (provider_url and token):
+        return {"error": "provider URL or token not configured"}
+    req = urllib.request.Request(provider_url.rstrip("/") + "/v1/cortados/runs/" + run_id, method="GET",
+                                 headers={"x-api-key": token})
+    try:
+        with _urlopen(req, timeout=RUN_FETCH_TIMEOUT_S) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return {"error": f"provider returned HTTP {exc.code}" + (" (no routed request recorded under this run id)"
+                                                                 if exc.code == 404 else "")}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"error": scrub(f"could not reach the provider ({type(exc).__name__}: {exc})")[:300]}
+    if not isinstance(data, dict):
+        return {"error": f"unexpected run record ({type(data).__name__})"}
+    return {k: data[k] for k in ("model", "label", "provider", "models", "builder_models") if k in data}
+
+
+def _running(root: str) -> list:
+    """meta of every running task."""
+    out = []
+    for name in os.listdir(root):
+        if TASK_ID_RE.match(name):
+            state, meta, _ = _state(os.path.join(root, name))
+            if state == "running":
+                out.append(meta)
+    return out
 
 
 def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION_MODE, allowed_tools=None,
-          provider_url="", token_file=None) -> dict:
+          provider_url="", token_file=None, chrome=False) -> dict:
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    if not isinstance(chrome, bool):
+        raise TaskError("chrome must be true or false")
     if not provider_url:
         raise TaskError("start_task is not configured: set CORTADOS_PROVIDER_URL for the cortados-route MCP server")
     exe = claude_bin()
     root = _private_root()
-    if _running_count(root) >= MAX_RUNNING:
-        raise TaskError(f"{MAX_RUNNING} child tasks are already running (CORTADOS_CHILD_MAX_RUNNING); wait for or cancel one")
+    prune(root)
+    # No cap on parallel children: capacity is the router's job (S1 and the quota gates refuse or redirect a spent lane).
+    running = _running(root)
+    busy = [m.get("task_id") for m in running if m.get("chrome")]
+    if chrome and busy:
+        # Browser steps drive the user's real signed-in Chrome; two children steering it at once would trample each
+        # other's tabs and act on each other's pages.
+        raise TaskError(f"child task {busy[0]} is already driving Chrome; only one chrome task may run at a time")
     task_id = _new_id()
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
-    launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d]
+    launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
         launch += ["--token-file", token_file]
     if orchestrator == "cortados":
@@ -175,6 +272,15 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     extra = ["-p", "--output-format", "json", "--permission-mode", permission_mode]
     if tools:
         extra += ["--allowedTools", ",".join(tools)]
+    if chrome:
+        extra.append("--chrome")    # opt-in per task: the child acts in the user's real, signed-in Chrome
+    conn = connectors_config()
+    conn_note = None
+    if os.path.isfile(conn):
+        extra += ["--mcp-config", conn]
+    else:
+        # Not an error: the child still gets the user's Claude Code MCP servers, just not the connector ones.
+        conn_note = f"connectors MCP config {conn} not found; the child runs without connector servers\n"
     base = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     try:
         _args, env, cmd = session.prepare(launch + ["--"] + extra, base, MANAGED_DIRS)
@@ -184,29 +290,41 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     cmd[0] = exe
     env[NESTED_ENV] = "1"
     env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    if conn_note:
+        with open(os.path.join(d, "runner.log"), "a", encoding="utf-8") as f:
+            f.write(conn_note)
     with open(os.open(os.path.join(d, "prompt.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
               encoding="utf-8") as f:
         f.write(task)
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": task.strip()[:200],
-            "started_at": time.time(),
+            "started_at": time.time(), "connectors_config": conn if not conn_note else None,
+            "chrome": chrome,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:]}
-    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": CHILD_MAX_S})
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": CHILD_MAX_S,
+                                                    # for the runner's "finished" event (meta.json may not exist yet)
+                                                    "event": _event_fields(meta), "started_at": meta["started_at"]})
     try:
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", "-m", "cortados_router.child_tasks", "--run", d],
                                       cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                       stderr=rlog, start_new_session=True)
     except OSError as exc:
+        meta["settings_removed"] = _remove_settings(d)
         _write_json(os.path.join(d, "meta.json"), meta)
         _write_json(os.path.join(d, "result.json"), {"exit_code": None, "ended_at": time.time(),
                                                      "error": f"could not start the runner: {type(exc).__name__}"})
         raise TaskError(f"could not start the child runner ({type(exc).__name__}: {exc})") from None
     _REAP[task_id] = runner
     meta["runner_pid"] = runner.pid
+    meta["event_log_error"] = log_event("started", **_event_fields(meta))
     _write_json(os.path.join(d, "meta.json"), meta)
     return {"task_id": task_id, "state": "running", "dir": d}
+
+
+def _event_fields(meta: dict) -> dict:
+    return {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
 
 
 _REAP: dict = {}    # Popen handles of runners this server started: polled so an exited runner is reaped, not a zombie
@@ -236,7 +354,14 @@ def _state(d: str):
             return "running", meta, None
         if not meta:
             return "running", meta, None        # start() is between mkdir and writing meta.json
-        return "failed", meta, {"error": "the runner exited without recording a result (killed or crashed); see runner.log"}
+        # The runner died without writing result.json, so it never removed the token-bearing settings file either.
+        removed = _remove_settings(d)
+        if os.path.exists(os.path.join(d, "cancelled")):
+            # cancel_task signalled it before it had installed its SIGTERM handler (it was still starting up)
+            return "cancelled", meta, {"cancelled": True, "settings_removed": removed,
+                                       "error": "cancelled while the runner was starting; no child output"}
+        return "failed", meta, {"error": "the runner exited without recording a result (killed or crashed); see runner.log",
+                                "settings_removed": removed}
     if res.get("cancelled"):
         return "cancelled", meta, res
     out = res.get("output") or {}
@@ -256,7 +381,7 @@ def _tail(path: str, n: int) -> str:
         return ""
 
 
-def status(task_id, scrub=lambda s: s) -> dict:
+def status(task_id, scrub=lambda s: s, provider_url="", token="") -> dict:
     d = task_path(task_id)
     state, meta, res = _state(d)
     started = meta.get("started_at") or os.path.getmtime(d)
@@ -270,6 +395,7 @@ def status(task_id, scrub=lambda s: s) -> dict:
         out["exit_code"] = res.get("exit_code")
         if res.get("timed_out"):
             out["timed_out"] = True
+        out["settings_removed"] = bool(res.get("settings_removed"))
         if o:
             text = o.get("result")
             text = text if isinstance(text, str) else ""
@@ -286,12 +412,14 @@ def status(task_id, scrub=lambda s: s) -> dict:
             out["output_error"] = res["output_error"]
         if res.get("error"):
             out["error"] = res["error"]
+        # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
+        out["router_run"] = fetch_run(provider_url, token, task_id)
         if state != "succeeded":
             out["stderr_tail"] = scrub(_tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS))
     return out
 
 
-def wait(task_id, timeout_s=WAIT_MAX_S, scrub=lambda s: s, poll_s=0.5) -> dict:
+def wait(task_id, timeout_s=WAIT_MAX_S, scrub=lambda s: s, poll_s=0.5, provider_url="", token="") -> dict:
     try:
         t = float(timeout_s)
     except (TypeError, ValueError):
@@ -303,7 +431,7 @@ def wait(task_id, timeout_s=WAIT_MAX_S, scrub=lambda s: s, poll_s=0.5) -> dict:
     end = time.monotonic() + t
     while _state(d)[0] == "running" and time.monotonic() < end:
         time.sleep(poll_s)
-    return status(task_id, scrub)
+    return status(task_id, scrub, provider_url, token)
 
 
 def list_recent(n=20) -> list:
@@ -338,7 +466,11 @@ def cancel(task_id) -> dict:
         return {"task_id": task_id, "state": "failed", "cancelled": False, "reason": "runner is not running"}
     open(os.path.join(d, "cancelled"), "w").close()
     os.killpg(pid, signal.SIGTERM)              # this task's process group only: the runner and its claude child
-    return {"task_id": task_id, "state": "cancelling", "cancelled": True}
+    err = log_event("cancelled", **_event_fields(meta))
+    out = {"task_id": task_id, "state": "cancelling", "cancelled": True}
+    if err:
+        out["event_log_error"] = err
+    return out
 
 
 # --- runner (detached child process) -------------------------------------------------------------------------------
@@ -369,6 +501,10 @@ def _run(d: str) -> int:
                     result["exit_code"] = proc.wait()
     except OSError as exc:
         result["error"] = f"could not start the child: {type(exc).__name__}: {exc}"
+    finally:
+        # The settings file holds the provider token; once the child has exited (normally, cancelled or timed out)
+        # nothing needs it, so it does not stay at rest. (A SIGKILLed runner cannot do this; prune() removes the dir.)
+        result["settings_removed"] = _remove_settings(d)
     result["cancelled"] = os.path.exists(os.path.join(d, "cancelled"))
     raw = ""
     try:
@@ -383,6 +519,14 @@ def _run(d: str) -> int:
         except ValueError:
             result["output_error"] = "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
     result["ended_at"] = time.time()
+    out = result.get("output") or {}
+    final = ("cancelled" if result["cancelled"] else
+             "succeeded" if result["exit_code"] == 0 and not out.get("is_error") else "failed")
+    started = spec.get("started_at")
+    result["event_log_error"] = log_event(
+        "finished", **(spec.get("event") or {}), status=final, exit_code=result["exit_code"],
+        timed_out=bool(result.get("timed_out")),
+        duration_s=round(result["ended_at"] - started, 1) if isinstance(started, (int, float)) else None)
     _write_json(os.path.join(d, "result.json"), result)
     return 0
 

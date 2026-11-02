@@ -307,12 +307,28 @@ server the user's Claude Code has. Only the result comes back; the calling orche
 Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?)` returns a `task_id` at once;
 `task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
 `orchestrator` is `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`, ...).
-`permission_mode` is one of `acceptEdits` (default), `default`, `plan`; `bypassPermissions` is deliberately not offered
-for unattended runs, so widen with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. State lives in
-`~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). Limits: 4 running children
-(`CORTADOS_CHILD_MAX_RUNNING`), 3 h per child (`CORTADOS_CHILD_MAX_S`), and a child cannot start children. The token is
+`permission_mode` is one of `auto` (default: a safety classifier approves or denies each action, so a child can run
+Bash and tests unattended), `acceptEdits`, `default`, `dontAsk`, `plan`; `bypassPermissions` is deliberately not offered
+for unattended runs, so widen with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. claude.ai connectors are
+disabled in token-auth sessions, so if `~/.config/cortados/connectors.mcp.json` exists (or the file named by
+`CORTADOS_CONNECTORS_MCP_CONFIG`) the child gets it as `--mcp-config`, loading those servers directly; without it the
+child runs without connector servers (noted in `runner.log`). State lives in `~/.config/cortados/tasks/<task_id>/`
+(0700; logs, `result.json`); the token-bearing settings file is deleted when the child exits, and finished task dirs
+older than 14 days are pruned on the next `start_task`. `chrome: true` (default false) passes `--chrome` so the child
+can use Claude in Chrome; it acts in the user's real signed-in Chrome, so it is opt-in per task and only one chrome task
+may run at a time. Chrome inside a headless `-p` child is unverified until a live test. There is no cap on parallel children: capacity is the router's job (S1 and
+the quota gates refuse or redirect a spent lane). Limits: 3 h per child (`CORTADOS_CHILD_MAX_S`), and a child cannot start children. The token is
 read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`); the desktop app starts servers with a
 thin PATH, so set `CORTADOS_CHILD_CLAUDE_BIN` to claude's absolute path.
+
+Router logs: the child sends `x-cortados-run-id: <task_id>` on every provider request (added to
+`ANTHROPIC_CUSTOM_HEADERS` next to `x-cortados-reveal`), so the provider's run record holds it under the task id; when
+the task is done, `task_status`/`wait_task` fetch `GET /v1/cortados/runs/<task_id>` and return it as `router_run`
+(models, primary lane; a fetch failure is a field, not an error). The run record is in memory, bounded (16 entries per
+run, 512 runs) and forgotten on a provider restart. Each lifecycle event (`started`, `finished` with status, exit code
+and duration, `cancelled`) is also appended as one JSON line to `$CORTADOS_HOME/child-tasks.jsonl` (default
+`~/.cortados`): task id, cwd, orchestrator, permission mode, chrome flag, status and timings; never the prompt or a
+secret.
 
 Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
 

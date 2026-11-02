@@ -6,8 +6,10 @@ import stat
 import sys
 import tempfile
 import textwrap
+import io
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 from cortados_router import child_tasks as ct
@@ -21,7 +23,8 @@ FAKE = textwrap.dedent('''\
     with open(os.path.join(os.getcwd(), "fake-argv.json"), "w") as f:
         json.dump({{"argv": sys.argv[1:], "prompt": prompt, "nested": os.environ.get("CORTADOS_CHILD_TASK"),
                    "subagent": os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"),
-                   "claudecode": os.environ.get("CLAUDECODE")}}, f)
+                   "claudecode": os.environ.get("CLAUDECODE"),
+                   "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS")}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "fail":
@@ -30,6 +33,25 @@ FAKE = textwrap.dedent('''\
     print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "done: " + prompt,
                       "num_turns": 2, "modelUsage": {{"claude-fable-5": {{}}, "gpt-6.1-sol": {{}}}}}}))
 ''')
+
+
+class _Resp:
+    def __init__(self, obj):
+        self.b = json.dumps(obj).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self.b
+
+
+def _events():
+    with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
+        return [json.loads(line) for line in f]
 
 
 def _load(path):
@@ -51,13 +73,26 @@ class ChildTaskTests(unittest.TestCase):
             f.write("tok-test-000000001")
         self.env = mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": os.path.join(self.tmp, "tasks"),
                                                 "CORTADOS_CHILD_CLAUDE_BIN": bin_, "FAKE_CLAUDE_MODE": "ok",
-                                                "CLAUDECODE": "1"})
+                                                "CLAUDECODE": "1",
+                                                "CORTADOS_CONNECTORS_MCP_CONFIG": os.path.join(self.tmp, "no-conn.json"),
+                                                "CORTADOS_HOME": os.path.join(self.tmp, "home"),
+                                                "CORTADOS_SCARCITY_REFRESH": "off"})
         self.env.start()
         os.environ.pop("CORTADOS_CHILD_TASK", None)
         self.addCleanup(self.env.stop)
         p = mock.patch.object(ct, "MANAGED_DIRS", (os.path.join(self.tmp, "no-managed"),))
         p.start()
         self.addCleanup(p.stop)
+        self.runs = {}
+
+        def fake_urlopen(req, timeout=None):
+            rid = req.full_url.rsplit("/", 1)[1]
+            if rid not in self.runs:
+                raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, io.BytesIO(b"{}"))
+            return _Resp(self.runs[rid])
+        u = mock.patch.object(ct, "_urlopen", fake_urlopen)
+        u.start()
+        self.addCleanup(u.stop)
         self.cfg = {"url": "http://provider.invalid:8432", "token": "tok-test-000000001", "token_file": tok}
 
     def tearDown(self):
@@ -103,7 +138,12 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn("build it", seen["argv"])
         a = seen["argv"]
         self.assertEqual(a[a.index("--model") + 1], "cortados")
-        self.assertEqual(a[a.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(a[a.index("--permission-mode") + 1], "auto")
+        self.assertNotIn("--mcp-config", a)                      # no connectors file: no flag, a note in the log
+        with open(os.path.join(w["dir"], "runner.log")) as f:
+            self.assertIn("connectors MCP config", f.read())
+        self.assertTrue(w["settings_removed"])                   # the token-bearing settings file is gone
+        self.assertFalse([n for n in os.listdir(w["dir"]) if n.startswith("session-")])
         self.assertIn("-p", a)
         self.assertEqual(a[a.index("--output-format") + 1], "json")
         self.assertNotIn("--append-system-prompt", a)          # cortados orchestrator: no directive
@@ -126,6 +166,95 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(a[a.index("--permission-mode") + 1], "plan")
         self.assertEqual(a[a.index("--allowedTools") + 1], "Bash(git diff:*),Read")
 
+    def test_connectors_config_passed_when_present(self):
+        conn = os.path.join(self.tmp, "connectors.mcp.json")
+        with open(conn, "w") as f:
+            json.dump({"mcpServers": {}}, f)
+        os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
+        tid = self.start(permission_mode="dontAsk")
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertEqual(a[a.index("--mcp-config") + 1], conn)
+        self.assertEqual(a[a.index("--permission-mode") + 1], "dontAsk")
+
+    def test_settings_file_exists_while_running(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start()
+        d = ct.task_path(tid)
+        self.assertTrue([n for n in os.listdir(d) if n.startswith("session-")])
+        self.call("cancel_task", task_id=tid)
+        self.call("wait_task", task_id=tid, timeout_s=30)
+
+    def test_prune_old_finished_tasks_on_start(self):
+        root = ct._private_root()
+        old, live = "t20200101000000-0000000a", "t20200101000000-0000000b"
+        for tid in (old, live):
+            os.mkdir(os.path.join(root, tid), 0o700)
+        ct._write_json(os.path.join(root, old, "meta.json"), {"started_at": 1.0, "runner_pid": 0})
+        ct._write_json(os.path.join(root, old, "result.json"), {"exit_code": 0, "ended_at": 2.0})
+        # a "running" old task: its runner pid is alive (this test process), so it is kept
+        ct._write_json(os.path.join(root, live, "meta.json"), {"started_at": 1.0, "runner_pid": os.getpid()})
+        self.start()
+        names = os.listdir(root)
+        self.assertNotIn(old, names)
+        self.assertIn(live, names)
+
+    def test_chrome_opt_in_and_single_driver(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start(chrome=True)
+        self.assertTrue(_load(os.path.join(ct.task_path(tid), "meta.json"))["chrome"])
+        self.assertIn("--chrome", _load(os.path.join(ct.task_path(tid), "meta.json"))["argv"])
+        r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("already driving Chrome", r["content"][0]["text"])
+        other = self.start()                                  # a non-chrome task may still run alongside
+        self.assertNotIn("--chrome", _load(os.path.join(ct.task_path(other), "meta.json"))["argv"])
+        for t in (tid, other):
+            self.call("cancel_task", task_id=t)
+            self.call("wait_task", task_id=t, timeout_s=30)
+
+    def test_router_run_id_header_and_run_record(self):
+        tid = self.start(task="secret-ish prompt text")
+        self.runs[tid] = {"run_id": tid, "model": "gpt-6.1-sol", "label": "x", "provider": "codex-cli",
+                          "models": ["gpt-6.1-sol"], "builder_models": ["gpt-6.1-sol"]}
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["router_run"]["models"], ["gpt-6.1-sol"])
+        self.assertEqual(w["router_run"]["provider"], "codex-cli")
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        self.assertIn("x-cortados-run-id: " + tid, seen["headers"])
+        self.assertIn("x-cortados-reveal: 1", seen["headers"])
+        ev = _events()
+        self.assertEqual([e["event"] for e in ev], ["started", "finished"])
+        self.assertEqual(ev[1]["status"], "succeeded")
+        self.assertEqual(ev[1]["exit_code"], 0)
+        self.assertIsInstance(ev[1]["duration_s"], float)
+        self.assertEqual(ev[0]["task_id"], tid)
+        with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
+            raw = f.read()
+        self.assertNotIn("secret-ish", raw)
+        self.assertNotIn("tok-test", raw)
+
+    def test_run_record_fetch_failure_is_a_field(self):
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded")
+        self.assertIn("404", w["router_run"]["error"])
+
+    def test_no_parallel_cap(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        ids = [self.start(cwd=self.work) for _ in range(6)]   # more than the old cap of 4
+        for t in ids:
+            _, st = self.call("task_status", task_id=t)
+            self.assertEqual(st["state"], "running")
+        for t in ids:
+            self.call("cancel_task", task_id=t)
+        for t in ids:
+            _, w = self.call("wait_task", task_id=t, timeout_s=30)
+            self.assertEqual(w["state"], "cancelled")
+        kinds = [e["event"] for e in _events()]
+        self.assertEqual(kinds.count("cancelled"), 6)
+        self.assertEqual(kinds.count("started"), 6)
+
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"
         tid = self.start()
@@ -144,6 +273,8 @@ class ChildTaskTests(unittest.TestCase):
         self.assertTrue(c["cancelled"], c)
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertEqual(w["state"], "cancelled", w)
+        self.assertTrue(w["settings_removed"])
+        self.assertFalse([n for n in os.listdir(w["dir"]) if n.startswith("session-")])
         _, again = self.call("cancel_task", task_id=tid)
         self.assertFalse(again["cancelled"])
 
@@ -160,7 +291,7 @@ class ChildTaskTests(unittest.TestCase):
             self.assertTrue(r.get("isError"), cwd)
 
     def test_permission_mode_outside_allowed_set(self):
-        for mode in ("bypassPermissions", "dangerously-skip-permissions", "auto"):
+        for mode in ("bypassPermissions", "dangerously-skip-permissions", "yolo"):
             r, _ = self.call("start_task", task="x", cwd=self.work, permission_mode=mode)
             self.assertTrue(r.get("isError"))
             self.assertIn("not allowed", r["content"][0]["text"])
