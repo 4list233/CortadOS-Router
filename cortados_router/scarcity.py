@@ -460,14 +460,16 @@ def _is_exe(path: str | None) -> bool:
     return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _bundle_codex_candidates(bundles, note) -> list[str]:
+def _bundle_codex_candidates(bundles, note, problem=None) -> list[str]:
     """Codex binaries inside app bundles: each Contents/Resources/codex-package.json (or one directory below it) names
     its CLI in "entrypoint", resolved against that manifest's own directory; then a bounded Resources/codex*/bin/codex
     for a bundle that ships no manifest. Depth is bounded on purpose: an unbounded walk of a bundle is slow and would
-    happily find an unrelated `codex`. Every path considered and every unreadable manifest is recorded via note().
+    happily find an unrelated `codex`. Every path considered is recorded via note(); every unreadable manifest or
+    unsearchable directory via problem() (default: note()), so a caller can keep those even when discovery succeeds.
 
     Precedence holds ACROSS bundles: every bundle's manifest entrypoint comes before any bundle's glob match, so one
     bundle's last-resort guess never outranks another bundle's own declaration."""
+    problem = problem or note
     entries: list[str] = []
     globbed_all: list[str] = []
     for bundle in bundles:
@@ -479,26 +481,28 @@ def _bundle_codex_candidates(bundles, note) -> list[str]:
             manifests = sorted(res.glob(patterns[0])) + sorted(res.glob(patterns[1]))
             globbed = sorted(res.glob(patterns[2]))
         except OSError as exc:          # an unreadable or disappearing bundle: skip it with a reason, never silently
-            note(f"{res}/ (unsearchable: {type(exc).__name__})")
+            problem(f"{res}/ (unsearchable: {type(exc).__name__})")
             continue
         globbed_all.extend(str(p) for p in globbed)
         for manifest in manifests:
             try:
                 entry = json.loads(manifest.read_text())
             except (OSError, ValueError, UnicodeDecodeError) as exc:
-                note(f"{manifest} (unreadable: {type(exc).__name__})")
+                problem(f"{manifest} (unreadable: {type(exc).__name__})")
                 continue
             target = entry.get("entrypoint") if isinstance(entry, dict) else None
             if not isinstance(target, str) or not target:
-                note(f'{manifest} (no "entrypoint")')
+                problem(f'{manifest} (no "entrypoint")')
                 continue
             entries.append(os.path.normpath(os.path.join(str(manifest.parent), target)))
     return entries + [g for g in globbed_all if g not in entries]
 
 
-def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None = None) -> tuple[str | None, str | None]:
+def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None = None,
+                  notes: list[str] | None = None) -> tuple[str | None, str | None]:
     """The Codex CLI to run, as (binary or None, missing configured path or None), appending everything considered to
-    `searched` so a failure can say where it looked.
+    `searched` so a failure can say where it looked, and every discovery problem (a dead configured path, a malformed
+    or unreadable manifest, an unsearchable directory) to `notes` too, which outlive a successful pick.
 
     Precedence: CORTADOS_CODEX_BIN > `codex` on PATH > an app bundle's codex-package.json "entrypoint" > a bounded
     Resources/codex*/bin/codex glob > the legacy CODEX_APP_BINARIES tuple. PATH beats the bundle because an explicitly
@@ -507,16 +511,21 @@ def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None 
     must not blind the probe: it is reported, not obeyed."""
     import shutil
     seen = searched if searched is not None else []
+
+    def problem(msg: str) -> None:
+        seen.append(msg)
+        if notes is not None:
+            notes.append(msg)
     configured = env.get("CORTADOS_CODEX_BIN")
     if configured:
         if _is_exe(configured):
             return configured, None
-        seen.append(f"CORTADOS_CODEX_BIN={configured} (not an executable file)")
+        problem(f"CORTADOS_CODEX_BIN={configured} (not an executable file)")
     on_path = shutil.which("codex", path=env.get("PATH"))
     if _is_exe(on_path):
         return on_path, configured
     seen.append("`codex` on PATH")
-    cands = _bundle_codex_candidates(CODEX_APP_BUNDLES if bundles is None else bundles, seen.append)
+    cands = _bundle_codex_candidates(CODEX_APP_BUNDLES if bundles is None else bundles, seen.append, problem)
     for cand in cands + [b for b in CODEX_APP_BINARIES if b not in cands]:
         if _is_exe(cand):
             return cand, configured
@@ -548,11 +557,14 @@ def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) ->
     rec = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
     # The full list of places looked, beyond the 200-char summary above; dropped when this failure carries none, so a
     # stale list from an earlier failure never describes a different one.
-    searched = getattr(exc, "searched", None)
-    if searched:
-        rec["searched"] = list(searched)
-    else:
-        rec.pop("searched", None)
+    # The same for the binary a probe ran and the discovery problems met on the way (a malformed manifest that fell
+    # back to a glob): a boot or parser failure after discovery must still show how the binary was chosen.
+    for field in ("searched", "binary", "discovery_notes"):
+        value = getattr(exc, field, None)
+        if value:
+            rec[field] = list(value) if isinstance(value, (list, tuple)) else value
+        else:
+            rec.pop(field, None)
     if kind != old.get("error_kind"):
         try:
             print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
@@ -571,14 +583,32 @@ class CodexNotFound(RuntimeError):
         self.searched = list(searched)
 
 
+MAX_DISCOVERY_NOTES = 10        # a short list: enough to name the broken manifests, never a whole directory listing
+
+
 def _codex() -> dict[str, Any]:
     env = _cli_env()
     searched: list[str] = []
-    binary, missing_bin = _codex_binary(env, searched=searched)
+    notes: list[str] = []
+    binary, missing_bin = _codex_binary(env, searched=searched, notes=notes)
     if not binary:
         # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen, and name
         # every place looked so the next relocation is a one-line read of the error rather than a debugging session.
         raise CodexNotFound(searched)
+    notes = [n[:200] for n in notes[:MAX_DISCOVERY_NOTES]]
+    try:
+        return _codex_probe(env, binary, missing_bin, notes)
+    except Exception as exc:
+        # Discovery succeeded but the probe did not: keep which binary ran and what discovery tripped over, so a
+        # fallback past a malformed manifest is visible next to the boot or parser failure it may explain.
+        try:
+            exc.binary, exc.discovery_notes = binary, notes
+        except AttributeError:          # an exception type that refuses attributes still propagates unchanged
+            pass
+        raise
+
+
+def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str]) -> dict[str, Any]:
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -601,7 +631,8 @@ def _codex() -> dict[str, Any]:
         raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
     wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
     return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
-            **({"configured_binary_missing": missing_bin, "binary": binary} if missing_bin else {})}
+            "binary": binary, "discovery_notes": notes,
+            **({"configured_binary_missing": missing_bin} if missing_bin else {})}
 
 
 def parse_cursor_usage(text: str) -> list[dict[str, Any]]:

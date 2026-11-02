@@ -143,6 +143,56 @@ class CodexBinaryTest(unittest.TestCase):
         with mock.patch.object(sc, "CODEX_APP_BINARIES", ()):
             self.assertEqual(sc._codex_binary(env, bundles=(str(app),)), (None, str(self.tmp / "conf/codex")))
 
+    # --- discovery notes outlive a successful pick ----------------------------------------------------------------
+    def _malformed_manifest_fallback(self):
+        app = self.tmp / "ChatGPT.app"
+        found = _bundle(app, "Contents/Resources/codex-cli/bin/codex", "{not json")
+        return found, [mock.patch.object(sc, "CODEX_APP_BUNDLES", (str(app),)),
+                       mock.patch.object(sc, "CODEX_APP_BINARIES", ()),
+                       mock.patch.object(sc, "_cli_env", return_value={"PATH": self.empty_path})]
+
+    def test_codex_keeps_the_binary_and_the_malformed_manifest_note_on_success(self):
+        found, patches = self._malformed_manifest_fallback()
+        with patches[0], patches[1], patches[2], \
+             mock.patch.object(sc, "tui_capture", return_value="screen") as call, \
+             mock.patch.object(sc, "parse_codex_status", return_value=[]), \
+             mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
+            rec = sc._codex()
+        self.assertEqual(call.call_args.args[0], [found])
+        self.assertEqual(rec["binary"], found)
+        self.assertEqual(len(rec["discovery_notes"]), 1, rec["discovery_notes"])
+        self.assertIn("codex-package.json (unreadable: JSONDecodeError)", rec["discovery_notes"][0])
+        self.assertNotIn("configured_binary_missing", rec)
+
+    def test_a_probe_failure_after_discovery_carries_the_binary_and_notes(self):
+        found, patches = self._malformed_manifest_fallback()
+        with patches[0], patches[1], patches[2], \
+             mock.patch.object(sc, "tui_capture", return_value="screen"), \
+             mock.patch.object(sc, "parse_codex_status", side_effect=ValueError("unknown limit label")):
+            with self.assertRaises(ValueError) as cm:
+                sc._codex()
+        self.assertEqual(cm.exception.binary, found)
+        self.assertTrue(any("unreadable: JSONDecodeError" in n for n in cm.exception.discovery_notes))
+        rec = sc._failed_record("codex", {"binary": "stale", "discovery_notes": ["stale"]}, cm.exception)
+        self.assertEqual(rec["binary"], found)
+        self.assertEqual(rec["discovery_notes"], cm.exception.discovery_notes)
+        # A later failure that carries neither drops the stale fields rather than describing a different failure.
+        later = sc._failed_record("codex", rec, RuntimeError("other"))
+        self.assertNotIn("binary", later)
+        self.assertNotIn("discovery_notes", later)
+
+    def test_a_boot_failure_after_discovery_carries_the_notes_too(self):
+        found, patches = self._malformed_manifest_fallback()
+
+        def empty(*_a, diagnostics=None, **_k):
+            diagnostics.update({"stage": "boot", "eof": True, "boot_failure": "exec"})
+            return ""
+        with patches[0], patches[1], patches[2], mock.patch.object(sc, "tui_capture", side_effect=empty):
+            with self.assertRaisesRegex(RuntimeError, "Codex /status empty") as cm:
+                sc._codex()
+        self.assertEqual(cm.exception.binary, found)
+        self.assertTrue(cm.exception.discovery_notes)
+
     # --- failure labelling ---------------------------------------------------------------------------------------
     def test_failure_kind_is_stable_across_attempts(self):
         a = "RuntimeError: Codex /status empty (attempts=2): stage=boot, eof=True, startup_chars=0, ready_seen=False"
