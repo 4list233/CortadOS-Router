@@ -8,8 +8,9 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
-  sub/ pin          a client that names `sub/<claude model>` chose the model itself: S1 and the band are skipped, but
-                    the served-model, account, capacity and route-log rules still apply (choose_pinned).
+  sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
+                    model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
+                    route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
 """
 from __future__ import annotations
 
@@ -109,6 +110,12 @@ def request_fit(body: dict[str, Any]) -> dict[str, Any]:
             "source": "provider_request_estimate"}         # chars / 4; the CLI's own tokenizer is not reachable here
 
 
+# The vendor each pinnable backend belongs to: its scarcity lane (capacity, fit) and the label its errors and model
+# names use. Keyed by the same providers as SERVED_PROVIDERS, so a backend added there must be given a row here before
+# its models become pinnable (pinnable_models skips nothing silently: a served provider without a row raises).
+PIN_VENDORS = {"claude-cli": {"lane": "claude", "family": "Claude"},
+               "codex-cli": {"lane": "codex", "family": "Codex"}}
+
 SUB_PREFIX = "sub/"
 SUB_DEFAULT = "claude-opus-5-5"
 # Short names a person types (`claude --model sub/opus`); each must name a model the tables serve on claude-cli.
@@ -117,8 +124,8 @@ SUB_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": 
 
 
 def sub_pin(body: dict[str, Any]) -> str | None:
-    """A request pinned to a Claude subscription model: model `sub/<claude-model or alias>` (bare `sub` for the
-    default). Returns the requested model name (unvalidated), or None for a normal S1-routed request."""
+    """A request pinned to a subscription model: model `sub/<model id or Claude alias>` (bare `sub` for the
+    default), a Claude model (claude-cli) or a Codex one (codex-cli). Returns the requested model name (unvalidated), or None for a normal S1-routed request."""
     m = (body.get("model") or "").strip()
     if m == "sub":
         return SUB_DEFAULT
@@ -159,26 +166,70 @@ def model_key(name: str | None) -> str | None:
     return re.sub(r"-\d{8}$", "", name.casefold()) if name else name
 
 
+def pinnable_models(core) -> list[tuple[str, str]]:
+    """Every `(provider, model)` a client may pin as `sub/<model>`: the routes this endpoint serves (served_routes, read
+    from the tables, never a list kept here), one entry per model on its base provider (accounts are chosen at pin
+    time, not by the client). Claude first, then Codex, each sorted by id. A broken accounts config drops the Claude
+    models here exactly as served_routes does (a pin of one would be refused with the config error)."""
+    out = sorted({(_base_provider(p), m) for p, m in served_routes(core)},
+                 key=lambda pm: (list(PIN_VENDORS).index(pm[0]) if pm[0] in PIN_VENDORS else len(PIN_VENDORS), pm[1]))
+    for p, m in out:
+        if p not in PIN_VENDORS:     # a served backend with no vendor row would be pinned without its capacity gates
+            raise ValueError(f"served provider {p!r} has no PIN_VENDORS row; give it one before {m} can be pinned")
+    return out
+
+
+def readable_model_name(model: str) -> str:
+    """A person's name for a table model id, derived from the id (the tables carry no display name for the
+    claude-cli/codex-cli rows): `claude-fable-5-1` -> `Claude Fable 5.1`, `gpt-6.1-sol` -> `GPT-6.1 Sol`. The release
+    date suffix is dropped. An id of another shape is returned unchanged rather than guessed at."""
+    parts = (model_key(model) or "").split("-")
+    words: list[str] = []
+    for part in parts[1:]:
+        if part.replace(".", "").isdigit() and words and words[-1][0].isdigit():
+            words[-1] += "." + part                       # Claude ids spell versions with dashes: 5-1 is 5.1
+        else:
+            words.append(part if part[:1].isdigit() else part.capitalize())
+    if parts[0] == "claude" and words:
+        return " ".join(["Claude"] + words)
+    if parts[0] == "gpt" and words and words[0][0].isdigit():
+        return " ".join([f"GPT-{words[0]}"] + words[1:])
+    return model
+
+
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
-                  claude_bin: str = "claude") -> dict[str, Any]:
+                  claude_bin: str = "claude", codex_bin: str = "codex") -> dict[str, Any]:
     """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
     (a pin that the band would refuse still runs; that is what pinning is for). What stays is the router's accounting
-    and safety: only a model the tables serve on claude-cli, only a configured account whose subscription is not spent
-    (ranked by core's static account ranking: reserves spared, expiring credit first, scarce last), a request that
-    fits the account's context ceiling, the binary on PATH, and a routes row so the usage is on record (engine
-    `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for labelling).
-    Claude only for now: the Codex lane is paused (Forest, 2026-10-30)."""
-    # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport it as an unknown model.
+    and safety: only a model the tables serve on claude-cli or codex-cli, only a configured account whose subscription
+    is not spent (ranked by core's static account ranking: reserves spared, expiring credit first, scarce last), a
+    request that fits the lane's context ceiling, the binary on PATH, and a routes row so the usage is on record
+    (engine `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for
+    labelling). A Codex pin runs on the provider's one Codex login (codex_bridge on --codex-home): this endpoint
+    has no per-account Codex backend yet (server._codex_session), so it is a single candidate on the `codex` lane."""
+    # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport a Claude model as
+    # unknown. Only a Claude-shaped name is refused for it, so a broken Claude config never blocks a Codex pin.
     try:
-        accounts = core._vendor_accounts("claude", "claude", "claude-cli")
+        claude_accounts = core._vendor_accounts("claude", "claude", "claude-cli")
     except core.AccountsConfigError as exc:         # broken accounts config refuses Claude, never an ambient login
-        return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
-    claude = sorted({m for p, m in served_routes(core) if _base_provider(p) == "claude-cli"})
-    if model not in claude:
+        if model.startswith("claude"):
+            return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
+        claude_accounts = []
+    pinnable = pinnable_models(core)
+    provider = next((p for p, m in pinnable if m == model), None)
+    if provider is None:
         return {"router": execution_routing.ROUTER, "client_error": True,
-                "error": f"sub/{model} is not a Claude model this endpoint serves; pin one of: {', '.join(claude)}"}
+                "error": f"sub/{model} is not a model this endpoint serves; pin one of: "
+                         f"{', '.join(m for _, m in pinnable)}"}
+    vendor = PIN_VENDORS[provider]
+    family = vendor["family"]
+    if provider == "claude-cli":
+        accounts = claude_accounts
+    else:
+        # One candidate, the default login: the same shape core._vendor_accounts gives a vendor with no accounts entry.
+        accounts = [{"lane": vendor["lane"], "provider": provider, "account": None, "reserve": False, "config_dir": None}]
     try:
-        _credentials(claude_bin, "codex")(requested="claude-cli", target_model=model)
+        _credentials(claude_bin, codex_bin)(requested=provider, target_model=model)
     except execution_routing.CredentialsUnavailable as exc:
         return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {exc}"}
     # The same input-fit gate core.resolve applies in execution mode: an assembled request's estimate must fit the
@@ -190,9 +241,12 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
               "config_dir": a["config_dir"], "reserve": a["reserve"]} for a in accounts]
     ch_of = {id(c): core.candidate_health(c, health) for c in cands}
     byte_caps = core.lane_byte_ceilings()
+    # core.resolve's execution ceiling: the codex-cli transport has its own (provider_ceiling_tokens), not the lane's.
+    cap_of = lambda c: (int(core._context_cfg().get("provider_ceiling_tokens", {}).get("codex-cli", 200000))
+                        if provider == "codex-cli" else core.lane_ceiling(c["lane"], model))
     too_big = []
     for c in cands:
-        cap = core.lane_ceiling(c["lane"], model)
+        cap = cap_of(c)
         bcap = byte_caps.get(core._base_lane(c["lane"]))
         why = None
         if need > cap:
@@ -204,7 +258,7 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
             too_big.append(c)
     if cands and len(too_big) == len(cands):
         return {"router": execution_routing.ROUTER, "fit_blocked": True,
-                "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any Claude account's "
+                "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any {family} account's "
                          f"input ceiling ({ch_of[id(too_big[0])]['why']})"}
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     # Account choice is core's static ranking (core.resolve's unscored path): reserves spared while a non-reserve sibling
@@ -229,9 +283,10 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
                              ("usage reading came from a different login, awaiting a fresh sample", stale)):
             if group:
                 parts.append(f"{label}: " + "; ".join(f"{c['provider']} ({why_of(c)})" for c in group))
-        hint = f"; pin api/{model} to spend API credit instead" if spent else ""
+        # The API-credit lane is Anthropic's: there is no api/ pin for a Codex model to point at.
+        hint = f"; pin api/{model} to spend API credit instead" if spent and provider == "claude-cli" else ""
         return {"router": execution_routing.ROUTER,
-                "error": f"sub/{model}: no Claude subscription account can take this request ({' | '.join(parts)}){hint}"}
+                "error": f"sub/{model}: no {family} subscription account can take this request ({' | '.join(parts)}){hint}"}
     chosen = {**live[0], "pool": ch_of[id(live[0])].get("pool")}
     route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
     # skipped has core.resolve's shape ({lane, model, pool, why}): core.footer and s1/outcome/run.py read it as dicts.
@@ -247,7 +302,7 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
                    decision, route)
     return {"router": execution_routing.ROUTER, "provider": chosen["provider"], "model": model,
             "account": chosen["account"], "config_dir": chosen["config_dir"],
-            "context_length": core.lane_ceiling(chosen["lane"], model), "route_id": route_id, "api_request_id": "",
+            "context_length": cap_of(chosen), "route_id": route_id, "api_request_id": "",
             "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
 
 
@@ -319,7 +374,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         if model_key(pinned) in excluded_keys:
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
-        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin)
+        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
+                             codex_bin=codex_bin)
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
     if excluded_models:
         constraints["excluded_routes"] = []

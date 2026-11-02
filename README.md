@@ -178,9 +178,10 @@ Codex as a client uses `/v1/responses`; its provider config is in `docs/PROVIDER
 |---|---|---|
 | `cortados` | the cheapest capable route S1 and the tables pick, fixed for the conversation | scores the first user message |
 | `sub/<claude-model>` (or `sub/opus`, `sub/sonnet`, `sub/haiku`, `sub/fable`; bare `sub` = Opus) | that model on a Claude **subscription** account: the least-scarce configured account whose quota is not spent | skipped |
+| `sub/<codex-model>` (e.g. `sub/gpt-6.1-sol`; any model the tables serve on codex-cli) | that model on the Codex backend (`codex app-server`, the provider's one Codex login), if its lane has capacity | skipped |
 | `api/<claude-model>` (bare `api` = Opus) | that model on the dollar-metered Anthropic **API credit** lane | skipped |
 
-A `sub/` pin still writes a `routes` row (engine `pin`), so a pinned planner's usage is on record next to the routed workers'. Use it for an orchestrating main session whose first message is too thin to score well, with the routed-subagents mod sending the workers through S1. When every subscription account is spent the pin is refused with a pointer to the `api/` pin; it never falls over to API credit on its own.
+A `sub/` pin still writes a `routes` row (engine `pin`), so a pinned planner's usage is on record next to the routed workers'. Use it for an orchestrating main session whose first message is too thin to score well, with the routed-subagents mod sending the workers through S1. `GET /v1/models` lists `cortados` and every pinnable model as `sub/<id>` (display name e.g. `GPT-6.1 Sol · CortadOS`), derived from the tables, so a model picker can choose the orchestrator. When every Claude subscription account is spent the pin is refused with a pointer to the `api/` pin; it never falls over to API credit on its own.
 
 The `sub/` and `api/` pins are for Claude Code clients (`/v1/messages`); Codex clients (`/v1/responses`) use `cortados` (a pin on `/v1/responses` is refused with a 400). The model is fixed per conversation: a continuation that names a different `sub/` model, or pins an S1-routed conversation, is refused with a 409; start a new conversation to switch.
 

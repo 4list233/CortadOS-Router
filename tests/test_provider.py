@@ -427,6 +427,72 @@ class RoutedHarness(EndpointHarness):
         self.assertEqual(self.status_of(body), 400)
 
 
+class SubscriptionPinEndpointTests(EndpointHarness):
+    """sub/ pins through the endpoint: GET /v1/models offers every pinnable model, and a Codex pin opens the codex-cli
+    backend with the pinned model (the backend is a recording stand-in over the fake Claude CLI: no vendor CLI runs)."""
+
+    def setUp(self):
+        super().setUp()
+        self._keep = (core.STATE, core.lane_health, core.decide)
+        core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-pin-endpoint-"))   # never the live router.db
+        core.lane_health = lambda: {}
+
+        def no_s1(text, ctx=None):
+            raise AssertionError("a pinned request must not be scored")
+        core.decide = no_s1
+        self.opened = []
+
+        def recording(provider):
+            def factory(reg, **kw):
+                self.opened.append((provider, kw["model"]))
+                return server._claude_session(reg, **kw)
+            return factory
+        self.reg._factories = {"claude-cli": recording("claude-cli"), "codex-cli": recording("codex-cli")}
+        from cortados_router.provider import routing
+        self.reg.router = lambda body, client, **kw: routing.choose(
+            core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=sys.executable,
+            codex_bin=sys.executable, **kw)
+
+    def tearDown(self):
+        core.STATE, core.lane_health, core.decide = self._keep
+        super().tearDown()
+
+    def models(self):
+        req = urllib.request.Request(self.url + "/v1/models", headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_models_lists_cortados_and_every_pinnable_model_with_labels(self):
+        from cortados_router.provider import routing
+        got = self.models()
+        names = {m["id"]: m["display_name"] for m in got["data"]}
+        self.assertEqual(got["data"][0]["id"], "cortados")
+        self.assertEqual(names["cortados"], "CortadOS")
+        self.assertEqual(names["sub/claude-fable-5-1"], "Claude Fable 5.1 · CortadOS")
+        self.assertEqual(names["sub/gpt-6.1-sol"], "GPT-6.1 Sol · CortadOS")
+        self.assertEqual(set(names) - {"cortados"}, {f"sub/{m}" for _, m in routing.pinnable_models(core)})
+        self.assertEqual((got["first_id"], got["last_id"]), ("cortados", got["data"][-1]["id"]))
+
+    def test_models_without_routing_lists_only_cortados(self):
+        self.reg.router = None                  # a --fixed-model endpoint does not honour pins
+        self.assertEqual([m["id"] for m in self.models()["data"]], ["cortados"])
+
+    def test_codex_pin_opens_the_codex_backend_with_the_pinned_model(self):
+        body = {"model": "sub/gpt-6.1-sol", "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "hello"}]}
+        self.assertEqual(self.post(body)["stop_reason"], "end_turn")
+        self.assertEqual(self.opened, [("codex-cli", "gpt-6.1-sol")])
+        self.assertEqual(self.status_of({**body, "model": "sub/gpt-9-imaginary"}), 400)
+
+    def test_a_codex_pinned_conversation_keeps_its_model(self):
+        session = type("S", (), {"route": {"pinned": True, "model": "gpt-6.1-sol", "provider": "codex-cli"}})()
+        self.assertIsNone(server.Handler._model_change(session, {"model": "sub/gpt-6.1-sol"}))
+        self.assertIsNone(server.Handler._model_change(session, {"model": "cortados"}))
+        why = server.Handler._model_change(session, {"model": "sub/opus"})
+        self.assertIn("pinned to sub/gpt-6.1-sol", why)
+        self.assertIn("start a new conversation", why)
+
+
 class RoutedEndpointTests(RoutedHarness, EndpointTests):
     """The endpoint with a router: one route per conversation, the route's model on the CLI, execution logged once."""
 
