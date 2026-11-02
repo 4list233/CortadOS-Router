@@ -12,6 +12,11 @@ Only Claude teachers: Codex-labelled rows rated tasks much easier and caused und
 here and common.read_labels drops any already on disk.
 
 Resume-safe: finished (id, teacher, sample) triples are skipped.
+Exit codes (nightly branches on these, not on log text):
+  0  pass completed (every scheduled call made; individual batches may still have been dropped, e.g. a 413, and are logged)
+  2  config error before any call (no CORTADOS_PROVIDER_URL, unreadable/empty token file, a non-Claude teacher)
+  3  stopped early: quota refusal, auth/other 4xx, x-should-retry: false, retries exhausted, or (cli backend) the scarcity gate;
+     the labels written before the stop are kept and the next run resumes from them
   python3 label.py [--limit N] [--k 3] [--batch 12] [--workers 3] [--split train|holdout|all] [--train-teacher M] [--holdout-teacher M]"""
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ DEFAULTS = {"steps": 0, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "n
             "urgency": "now", "needs_clarification": False, "parts": 0, "diversity": False}
 TEACHER = {"train": "claude-sonnet-5", "holdout": "claude-opus-5"}
 BACKEND = "provider"
+EXIT_OK, EXIT_CONFIG, EXIT_STOPPED = 0, 2, 3          # see the module docstring
 SCARCITY_STOP = 0.7
 _write = threading.Lock()
 _stop = threading.Event()
@@ -107,18 +113,23 @@ class TeacherSkip(Exception):
     """Drop this batch only (e.g. 413 too large for every account: retrying unchanged cannot succeed)."""
 
 
+def _config_exit(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(EXIT_CONFIG)
+
+
 def provider_config() -> tuple[str, str]:
     url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip().rstrip("/")
     if not url:
-        raise SystemExit("label: CORTADOS_PROVIDER_URL is not set; the provider backend needs the cortados endpoint (no default: a wrong "
+        _config_exit("label: CORTADOS_PROVIDER_URL is not set; the provider backend needs the cortados endpoint (no default: a wrong "
                          "host would only show up as a connection error per batch)")
     tf = Path(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or TOKEN_FILE_DEFAULT).expanduser()
     try:
         token = tf.read_text().strip()
     except OSError as exc:
-        raise SystemExit(f"label: provider token file {tf} unreadable: {type(exc).__name__}")
+        _config_exit(f"label: provider token file {tf} unreadable: {type(exc).__name__}")
     if not token:
-        raise SystemExit(f"label: provider token file {tf} is empty")
+        _config_exit(f"label: provider token file {tf} is empty")
     return url, token
 
 
@@ -273,7 +284,7 @@ def main() -> int:
         if not is_claude_teacher(model):
             print(f"label: refusing {split} teacher {model!r}: only Claude teachers label (Codex labels under-rated tasks; training drops them)",
                   file=sys.stderr)
-            return 2
+            return EXIT_CONFIG
         TEACHER[split] = model
     BACKEND = a.backend
     if BACKEND == "provider":
@@ -315,7 +326,7 @@ def main() -> int:
                     print(f"  claude pool scarcity {worst} ≥ {a.max_scarcity}: stopping; rerun after the reset (resume-safe)", flush=True)
                     _stop.set()
     print(f"done: {total} labels written" + (" (stopped early)" if _stop.is_set() else ""), flush=True)
-    return 0
+    return EXIT_STOPPED if _stop.is_set() else EXIT_OK
 
 
 if __name__ == "__main__":

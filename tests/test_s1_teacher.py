@@ -182,18 +182,85 @@ class ProviderTeacherTests(unittest.TestCase):
         old = {k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE")}
         try:
             os.environ.pop("CORTADOS_PROVIDER_URL", None)
-            with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
                 label.provider_config()
+            self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
             tf = self.tmp / "tok"; tf.write_text("secret-x\n")
             os.environ.update(CORTADOS_PROVIDER_URL="http://h:8432/", CORTADOS_PROVIDER_TOKEN_FILE=str(tf))
             self.assertEqual(label.provider_config(), ("http://h:8432", "secret-x"))
             os.environ["CORTADOS_PROVIDER_TOKEN_FILE"] = str(self.tmp / "missing")
-            with self.assertRaises(SystemExit) as cm:
+            with redirect_stderr(io.StringIO()) as e, self.assertRaises(SystemExit) as cm:
                 label.provider_config()
-            self.assertNotIn("secret", str(cm.exception))
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("unreadable", e.getvalue())
         finally:
             for k, v in old.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+class MainExitCodeTests(unittest.TestCase):
+    """0 = pass completed, 2 = config error, 3 = stopped early (partial labels kept): nightly branches on the code, not the log."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        reqs = [{"id": f"r{i}", "split": "train", "unit_kind": "interactive", "request": f"task {i}"} for i in range(4)]
+        (self.tmp / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
+        (self.tmp / "tok").write_text("tok-test\n")
+        self._saved = (label.DATA, label.LABELS, label.BACKEND, label.PROVIDER, label.PROVIDER_BACKOFF_S, dict(label.TEACHER), sys.argv)
+        self._env = {k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+                                                     "CORTADOS_S1_TEACHER_TRAIN", "CORTADOS_S1_TEACHER_HOLDOUT")}
+        for k in self._env:
+            os.environ.pop(k, None)
+        label.DATA, label.LABELS, label.PROVIDER_BACKOFF_S = self.tmp, self.tmp / "labels.jsonl", (0.0, 0.0)
+        label._stop.clear()
+        self.fake = None
+
+    def tearDown(self):
+        (label.DATA, label.LABELS, label.BACKEND, label.PROVIDER, label.PROVIDER_BACKOFF_S, teacher, sys.argv) = self._saved
+        label.TEACHER.clear(); label.TEACHER.update(teacher)
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        label._stop.clear()
+        if self.fake:
+            self.fake.close()
+
+    def _main(self, script, url=None):
+        if script is not None:
+            self.fake = FakeProvider(script)
+            url = self.fake.url
+        if url:
+            os.environ["CORTADOS_PROVIDER_URL"] = url
+        os.environ["CORTADOS_PROVIDER_TOKEN_FILE"] = str(self.tmp / "tok")
+        sys.argv = ["label.py", "--k", "2", "--batch", "2", "--workers", "1", "--split", "train"]
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            try:
+                code = label.main()
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue()
+
+    def test_completed_pass_exits_0(self):
+        code, out = self._main([(200, {}, answers_for)] * 4)
+        self.assertEqual(code, label.EXIT_OK)
+        self.assertEqual(len(common.read_jsonl(label.LABELS)), 8)          # 4 requests x k=2
+
+    def test_quota_refusal_exits_3_and_keeps_partial_labels(self):
+        code, out = self._main([(200, {}, answers_for), (503, {}, err("no claude subscription account can take this request"))])
+        self.assertEqual(code, label.EXIT_STOPPED)
+        self.assertEqual(len(common.read_jsonl(label.LABELS)), 2)          # the first batch's labels survive
+        self.assertIn("stopped early", out)
+
+    def test_auth_error_exits_3(self):
+        self.assertEqual(self._main([(401, {}, err("bad token", "authentication_error"))])[0], 3)
+
+    def test_should_retry_false_exits_3(self):
+        self.assertEqual(self._main([(503, {"x-should-retry": "false"}, err("terminal"))])[0], 3)
+
+    def test_retries_exhausted_exits_3(self):
+        self.assertEqual(self._main([(500, {}, err("x", "api_error"))] * 3)[0], 3)
+
+    def test_missing_url_exits_2(self):
+        self.assertEqual(self._main(None)[0], label.EXIT_CONFIG)
 
 
 class CodexLabelExclusionTests(unittest.TestCase):
