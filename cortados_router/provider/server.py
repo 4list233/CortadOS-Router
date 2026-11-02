@@ -233,6 +233,8 @@ RUNS_PATH = "/v1/cortados/runs/"
 #   session-id                 Codex 0.166.0 sends its thread id as `session-id` (and `thread-id`, x-client-request-id,
 #                              prompt_cache_key) on /v1/responses; the 0.163.0 binary carries the same header names.
 # Every one present is part of the identity; with none, the request has no identity and gets no tombstone.
+# These headers are client-asserted, not authenticated: a client holding the endpoint token could send another's. They
+# scope failure diagnostics to a conversation; they do not isolate one client from another.
 CONVERSATION_ID_HEADERS = (RUN_ID_HEADER, "x-claude-code-session-id", "session-id")
 
 
@@ -403,7 +405,8 @@ class Registry:
             pass
         return None
 
-    def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None):
+    def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
+            scope: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None:
@@ -418,6 +421,7 @@ class Registry:
             kw["account"], kw["config_dir"] = route["account"], cfg
         s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
+        s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         if keep:
             with self._lock:
@@ -439,7 +443,14 @@ class Registry:
             return None
         return anthropic_wire.history_digest(wire_path, client, identity, turn.prefix_digest)
 
-    def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None):
+    @staticmethod
+    def conversation_scope(*, wire_path: str, client: str, identity: str | None) -> str | None:
+        """Who a conversation belongs to without its history: the wire, the client's User-Agent name and the
+        conversation identity it sent; None without an identity. Kept on each live session (Registry.new) so failure()
+        can tell a sibling's live conversation (same identity, see CONVERSATION_ID_HEADERS) from a stranger's."""
+        return anthropic_wire.history_digest(wire_path, client, identity) if identity else None
+
+    def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
         tombstone under `failure_key` makes it a FailedSession instead."""
@@ -450,14 +461,16 @@ class Registry:
         if len(matches) > 1:
             raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
         if not matches:
-            dead = self.failure(failure_key)
+            dead = self.failure(failure_key, turn.history, scope)
             if dead:
                 raise dead
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
 
-    def failure(self, key: str | None) -> "FailedSession | None":
-        """The FailedSession for this conversation's live tombstone, or None; expired tombstones are pruned on the way."""
+    def failure(self, key: str | None, history: list | None = None,
+                scope: str | None = None) -> "FailedSession | None":
+        """The FailedSession for this conversation's live tombstone, or None; expired tombstones are pruned on the way.
+        None too when a live session in the same `scope` has a history that strictly extends `history`: see below."""
         if not key:
             return None
         now = time.time()
@@ -468,6 +481,17 @@ class Registry:
                     break
                 del self.tombstones[oldest]
             dead = self.tombstones.get(key)
+            # Claude Code's session id is shared by its main loop and every subagent, so two siblings can carry the
+            # same identity and history: sibling A fails (tombstone), sibling B advances on its live session, loses
+            # that response, and retries its previous history. That retry matches A's tombstone, but it is B's
+            # lost-response retry of a healthy conversation, and A's terminal error would kill B. A live session in
+            # the same scope whose history strictly extends the request's names that case: the ordinary 409 instead.
+            # Checked under the same lock as the tombstone lookup, so no fail() or turn can slip in between.
+            if dead and scope and history is not None:
+                n = len(history)
+                if any(getattr(s, "scope", None) == scope and len(s.history) > n and s.history[:n] == history
+                       for s in self.sessions.values()):
+                    dead = None
         if not dead:
             return None
         diagnostic, failed_at, short = dead
@@ -768,7 +792,8 @@ class Handler(BaseHTTPRequestHandler):
                                                               client=self._client(), identity=identity)
             unkeyed = (None if identity or not turn.history else
                        "the client sent no conversation identity: none of " + ", ".join(CONVERSATION_ID_HEADERS))
-            session = None if one_shot else reg.find(turn, fail_key)
+            scope = reg.conversation_scope(wire_path=self.path.split("?")[0], client=self._client(), identity=identity)
+            session = None if one_shot else reg.find(turn, fail_key, scope)
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
                 # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
@@ -840,7 +865,7 @@ class Handler(BaseHTTPRequestHandler):
                 logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
-                session = reg.new(turn, keep=not one_shot, route=route)
+                session = reg.new(turn, keep=not one_shot, route=route, scope=scope)
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
@@ -897,7 +922,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Registry.find ran before the lock, and the conversation was closed while this request waited:
                     # its backend failed under the request that held the lock (Registry.fail), or it was reaped. The
                     # backend is gone, so nothing is sent to it; the request is told what a fresh lookup would say.
-                    outcome["stale"] = reg.failure(fail_key) or LostSession(
+                    outcome["stale"] = reg.failure(fail_key, turn.history, scope) or LostSession(
                         "the conversation was closed while this request waited for it; start a new conversation")
                     return
                 if not created and session.history != turn.history:

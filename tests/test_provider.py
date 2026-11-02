@@ -654,6 +654,27 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.assertEqual(code, 409)
         self.assertNotIn("failed at", err["error"]["message"])
 
+    def test_a_sibling_sharing_the_session_id_retrying_a_lost_reply_gets_the_409_not_the_failure(self):
+        # Round-4 reproduction: Claude Code's main loop and subagents share one session id. Sibling A fails after
+        # "hi -> OK" (tombstone); sibling B, same id, UA and history, advances, loses that response and retries its
+        # previous history. B's live session strictly extends it: B gets the ordinary 409, never A's terminal error.
+        body = self.failed_conversation()
+        self.assertEqual(len(self.reg.tombstones), 1)
+        code, err, _ = self.error_of(self.lose_a_reply(self.HEADERS))
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+        self.assertEqual(len(self.reg.sessions), 1)                    # B is untouched and still live
+        self.assertEqual(self.error_of(body)[0], 409)                  # A's retry is indistinguishable from B's
+
+    def test_a_live_extension_under_another_identity_never_hides_the_failure(self):
+        # Control: the live session that extends the history belongs to another session id; A's retry keeps its
+        # terminal error.
+        body = self.failed_conversation()
+        self.lose_a_reply({"X-Claude-Code-Session-Id": "session-b"})
+        code, err, _ = self.error_of(body)
+        self.assertEqual(code, 400)
+        self.assertIn("failed at", err["error"]["message"])
+
     def test_the_same_identity_and_history_gets_the_terminal_error(self):
         body = self.failed_conversation()
         self.assertEqual(len(self.reg.tombstones), 1)
