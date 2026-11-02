@@ -90,7 +90,9 @@ const HOST_PLUMBING_TOOLS: ReadonlySet<string> = new Set([
   'mcp__ccd_session__mark_chapter',
 ])
 
-/** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session. */
+/** The standing directive injected into the orchestrator's system prompt so it delegates by default, every session.
+ * Keep in step with integrations/orchestrator-directive.md (the whole-session launcher's copy, adapted: there
+ * subagents DO have MCP tools). The plugin is paused; the two must match in intent. */
 const ORCHESTRATOR_DIRECTIVE =
   'You are operating as an ORCHESTRATOR — the planning "brain" of a routed system. Your job is to decide and ' +
   'DELEGATE: decompose the request into self-contained subtasks and hand EACH to a subagent via the Agent tool (or a ' +
