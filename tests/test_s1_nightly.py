@@ -224,6 +224,25 @@ class NightlyEndToEnd(unittest.TestCase):
         rc, log, run = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_SERVE_POINTER=other)
         self.assertEqual(json.loads(other.read_text())["adapter"], str((run / "adapter").resolve()))
 
+    def test_failed_promotion_is_retried_on_an_unchanged_data_night(self):
+        ro = self.tmp / "ro"; ro.mkdir()
+        pointer = ro / "current.json"
+        ro.chmod(0o500)                                               # the scorer's directory is not writable tonight
+        self.addCleanup(ro.chmod, 0o700)
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("PROMOTION FAILED", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "no marker until the outcome is published")
+        ro.chmod(0o700)
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
+        self.assertFalse((run2 / "adapter").exists(), "publishing the approved run needs no retraining")
+        self.assertFalse((self.s1 / "data/pending-promotion").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
+        self.assertIn("skipped: no new labels", log)
+
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
         rc, log, _ = self.run_night(STUB_NEW_LABELS=4, STUB_PROMOTE=0)

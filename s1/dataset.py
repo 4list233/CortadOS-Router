@@ -71,10 +71,10 @@ def _rows_from_db(db: Path, excluded: Counter | None = None) -> list:
     try:
         rows = []
         for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
-            kind = machine_kind(req)
-            if kind:
+            machine = machine_kind(req)     # separate name: `kind` is the row's unit_kind (interactive/background) and must survive
+            if machine:
                 if excluded is not None:
-                    excluded[kind] += 1
+                    excluded[machine] += 1
                 continue
             rid = "rt." + tid if not tag else f"rt.{tag}.{tid}"
             rows.append({"id": rid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})

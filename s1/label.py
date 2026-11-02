@@ -248,6 +248,9 @@ def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
         if PROVIDER is None:
             raise TeacherStop("provider backend not configured")
         text, meta = call_provider(model, _payload(batch), system_prompt(), url=PROVIDER[0], token=PROVIDER[1])
+        # Headroom first: the response metadata says how much of the account is left whatever the answer text looks like, so a
+        # prose / truncated / invalid answer (TeacherSkip below) must not hide a 12%-left reading and let later calls spend more.
+        check_headroom(model, meta)
     where = meta.get("tag") or "cli"
     if meta.get("stop_reason") == "max_tokens":         # a truncated array would parse partly or not at all: never trust it
         raise TeacherSkip(f"{where}: answer truncated (stop_reason max_tokens, {len(text or '')} chars)")
@@ -323,9 +326,7 @@ def work(job: tuple[str, int, list[dict]]) -> int:
                 f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
                                     "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
                 good += 1
-    if BACKEND != "cli":
-        check_headroom(model, meta)
-    if BACKEND != "cli":                                   # the provider meters its own routed requests per account; recording here would double-count
+    if BACKEND != "cli":                                   # (headroom was already checked in call_teacher, before parsing)                                   # the provider meters its own routed requests per account; recording here would double-count
         return good
     try:                                                   # the subscription ledger sees teacher work like any other lane use
         # The usage ledger is CortadOS's PTY plugin ($CORTADOS_PTY_PLUGIN, else <CORTADOS_REPO>/plugins/cortados-pty).

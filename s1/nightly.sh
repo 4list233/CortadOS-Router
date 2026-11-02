@@ -178,6 +178,20 @@ pending=0
 if [ ! -f "$RUN/report.json" ] && { [ -f "$RUN/segment-target" ] || compgen -G "$RUN/adapter/0*_adapters.safetensors" >/dev/null; }; then
   pending=1
 fi
+# A run approved but never published (PROMOTION FAILED): on the same data, publish it now instead of retraining or skipping;
+# new data supersedes it (tonight trains a fresh candidate).
+if [ -f data/pending-promotion ]; then
+  read -r p_hash p_run < data/pending-promotion
+  if [ "$p_hash" = "$sft_hash" ] && [ -f "$p_run/report.json" ]; then
+    if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
+      rm -f data/pending-promotion; state event "$STATUS" promotion "$p_run (retried)";
+      echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels
+      echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
+    fi
+    echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
+  fi
+  echo "pending promotion of $p_run superseded by new training data"; rm -f data/pending-promotion
+fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 # Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
 # 2026-11-02, the same labels + a warm start from the same adapter reproduce the incumbent, so a night with no new labels skips.
@@ -275,18 +289,24 @@ done
 gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
 HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --base "$BASE" --adapter "$RUN/adapter" --out "$RUN" --baseline || exit 1
 echo "$labelled" > data/last-train-count
-echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels   # the no-new-labels marker
 state event "$STATUS" train "$RUN ($labelled labels)"
+# The no-new-data marker is committed only once tonight's outcome is final (published, or intentionally not promoted): saved
+# before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
+mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
 if python3 -c "import json,sys;sys.exit(0 if json.load(open('$RUN/report.json'))['promote'] else 1)"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
     state event "$STATUS" promotion "$RUN"
+    mark_trained
     echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
   else
-    echo "PROMOTION FAILED writing $SERVE_POINTER; incumbent stays"; exit 1
+    echo "$sft_hash $RUN" > data/pending-promotion   # the next night retries publishing this run instead of skipping
+    state event "$STATUS" promotion_failure "$RUN → $SERVE_POINTER"
+    echo "PROMOTION FAILED writing $SERVE_POINTER; incumbent stays; publication retried next night"; exit 1
   fi
 else
+  mark_trained
   echo "not promoted (see $RUN/report.json); incumbent stays"
 fi
 echo "=== $(date) nightly end"

@@ -194,6 +194,24 @@ class ProviderTeacherTests(unittest.TestCase):
         self.assertTrue(label._stop.is_set())
         self.assertIn("12% left < --min-left-pct 30", log)
 
+    def test_low_headroom_stops_the_pass_even_when_the_answer_is_skipped(self):
+        low = "claude-sonnet-5 · 12% left"
+        bodies = {
+            "prose": {"model": low, "stop_reason": "end_turn", "content": [{"type": "text", "text": "I cannot label these."}]},
+            "invalid json": {"model": low, "stop_reason": "end_turn", "content": [{"type": "text", "text": "[{not json}]"}]},
+            "max_tokens": {"model": low, "stop_reason": "max_tokens", "content": [{"type": "text", "text": "[{\"i\": 0"}]},
+        }
+        for name, body in bodies.items():
+            with self.subTest(name):
+                label._stop.clear()
+                self._serve([(200, {}, body)])
+                got, log = self._work()
+                self.fake.close()
+                self.assertEqual(got, 0)
+                self.assertIn("batch dropped", log)
+                self.assertIn("12% left < --min-left-pct 30", log)
+                self.assertTrue(label._stop.is_set(), f"{name}: a skipped answer must not hide low headroom")
+
     def test_ample_headroom_continues(self):
         self._serve([(200, {}, revealed(80))])
         self.assertEqual(self._work()[0], 3)
@@ -350,6 +368,12 @@ class MainExitCodeTests(unittest.TestCase):
         self.fake.close(); reset_pass_state(); label.LABELS.unlink()
         self.assertEqual(self._main([(200, {}, revealed(12))] * 4, extra=("--min-left-pct", "10"))[0], label.EXIT_OK)
         self.assertEqual(len(self.fake.seen), 4)
+
+    def test_low_headroom_on_a_skipped_answer_exits_3(self):
+        prose = {"model": "claude-sonnet-5 · 12% left", "stop_reason": "end_turn", "content": [{"type": "text", "text": "no"}]}
+        code, out = self._main([(200, {}, prose)] * 4)
+        self.assertEqual(code, label.EXIT_STOPPED)
+        self.assertEqual(len(self.fake.seen), 1, "no further calls after a low-headroom reading")
 
     def test_max_scarcity_on_the_provider_backend_is_a_config_error(self):
         self.assertEqual(self._main([], extra=("--max-scarcity", "0.9"))[0], label.EXIT_CONFIG)

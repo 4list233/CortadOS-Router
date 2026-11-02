@@ -63,6 +63,16 @@ class IngestionTests(unittest.TestCase):
         self.assertTrue(rows[0]["id"].endswith(".t1"))
         self.assertIn("refactor the parser", rows[0]["request"])
 
+    def test_unit_kinds_survive_the_machine_filter(self):
+        d = Path(tempfile.mkdtemp()); db = d / "router.db"
+        c = sqlite3.connect(db)
+        c.execute("CREATE TABLE routes (turn_id TEXT, ts REAL, unit_kind TEXT, platform TEXT, request TEXT)")
+        c.executemany("INSERT INTO routes VALUES (?,?,?,?,?)", [("a", 1.0, "interactive", "p", "fix the login bug"),
+                                                                ("b", 2.0, "background", "p", "summarise the logs")])
+        c.commit(); c.close()
+        rows = dataset._rows_from_db(db)
+        self.assertEqual([r["unit_kind"] for r in rows], ["interactive", "background"])
+
     def test_same_stem_dbs_on_different_paths_get_distinct_ids(self):
         # /air/router.db and /studio/router.db share a stem; a shared turn_id must still produce two distinct rows
         a = Path(tempfile.mkdtemp()) / "router.db"; b = Path(tempfile.mkdtemp()) / "router.db"
