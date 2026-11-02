@@ -45,7 +45,7 @@ class GateTests(unittest.TestCase):
 
     def test_fork_denied_in_main_loop_without_budget(self):
         for tool in ("Agent", "Task"):
-            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "f\u2014ork", "\uff46\uff4f\uff52\uff4b"):
+            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "f\u2014ork", "f\u2e5dork", "f\u0378ork", "\uff46\uff4f\uff52\uff4b"):
                 out, err = self.call(dict(self.event, tool_name=tool,
                                           tool_input={"subagent_type": kind, "prompt": "x"}))
                 self.assertEqual(err, "")

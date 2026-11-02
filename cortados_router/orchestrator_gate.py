@@ -57,10 +57,11 @@ def private_file(path, flags):
 
 
 def agent_type_key(name):
-    # Mirrors how Claude Code 2.1.316 resolves an agent type (NFKC, lowercase, whitespace, Unicode dashes and
-    # underscores removed), so spellings like "f_ork", "f-ork" or a full-width "ｆｏｒｋ" cannot slip a fork past us.
-    name = unicodedata.normalize("NFKC", name).lower()
-    return "".join(c for c in name if not c.isspace() and c != "_" and unicodedata.category(c) != "Pd")
+    # Claude Code 2.1.316 resolves an agent type after NFKC, lowercasing, and removing whitespace, Unicode dashes and
+    # underscores, so "f_ork", "f-ork" or a full-width "ｆｏｒｋ" all mean fork. Python's Unicode tables can be older than
+    # Claude Code's (Python 3.9 lacks dashes added in Unicode 14), so instead of copying that rule we keep ONLY letters:
+    # a stricter key that drops every separator, known or not. It can only deny more names as "fork", never fewer.
+    return "".join(c for c in unicodedata.normalize("NFKC", name).lower() if c.isalpha())
 
 
 def decide(event, env, directory=None):
