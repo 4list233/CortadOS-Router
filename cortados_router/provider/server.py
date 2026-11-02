@@ -383,6 +383,21 @@ def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: s
 SESSION_FACTORIES: dict[str, Callable[..., Any]] = {"claude-cli": _claude_session, "codex-cli": _codex_session}
 
 
+class LocalSession:
+    """A local-pinned conversation (local_lane.py). The turns are relayed statelessly, so there is no backend to hold;
+    what is kept is the conversation's binding to its model and the fingerprints of the replies it sent, which is how
+    find() continues it and _model_change keeps it on its model, exactly as for a Claude or Codex pin."""
+
+    def __init__(self, reg: "Registry", *, model: str, **_):
+        self.id, self.model = uuid.uuid4().hex, model
+        self.history: list[str] = []
+        self.lock = threading.Lock()
+        self.last_used = time.time()
+
+    def close(self) -> None:
+        pass
+
+
 class Registry:
     """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
@@ -421,6 +436,8 @@ class Registry:
             scope: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
+        if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
+            factory = LocalSession                  # a local pin: no backend process, only the conversation's binding
         if factory is None:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
@@ -783,48 +800,42 @@ class Handler(BaseHTTPRequestHandler):
                 logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
                              "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
 
-    def _local_pin(self, body: dict[str, Any]) -> bool:
-        """Whether the request pins a local model. A broken local config counts as one when the name is not a table
-        model, so routing.choose answers with the config error instead of an "unknown model" 400."""
-        pinned = routing.sub_pin(body)
-        if not pinned:
-            return False
-        try:
-            return local_lane.find(pinned) is not None
-        except local_lane.LocalConfigError:
-            return False                        # choose_pinned reports the config error for a name it cannot place
-
-    def _serve_local_lane(self, body: dict[str, Any], wire: Wire) -> None:
-        """A local-pinned turn: routed by routing.choose (the one pin path: availability, fit, the routes row) and
-        relayed statelessly to the node. Each turn re-checks the node; an unavailable one is a 503, never a fallback."""
+    def _relay_local(self, session: "LocalSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
+                     wire: Wire) -> None:
+        """One turn of a local-pinned conversation: relayed statelessly to its Ollama node (local_lane.serve), under
+        the conversation's lock and the same stale-history rule as a CLI turn. The reply's fingerprint is appended to
+        the session's history, so the next turn finds this conversation and keeps its model (_model_change). A node
+        that fails a turn leaves the conversation as it was: the laptop may wake, and the same history retried
+        continues it. A conversation whose opening turn failed is dropped (no reply exists to continue from)."""
         reg = self.server.registry
-        exclude, valid = _exclude_model_header(self.headers)
-        if not valid:
-            return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
+        route = session.route or {}
+        if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
+            return self._json(BUSY_STATUS, wire.error_json("overloaded_error", "cortados: conversation busy; retry once "
+                              "the other request on it has finished"))
         try:
-            route = reg.router(body, self._client(), **({"exclude_model": exclude} if exclude else {}))
-        except Exception as exc:
-            logger.exception("routing failed")
-            return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire)
-        if route.get("error"):
-            if route.get("client_error"):
-                return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire)
-            if route.get("fit_blocked"):
-                return self._error(413, "request_too_large", f"cortados: {route['error']}", wire)
-            return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire)
-        local = route.get("local")
-        if not local:                            # the name was local when checked, the route is not: refuse, never guess
-            return self._error(503, "overloaded_error", f"cortados: {body.get('model')} did not route to its local lane", wire)
-        if route.get("route_id"):
-            logger.info("route %s: %s/%s band pin", route["route_id"], route["provider"], route["model"])
-        self._record_run(provider=route["provider"], model=route["model"], label=route["model"],
-                         tools=bool(body.get("tools")))
-        outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=str(body.get("model")))
-        if outcome == "completed" and route.get("route_id") and reg.executed:
-            try:
-                reg.executed(route)              # actual_model; response size is not counted on a relayed stream
-            except Exception as exc:             # the record is advisory: the answer was already delivered
-                logger.warning("local lane: route record failed: %s", exc)
+            if not created and session.history != turn.history:
+                return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
+                                   "for it: another request with the same history was served first; send the current "
+                                   "history", wire)
+            if created and route.get("model"):
+                self._record_run(provider=str(route.get("provider") or ""), model=str(route["model"]),
+                                 label=str(route["model"]), tools=not one_shot)
+            reply: list = []
+            local = route["local"]
+            outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model, reply=reply)
+            session.last_used = time.time()
+            if outcome == "completed":
+                session.history.append(anthropic_wire.reply_fingerprint(reply))
+                if route.get("route_id") and not session.route_logged and reg.executed:
+                    try:
+                        reg.executed(route)
+                        session.route_logged = True
+                    except Exception as exc:     # the answer was delivered; only its record failed
+                        logger.warning("local lane: route record failed: %s", exc)
+            elif created:
+                reg.drop(session)
+        finally:
+            session.lock.release()
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
@@ -837,10 +848,6 @@ class Handler(BaseHTTPRequestHandler):
             # The api/ lane relays the body verbatim to the Anthropic Messages API, so only a Messages-wire body can be
             # pinned to it; on /v1/responses an api/ (or sub/) name falls through to parse_request, which refuses any
             # model but `cortados` with a 400 (Codex compares the echoed model to the one it asked for).
-            # A local pin (sub/<local model>) is relayed to its Ollama node's Messages API, so it too is Messages-wire
-            # only, and only on a routing endpoint (a --fixed-model endpoint honours no pins).
-            if wire is ANTHROPIC and reg.router is not None and self._local_pin(body):
-                return self._serve_local_lane(body, wire)
             api_model = self._api_pin(body) if wire is ANTHROPIC else None
             if api_model:
                 # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
@@ -949,6 +956,8 @@ class Handler(BaseHTTPRequestHandler):
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
                 logger.warning("backend start failed: %s", exc)
                 return self._error(502, "api_error", str(exc), wire)
+        if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
+            return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
         msg_id = wire.new_message_id()
         # The model this response names: what the client asked for, unless it asked to see the real route (the
         # routed-subagents mod does; the main session does not and keeps seeing `cortados`).
@@ -1173,9 +1182,17 @@ class Handler(BaseHTTPRequestHandler):
         if not pinned:
             return None
         r = getattr(session, "route", None) or {}
-        if r.get("pinned") and r.get("model") == pinned:
-            return None
-        now = f"pinned to sub/{r.get('model')}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
+        local = r.get("local")
+        if local:                       # a local pin answers to its alias or its tag, case-insensitively
+            names = {local["model"]["id"].casefold(), local_lane.pin_id(local["model"]).casefold()}
+            if r.get("pinned") and pinned.strip().casefold() in names:
+                return None
+            shown = local_lane.pin_id(local["model"])
+        else:
+            if r.get("pinned") and r.get("model") == pinned:
+                return None
+            shown = r.get("model")
+        now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
                 f"sub/{pinned}; start a new conversation to change models")
 

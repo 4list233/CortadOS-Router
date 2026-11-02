@@ -185,12 +185,26 @@ def _rename(event_line: bytes, name: str) -> bytes:
     return event_line
 
 
+def _fold(reply: list, ev: dict[str, Any]) -> None:
+    """Rebuild the streamed answer's content blocks (text and tool_use ids are all a reply fingerprint reads)."""
+    t = ev.get("type")
+    if t == "content_block_start" and isinstance(ev.get("content_block"), dict):
+        reply.append(dict(ev["content_block"]))
+    elif t == "content_block_delta" and reply and isinstance(ev.get("delta"), dict):
+        d = ev["delta"]
+        if d.get("type") == "text_delta" and reply[-1].get("type") == "text":
+            reply[-1]["text"] = reply[-1].get("text", "") + str(d.get("text", ""))
+
+
 def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, Any], *,
-          echo_model: str) -> str:
+          echo_model: str, reply: list | None = None) -> str:
     """Relay one turn to the node's /v1/messages and the answer back to the client. Returns the outcome: "completed"
     (a whole message or a parsed message_stop), "rejected" (the node answered an HTTP error, relayed as-is),
     "unreachable" (503 sent), or "incomplete" (the stream broke). The response names `echo_model` (what the client
-    asked for), as every other lane does; content, tool_use blocks and stop reasons pass through untouched."""
+    asked for), as every other lane does; content, tool_use blocks and stop reasons pass through untouched. `reply`,
+    when given, receives the answer's content blocks (text and tool_use, rebuilt from the stream) so the server can
+    fingerprint the reply and continue the conversation by its history, as for every other pin."""
+    reply = [] if reply is None else reply
     out = dict(body)
     out["model"] = model["id"]
     data = json.dumps(out).encode()
@@ -234,6 +248,8 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 return "incomplete"
             if isinstance(msg, dict) and msg.get("type") == "message":
                 msg["model"] = echo_model
+            if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                reply.extend(b for b in msg["content"] if isinstance(b, dict))
             _send_json(handler, 200, msg)
             return "completed" if isinstance(msg, dict) and msg.get("type") == "message" else "incomplete"
         try:
@@ -253,11 +269,13 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                     break
                 if line.startswith(b"data:"):
                     line = _rename(line, echo_model)
-                    if b'"message_stop"' in line:
-                        try:
-                            done = done or json.loads(line[5:].strip()).get("type") == "message_stop"
-                        except ValueError:
-                            pass
+                    try:
+                        ev = json.loads(line[5:].strip())
+                    except ValueError:
+                        ev = None
+                    if isinstance(ev, dict):
+                        _fold(reply, ev)
+                        done = done or ev.get("type") == "message_stop"
                 try:
                     handler.wfile.write(line)
                     if line in (b"\n", b"\r\n"):

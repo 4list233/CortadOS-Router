@@ -52,7 +52,8 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if body.get("tools"):
-            content = [{"type": "tool_use", "id": "toolu_1", "name": body["tools"][0]["name"], "input": {"path": "x"}}]
+            content = [{"type": "tool_use", "id": f"toolu_{uuid.uuid4().hex[:8]}", "name": body["tools"][0]["name"],
+                        "input": {"path": "x"}}]
             stop = "tool_use"
         else:
             content = [{"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "hello from qwen"}]
@@ -72,8 +73,13 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.end_headers()
         events = [{"type": "message_start", "message": {**msg, "content": [], "stop_reason": None}}]
         for i, b in enumerate(content):
-            events += [{"type": "content_block_start", "index": i, "content_block": b},
-                       {"type": "content_block_stop", "index": i}]
+            if b["type"] == "text":                       # text streams as deltas, as Ollama sends it
+                events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}]
+                events += [{"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": w}}
+                           for w in ("hello ", "from ", "qwen")]
+            else:
+                events += [{"type": "content_block_start", "index": i, "content_block": b}]
+            events += [{"type": "content_block_stop", "index": i}]
         events += [{"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 3}},
                    {"type": "message_stop"}]
         for ev in events:
@@ -164,14 +170,17 @@ class LocalPinTests(LocalHarness):
         self.assertEqual(events[0]["type"], "message_start")
         self.assertEqual(events[0]["message"]["model"], "sub/qwen-27b")
         self.assertEqual(events[-1]["type"], "message_stop")
-        self.assertIn("hello from qwen", raw)
+        self.assertEqual("".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta"),
+                         "hello from qwen")
         self.assertTrue(FakeOllama.seen[-1][1]["stream"])
 
     def test_tool_use_passthrough(self):
         body = {**self.BODY, "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
         got = self.post(body)
         self.assertEqual(got["stop_reason"], "tool_use")
-        self.assertEqual(got["content"][0], {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "x"}})
+        self.assertEqual({k: v for k, v in got["content"][0].items() if k != "id"},
+                         {"type": "tool_use", "name": "Read", "input": {"path": "x"}})
+        self.assertTrue(got["content"][0]["id"].startswith("toolu_"))
         self.assertEqual(FakeOllama.seen[-1][1]["tools"], body["tools"])
         raw = self.post({**body, "stream": True})
         self.assertIn('"tool_use"', raw)
@@ -220,6 +229,86 @@ class LocalPinTests(LocalHarness):
     def test_excluded_model_refuses_the_local_pin(self):
         self.assertEqual(self.status_of(self.BODY, headers={"x-cortados-exclude-model": "sub/qwen-27b"}), 400)
         self.assertEqual(FakeOllama.seen, [])
+
+
+class LocalConversationPinTests(LocalHarness):
+    """A local-pinned conversation keeps its model, exactly as a Claude or Codex pin does: the binding is recorded in
+    the registry and every continuation is checked against it (the 409 "fixed per conversation")."""
+    TOOLS = [{"name": "Read", "input_schema": {"type": "object"}}]
+
+    def opener(self, model, stream=False):
+        return {"model": model, "max_tokens": 64, "tools": self.TOOLS, "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]}
+
+    def follow(self, opener, reply_content, model):
+        last = reply_content[-1] if reply_content else {}
+        nxt = ({"role": "user", "content": [{"type": "tool_result", "tool_use_id": last["id"], "content": "ok"}]}
+               if last.get("type") == "tool_use" else {"role": "user", "content": "more"})
+        return {**opener, "model": model, "messages": opener["messages"] + [
+            {"role": "assistant", "content": reply_content}, nxt]}
+
+    def conflict(self, body):
+        code, msg = self.error_of(body)
+        self.assertEqual(code, 409)
+        self.assertIn("fixed per conversation", msg)
+        return msg
+
+    def test_a_local_conversation_continues_on_its_model(self):
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first)
+        self.assertEqual(len(self.reg.sessions), 1)
+        second = self.follow(first, got["content"], "sub/qwen-27b")
+        got2 = self.post(second)
+        self.assertEqual(got2["stop_reason"], "tool_use")
+        self.assertEqual(len(FakeOllama.seen), 2)
+        # the tag names the same pin, and `cortados` continues whatever the conversation runs
+        self.post(self.follow(second, got2["content"], f"sub/{TAG}"))
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_a_streamed_local_conversation_continues(self):
+        first = {**self.opener("sub/qwen-27b", stream=True), "tools": self.TOOLS}
+        raw = self.post({**first, "tools": []})                 # tool-less: a one-shot, never registered
+        self.assertEqual(self.reg.sessions, {})
+        raw = self.post(first)
+        blocks = [json.loads(l[5:])["content_block"] for l in raw.splitlines()
+                  if l.startswith("data:") and '"content_block_start"' in l]
+        self.assertEqual(self.post(self.follow({**first, "stream": False}, blocks, "sub/qwen-27b"))["stop_reason"], "tool_use")
+
+    def test_claude_pinned_conversation_cannot_switch_to_a_local_pin(self):
+        first = self.opener("sub/opus")
+        got = self.post(first)
+        msg = self.conflict(self.follow(first, got["content"], "sub/qwen-27b"))
+        self.assertIn("pinned to sub/claude-opus-5-5", msg)
+        self.assertEqual(FakeOllama.seen, [])
+
+    def test_local_pinned_conversation_cannot_switch_to_a_claude_or_codex_pin(self):
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first)
+        for other in ("sub/opus", "sub/gpt-6.1-sol", "sub/phi:latest"):
+            msg = self.conflict(self.follow(first, got["content"], other))
+            self.assertIn("pinned to sub/qwen-27b", msg)
+        self.assertEqual(len(FakeOllama.seen), 1)
+
+    def test_s1_routed_conversation_cannot_switch_to_a_local_pin(self):
+        pinned_router = self.reg.router
+
+        def router(body, client, **kw):
+            if body.get("model") == "cortados":         # stands in for S1: no scorer runs in this test
+                return {"provider": "claude-cli", "model": "claude-sonnet-5", "route_id": "execution:test:s1",
+                        "band": "R2", "degraded": False}
+            return pinned_router(body, client, **kw)
+        self.reg.router = router
+        first = self.opener("cortados")
+        got = self.post(first)
+        msg = self.conflict(self.follow(first, got["content"], "sub/qwen-27b"))
+        self.assertIn("routed by S1 to claude-sonnet-5", msg)
+        self.assertEqual(FakeOllama.seen, [])
+
+    def test_a_failed_opening_turn_leaves_no_conversation(self):
+        self.ollama.shutdown()
+        self.ollama.server_close()
+        self.assertEqual(self.error_of(self.opener("sub/qwen-27b"))[0], 503)
+        self.assertEqual(self.reg.sessions, {})
 
 
 class LocalAutoRoutingOffTests(unittest.TestCase):

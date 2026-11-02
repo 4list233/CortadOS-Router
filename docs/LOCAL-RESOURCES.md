@@ -146,8 +146,11 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
 
 - Only on `/v1/messages` (Ollama implements the Anthropic Messages API there), only on a routing endpoint (not
   `--fixed-model`). The turn is relayed as-is (streaming or not, tools and `tool_use` blocks untouched); only `model` is
-  rewritten to the tag, and the response names the pin the client asked for. Stateless: every turn carries the whole
-  conversation.
+  rewritten to the tag, and the response names the pin the client asked for. The relay is stateless (every turn
+  carries the whole conversation), but the conversation's model binding is kept in the provider's registry
+  (`server.LocalSession`: the reply fingerprints, as for every pin), so a conversation keeps its model: a local
+  conversation whose next turn names `sub/opus`, a `sub/opus` or S1-routed one whose next turn names a local pin, gets
+  the same 409 "the model is fixed per conversation". A tool-less request (a title call) is a one-shot, not tracked.
 - Routing goes through `routing.choose_pinned` (local branch `_choose_local`): no S1; the node must answer `/api/tags`
   within `probe_timeout_s` and list the tag; the request must fit `context_length` (else 413); the conversation's
   opening request is logged as a `routes` row (engine `pin`, lane and provider `local-<node>`), continuations are not.
