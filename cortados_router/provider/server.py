@@ -261,6 +261,18 @@ class RunRecords:
     def __init__(self):
         self._lock = threading.Lock()
         self._runs: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+        # Refused requests per run id (status, kind, message): a request refused before routing (413 too large, a bad
+        # pin) has no route entry, and without this a headless client could only learn "no routed request recorded".
+        self._refusals: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+
+    def refuse(self, run_id: str, *, status: int, kind: str, message: str) -> None:
+        entry = {"status": int(status), "type": kind, "message": str(message)[:500], "at": round(time.time(), 3)}
+        with self._lock:
+            entries = self._refusals.pop(run_id, [])
+            entries = (entries + [entry])[-self.PER_RUN:]      # the most recent PER_RUN refusals
+            self._refusals[run_id] = entries
+            while len(self._refusals) > self.MAX_RUNS:
+                self._refusals.popitem(last=False)
 
     def record(self, run_id: str, *, provider: str, model: str, label: str, tools: bool) -> None:
         entry = {"provider": provider, "model": model, "label": label, "tools": bool(tools)}
@@ -288,14 +300,22 @@ class RunRecords:
         unknown (or evicted) id."""
         with self._lock:
             entries = self._runs.get(run_id)
-            if entries is None:
+            refusals = list(self._refusals.get(run_id) or [])
+            if entries is None and not refusals:
                 return None
-            self._runs.move_to_end(run_id)
-            entries = list(entries)
+            if entries is not None:
+                self._runs.move_to_end(run_id)
+                entries = list(entries)
+        if not entries:                                 # only refusals: nothing was routed
+            return {"run_id": run_id, "model": None, "label": None, "provider": None, "models": [],
+                    "builder_models": [], "refusals": refusals}
         primary = next((e for e in entries if e["tools"]), entries[0])
-        return {"run_id": run_id, "model": primary["model"], "label": primary["label"],
-                "provider": primary["provider"], "models": list(dict.fromkeys(e["model"] for e in entries)),
-                "builder_models": list(dict.fromkeys(e["model"] for e in entries if e["tools"]))}
+        out = {"run_id": run_id, "model": primary["model"], "label": primary["label"],
+               "provider": primary["provider"], "models": list(dict.fromkeys(e["model"] for e in entries)),
+               "builder_models": list(dict.fromkeys(e["model"] for e in entries if e["tools"]))}
+        if refusals:
+            out["refusals"] = refusals
+        return out
 # Route provider -> scarcity lane, for a route that does not carry its resolved candidate's lane. (The anthropic-api
 # lane is not here: an api/-pinned request never has a route and reveals its % in _serve_api_lane instead.)
 _PROVIDER_LANES = {"claude-cli": "claude", "codex-cli": "codex"}
@@ -616,6 +636,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _error(self, code: int, kind: str, message: str, w: Wire = wire) -> None:
+        # Every refusal is logged with its reason (a 413 or 400 used to leave no line at all), and a POST that names a
+        # valid run id records it there, so GET /v1/cortados/runs/<id> can tell a headless client why it was refused.
+        path = (self.path or "").split("?")[0]
+        logger.warning("refused %s %s with %s %s: %s", self.command, path, code, kind, message)
+        if self.command == "POST":
+            try:
+                run_id, valid = self._run_id()
+                if run_id and valid:
+                    self.server.registry.runs.refuse(run_id, status=code, kind=kind, message=message)
+            except Exception:                           # bookkeeping only: never turn a refusal into a crash
+                logger.debug("refusal record failed", exc_info=True)
         self._json(code, w.error_json(kind, message))
 
     # ------------------------------------------------------------------ routes

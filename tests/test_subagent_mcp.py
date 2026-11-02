@@ -34,7 +34,7 @@ class RouteTaskTests(unittest.TestCase):
                             "content": [{"type": "text", "text": "the answer"}]})
         r = m.route_task("http://x:8432", "tok-test-0001", "do a thing", urlopen=prov)
         self.assertNotIn("isError", r)
-        self.assertEqual(r["content"][0]["text"], "the answer\n\n[cortados: gpt-6.1-sol]")   # trailing model line
+        self.assertEqual(r["content"][0]["text"], "the answer\n\n[cortados: S1 → gpt-6.1-sol]")   # trailing model line
         self.assertEqual(r["_meta"]["cortados/routed_model"], "gpt-6.1-sol")
 
     def test_posts_cortados_model_and_token(self):
@@ -90,6 +90,20 @@ class RouteTaskTests(unittest.TestCase):
         schema = [t for t in m.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {})["result"]["tools"]
                   if t["name"] == "route_task"][0]["inputSchema"]["properties"]
         self.assertIn("model", schema)
+
+    def test_reveal_header_and_trailer(self):
+        seen = []
+
+        def _open(req, timeout=None):
+            seen.append(req.headers.get("X-cortados-reveal"))
+            return FakeResp({"model": "claude-haiku-4-5-20251001 · 92% left",
+                             "content": [{"type": "text", "text": "hi"}]})
+        r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open)
+        self.assertEqual(seen[-1], "1")
+        self.assertTrue(r["content"][0]["text"].endswith("[cortados: S1 → claude-haiku-4-5-20251001 · 92% left]"))
+        r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, model="haiku")
+        self.assertEqual(seen[-1], "1")
+        self.assertTrue(r["content"][0]["text"].endswith("[cortados: claude-haiku-4-5-20251001 · 92% left]"))
 
     def test_empty_task_is_an_error(self):
         self.assertTrue(m.route_task("http://x", "t-test-0001", "   ", urlopen=ok_provider({}))["isError"])

@@ -15,7 +15,7 @@ It works in three steps:
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
 - **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`) intercepts every Agent-tool subagent the session spawns and runs it as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. An optional **orchestrator mode** directs the main session to plan and delegate rather than do substantive work itself (guidance by default; `orchestratorEnforce` makes it a hard allowlist). Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
-- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?, model?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. `model` (optional) pins a model instead of S1: any name `start_task`'s `orchestrator` accepts (`fable`, `opus`, `claude-*`, `gpt-*`; one validation, `child_tasks.pin_model`), sent as `sub/<id>`; the result's `_meta` carries the requested and the routed model. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
+- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?, model?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. `model` (optional) pins a model instead of S1: any name `start_task`'s `orchestrator` accepts (`fable`, `opus`, `claude-*`, `gpt-*`; one validation, `child_tasks.pin_model`), sent as `sub/<id>`; the result's `_meta` carries the requested and the routed model, and the text ends with `[cortados: S1 → <model> · <pct>% left]` (routed) or `[cortados: <model> · <pct>% left]` (pinned): route_task asks the provider to reveal the backend model. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
 
 **Recommended setup:** pin the main session to a strong model with `claude --model sub/opus` against the provider, and let the routed-subagents mod send its workers through S1 (`model: cortados` in the mod config, the default). S1 only scores a conversation's first message and the route is then fixed for that conversation — good for a worker whose task is stated up front, not for an orchestrating session whose first message ("let's get started") is too thin to score well. Pinning the planner sidesteps that; routing the workers still gets each one the cheapest capable model.
 
@@ -313,7 +313,7 @@ on the machine that runs the server (`claude -p` launched through `cortados_rout
 `sub/<model>` pin and S1-routed native subagents are exactly those of a `cortados` session), with every tool and MCP
 server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
 
-Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?)` returns a `task_id` at once;
+Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
 `task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
 
 - `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
@@ -324,15 +324,25 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead.
 - Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
   `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
-  `~/.claude/CLAUDE.md` does not make it delegate again. With a pinned orchestrator the launcher's whole-session
-  directive comes first and the child directive last, in the same flag.
+  `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive
+  or its delegation gate, whatever `orchestrator` is: a pin only pins the child's main model (its native subagents
+  are still S1-routed).
+- `claude -p` and deferred tool loading: with tool search on, a headless session may not have an MCP tool's schema
+  loaded and report e.g. "start_task is not a function". Run such sessions with `ENABLE_TOOL_SEARCH=false` so every
+  MCP tool is loaded up front.
 - `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
   signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Without it the
   child gets an explicit `--no-chrome`, so a `claudeInChromeDefaultEnabled` setting cannot turn Chrome on. Chrome inside a
   headless `-p` child is unverified until a live test.
-- Connectors: claude.ai connectors are disabled in token-auth sessions, so if `~/.config/cortados/connectors.mcp.json`
-  exists (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`) the child gets it as `--mcp-config`, loading those
-  servers directly; without it the child runs without connector servers (noted in `runner.log`).
+- Connectors (opt-in): claude.ai connectors are disabled in token-auth sessions, so their servers are listed in
+  `~/.config/cortados/connectors.mcp.json` (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`). A child gets only
+  the servers named in `connectors` (default none), written to a private per-task `--mcp-config` file that is removed
+  when the child exits. Why: every connected server's tool schemas go up front in every request (a custom provider URL
+  gets no client-side tool search). The full set measured ~1.1 MB, about 290k estimated tokens across 495 MCP tools
+  (Vercel alone 241), on 2026-11-02. That is over a 200k model's input ceiling, so the provider refused every such
+  child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
+- Refusals: the provider logs every refusal (any 4xx/5xx it answers) with its reason, and records a refused request
+  under its `x-cortados-run-id`. `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.
   If the runner itself dies, the next status call stops claude's leftover process group (SIGTERM, then SIGKILL after

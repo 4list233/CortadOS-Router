@@ -586,6 +586,29 @@ class RunRecordTests(RoutedHarness):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.lookup("short")[0], 400)
 
+    def test_refusals_are_logged_and_recorded_under_the_run_id(self):
+        def too_big(body, client):
+            return {"error": "sub/x: the request (≈293k tokens) does not fit any Claude account's input ceiling",
+                    "fit_blocked": True}
+        self.reg.router = too_big
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            code, err = self.send({"messages": [{"role": "user", "content": "hi"}]}, "t20261102182559-5ca0fe09")
+        self.assertEqual((code, err["type"]), (413, "request_too_large"))
+        self.assertTrue(any("413" in line and "does not fit" in line for line in logs.output), logs.output)
+        code, got = self.lookup("t20261102182559-5ca0fe09")
+        self.assertEqual(code, 200)                              # no longer "no routed request recorded"
+        self.assertEqual(got["models"], [])
+        self.assertEqual(got["refusals"][-1]["status"], 413)
+        self.assertIn("does not fit", got["refusals"][-1]["message"])
+
+    def test_a_400_refusal_is_recorded_too(self):
+        def bad_pin(body, client):
+            return {"error": "sub/nope: not a served model", "client_error": True}
+        self.reg.router = bad_pin
+        code, _ = self.send({"messages": [{"role": "user", "content": "hi"}]}, "run_bad-pin-1")
+        self.assertEqual(code, 400)
+        self.assertEqual(self.lookup("run_bad-pin-1")[1]["refusals"][-1]["status"], 400)
+
     def test_a_routed_request_is_retrievable_by_run_id(self):
         code, _ = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
                             "run_abc-123")
@@ -633,7 +656,10 @@ class RunRecordTests(RoutedHarness):
                               "run-nostart")
         self.assertEqual((code, err["type"]), (502, "api_error"))
         self.assertEqual(len(self.calls), 1)                          # it was routed, then the backend failed
-        self.assertEqual(self.lookup("run-nostart")[0], 404)
+        code, got = self.lookup("run-nostart")
+        self.assertEqual(code, 200)                                   # no route entry: only the refusal is recorded
+        self.assertEqual((got["models"], got["model"]), ([], None))
+        self.assertEqual(got["refusals"][-1]["status"], 502)
 
     def test_the_api_lane_records_its_label(self):
         from types import SimpleNamespace
