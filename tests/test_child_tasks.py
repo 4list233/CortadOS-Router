@@ -49,6 +49,13 @@ FAKE = textwrap.dedent('''\
         sys.stderr.write(os.environ.get("FAKE_STDERR", ""))
         print(json.dumps({{"type": "result", "is_error": True, "result": os.environ.get("FAKE_RESULT", "")}}))
         sys.exit(1)
+    if mode == "crash-orphan":
+        g = subprocess.Popen([sys.executable, "-c",
+                              "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+        with open(os.path.join(os.getcwd(), "grandchild.pid"), "w") as f:
+            f.write(str(g.pid))
+        time.sleep(0.3)
+        sys.exit(3)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -642,6 +649,7 @@ class ChildTaskTests(unittest.TestCase):
             _, w = self.call("wait_task", task_id=tid, timeout_s=30)
             self.assertEqual(w["exit_code"], 0, mode)
             self.assertEqual(w["state"], "failed", (mode, w))
+            self.assertIn("output_error", w, mode)              # the diagnostic is reported for every malformed shape
         for res in ({"exit_code": 0}, {"exit_code": 0, "output": {}}, {"exit_code": 0, "output_error": "x"},
                     {"exit_code": 0, "output": {"type": "result", "result": "r"}},          # is_error missing
                     {"exit_code": 0, "output": {"type": "result", "is_error": False}}):    # result missing
@@ -702,6 +710,69 @@ class ChildTaskTests(unittest.TestCase):
             self.assertTrue(prompt.endswith(ct.CHILD_DIRECTIVE), orch)       # last, so it wins
             if orch == "opus":
                 self.assertGreater(len(prompt), len(ct.CHILD_DIRECTIVE))      # the launcher's directive comes first
+
+    # --- review round 4 ---------------------------------------------------------------------------------------------
+
+    def test_group_survivor_reaped_after_crash(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "crash-orphan"
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "failed")
+        self.assertEqual(w["exit_code"], 3)
+        with open(os.path.join(self.work, "grandchild.pid")) as f:
+            gpid = int(f.read())
+        end = time.time() + 5
+        while _pid_alive(gpid) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(gpid), "a tool process left in claude's group survived claude's exit")
+
+    def test_overlapping_credentials_across_chunk_boundaries(self):
+        short, long_ = "abcdefgh", "abcdefgh-LONGER-1234"
+        red = ct.Redactor([short, long_])
+        self.assertEqual(red.text("x" + long_ + "y" + short), "x***y***")
+        body = "x" * 11 + long_ + "z" * 5 + short + "q"
+        path = os.path.join(self.tmp, "multi.log")
+        for chunk in range(1, len(body) + 2):
+            with open(path, "w") as f:
+                f.write(body)
+            ct.redact_file(path, red, chunk=chunk)
+            with open(path) as f:
+                got = f.read()
+            self.assertEqual(got, "x" * 11 + "***" + "z" * 5 + "***" + "q", chunk)
+
+    def test_json_escaped_token_scrubbed_from_stored_logs(self):
+        tok = 'tok"quo\\te-0001'                       # a quote and a backslash
+        with open(self.cfg["token_file"], "w") as f:
+            f.write(tok)
+        self.cfg["token"] = "env-token-unrelated-01"
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-auth"
+        tid = self.start()
+        with open(self.cfg["token_file"], "w") as f:            # rotated right after launch
+            f.write("a-rotated-token-0003")
+        r, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        d = ct.task_path(tid)
+        for name in ("stdout.log", "stderr.log", "result.json"):
+            with open(os.path.join(d, name)) as f:
+                data = f.read()
+            self.assertNotIn(tok, data, name)
+            self.assertNotIn(json.dumps(tok)[1:-1], data, name)
+        self.assertNotIn(json.dumps(tok)[1:-1], r["content"][0]["text"])
+
+    def test_redaction_failure_fails_the_task_and_withholds_logs(self):
+        for mode in ("ok", "fail"):
+            tid, d = self._manual_task(mode)
+            old = signal.getsignal(signal.SIGTERM)
+            self.addCleanup(signal.signal, signal.SIGTERM, old)
+            with mock.patch.object(ct, "redact_file", side_effect=OSError("disk gone")):
+                ct._run(d)
+            res = _load(os.path.join(d, "result.json"))
+            self.assertIn("redact_error", res)
+            self.assertEqual(ct.classify(res), "failed", mode)
+            _, st = self.call("task_status", task_id=tid)
+            self.assertEqual(st["state"], "failed")
+            self.assertIn("redact_error", st)
+            self.assertEqual(st["stderr_tail"], ct.REDACT_FAILED_PLACEHOLDER)
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

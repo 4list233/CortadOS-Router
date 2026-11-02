@@ -80,6 +80,7 @@ CHILD_MAX_S_DEFAULT = 3 * 3600      # an unattended child that never ends burns 
 KILL_GRACE_S = 30                   # after SIGTERM to claude's process group, wait this long, then SIGKILL the group
 META_GRACE_S = 60                   # a task dir with no meta.json older than this is a failed start, not "running"
 RESULT_CHARS = 20_000               # result text returned through MCP; MCP clients choke on huge tool results
+REDACT_FAILED_PLACEHOLDER = "(withheld: the runner could not redact this log)"
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
 WAIT_MAX_S = 540                    # MCP clients time a tool call out (~10 min); stay under it
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
@@ -154,12 +155,15 @@ class Redactor:
             raise TaskError(f"a configured provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
                             "provider token and could not be redacted safely (check CORTADOS_PROVIDER_TOKEN and the "
                             "token file)")
+        # Each credential's JSON-escaped spelling too: claude's JSON output escapes quotes and backslashes in it.
+        toks |= {json.dumps(t)[1:-1] for t in toks}
         self.tokens = sorted(toks, key=len, reverse=True)
+        # One alternation, longest first: at any position the longest credential wins (a shorter one that is a prefix
+        # of a longer one never splits it).
+        self._re = re.compile("|".join(re.escape(t) for t in self.tokens)) if self.tokens else None
 
     def text(self, s: str) -> str:
-        for t in self.tokens:
-            s = s.replace(t, "***")
-        return s
+        return self._re.sub("***", s) if self._re else s
 
     def leading_fragment(self, s: str) -> str:
         """Mask a token suffix at the very start of `s` (text read from mid-file may begin mid-token)."""
@@ -177,6 +181,18 @@ class Redactor:
         if isinstance(obj, dict):
             return {self.text(str(k)): self.tree(v) for k, v in obj.items()}
         return obj
+
+
+def pin_model(name) -> str:
+    """The ONE validation for a model name a tool accepts (start_task's orchestrator, route_task's model): 'cortados'
+    (S1 routes) or a pinnable model or alias (fable, opus, sonnet, claude-*, gpt-*, ...). Returns the provider model id:
+    'cortados' or 'sub/<id>' (session.resolve_model, which uses the provider's own alias table)."""
+    if not isinstance(name, str) or not ORCHESTRATOR_RE.fullmatch(name):
+        raise TaskError(f"invalid model {name!r}: use 'cortados' or a pinnable model name (e.g. fable, opus, gpt-6.1-sol)")
+    try:
+        return session.resolve_model(name)
+    except session.SessionError as exc:
+        raise TaskError(str(exc)) from None
 
 
 def claude_bin() -> str:
@@ -198,8 +214,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
         raise TaskError("start_task requires 'cwd', an absolute directory path")
     if not os.path.isdir(cwd):
         raise TaskError(f"cwd {cwd!r} is not an existing directory")
-    if not isinstance(orchestrator, str) or not ORCHESTRATOR_RE.fullmatch(orchestrator):
-        raise TaskError(f"invalid orchestrator {orchestrator!r}: use 'cortados' or a pinnable model name (e.g. fable, opus)")
+    pin_model(orchestrator)
     if permission_mode not in PERMISSION_MODES:
         raise TaskError(f"permission_mode {permission_mode!r} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
                         "(bypassPermissions is deliberately unavailable for unattended children)")
@@ -503,7 +518,7 @@ def classify(res: dict) -> str:
     that exits 0 on the SIGTERM sent at its timeout did not succeed."""
     if res.get("cancelled"):
         return "cancelled"
-    if res.get("timed_out") or res.get("error") or res.get("output_error"):
+    if res.get("timed_out") or res.get("error") or res.get("output_error") or res.get("redact_error"):
         return "failed"
     # Success needs exit 0 AND a valid claude result record that says it is not an error (parse_output's rules):
     # empty stdout, malformed JSON, a scalar or a record of the wrong shape is a failure, not a quiet success.
@@ -592,14 +607,19 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             for k in ("num_turns", "total_cost_usd", "session_id", "subtype"):
                 if k in o:
                     out[k] = o[k]
-        elif res.get("output_error"):
-            out["output_error"] = res["output_error"]
+        if res.get("output_error"):
+            out["output_error"] = res["output_error"]     # reported even when a (malformed) record was parsed
+        if res.get("redact_error"):
+            out["redact_error"] = res["redact_error"]
         if res.get("error"):
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
         out["router_run"] = fetch_run(provider_url, token, task_id)
         if state != "succeeded":
-            out["stderr_tail"] = _tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS, red)
+            # A log the runner could not redact is never shown, not even through this call's own redaction (it only
+            # knows today's credentials).
+            out["stderr_tail"] = (REDACT_FAILED_PLACEHOLDER if res.get("redact_error") else
+                                  _tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS, red))
     return red.tree(out)                        # every string (structured, before any serialization)
 
 
@@ -698,20 +718,31 @@ def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:
     via a unique temp file and an atomic rename."""
     if not red.tokens or not os.path.exists(path):
         return
-    keep = max(len(t) for t in red.tokens) - 1
+    longest = max(len(t) for t in red.tokens)
     fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
     try:
         with open(path, encoding="utf-8", errors="replace", newline="") as src, \
                 os.fdopen(fd, "w", encoding="utf-8", newline="") as dst:
-            carry = ""
+            buf = ""
             while True:
                 block = src.read(chunk)
+                buf += block
+                # Decide matches only where a longest credential would fit entirely inside the buffer: a match that
+                # starts before `cut` is final; text from the first undecided position on is carried, still raw.
+                cut = len(buf) if not block else max(0, len(buf) - longest + 1)
+                out, pos = [], 0
+                for m in red._re.finditer(buf):
+                    if m.start() >= cut:
+                        break
+                    out.append(buf[pos:m.start()])
+                    out.append("***")
+                    pos = m.end()
+                emit_to = max(pos, cut)
+                out.append(buf[pos:emit_to])
+                dst.write("".join(out))
+                buf = buf[emit_to:]
                 if not block:
                     break
-                text = red.text(carry + block)
-                carry = text[-keep:] if keep and len(text) > keep else ("" if not keep else text)
-                dst.write(text[:len(text) - len(carry)])
-            dst.write(red.text(carry))
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -782,8 +813,9 @@ def _run(d: str, lock_fd=None) -> int:
                         _stop_group(proc, pgid, grace)
                         break
                     time.sleep(0.1)
-                if flag["term"] and proc.poll() is not None and _killpg(pgid, 0):
-                    _stop_group(proc, pgid, grace)      # claude went, but its group did not
+                if _killpg(pgid, 0):
+                    # On EVERY exit (clean, crash, stop): a tool process left in claude's group would be orphaned.
+                    _stop_group(proc, pgid, grace)
             except BaseException as exc:
                 # Anything failing after the spawn (even writing child.pid) must not orphan claude: stop its group first.
                 result["error"] = f"runner error after the child started: {type(exc).__name__}: {exc}"
