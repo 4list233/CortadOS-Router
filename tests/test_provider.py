@@ -854,3 +854,40 @@ class MessagesWireFoldTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t1"]["content"], [{"type": "text", "text": "body"}, {"type": "text", "text": "<reminder>"},
                                                               {"type": "image", "data": "QUJD", "mimeType": "image/png"}])
 
+
+
+class WholeSessionTests(RoutedHarness):
+    """Whole-session mode: one Claude Code session sends its main loop as `sub/claude-fable-5-1` and its native
+    subagents as `cortados`. Each first user message is its own conversation; subagents are S1-routed; MCP-named
+    tools reach the backend and come back by name."""
+
+    def test_main_loop_and_concurrent_subagents_are_separate_conversations(self):
+        mcp_tool = dict(READ_TOOL, name="mcp__srv__tool")
+        models, firsts = [], []
+        inner = self.reg.router
+
+        def router(body, client):        # the real router handles the sub/ pin itself; record what it is asked
+            models.append(body.get("model")); firsts.append(body["messages"][0]["content"])
+            return inner(body, client)
+        self.reg.router = router
+        self.raw({"model": "sub/claude-fable-5-1", "tools": [READ_TOOL], "messages": [
+            {"role": "user", "content": "plan the work"}]})
+        results = {}
+
+        def sub(i):
+            results[i] = self.raw({"model": "cortados", "tools": [mcp_tool, READ_TOOL], "messages": [
+                {"role": "user", "content": f"subtask {i}: please use tool"}]})
+
+        threads = [threading.Thread(target=sub, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(models), ["cortados", "cortados", "sub/claude-fable-5-1"])   # one route each
+        self.assertEqual(len(set(firsts)), 3)
+        for header, r in results.values():
+            self.assertTrue(header and header.startswith("claude-cli/claude-test-model"), header)
+            uses = [b for b in r["content"] if b["type"] == "tool_use"]
+            self.assertEqual([u["name"] for u in uses], ["mcp__srv__tool"])   # survives to the backend and back
+        self.assertGreaterEqual(len(self.reg.sessions), 3)
