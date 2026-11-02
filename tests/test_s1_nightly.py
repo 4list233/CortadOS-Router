@@ -50,7 +50,7 @@ STUBS = {
         "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
         "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
         "if a.holdout_count and os.environ.get('STUB_COUNT_RC'): print('Traceback: KeyError answers'); raise SystemExit(1)\n"
-        "if a.holdout_count and os.environ.get('STUB_COUNT_GARBAGE'): print('fifty', floor); raise SystemExit(0)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_GARBAGE'): print('fifty', floor); raise SystemExit(0)\n"        "if a.holdout_count and os.environ.get('STUB_COUNT_MULTILINE'): print(300, floor); print('garbage'); raise SystemExit(0)\n"
         "if a.holdout_count: print('labels: kept N Claude-teacher rows', file=__import__('sys').stderr)   # like read_labels\n"
         "if a.holdout_count: print(50 if hk == 'h0' else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
         "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
@@ -492,14 +492,35 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertIn("ALERT: holdout_count_failed", log)
         self.assertIn("holdout_count_failed", self.status()["alerts"])
         (self.s1 / "data/force-train").write_text("")                              # an explicit override still trains
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")                 # ... and its candidate promotes
         rc, log, run = self.run_night(STUB_NEW_LABELS=1, STUB_HOLDOUT_BLOCKED=1, **env)
         self.assertTrue((run / "adapter").exists(), log)
+        self.assertIn("PROMOTED →", log)
+        st = self.status()
+        self.assertNotIn("holdout_count_failed", st.get("alerts", {}), "resolving the candidate clears its failed-count alert")
+        self.assertNotIn("holdout_count_failed", st.get("streaks", {}))
 
     def test_failed_holdout_count_keeps_the_candidate(self):
         self._count_failure_keeps_candidate(STUB_COUNT_RC=1)
 
     def test_malformed_holdout_count_keeps_the_candidate(self):
         self._count_failure_keeps_candidate(STUB_COUNT_GARBAGE=1)
+
+    def test_multiline_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_MULTILINE=1)
+
+    def test_huge_holdout_floor_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(CORTADOS_S1_MIN_HOLDOUT="9" * 25)
+
+    def test_bad_numeric_settings_fall_back_to_defaults(self):
+        db = self.tmp / "router-air.db"; db.write_text(""); os.utime(db, (1_700_000_000, 1_700_000_000))
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_ROUTER_DB_EXTRA=db, CORTADOS_S1_DB_MAX_AGE_MIN="9" * 30,
+                                   CORTADOS_S1_LOG_KEEP="9" * 30, CORTADOS_S1_MAX_ITERS="x")
+        self.assertNotIn("integer expression expected", log)
+        self.assertIn("DB_MAX_AGE_MIN=" + "9" * 30 + " is not a whole number up to 9 digits; using 60", log)
+        self.assertIn("WARNING: synced router db", log, "a huge age limit must not make a stale db look fresh")
+        self.assertIn("CORTADOS_S1_LOG_KEEP=" + "9" * 30 + " is not a whole number; keeping 14", log)
+        self.assertIn("MAX_ITERS=x is not a whole number up to 9 digits; using 3600", log)
 
     def test_holdout_blocked_force_train_retrains_below_the_floor(self):
         self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)

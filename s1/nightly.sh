@@ -66,6 +66,15 @@ EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailab
 HOLDOUT_BLOCKED_NIGHTS="${CORTADOS_S1_HOLDOUT_BLOCKED_NIGHTS:-2}"   # a candidate blocked by the holdout floor this many nights → ALERT
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
+# `[ a -lt b ]` on a non-number or an out-of-range number prints "integer expression expected" and is simply false, so a
+# bad setting would silently take the permissive branch. Every configurable number a comparison reads is validated here:
+# 1-9 digits (well inside bash's 64-bit arithmetic), else the documented default, with a logged reason.
+whole() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
+setting() {   # setting <var name> <default>: replace an invalid value with the default (logged once the log is open)
+  local v="${!1}"
+  whole "$v" || { SETTING_NOTES="${SETTING_NOTES:-}$1=$v is not a whole number up to 9 digits; using $2. "; printf -v "$1" '%s' "$2"; }
+}
+setting DB_MAX_AGE_MIN 60
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 export CORTADOS_S1_BASE="$BASE"
 # Forest 2026-10-26: fold the Air's synced routed usage into training (another machine rsyncs its router.db here);
@@ -102,12 +111,13 @@ fi
 mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
+[ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 prune_unresumable_runs
 # names only: values can be an internal provider URL or a secret's path
 [ -f data/train-config.env ] && echo "train-config sets: $(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' data/train-config.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | tr '\n' ' ')"
 rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapters, reports) are untouched
   local old
-  case "$LOG_KEEP" in ''|*[!0-9]*) echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14 ;; esac
+  whole "$LOG_KEEP" || { echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14; }
   # 0 would delete tonight's own log (tail -n +1 lists every file): keep at least the current one
   [ "$LOG_KEEP" -lt 1 ] && { echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP would delete tonight's log; keeping 1"; LOG_KEEP=1; }
   old=$(ls -t runs/*/nightly.log 2>/dev/null | tail -n +"$((LOG_KEEP + 1))")
@@ -150,7 +160,10 @@ try: print(json.load(open(sys.argv[1])).get('evaluation_unavailable') or 'report
 except Exception: print('report.json unreadable or malformed')" "$1/report.json"; }
 holdout_count() { CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --holdout-count; }
 holdout_hit() { alert_line "$(state streak "$STATUS" holdout_blocked hit "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS" "candidate waits for the Claude holdout backfill")"; }
-holdout_clear() { state streak "$STATUS" holdout_blocked clear "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS"; }
+holdout_clear() {   # the holdout-blocked candidate is resolved: its blocked streak and any failed-count streak end with it
+  state streak "$STATUS" holdout_blocked clear "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS"
+  state streak "$STATUS" holdout_count_failed clear "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS"
+}
 report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
 eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
   local hk inc
@@ -246,6 +259,7 @@ if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
   # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one
   read -r _ _ p_reason p_run < data/pending-candidate
   echo "forced training: pending candidate $p_run ($p_reason) superseded"; rm -f data/pending-candidate
+  holdout_clear   # the waiting candidate (and any failed count about it) is resolved
 fi
 if [ -f data/pending-candidate ]; then
   read -r p_sft p_eval p_reason p_run < data/pending-candidate
@@ -300,8 +314,10 @@ if [ -f data/pending-candidate ]; then
       # stdout only: evaluate.py's label loader reports its Claude-only filter on stderr, which must not reach the parse
       hc_err=$(mktemp "${TMPDIR:-/tmp}/holdout-count.XXXXXX")
       if hc=$(holdout_count 2>"$hc_err"); then
-        read -r h_rows h_floor h_extra <<< "$hc"
-        case "$h_rows$h_floor" in ''|*[!0-9]*) ;; *) [ -n "$h_rows" ] && [ -n "$h_floor" ] && [ -z "${h_extra:-}" ] && hc_ok=1 ;; esac
+        # the WHOLE stdout must be exactly "<rows> <floor>" on one line, each 1-9 digits (no trailing lines, no huge values)
+        if [[ "$hc" =~ ^([0-9]{1,9})\ ([0-9]{1,9})$ ]]; then
+          h_rows=${BASH_REMATCH[1]}; h_floor=${BASH_REMATCH[2]}; hc_ok=1
+        fi
       fi
       if [ "$hc_ok" -ne 1 ]; then
         echo "HOLDOUT COUNT FAILED (evaluate.py --holdout-count: $( { echo "$hc"; cat "$hc_err"; } | grep -v '^$' | tail -1 | cut -c1-160)); pending $p_run kept, not retraining"
@@ -339,7 +355,8 @@ if [ -f data/laya-tonight ]; then
   LRUN="laya/runs/$(date +%Y-%m-%d)"; [ -f "$LRUN/train-meta.json" ] && LRUN="$LRUN-$(date +%H%M)"
   gpu_alone
   echo "=== $(date) laya night: training into $LRUN (cap ${LAYA_MAX_STEPS:-2000} steps, stop file at ${LAYA_STOP_AT:-0645})"
-  ( while [ "$(date +%H%M)" -lt "${LAYA_STOP_AT:-0645}" ] || [ "$(date +%H%M)" -gt 1200 ]; do sleep 60; [ -f "$LRUN/train-meta.json" ] && exit 0; done; touch "$LRUN/stop"; echo "laya: deadline reached, stop file set" ) &
+  LAYA_STOP_AT="${LAYA_STOP_AT:-0645}"; [[ "$LAYA_STOP_AT" =~ ^[0-9]{4}$ ]] || { echo "LAYA_STOP_AT=$LAYA_STOP_AT is not HHMM; using 0645"; LAYA_STOP_AT=0645; }
+  ( while [ "$((10#$(date +%H%M)))" -lt "$((10#$LAYA_STOP_AT))" ] || [ "$(date +%H%M)" -gt 1200 ]; do sleep 60; [ -f "$LRUN/train-meta.json" ] && exit 0; done; touch "$LRUN/stop"; echo "laya: deadline reached, stop file set" ) &
   deadline=$!
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
@@ -372,6 +389,9 @@ if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f "${SERVE_POINT
   MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
 fi
 if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then mkdir -p "$RUN/adapter"; cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/" 2>/dev/null; echo "warm start from $CORTADOS_S1_INIT"; fi
+setting MAX_ITERS 3600; setting BATCH 2; setting EPOCHS 2   # MAX_ITERS bounds the segment below: never let a bad value pass
+[ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
+[ "$BATCH" -ge 1 ] || BATCH=2
 iters=$(( n * EPOCHS / BATCH ))
 echo "training on $n examples, $iters iterations at batch $BATCH"
 attempt=0
