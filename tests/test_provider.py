@@ -57,6 +57,10 @@ class WireTests(unittest.TestCase):
         body = json.loads('{"tools": [{"name": "Re\\ud800d", "input_schema": {}}], "messages": [{"role": "user", "content": "x"}]}')
         with self.assertRaisesRegex(wire.WireError, r"tool name .*not valid Unicode"):
             wire.parse_request(body)
+        # Non-ASCII beside the surrogate (seen in review: "é\ud800" crashed the old message formatting).
+        mixed = json.loads('{"tools": [{"name": "\\u00e9\\ud800", "input_schema": {}}], "messages": [{"role": "user", "content": "x"}]}')
+        with self.assertRaisesRegex(wire.WireError, r"tool name .*not valid Unicode"):
+            wire.parse_request(mixed)
 
     def test_mid_conversation_system_messages_join_the_new_turn(self):
         turn = wire.parse_request({"messages": [{"role": "user", "content": "do it"},

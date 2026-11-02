@@ -78,7 +78,8 @@ def check_tool_name(name: str, what: str = "tool name") -> str:
     try:
         name.encode("utf-8")
     except UnicodeEncodeError:
-        raise WireError(f"{what} {name.encode('utf-8', 'backslashreplace').decode('ascii')} is not valid Unicode "
+        # !a escapes every non-ASCII code point, so the message itself can always be encoded (é and a surrogate alike).
+        raise WireError(f"{what} {name!a} is not valid Unicode "
                         "(it contains a lone surrogate)") from None
     return name
 
