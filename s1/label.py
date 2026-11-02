@@ -1,10 +1,18 @@
-"""Teacher labelling for CortadOS Router S1. Every request is answered on all twelve routing questions k times, independently, by a strong model
-through the STATELESS Claude brain (subscription, no tools, no session). The k samples are the soft label; their disagreement is the uncertainty.
+"""Teacher labelling for CortadOS Router S1. Every request is answered on all twelve routing questions k times, independently, by a strong model,
+stateless (no tools, no session). The k samples are the soft label; their disagreement is the uncertainty.
 
   train split   → claude-sonnet-5 × 3        holdout split → claude-opus-5 × 3   (a different, stronger teacher grades the exam)
 
-Resume-safe: finished (id, teacher, sample) triples are skipped. Scarcity-gated: stops when the Claude pool it draws on gets scarce.
-  python3 label.py [--limit N] [--k 3] [--batch 12] [--workers 3] [--split train|holdout|all]"""
+Backend (Forest 2026-11-02): the teacher calls go THROUGH THE ROUTER — the `cortados` provider's /v1/messages with a `sub/<model>` pin — so
+the provider picks the subscription account by scarcity and refuses on its own quota/fit gates; no CLI or account is hard-coded here, and a
+new provider needs no recoding. `--backend cli` keeps the old local `claude -p` path for an explicit manual pass only (never a fallback).
+Provider config: CORTADOS_PROVIDER_URL (required), token from CORTADOS_PROVIDER_TOKEN_FILE or ~/.config/cortados/provider-token.
+
+Only Claude teachers: Codex-labelled rows rated tasks much easier and caused under-routing (Forest 2026-11-02), so a non-Claude teacher is refused
+here and common.read_labels drops any already on disk.
+
+Resume-safe: finished (id, teacher, sample) triples are skipped.
+  python3 label.py [--limit N] [--k 3] [--batch 12] [--workers 3] [--split train|holdout|all] [--train-teacher M] [--holdout-teacher M]"""
 from __future__ import annotations
 
 import argparse
@@ -16,16 +24,19 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import DATA, QUESTIONS, REPO, core, read_jsonl, valid_answers
+from common import DATA, LABELER_MARKER, QUESTIONS, REPO, core, is_claude_teacher, read_jsonl, valid_answers
 
 STATE = Path.home() / ".cortados"
 LABELS = DATA / "labels.jsonl"
 DEFAULTS = {"steps": 0, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0, "outward": False, "work_kind": "conversation",
             "urgency": "now", "needs_clarification": False, "parts": 0, "diversity": False}
 TEACHER = {"train": "claude-sonnet-5", "holdout": "claude-opus-5"}
+BACKEND = "provider"
 SCARCITY_STOP = 0.7
 _write = threading.Lock()
 _stop = threading.Event()
@@ -67,10 +78,129 @@ def system_prompt() -> str:
             + ", ".join(f'"{q}": …' for q in ONLY) + "}. No prose, no code fence.")
 
 
+# ------------------------------------------------------------------ provider backend (the router picks the account)
+TOKEN_FILE_DEFAULT = Path.home() / ".config/cortados/provider-token"
+# Seconds per HTTP call: the CLI path's 600 s bound, kept — a 12-request batch on Opus can take minutes; longer means a stalled provider.
+PROVIDER_TIMEOUT_S = 600
+# Attempts per batch on a retryable answer (429/529/5xx without x-should-retry: false, or a dropped connection). Three covers a provider
+# restart or a busy session; more would keep hammering a provider that is down while every other batch does the same.
+PROVIDER_ATTEMPTS = 3
+PROVIDER_BACKOFF_S = (5.0, 20.0)          # seconds before attempt 2 and 3: past a provider restart, short of stalling the nightly
+# The labeler's own traffic lands in the router db like any request; s1/dataset.py must not feed it back as training requests (it is a JSON
+# array of OTHER requests). The provider does not persist x-cortados-run-id in the routes table (only in memory for /v1/cortados/runs), but it
+# logs the user message text, so the marker rides at the head of the message, and the run id (prefix RUN_ID_PREFIX) rides in the header too.
+RUN_ID_PREFIX = "s1-label-"
+# A provider refusal that names spent quota: stop the whole pass (every later batch would get the same answer and the subscriptions need
+# the headroom); rerun after the reset — the pass is resume-safe. The provider answers it as 503 overloaded_error (routing.choose_pinned).
+QUOTA_RE = re.compile(r"no capacity left|subscription account can take|quota|usage limit", re.I)
+# Output budget per call: a 12-request batch answers in ~3-4k tokens of JSON; 8192 leaves room for a --batch of ~24 without truncating the array.
+MAX_TOKENS = 8192
+_run_seq = iter(range(1, 10**9))
+_run_lock = threading.Lock()
+
+
+class TeacherStop(Exception):
+    """Stop the whole pass (quota refused, auth/config rejected, provider unreachable after retries). Logged, never a crash."""
+
+
+class TeacherSkip(Exception):
+    """Drop this batch only (e.g. 413 too large for every account: retrying unchanged cannot succeed)."""
+
+
+def provider_config() -> tuple[str, str]:
+    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip().rstrip("/")
+    if not url:
+        raise SystemExit("label: CORTADOS_PROVIDER_URL is not set; the provider backend needs the cortados endpoint (no default: a wrong "
+                         "host would only show up as a connection error per batch)")
+    tf = Path(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or TOKEN_FILE_DEFAULT).expanduser()
+    try:
+        token = tf.read_text().strip()
+    except OSError as exc:
+        raise SystemExit(f"label: provider token file {tf} unreadable: {type(exc).__name__}")
+    if not token:
+        raise SystemExit(f"label: provider token file {tf} is empty")
+    return url, token
+
+
+def _run_id() -> str:
+    with _run_lock:
+        n = next(_run_seq)
+    return f"{RUN_ID_PREFIX}{time.strftime('%Y%m%d')}-{os.getpid()}-{n}"       # matches the provider's [A-Za-z0-9_-]{8,64}
+
+
+def _error_message(raw: bytes) -> str:
+    try:
+        e = json.loads(raw.decode("utf-8", "replace")).get("error")
+        return str(e.get("message") if isinstance(e, dict) else e)[:300]
+    except (ValueError, AttributeError):
+        return raw[:300].decode("utf-8", "replace")
+
+
+def classify(status: int, should_retry: str | None, message: str) -> str:
+    """'retry' | 'stop' | 'skip' for a non-200 provider answer."""
+    if QUOTA_RE.search(message or ""):
+        return "stop"                                       # spent quota: nothing later in this pass will fare better
+    if status == 413:
+        return "skip"                                       # too large for every account: this batch only
+    if status in (429, 529) or 500 <= status < 600:
+        return "stop" if (should_retry or "").strip().lower() == "false" else "retry"
+    return "stop"                                           # 400/401/403/404: a bad token or an unserved pin; every batch would fail the same
+
+
+def call_provider(model: str, batch_payload: str, system: str, *, url: str, token: str, sleep=time.sleep) -> tuple[str, dict]:
+    run_id = _run_id()
+    body = json.dumps({"model": f"sub/{model}", "max_tokens": MAX_TOKENS, "system": system + "\n\nThe user message starts with a bookkeeping tag "
+                       f"line ({LABELER_MARKER} …); ignore it.",
+                       "messages": [{"role": "user", "content": f"{LABELER_MARKER} run={run_id}\n{batch_payload}"}]}).encode()
+    headers = {"content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": token, "x-cortados-run-id": run_id}
+    last = ""
+    for attempt in range(PROVIDER_ATTEMPTS):
+        if attempt:
+            sleep(PROVIDER_BACKOFF_S[min(attempt - 1, len(PROVIDER_BACKOFF_S) - 1)])
+        req = urllib.request.Request(url + "/v1/messages", data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=PROVIDER_TIMEOUT_S) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            text = "".join(b.get("text", "") for b in out.get("content") or [] if isinstance(b, dict) and b.get("type") == "text")
+            return text, {"run_id": run_id, "usage": out.get("usage") or {}, "model": out.get("model")}
+        except urllib.error.HTTPError as exc:
+            msg = _error_message(exc.read())
+            verdict = classify(exc.code, exc.headers.get("x-should-retry"), msg)
+            last = f"HTTP {exc.code}: {msg}"
+            if verdict == "stop":
+                raise TeacherStop(f"{run_id}: {last}")
+            if verdict == "skip":
+                raise TeacherSkip(f"{run_id}: {last}")
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:     # unreachable / reset / timed out: retryable
+            last = f"{type(exc).__name__}: {str(getattr(exc, 'reason', exc))[:160]}"
+        except ValueError as exc:                                                         # a 200 whose body is not JSON: a provider bug
+            raise TeacherSkip(f"{run_id}: unparseable response: {exc}")
+        print(f"  ~ {model} {run_id}: attempt {attempt + 1}/{PROVIDER_ATTEMPTS} failed ({last}); retrying" if attempt + 1 < PROVIDER_ATTEMPTS
+              else f"  ~ {model} {run_id}: attempt {attempt + 1}/{PROVIDER_ATTEMPTS} failed ({last})", flush=True)
+    raise TeacherStop(f"{run_id}: provider still failing after {PROVIDER_ATTEMPTS} attempts ({last})")
+
+
+PROVIDER: tuple[str, str] | None = None                  # (url, token), set by main() for the provider backend
+
+
+def _payload(batch: list[dict]) -> str:
+    return json.dumps([{"i": n, "unit_kind": r["unit_kind"], "request": r["request"]} for n, r in enumerate(batch)], ensure_ascii=False)
+
+
 def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
+    if BACKEND == "cli":
+        return call_teacher_cli(model, batch)
+    if PROVIDER is None:
+        raise TeacherStop("provider backend not configured")
+    text, meta = call_provider(model, _payload(batch), system_prompt(), url=PROVIDER[0], token=PROVIDER[1])
+    m = re.search(r"\[[\s\S]*\]", text or "")
+    return json.loads(m.group(0)) if m else [], meta
+
+
+def call_teacher_cli(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
     cwd = STATE / "teacher-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps([{"i": n, "unit_kind": r["unit_kind"], "request": r["request"]} for n, r in enumerate(batch)], ensure_ascii=False)
+    payload = _payload(batch)
     argv = ["claude", "-p", "--output-format", "json", "--no-session-persistence", "--max-turns", "1", "--tools", "", "--disable-slash-commands",
             "--strict-mcp-config", "--setting-sources", "project", "--model", model, "--system-prompt", system_prompt()]
     p = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=600, cwd=cwd, env=_env())
@@ -87,6 +217,13 @@ def work(job: tuple[str, int, list[dict]]) -> int:
         return 0
     try:
         answers, meta = call_teacher(model, batch)
+    except TeacherStop as exc:
+        print(f"  ! {model} s{sample}: stopping the pass: {exc}", flush=True)
+        _stop.set()
+        return 0
+    except TeacherSkip as exc:
+        print(f"  ! {model} s{sample}: batch dropped: {exc}", flush=True)
+        return 0
     except Exception as exc:
         msg = str(exc)
         print(f"  ! {model} s{sample}: {type(exc).__name__}: {msg[:160]}", flush=True)
@@ -107,6 +244,8 @@ def work(job: tuple[str, int, list[dict]]) -> int:
                 f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
                                     "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
                 good += 1
+    if BACKEND != "cli":                                   # the provider meters its own routed requests per account; recording here would double-count
+        return good
     try:                                                   # the subscription ledger sees teacher work like any other lane use
         # The usage ledger is CortadOS's PTY plugin ($CORTADOS_PTY_PLUGIN, else <CORTADOS_REPO>/plugins/cortados-pty).
         sys.path.insert(0, str(os.environ.get("CORTADOS_PTY_PLUGIN") or Path(core.REPO) / "plugins/cortados-pty"))
@@ -124,8 +263,21 @@ def work(job: tuple[str, int, list[dict]]) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0); ap.add_argument("--k", type=int, default=3); ap.add_argument("--batch", type=int, default=12)
+    ap.add_argument("--train-teacher", default=os.environ.get("CORTADOS_S1_TEACHER_TRAIN") or TEACHER["train"])
+    ap.add_argument("--holdout-teacher", default=os.environ.get("CORTADOS_S1_TEACHER_HOLDOUT") or TEACHER["holdout"])
+    ap.add_argument("--backend", choices=("provider", "cli"), default="provider", help="cli: the old local `claude -p` path, explicit manual passes only")
     ap.add_argument("--workers", type=int, default=3); ap.add_argument("--split", default="all"); ap.add_argument("--only", default=""); ap.add_argument("--max-scarcity", type=float, default=SCARCITY_STOP, help="override the pool gate for an approved pass")
     a = ap.parse_args()
+    global BACKEND, PROVIDER
+    for split, model in (("train", a.train_teacher), ("holdout", a.holdout_teacher)):
+        if not is_claude_teacher(model):
+            print(f"label: refusing {split} teacher {model!r}: only Claude teachers label (Codex labels under-rated tasks; training drops them)",
+                  file=sys.stderr)
+            return 2
+        TEACHER[split] = model
+    BACKEND = a.backend
+    if BACKEND == "provider":
+        PROVIDER = provider_config()
     global ONLY
     ONLY = [q for q in a.only.split(",") if q]
     global LABELS
@@ -150,6 +302,11 @@ def main() -> int:
     with ThreadPoolExecutor(a.workers) as ex:
         for n, got in enumerate(ex.map(work, jobs), 1):
             total += got
+            if BACKEND == "provider":
+                # No local scarcity gate: the provider chooses the account by scarcity and refuses on its own quota gates (TeacherStop).
+                if n % 5 == 0 or n == len(jobs):
+                    print(f"  {n}/{len(jobs)} calls · {total} labels · {int(time.time() - t0)} s", flush=True)
+                continue
             if n % 5 == 0 or n == len(jobs):
                 models = {j[0] for j in jobs}
                 worst = max(_scarce(m) for m in models)
