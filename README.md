@@ -250,6 +250,18 @@ What runs where:
   (`--no-delegate-directive` skips it). The same settings file turns the routed-subagents plugin off for this session
   (`"enabledPlugins": {"cortados-routed-subagents@cortados-router": false}`) so subagents are not routed twice and the
   directive is not added twice.
+- **Delegation gate:** a standalone stdlib PreToolUse command in that settings file allows the main loop
+  `--delegate-budget N` direct work calls per user prompt (default **3**; **0** is strict), then denies further
+  work and asks it to delegate with Agent. Subagents (hook input contains `agent_id`) keep every tool without a
+  budget. Agent, Task, TodoWrite, Read, Grep, Glob, ToolSearch, Skill, AskUserQuestion, ExitPlanMode and EnterPlanMode
+  are unlimited; every other tool, including unknown future tools, Bash, edits, web and MCP, spends the budget.
+  Set `CORTADOS_DELEGATE_ALLOW_MCP` to a comma-separated list of **exact** `mcp__...` tool names to exempt owner-approved
+  MCP tools (default none; no wildcards). The launcher writes `CORTADOS_DELEGATE_BUDGET` into settings env.
+  `--no-gate` disables enforcement independently of `--no-delegate-directive`.
+  Counters live in `~/.config/cortados/gate/` (0700 directory, 0600 files), keyed by a hashed session ID and then
+  prompt ID (missing prompt ID uses `none`). Atomic replacements and a shared file lock protect parallel calls;
+  counter files older than seven days are pruned. Any internal error **fails open** with one stderr diagnostic:
+  a broken gate must never brick a session. This is an orchestration guardrail, not a security sandbox.
 - `--print-env` shows the env (token masked) and the `claude` argv without launching. Args after `--` go to `claude`.
 
 Known limits: terminal Claude Code only. Desktop-app-only MCP tools (for example the in-app browser) are not

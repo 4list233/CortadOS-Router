@@ -12,6 +12,7 @@ import argparse
 import fnmatch
 import json
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -88,7 +89,7 @@ def read_token(path: str) -> str:
     return token
 
 
-def launcher_env(provider_url: str, token: str) -> dict:
+def launcher_env(provider_url: str, token: str, delegate_budget: int = 3) -> dict:
     """Every variable the launcher sets (BLANKED ones as empty)."""
     env = dict(
         {
@@ -108,6 +109,7 @@ def launcher_env(provider_url: str, token: str) -> dict:
             "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-reveal: 1",
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CORTADOS_WHOLE_SESSION": "1",
+            "CORTADOS_DELEGATE_BUDGET": str(delegate_budget),
         }
     )
     for key in BLANKED:
@@ -115,13 +117,18 @@ def launcher_env(provider_url: str, token: str) -> dict:
     return env
 
 
-def build_env(base: dict, provider_url: str, token: str) -> dict:
+def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 3) -> dict:
     # Kept in the process env too, so anything that reads the environment before settings load sees the same values.
-    return {**base, **launcher_env(provider_url, token)}
+    return {**base, **launcher_env(provider_url, token, delegate_budget)}
 
 
-def settings_content(provider_url: str, token: str) -> dict:
-    return {"env": launcher_env(provider_url, token), "enabledPlugins": {PLUGIN_ID: False}}
+def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True) -> dict:
+    content = {"env": launcher_env(provider_url, token, delegate_budget), "enabledPlugins": {PLUGIN_ID: False}}
+    if gate:
+        # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
+        command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
+        content["hooks"] = {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}
+    return content
 
 
 def _lexical(path: str) -> str:
@@ -264,6 +271,8 @@ def parse(argv: list):
     ap.add_argument("--provider-url")
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     ap.add_argument("--no-delegate-directive", action="store_true")
+    ap.add_argument("--delegate-budget", type=int, default=3, help="direct work calls per prompt (0 = strict)")
+    ap.add_argument("--no-gate", action="store_true", help="disable the delegation enforcement hook")
     ap.add_argument("--print-env", action="store_true")
     ap.add_argument("--settings-dir", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
@@ -272,6 +281,8 @@ def parse(argv: list):
 def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None):
     args, extra = parse(argv)
     check_passthrough(extra)
+    if args.delegate_budget < 0:
+        raise SessionError("--delegate-budget must be nonnegative")
     url = (args.provider_url or base_env.get("CORTADOS_PROVIDER_URL") or "").strip()
     if not url:
         raise SessionError("no provider URL: pass --provider-url or set CORTADOS_PROVIDER_URL")
@@ -280,9 +291,12 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     directive = None
     if not args.no_delegate_directive:
         directive = DIRECTIVE_FILE.read_text(encoding="utf-8").strip()
-    check_managed(set(launcher_env(url, token)), managed_dirs)
-    settings_path = write_settings(args.settings_dir or SETTINGS_DIR, settings_content(url, token), home)
-    return args, build_env(base_env, url, token), build_argv(model, directive, extra, settings_path)
+        if not args.no_gate:
+            directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
+    check_managed(set(launcher_env(url, token, args.delegate_budget)), managed_dirs)
+    settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
+                                   settings_content(url, token, args.delegate_budget, not args.no_gate), home)
+    return args, build_env(base_env, url, token, args.delegate_budget), build_argv(model, directive, extra, settings_path)
 
 
 def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=MANAGED_SETTINGS_DIRS,

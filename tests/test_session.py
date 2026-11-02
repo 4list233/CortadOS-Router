@@ -43,6 +43,31 @@ class SessionTests(unittest.TestCase):
     def settings_files(self):
         return sorted(os.listdir(self.sdir)) if os.path.isdir(self.sdir) else []
 
+    def test_gate_settings_and_controls(self):
+        import shlex
+        from pathlib import Path
+        for flags, budget, enabled in (([], 3, True), (["--delegate-budget", "0"], 0, True),
+                                       (["--delegate-budget", "7"], 7, True),
+                                       (["--no-delegate-directive"], 3, True),
+                                       (["--no-gate"], 3, False)):
+            with self.subTest(flags=flags):
+                _, env, cmd = self.prepare(["--provider-url", "http://r.example",
+                                            "--token-file", self.tok] + flags)
+                with open(cmd[cmd.index("--settings") + 1]) as src:
+                    data = json.load(src)
+                self.assertEqual(data["env"]["CORTADOS_DELEGATE_BUDGET"], str(budget))
+                self.assertEqual(env["CORTADOS_DELEGATE_BUDGET"], str(budget))
+                self.assertEqual("hooks" in data, enabled)
+                if enabled:
+                    hook = data["hooks"]["PreToolUse"][0]
+                    self.assertEqual(hook["matcher"], "*")
+                    self.assertEqual(hook["hooks"][0]["type"], "command")
+                    command = shlex.split(hook["hooks"][0]["command"])
+                    self.assertEqual(command[:2], ["python3", "-B"])
+                    self.assertEqual(Path(command[2]), Path(session.__file__).resolve().with_name("orchestrator_gate.py"))
+        with self.assertRaises(session.SessionError):
+            self.prepare(["--delegate-budget", "-1"])
+
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")
         self.assertEqual(session.resolve_model("opus"), "sub/claude-opus-5-5")
