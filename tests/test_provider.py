@@ -12,6 +12,7 @@ os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import threading
 import time
 import unittest
+import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -854,3 +855,115 @@ class MessagesWireFoldTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t1"]["content"], [{"type": "text", "text": "body"}, {"type": "text", "text": "<reminder>"},
                                                               {"type": "image", "data": "QUJD", "mimeType": "image/png"}])
 
+
+
+class WholeSessionTests(EndpointHarness):
+    """Whole-session mode on PRODUCTION routing: the router is server.serve's (routing.choose over the real core and
+    tables), with only S1 (core.decide), lane health, the route-log state dir and the backend CLI faked. One Claude
+    Code session sends its main loop as `sub/<fable>` and its native subagents as `cortados`."""
+
+    def setUp(self):
+        super().setUp()
+        from cortados_router.provider import routing
+        from cortados_router.session import ORCHESTRATORS
+        self.fable = ORCHESTRATORS["fable"]
+        keep = (core.STATE, core.lane_health, core.decide)
+        self.addCleanup(lambda: (setattr(core, "STATE", keep[0]), setattr(core, "lane_health", keep[1]),
+                                 setattr(core, "decide", keep[2])))
+        core.STATE = Path(tempfile.mkdtemp(prefix="cortados-whole-session-"))   # never the live router.db
+        core.lane_health = lambda: {}
+        routing.execution_routing._scores.clear()
+        self.scored, lock = [], threading.Lock()
+        easy = {"steps": 0, "ambiguity": 0, "blast_radius": 0, "context_size": 0, "novelty": 0, "parallelizability": 0,
+                "outward": False, "needs_clarification": False, "diversity": False, "work_kind": "code",
+                "urgency": "now", "parts": 0}
+
+        def fake_s1(text, ctx=None):
+            with lock:
+                self.scored.append(text)
+            return {"answers": dict(easy), "degraded": False, "engine": "s1-test", "engine_ms": 1}
+        core.decide = fake_s1
+
+        def router(body, client, exclude_model=None):     # as server.serve builds it; Codex off so routes stay Claude
+            return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin="python3",
+                                  codex_bin="no-such-codex-cli", exclude_model=exclude_model)
+        self.executed = []
+        self.reg.router, self.reg.executed = router, self.executed.append
+        self.tools_dir = os.path.join(self.scratch, "tools")
+        os.makedirs(self.tools_dir)
+        os.environ["FAKE_CLAUDE_TOOLS_DIR"] = self.tools_dir
+        self.addCleanup(os.environ.pop, "FAKE_CLAUDE_TOOLS_DIR", None)
+
+    def send(self, body):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              "user-agent": "claude-cli/2.1.316 (external, cli)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.headers.get("x-cortados-route"), json.loads(r.read())
+
+    def test_main_loop_pin_and_concurrent_subagents_on_production_routing(self):
+        mcp_tool = dict(READ_TOOL, name="mcp__srv__tool")
+        # Main loop: sub/<fable> runs Fable and S1 is never asked.
+        header, main = self.send({"model": self.fable, "tools": [READ_TOOL], "messages": [
+            {"role": "user", "content": "plan the work"}]})
+        self.assertTrue(header.startswith("claude-cli/claude-fable-5-1"), header)
+        self.assertEqual(main["content"], [{"type": "text", "text": "echo: plan the work"}])
+        self.assertEqual(self.scored, [])
+
+        # Two native subagents (`cortados`), started together, each with its own first message and an MCP tool.
+        firsts = [f"subtask {i}: please use tool" for i in range(2)]
+        bodies = {i: {"model": "cortados", "tools": [mcp_tool, READ_TOOL],
+                      "messages": [{"role": "user", "content": firsts[i]}]} for i in range(2)}
+        first, second, errors = {}, {}, []
+        gate = threading.Barrier(2)
+
+        def subagent(i):
+            try:
+                gate.wait(10)
+                first[i] = self.send(bodies[i])
+                use = first[i][1]["content"][-1]
+                history = bodies[i]["messages"] + [
+                    {"role": "assistant", "content": first[i][1]["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"],
+                                                  "content": f"result for {i}"}]}]
+                gate.wait(10)                                   # both continuations in flight at once
+                second[i] = self.send(dict(bodies[i], messages=history))
+            except Exception as exc:                            # surfaced below, not lost in the thread
+                errors.append(exc)
+                gate.abort()
+
+        threads = [threading.Thread(target=subagent, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(first), [0, 1])
+        self.assertEqual(sorted(second), [0, 1])
+
+        # S1 scored each subagent exactly once (the continuations are not new conversations), on its own text.
+        self.assertEqual(len(self.scored), 2, self.scored)
+        for f in firsts:
+            self.assertEqual(sum(f in t for t in self.scored), 1, (f, self.scored))
+        for i in range(2):
+            header, r1 = first[i]
+            self.assertTrue(header.startswith("claude-cli/"), header)
+            self.assertFalse(header.startswith("claude-cli/claude-fable-5-1"), header)
+            self.assertEqual(r1["stop_reason"], "tool_use")
+            uses = [b for b in r1["content"] if b["type"] == "tool_use"]
+            self.assertEqual([u["name"] for u in uses], ["mcp__srv__tool"])   # back to the client by its own name
+            # The continuation reached its own conversation's tool call, not the other subagent's.
+            self.assertEqual(second[i][1]["stop_reason"], "end_turn")
+            self.assertEqual(second[i][1]["content"], [{"type": "text", "text": f"tool said: result for {i}"}])
+
+        # Three conversations, three backends, three routes (one pinned, two S1-routed).
+        self.assertEqual(len(self.reg.sessions), 3)
+        self.assertEqual(len({s.route["route_id"] for s in self.reg.sessions.values()}), 3)
+        self.assertEqual(sorted(bool(s.route.get("pinned")) for s in self.reg.sessions.values()), [False, False, True])
+        # The MCP tool name reached each subagent backend unchanged (the bridge lists it as-is, first).
+        seen = [json.loads(Path(self.tools_dir, f).read_text()) for f in sorted(os.listdir(self.tools_dir))]
+        self.assertEqual(len(seen), 3)
+        sub_tools = [x["tools"] for x in seen if "mcp__srv__tool" in x["tools"]]
+        self.assertEqual(len(sub_tools), 2)
+        for tools in sub_tools:
+            self.assertEqual(tools[0], "mcp__srv__tool")

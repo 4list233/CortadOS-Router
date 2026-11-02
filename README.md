@@ -212,6 +212,49 @@ Legacy `WANGCAI_*` names still work and log a deprecation warning.
 | `x-cortados-run-id` | request | tag this request as part of a client-tracked run (`[A-Za-z0-9_-]{8,64}`), so later requests and `GET /v1/cortados/runs/<id>` can learn what it actually ran on |
 | `GET /v1/cortados/runs/<id>` | — | returns `{run_id, model, label, provider, models, builder_models}` for a tagged run (404 unknown id, 400 invalid); advisory, since any token holder can write to a run id |
 
+## Whole session on the router (recommended)
+
+```sh
+export CORTADOS_PROVIDER_URL=http://<provider-host>:<port>   # token in ~/.config/cortados/provider-token
+python3 -m cortados_router.session                           # --orchestrator fable|opus|sonnet|haiku|<model id>|cortados
+```
+
+What runs where:
+
+- **Main loop (orchestrator):** pinned with `--model sub/claude-fable-5-1` (default). The short names come from the
+  provider's own `sub/` alias table (`routing.SUB_ALIASES`): `opus` = `claude-opus-5-5`, `sonnet` = `claude-sonnet-5`,
+  `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
+- **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
+  each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
+  calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is
+  inferred from the Claude Code binary (it is listed beside `CLAUDE_CODE_SUBAGENT_MODEL`), namely that it overrides a
+  model named by an Agent call or agent definition. That is not yet verified; a live end-to-end check will confirm it.
+  The provider tests submit `model=cortados` directly, so they cover routing once that model arrives, not that Claude
+  Code sends it for every subagent. Until the live check passes, treat "every subagent is routed" as expected, not
+  guaranteed.
+- **Side calls** (titles, summaries): `ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-4-5-20251001`, so they stay cheap and skip
+  S1 latency.
+- The provider token is set as both `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`; Bedrock/Vertex/Foundry selectors
+  are blanked; `x-cortados-reveal: 1` is sent; `CORTADOS_WHOLE_SESSION=1` is set.
+- Claude Code applies a settings file's `env` over the process environment, so a saved `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` (or a project's) would override the launcher. So every launcher
+  variable, token included, is written to a private per-session settings file,
+  `~/.config/cortados/sessions/session-<random>.json` (a new 0600 file per launch, so concurrent launches never share
+  one; the directory must be 0700 and it and its ancestors must not be symlinks or owned by another user; files
+  older than 7 days are pruned at launch), and passed with `--settings <path>`. Args after `--` may not include
+  `--settings`, `--setting-sources` or `--model`. That is flag precedence, which beats user, project and local settings; the token is never
+  in argv. The same variables stay in the process env. Only managed policy settings outrank flag settings, so if
+  `/Library/Application Support/ClaudeCode/managed-settings.json` (or `/etc/claude-code/…`, or a
+  `managed-settings.d/*.json` drop-in) sets any of these variables in `env`, the launcher refuses to start.
+- The orchestrator directive (`integrations/orchestrator-directive.md`) is appended with `--append-system-prompt`
+  (`--no-delegate-directive` skips it). The same settings file turns the routed-subagents plugin off for this session
+  (`"enabledPlugins": {"cortados-routed-subagents@cortados-router": false}`) so subagents are not routed twice and the
+  directive is not added twice.
+- `--print-env` shows the env (token masked) and the `claude` argv without launching. Args after `--` go to `claude`.
+
+Known limits: terminal Claude Code only. Desktop-app-only MCP tools (for example the in-app browser) are not
+available. Whether claude.ai connectors load when the session uses a provider token is untested.
+
 ## Delegating sub-agent work through the router
 
 Point a whole tool at `cortados` to route everything, or keep your main session on its own model and route only the

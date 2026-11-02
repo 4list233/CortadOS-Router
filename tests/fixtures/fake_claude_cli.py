@@ -8,7 +8,8 @@ Starts the `bridge` MCP server from --mcp-config like the real CLI, then for eac
     then carries on as above; "misnamed" does the same with a wrong tool under the bridge's prefix
     (mcp__bridge__Bsh); "ran locally" answers the garbled call with a NON-error result, as if the CLI ran it;
   - otherwise it answers "echo: <text>".
-Every turn ends with a result event. Writes its argv and relevant env to $FAKE_CLAUDE_ARGV when set.
+Every turn ends with a result event. Writes its argv and relevant env to $FAKE_CLAUDE_ARGV when set, and its argv and
+the bridge's tools/list names to $FAKE_CLAUDE_TOOLS_DIR/<pid>.json when that is set (one file per backend process).
 With $FAKE_CLAUDE_STALL set it never reads stdin (a hung CLI).
 """
 import json
@@ -45,6 +46,9 @@ tools = []
 if mcp:
     rpc("initialize", {"protocolVersion": "2025-06-18"})
     tools = [t["name"] for t in rpc("tools/list", {})["tools"]]
+if os.environ.get("FAKE_CLAUDE_TOOLS_DIR"):
+    with open(os.path.join(os.environ["FAKE_CLAUDE_TOOLS_DIR"], f"{os.getpid()}.json"), "w") as f:
+        json.dump({"argv": args, "tools": tools}, f)
 
 
 def out(ev):
