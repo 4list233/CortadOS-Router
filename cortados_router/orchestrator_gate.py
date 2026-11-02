@@ -122,6 +122,9 @@ def main(stdin=None, stdout=None, stderr=None, env=None, directory=None):
         # visibly, rather than turning corrupt state or an I/O failure into denial.
         detail = str(exc).replace("\n", " ").replace("\r", " ")
         print(f"orchestrator gate: fail open: {type(exc).__name__}: {detail}", file=stderr)
+        # Exit 1, not 0: Claude Code hides a PreToolUse hook's stderr on exit 0, but shows it on a non-blocking
+        # error (any code other than 0 and 2) while still allowing the tool, so the user sees the gate is off.
+        return 1
     return 0
 
 

@@ -26,7 +26,8 @@ class GateTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         rc = gate.main(io.StringIO(json.dumps(self.event if event is None else event)),
                        out, err, {} if env is None else env, self.directory)
-        self.assertEqual(rc, 0)
+        # Fail-open exits 1 so Claude Code shows the stderr line yet still allows the tool; normal decisions exit 0.
+        self.assertEqual(rc, 1 if err.getvalue() else 0)
         return out.getvalue(), err.getvalue()
 
     def test_subagent_exempt_even_with_empty_agent_id(self):
