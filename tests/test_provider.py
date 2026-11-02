@@ -576,12 +576,13 @@ class RunRecordTests(RoutedHarness):
 
 
 class FailedSessionTombstoneTests(EndpointHarness):
-    """A conversation dropped because its backend failed answers a retry of the failed request with the real reason
-    (502 api_error), not the 409 of a conversation this endpoint never held."""
+    """A conversation dropped because its backend failed answers the next request on it (a retry of the failed request,
+    or a new message on the same history) with a terminal error naming the failure's category, not the 409 of a
+    conversation this endpoint never held; the tombstone belongs to that conversation and client only."""
 
-    def failed_conversation(self):
+    def failed_conversation(self, first="hi"):
         """Open a conversation, fail its second turn in the backend, and return the failed request's body."""
-        history = [{"role": "user", "content": "hi"}]
+        history = [{"role": "user", "content": first}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history})
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "backend failure"}]
         body = {"tools": [READ_TOOL], "messages": history}
@@ -590,38 +591,68 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.assertEqual(self.reg.sessions, {})                        # the failed conversation was dropped
         return body
 
-    def error_of(self, body):
+    def send(self, body, headers=None):
+        req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              **(headers or {})})
+        return urllib.request.urlopen(req, timeout=30)
+
+    def error_of(self, body, headers=None):
         try:
-            self.post(body)
+            self.send(body, headers).close()
             self.fail("expected an HTTP error")
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read())
+            return e.code, json.loads(e.read()), e.headers
 
-    def test_a_retry_of_the_failed_request_gets_the_original_reason_not_a_409(self):
+    def test_a_retry_of_the_failed_request_gets_a_terminal_error_not_a_409(self):
         body = self.failed_conversation()
         for _ in range(2):                                              # every retry, not only the first
-            code, err = self.error_of(body)
-            self.assertEqual((code, err["error"]["type"]), (502, "api_error"))
+            code, err, headers = self.error_of(body)
+            # 400 invalid_request_error + x-should-retry: false: Claude Code / the SDK retry api_error and 5xx.
+            self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+            self.assertEqual(headers.get("x-should-retry"), "false")
             msg = err["error"]["message"]
-            self.assertIn("cache TTL ordering", msg)                   # the backend's own reason
-            self.assertRegex(msg, r"^cortados: conversation [0-9a-f]{8} failed at \d\d:\d\d:\d\d: .*start a new conversation$")
+            self.assertIn("backend_reported_error: the Claude backend reported an error (API status 400)", msg)
+            self.assertNotIn("cache TTL ordering", msg)                # backend text is never replayed
+            self.assertRegex(msg, r"^cortados: conversation [0-9a-f]{8} failed at \d\d:\d\d:\d\d .*start a new conversation$")
             self.assertNotIn("no longer holds", msg)
         self.assertEqual(self.reg.sessions, {})                        # a tombstone never restarts a backend
 
-    def test_a_streaming_retry_gets_the_reason_as_an_sse_error(self):
+    def test_a_new_message_on_the_failed_history_also_gets_the_terminal_error(self):
+        body = self.failed_conversation()
+        follow = dict(body, messages=body["messages"] + [{"role": "user", "content": "are you there?"}])
+        self.assertEqual(self.error_of(follow)[0], 400)
+
+    def test_a_streaming_retry_gets_a_terminal_sse_error(self):
         body = self.failed_conversation()
         raw = self.post(dict(body, stream=True))
         events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
         self.assertEqual([e["type"] for e in events], ["message_start", "error"])
-        self.assertEqual(events[-1]["error"]["type"], "api_error")
-        self.assertIn("cache TTL ordering", events[-1]["error"]["message"])
+        self.assertEqual(events[-1]["error"]["type"], "invalid_request_error")
+        self.assertIn("backend_reported_error", events[-1]["error"]["message"])
+
+    def test_another_conversation_with_the_same_reply_never_gets_the_tombstone(self):
+        body = self.failed_conversation()
+        # Same assistant reply (same fingerprints), different earlier user message: another conversation.
+        other = dict(body, messages=[{"role": "user", "content": "a different question"}] + body["messages"][1:])
+        code, err, _ = self.error_of(other)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+        other_system = dict(body, system="another client's system prompt")
+        self.assertEqual(self.error_of(other_system)[0], 409)
+
+    def test_another_client_or_run_with_the_same_history_never_gets_the_tombstone(self):
+        body = self.failed_conversation()
+        self.assertEqual(self.error_of(body)[0], 400)                  # the default client (Python-urllib)
+        self.assertEqual(self.error_of(body, {"user-agent": "claude-cli/2.1.0 (external, cli)"})[0], 409)
+        self.assertEqual(self.error_of(body, {server.RUN_ID_HEADER: "run-00042"})[0], 409)
 
     def test_a_genuinely_unknown_history_is_still_a_409(self):
         self.failed_conversation()
         body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"},
                                                    {"role": "assistant", "content": "an answer from elsewhere"},
                                                    {"role": "user", "content": "go on"}]}
-        code, err = self.error_of(body)
+        code, err, _ = self.error_of(body)
         self.assertEqual(code, 409)
         self.assertIn("no longer holds", err["error"]["message"])
 
@@ -635,17 +666,35 @@ class FailedSessionTombstoneTests(EndpointHarness):
     def test_the_store_keeps_only_the_newest_entries(self):
         class Dead:
             def __init__(self, i):
-                self.id, self.history = f"{i:08x}-dead", [f"fp-{i}"]
+                self.id = f"{i:08x}-dead"
             def close(self):
                 pass
         with mock.patch.object(server, "TOMBSTONE_MAX", 3):
             for i in range(5):
-                self.reg.fail(Dead(i), "x" * 10_000 + TOKEN)
-        self.assertEqual(list(self.reg.tombstones), [("fp-2",), ("fp-3",), ("fp-4",)])
-        reason = self.reg.tombstones[("fp-4",)][0]
-        self.assertLessEqual(len(reason), server.TOMBSTONE_REASON_CHARS)
-        self.reg.fail(Dead(9), "boom " + TOKEN)
-        self.assertNotIn(TOKEN, self.reg.tombstones[("fp-9",)][0])     # the endpoint token never lands in one
+                self.reg.fail(Dead(i), BridgeError("boom"), f"key-{i}")
+        self.assertEqual(list(self.reg.tombstones), ["key-2", "key-3", "key-4"])
+        self.reg.fail(Dead(9), BridgeError("boom"), None)              # an opening request: no tombstone
+        self.assertEqual(len(self.reg.tombstones), 3)
+
+    def test_the_replayed_reason_never_carries_tool_arguments_or_backend_text(self):
+        secret = "sk-live-SECRET123 /Users/someone/private.txt"
+        cases = {
+            "codex app-server sent a malformed item/tool/call: "
+            + json.dumps({"arguments": {"command": f"cat {secret}"}})[:300]: "backend_protocol_error",
+            f"the headless CLI reported an error: API Error: 400 {secret}": "backend_reported_error",
+            f"the Codex turn failed: {secret} (usageLimitExceeded)": "codex_turn_failed",
+            f"the Codex turn failed: boom ({secret})": "codex_turn_failed",
+            f"codex app-server refused client tool {secret}: {secret}": "backend_protocol_error",
+            f"the headless CLI exited with code 1; see {secret}": "backend_exited",
+            f"something nobody anticipated: {secret} {TOKEN}": "backend_error",
+        }
+        for text, kind in cases.items():
+            diag = server.failure_diagnostic(BridgeError(text))
+            self.assertTrue(diag.startswith(kind + ": "), (text, diag))
+            for leak in ("SECRET", "private", "someone", TOKEN, "cat "):
+                self.assertNotIn(leak, diag)
+        self.assertTrue(server.failure_diagnostic(BridgeError("the Codex turn failed: x (usageLimitExceeded)"))
+                        .endswith("(usageLimitExceeded)"))           # an allowlisted enum value is kept
 
     def test_an_idle_closed_conversation_leaves_no_tombstone(self):
         history = [{"role": "user", "content": "hi"}]
@@ -656,6 +705,65 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
         follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
         self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": follow}), 409)
+
+    def test_a_request_waiting_on_a_failing_turn_never_reaches_the_dead_backend(self):
+        # Deterministic overlap: request A holds the session lock and its backend fails; request B (a retry with the
+        # same history) found the session before A failed and waits for the lock. The session must be out of the
+        # registry and the tombstone in place at the same instant, before B gets the lock; B is then told the
+        # failure, terminally, and never drives the closed backend.
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r1["content"]},
+                                                              {"role": "user", "content": "overlap"}]}
+        in_turn, release = threading.Event(), threading.Event()
+        seen, b_waiting, sends = [], threading.Event(), []
+        real_acquire = s.lock.acquire
+
+        def send_user(content, timeout):
+            sends.append(content)
+            if len(sends) == 1:
+                in_turn.set()
+                release.wait(10)
+                with self.reg._lock:                                    # what any other request could observe now
+                    seen.append((s.id in self.reg.sessions, len(self.reg.tombstones)))
+                raise BridgeError("the headless CLI exited with code 9; see /secret/dir")
+            raise AssertionError("a request reached the failed backend")
+
+        class Lock:                                                     # signals when B starts waiting for the lock
+            def acquire(self_, timeout=-1):
+                if in_turn.is_set():
+                    b_waiting.set()
+                return real_acquire(timeout=timeout)
+            def release(self_):
+                s.lock_real.release()
+            def locked(self_):
+                return s.lock_real.locked()
+        s.lock_real, s.send_user = s.lock, send_user
+        s.lock = Lock()
+        results = {}
+
+        def call(name):
+            results[name] = self.error_of(body)
+
+        a = threading.Thread(target=call, args=("a",))
+        with self.assertLogs("cortados.provider", "WARNING"):
+            a.start()
+            self.assertTrue(in_turn.wait(10))
+            b = threading.Thread(target=call, args=("b",))
+            b.start()
+            self.assertTrue(b_waiting.wait(10))
+            release.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(seen, [(True, 0)])                           # while A's turn ran: live, no tombstone
+        self.assertEqual(len(sends), 1)                                # B never sent anything to the backend
+        self.assertEqual(results["a"][0], 502)                         # A gets its own failure
+        code, err, _ = results["b"]
+        self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("backend_exited", err["error"]["message"])
+        self.assertNotIn("secret", err["error"]["message"])
+        self.assertEqual((self.reg.sessions, len(self.reg.tombstones)), ({}, 1))
 
 
 class StartFailureTests(unittest.TestCase):

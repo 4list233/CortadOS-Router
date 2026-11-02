@@ -27,6 +27,9 @@ class ClientTurn:
     history: list[str] = field(default_factory=list)   # reply_fingerprint of every earlier assistant message
     stream: bool = False
     model: str = MODEL_ID
+    # Digest of everything the request carried before its new turn (system, every earlier user and assistant
+    # message, cache metadata removed): it names the conversation itself, where `history` only proves the replies.
+    prefix_digest: str = ""
 
 
 def _system_text(system: Any) -> str:
@@ -83,6 +86,12 @@ def reply_fingerprint(blocks: Any) -> str:
     text = "".join(b.get("text", "") for b in bs if b.get("type") == "text").strip()
     ids = [b.get("id") for b in bs if b.get("type") == "tool_use"]
     return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
+
+
+def history_digest(*parts: Any) -> str:
+    """A stable digest of a request's conversation so far. Canonical JSON (sorted keys, ASCII escapes, so a lone
+    surrogate hashes too); the same request re-sent gives the same digest, any other content another."""
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
 
 
 def check_tool_name(name: str, what: str = "tool name") -> str:
@@ -142,7 +151,9 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools if t.get("name")],
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
-                      stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID))
+                      stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
+                      prefix_digest=history_digest(_system_text(body.get("system")),
+                                                   [[m.get("role"), _blocks(m.get("content"))] for m in messages[:start]]))
 
 
 def transcript_text(messages: list[dict[str, Any]]) -> str:

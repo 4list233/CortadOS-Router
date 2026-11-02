@@ -248,7 +248,8 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     if not content and not results:
         raise WireError("the new turn carries no user content and no tool outputs")
     return ClientTurn(system="\n\n".join(system_parts), tools=_parse_tools(body.get("tools")), content=content,
-                      tool_results=results, history=history, stream=stream, model=MODEL_ID)
+                      tool_results=results, history=history, stream=stream, model=MODEL_ID,
+                      prefix_digest=anthropic_wire.history_digest(body.get("instructions"), [it for _, it in kept[:start]]))
 
 
 def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, Any]]:
@@ -380,11 +381,19 @@ def sse_body(blocks: list[dict[str, Any]], stop_reason: str, usage: dict[str, in
                  response=_response(msg_id or new_message_id(), model, "completed", items, _usage_json(usage)))
 
 
-def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID, sequence: int = 1) -> bytes:
-    """response.failed; Codex shows response.error.message."""
+# The response.failed code of a failure retrying cannot fix. Codex retries a response.failed stream error, except
+# for the codes it maps to a fatal error; `invalid_prompt` is the one of those that means "this request will not be
+# served" (the others claim a context-window or quota problem, which would mislead). A Codex build that does not know
+# it falls back to its ordinary, bounded stream retry, and every retry gets the same answer.
+TERMINAL_CODE = "invalid_prompt"
+
+
+def sse_error(message: str, *, msg_id: str | None = None, model: str = MODEL_ID, sequence: int = 1,
+              terminal: bool = False) -> bytes:
+    """response.failed; Codex shows response.error.message. `terminal`: the non-retried code (TERMINAL_CODE)."""
     return _event("response.failed", sequence,
                   response=_response(msg_id or new_message_id(), model, "failed", [], None,
-                                     error={"code": "server_error", "message": message}))
+                                     error={"code": TERMINAL_CODE if terminal else "server_error", "message": message}))
 
 
 def error_json(kind: str, message: str) -> dict[str, Any]:

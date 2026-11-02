@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from cortados_router.provider import codex_bridge, routing, server
+from cortados_router.provider import codex_bridge, responses_wire, routing, server
 from cortados_router.provider.server import ProviderServer, Registry
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -391,22 +391,27 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertIn("usageLimitExceeded", body["error"]["message"])
         self.assertEqual(self.reg.sessions, {})                        # a failed conversation is dropped
 
-    def test_a_retry_of_a_failed_mid_conversation_turn_gets_the_reason_not_a_409(self):
-        # /v1/responses shares Registry.find: Codex re-sending the failed request is told why, in its own shape.
+    def test_a_retry_of_a_failed_mid_conversation_turn_gets_a_terminal_error_not_a_409(self):
+        # /v1/responses shares Registry.find: Codex re-sending the failed request is told why, in its own shape, and
+        # in a shape it does not retry (HTTP 400; streaming: response.failed with TERMINAL_CODE, not server_error).
         items = [user("hi")]
         _, r1 = self.post(request(*items))
         items += r1["output"] + [user("fail")]
         code, _ = self.error_of(request(*items))
         self.assertEqual(code, 502)
         code, body = self.error_of(request(*items))                   # the retry, identical history
-        self.assertEqual((code, body["error"]["type"]), (502, "api_error"))
-        self.assertIn("usageLimitExceeded", body["error"]["message"])
+        self.assertEqual((code, body["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("codex_turn_failed: the Codex backend failed the turn (usageLimitExceeded)", body["error"]["message"])
+        self.assertNotIn("You've hit your usage limit", body["error"]["message"])   # backend text is never replayed
         self.assertNotIn("no longer holds", body["error"]["message"])
-        _, events, _ = self.stream(request(*items))                    # streaming: response.failed with the reason
+        _, events, _ = self.stream(request(*items))                    # streaming: response.failed, terminal code
         self.assertEqual([k for k, _ in events], ["response.created", "response.failed"])
-        self.assertIn("usageLimitExceeded", events[-1][1]["response"]["error"]["message"])
+        error = events[-1][1]["response"]["error"]
+        self.assertEqual(error["code"], responses_wire.TERMINAL_CODE)
+        self.assertIn("usageLimitExceeded", error["message"])
         self.assertEqual(self.reg.sessions, {})
-
+        other = [user("another conversation")] + items[1:]             # same reply, another conversation: 409
+        self.assertEqual(self.error_of(request(*other))[0], 409)
 
 if __name__ == "__main__":
     unittest.main()

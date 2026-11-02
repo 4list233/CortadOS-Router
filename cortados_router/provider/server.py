@@ -2,8 +2,9 @@
 
 Owner of the conversation registry: which bridge session a request belongs to. A request with no assistant messages
 starts a new session; any other goes to the one live session whose replies are exactly its assistant history, and
-fails with 409 when there is none or more than one, or with 502 and the original reason when that history belongs to
-a conversation closed because its backend failed (a bounded, time-limited tombstone; both wires share the lookup).
+fails with 409 when there is none or more than one, or with a terminal 400 naming the failure's category when the
+request belongs to a conversation closed because its backend failed (a bounded, time-limited tombstone keyed by the
+conversation itself; both wires share the lookup).
 A request without tools always gets its own throwaway CLI.
 
 Run:  python3 -B -m cortados_router.provider.server [--port 8432]
@@ -49,16 +50,67 @@ DEFAULT_PORT = 8432                                     # next to S1's 8431
 TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 # A conversation the client has not touched for this long is closed; its CLI process holds memory and a login slot.
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
-# A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request
-# (Claude Code retries an api_error with the same history) is told the real reason instead of a misleading 409.
+# A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request,
+# or its next message on the same history, is told why instead of a misleading 409. A tombstone is keyed by the
+# conversation itself (Registry.failure_key: the calling client, its run id, and a digest of the whole history the
+# request carried), so another conversation that happens to contain the same reply never receives it. It holds only
+# an allowlisted diagnostic (failure_diagnostic): a fixed category and message, never backend or tool text.
 # TTL: a client's automatic retries finish within minutes; 15 minutes also covers a person re-sending by hand, and
 # after that the conversation is as unknown as any other (409). Max entries: one per recently failed conversation,
 # capped so a burst of failures (a vendor outage across many sessions) cannot grow memory without bound; the oldest
-# goes first. Reason chars: the bridge's error is one line about the backend; capped so a tombstone never holds more
-# than a short reason (no tool contents, no transcript), whatever an error message happens to carry.
+# goes first.
 TOMBSTONE_TTL_S = 900.0
 TOMBSTONE_MAX = 256
-TOMBSTONE_REASON_CHARS = 300
+# The answer to a request on a failed conversation must be terminal: an api_error (5xx, or an SSE `api_error`) is
+# what Claude Code and the Anthropic SDK retry, so a retryable shape would make the client re-send the same doomed
+# request until its retry budget runs out. 400 invalid_request_error is not retried (the SDK retries 408, 409, 429
+# and 5xx only), and `x-should-retry: false` says so explicitly to the SDK; the message says to start a new
+# conversation. The Responses wire uses its own non-retried code (responses_wire.TERMINAL_CODE).
+TERMINAL_ERROR = "invalid_request_error"
+TERMINAL_STATUS = 400
+
+# What a tombstone may say about a failure: (category, fixed message), chosen by matching the bridge's own BridgeError
+# templates. Only these fixed strings are ever replayed; an error message can embed tool arguments (a malformed
+# item/tool/call), backend output or paths, and none of that may reach another request. First match wins.
+_FAILURE_CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    (r"^the Codex turn (failed|interrupted)", "codex_turn_failed", "the Codex backend failed the turn"),
+    (r"^the headless CLI reported an error", "backend_reported_error", "the Claude backend reported an error"),
+    (r"within \d+s|deadline passed|produced nothing for|conversation busy", "backend_timeout",
+     "the backend did not answer in time"),
+    (r"exited with code|is gone:|the session was closed", "backend_exited", "the backend process exited"),
+    (r"^cannot start", "backend_start_failed", "the backend could not be started"),
+    (r"isolation|non-bridged tool|rerouted the turn|started the thread (on|with)", "backend_policy_violation",
+     "the backend broke the endpoint's isolation or routing policy"),
+    (r"tool results? for|pending tool calls|without a result for|unanswered|without consuming",
+     "tool_result_mismatch", "the tool results did not match the backend's pending tool calls"),
+    (r"malformed|reused tool call id|refused|without a (thread|turn) id|cliVersion", "backend_protocol_error",
+     "the backend broke its protocol"),
+)
+# Codex's codexErrorInfo values (app-server protocol enum): the one detail of a failed Codex turn safe to replay,
+# because it is a fixed identifier from this list, never free text.
+_CODEX_ERROR_INFO = frozenset({
+    "contextWindowExceeded", "usageLimitExceeded", "httpConnectionFailed", "responseStreamConnectionFailed",
+    "internalServerError", "unauthorized", "badRequest", "sandboxError", "responseStreamDisconnected",
+    "responseTooManyFailedAttempts", "threadRollbackFailed", "other"})
+
+
+def failure_diagnostic(exc: object) -> str:
+    """The allowlisted, replayable description of a backend failure: `<category>: <fixed message>`, plus an HTTP
+    status (Claude) or codexErrorInfo value (Codex) only when it has exactly the known shape. Never raw error text."""
+    text = str(exc)
+    for pattern, kind, message in _FAILURE_CATEGORIES:
+        if re.search(pattern, text):
+            break
+    else:
+        kind, message = "backend_error", "the backend failed"
+    detail = ""
+    if kind == "backend_reported_error":
+        m = re.match(r"^the headless CLI reported an error: API Error: ([1-5]\d\d)\b", text)
+        detail = f" (API status {m.group(1)})" if m else ""
+    elif kind == "codex_turn_failed":
+        m = re.search(r"\(([A-Za-z]+)\)$", text)
+        detail = f" ({m.group(1)})" if m and m.group(1) in _CODEX_ERROR_INFO else ""
+    return f"{kind}: {message}{detail}"
 
 _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
@@ -84,9 +136,9 @@ class Wire:
     API) reuses the session logic by supplying its own. `parse_request`, `one_shot_content(body)`, `message_json`
     and `error_json` take and return what the Anthropic ones do; `routing_body` turns the request into the
     Anthropic-shaped body `routing.choose` scores; `stream_body(msg_id, model, blocks, stop, usage)` and
-    `stream_error(msg_id, model, message)` also receive the id `stream_start` announced and the requested model,
+    `stream_error(msg_id, model, message[, terminal=])` also receive the id `stream_start` announced and the requested model,
     because the Responses wire must echo both in its final event (Codex compares the model) while the Anthropic
-    wire needs neither."""
+    wire needs neither. `terminal=True` marks an error no retry can fix with each wire's non-retried kind."""
 
     def __init__(self, *, model_id: str, error_type: type, parse_request: Callable, one_shot_content: Callable,
                  routing_body: Callable, new_message_id: Callable, stream_start: Callable, stream_ping: Callable,
@@ -102,7 +154,8 @@ ANTHROPIC = Wire(
     one_shot_content=lambda body: anthropic_wire.one_shot_content(body["messages"]), routing_body=lambda body: body,
     new_message_id=anthropic_wire.new_message_id, stream_start=anthropic_wire.sse_start, stream_ping=anthropic_wire.sse_ping,
     stream_body=lambda msg_id, model, blocks, stop, usage: anthropic_wire.sse_body(blocks, stop, usage),
-    stream_error=lambda msg_id, model, message: anthropic_wire.sse("error", anthropic_wire.error_json("api_error", message)),
+    stream_error=lambda msg_id, model, message, terminal=False: anthropic_wire.sse(
+        "error", anthropic_wire.error_json(TERMINAL_ERROR if terminal else "api_error", message)),
     message_json=anthropic_wire.message_json, error_json=anthropic_wire.error_json)
 # The Responses wire scores what its user and assistant messages say, in Anthropic shape, with the rest of the body
 # kept (routing.choose sizes the request from the whole body and reads `tools` to tell a one-shot from a session).
@@ -115,7 +168,8 @@ RESPONSES = Wire(
                                    tools=responses_wire.function_tools(body)),
     new_message_id=responses_wire.new_message_id, stream_start=responses_wire.sse_start, stream_ping=responses_wire.sse_ping,
     stream_body=lambda msg_id, model, blocks, stop, usage: responses_wire.sse_body(blocks, stop, usage, msg_id=msg_id, model=model),
-    stream_error=lambda msg_id, model, message: responses_wire.sse_error(message, msg_id=msg_id, model=model),
+    stream_error=lambda msg_id, model, message, terminal=False: responses_wire.sse_error(message, msg_id=msg_id, model=model,
+                                                                                         terminal=terminal),
     message_json=responses_wire.message_json, error_json=responses_wire.error_json)
 WIRES: dict[str, Wire] = {"/v1/messages": ANTHROPIC, "/v1/responses": RESPONSES}
 wire = ANTHROPIC                                        # the endpoint's own errors (GET 401, 404) speak the Anthropic wire
@@ -314,8 +368,8 @@ class Registry:
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
-        # tuple(history) of a failed conversation -> (reason, failed_at, short id); under self._lock, oldest first.
-        self.tombstones: "OrderedDict[tuple, tuple[str, float, str]]" = OrderedDict()
+        # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
+        self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
 
     def claude_config_dir(self, account: str | None) -> str | None:
@@ -353,9 +407,21 @@ class Registry:
                 self.sessions[s.id] = s
         return s
 
-    def find(self, turn: anthropic_wire.ClientTurn):
+    @staticmethod
+    def failure_key(turn: anthropic_wire.ClientTurn, *, wire_path: str, client: str, run_id: str | None) -> str | None:
+        """The identity of the conversation a request belongs to, for its tombstone: the wire, the calling client (its
+        User-Agent name), its x-cortados-run-id when it sends one, and the wire's digest of the whole history before
+        the new turn (system, every earlier user and assistant message). A retry of a failed request, and the next
+        message a person types after it, carry that same history; an unrelated conversation that contains the same
+        reply does not. None for an opening request: it has no conversation to name, and find never matches it."""
+        if not turn.history:
+            return None
+        return anthropic_wire.history_digest(wire_path, client, run_id or "", turn.prefix_digest)
+
+    def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
-        No match, or more than one, is a LostSession: never continue a conversation on a guess."""
+        No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
+        tombstone under `failure_key` makes it a FailedSession instead."""
         if not turn.history:
             return None
         with self._lock:
@@ -363,17 +429,16 @@ class Registry:
         if len(matches) > 1:
             raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
         if not matches:
-            dead = self._tombstone(tuple(turn.history))
+            dead = self.failure(failure_key)
             if dead:
-                reason, failed_at, short = dead
-                raise FailedSession(f"cortados: conversation {short} failed at "
-                                    f"{time.strftime('%H:%M:%S', time.localtime(failed_at))}: {reason}; "
-                                    "it was closed — start a new conversation")
+                raise dead
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
 
-    def _tombstone(self, key: tuple):
-        """The live tombstone for this history, or None; expired ones are pruned on the way."""
+    def failure(self, key: str | None) -> "FailedSession | None":
+        """The FailedSession for this conversation's live tombstone, or None; expired tombstones are pruned on the way."""
+        if not key:
+            return None
         now = time.time()
         with self._lock:
             while self.tombstones:
@@ -381,26 +446,29 @@ class Registry:
                 if now - self.tombstones[oldest][1] <= TOMBSTONE_TTL_S:
                     break
                 del self.tombstones[oldest]
-            return self.tombstones.get(key)
+            dead = self.tombstones.get(key)
+        if not dead:
+            return None
+        diagnostic, failed_at, short = dead
+        return FailedSession(f"cortados: conversation {short} failed at "
+                             f"{time.strftime('%H:%M:%S', time.localtime(failed_at))} ({diagnostic}; details are in "
+                             "the provider log) and was closed: start a new conversation")
 
-    def fail(self, s, reason: object) -> None:
-        """Drop a conversation whose backend failed, leaving a tombstone keyed by its history: a request that failed
-        did not advance the history, so the failed request and any retry of it carry exactly this history. An opening
-        request (empty history) leaves none: its retry is a new conversation anyway (find never matches it). The
-        reason is one line, the endpoint token masked, truncated; nothing else of the conversation is kept."""
-        key = tuple(getattr(s, "history", None) or ())
-        if key:
-            text = " ".join(str(reason).split())
-            if self.token:
-                text = text.replace(self.token, "<token>")
-            if len(text) > TOMBSTONE_REASON_CHARS:
-                text = text[:TOMBSTONE_REASON_CHARS - 1] + "…"
-            with self._lock:
+    def fail(self, s, exc: object, key: str | None) -> None:
+        """Close a conversation whose backend failed. The caller holds `s.lock` and passes the failing request's own
+        failure_key, so no request can reach the backend in between and the key never depends on session state.
+        Removing the session and installing the tombstone happen together under the registry lock: no request ever
+        sees both the live session and its tombstone, or neither. The backend is closed after, outside that lock (a
+        slow close must not stall every other request). The tombstone keeps only failure_diagnostic(exc)."""
+        diagnostic = failure_diagnostic(exc)
+        with self._lock:
+            self.sessions.pop(s.id, None)
+            if key:
                 self.tombstones.pop(key, None)
-                self.tombstones[key] = (text or "backend error", time.time(), str(s.id)[:8])
+                self.tombstones[key] = (diagnostic, time.time(), str(s.id)[:8])
                 while len(self.tombstones) > TOMBSTONE_MAX:
                     self.tombstones.popitem(last=False)
-        self.drop(s)
+        s.close()
 
     def get(self, session_id: str):
         with self._lock:
@@ -424,8 +492,9 @@ class LostSession(LookupError):
 
 
 class FailedSession(LostSession):
-    """The history belongs to a conversation that was closed because its backend failed (a tombstone): answered 502
-    with the failure's reason, not the 409 of a conversation this endpoint never held or has forgotten."""
+    """The request belongs to a conversation that was closed because its backend failed (a tombstone): answered with
+    a terminal error (TERMINAL_STATUS / TERMINAL_ERROR) naming the failure's category, not the 409 of a conversation
+    this endpoint never held or has forgotten."""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -452,10 +521,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a JSON object")
         return body
 
-    def _json(self, code: int, data: dict[str, Any], session=None) -> None:
+    def _json(self, code: int, data: dict[str, Any], session=None, headers: dict[str, str] | None = None) -> None:
         raw = json.dumps(data).encode()
         self.send_response(code)
         self._route_header(session)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
@@ -662,7 +733,9 @@ class Handler(BaseHTTPRequestHandler):
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools
-            session = None if one_shot else reg.find(turn)
+            fail_key = None if one_shot else reg.failure_key(turn, wire_path=self.path.split("?")[0],
+                                                              client=self._client(), run_id=self._run_id()[0])
+            session = None if one_shot else reg.find(turn, fail_key)
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
                 # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
@@ -685,23 +758,26 @@ class Handler(BaseHTTPRequestHandler):
         except wire.WireError as exc:
             return self._error(400, "invalid_request_error", str(exc), wire)
         except FailedSession as exc:
-            logger.info("retry of a failed conversation refused: %s", exc)
-            if turn.stream:                             # the same SSE error a streaming client got when it failed
+            logger.info("request on a failed conversation refused: %s", exc)
+            if turn.stream:                             # an SSE error, as a streaming client gets any turn's failure
                 try:
                     self.send_response(200)
                     self.send_header("content-type", "text/event-stream")
                     self.send_header("cache-control", "no-cache")
                     self.send_header("connection", "close")
+                    self.send_header("x-should-retry", "false")
                     self.end_headers()
                     self.close_connection = True
                     msg_id = wire.new_message_id()
                     self.wfile.write(wire.stream_start(msg_id, turn.model))
-                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(exc)))
+                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(exc), terminal=True))
                     self.wfile.flush()
                 except OSError as gone:
                     logger.info("client gone before the failed-conversation error was sent (%s)", gone)
                 return
-            return self._error(502, "api_error", str(exc), wire)
+            # Terminal, not retryable: see TERMINAL_ERROR.
+            return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(exc)),
+                              headers={"x-should-retry": "false"})
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         changed = self._model_change(session, body) if session is not None else None
@@ -780,6 +856,13 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["error"] = BridgeError(f"conversation busy for {TURN_TIMEOUT_S:.0f}s")
                 return
             try:
+                if not created and reg.get(session.id) is not session:
+                    # Registry.find ran before the lock, and the conversation was closed while this request waited:
+                    # its backend failed under the request that held the lock (Registry.fail), or it was reaped. The
+                    # backend is gone, so nothing is sent to it; the request is told what a fresh lookup would say.
+                    outcome["stale"] = reg.failure(fail_key) or LostSession(
+                        "the conversation was closed while this request waited for it; start a new conversation")
+                    return
                 if not created and session.history != turn.history:
                     # Registry.find ran before the lock: a second continuation with the same history (a client
                     # retry, two overlapping requests) found the session too, and the one that lost the lock now
@@ -819,6 +902,11 @@ class Handler(BaseHTTPRequestHandler):
                             threading.Thread(target=_log_outcome, name="cortados-outcome-log", daemon=True).start()
             except BridgeError as exc:
                 outcome["error"] = exc
+                if not one_shot:
+                    # Still under the session lock: a request waiting for it finds the conversation gone (above), never
+                    # a backend that just failed. The key is this request's own, computed before the turn ran.
+                    reg.fail(session, exc, fail_key)
+                    outcome["failed"] = True
             finally:
                 session.lock.release()
                 if one_shot:
@@ -845,17 +933,22 @@ class Handler(BaseHTTPRequestHandler):
                         logger.info("conversation %s: client gone mid-turn (%s); waiting for the turn to end",
                                     session.id[:8], exc)
             if "stale" in outcome:
-                logger.warning("conversation %s: stale continuation refused: %s", session.id[:8], outcome["stale"])
+                stale = outcome["stale"]
+                logger.warning("conversation %s: stale continuation refused: %s", session.id[:8], stale)
+                failed = isinstance(stale, FailedSession)     # terminal, as when find meets the tombstone
                 if client_gone:
                     return
                 if turn.stream:
-                    self.wfile.write(wire.stream_error(msg_id, model, str(outcome["stale"])))
+                    self.wfile.write(wire.stream_error(msg_id, model, str(stale), terminal=failed))
                     return
-                return self._error(409, "invalid_request_error", str(outcome["stale"]), wire)
+                if failed:
+                    return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(stale)),
+                                      headers={"x-should-retry": "false"})
+                return self._error(409, "invalid_request_error", str(stale), wire)
             if "error" in outcome:
                 logger.warning("conversation %s failed: %s", session.id[:8], outcome["error"])
-                if not one_shot:
-                    reg.fail(session, outcome["error"])
+                if not one_shot and not outcome.get("failed"):   # busy: the worker never held the lock to do it
+                    reg.fail(session, outcome["error"], fail_key)
                 if client_gone:
                     return
                 if turn.stream:
