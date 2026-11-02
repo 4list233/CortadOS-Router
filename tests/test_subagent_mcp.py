@@ -34,7 +34,7 @@ class RouteTaskTests(unittest.TestCase):
                             "content": [{"type": "text", "text": "the answer"}]})
         r = m.route_task("http://x:8432", "tok-test-0001", "do a thing", urlopen=prov)
         self.assertNotIn("isError", r)
-        self.assertEqual(r["content"][0]["text"], "the answer")
+        self.assertEqual(r["content"][0]["text"], "the answer\n\n[cortados: gpt-6.1-sol]")   # trailing model line
         self.assertEqual(r["_meta"]["cortados/routed_model"], "gpt-6.1-sol")
 
     def test_posts_cortados_model_and_token(self):

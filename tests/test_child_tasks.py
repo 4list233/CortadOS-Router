@@ -700,6 +700,11 @@ class ChildTaskTests(unittest.TestCase):
         with open(path) as f:
             self.assertEqual(f.read(), "x" * 10 + "***" + "y" * 7 + "***")
 
+    def test_child_directive_wording(self):
+        self.assertIn("may use your own subagents", ct.CHILD_DIRECTIVE)
+        self.assertIn("do not call start_task", ct.CHILD_DIRECTIVE)
+        self.assertNotIn("do not delegate it again", ct.CHILD_DIRECTIVE)
+
     def test_child_directive_in_argv(self):
         for orch in ("cortados", "opus"):
             tid = self.start(orchestrator=orch)

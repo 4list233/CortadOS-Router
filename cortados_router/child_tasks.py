@@ -89,10 +89,11 @@ STRIP_ENV = ("CLAUDECODE",)
 MANAGED_DIRS = session.MANAGED_SETTINGS_DIRS   # tests point this elsewhere
 # Children load the same ~/.claude/CLAUDE.md as the user's top-level sessions, whose ORCHESTRATOR directive says to
 # delegate via start_task/route_task; this tells the child unambiguously that it is the delegate.
-CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do the task yourself, directly and "
-                   "completely; do not delegate it again and do not call start_task. Your final message is returned to "
-                   "the orchestrator: end with a concise report of what you did, what you verified, and anything left "
-                   "undone.")
+# Native subagents are fine (S1 routes them); starting further child tasks or re-handing the whole task off is not.
+CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do the task yourself and completely. You may "
+                   "use your own subagents for parts of it (they are routed by S1), but do not call start_task or hand "
+                   "the whole task off again. Your final message is returned to the orchestrator: end with a concise "
+                   "report of what you did, what you verified, and anything left undone.")
 
 
 class TaskError(Exception):

@@ -229,7 +229,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     model = data.get("model")
     model = model if isinstance(model, str) and model else "?"    # a non-string would be repr'd past the scrub
     # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
-    return {"content": [{"type": "text", "text": scrub(text) or "(the delegate returned no text)"}],
+    # One trailing line names the model that really ran, so the orchestrator can see and report it (MCP clients may not
+    # show _meta to the model).
+    body_text = (scrub(text) or "(the delegate returned no text)") + f"\n\n[cortados: {scrub(model)}]"
+    return {"content": [{"type": "text", "text": body_text}],
             "_meta": {"cortados/routed_model": scrub(model), "cortados/requested_model": requested}}
 
 
