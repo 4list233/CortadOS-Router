@@ -297,6 +297,14 @@ codex mcp add cortados-route \
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
 
+## Local models (pin-only)
+
+The owner's machines can serve their Ollama models through the provider as pins: `claude --model sub/qwen-27b`
+relays each turn to that node's Ollama Messages API. S1 never routes there (the `auto_route` switch is off and
+refused when on until local lanes are evaluated); an asleep or busy node fails the pin with a clear 503, never a
+fallback. Ollama has no auth, so bind it to the node's Tailscale address or localhost plus a tunnel. Config schema and
+details: `docs/LOCAL-RESOURCES.md` ("Local models").
+
 ## The resource pool at a glance
 
 A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (reachable from any device on the tailnet; it asks for the token and never embeds it), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.

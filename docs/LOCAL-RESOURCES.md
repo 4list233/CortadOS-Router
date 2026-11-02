@@ -127,6 +127,38 @@ to 240 seconds, and publishes through the same merge-on-write), so a `max_age_s`
 under 60 leaves the lane unavailable between refreshes rather than admitting
 stale capacity.
 
+## Local models (pin-only)
+
+A node with an `ollama` block offers its Ollama models to the provider as `sub/<alias or tag>` pins
+(`cortados_router/provider/local_lane.py`). The provider reads the same file as the sampler,
+`CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's block.
+
+| key | meaning |
+| --- | --- |
+| `base_url_env` | name of an env var holding the node's Ollama URL, e.g. `http://<tailscale-ip>:11434` (wins over `base_url`) |
+| `base_url` | the URL itself, for the git-ignored `tables/resources.json` only; never commit a real address |
+| `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
+| `auto_route` | the S1 auto-routing switch; default `false`. `true` is refused with a config error: a local lane must be evaluated and given routing-table candidates before S1 may pick it |
+| `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute) |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (tokens; default 32768, the input-fit gate) |
+
+Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
+
+- Only on `/v1/messages` (Ollama implements the Anthropic Messages API there), only on a routing endpoint (not
+  `--fixed-model`). The turn is relayed as-is (streaming or not, tools and `tool_use` blocks untouched); only `model` is
+  rewritten to the tag, and the response names the pin the client asked for. Stateless: every turn carries the whole
+  conversation.
+- Routing goes through `routing.choose_pinned` (local branch `_choose_local`): no S1; the node must answer `/api/tags`
+  within `probe_timeout_s` and list the tag; the request must fit `context_length` (else 413); the conversation's
+  opening request is logged as a `routes` row (engine `pin`, lane and provider `local-<node>`), continuations are not.
+- Availability is the `/api/tags` answer; there is no quota. The Pro is the owner's laptop: asleep, closed, off the
+  tailnet or busy, it fails the pin with a 503 that says so. Nothing falls back to another model.
+- Not listed in `served_routes`, so S1 cannot choose a local lane.
+
+**Exposure.** Ollama has no authentication: anyone who reaches the port can run models. On the node, listen only on
+the Tailscale address (`OLLAMA_HOST=<tailscale-ip>:11434`), or on localhost with a tunnel (SSH `-L`) from the provider
+host, never on `0.0.0.0` on an untrusted network. This repository configures neither.
+
 ## What this setup does not claim
 
 The home machines are not verified until their SSH targets are configured and

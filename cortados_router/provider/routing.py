@@ -8,6 +8,8 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
+  local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py): pin-only,
+                    never in SERVED_PROVIDERS, so S1 auto-routing cannot pick it (its auto_route switch stays off).
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
                     route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
@@ -22,6 +24,7 @@ from typing import Any, Callable
 
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import local_lane
 
 # The Claude CLI (P1, bridge.py) and the Codex CLI (P2, codex_bridge.py). Local models need the 2026-09-28 "no local
 # routes" ruling lifted and local entries in the generated model scores. `openai-codex` is deliberately absent: it is
@@ -207,6 +210,15 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     (engine `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for
     labelling). A Codex pin runs on the provider's one Codex login (codex_bridge on --codex-home): this endpoint
     has no per-account Codex backend yet (server._codex_session), so it is a single candidate on the `codex` lane."""
+    try:
+        local = local_lane.find(model)
+    except local_lane.LocalConfigError as exc:      # a broken local config refuses local pins, never guesses a node
+        local = None
+        local_error = str(exc)
+    else:
+        local_error = None
+    if local is not None:
+        return _choose_local(core, body, *local, client=client, conversation_id=conversation_id)
     # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport a Claude model as
     # unknown. Only a Claude-shaped name is refused for it, so a broken Claude config never blocks a Codex pin.
     try:
@@ -218,9 +230,11 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     pinnable = pinnable_models(core)
     provider = next((p for p, m in pinnable if m == model), None)
     if provider is None:
+        if local_error:
+            return {"router": execution_routing.ROUTER, "error": f"sub/{model}: {local_error}"}
+        names = [m for _, m in pinnable] + [local_lane.pin_id(m) for _, m in local_lane.pins()]
         return {"router": execution_routing.ROUTER, "client_error": True,
-                "error": f"sub/{model} is not a model this endpoint serves; pin one of: "
-                         f"{', '.join(m for _, m in pinnable)}"}
+                "error": f"sub/{model} is not a model this endpoint serves; pin one of: {', '.join(names)}"}
     vendor = PIN_VENDORS[provider]
     family = vendor["family"]
     if provider == "claude-cli":
@@ -304,6 +318,46 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
             "account": chosen["account"], "config_dir": chosen["config_dir"],
             "context_length": cap_of(chosen), "route_id": route_id, "api_request_id": "",
             "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
+
+
+def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *, client: str,
+                  conversation_id: str) -> dict[str, Any]:
+    """The local-lane kind of a sub/ pin (choose_pinned's one branch for it): the node must answer /api/tags and list
+    the model (no quota: available or not), the request must fit the model's configured context, and the opening
+    request of a conversation is put on record as a routes row (engine `pin`, lane local-<node>). The lane is
+    stateless, so every turn is checked again but only the opener is logged: one row per conversation, as other pins.
+    Never a fallback: an unavailable node is an error the person sees, not a quiet hop to another model."""
+    pin = local_lane.pin_id(entry)
+    try:
+        tags = local_lane.probe(node)
+    except local_lane.LocalUnavailable as exc:
+        return {"router": execution_routing.ROUTER, "error": f"sub/{pin}: {exc}; no other model was tried"}
+    if entry["id"] not in tags:
+        return {"router": execution_routing.ROUTER,
+                "error": f"sub/{pin}: node {node['node']} does not list {entry['id']} (ollama pull it there); "
+                         "no other model was tried"}
+    need = int(request_fit(body)["input_tokens"])
+    if need > entry["context_length"]:
+        return {"router": execution_routing.ROUTER, "fit_blocked": True,
+                "error": f"sub/{pin}: the request (≈{need // 1000}k tokens) exceeds {entry['id']}'s configured "
+                         f"context ({entry['context_length'] // 1000}k) on {node['lane']}"}
+    chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+              "config_dir": None, "reserve": False, "pool": None}
+    route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
+             "hard_rules": [f"pinned by the client: sub/{pin}"], "skipped": None}
+    decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": None}
+    opener = not any(m.get("role") == "assistant" for m in body.get("messages") or [])
+    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}" if opener else None
+    if opener:
+        core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}",
+                                  "unit_kind": "interactive", "actual_model": None,
+                                  "request": request_text(body.get("messages") or [],
+                                                          standalone=not body.get("tools"))[:8000]},
+                       decision, route)
+    return {"router": execution_routing.ROUTER, "provider": node["lane"], "model": entry["id"], "account": None,
+            "config_dir": None, "context_length": entry["context_length"], "route_id": route_id,
+            "api_request_id": "", "degraded": False, "band": "pin", "pinned": True, "decision": decision,
+            "route": route, "local": {"node": node, "model": entry}}
 
 
 def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, codex_bin: str) -> bool | None:
