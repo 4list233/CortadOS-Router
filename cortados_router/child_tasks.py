@@ -299,7 +299,8 @@ def _max_s() -> int:
 
 
 def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION_MODE, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False) -> dict:
+          provider_url="", token_file=None, chrome=False, red=None) -> dict:
+    """`red` carries the launch credentials (env token and token file's token as they are now)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
@@ -325,6 +326,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
+                                  red or Redactor(),
                                   chrome, max_s, exe)
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
@@ -371,7 +373,8 @@ def _abort_runner(runner, d: str) -> None:
         pass
 
 
-def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, chrome, max_s, exe):
+def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
+             exe):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
@@ -409,7 +412,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
               encoding="utf-8") as f:
         f.write(task)
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
-            "allowed_tools": tools, "task_chars": len(task), "task_preview": task.strip()[:200],
+            "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],   # redact, THEN slice
             "started_at": time.time(), "connectors_config": conn if not conn_note else None,
             "chrome": chrome, "max_s": max_s, "runner_pid": None,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
@@ -480,10 +483,13 @@ def classify(res: dict) -> str:
     that exits 0 on the SIGTERM sent at its timeout did not succeed."""
     if res.get("cancelled"):
         return "cancelled"
-    if res.get("timed_out") or res.get("error"):
+    if res.get("timed_out") or res.get("error") or res.get("output_error"):
         return "failed"
-    out = res.get("output") or {}
-    if res.get("exit_code") == 0 and not out.get("is_error"):
+    # Success needs exit 0 AND a valid claude result record that says it is not an error (parse_output's rules):
+    # empty stdout, malformed JSON, a scalar or a record of the wrong shape is a failure, not a quiet success.
+    out = res.get("output")
+    if (res.get("exit_code") == 0 and isinstance(out, dict) and out.get("type") == "result"
+            and out.get("is_error") is False and isinstance(out.get("result"), str)):
         return "succeeded"
     return "failed"
 
@@ -643,6 +649,75 @@ def _killpg(pgid: int, sig) -> bool:
         return False
 
 
+def _note_child(d: str, pgid: int) -> None:
+    with open(os.path.join(d, "child.pid"), "w", encoding="utf-8") as f:
+        f.write(str(pgid))                      # lets start() kill the group if it must abort this runner
+
+
+def _stop_group(proc, pgid: int, grace: float) -> None:
+    """SIGTERM claude's process group, wait up to `grace` for claude and the rest of the group to exit, then SIGKILL the
+    group; claude is reaped either way."""
+    _killpg(pgid, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        if proc.poll() is not None and not _killpg(pgid, 0):
+            return
+        time.sleep(0.1)
+    _killpg(pgid, signal.SIGKILL)               # escalate: something ignored SIGTERM
+    proc.wait()
+
+
+def _launch_tokens() -> list:
+    """The exact credentials this child was launched with (the runner's env is the launch env): used to redact the
+    child's stored output before anything else reads it. Never written anywhere."""
+    return [os.environ.get(k, "") for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CORTADOS_PROVIDER_TOKEN")]
+
+
+def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:
+    """Rewrite `path` with every token replaced, streaming (a carried overlap keeps a token split across chunks whole),
+    via a unique temp file and an atomic rename."""
+    if not red.tokens or not os.path.exists(path):
+        return
+    keep = max(len(t) for t in red.tokens) - 1
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as src, \
+                os.fdopen(fd, "w", encoding="utf-8", newline="") as dst:
+            carry = ""
+            while True:
+                block = src.read(chunk)
+                if not block:
+                    break
+                text = red.text(carry + block)
+                carry = text[-keep:] if keep and len(text) > keep else ("" if not keep else text)
+                dst.write(text[:len(text) - len(carry)])
+            dst.write(red.text(carry))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def parse_output(raw: str):
+    """(output, error): claude's `-p --output-format json` result record, or why stdout is not one. A valid record is
+    an object with type "result", a boolean is_error and a string result."""
+    raw = raw.strip()
+    if not raw:
+        return None, "the child printed nothing on stdout (no result record)"
+    try:
+        out = json.loads(raw) if raw.startswith("{") else json.loads(raw.splitlines()[-1])
+    except ValueError:
+        return None, "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
+    if not isinstance(out, dict):
+        return None, f"stdout is JSON but not a result record ({type(out).__name__})"
+    if out.get("type") != "result" or not isinstance(out.get("is_error"), bool) or not isinstance(out.get("result"), str):
+        return out, "stdout is not a claude result record (needs type 'result', boolean is_error, string result)"
+    return out, None
+
+
 class _CancelledBeforeSpawn(Exception):
     pass
 
@@ -673,28 +748,26 @@ def _run(d: str, lock_fd=None) -> int:
             proc = subprocess.Popen(spec["argv"], cwd=spec["cwd"], stdin=stdin, stdout=so, stderr=se,
                                     start_new_session=True)
             holder["proc"] = proc
-            if flag["pre"]:
-                flag["term"] = True             # the SIGTERM landed while Popen ran: stop the child now
             pgid = proc.pid
-            with open(os.path.join(d, "child.pid"), "w", encoding="utf-8") as f:
-                f.write(str(pgid))              # lets start() kill the group if it must abort this runner
-            deadline = time.monotonic() + max_s
-            term_at = None
-            while True:
-                now = time.monotonic()
-                if term_at is None and (flag["term"] or now >= deadline):
-                    if not flag["term"]:
-                        result["timed_out"] = True
-                        result["error"] = f"child exceeded {max_s} s (CORTADOS_CHILD_MAX_S) and was terminated"
-                    _killpg(pgid, signal.SIGTERM)
-                    term_at = now
-                if proc.poll() is not None and (term_at is None or not _killpg(pgid, 0)):
-                    break                       # done; after a stop, also wait for the rest of the group to go
-                if term_at is not None and now - term_at >= grace:
-                    _killpg(pgid, signal.SIGKILL)   # escalate: something ignored SIGTERM
-                    proc.wait()
-                    break
-                time.sleep(0.1)
+            try:
+                if flag["pre"]:
+                    flag["term"] = True         # the SIGTERM landed while Popen ran: stop the child now
+                _note_child(d, pgid)
+                deadline = time.monotonic() + max_s
+                while proc.poll() is None:
+                    if flag["term"] or time.monotonic() >= deadline:
+                        if not flag["term"]:
+                            result["timed_out"] = True
+                            result["error"] = f"child exceeded {max_s} s (CORTADOS_CHILD_MAX_S) and was terminated"
+                        _stop_group(proc, pgid, grace)
+                        break
+                    time.sleep(0.1)
+                if flag["term"] and proc.poll() is not None and _killpg(pgid, 0):
+                    _stop_group(proc, pgid, grace)      # claude went, but its group did not
+            except BaseException as exc:
+                # Anything failing after the spawn (even writing child.pid) must not orphan claude: stop its group first.
+                result["error"] = f"runner error after the child started: {type(exc).__name__}: {exc}"
+                _stop_group(proc, pgid, grace)
             result["exit_code"] = proc.returncode
             result["cancelled"] = flag["term"]
     except _CancelledBeforeSpawn:
@@ -706,20 +779,26 @@ def _run(d: str, lock_fd=None) -> int:
         # The settings file holds the provider token; once the child has exited (normally, cancelled or timed out)
         # nothing needs it, so it does not stay at rest. (A SIGKILLed runner cannot do this; _state() does it then.)
         result["settings_removed"] = _remove_settings(d)
+    # Redact the child's stored output with the exact launch credentials while the runner still has them: a later
+    # status call only knows the token file as it is THEN (it may have been replaced or removed).
+    red = Redactor([t for t in _launch_tokens() if len(t) >= MIN_TOKEN_LEN])
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            redact_file(os.path.join(d, name), red)
+        except OSError as exc:
+            result["redact_error"] = f"could not redact {name}: {type(exc).__name__}"
     raw = ""
     try:
         with open(os.path.join(d, "stdout.log"), encoding="utf-8", errors="replace") as f:
-            raw = f.read().strip()
+            raw = f.read()
     except FileNotFoundError:
         pass
-    if raw:
-        try:
-            out = json.loads(raw.splitlines()[-1]) if not raw.startswith("{") else json.loads(raw)
-            result["output"] = out if isinstance(out, dict) else {}
-        except ValueError:
-            result["output_error"] = "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
+    out, err = parse_output(raw)
+    if out is not None:
+        result["output"] = red.tree(out)
+    if err:
+        result["output_error"] = err
     result["ended_at"] = time.time()
-    out = result.get("output") or {}
     final = classify(result)
     started = spec.get("started_at")
     result["event_log_error"] = log_event(

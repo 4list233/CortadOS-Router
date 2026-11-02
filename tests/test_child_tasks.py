@@ -49,6 +49,23 @@ FAKE = textwrap.dedent('''\
         sys.stderr.write(os.environ.get("FAKE_STDERR", ""))
         print(json.dumps({{"type": "result", "is_error": True, "result": os.environ.get("FAKE_RESULT", "")}}))
         sys.exit(1)
+    if mode == "badjson":
+        print("this is not json")
+        sys.exit(0)
+    if mode == "empty":
+        sys.exit(0)
+    if mode == "scalar":
+        print("42")
+        sys.exit(0)
+    if mode == "wrongshape":
+        print(json.dumps({{"foo": 1}}))
+        sys.exit(0)
+    if mode == "echo-auth":
+        tok = os.environ["ANTHROPIC_AUTH_TOKEN"]
+        time.sleep(0.5)
+        sys.stderr.write("stderr has " + tok + "\\n")
+        print(json.dumps({{"type": "result", "is_error": False, "result": "result has " + tok}}))
+        sys.exit(0)
     if mode == "leak":
         tok = open(os.environ["FAKE_LEAK_FILE"]).read().strip()
         print(json.dumps({{"type": "result", "is_error": False, "result": "the token is " + tok}}))
@@ -590,7 +607,90 @@ class ChildTaskTests(unittest.TestCase):
                 self.assertNotIn(frag, text, frag)
         self.assertIn("***", w["result"])               # redacted first, then cut (not cut mid-token)
         self.assertEqual(len(w["result"]), ct.RESULT_CHARS)
-        self.assertTrue(w["stderr_tail"].startswith("***z"), w["stderr_tail"][:20])
+        self.assertTrue(w["stderr_tail"].startswith("***"), w["stderr_tail"][:20])
+
+    # --- review round 3 ---------------------------------------------------------------------------------------------
+
+    def test_runner_error_after_spawn_stops_child_and_grandchild(self):
+        tid, d = self._manual_task("stubborn")
+        gpath = os.path.join(self.work, "grandchild.pid")
+
+        def fail_after_child_is_up(d_, pgid):
+            self.assertTrue(_wait_file(gpath))
+            time.sleep(0.3)                      # the fake now ignores SIGTERM and its grandchild exists
+            raise OSError("cannot write child.pid")
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        with mock.patch.object(ct, "_note_child", fail_after_child_is_up):
+            ct._run(d)
+        with open(gpath) as f:
+            gpid = int(f.read())
+        cpid = _load(os.path.join(self.work, "fake-argv.json"))["pid"]
+        end = time.time() + 5
+        while (_pid_alive(gpid) or _pid_alive(cpid)) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(cpid), "claude survived a runner error")
+        self.assertFalse(_pid_alive(gpid), "the grandchild survived a runner error")
+        res = _load(os.path.join(d, "result.json"))
+        self.assertIn("runner error after the child started", res["error"])
+        self.assertEqual(ct.classify(res), "failed")
+
+    def test_malformed_output_is_failed(self):
+        for mode in ("badjson", "empty", "scalar", "wrongshape"):
+            os.environ["FAKE_CLAUDE_MODE"] = mode
+            tid = self.start()
+            _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+            self.assertEqual(w["exit_code"], 0, mode)
+            self.assertEqual(w["state"], "failed", (mode, w))
+        for res in ({"exit_code": 0}, {"exit_code": 0, "output": {}}, {"exit_code": 0, "output_error": "x"},
+                    {"exit_code": 0, "output": {"type": "result", "result": "r"}},          # is_error missing
+                    {"exit_code": 0, "output": {"type": "result", "is_error": False}}):    # result missing
+            self.assertEqual(ct.classify(res), "failed", res)
+        self.assertEqual(ct.classify({"exit_code": 0, "output": {"type": "result", "is_error": False, "result": ""}}),
+                         "succeeded")
+
+    def test_preview_redacted_before_slicing(self):
+        file_tok = "tok-test-000000001"
+        tid = self.start(task="a" * 195 + file_tok + " tail")    # the token straddles the 200-char preview cut
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        r, lst = self.call("list_tasks")
+        preview = lst["tasks"][0]["task_preview"]
+        self.assertNotIn(file_tok[:5], preview)
+        self.assertIn("***", preview)
+        self.assertNotIn(file_tok[:5], _load(os.path.join(ct.task_path(tid), "meta.json"))["task_preview"])
+
+    def _launch_token_case(self, after_launch):
+        file_tok = "tok-test-000000001"                  # the launch token (the child sees it as ANTHROPIC_AUTH_TOKEN)
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-auth"
+        tid = self.start()
+        after_launch()
+        r, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertFalse(r.get("isError"), r)
+        text = r["content"][0]["text"]
+        self.assertNotIn(file_tok, text)
+        self.assertIn("result has ***", w["result"])
+        d = ct.task_path(tid)
+        for name in ("stdout.log", "stderr.log", "result.json"):
+            with open(os.path.join(d, name)) as f:
+                self.assertNotIn(file_tok, f.read(), name)
+
+    def test_token_file_replaced_after_launch(self):
+        def replace():
+            with open(self.cfg["token_file"], "w") as f:
+                f.write("a-brand-new-token-0002")
+        self._launch_token_case(replace)
+
+    def test_token_file_removed_after_launch(self):
+        self._launch_token_case(lambda: os.unlink(self.cfg["token_file"]))
+
+    def test_redact_file_streams_across_chunks(self):
+        path = os.path.join(self.tmp, "big.log")
+        tok = "tok-test-000000001"
+        with open(path, "w") as f:
+            f.write("x" * 10 + tok + "y" * 7 + tok)
+        ct.redact_file(path, ct.Redactor([tok]), chunk=13)   # chunk boundaries fall inside both tokens
+        with open(path) as f:
+            self.assertEqual(f.read(), "x" * 10 + "***" + "y" * 7 + "***")
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

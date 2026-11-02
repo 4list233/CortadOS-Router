@@ -130,7 +130,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
-                           cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False))
+                           cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red)
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
