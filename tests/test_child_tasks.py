@@ -7,6 +7,7 @@ import sys
 import tempfile
 import textwrap
 import io
+import signal
 import time
 import unittest
 import urllib.error
@@ -25,7 +26,7 @@ FAKE = textwrap.dedent('''\
                    "subagent": os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                    "claudecode": os.environ.get("CLAUDECODE"),
                    "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS"),
-                   "pythonpath": os.environ.get("PYTHONPATH")}}, f)
+                   "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid()}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "stubborn":
@@ -36,6 +37,18 @@ FAKE = textwrap.dedent('''\
         with open(os.path.join(os.getcwd(), "grandchild.pid"), "w") as f:
             f.write(str(g.pid))
         time.sleep(120)
+    if mode == "termok":
+        # exits 0 with a success result when it gets SIGTERM (as at a timeout)
+        def ok(*_):
+            print(json.dumps({{"type": "result", "is_error": False, "result": "fine"}}))
+            sys.stdout.flush()
+            os._exit(0)
+        signal.signal(signal.SIGTERM, ok)
+        time.sleep(120)
+    if mode == "echo-env":
+        sys.stderr.write(os.environ.get("FAKE_STDERR", ""))
+        print(json.dumps({{"type": "result", "is_error": True, "result": os.environ.get("FAKE_RESULT", "")}}))
+        sys.exit(1)
     if mode == "leak":
         tok = open(os.environ["FAKE_LEAK_FILE"]).read().strip()
         print(json.dumps({{"type": "result", "is_error": False, "result": "the token is " + tok}}))
@@ -423,6 +436,161 @@ class ChildTaskTests(unittest.TestCase):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertNotIn("tok-test-000000001", json.dumps(w))
+
+    # --- review round 2 ---------------------------------------------------------------------------------------------
+
+    def _manual_task(self, mode="sleep"):
+        """A task dir prepared by hand, for driving ct._run in-process."""
+        root = ct._private_root()
+        tid = ct._new_id()
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        with open(os.path.join(d, "prompt.txt"), "w") as f:
+            f.write("p")
+        env_bin = os.environ["CORTADOS_CHILD_CLAUDE_BIN"]
+        ct._write_json(os.path.join(d, "cmd.json"), {"argv": [env_bin], "cwd": self.work, "max_s": 60, "grace_s": 1,
+                                                    "event": {"task_id": tid}, "started_at": time.time()})
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": time.time(), "runner_pid": None})
+        os.environ["FAKE_CLAUDE_MODE"] = mode
+        return tid, d
+
+    def test_cancel_during_popen_is_not_dropped(self):
+        tid, d = self._manual_task("sleep")
+        real = ct.subprocess.Popen
+
+        def popen_with_sigterm(*a, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)   # lands while Popen runs: the handler sees no proc yet
+            return real(*a, **kw)
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        with mock.patch.object(ct.subprocess, "Popen", popen_with_sigterm):
+            t0 = time.time()
+            ct._run(d)
+        self.assertLess(time.time() - t0, 20, "the latched cancel stopped the 60 s child")
+        res = _load(os.path.join(d, "result.json"))
+        self.assertTrue(res["cancelled"], res)
+        self.assertEqual(ct.classify(res), "cancelled")
+
+    def test_cancel_marker_before_spawn_skips_the_child(self):
+        tid, d = self._manual_task("ok")
+        open(os.path.join(d, "cancelled"), "w").close()
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        ct._run(d)
+        res = _load(os.path.join(d, "result.json"))
+        self.assertTrue(res["cancelled"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+
+    def test_status_in_the_window_before_spawn_does_not_recover(self):
+        # Poll exactly between meta.json being published and the runner being spawned: the lock is already held by
+        # start(), so the task is running and its settings file is untouched.
+        seen = {}
+        real = ct._prepare
+
+        def prepare_then_poll(d, *a, **kw):
+            out = real(d, *a, **kw)
+            seen["state"] = ct._state(d)[0]
+            seen["settings"] = [n for n in os.listdir(d) if n.startswith("session-")]
+            seen["result"] = os.path.exists(os.path.join(d, "result.json"))
+            return out
+        with mock.patch.object(ct, "_prepare", prepare_then_poll):
+            tid = self.start()
+        self.assertEqual(seen["state"], "running")
+        self.assertTrue(seen["settings"])
+        self.assertFalse(seen["result"])
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+
+    def test_timeout_with_exit_zero_is_failed(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "termok"
+        os.environ["CORTADOS_CHILD_MAX_S"] = "1"
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertTrue(w.get("timed_out"), w)
+        self.assertEqual(w["exit_code"], 0)
+        self.assertEqual(w["state"], "failed")
+        self.assertEqual(ct.classify({"exit_code": 0, "timed_out": True, "output": {"is_error": False}}), "failed")
+        self.assertEqual(ct.classify({"exit_code": 0, "error": "x"}), "failed")
+        self.assertEqual(ct.classify({"exit_code": 0, "cancelled": True}), "cancelled")
+        self.assertEqual([e["status"] for e in _events() if e["event"] == "finished"], ["failed"])
+
+    def test_simultaneous_recovery(self):
+        import threading
+        root = ct._private_root()
+        tid = "t20261102000000-00000ccc"
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": time.time() - 3600,
+                                                      "runner_pid": None})
+        open(os.path.join(d, "runner.lock"), "w").close()
+        with open(os.path.join(d, "session-1.json"), "w") as f:
+            f.write("{}")
+        barrier, states = threading.Barrier(8), []
+
+        def probe():
+            barrier.wait()
+            states.append(ct._state(d)[0])
+        ts = [threading.Thread(target=probe) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertTrue(set(states) <= {"failed", "running"}, states)
+        self.assertIn("failed", states)
+        res = _load(os.path.join(d, "result.json"))
+        self.assertEqual(res["settings_removed"], ["session-1.json"])   # exactly one recoverer did the work
+        self.assertEqual(ct._state(d)[0], "failed")
+        self.assertFalse([n for n in os.listdir(d) if n.endswith(".tmp")])
+
+    def test_failure_at_final_meta_write_stops_the_runner(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        real = ct._write_json
+
+        def failing(path, obj):
+            if path.endswith("meta.json") and obj.get("runner_pid"):
+                raise OSError("disk full")
+            return real(path, obj)
+        with mock.patch.object(ct, "_write_json", failing):
+            r, _ = self.call("start_task", task="x", cwd=self.work)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("stopped", r["content"][0]["text"])
+        self.assertEqual([n for n in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(n)], [])
+        if os.path.exists(os.path.join(self.work, "fake-argv.json")):
+            pid = _load(os.path.join(self.work, "fake-argv.json"))["pid"]
+            end = time.time() + 5
+            while _pid_alive(pid) and time.time() < end:
+                time.sleep(0.1)
+            self.assertFalse(_pid_alive(pid), "the child kept running after the aborted start")
+
+    def test_short_tokens_refused(self):
+        for env_tok, file_tok in (("short", "tok-test-000000001"), ("tok-test-000000001", "abc")):
+            with open(self.cfg["token_file"], "w") as f:
+                f.write(file_tok)
+            self.cfg["token"] = env_tok
+            r, _ = self.call("list_tasks")
+            self.assertTrue(r.get("isError"), (env_tok, file_tok))
+            self.assertIn("shorter than 8", r["content"][0]["text"])
+
+    def test_tokens_with_quotes_and_at_cuts_are_redacted(self):
+        env_tok = 'env"tok\\en-0001'                 # a quote and a backslash: json.dumps would escape both
+        file_tok = "file-token-000000000002"
+        with open(self.cfg["token_file"], "w") as f:
+            f.write(file_tok)
+        self.cfg["token"] = env_tok
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-env"
+        # the file token straddles the result cut; the env token sits where the stderr tail read begins
+        os.environ["FAKE_RESULT"] = "x" * (ct.RESULT_CHARS - 5) + file_tok + " " + env_tok
+        # the stderr tail's read starts 10 characters before the end of the file token (mid-token)
+        os.environ["FAKE_STDERR"] = env_tok + "\n" + file_tok + "z" * (ct.LOG_TAIL_CHARS - 10)
+        tid = self.start()
+        r, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        text = r["content"][0]["text"]
+        for tok in (env_tok, file_tok):
+            for frag in (tok, tok[:6], tok[-6:], json.dumps(tok)[1:-1]):
+                self.assertNotIn(frag, text, frag)
+        self.assertIn("***", w["result"])               # redacted first, then cut (not cut mid-token)
+        self.assertEqual(len(w["result"]), ct.RESULT_CHARS)
+        self.assertTrue(w["stderr_tail"].startswith("***z"), w["stderr_tail"][:20])
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

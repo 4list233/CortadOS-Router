@@ -323,7 +323,9 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
 - Limits: no cap on parallel children (capacity is the router's job: S1 and the quota gates refuse or redirect a spent
   lane); 3 h per child (`CORTADOS_CHILD_MAX_S`), after which claude's process group gets SIGTERM, then SIGKILL 30 s
   later (cancel does the same); a child cannot start children.
-- The token is read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`). The desktop app
+- The token is read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`). Both it and
+  `CORTADOS_PROVIDER_TOKEN` are redacted from everything the tools return; a token shorter than 8 characters is refused
+  (it could not be redacted safely). The desktop app
   starts servers with a thin PATH, so set `CORTADOS_CHILD_CLAUDE_BIN` to claude's absolute path.
 
 Router logs: the child sends `x-cortados-run-id: <task_id>` on every provider request (added to

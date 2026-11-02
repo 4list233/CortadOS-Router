@@ -114,36 +114,37 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         ct = _child_module()
     except ImportError as exc:
         return _err(f"child tasks unavailable: cannot import cortados_router.child_tasks ({exc})")
-    # Scrub BOTH secrets: the env token (what route_task uses) and the token file's (what the child launcher uses);
-    # they can differ, and a child could echo the one it was given.
-    secrets_ = {token}
+    # Redact BOTH secrets: the env token (what route_task uses) and the token file's (what the child launcher uses);
+    # they can differ, and a child could echo the one it was given. A token shorter than MIN_TOKEN_LEN is refused
+    # outright (route_task refuses it too): it could not be redacted without mangling ordinary words.
+    tokens = [token]
     try:
-        secrets_.add(ct.session.read_token(cfg.get("token_file") or ct.session.DEFAULT_TOKEN_FILE))
+        tokens.append(ct.session.read_token(cfg.get("token_file") or ct.session.DEFAULT_TOKEN_FILE))
     except ct.session.SessionError:
-        pass                                    # no token file: nothing more to scrub (start_task reports it if needed)
-    secrets_ = sorted((t for t in secrets_ if len(t) >= MIN_TOKEN_LEN), key=len, reverse=True)
-
-    def scrub(s: str) -> str:
-        for t in secrets_:
-            s = s.replace(t, "***")
-        return s
+        pass                                    # no token file: nothing more to redact (start_task reports it if needed)
+    try:
+        red = ct.Redactor(tokens)
+    except ct.TaskError as exc:
+        return _err(f"{name}: {exc}")
     try:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False))
         elif name == "task_status":
-            out = ct.status(a.get("task_id"), scrub, cfg.get("url", ""), token)
+            out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
-            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), scrub, provider_url=cfg.get("url", ""),
+            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), red, provider_url=cfg.get("url", ""),
                           token=token)
         elif name == "list_tasks":
             out = {"tasks": ct.list_recent(a.get("limit", 20))}
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:
-        return _err(scrub(f"{name}: {exc}"))
-    return {"content": [{"type": "text", "text": scrub(json.dumps(out, indent=2))}]}
+        return _err(red.text(f"{name}: {exc}"))
+    # Redact the structure's strings BEFORE serializing: json.dumps escapes quotes and backslashes, so a token holding
+    # either would no longer match once serialized.
+    return {"content": [{"type": "text", "text": json.dumps(red.tree(out), indent=2)}]}
 
 
 def _err(text: str) -> dict:
