@@ -173,6 +173,18 @@ def probe(node: dict[str, Any]) -> set[str]:
     return {str(m.get("name") or m.get("model") or "") for m in (data.get("models") or []) if isinstance(m, dict)}
 
 
+ERROR_BODY_MAX = 65536      # an error body is a short JSON message; more is not read, so a stall cannot pin a thread
+
+
+def _bounded_read(resp) -> bytes | None:
+    """At most ERROR_BODY_MAX bytes of an error response, or None when it is truncated (IncompleteRead), stalls past
+    the read timeout, or the connection drops."""
+    try:
+        return resp.read(ERROR_BODY_MAX)
+    except (OSError, http.client.HTTPException):
+        return None
+
+
 def _send_json(handler, code: int, data: dict[str, Any]) -> None:
     raw = json.dumps(data).encode()
     try:
@@ -248,12 +260,16 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                        f"refused or dropped the request ({type(exc).__name__}: {exc}). No other model was tried."))
             return "unreachable"
         if resp.status == 401:                                   # the gate's refusal is the provider's problem,
-            resp.read()                                          # not the client's: a 503 that says so
+            _bounded_read(resp)                                  # not the client's: a 503 that says so
             _send_json(handler, 503, _error("overloaded_error", "cortados: " + GATE_REFUSED.format(node=node["node"])
                                             + "; no other model was tried"))
             return "unreachable"
         if resp.status != 200:
-            raw = resp.read()
+            raw = _bounded_read(resp)
+            if raw is None:                                      # truncated or stalled error body: say so, bounded
+                _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "
+                                                f"{resp.status} and its error body was truncated or stalled"))
+                return "incomplete"
             try:
                 json.loads(raw)
             except ValueError:

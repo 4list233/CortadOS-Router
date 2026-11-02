@@ -102,6 +102,131 @@ class GateTests(GateHarness):
             for sock in idle:
                 sock.close()
 
+    def _trickle(self, payload: bytes, interval: float, stop: threading.Event):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.gate.server_port))
+
+        def run():
+            try:
+                for i in range(len(payload)):
+                    if stop.is_set():
+                        break
+                    sock.sendall(payload[i:i + 1])
+                    stop.wait(interval)
+            except OSError:
+                pass                                       # the gate closed it: what the deadline is for
+        threading.Thread(target=run, daemon=True).start()
+        return sock
+
+    def _slots_freed_by_deadline(self, payload: bytes):
+        import time
+        self.gate.idle_timeout = 0.5                      # each trickled byte arrives well inside this
+        stop = threading.Event()
+        socks = [self._trickle(payload, 0.1, stop) for _ in range(local_gate.MAX_CONNECTIONS)]
+        try:
+            time.sleep(0.3)
+            self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 503)
+            t0 = time.time()
+            code = None
+            while time.time() - t0 < 4:
+                time.sleep(0.2)
+                code = self.call("/api/tags", headers={"x-api-key": TOKEN})[0]
+                if code == 200:
+                    break
+            self.assertEqual(code, 200)
+            self.assertLess(time.time() - t0, 3)          # within the 1 s deadline plus slack, not the trickle's length
+        finally:
+            stop.set()
+            for sock in socks:
+                sock.close()
+
+    def test_trickled_headers_hit_the_header_deadline(self):
+        self.gate.header_deadline = 1.0
+        self._slots_freed_by_deadline(b"GET /api/tags HTTP/1.1\r\nx-api-key: " + TOKEN.encode() + b"\r\n" + b"x" * 500)
+
+    def test_trickled_body_hits_the_body_deadline(self):
+        self.gate.body_deadline = 1.0
+        head = (b"POST /v1/messages HTTP/1.1\r\nx-api-key: " + TOKEN.encode() +
+                b"\r\ncontent-length: 1000\r\n\r\n")
+        self.gate.header_deadline = 5.0
+        self._slots_freed_by_deadline_after_head(head, b"x" * 1000)
+
+    def test_trickled_refused_body_hits_the_drain_deadline_and_closes(self):
+        import socket
+        import time
+        self.gate.drain_deadline = 1.0
+        head = b"POST /v1/messages HTTP/1.1\r\nx-api-key: wrong\r\ncontent-length: 1000\r\n\r\n"
+        self._slots_freed_by_deadline_after_head(head, b"x" * 1000)
+        # and a drained-too-slowly request is closed without the 401
+        self.gate.idle_timeout = 0.5
+        sock = socket.create_connection(("127.0.0.1", self.gate.server_port))
+        stop = threading.Event()
+        try:
+            sock.sendall(head)
+
+            def run():
+                try:
+                    while not stop.is_set():
+                        sock.sendall(b"x")
+                        stop.wait(0.1)
+                except OSError:
+                    pass
+            threading.Thread(target=run, daemon=True).start()
+            sock.settimeout(4)
+            t0 = time.time()
+            got = b""
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+            except OSError:
+                pass
+            self.assertNotIn(b"401", got)
+            self.assertLess(time.time() - t0, 3)
+        finally:
+            stop.set()
+            sock.close()
+
+    def _slots_freed_by_deadline_after_head(self, head: bytes, body: bytes):
+        import socket
+        import time
+        self.gate.idle_timeout = 0.5
+        stop = threading.Event()
+        socks = []
+        for _ in range(local_gate.MAX_CONNECTIONS):
+            sock = socket.create_connection(("127.0.0.1", self.gate.server_port))
+            sock.sendall(head)
+            socks.append(sock)
+
+            def run(sock=sock):
+                try:
+                    for i in range(len(body)):
+                        if stop.is_set():
+                            break
+                        sock.sendall(body[i:i + 1])
+                        stop.wait(0.1)
+                except OSError:
+                    pass
+            threading.Thread(target=run, daemon=True).start()
+        try:
+            time.sleep(0.3)
+            self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 503)
+            t0 = time.time()
+            code = None
+            while time.time() - t0 < 4:
+                time.sleep(0.2)
+                code = self.call("/api/tags", headers={"x-api-key": TOKEN})[0]
+                if code == 200:
+                    break
+            self.assertEqual(code, 200)
+            self.assertLess(time.time() - t0, 3)
+        finally:
+            stop.set()
+            for sock in socks:
+                sock.close()
+
     def test_other_paths_are_404(self):
         auth = {"authorization": f"Bearer {TOKEN}"}
         for method, path, body in (("POST", "/api/pull", {"name": "x"}), ("DELETE", "/api/delete", {"name": TAG}),
@@ -142,13 +267,37 @@ class GateConfigTests(unittest.TestCase):
             local_gate.read_token(os.path.join(self.dir, "missing"))
 
     def test_all_interfaces_refused_without_the_flag(self):
-        for host in ("0.0.0.0", "::", "", "0", "::0", "0:0:0:0:0:0:0:0", "[::]", " 0.0.0.0 ", "0.0", "0x0"):
+        for host in ("0.0.0.0", "::", "", "::0", "0:0:0:0:0:0:0:0", "[::]", " 0.0.0.0 "):
             with self.assertRaises(local_gate.GateConfigError):
                 local_gate.check_listen(host, allow_any=False)
-            local_gate.check_listen(host, allow_any=True)
-        for host in ("127.0.0.1", "100.64.0.1", "fd7a::1", "pro.example"):
-            local_gate.check_listen(host, allow_any=False)
+            self.assertIn(local_gate.check_listen(host, allow_any=True), ("0.0.0.0", "::"))
+        # spellings the socket layer would resolve or normalise: refused even with --allow-any, because the address
+        # bound must be the one checked (fullwidth digits bind as 0.0.0.0)
+        for host in ("0", "0.0", "0x0", "\uff10.\uff10.\uff10.\uff10", "\uff11\uff12\uff17.0.0.1", "pro.example",
+                     "localhost"):
+            for allow in (False, True):
+                with self.assertRaises(local_gate.GateConfigError, msg=host):
+                    local_gate.check_listen(host, allow_any=allow)
+        for host, bound in (("127.0.0.1", "127.0.0.1"), ("100.64.0.1", "100.64.0.1"), ("fd7a::1", "fd7a::1"),
+                            ("[FD7A::1]", "fd7a::1")):
+            self.assertEqual(local_gate.check_listen(host, allow_any=False), bound)
+        self.assertEqual(local_gate.main(["--listen", "\uff10.\uff10.\uff10.\uff10", "--token-file", token_file(self.dir),
+                                          "--print-config"]), 2)
         self.assertEqual(local_gate.main(["--listen", "0.0.0.0", "--token-file", token_file(self.dir)]), 2)
+
+    def test_limits_must_be_finite_and_positive(self):
+        tf = token_file(self.dir)
+        for flag in ("--connect-timeout", "--read-timeout", "--max-body-bytes", "--max-connections"):
+            for bad in ("-1", "0", "nan", "inf"):
+                if flag.startswith("--max") and bad in ("nan", "inf"):
+                    continue                              # int flags: argparse refuses those itself
+                self.assertEqual(local_gate.main(["--listen", "127.0.0.1", "--token-file", tf, "--print-config",
+                                                  flag, bad]), 2, (flag, bad))
+        for key in ("connect_timeout", "read_timeout", "idle_timeout", "header_deadline", "body_deadline",
+                    "drain_deadline"):
+            for bad in (-1, 0, float("nan"), float("inf")):
+                with self.assertRaises(local_gate.GateConfigError, msg=(key, bad)):
+                    local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream="http://127.0.0.1:9", **{key: bad})
 
     def test_print_config_checks_without_printing_the_token(self):
         import contextlib

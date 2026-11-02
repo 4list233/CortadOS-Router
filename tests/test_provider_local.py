@@ -40,9 +40,22 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    mode = "ok"                 # "truncated" / "stalled": a broken error body (review round 2, item 4)
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeOllama.seen.append((self.path, body))
+        if FakeOllama.mode in ("truncated", "stalled"):
+            self.send_response(500)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"type":"err')
+            self.wfile.flush()
+            if FakeOllama.mode == "stalled":
+                time.sleep(2)
+            self.close_connection = True
+            return
         if body["model"] not in self.tags:
             raw = json.dumps({"type": "error", "error": {"type": "not_found_error", "message": "model not found"}}).encode()
             self.send_response(404)
@@ -231,6 +244,59 @@ class LocalPinTests(LocalHarness):
         self.assertEqual(self.status_of(self.BODY, headers={"x-cortados-exclude-model": "sub/qwen-27b"}), 400)
         self.assertEqual(FakeOllama.seen, [])
 
+    def test_exclusion_holds_across_alias_and_tag_spellings(self):
+        for pin, excluded in (("sub/qwen-27b", TAG), ("sub/qwen-27b", f"sub/{TAG}"), (f"sub/{TAG}", "qwen-27b"),
+                              (f"sub/{TAG}", "sub/QWEN-27B"), (f"sub/{TAG.upper()}", "qwen-27b")):
+            code = self.status_of({**self.BODY, "model": pin}, headers={"x-cortados-exclude-model": excluded})
+            self.assertEqual(code, 400, (pin, excluded))
+        self.assertEqual(FakeOllama.seen, [])
+        # excluding a local model leaves another local pin, and S1 routing, unaffected
+        self.assertEqual(self.status_of({**self.BODY, "model": "sub/phi:latest"},
+                                        headers={"x-cortados-exclude-model": "qwen-27b"}), 200)
+
+    def test_canonical_model_names_one_identity(self):
+        self.assertEqual(routing.canonical_model("qwen-27b"), routing.canonical_model(TAG))
+        self.assertEqual(routing.canonical_model("QWEN-27B"), routing.model_key(TAG))
+        self.assertEqual(routing.canonical_model("claude-haiku-4-5-20251001"), "claude-haiku-4-5")
+
+    def test_post_selection_check_refuses_an_excluded_result(self):
+        real = routing.choose_pinned
+        routing.choose_pinned = lambda *a, **k: {"provider": "local-pro", "model": TAG, "route_id": None}
+        try:
+            r = routing.choose(core, {**self.BODY, "model": "sub/phi:latest"}, client="t", conversation_id="c",
+                               exclude_model="qwen-27b")
+        finally:
+            routing.choose_pinned = real
+        self.assertIn("resolved to the excluded model", r["error"])
+
+    def test_truncated_or_stalled_error_body_is_a_bounded_502_and_cleans_up(self):
+        for mode in ("truncated", "stalled"):
+            FakeOllama.mode = mode
+            if mode == "stalled":
+                cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
+                cfg["nodes"][0]["ollama"]["read_timeout_s"] = 0.5
+                Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
+            try:
+                body = {**self.BODY, "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
+                code, msg = self.error_of(body)
+            finally:
+                FakeOllama.mode = "ok"
+            self.assertIn(code, (500, 502), mode)
+            self.assertIn("cortados", msg)
+            self.assertLess(len(msg), 1000)
+            self.assertEqual(self.reg.sessions, {}, mode)              # the failed opener was cleaned up
+
+    def test_a_relay_crash_still_answers_and_cleans_up(self):
+        real = local_lane.serve
+        local_lane.serve = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            code, msg = self.error_of({**self.BODY, "tools": [{"name": "Read", "input_schema": {"type": "object"}}]})
+        finally:
+            local_lane.serve = real
+        self.assertEqual(code, 502)
+        self.assertIn("local relay failed", msg)
+        self.assertEqual(self.reg.sessions, {})
+
 
 class LocalConversationPinTests(LocalHarness):
     """A local-pinned conversation keeps its model, exactly as a Claude or Codex pin does: the binding is recorded in
@@ -304,6 +370,22 @@ class LocalConversationPinTests(LocalHarness):
         msg = self.conflict(self.follow(first, got["content"], "sub/qwen-27b"))
         self.assertIn("routed by S1 to claude-sonnet-5", msg)
         self.assertEqual(FakeOllama.seen, [])
+
+    def test_an_oversized_continuation_is_413_and_keeps_the_history(self):
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first)
+        session = next(iter(self.reg.sessions.values()))
+        history = list(session.history)
+        big = self.follow(first, got["content"], "sub/qwen-27b")
+        big["messages"][-1]["content"][0]["content"] = "x" * (4 * 40000)      # ≈40k tokens > 32k context
+        code, msg = self.error_of(big)
+        self.assertEqual(code, 413)
+        self.assertIn("exceeds", msg)
+        self.assertEqual(len(FakeOllama.seen), 1)                       # never sent to the node
+        self.assertEqual(session.history, history)
+        self.assertIs(next(iter(self.reg.sessions.values())), session)
+        ok = self.follow(first, got["content"], "sub/qwen-27b")         # the conversation is still usable
+        self.assertEqual(self.post(ok)["stop_reason"], "tool_use")
 
     def test_a_failed_opening_turn_leaves_no_conversation(self):
         self.ollama.shutdown()

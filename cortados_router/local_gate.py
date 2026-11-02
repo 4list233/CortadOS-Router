@@ -22,11 +22,13 @@ import ipaddress
 import http.client
 import json
 import logging
+import math
 import os
 import socket
 import stat
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +56,15 @@ READ_TIMEOUT_S = 300.0
 # timeout, a few idle sockets (or Tailscale links dropped mid-request, which never send a FIN) would hold every slot
 # forever and lock the lane out. 30 s is far more than a provider needs to send its request line and body.
 IDLE_TIMEOUT_S = 30.0
+# The idle timeout only measures silence: a client trickling one byte every few seconds never trips it. So each phase
+# of reading a request also has an absolute deadline, after which the connection is closed and its slot freed.
+#   headers: the provider sends its request line and headers in one write; 10 s is generous even for a waking link.
+HEADER_DEADLINE_S = 10.0
+#   body: up to MAX_BODY_BYTES over Tailscale between home machines; 32 MiB at a slow 5 Mbit/s is ~55 s.
+BODY_DEADLINE_S = 120.0
+#   drain of a refused request: only a courtesy so the 401 arrives (see _drain); a client that cannot send its
+#   body within 5 s is closed without the 401, since a well-behaved provider is never refused in the first place.
+DRAIN_DEADLINE_S = 5.0
 # The only routes the provider's local lane uses (local_lane.probe and local_lane.serve).
 ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
 
@@ -88,22 +99,39 @@ def read_token(path: str | os.PathLike) -> str:
     return token
 
 
-def check_listen(host: str, allow_any: bool) -> None:
-    """Refuse an all-interfaces bind unless asked: on a laptop that joins cafe Wi-Fi, 0.0.0.0 puts the gate on every
-    network it meets, and the token would be the node's only defence there. The Tailscale address is the intended one."""
-    h = (host or "").strip().strip("[]")
-    try:
-        unspecified = not h or ipaddress.ip_address(h).is_unspecified
-    except ValueError:
-        # Not a canonical address. The socket layer also accepts legacy IPv4 spellings ("0", "0.0", "0x0"), which
-        # inet_aton normalises; anything it rejects is a hostname, not an all-interfaces spelling.
+def check_listen(host: str, allow_any: bool) -> str:
+    """The address to bind, validated: a numeric ASCII IP literal in canonical form (the node's Tailscale address).
+    Hostnames, legacy spellings ("0", "0x0") and non-ASCII digits are refused, because the socket layer resolves or
+    normalises them (fullwidth "０.０.０.０" binds as 0.0.0.0), so what was checked would not be what is bound.
+    An all-interfaces address is refused unless asked: on a laptop that joins cafe Wi-Fi, 0.0.0.0 puts the gate on
+    every network it meets, and the token would be the node's only defence there. Empty means all interfaces."""
+    h = (host or "").strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if not h:
+        ip = ipaddress.ip_address("0.0.0.0")
+    else:
+        if not h.isascii():
+            raise GateConfigError(f"listen address {host!r} is not ASCII; give the numeric IP literal")
         try:
-            unspecified = socket.inet_aton(h) == b"\0\0\0\0"
-        except OSError:
-            unspecified = False
-    if unspecified and not allow_any:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            raise GateConfigError(f"listen address {host!r} is not a numeric IP literal (hostnames and legacy forms "
+                                  "are refused: the bound address must be the one checked)") from None
+        if str(ip) != h.lower() and not (ip.version == 6 and ipaddress.ip_address(h.lower()) == ip):
+            raise GateConfigError(f"listen address {host!r} is not in canonical form (use {ip})")
+    if ip.is_unspecified and not allow_any:
         raise GateConfigError(f"refusing to listen on all interfaces ({host or 'empty'}): listen on the node's "
                               "Tailscale address, or pass --allow-any if every network this machine joins is trusted")
+    return str(ip)
+
+
+def check_limits(**limits: float) -> None:
+    """Every timeout, deadline and size limit must be a finite positive number: 0 makes a socket non-blocking,
+    a negative one raises mid-request, NaN compares false everywhere and inf is no bound at all."""
+    for name, v in limits.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise GateConfigError(f"{name} must be a finite positive number, got {v!r}")
 
 
 class GateServer(ThreadingHTTPServer):
@@ -111,7 +139,14 @@ class GateServer(ThreadingHTTPServer):
 
     def __init__(self, addr, *, token: str, upstream: str, max_body: int = MAX_BODY_BYTES,
                  max_connections: int = MAX_CONNECTIONS, connect_timeout: float = CONNECT_TIMEOUT_S,
-                 read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S):
+                 read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S,
+                 header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
+                 drain_deadline: float = DRAIN_DEADLINE_S):
+        check_limits(max_body=max_body, max_connections=max_connections, connect_timeout=connect_timeout,
+                     read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
+                     body_deadline=body_deadline, drain_deadline=drain_deadline)
+        if ":" in addr[0]:
+            self.address_family = socket.AF_INET6
         u = urllib.parse.urlparse(upstream)
         if u.scheme != "http" or not u.hostname:
             raise GateConfigError(f"upstream must be http://host:port (Ollama on loopback), got {upstream!r}")
@@ -119,6 +154,7 @@ class GateServer(ThreadingHTTPServer):
         self.upstream_host, self.upstream_port = u.hostname, u.port or 80
         self.max_body, self.connect_timeout, self.read_timeout = max_body, connect_timeout, read_timeout
         self.idle_timeout = idle_timeout
+        self.header_deadline, self.body_deadline, self.drain_deadline = header_deadline, body_deadline, drain_deadline
         self.slots = threading.BoundedSemaphore(max_connections)
         super().__init__(addr, GateHandler)
 
@@ -155,6 +191,46 @@ class GateHandler(BaseHTTPRequestHandler):
     def setup(self):
         self.timeout = self.server.idle_timeout
         super().setup()
+        # The header deadline (HEADER_DEADLINE_S): http.server reads the request line and headers itself, so a timer
+        # shuts the socket if they have not all arrived in time; _handle cancels it once they have.
+        self._header_timer = threading.Timer(self.server.header_deadline, self._expire)
+        self._header_timer.daemon = True
+        self._header_timer.start()
+
+    def _expire(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        self._header_timer.cancel()
+        super().finish()
+
+    def _read_body(self, n: int, deadline_s: float) -> bytes | None:
+        """n bytes of body within an absolute deadline (BODY_DEADLINE_S / DRAIN_DEADLINE_S), or None when the
+        deadline passes or the client goes away. Each wait is bounded by the time left, so a trickle cannot extend it."""
+        end = time.monotonic() + deadline_s
+        parts, left = [], n
+        try:
+            while left > 0:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.connection.settimeout(min(self.server.idle_timeout, remaining))
+                chunk = self.rfile.read1(min(left, 65536))
+                if not chunk:
+                    return None
+                parts.append(chunk)
+                left -= len(chunk)
+        except OSError:
+            return None
+        finally:
+            try:
+                self.connection.settimeout(self.server.idle_timeout)
+            except OSError:
+                pass
+        return b"".join(parts)
 
     def log_message(self, fmt, *args):          # http.server's line has the request line only: no token, no body
         logger.info("%s %s", self.address_string(), fmt % args)
@@ -176,23 +252,18 @@ class GateHandler(BaseHTTPRequestHandler):
         given = auth[7:].strip() if auth[:7].lower() == "bearer " else (self.headers.get("x-api-key") or "").strip()
         return hmac.compare_digest(given.encode(), self.server.token)
 
-    def _drain(self) -> None:
-        """Read and discard a refused request's body (up to max_body), so the client receives the 401 instead of a
-        reset: closing with unread bytes in the socket makes the kernel send RST, which the client sees as EPIPE.
-        A body over the limit, or with no length, is not read: the connection just closes."""
+    def _drain(self) -> bool:
+        """Read and discard a refused request's body (up to max_body, within DRAIN_DEADLINE_S), so the client receives
+        the 401 instead of a reset: closing with unread bytes in the socket makes the kernel send RST, which the client
+        sees as EPIPE. False when the drain overran or the client left: the caller closes without the 401. A body over
+        the limit, or with no length, is not read: the 401 is sent and the connection closes."""
         try:
             n = int(self.headers.get("content-length") or "0")
         except ValueError:
-            return
+            return True
         if 0 < n <= self.server.max_body:
-            try:
-                while n > 0:
-                    chunk = self.rfile.read(min(n, 65536))
-                    if not chunk:
-                        break
-                    n -= len(chunk)
-            except OSError:
-                pass
+            return self._read_body(n, self.server.drain_deadline) is not None
+        return True
 
     def do_GET(self):
         self._handle("GET")
@@ -207,9 +278,18 @@ class GateHandler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
     def _handle(self, method: str) -> None:
+        try:
+            self._handle_one(method)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            self.close_connection = True           # the client left or stalled mid-response: nothing to tell it
+
+    def _handle_one(self, method: str) -> None:
+        self._header_timer.cancel()              # the headers are in
+        self.close_connection = True             # one request per connection: no keep-alive slot holding
         if not self._authorized():               # before the path or body is looked at
-            self._drain()
-            return self._send(401, _UNAUTHORIZED)
+            if self._drain():
+                self._send(401, _UNAUTHORIZED)
+            return
         path = self.path.split("?", 1)[0]
         if (method, path) not in ROUTES:
             return self._error(404, "not_found_error", "not a forwarded path")
@@ -223,7 +303,9 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._error(411, "invalid_request_error", "content-length required")
             if n > self.server.max_body:
                 return self._error(413, "request_too_large", f"body over {self.server.max_body} bytes")
-            body = self.rfile.read(n)
+            body = self._read_body(n, self.server.body_deadline)
+            if body is None:                     # too slow or gone: close, freeing the slot
+                return
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
                                           timeout=self.server.connect_timeout)
         try:
@@ -282,25 +364,27 @@ def main(argv=None) -> int:
     a = _settings(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     try:
-        check_listen(a.listen, a.allow_any)
+        listen = check_listen(a.listen, a.allow_any)
+        check_limits(max_body_bytes=a.max_body_bytes, max_connections=a.max_connections,
+                     connect_timeout=a.connect_timeout, read_timeout=a.read_timeout)
         token = read_token(a.token_file)
     except GateConfigError as exc:
         print(f"local_gate: {exc}", file=sys.stderr)
         return 2
     if a.print_config:
-        print(json.dumps({"listen": f"{a.listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
+        print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections,
                           "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout}, indent=1))
         return 0
     try:
-        srv = GateServer((a.listen, a.port), token=token, upstream=a.upstream, max_body=a.max_body_bytes,
+        srv = GateServer((listen, a.port), token=token, upstream=a.upstream, max_body=a.max_body_bytes,
                          max_connections=a.max_connections, connect_timeout=a.connect_timeout,
                          read_timeout=a.read_timeout)
     except (GateConfigError, OSError) as exc:
         print(f"local_gate: cannot start: {exc}", file=sys.stderr)
         return 2
-    logger.info("local gate on %s:%s -> %s (%d forwarded routes)", a.listen, a.port, a.upstream, len(ROUTES))
+    logger.info("local gate on %s:%s -> %s (%d forwarded routes)", listen, a.port, a.upstream, len(ROUTES))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -822,8 +822,26 @@ class Handler(BaseHTTPRequestHandler):
                                  label=str(route["model"]), tools=not one_shot)
             reply: list = []
             local = route["local"]
+            # The same input-fit gate as the opener (routing._choose_local), on every turn: the conversation grows,
+            # and Ollama would silently truncate an over-long one. A refusal keeps the history (nothing was sent).
+            need = int(routing.request_fit(body)["input_tokens"])
+            cap = int(local["model"]["context_length"])
+            if need > cap:
+                return self._error(413, "request_too_large",
+                                   f"cortados: sub/{local_lane.pin_id(local['model'])}: the conversation (≈{need // 1000}k "
+                                   f"tokens) now exceeds {local['model']['id']}'s configured context ({cap // 1000}k); "
+                                   "compact it or start a new conversation", wire)
             t0 = time.time()
-            outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model, reply=reply)
+            try:
+                outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
+                                           reply=reply)
+            except Exception as exc:             # serve handles its own I/O; anything else must still clean up
+                logger.exception("local lane: relay failed")
+                outcome = "incomplete"
+                try:
+                    self._error(502, "api_error", f"cortados: local relay failed: {type(exc).__name__}", wire)
+                except Exception:
+                    pass                         # headers may already be out; the client sees a broken response
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
             if outcome == "completed":

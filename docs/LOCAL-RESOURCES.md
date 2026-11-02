@@ -153,7 +153,8 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
   conversation whose next turn names `sub/opus`, a `sub/opus` or S1-routed one whose next turn names a local pin, gets
   the same 409 "the model is fixed per conversation". A tool-less request (a title call) is a one-shot, not tracked.
 - Routing goes through `routing.choose_pinned` (local branch `_choose_local`): no S1; the node must answer `/api/tags`
-  within `probe_timeout_s` and list the tag; the request must fit `context_length` (else 413); the conversation's
+  within `probe_timeout_s` and list the tag; the request must fit `context_length` (else 413, checked again on every
+  turn, keeping the history); `x-cortados-exclude-model` treats a local alias and its tag as one model; the conversation's
   opening request is logged as a `routes` row (engine `pin`, lane and provider `local-<node>`), continuations are not.
 - Availability is the `/api/tags` answer; there is no quota. The Pro is the owner's laptop: asleep, closed, off the
   tailnet or busy, it fails the pin with a 503 that says so. Nothing falls back to another model.
@@ -163,14 +164,17 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
 models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the
 tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
 
-- listens on the node's Tailscale address (`--listen <tailscale-ip>`, default port 11435); `0.0.0.0`/`::` is refused
-  unless `--allow-any` (a laptop joins untrusted networks);
+- listens on the node's Tailscale address (`--listen <tailscale-ip>`, default port 11435), given as a numeric ASCII
+  IP literal in canonical form and bound exactly as checked (hostnames, legacy forms like `0` and non-ASCII digits are
+  refused); `0.0.0.0`/`::` is refused unless `--allow-any` (a laptop joins untrusted networks);
 - forwards only `POST /v1/messages` and `GET /api/tags` to `http://127.0.0.1:11434`; every other path is a 404;
 - requires `Authorization: Bearer <token>` or `x-api-key: <token>`, compared in constant time with the token in a
   0600 file (default `~/.config/cortados/local-gate-token`); it refuses to start when the file is missing, shorter than
   32 characters or readable by group/others. A wrong token is a fixed 401 that echoes nothing;
 - streams SSE through line by line; bounds the body (32 MiB), concurrent connections (8, then 503), the loopback
-  connect (3 s), each read (300 s) and an idle client socket (30 s, so idle or dropped connections cannot hold every slot); logs method, path and status only, never the token or a body.
+  connect (3 s), each read (300 s), an idle client socket (30 s) and, as absolute deadlines a trickling client cannot extend, the
+  headers (10 s), the body (120 s) and the drain of a refused body (5 s, then closed without the 401); every limit must
+  be a finite positive number; logs method, path and status only, never the token or a body.
 
 A launchd template is `integrations/local-gate/com.cortados.local-gate.plist` (RunAtLoad + KeepAlive; placeholders
 only). Check a setup with `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` (validates the

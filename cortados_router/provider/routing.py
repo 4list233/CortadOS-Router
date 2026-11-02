@@ -169,6 +169,26 @@ def model_key(name: str | None) -> str | None:
     return re.sub(r"-\d{8}$", "", name.casefold()) if name else name
 
 
+def canonical_model(name: str | None) -> str | None:
+    """The identity a model name resolves to, for exclusion checks: a local pin's alias and its Ollama tag are one
+    model (the tag, model_key'd); any other name is its model_key. A broken local config resolves nothing locally
+    (choose_pinned reports it)."""
+    if not name:
+        return name
+    try:
+        loc = local_lane.find(name)
+    except local_lane.LocalConfigError:
+        loc = None
+    return model_key(loc[1]["id"] if loc else name)
+
+
+def _is_local(name: str) -> bool:
+    try:
+        return local_lane.find(name) is not None
+    except local_lane.LocalConfigError:
+        return False
+
+
 def pinnable_models(core) -> list[tuple[str, str]]:
     """Every `(provider, model)` a client may pin as `sub/<model>`: the routes this endpoint serves (served_routes, read
     from the tables, never a list kept here), one entry per model on its base provider (accounts are chosen at pin
@@ -421,15 +441,22 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                              "the review could not be kept off it"}
         if m and m not in excluded_models:
             excluded_models.append(m)
-    excluded_keys = {model_key(m) for m in excluded_models}
+    excluded_keys = {canonical_model(m) for m in excluded_models}   # alias and tag of a local model are one key
     names = ", ".join(excluded_models)            # one model: exactly the single-model wording
     pinned = sub_pin(body)
     if pinned:
-        if model_key(pinned) in excluded_keys:
+        if canonical_model(pinned) in excluded_keys:
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
-        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
-                             codex_bin=codex_bin)
+        r = choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
+                          codex_bin=codex_bin)
+        if not r.get("error") and canonical_model(r.get("model")) in excluded_keys:
+            # Defence in depth, as on the S1 path: the review guarantee must hold on what was selected, not only on
+            # how the client spelled the pin.
+            return {"router": execution_routing.ROUTER,
+                    "error": f"internal: sub/{pinned} resolved to the excluded model {r.get('model')}; refused "
+                             "(x-cortados-exclude-model)"}
+        return r
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
     if excluded_models:
         constraints["excluded_routes"] = []
@@ -437,6 +464,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             m = normalize_model(item)
             if not m:                              # `cortados`: names no model to stay off
                 continue
+            if canonical_model(m) != model_key(m) or _is_local(m):
+                continue                           # a local model: S1 never routes there, so it is already avoided
             routes = [[p, r] for p, r in constraints["allowed_routes"] if model_key(r) == model_key(m)]
             if not routes:
                 # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
