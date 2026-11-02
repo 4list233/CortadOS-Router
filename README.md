@@ -226,7 +226,12 @@ What runs where:
   `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
-  calls back to this Claude Code, which runs them locally.
+  calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is
+  inferred from the Claude Code binary (it is listed beside `CLAUDE_CODE_SUBAGENT_MODEL`), namely that it overrides a
+  model named by an Agent call or agent definition. That is not yet verified; a live end-to-end check will confirm it.
+  The provider tests submit `model=cortados` directly, so they cover routing once that model arrives, not that Claude
+  Code sends it for every subagent. Until the live check passes, treat "every subagent is routed" as expected, not
+  guaranteed.
 - **Side calls** (titles, summaries): `ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-4-5-20251001`, so they stay cheap and skip
   S1 latency.
 - The provider token is set as both `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`; Bedrock/Vertex/Foundry selectors
@@ -234,8 +239,10 @@ What runs where:
 - Claude Code applies a settings file's `env` over the process environment, so a saved `ANTHROPIC_API_KEY` or
   `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` (or a project's) would override the launcher. So every launcher
   variable, token included, is written to a private per-session settings file,
-  `~/.config/cortados/session-settings.json` (directory 0700, file 0600, atomically replaced each launch), and passed
-  with `--settings <path>`. That is flag precedence, which beats user, project and local settings; the token is never
+  `~/.config/cortados/sessions/session-<random>.json` (a new 0600 file per launch, so concurrent launches never share
+  one; the directory must be 0700 and it and its ancestors must not be symlinks or owned by another user; files
+  older than 24 h are pruned at launch), and passed with `--settings <path>`. Args after `--` may not include
+  `--settings`, `--setting-sources` or `--model`. That is flag precedence, which beats user, project and local settings; the token is never
   in argv. The same variables stay in the process env. Only managed policy settings outrank flag settings, so if
   `/Library/Application Support/ClaudeCode/managed-settings.json` (or `/etc/claude-code/…`, or a
   `managed-settings.d/*.json` drop-in) sets any of these variables in `env`, the launcher refuses to start.

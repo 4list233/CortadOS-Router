@@ -95,10 +95,11 @@ def launcher_env(provider_url: str, token: str) -> dict:
             "ANTHROPIC_AUTH_TOKEN": token,
             "ANTHROPIC_API_KEY": token,
             "CLAUDE_CODE_SUBAGENT_MODEL": "cortados",
-            # Claude Code 2.1.316 lists CLAUDE_CODE_SUBAGENT_MODEL_FORCE next to CLAUDE_CODE_SUBAGENT_MODEL among its
-            # model env vars (and among the model-selection vars a settings `env` may set). Per its name it forces
-            # the subagent model even when an Agent call or agent definition names one (e.g. `model: haiku`); without
-            # it such subagents would bypass S1. Set it so every subagent is routed. Not exercised end to end here.
+            # INFERRED, NOT VERIFIED: the Claude Code 2.1.316 binary lists CLAUDE_CODE_SUBAGENT_MODEL_FORCE next to
+            # CLAUDE_CODE_SUBAGENT_MODEL among its model env vars. From that and its name we infer it makes subagents
+            # use CLAUDE_CODE_SUBAGENT_MODEL even when an Agent call or agent definition names a model (e.g.
+            # `model: haiku`), which would otherwise bypass S1. That behaviour is pending an end-to-end live check;
+            # the unit and provider tests only submit model=cortados directly and do not prove it.
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
             "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
             "ANTHROPIC_SMALL_FAST_MODEL": SMALL_FAST_MODEL,
