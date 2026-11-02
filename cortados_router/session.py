@@ -9,9 +9,13 @@ subagents, which keep every tool including MCP, are sent to `cortados` so S1 rou
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import stat
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from cortados_router.provider import routing
@@ -45,7 +49,14 @@ PLUGIN_ID = "cortados-routed-subagents@cortados-router"
 # key) elsewhere. Settings sources merge user < project < local < flag < policy (Claude Code 2.1.316), so the launcher
 # writes its env into a private file passed with `--settings` (flag precedence; never secrets in argv). Only managed
 # policy outranks it, so a managed env that sets any of these keys refuses the launch.
-SETTINGS_FILE = "~/.config/cortados/session-settings.json"
+# Each launch gets its own file (mkstemp: O_EXCL, 0600) in this verified private directory, so concurrent launches never
+# read each other's provider or token. The launcher execs claude and cannot delete its file, so each launch prunes the
+# directory's own session-*.json files older than PRUNE_AGE.
+SETTINGS_DIR = "~/.config/cortados/sessions"
+SETTINGS_PATTERN = "session-*.json"
+PRUNE_AGE = 24 * 3600
+# Passthrough args that would add a settings source after ours or replace the launcher's model.
+REFUSED_ARGS = ("--settings", "--setting-sources", "--model")
 MANAGED_SETTINGS_DIRS = ("/Library/Application Support/ClaudeCode", "/etc/claude-code")
 
 
@@ -110,31 +121,76 @@ def settings_content(provider_url: str, token: str) -> dict:
     return {"env": launcher_env(provider_url, token), "enabledPlugins": {PLUGIN_ID: False}}
 
 
-def write_settings(path: str, content: dict) -> str:
-    """Write the per-session settings privately: directory 0700, file created 0600 under a temp name and atomically
-    renamed over the previous launch's file, so the token is never readable by others, even briefly."""
-    p = Path(os.path.expanduser(path))
-    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(p.parent, 0o700)
-    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+def _lexical(path: str) -> str:
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def verify_private_dir(path: str, home: str) -> None:
+    """The private dir and every ancestor must be a real directory (never a symlink). The dir and ancestors up to and
+    including $HOME must be owned by this uid; ancestors above $HOME (or of a dir outside $HOME) by this uid or root.
+    The dir itself must be mode 0700. Otherwise another user could substitute a path component."""
+    uid = os.getuid()
+    home = _lexical(home)
+    p = path
+    while True:
+        try:
+            st = os.lstat(p)
+        except OSError as exc:
+            raise SessionError(f"cannot check settings directory component {p}: {exc.strerror}") from None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise SessionError(f"settings directory component {p} is a symlink or not a directory; refusing to launch")
+        inside_home = p == home or p.startswith(home.rstrip(os.sep) + os.sep)
+        allowed = (uid,) if inside_home else (uid, 0)
+        if st.st_uid not in allowed:
+            raise SessionError(f"settings directory component {p} is owned by uid {st.st_uid}; refusing to launch")
+        if p == path and stat.S_IMODE(st.st_mode) != 0o700:
+            raise SessionError(f"settings directory {p} has mode {stat.S_IMODE(st.st_mode):o}, not 700; "
+                               "refusing to launch")
+        parent = os.path.dirname(p)
+        if parent == p:
+            return
+        p = parent
+
+
+def prune_settings(path: str, now: float | None = None) -> None:
+    """Remove this uid's regular session-*.json files older than PRUNE_AGE; nothing else is touched."""
+    uid, cutoff = os.getuid(), (time.time() if now is None else now) - PRUNE_AGE
+    for name in os.listdir(path):
+        if not fnmatch.fnmatchcase(name, SETTINGS_PATTERN):
+            continue
+        f = os.path.join(path, name)
+        try:
+            st = os.lstat(f)
+            if stat.S_ISREG(st.st_mode) and st.st_uid == uid and st.st_mtime < cutoff:
+                os.unlink(f)
+        except FileNotFoundError:
+            pass
+
+
+def write_settings(directory: str, content: dict, home: str | None = None) -> str:
+    """Write this launch's settings to a new unique file (0600, O_EXCL) inside a verified private 0700 directory."""
+    d = _lexical(directory)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    verify_private_dir(d, os.path.expanduser("~") if home is None else home)
+    prune_settings(d)
+    fd, name = tempfile.mkstemp(prefix="session-", suffix=".json", dir=d)
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        os.unlink(tmp)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600 or not stat.S_ISREG(st.st_mode):
+            raise SessionError(f"settings file {name} is not a private 0600 file of this user; refusing to launch")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
             json.dump(content, f, indent=2, sort_keys=True)
             f.write("\n")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, p)
     except BaseException:
+        if fd >= 0:
+            os.close(fd)
         try:
-            os.unlink(tmp)
+            os.unlink(name)
         except OSError:
             pass
         raise
-    return str(p)
+    return name
 
 
 def managed_settings_files(dirs=MANAGED_SETTINGS_DIRS) -> list:
@@ -168,6 +224,14 @@ def check_managed(keys, dirs=MANAGED_SETTINGS_DIRS) -> None:
             )
 
 
+def check_passthrough(extra: list) -> None:
+    for a in extra:
+        for flag in REFUSED_ARGS:
+            if a == flag or a.startswith(flag + "="):
+                raise SessionError(f"refusing to pass {flag} to claude: the launcher owns the settings source and the "
+                                   "model (use --orchestrator to choose the model)")
+
+
 def build_argv(model: str, directive: str | None, extra: list, settings_path: str) -> list:
     argv = ["claude", "--model", model, "--settings", settings_path]
     if directive:
@@ -195,12 +259,13 @@ def parse(argv: list):
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     ap.add_argument("--no-delegate-directive", action="store_true")
     ap.add_argument("--print-env", action="store_true")
-    ap.add_argument("--settings-file", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--settings-dir", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
-def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS):
+def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None):
     args, extra = parse(argv)
+    check_passthrough(extra)
     url = (args.provider_url or base_env.get("CORTADOS_PROVIDER_URL") or "").strip()
     if not url:
         raise SessionError("no provider URL: pass --provider-url or set CORTADOS_PROVIDER_URL")
@@ -210,14 +275,15 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS):
     if not args.no_delegate_directive:
         directive = DIRECTIVE_FILE.read_text(encoding="utf-8").strip()
     check_managed(set(launcher_env(url, token)), managed_dirs)
-    settings_path = write_settings(args.settings_file or SETTINGS_FILE, settings_content(url, token))
+    settings_path = write_settings(args.settings_dir or SETTINGS_DIR, settings_content(url, token), home)
     return args, build_env(base_env, url, token), build_argv(model, directive, extra, settings_path)
 
 
-def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=MANAGED_SETTINGS_DIRS) -> int:
+def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=MANAGED_SETTINGS_DIRS,
+         home=None) -> int:
     base = dict(os.environ if base_env is None else base_env)
     try:
-        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base, managed_dirs)
+        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base, managed_dirs, home)
     except SessionError as exc:
         print(f"cortados session: {exc}", file=err)
         return 2

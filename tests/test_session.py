@@ -3,7 +3,9 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 from cortados_router import session
 
@@ -18,22 +20,28 @@ class SessionTests(unittest.TestCase):
         with open(self.tok, "w") as f:
             f.write(SECRET + "\n")
         self.base = {"PATH": "/usr/bin", "CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_API_KEY": "console-key"}
-        self.settings = os.path.join(self.tmp.name, "cfg", "session-settings.json")
+        # A fake HOME under the real temp path (no /var symlink), so the ancestor checks run on real directories.
+        self.home = os.path.join(os.path.realpath(self.tmp.name), "home")
+        os.mkdir(self.home, 0o700)
+        self.sdir = os.path.join(self.home, ".config", "cortados", "sessions")
         self.managed = os.path.join(self.tmp.name, "managed")     # empty: no managed settings unless a test writes one
-        # Belt and braces: even a call that misses --settings-file must never write the real ~/.config file.
-        keep = session.SETTINGS_FILE
-        session.SETTINGS_FILE = os.path.join(self.tmp.name, "default", "session-settings.json")
-        self.addCleanup(setattr, session, "SETTINGS_FILE", keep)
+        # Belt and braces: even a call that misses --settings-dir must never write the real ~/.config directory.
+        keep = session.SETTINGS_DIR
+        session.SETTINGS_DIR = os.path.join(self.home, "default-sessions")
+        self.addCleanup(setattr, session, "SETTINGS_DIR", keep)
 
     def prepare(self, argv, base=None):
-        return session.prepare(["--settings-file", self.settings] + list(argv), self.base if base is None else base,
-                               managed_dirs=(self.managed,))
+        return session.prepare(["--settings-dir", self.sdir] + list(argv), self.base if base is None else base,
+                               managed_dirs=(self.managed,), home=self.home)
 
     def run_main(self, *argv, base=None):
         out, err = io.StringIO(), io.StringIO()
-        rc = session.main(["--settings-file", self.settings] + list(argv), base_env=self.base if base is None else base,
-                          out=out, err=err, managed_dirs=(self.managed,))
+        rc = session.main(["--settings-dir", self.sdir] + list(argv), base_env=self.base if base is None else base,
+                          out=out, err=err, managed_dirs=(self.managed,), home=self.home)
         return rc, out.getvalue(), err.getvalue()
+
+    def settings_files(self):
+        return sorted(os.listdir(self.sdir)) if os.path.isdir(self.sdir) else []
 
     def test_model_mapping(self):
         self.assertEqual(session.resolve_model("fable"), "sub/claude-fable-5-1")
@@ -75,8 +83,10 @@ class SessionTests(unittest.TestCase):
 
     def test_settings_file_holds_env_at_flag_precedence(self):
         _, env, cmd = self.prepare(["--provider-url", "http://router.example:8787", "--token-file", self.tok])
-        self.assertEqual(cmd[cmd.index("--settings") + 1], self.settings)
-        with open(self.settings, encoding="utf-8") as f:
+        path = cmd[cmd.index("--settings") + 1]
+        self.assertEqual(os.path.dirname(path), self.sdir)
+        self.assertTrue(os.path.basename(path).startswith("session-") and path.endswith(".json"))
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["enabledPlugins"], {session.PLUGIN_ID: False})
         senv = data["env"]
@@ -89,22 +99,107 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(senv[k], "")
         # Every launcher variable is in both the settings file and the process env, with the same value.
         self.assertEqual(senv, {k: env[k] for k in senv})
-        self.assertEqual(stat.S_IMODE(os.stat(self.settings).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(self.settings)).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.sdir).st_mode), 0o700)
         self.assertFalse(any(SECRET in a for a in cmd), "token must never be in argv")
 
-    def test_settings_file_replaced_each_launch(self):
-        self.prepare(["--provider-url", "http://a.example", "--token-file", self.tok])
-        os.chmod(self.settings, 0o644)                      # a loosened old file is replaced, not reused
+    def launch(self, url, token):
         with open(self.tok, "w") as f:
-            f.write("tok-OTHER\n")
-        self.prepare(["--provider-url", "http://b.example", "--token-file", self.tok])
-        with open(self.settings, encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "http://b.example")
-        self.assertEqual(data["env"]["ANTHROPIC_API_KEY"], "tok-OTHER")
-        self.assertEqual(stat.S_IMODE(os.stat(self.settings).st_mode), 0o600)
-        self.assertEqual([n for n in os.listdir(os.path.dirname(self.settings)) if n.endswith(".tmp")], [])
+            f.write(token + "\n")
+        _, _, cmd = self.prepare(["--provider-url", url, "--token-file", self.tok])
+        return cmd[cmd.index("--settings") + 1]
+
+    def test_interleaved_launches_get_their_own_files(self):
+        a = self.launch("http://a.example", "tok-A")          # launch A writes, but its claude has not read yet
+        b = self.launch("http://b.example", "tok-B")          # launch B must not touch A's file
+        self.assertNotEqual(a, b)
+        for path, url, token in ((a, "http://a.example", "tok-A"), (b, "http://b.example", "tok-B")):
+            with open(path, encoding="utf-8") as f:
+                senv = json.load(f)["env"]
+            self.assertEqual((senv["ANTHROPIC_BASE_URL"], senv["ANTHROPIC_API_KEY"], senv["ANTHROPIC_AUTH_TOKEN"]),
+                             (url, token, token))
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_prune_removes_only_old_matching_files(self):
+        os.makedirs(self.sdir, mode=0o700)
+        old = time.time() - session.PRUNE_AGE - 60
+        names = {"session-old.json": old, "session-new.json": None, "other-old.json": old, "session-old.txt": old}
+        for n, mtime in names.items():
+            with open(os.path.join(self.sdir, n), "w") as f:
+                f.write("{}")
+            if mtime:
+                os.utime(os.path.join(self.sdir, n), (mtime, mtime))
+        os.mkdir(os.path.join(self.sdir, "session-dir.json"))      # not a regular file: kept
+        os.utime(os.path.join(self.sdir, "session-dir.json"), (old, old))
+        target = os.path.join(self.tmp.name, "outside.json")      # an old symlink is never followed or removed
+        with open(target, "w") as f:
+            f.write("{}")
+        os.symlink(target, os.path.join(self.sdir, "session-link.json"))
+        os.utime(os.path.join(self.sdir, "session-link.json"), (old, old), follow_symlinks=False)
+        new = os.path.basename(self.launch("http://a.example", "tok-A"))
+        self.assertEqual(self.settings_files(), sorted(
+            [new, "session-new.json", "other-old.json", "session-old.txt", "session-dir.json", "session-link.json"]))
+        self.assertTrue(os.path.exists(target))
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):   # another uid's old file is never removed
+            os.utime(os.path.join(self.sdir, "session-new.json"), (old, old))
+            session.prune_settings(self.sdir)
+        self.assertIn("session-new.json", self.settings_files())
+
+    def test_symlinked_private_dir_refused(self):
+        real = os.path.join(self.home, "elsewhere")
+        os.mkdir(real, 0o700)
+        os.makedirs(os.path.dirname(self.sdir), mode=0o700)
+        os.symlink(real, self.sdir)
+        with self.assertRaises(session.SessionError) as cm:
+            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+        self.assertIn("symlink", str(cm.exception))
+        self.assertEqual(os.listdir(real), [])
+
+    def test_symlinked_ancestor_refused(self):
+        real = os.path.join(self.home, "realcfg")
+        os.mkdir(real, 0o700)
+        os.symlink(real, os.path.join(self.home, ".config"))
+        with self.assertRaises(session.SessionError):
+            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+
+    def test_loose_private_dir_refused(self):
+        for mode in (0o770, 0o707, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.makedirs(self.sdir, mode=0o700, exist_ok=True)
+                os.chmod(self.sdir, mode)
+                with self.assertRaises(session.SessionError) as cm:
+                    self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+                self.assertIn("mode", str(cm.exception))
+                self.assertEqual(self.settings_files(), [])
+
+    def test_foreign_owner_refused(self):
+        real_lstat = os.lstat
+
+        def fake(p, *a, **k):
+            st = real_lstat(p, *a, **k)
+            if p == self.home:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, os.getuid() + 1) + tuple(st)[5:])
+            return st
+        with mock.patch("os.lstat", fake):
+            with self.assertRaises(session.SessionError) as cm:
+                self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+        self.assertIn("owned by", str(cm.exception))
+
+    def test_happy_path_private_dir(self):
+        path = self.launch("http://r.example", "tok-A")
+        self.assertEqual(stat.S_IMODE(os.lstat(self.sdir).st_mode), 0o700)
+        self.assertEqual(os.lstat(path).st_uid, os.getuid())
+
+    def test_refused_passthrough_args(self):
+        for extra in (["--settings", "other.json"], ["--settings=other.json"], ["--setting-sources", "user"],
+                      ["--setting-sources=user"], ["--model", "opus"], ["--model=opus"], ["-c", "--settings", "x"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(session.SessionError):
+                    self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--"] + extra)
+                self.assertEqual(self.settings_files(), [])
+        _, _, cmd = self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--",
+                                  "--mcp-config", "mcp.json", "--settingsx"])
+        self.assertEqual(cmd[-3:], ["--mcp-config", "mcp.json", "--settingsx"])
 
     def write_managed(self, rel, content):
         path = os.path.join(self.managed, rel)
@@ -118,7 +213,7 @@ class SessionTests(unittest.TestCase):
             self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
         self.assertIn("ANTHROPIC_API_KEY", str(cm.exception))
         self.assertNotIn("corp-key", str(cm.exception))
-        self.assertFalse(os.path.exists(self.settings), "no token file is written for a refused launch")
+        self.assertEqual(self.settings_files(), [], "no token file is written for a refused launch")
         rc, out, err = self.run_main("--provider-url", "http://r.example", "--token-file", self.tok, "--print-env")
         self.assertEqual(rc, 2)
         self.assertIn("managed settings", err)
@@ -132,7 +227,7 @@ class SessionTests(unittest.TestCase):
     def test_managed_settings_without_conflict_ok(self):
         self.write_managed("managed-settings.json", {"env": {"OTHER": "x"}, "permissions": {}})
         self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
-        self.assertTrue(os.path.exists(self.settings))
+        self.assertEqual(len(self.settings_files()), 1)
 
     def test_launcher_models_are_served(self):
         """Every launcher default and short name goes through the provider's real normalize_model and choose (real
