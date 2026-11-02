@@ -31,6 +31,19 @@ READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
 
 
 class WireTests(unittest.TestCase):
+    def test_cache_metadata_is_not_application_data_and_request_is_not_mutated(self):
+        block = {"type": "tool_use", "input": {"cache_control": "application data"},
+                 "cache_control": {"type": "ephemeral"}}
+        clean = wire.without_cache_control(block)
+        self.assertNotIn("cache_control", clean)
+        self.assertEqual(clean["input"], block["input"])
+        self.assertIn("cache_control", block)
+        tool = dict(READ_TOOL, cache_control={"type": "ephemeral"})
+        turn = wire.parse_request({"tools": [tool], "messages": [{"role": "user", "content": "hi"}]})
+        self.assertNotIn("cache_control", turn.tools[0])
+        self.assertIn("cache_control", tool)
+
+
     def test_tool_results_are_split_from_new_content_and_reminders_ride_on_the_last_result(self):
         turn = wire.parse_request({"messages": [
             {"role": "user", "content": "hi"},
@@ -116,6 +129,27 @@ class EndpointHarness(unittest.TestCase):
 
 
 class EndpointTests(EndpointHarness):
+    def test_client_cache_markers_are_removed_on_every_claude_path(self):
+        def blocks(text):
+            return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                    {"type": "text", "text": "context", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        # Single-message one-shot, multi-message replay, first persistent turn, and continuation.
+        for messages in ([{"role": "user", "content": blocks("hello")}],
+                         [{"role": "user", "content": blocks("old")},
+                          {"role": "assistant", "content": blocks("reply")},
+                          {"role": "user", "content": blocks("new")}]):
+            self.assertEqual(self.post({"messages": messages})["stop_reason"], "end_turn")
+        history = [{"role": "user", "content": blocks("use tool")}]
+        first = self.post({"tools": [READ_TOOL], "messages": history})
+        use = first["content"][-1]
+        history += [{"role": "assistant", "content": first["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"],
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        "content": blocks("result") + [{"type": "document",
+                            "cache_control": {"type": "ephemeral"}, "content": blocks("nested")}]}]}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": history})["stop_reason"], "end_turn")
+
+
     def test_a_bridged_tool_call_round_trips_through_the_client(self):
         history = [{"role": "user", "content": "please use tool"}]
         r1 = self.post({"model": "cortados", "tools": [READ_TOOL], "messages": history})
