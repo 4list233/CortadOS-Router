@@ -57,6 +57,7 @@ SERVE_POINTER="${CORTADOS_S1_SERVE_POINTER:-$PWD/current.json}"   # serve.py rea
 export CORTADOS_S1_SERVE_POINTER="$SERVE_POINTER"   # evaluate.py grades against the incumbent named here
 SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
+NIGHT="${CORTADOS_S1_NIGHT_DATE:-$(date +%F)}"   # the stall tracker counts nights by this date (override for tests / backfilled runs)
 STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"   # one quiet night is normal (weekend); two in a row means the labeler is stuck
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
@@ -120,6 +121,7 @@ evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdo
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
 mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
+report_unavailable() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('evaluation_status') == 'unavailable' else 1)" "$1/report.json"; }
 report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
 eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
   local hk inc
@@ -166,7 +168,7 @@ rc=$?
 if ! labelled=$(state labels data/labels.jsonl); then
   echo "LABEL COUNT FAILED (data/labels.jsonl unreadable): training skipped"; state event "$STATUS" label_count_failure "labels.jsonl unreadable"; exit 1
 fi
-alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS")
+alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT")
 [ -n "$alert" ] && echo "$alert"
 # label.py exit codes: 0 completed, 2 config error, 3 stopped early (quota/auth/retries; the labels it wrote are kept).
 if [ "$rc" -eq 3 ]; then
@@ -199,6 +201,8 @@ fi
 # A pending candidate is a trained run whose outcome is not final yet, kept in data/pending-candidate as
 #   "<sft fingerprint> <eval fingerprint> <reason> <run>"
 #   reason promotion_failed: approved but the pointer write failed → re-evaluate and publish on the next night;
+#   reason evaluation_failed: evaluate.py crashed or could not build the bar (evaluation_status unavailable) → re-evaluate next
+#                            night whatever the fingerprints say; never finalised as a rejection;
 #   reason holdout_blocked:  evaluate.py refused for a too-small Claude holdout. Holdout labels never enter the SFT data, so the
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
@@ -223,6 +227,11 @@ if [ -f data/pending-candidate ]; then
     echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
     if ! evaluate_run "$p_run"; then
       echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; exit 1
+    fi
+    if report_unavailable "$p_run"; then
+      echo "$sft_hash $now_eval evaluation_failed $p_run" > data/pending-candidate
+      echo "EVALUATION UNAVAILABLE again for $p_run: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$p_run/report.json"); retried next night"
+      state event "$STATUS" evaluation_failure "$p_run (retry)"; exit 1
     fi
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
@@ -339,10 +348,20 @@ while :; do
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
 gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
-evaluate_run "$RUN" || exit 1
+if ! evaluate_run "$RUN"; then
+  # a crashed evaluation is not a verdict: keep the run pending and re-evaluate it next night, data unchanged or not
+  echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
+  state event "$STATUS" evaluation_failure "$RUN (evaluate.py failed)"
+  echo "EVALUATION FAILED for $RUN; it stays pending and is re-evaluated next night"; exit 1
+fi
 echo "$labelled" > data/last-train-count
 state event "$STATUS" train "$RUN ($labelled labels)"
-if report_promotes "$RUN"; then
+if report_unavailable "$RUN"; then
+  echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
+  state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"
+  echo "EVALUATION UNAVAILABLE for $RUN: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$RUN/report.json"); not a rejection: re-evaluated next night"
+  exit 1
+elif report_promotes "$RUN"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then

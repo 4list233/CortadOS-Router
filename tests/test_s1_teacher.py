@@ -62,7 +62,8 @@ class FakeProvider:
 
 def answers_for(body, model=None):
     batch = json.loads(body["messages"][0]["content"].split("\n", 1)[1])
-    return {"model": model or body["model"], "usage": {"input_tokens": 1, "output_tokens": 1}, "stop_reason": "end_turn",
+    # default: a healthy provider that reveals ample headroom (an unrevealed % now stops the pass; see the reveal tests)
+    return {"model": model or f"{body['model'][len('sub/'):] if body['model'].startswith('sub/') else body['model']} · 80% left", "usage": {"input_tokens": 1, "output_tokens": 1}, "stop_reason": "end_turn",
             "content": [{"type": "text", "text": json.dumps([{"i": r["i"], **ANSWER} for r in batch])}]}
 
 
@@ -81,7 +82,7 @@ FIT_413 = ("cortados: sub/claude-sonnet-5: the request (≈250k tokens) does not
 
 def reset_pass_state():
     label._stop.clear(); label._reveal_missing_logged.clear()
-    label.PASS_RUN_ID = None; label.ONLY = []; label.MIN_LEFT_PCT = label.MIN_LEFT_PCT_DEFAULT
+    label.PASS_RUN_ID = None; label.ONLY = []; label.MIN_LEFT_PCT = label.MIN_LEFT_PCT_DEFAULT; label.ALLOW_UNKNOWN_HEADROOM = False
 
 
 def err(msg, kind="overloaded_error"):
@@ -217,18 +218,28 @@ class ProviderTeacherTests(unittest.TestCase):
         self.assertEqual(self._work()[0], 3)
         self.assertFalse(label._stop.is_set())
 
-    def test_missing_reveal_logs_once_and_continues(self):
-        self._serve([(200, {}, answers_for), (200, {}, answers_for)])
-        _, log1 = self._work()
-        _, log2 = self._work()
-        self.assertIn("headroom unknown", log1)
-        self.assertNotIn("headroom unknown", log2)
-        self.assertFalse(label._stop.is_set())
+    def test_missing_reveal_keeps_the_batch_and_stops_the_pass(self):
+        unrevealed = lambda body: answers_for(body, "claude-sonnet-5")          # stale / unknown reading: no "% left"
+        self._serve([(200, {}, unrevealed)])
+        got, log = self._work()
+        self.assertEqual(got, 3, "the completed batch is kept")
+        self.assertTrue(label._stop.is_set())
+        self.assertIn("headroom unknown: stopping the pass", log)
         self.assertEqual(label.left_pct("claude-opus-5 · 7% left"), 7.0)
         self.assertIsNone(label.left_pct("claude-opus-5"))
 
+    def test_missing_reveal_continues_when_opted_in(self):
+        label.ALLOW_UNKNOWN_HEADROOM = True
+        unrevealed = lambda body: answers_for(body, "claude-sonnet-5")
+        self._serve([(200, {}, unrevealed), (200, {}, unrevealed)])
+        _, log1 = self._work()
+        _, log2 = self._work()
+        self.assertIn("headroom unknown, continuing", log1)
+        self.assertNotIn("headroom unknown", log2)
+        self.assertFalse(label._stop.is_set())
+
     def test_prose_or_truncated_answer_drops_the_batch_loudly(self):
-        prose = {"model": "m", "stop_reason": "end_turn", "content": [{"type": "text", "text": "I cannot rate these."}]}
+        prose = {"model": "claude-sonnet-5 · 80% left", "stop_reason": "end_turn", "content": [{"type": "text", "text": "I cannot rate these."}]}
         self._serve([(200, {}, prose), (200, {}, lambda b: {**answers_for(b), "stop_reason": "max_tokens"})])
         got, log = self._work()
         self.assertEqual(got, 0)
@@ -374,6 +385,21 @@ class MainExitCodeTests(unittest.TestCase):
         code, out = self._main([(200, {}, prose)] * 4)
         self.assertEqual(code, label.EXIT_STOPPED)
         self.assertEqual(len(self.fake.seen), 1, "no further calls after a low-headroom reading")
+
+    def test_unknown_headroom_exits_3_unless_allowed(self):
+        unrevealed = lambda body: answers_for(body, "claude-sonnet-5")
+        code, _ = self._main([(200, {}, unrevealed)] * 4)
+        self.assertEqual(code, label.EXIT_STOPPED)
+        self.assertEqual((len(self.fake.seen), len(common.read_jsonl(label.LABELS))), (1, 2), "first batch kept, then stopped")
+        self.fake.close(); reset_pass_state(); label.LABELS.unlink()
+        self.assertEqual(self._main([(200, {}, unrevealed)] * 4, extra=("--allow-unknown-headroom",))[0], label.EXIT_OK)
+        self.assertEqual(len(self.fake.seen), 4)
+        self.fake.close(); reset_pass_state(); label.LABELS.unlink()
+        os.environ["CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM"] = "1"
+        try:
+            self.assertEqual(self._main([(200, {}, unrevealed)] * 4)[0], label.EXIT_OK)
+        finally:
+            os.environ.pop("CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM", None)
 
     def test_max_scarcity_on_the_provider_backend_is_a_config_error(self):
         self.assertEqual(self._main([], extra=("--max-scarcity", "0.9"))[0], label.EXIT_CONFIG)

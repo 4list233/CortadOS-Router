@@ -119,6 +119,11 @@ MAX_TOKENS = 8192
 # while they still have room. 30% ~ the old --max-scarcity 0.7 gate. Override with --min-left-pct.
 MIN_LEFT_PCT_DEFAULT = 30.0
 MIN_LEFT_PCT = MIN_LEFT_PCT_DEFAULT
+# Unknown headroom (the provider sent no "% left": its usage reading is stale, failed, or of another login) stops the pass by
+# default, after keeping the batch that came back: --min-left-pct cannot be honoured blind, and a whole backlog run blind could
+# drain the accounts interactive work shares. --allow-unknown-headroom (or CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM=1, e.g. in
+# s1/data/train-config.env) opts into continuing on the provider's own spent gate.
+ALLOW_UNKNOWN_HEADROOM = False
 REVEAL_RE = re.compile(r"·\s*(\d+(?:\.\d+)?)%\s*left\s*$")
 PASS_RUN_ID: str | None = None                           # one x-cortados-run-id per pass: the provider keeps a bounded LRU of run records
 _call_seq = iter(range(1, 10**9))
@@ -267,12 +272,17 @@ def check_headroom(model: str, meta: dict) -> None:
     """Stop the pass once the account this call ran on is below MIN_LEFT_PCT (provider backend)."""
     left = meta.get("left_pct")
     if left is None:
-        # The provider reveals % left only for a fresh reading of the login the route ran on (server._reveal); without it the labeler
-        # cannot see headroom and relies on the provider's own spent gate. Logged once per pass, not per call, to keep the log readable.
-        if not _reveal_missing_logged.is_set():
+        # The provider reveals % left only for a fresh reading of the login the route ran on (server.reveal_model).
+        if not ALLOW_UNKNOWN_HEADROOM:
+            print(f"  ! {model}: provider sent no '% left' (model {meta.get('model')!r}); headroom unknown: stopping the pass after "
+                  "this batch (--allow-unknown-headroom / CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM=1 continues on the provider's own "
+                  "quota gate)", flush=True)
+            _stop.set()
+            return
+        if not _reveal_missing_logged.is_set():          # opted in: logged once per pass, not per call
             _reveal_missing_logged.set()
             print(f"  ? {model}: provider sent no '% left' (model {meta.get('model')!r}); headroom unknown, continuing on the provider's "
-                  "own quota gate", flush=True)
+                  "own quota gate (--allow-unknown-headroom)", flush=True)
         return
     if left < MIN_LEFT_PCT:
         print(f"  ! {model}: account at {left:g}% left < --min-left-pct {MIN_LEFT_PCT:g}: stopping the pass to leave headroom for "
@@ -351,8 +361,12 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=3); ap.add_argument("--split", default="all"); ap.add_argument("--only", default=""); ap.add_argument("--max-scarcity", type=float, default=None, help="cli backend only: the local pool gate (default %s)" % SCARCITY_STOP)
     ap.add_argument("--min-left-pct", type=float, default=MIN_LEFT_PCT_DEFAULT, help="provider backend: stop once the routed account has less "
                     "than this %% left (default %(default)s; interactive sessions, reviews and routed subagents share these accounts)")
+    ap.add_argument("--allow-unknown-headroom", action="store_true",
+                    default=os.environ.get("CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM") == "1",
+                    help="provider backend: keep labelling when the provider reveals no %% left (default: stop the pass with exit 3)")
     a = ap.parse_args()
-    global BACKEND, PROVIDER
+    global BACKEND, PROVIDER, ALLOW_UNKNOWN_HEADROOM
+    ALLOW_UNKNOWN_HEADROOM = a.allow_unknown_headroom
     for split, model in (("train", a.train_teacher), ("holdout", a.holdout_teacher)):
         if not is_claude_teacher(model):
             print(f"label: refusing {split} teacher {model!r}: only Claude teachers label (Codex labels under-rated tasks; training drops them)",

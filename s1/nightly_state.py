@@ -3,8 +3,9 @@
   labels <labels.jsonl>                       print the number of usable Claude (id, teacher, sample) labels (0 when missing); a corrupt
                                               line exits non-zero so the nightly stops instead of recording a bogus count
   fingerprint <file>...                       print one sha256 over the files (the SFT data training reads); a missing file exits 1
-  growth <status.json> <count> <stall-nights> record tonight's label count; print ALERT line when labels have not grown for
-                                              <stall-nights> consecutive nights (the router dashboard reads the same file)
+  growth <status.json> <count> <stall-nights> [<night YYYY-MM-DD>]
+                                              record tonight's label count; print ALERT line when labels have not grown for
+                                              <stall-nights> consecutive nights (distinct dates; the dashboard reads the same file)
   event <status.json> <key> [<detail>]        stamp last_<key> (train, promotion, labeling_failure, skip) with now + detail
   promote <report.json> <adapter dir> <pointer>
                                               write the promoted pointer the scorer reads (s1/serve.py reloads on mtime change),
@@ -88,16 +89,21 @@ def fingerprint(paths: list[Path]) -> str:
     return h.hexdigest()[:16]
 
 
-def growth(path: Path, count: int, stall_nights: int) -> str:
+def growth(path: Path, count: int, stall_nights: int, night: str | None = None) -> str:
+    """Track label growth per NIGHT (a calendar date), not per invocation: a manual rerun on the same night must not count
+    as a second stalled night, and a night that grew at any of its runs is not a stalled night."""
     st = load_status(path)
     prev = st.get("last_label_count")
     stamp = now()
+    night = night or datetime.now().date().isoformat()
     if prev is None or count > prev:
-        st.update(last_label_growth=stamp, nights_without_growth=0)
-    else:
+        st.update(last_label_growth=stamp, nights_without_growth=0, last_growth_night=night)
+        st.pop("last_stall_night", None)
+    elif night not in (st.get("last_growth_night"), st.get("last_stall_night")):
         st["nights_without_growth"] = int(st.get("nights_without_growth", 0)) + 1
+        st["last_stall_night"] = night
     st.update(last_label_count=count, last_label_check=stamp)
-    n = st["nights_without_growth"]
+    n = int(st.get("nights_without_growth", 0))
     if n >= stall_nights:
         st["alert"] = (f"ALERT: S1 labels have not grown for {n} consecutive nights "
                        f"(count {count}, last growth {st.get('last_label_growth', 'never')}); check the teacher/label.py")
@@ -141,7 +147,7 @@ def main(argv: list[str]) -> int:
             print(f"nightly_state: {exc}", file=sys.stderr)
             return 1
     elif cmd == "growth":
-        alert = growth(Path(args[0]), int(args[1]), int(args[2]))
+        alert = growth(Path(args[0]), int(args[1]), int(args[2]), args[3] if len(args) > 3 else None)
         if alert:
             print(alert)
     elif cmd == "event":

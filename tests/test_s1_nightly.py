@@ -13,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -48,12 +49,16 @@ STUBS = {
         "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
         "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
+        "if os.environ.get('STUB_EVAL_RC'): raise SystemExit(int(os.environ['STUB_EVAL_RC']))\n"
+        "unavailable = os.environ.get('STUB_EVAL_UNAVAILABLE') == '1'\n"
         "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0' and floor > 50   # the stub holdout has 50 rows\n"
         "open('data/eval-pointer', 'w').write(os.environ.get('CORTADOS_S1_SERVE_POINTER', ''))\n"
         "c = {'band_accuracy': 0.9, 'under_routed': 0.01, 'over_routed': 0.1, 'outward_recall': 1.0}\n"
         "json.dump({'base': a.base, 'temperatures': {}, 'when': '2026-11-02', 'candidate': c,\n"
         "           'holdout_key': hk, **({'promote_blocked': 'teacher holdout too small'} if blocked else {}),\n"
-        "           'promote': os.environ.get('STUB_PROMOTE', '1') == '1' and not blocked}, open(os.path.join(a.out, 'report.json'), 'w'))\n"
+        "           'evaluation_status': 'unavailable' if unavailable else 'ok',\n"
+        "           **({'evaluation_unavailable': 'bar_error: incumbent load failed'} if unavailable else {}),\n"
+        "           'promote': os.environ.get('STUB_PROMOTE', '1') == '1' and not blocked and not unavailable}, open(os.path.join(a.out, 'report.json'), 'w'))\n"
     ),
 }
 
@@ -100,7 +105,9 @@ class NightlyEndToEnd(unittest.TestCase):
         self.night += 1
         run = f"runs/n{self.night}"
         out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh")], cwd=self.tmp,
-                             env={**self.env, "CORTADOS_S1_RUN": run, **{k: str(v) for k, v in env.items()}},
+                             env={**self.env, "CORTADOS_S1_RUN": run,
+                                  "CORTADOS_S1_NIGHT_DATE": (date(2026, 1, 1) + timedelta(days=self.night)).isoformat(),
+                                  **{k: str(v) for k, v in env.items()}},
                              capture_output=True, text=True, timeout=60)
         log = (self.s1 / run / "nightly.log").read_text()
         return out.returncode, log, self.s1 / run
@@ -351,6 +358,55 @@ class NightlyEndToEnd(unittest.TestCase):
             p.write_text("".join(json.dumps(r) + "\n" for r in rows))
             self.assertEqual(count(), want, add)
 
+    def test_unavailable_evaluation_stays_pending_and_recovers(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_UNAVAILABLE=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("EVALUATION UNAVAILABLE for runs/n1", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "an unavailable evaluation is not a rejection")
+        self.assertIn("evaluation_failed runs/n1", (self.s1 / "data/pending-candidate").read_text())
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0)           # bar loads again; data and fingerprints unchanged
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending candidate runs/n1 (evaluation_failed): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertFalse((run2 / "adapter").exists(), "recovered without retraining")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("skipped: no new labels", log)
+
+    def test_crashed_evaluation_stays_pending_and_recovers(self):
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("EVALUATION FAILED for runs/n1", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_EVAL_UNAVAILABLE=1)   # still unavailable: stays pending
+        self.assertEqual(rc, 1, log)
+        self.assertIn("EVALUATION UNAVAILABLE again for runs/n1", log)
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertFalse((run3 / "adapter").exists())
+
+    def test_reruns_on_one_night_count_as_one_stalled_night(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        same = (date(2026, 1, 1) + timedelta(days=99)).isoformat()
+        for _ in range(3):
+            _, log, _ = self.run_night(STUB_LABEL_RC=2, CORTADOS_S1_NIGHT_DATE=same)
+        self.assertNotIn("ALERT", log, "three runs on one night are one stalled night")
+        self.assertEqual(self.status()["nights_without_growth"], 1)
+        _, log, _ = self.run_night(STUB_LABEL_RC=2)
+        self.assertIn("ALERT: S1 labels have not grown for 2 consecutive nights", log)
+
+    def test_same_night_growth_clears_the_stall(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        self.run_night(STUB_LABEL_RC=2)
+        night = (date(2026, 1, 1) + timedelta(days=50)).isoformat()
+        _, log, _ = self.run_night(STUB_LABEL_RC=2, CORTADOS_S1_NIGHT_DATE=night)
+        self.assertIn("ALERT", log)
+        self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_NIGHT_DATE=night)          # a rerun the same night grows
+        st = self.status()
+        self.assertNotIn("alert", st)
+        self.assertEqual(st["nights_without_growth"], 0)
+        _, log, _ = self.run_night(STUB_LABEL_RC=2, CORTADOS_S1_NIGHT_DATE=night)  # that night grew: not a stalled night
+        self.assertEqual(self.status()["nights_without_growth"], 0)
+
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
         rc, log, _ = self.run_night(STUB_NEW_LABELS=4, STUB_PROMOTE=0)
@@ -495,6 +551,37 @@ class EvaluateHoldoutKeyCli(unittest.TestCase):
             return out.getvalue().strip()
         self.assertNotEqual(key(200), key(40))
         self.assertTrue(key(200).endswith("-min200"))
+
+
+class EvaluateUnavailableStatus(unittest.TestCase):
+    def run_eval(self, pointer_text):
+        import importlib.util, io, sys
+        from contextlib import redirect_stdout
+        sys.path.insert(0, str(S1))
+        spec = importlib.util.spec_from_file_location("s1_evaluate_status", S1 / "evaluate.py")
+        ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev)
+        tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp, True)
+        pointer = tmp / "current.json"
+        if pointer_text is not None:
+            pointer.write_text(pointer_text)
+        g = {"n": 0, "band_accuracy": 1.0, "under_routed": 0.0, "over_routed": 0.0, "outward_recall": 1.0}
+        with mock.patch.object(ev, "Scorer"), mock.patch.object(ev, "fit_temperatures", return_value={}), \
+             mock.patch.object(ev, "grade", return_value=g), mock.patch.object(ev, "outcome_holdout", return_value=[]), \
+             mock.patch.object(ev, "read_jsonl", return_value=[]), mock.patch.object(ev, "read_labels", return_value=[]), \
+             mock.patch.dict(os.environ, {"CORTADOS_S1_SERVE_POINTER": str(pointer)}), \
+             mock.patch.object(sys, "argv", ["evaluate.py", "--base", "b", "--adapter", str(tmp / "cand"), "--out", str(tmp / "out")]), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(ev.main(), 0)
+        return json.loads((tmp / "out/report.json").read_text())
+
+    def test_unreadable_incumbent_is_unavailable_not_a_rejection(self):
+        r = self.run_eval("{not json")
+        self.assertEqual(r["evaluation_status"], "unavailable")
+        self.assertIn("bar_error", r["evaluation_unavailable"])
+        self.assertFalse(r["promote"])
+
+    def test_no_incumbent_yet_is_a_normal_evaluation(self):
+        self.assertEqual(self.run_eval(None)["evaluation_status"], "ok")
 
 
 class AtomicPointer(unittest.TestCase):

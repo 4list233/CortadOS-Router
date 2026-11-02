@@ -305,7 +305,8 @@ def main() -> int:
     else:
         cur, inc = {}, None
         try:
-            cur = json.loads(current_pointer().read_text())
+            # no pointer at all = no incumbent yet (the first model), not a failure; an unreadable one is a failure
+            cur = json.loads(current_pointer().read_text()) if current_pointer().exists() else {}
         except Exception as exc:
             report["bar_error"] = f"{type(exc).__name__}: {exc}"
         if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
@@ -349,8 +350,15 @@ def main() -> int:
     if len(holdout) < MIN_TEACHER_HOLDOUT:
         report["promote_blocked"] = (f"teacher holdout has {len(holdout)} Claude-labelled rows < {MIN_TEACHER_HOLDOUT} "
                                      "(CORTADOS_S1_MIN_HOLDOUT): too few to compare models; finish the holdout backfill")
+    # A bar that could not be built (incumbent pointer unreadable, incumbent or outcome-bar grading failed) makes promote=False a
+    # verdict nobody reached: say so, so nightly.sh retries the evaluation instead of finalising the candidate as rejected.
+    errors = {k: report[k] for k in ("bar_error", "outcome_bar_error") if report.get(k)}
+    report["evaluation_status"] = "unavailable" if errors else "ok"
+    if errors:
+        report["promote"] = False
+        report["evaluation_unavailable"] = "; ".join(f"{k}: {v}" for k, v in errors.items())
     (out / "report.json").write_text(json.dumps(report, indent=1))
-    print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
+    print(json.dumps({k: report[k] for k in ("evaluation_status", "holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
                                               "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
     return 0
 
