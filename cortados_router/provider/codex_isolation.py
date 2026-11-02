@@ -13,6 +13,7 @@ Verified against Codex CLI 0.163.0 (docs/PROVIDER-PLAN.md, P2 status and live fi
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -151,17 +152,63 @@ def check_account(account: dict[str, Any]) -> None:
                           f"codex-cli lane is a subscription lane and must not bill another account")
 
 
+# Codex's validation of dynamic tool names (strings of the 0.166.0 binary, next to the -32600 "dynamic tool name is
+# reserved: mcp__cortados-route__route_task" seen live): a name "must match ^[a-zA-Z0-9_-]+$ to match Responses API",
+# "must be at most N characters to match Responses API" (the Responses API function-name limit is 64), must not carry
+# leading/trailing whitespace, and "dynamic tool name is reserved" for the mcp__ namespace Codex keeps for its own MCP
+# tools. Every Claude Code session with an MCP server loaded sends mcp__<server>__<tool> names, so the rule is applied
+# generically here — never a per-server or per-tool list — and any tool a user adds later is mapped the same way.
+SAFE_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+MAX_TOOL_NAME = 64
+RESERVED_TOOL_PREFIX = "mcp__"          # compared case-insensitively: the conservative reading of "reserved"
+ENCODED_MCP_PREFIX = "cx_mcp_"          # mcp__a__b -> cx_mcp_a__b
+
+
+def codex_safe(name: str) -> bool:
+    """True when Codex accepts `name` as a dynamic tool name as-is (and it is not one of Codex's own names)."""
+    return (bool(SAFE_TOOL_NAME.fullmatch(name)) and not name.lower().startswith(RESERVED_TOOL_PREFIX)
+            and name.lower() != "mcp" and name not in CODEX_TOOL_NAMES)
+
+
+def _encode(name: str, taken: set[str]) -> str:
+    """A deterministic Codex-safe name for `name`. Readable where possible (mcp__a__b -> cx_mcp_a__b, Codex's own names
+    -> client_<name>, other characters -> _); a short hash of the original is appended whenever the readable form lost
+    information (a substituted character or truncation) or is already taken, so two names never share an encoding."""
+    if name in CODEX_TOOL_NAMES:
+        base = ALIAS_PREFIX + name
+    elif name.lower().startswith(RESERVED_TOOL_PREFIX):
+        base = ENCODED_MCP_PREFIX + name[len(RESERVED_TOOL_PREFIX):]
+    else:
+        base = name
+    readable = re.sub(r"[^A-Za-z0-9_-]", "_", base) or "tool"
+    if readable.lower().startswith(RESERVED_TOOL_PREFIX):   # e.g. " mcp__x" after substitution
+        readable = "cx_" + readable
+    lossy = readable != base or len(readable) > MAX_TOOL_NAME
+    if not lossy and readable not in taken:
+        return readable
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    for n in range(8, len(digest) + 1):
+        suffix = "_" + digest[:n]
+        out = readable[:MAX_TOOL_NAME - len(suffix)] + suffix
+        if out not in taken:
+            return out
+    raise BridgeError(f"cannot find a Codex-safe name for client tool {name!r}")   # unreachable in practice
+
+
 def tool_aliases(tools: list[dict[str, Any]]) -> dict[str, str]:
-    """Dynamic-tool name -> client tool name, for the client tools whose names Codex would swallow (CODEX_TOOL_NAMES).
-    Refuses an alias that is itself a client tool's name: the call could not be mapped back unambiguously."""
-    names = {t["name"] for t in tools}
-    aliases = {ALIAS_PREFIX + n: n for n in sorted(names & CODEX_TOOL_NAMES)}
-    taken = sorted(set(aliases) & names)
-    if taken:
-        raise BridgeError(f"client tools {taken} collide with the aliases of Codex-named tools; rename them")
+    """Dynamic-tool name -> client tool name, for every client tool whose name Codex would refuse (SAFE_TOOL_NAME,
+    the reserved mcp__ prefix) or swallow (CODEX_TOOL_NAMES). Safe names pass through unchanged and are reserved first,
+    so an encoding never takes a client tool's own name; the map is per thread and reversed on item/tool/call."""
+    names = sorted({t["name"] for t in tools})
+    taken = {n for n in names if codex_safe(n)}
+    aliases: dict[str, str] = {}
+    for n in names:
+        if n in taken:
+            continue
+        alias = _encode(n, taken)
+        taken.add(alias)
+        aliases[alias] = n
     return aliases
-
-
 
 
 def command_line(prefix: list[str], codex_home: str) -> list[str]:

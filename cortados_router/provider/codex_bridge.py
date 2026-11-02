@@ -163,7 +163,7 @@ class CodexSession:
         self._aliases = tool_aliases(tools)
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
-            logger.info("codex conversation %s: client tools named like Codex's own are declared as %s", self.id[:8],
+            logger.info("codex conversation %s: client tools Codex would refuse or swallow are declared as %s", self.id[:8],
                         sorted(self._aliases))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
@@ -173,7 +173,10 @@ class CodexSession:
                               "inputSchema": t.get("input_schema") or {"type": "object"}} for t in tools]}
         if model:
             params["model"] = model
-        started = self._call("thread/start", params, HANDSHAKE_S)
+        try:
+            started = self._call("thread/start", params, HANDSHAKE_S)
+        except BridgeError as exc:
+            raise self._tool_refusal(exc, params["dynamicTools"]) from exc
         thread = started.get("thread") or {}
         version = thread.get("cliVersion")
         if version not in SUPPORTED_CLI_VERSIONS:
@@ -196,6 +199,20 @@ class CodexSession:
         logger.info("codex conversation %s: thread %s, model %s, codexHome %s, instructionSources %s", self.id[:8],
                     self.thread_id, started.get("model"), info.get("codexHome"), started.get("instructionSources"))
         self._check_fatal()
+
+    def _tool_refusal(self, exc: BridgeError, declared: list[dict[str, Any]]) -> BridgeError:
+        """A thread/start refusal that names a declared dynamic tool, restated with the client's own tool name: the
+        client must learn which of its tools Codex refused, never get a silently shortened tool set."""
+        msg = str(exc)
+        if "dynamic tool" not in msg:
+            return exc
+        hits = sorted({d["name"] for d in declared if d["name"] in msg}, key=len, reverse=True)
+        if not hits:
+            return BridgeError(f"codex app-server refused a client tool name: {msg}")
+        wire = hits[0]                                  # the longest match: a name may contain a shorter one
+        client = self._aliases.get(wire, wire)
+        shown = f"{client!r}" + (f" (declared to Codex as {wire!r})" if client != wire else "")
+        return BridgeError(f"codex app-server refused client tool {shown}: {msg}")
 
     def _read_stdout(self) -> None:
         try:

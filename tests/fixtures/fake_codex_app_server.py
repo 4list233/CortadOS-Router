@@ -29,6 +29,7 @@ to the thread total, reported as the real server does, after the tool results an
 import itertools
 import json
 import os
+import re
 import select
 import sys
 import time
@@ -264,6 +265,15 @@ def main():
         elif method == "thread/start":
             if params.get("dynamicTools") is not None and not state["experimental"]:
                 out({"id": mid, "error": {"code": -32600, "message": "thread/start.dynamicTools requires experimentalApi capability"}})
+                continue
+            # Codex 0.166.0's dynamic-tool name check: ^[a-zA-Z0-9_-]+$, at most 64 characters, mcp__ reserved;
+            # FAKE_CODEX_RESERVED (comma-separated) adds names refused as reserved, to test the refusal path.
+            extra = set(filter(None, os.environ.get("FAKE_CODEX_RESERVED", "").split(",")))
+            bad = [t["name"] for t in params.get("dynamicTools") or []
+                   if t["name"].startswith("mcp__") or t["name"] in extra
+                   or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", t["name"])]
+            if bad:
+                out({"id": mid, "error": {"code": -32600, "message": f"dynamic tool name is reserved: {bad[0]}"}})
                 continue
             state["tools"] = [t["name"] for t in params.get("dynamicTools") or []]
             state["thread"] = str(uuid.uuid4())
