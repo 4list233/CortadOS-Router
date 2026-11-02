@@ -8,6 +8,17 @@ when Codex finishes (end_turn) or asks for a client tool the client has not answ
 next request carries the results, which answer the waiting JSON-RPC server requests. Anything that shows a built-in
 tool or an MCP server ran is a BridgeError, never tolerated.
 
+Code mode can still end a turn around an outstanding call (the model may pass its own exec yield_time_ms, overriding
+codex_isolation's raised default). Every call is tracked with the turn that issued it, and a turn that completed is
+closed for good: a call it still issues afterwards (a code-mode cell that outlived it) is refused to Codex at once and
+never reaches the client, and its agent messages and items are dropped from client output, each drop logged. Each
+client result is delivered exactly once: to the waiting cell while its turn is live, or, when the turn ended first,
+only as text in a follow-up turn/start (MAX_FOLLOWUPS per user message), never both. Queued events are classified
+strictly in FIFO order: a sibling call or agent message queued before the turn's completion is the live turn's and
+reaches the client; only what follows the completion and names the ended turn is stale. A new user message instead of
+the results fails every outstanding call to Codex and starts no follow-up. A state this cannot classify (a call or
+message naming a turn this session never started, a turn that ended with a delivered result unread) is a BridgeError.
+
 Verified against Codex CLI 0.163.0 (docs/PROVIDER-PLAN.md, P2). The app-server API is experimental, so the CLI
 version is pinned (SUPPORTED_CLI_VERSIONS). What the child is started with and what its config and login must show
 is codex_isolation's; this module drives the protocol. The child runs on the user's real CODEX_HOME unless
@@ -16,6 +27,7 @@ that is logged (instructionSources), not hidden.
 """
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -31,9 +43,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cortados_router.provider.bridge import BridgeError, write_line
-from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, LEAKED_ITEMS, V1_APPROVALS, V2_APPROVALS,
-                                                       check_account, check_effective_config, child_env, command_line,
-                                                       tool_aliases)
+from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_EXEC_YIELD_MS, LEAKED_ITEMS,
+                                                       V1_APPROVALS, V2_APPROVALS, check_account, check_command_line,
+                                                       check_effective_config, child_env, command_line, tool_aliases)
 
 # The dynamic-tools API is experimental: each release is verified by hand before it joins this tuple (the /status
 # parser in scarcity_codex.py pins the same way).
@@ -61,6 +73,20 @@ REPLY_WRITE_S = 10.0
 INTERRUPT_S = 30.0
 # What a pending tool call is answered with when the client sends a new user message instead of its result (§A.13).
 MOVED_ON = "cortados: the client moved on without a result"
+# What Codex gets for an item/tool/call issued by a turn that already completed: the call is never forwarded, so a
+# cancelled or superseded turn cannot make the client run (possibly mutating) work.
+TURN_ENDED = "cortados: turn already ended; call refused"
+# What the waiting cell gets for a call that was outstanding when its turn completed. The client still runs the call
+# (the live turn asked for it), but its result goes to the model in the follow-up turn only, never also to this cell.
+ENDED_AROUND = ("cortados: the turn ended before this call's result arrived; the result is given to the model in the "
+                "next turn instead")
+# Follow-up turns one user message may start to hand the model results its turn ended without. Each one is a model
+# request on the subscription; a model that keeps ending turns around outstanding calls would otherwise loop for as
+# long as the client keeps answering. Exceeded: a BridgeError naming the calls, never a reply that drops a result.
+MAX_FOLLOWUPS = 3
+# Characters of each late result's text the follow-up carries. The follow-up is a user message: an unbounded tool
+# output there could exceed what one model input takes, and the cut is stated in the text.
+LATE_RESULT_CHARS = 20000
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +101,34 @@ def _content_items(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out.append({"type": "inputImage", "imageUrl": f"data:{c.get('mimeType') or 'image/png'};base64,{c['data']}"})
         else:
             out.append({"type": "inputText", "text": json.dumps(c)})
+    return out
+
+
+def _late_text(content: list[dict[str, Any]]) -> str:
+    """One late result's content as text, cut at LATE_RESULT_CHARS (the cut is stated)."""
+    parts = []
+    for c in content:
+        if c.get("type") == "text":
+            parts.append(c.get("text", ""))
+        elif c.get("type") == "image":
+            parts.append(f"[image result ({c.get('mimeType') or 'image'}) not carried: the follow-up states results as text]")
+        else:
+            parts.append(json.dumps(c))
+    text = "\n".join(parts)
+    if len(text) > LATE_RESULT_CHARS:
+        text = text[:LATE_RESULT_CHARS] + f"\n[cut at {LATE_RESULT_CHARS} of {len(text)} characters]"
+    return text
+
+
+def _late_input(late: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The follow-up turn's input, text only: every late result by call id, tool name, status and (cut) content."""
+    out: list[dict[str, Any]] = [{"type": "text", "text": (
+        "cortados: your previous turn ended before the results of these client tool calls arrived. They are below, by "
+        "call id; use them to continue the task (do not call the tools again for the same results).")}]
+    for entry in late:
+        status = "error" if entry["is_error"] else "ok"
+        out.append({"type": "text", "text": f"Result of call {entry['call_id']} (tool {entry['tool']}, status {status}):\n"
+                                            f"{_late_text(entry['content'])}"})
     return out
 
 
@@ -117,6 +171,7 @@ class CodexSession:
 
     def __init__(self, *, system: str, tools: list[dict[str, Any]], model: str | None = None,
                  codex_bin: str | list[str] = "codex", codex_home: str | None = None, scratch_root: str | None = None,
+                 exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS,
                  popen: Callable[..., subprocess.Popen] = subprocess.Popen):
         self.id = uuid.uuid4().hex
         self.lock = threading.Lock()                    # one client request at a time per conversation
@@ -125,8 +180,19 @@ class CodexSession:
         self.history: list[str] = []                    # reply_fingerprint of each reply, in order
         self.route: dict[str, Any] | None = None        # set by the registry
         self.route_logged = False
-        self._pending: dict[str, Any] = {}              # callId -> JSON-RPC id of the item/tool/call awaiting its result
-        self._delivered: set[str] = set()               # callIds answered by deliver() whose item/completed is still due
+        self._pending: dict[str, Any] = {}              # callId -> JSON-RPC id of a LIVE turn's call awaiting its result
+        self._delivered: dict[str, Any] = {}            # callIds whose result went to a live cell, item/completed due
+        self._call_tools: dict[str, str] = {}           # callId -> client tool name, for naming late results
+        self._call_turn: dict[str, str] = {}            # callId -> id of the turn that issued it
+        self._orphaned: dict[str, str] = {}             # callId -> tool: its turn ended first; Codex already answered
+        self._late: list[dict[str, Any]] = []           # client results for orphaned calls, for the follow-up turn
+        self._turns: set[str] = set()                   # every turn id this session started
+        self._ended: set[str] = set()                   # turns that completed: nothing of theirs reaches the client
+        self._backlog: collections.deque = collections.deque()  # events taken off the queue early, read first
+        self._carried: list[dict[str, Any]] = []        # blocks of an ended turn's events that preceded its completion,
+                                                        # classified early by _absorb_backlog, due to the client next
+        self._followups = 0                             # follow-up turns started for the current user message
+        self._exec_yield_ms = exec_yield_ms
         self._events: queue.Queue = queue.Queue()       # ("request"|"notify", msg) | ("exit", code), from the reader
         self._replies: dict[Any, dict[str, Any]] = {}   # replies to our requests, by id
         self._cv = threading.Condition()
@@ -148,7 +214,8 @@ class CodexSession:
         prefix = [codex_bin] if isinstance(codex_bin, str) else list(codex_bin)   # a list lets tests run a fake
         try:
             (self.dir / "work").mkdir()
-            args, env = command_line(prefix, home), child_env(home)
+            args, env = command_line(prefix, home, exec_yield_ms), child_env(home)
+            check_command_line(args, exec_yield_ms)
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)
@@ -178,7 +245,7 @@ class CodexSession:
         # refusal here means nothing ran. refreshToken=false: a refresh would spend the home's single-use token.
         check_account(self._call("account/read", {"refreshToken": False}, HANDSHAKE_S))
         config = self._call("config/read", {}, HANDSHAKE_S)
-        check_effective_config(config["config"] if isinstance(config.get("config"), dict) else config)
+        check_effective_config(config["config"] if isinstance(config.get("config"), dict) else config, self._exec_yield_ms)
         self._aliases = tool_aliases(tools)
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
@@ -299,15 +366,25 @@ class CodexSession:
             raise BridgeError(f"the request deadline passed {what}")
         return min(REPLY_WRITE_S, left)
 
-    def _call(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
-        """One client request; returns its result or raises BridgeError for an error reply, exit or timeout."""
+    def _left(self, deadline: float | None, what: str) -> float:
+        """_budget under a request deadline; REPLY_WRITE_S when the caller set none (deliver without a timeout)."""
+        return REPLY_WRITE_S if deadline is None else self._budget(deadline, what)
+
+    def _call(self, method: str, params: dict[str, Any], timeout: float, service: bool = False) -> dict[str, Any]:
+        """One client request; returns its result or raises BridgeError for an error reply, exit or timeout. With
+        `service`, tool calls of ended turns are refused while waiting (_service_while_waiting)."""
         self._next_id += 1
         rid = f"c-{self._next_id}"                      # strings: never in the server's integer id space
         deadline = time.time() + timeout
         self._write(json.dumps({"id": rid, "method": method, "params": params}) + "\n", timeout)
+        done = lambda: rid in self._replies or self._closed or self._exited is not None or self._fatal
+        while service:
+            with self._cv:
+                if self._cv.wait_for(done, timeout=min(0.02, max(deadline - time.time(), 0))) or time.time() >= deadline:
+                    break
+            self._service_while_waiting(deadline)
         with self._cv:
-            self._cv.wait_for(lambda: rid in self._replies or self._closed or self._exited is not None or self._fatal,
-                              timeout=max(deadline - time.time(), 0))
+            self._cv.wait_for(done, timeout=max(deadline - time.time(), 0))
             reply = self._replies.pop(rid, None)
         self._check_fatal()
         if reply is None:
@@ -322,22 +399,101 @@ class CodexSession:
             raise BridgeError(f"codex app-server refused {method}: {err.get('message')} (code {err.get('code')})")
         return reply.get("result") or {}
 
+    def _drain_snapshot(self, deadline: float | None) -> bool:
+        """Move the events queued when this is called into the backlog, in order; False when the deadline passed
+        first. Bounded by the queue length seen on entry, not "until queue.Empty": a server that keeps streaming would
+        otherwise hold the session lock (and grow the backlog) for as long as it streams. Whatever is not moved stays
+        queued behind the backlog, so _next_event still sees every event once, in FIFO order."""
+        for _ in range(self._events.qsize()):
+            if deadline is not None and time.time() >= deadline:
+                return False
+            try:
+                self._backlog.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return True
+
+    def _service_while_waiting(self, deadline: float) -> None:
+        """Refuse item/tool/call requests of ended turns now, whether already in the backlog or queued on entry; every
+        other event keeps its order in the backlog. Each event is classified as it is taken, and only the events queued
+        on entry are taken (see _drain_snapshot). Best effort under the deadline: it only runs between polls for a
+        reply, so on expiry it stops cleanly and leaves the rest in order, the backlog's ahead of the queue's (_call
+        then reports its own timeout, and run_turn refuses any stale call it later meets); nothing here must complete."""
+        old, self._backlog = self._backlog, collections.deque()
+        snapshot = self._events.qsize()
+        while time.time() < deadline:
+            event = old.popleft() if old else None
+            if event is None:
+                if snapshot <= 0:
+                    break
+                snapshot -= 1
+                try:
+                    event = self._events.get_nowait()
+                except queue.Empty:
+                    break
+            kind, msg = event
+            if (kind == "request" and msg.get("method") == "item/tool/call"
+                    and (msg.get("params") or {}).get("turnId") in self._ended):
+                # Never raise on the clock here (nothing must complete): out of time, the call is kept in order and
+                # run_turn refuses it later; raising would lose it and the events still in `old`.
+                left = deadline - time.time()
+                if left <= 0:
+                    self._backlog.append(event)
+                    break
+                self._refuse_stale_call(msg, min(REPLY_WRITE_S, left))
+            else:
+                self._backlog.append(event)
+        self._backlog.extend(old)                       # not reached before the deadline: kept, in order
+
     # ------------------------------------------------------------------ client side
     def send_user(self, content: list[dict[str, Any]], timeout: float) -> None:
         """Start a turn with one user message. Pending tool calls are abandoned first (§A.13)."""
         self.last_used = time.time()
         deadline = time.time() + timeout
+        self._followups = 0                             # MAX_FOLLOWUPS counts per user message
         if self._pending:
-            self._abandon_turn(deadline)
+            self._abandon_turn(deadline)                # a live turn's calls: failed to Codex, the turn interrupted
+        if self._orphaned or self._late:
+            # Calls of a turn that already ended: Codex was answered when the turn ended (ENDED_AROUND), and the
+            # client moved on instead of sending their results. No follow-up turn: the new message supersedes them.
+            logger.warning("codex conversation %s: new user message while the ended turn %s still had calls %s "
+                           "outstanding; they stay failed and no follow-up turn starts", self.id[:8], self._turn_id,
+                           sorted(list(self._orphaned) + [e["call_id"] for e in self._late]))
+        if self._carried:
+            logger.warning("codex conversation %s: new user message before %d block(s) of the ended turn %s reached "
+                           "the client; they are dropped", self.id[:8], len(self._carried), self._turn_id)
+        self._orphaned, self._late, self._delivered, self._carried = {}, [], {}, []
+        self._start_turn(_turn_input(content), deadline)
+
+    def _start_turn(self, items: list[dict[str, Any]], deadline: float) -> None:
+        """turn/start with these input items, under the request's deadline."""
         self._budget(deadline, "before the turn could start")      # never start backend work for an expired request
-        params: dict[str, Any] = {"threadId": self.thread_id, "summary": "none", "input": _turn_input(content)}
+        params: dict[str, Any] = {"threadId": self.thread_id, "summary": "none", "input": items}
         effort = (self.route or {}).get("effort")       # only a route that carries one; otherwise the model default
         if effort:
             params["effort"] = effort
-        result = self._call("turn/start", params, deadline - time.time())
-        self._turn_id = (result.get("turn") or {}).get("id")
-        if not self._turn_id:
+        # While turn/start waits, a cell of an ended turn may still call a tool; it is refused there and then, so a
+        # server that serves requests in order never waits on us (_service_while_waiting).
+        result = self._call("turn/start", params, deadline - time.time(), service=True)
+        turn_id = (result.get("turn") or {}).get("id")
+        if not isinstance(turn_id, str) or not turn_id:
             raise BridgeError("codex app-server answered turn/start without a turn id")
+        if turn_id in self._turns:
+            raise BridgeError(f"codex app-server answered turn/start with the id of an earlier turn ({turn_id})")
+        self._turn_id = turn_id
+        self._turns.add(turn_id)
+
+    def _start_followup(self, deadline: float) -> None:
+        """A follow-up turn that hands the model the results its previous turn ended without."""
+        late, ids = self._late, [e["call_id"] for e in self._late]
+        if self._followups >= MAX_FOLLOWUPS:
+            raise BridgeError(f"the Codex turn ended around outstanding tool calls {MAX_FOLLOWUPS} times for one user "
+                              f"message; refusing another follow-up turn (late results for {ids})")
+        self._followups += 1
+        logger.warning("codex conversation %s: turn %s ended before the results for %s were consumed; follow-up turn "
+                       "%d/%d carries them", self.id[:8], self._turn_id, ids, self._followups, MAX_FOLLOWUPS)
+        self._start_turn(_late_input(late), deadline)
+        self._late = []
 
     def _abandon_turn(self, deadline: float) -> None:
         """The client sent a new user message instead of the results Codex is waiting for (a Claude Code interrupt):
@@ -365,7 +521,7 @@ class CodexSession:
             if time.time() >= drain_until:
                 raise BridgeError(f"codex app-server did not complete the interrupted turn within {INTERRUPT_S:.0f}s")
             try:
-                kind, msg = self._events.get(timeout=max(drain_until - time.time(), 0))
+                kind, msg = self._next_event(max(drain_until - time.time(), 0))
             except queue.Empty:
                 continue
             if kind == "exit":
@@ -382,6 +538,8 @@ class CodexSession:
             if msg.get("method") == "turn/completed" and (msg.get("params") or {}).get("turn", {}).get("id") == turn_id:
                 logger.info("codex conversation %s: abandoned turn %s ended %s", self.id[:8], turn_id,
                             msg["params"]["turn"].get("status"))
+                if turn_id:
+                    self._ended.add(turn_id)
                 return
 
     def deliver(self, results: dict[str, dict[str, Any]], timeout: float | None = None) -> None:
@@ -391,29 +549,136 @@ class CodexSession:
         unknown = [i for i in results if i not in self.emitted]
         if unknown:
             raise BridgeError(f"tool results for ids this session never issued: {unknown}")
-        stale = [i for i in results if i not in self._pending]
+        if self._pending and self._orphaned:
+            raise BridgeError(f"calls of a live turn {sorted(self._pending)} and of an ended one {sorted(self._orphaned)} "
+                              f"are outstanding at once; this bridge cannot tell which turn the results belong to")
+        waiting = list(self._pending) + list(self._orphaned)
+        stale = [i for i in results if i not in waiting]
         if stale:
             raise BridgeError(f"tool results for calls no longer waiting (answered earlier, or abandoned when the "
                               f"client moved on): {stale}")
-        missing = [i for i in self._pending if i not in results]
+        missing = [i for i in waiting if i not in results]
         if missing:
             # Codex continues only once every call of the model's message is answered; a partial answer would hang
             # the turn until the deadline. Refuse it instead.
-            raise BridgeError(f"results for {len(results)} of {len(self._pending)} pending tool calls; every call of "
+            raise BridgeError(f"results for {len(results)} of {len(waiting)} pending tool calls; every call of "
                               f"one assistant message must be answered in one request (missing {missing})")
         self.last_used = time.time()
+        # A completion the reader already queued decides where these results go: a turn that ended is never written
+        # to. Whatever the turn sent before that completion is still the live turn's (FIFO): _absorb_backlog keeps it.
+        self._absorb_backlog(deadline)
         for call_id, r in results.items():
-            budget = self._budget(deadline, "while delivering the tool results") if deadline is not None else REPLY_WRITE_S
+            entry = {"call_id": call_id, "tool": self._call_tools.get(call_id, "?"), "is_error": bool(r.get("isError")),
+                     "content": r.get("content") or []}
+            if call_id in self._orphaned:
+                del self._orphaned[call_id]
+                self._late.append(entry)                # the follow-up turn carries it; the cell never gets it
+                continue
             self._reply(self._pending.pop(call_id), {"success": not r.get("isError"),
-                                                     "contentItems": _content_items(r.get("content") or [])}, timeout=budget)
-            self._delivered.add(call_id)
+                                                     "contentItems": _content_items(r.get("content") or [])},
+                        timeout=self._left(deadline, "while delivering the tool results"))
+            self._delivered[call_id] = True
+
+    def _absorb_backlog(self, deadline: float | None) -> None:
+        """Before results are written: when the reader has already queued the live turn's completion, classify every
+        queued event up to and including it now, strictly in FIFO order, exactly as run_turn would. What precedes the
+        completion belongs to the live turn: a sibling call becomes pending (then orphaned with the rest when the
+        completion closes the turn) and goes to the client as tool_use, an agentMessage is kept as text; both wait in
+        _carried for the next run_turn. Only events after the completion that name the ended turn are stale; they stay
+        in the backlog, where run_turn or _service_while_waiting refuses or drops them.
+
+        Exactly-once for the results being delivered: the completion was emitted before this write could be, so the
+        turn is over whether or not siblings came first, and every one of its calls is answered ENDED_AROUND by
+        _end_turn; those results then go only as text in a follow-up turn/start, never also to the cell. With no
+        completion queued yet the results go to the live cells and nothing is classified early.
+
+        The drain covers the events queued on entry (a completion queued before this call is among them; one queued
+        later is the ordinary race _end_turn guards) and keeps the deadline. Unlike _service_while_waiting this must
+        complete: results written without having looked for a queued completion could reach an ended turn's cells. So
+        on expiry it raises the request-deadline BridgeError before any result is written, with every event not yet
+        classified kept in the backlog (or the queue) in order. That restore only guarantees nothing was written: any
+        BridgeError from deliver ends the session (the server drops it), so no later pass resumes from this state."""
+        if not self._drain_snapshot(deadline):
+            self._budget(deadline, "while reading the queued events before the tool results")
+        if self._turn_id in self._ended:
+            return
+        events = list(self._backlog)
+        boundary = next((i for i, (kind, msg) in enumerate(events)
+                         if kind == "notify" and msg.get("method") == "turn/completed"
+                         # Any status: a failed or interrupted turn has ended too, and its cells must not be written
+                         # to; _handle_event raises the failed-turn BridgeError at the boundary before any result is.
+                         and ((msg.get("params") or {}).get("turn") or {}).get("id") == self._turn_id), None)
+        if boundary is None:
+            return
+        logger.warning("codex conversation %s: turn %s completed before the client's results arrived; they go to a "
+                       "follow-up turn, not to the turn's cell (%d earlier event(s) of the turn kept in order)",
+                       self.id[:8], self._turn_id, boundary)
+        self._backlog = collections.deque(events[boundary + 1:])
+        for i, (kind, msg) in enumerate(events[:boundary + 1]):
+            if deadline is not None and time.time() >= deadline:
+                self._backlog.extendleft(reversed(events[i:boundary + 1]))   # unclassified, back in front, in order
+                self._budget(deadline, "while classifying the queued events before the tool results")
+            self._handle_event(kind, msg, self._carried, deadline)
+
+    def _end_turn(self, turn_id: str, deadline: float | None) -> None:
+        """Close a completed turn for good: its outstanding calls are answered to Codex with ENDED_AROUND and become
+        orphaned (the client still owes their results, which only a follow-up turn will carry). A result already
+        written to its cell and never consumed (no item/completed) is a BridgeError: whether the model read it cannot
+        be known, and replaying it could deliver it twice."""
+        self._ended.add(turn_id)
+        unread = sorted(self._delivered)
+        if unread:
+            raise BridgeError(f"the Codex turn {turn_id} completed without consuming the delivered tool results for "
+                              f"{unread}; whether the model saw them is unknown, so they are neither dropped nor replayed")
+        for call_id in [c for c in self._pending if self._call_turn.get(c) == turn_id]:
+            self._reply(self._pending.pop(call_id), {"success": False, "contentItems": [
+                {"type": "inputText", "text": ENDED_AROUND}]}, timeout=self._left(deadline, "while closing the ended turn's calls"))
+            self._orphaned[call_id] = self._call_tools.get(call_id, "?")
+        if self._pending:
+            raise BridgeError(f"calls {sorted(self._pending)} are pending but belong to no live turn")
+
+    def _next_event(self, timeout: float) -> tuple[str, Any]:
+        """The next event: the backlog first, then the reader's queue. Raises queue.Empty after `timeout`."""
+        if self._backlog:
+            return self._backlog.popleft()
+        return self._events.get(timeout=timeout)
+
+    def _refuse_stale_call(self, msg: dict[str, Any], timeout: float) -> None:
+        """Answer an item/tool/call of an ended turn with TURN_ENDED; it never reaches the client."""
+        params = msg.get("params") or {}
+        logger.warning("codex conversation %s: item/tool/call %s (tool %s) from ended turn %s refused, not forwarded",
+                       self.id[:8], params.get("callId"), params.get("tool"), params.get("turnId"))
+        self._reply(msg["id"], {"success": False, "contentItems": [{"type": "inputText", "text": TURN_ENDED}]},
+                    timeout=timeout)
+
+    def _owning_turn(self, params: dict[str, Any], what: str) -> str:
+        """The turn a call or item names; a turn this session never started is a BridgeError (never guessed)."""
+        turn_id = params.get("turnId")
+        if turn_id not in self._turns and turn_id not in self._ended:
+            raise BridgeError(f"codex app-server sent {what} for turn {turn_id!r}, which this session never started "
+                              f"(current {self._turn_id!r})")
+        return turn_id
 
     # ------------------------------------------------------------------ one turn
     def run_turn(self, timeout: float) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
         """Read the app-server until the turn completes or blocks on client tool calls. Returns (blocks, stop, usage)."""
-        blocks: list[dict[str, Any]] = []
+        blocks, self._carried = self._carried, []       # what _absorb_backlog kept of the ended turn comes first
         deadline = time.time() + timeout
         settle_until: float | None = None               # set once a call is pending: sibling calls arrive together
+        if self._turn_id in self._ended:
+            shown = {b["id"] for b in blocks if b["type"] == "tool_use"}
+            if self._orphaned and not self._pending and set(self._orphaned) <= shown:
+                # Sibling calls the ended turn issued before its completion: the client sees them now, and their
+                # results join the late ones in the follow-up turn.
+                logger.warning("codex conversation %s: turn %s ended with sibling calls %s the client has not seen; "
+                               "returning them as tool_use", self.id[:8], self._turn_id, sorted(self._orphaned))
+                return self._finish(blocks, "tool_use")
+            if self._pending or self._orphaned:
+                raise BridgeError(f"run_turn on the ended Codex turn {self._turn_id} with calls "
+                                  f"{sorted(list(self._pending) + list(self._orphaned))} still unanswered")
+            if not self._late:
+                raise BridgeError(f"run_turn on the ended Codex turn {self._turn_id} with no late results to continue from")
+            self._start_followup(deadline)
         while True:
             self._check_fatal()
             now = time.time()
@@ -426,57 +691,90 @@ class CodexSession:
                 raise BridgeError(f"codex app-server did not finish the turn within {timeout:.0f}s")
             wait = min(settle_until, deadline) - now if settle_until else deadline - now
             try:
-                kind, msg = self._events.get(timeout=max(wait, 0))
+                kind, msg = self._next_event(max(wait, 0))
             except queue.Empty:
                 if settle_until and time.time() >= settle_until:
                     return self._finish(blocks, "tool_use")
                 continue                                # the deadline check at the top of the loop decides
-            if kind == "exit":
-                raise BridgeError(f"codex app-server exited with code {msg}; see {self.dir / 'stderr.log'}")
-            if kind == "request":
-                params = msg.get("params") or {}
-                if msg["method"] == "item/tool/call":
-                    call_id, args = params.get("callId"), params.get("arguments")
-                    if args is None:
-                        args = {}
-                    if not isinstance(call_id, str) or not call_id or not isinstance(args, dict):
-                        raise BridgeError(f"codex app-server sent a malformed item/tool/call: {json.dumps(params)[:300]}")
-                    if call_id in self.emitted:
-                        raise BridgeError(f"codex app-server reused tool call id {call_id}")
-                    name = params.get("tool") or ""
-                    blocks.append({"type": "tool_use", "id": call_id, "name": self._aliases.get(name, name), "input": args})
-                    self._pending[call_id] = msg["id"]
-                    self.emitted.add(call_id)
-                else:
-                    self._answer(msg, timeout=self._budget(deadline, "while answering a server request"))
-            else:
-                self._note_notification(msg)
-                params = msg.get("params") or {}
-                method = msg.get("method")
-                if method == "item/completed":
-                    item = params.get("item") or {}
-                    if item.get("type") == "agentMessage" and item.get("text"):
-                        blocks.append({"type": "text", "text": item["text"]})
-                    elif item.get("type") == "dynamicToolCall":
-                        self._delivered.discard(item.get("id"))     # Codex consumed this delivered result
-                elif method == "turn/completed":
-                    turn = params.get("turn") or {}
-                    if turn.get("status") == "completed":
-                        if self._pending:
-                            raise BridgeError(f"the Codex turn completed with {len(self._pending)} tool call(s) unanswered")
-                        if self._delivered:
-                            # A turn that completed around an outstanding call (its completion queued before the
-                            # client's results arrived) never read those results; the agentMessage-less end_turn
-                            # that follows would be an empty reply hiding a lost tool result.
-                            raise BridgeError(f"the Codex turn completed without consuming the delivered tool "
-                                              f"results for {sorted(self._delivered)}")
-                        return self._finish(blocks, "end_turn")
-                    err = turn.get("error") or {}
-                    info = err.get("codexErrorInfo")
-                    raise BridgeError(f"the Codex turn {turn.get('status')}: {err.get('message') or 'no message'} "
-                                      f"({info if isinstance(info, str) else json.dumps(info)})")
+            if self._handle_event(kind, msg, blocks, deadline) == "completed":
+                if self._orphaned:
+                    # The model ended the turn around calls it had issued (code mode yielded): they still go to the
+                    # client, and their results come back through deliver() for a follow-up turn.
+                    logger.warning("codex conversation %s: turn %s completed with calls %s outstanding; returning them "
+                                   "as tool_use", self.id[:8], self._turn_id, sorted(self._orphaned))
+                    return self._finish(blocks, "tool_use")
+                return self._finish(blocks, "end_turn")
             if self._pending:
                 settle_until = time.time() + CODEX_SETTLE_S   # the server is still talking: keep collecting siblings
+
+    def _handle_event(self, kind: str, msg: Any, blocks: list[dict[str, Any]], deadline: float | None) -> str | None:
+        """One event, in arrival order: a client tool call of the live turn becomes a tool_use block and a pending
+        call, its agentMessage a text block, server requests are answered, and the live turn's completion closes it
+        (returns "completed"). A call naming an ended turn is refused and its agentMessage dropped. Shared by run_turn
+        and _absorb_backlog, so every event is classified the same way, strictly in FIFO order."""
+        if kind == "exit":
+            raise BridgeError(f"codex app-server exited with code {msg}; see {self.dir / 'stderr.log'}")
+        if kind == "request":
+            params = msg.get("params") or {}
+            if msg["method"] == "item/tool/call":
+                call_id, args = params.get("callId"), params.get("arguments")
+                if args is None:
+                    args = {}
+                if not isinstance(call_id, str) or not call_id or not isinstance(args, dict):
+                    raise BridgeError(f"codex app-server sent a malformed item/tool/call: {json.dumps(params)[:300]}")
+                owner = self._owning_turn(params, f"item/tool/call {call_id}")
+                if owner in self._ended:
+                    self._refuse_stale_call(msg, self._left(deadline, "while refusing a stale tool call"))
+                    return None
+                if owner != self._turn_id:
+                    raise BridgeError(f"codex app-server sent item/tool/call {call_id} for turn {owner}, which is "
+                                      f"neither current ({self._turn_id}) nor ended")
+                if call_id in self.emitted:
+                    raise BridgeError(f"codex app-server reused tool call id {call_id}")
+                name = params.get("tool") or ""
+                blocks.append({"type": "tool_use", "id": call_id, "name": self._aliases.get(name, name), "input": args})
+                self._call_tools[call_id] = self._aliases.get(name, name)
+                self._call_turn[call_id] = owner
+                self._pending[call_id] = msg["id"]
+                self.emitted.add(call_id)
+            else:
+                self._answer(msg, timeout=self._left(deadline, "while answering a server request"))
+        else:
+            self._note_notification(msg)
+            params = msg.get("params") or {}
+            method = msg.get("method")
+            if method == "item/completed":
+                item = params.get("item") or {}
+                if item.get("type") == "dynamicToolCall":
+                    self._delivered.pop(item.get("id"), None)   # Codex consumed this delivered result
+                elif item.get("type") == "agentMessage" and item.get("text"):
+                    owner = self._owning_turn(params, "an agentMessage")
+                    if owner in self._ended:
+                        logger.warning("codex conversation %s: agentMessage from ended turn %s dropped (%d chars), "
+                                       "not shown to the client", self.id[:8], owner, len(item["text"]))
+                    elif owner != self._turn_id:
+                        raise BridgeError(f"codex app-server sent an agentMessage for turn {owner}, which is neither "
+                                          f"current ({self._turn_id}) nor ended")
+                    else:
+                        blocks.append({"type": "text", "text": item["text"]})
+            elif method == "turn/completed":
+                turn = params.get("turn") or {}
+                if turn.get("id") in self._ended:
+                    logger.info("codex conversation %s: turn/completed again for ended turn %s; ignored", self.id[:8],
+                                turn.get("id"))
+                    return None
+                if turn.get("id") != self._turn_id:
+                    raise BridgeError(f"codex app-server completed turn {turn.get('id')!r}, which is not the current "
+                                      f"turn {self._turn_id!r}")
+                if turn.get("status") == "completed":
+                    self._end_turn(self._turn_id, deadline)
+                    return "completed"
+                self._ended.add(self._turn_id)
+                err = turn.get("error") or {}
+                info = err.get("codexErrorInfo")
+                raise BridgeError(f"the Codex turn {turn.get('status')}: {err.get('message') or 'no message'} "
+                                  f"({info if isinstance(info, str) else json.dumps(info)})")
+        return None
 
     def _note_notification(self, msg: dict[str, Any]) -> None:
         """Notifications that are not turn content: isolation and item checks, usage, mid-turn errors."""
@@ -539,7 +837,9 @@ class CodexSession:
                  "cache_creation_input_tokens": delta("cacheWriteInputTokens"),
                  "reasoning_output_tokens": delta("reasoningOutputTokens")}
         self._usage_mark = dict(total)
-        self._delivered.clear()                         # the delivered-results check is scoped to one run_turn
+        if stop == "end_turn":
+            self._call_tools.clear()                    # every call of this exchange is answered and consumed
+            self._call_turn.clear()
         return blocks, stop, usage
 
     # ------------------------------------------------------------------ lifecycle

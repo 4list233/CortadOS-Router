@@ -4,6 +4,7 @@ standing in for `codex app-server` and tests/fixtures/fake_claude_cli.py for `cl
 The router is a stub returning a codex-cli route; the fake app-server speaks the exact line shapes of the real stream
 (brief §A), so these tests pin the bridge's protocol handling, its isolation command line and the factory map.
 """
+import collections
 import json
 import os
 import queue
@@ -27,6 +28,13 @@ TOKEN = "test-token"
 READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
     "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
 CODEX_ROUTE = {"provider": "codex-cli", "model": "gpt-test", "band": "R2", "route_id": "r1"}
+
+
+def late_state(s):
+    """The turn-tracking state CodexSession.__init__ sets, for sessions the unit tests build without a process: one
+    live turn, "turn-1"."""
+    s._call_tools, s._call_turn, s._orphaned, s._late, s._followups = {}, {}, {}, [], 0
+    s._turn_id, s._turns, s._ended, s._backlog, s._carried = "turn-1", {"turn-1"}, set(), collections.deque(), []
 
 
 class CodexEndpointTests(unittest.TestCase):
@@ -403,7 +411,8 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--enable"], ["code_mode_host"])
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false"):
+                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
+                         f"features.code_mode.default_exec_yield_time_ms={int(provider_server.TURN_TIMEOUT_S * 1000)}"):
             self.assertIn(override, overrides)
         self.assertEqual(len([o for o in overrides if o.startswith("mcp_servers.")]), 2)   # [mcp_servers.x.env] is not a server
         self.assertIsNone(seen["env"]["OPENAI_API_KEY"])
@@ -887,20 +896,298 @@ class CodexSessionUnitTests(unittest.TestCase):
         self.assertEqual(seen["env"]["CODEX_HOME"], os.path.abspath(self.codex_home))
         self.assertNotEqual(seen["cwd"], os.getcwd())                   # the child's cwd is the scratch work dir
 
-    def test_a_turn_that_completes_around_a_delivered_result_is_refused_not_an_empty_reply(self):
+    def turn_starts(self, log):
+        return [json.loads(l)["params"] for l in Path(log).read_text().splitlines()
+                if json.loads(l).get("method") == "turn/start"]
+
+    def late_session(self):
+        log = os.path.join(self.scratch, "log.jsonl")
+        os.environ["FAKE_CODEX_LOG"] = log
+        return self.session(), log
+
+    def assert_followup_carries(self, log, call, text):
+        starts = self.turn_starts(log)
+        self.assertEqual(len(starts), 2)                                 # the client's turn, then one follow-up
+        said = " ".join(i.get("text", "") for i in starts[1]["input"] if i.get("type") == "text")
+        self.assertIn(f"call {call['id']} (tool Read, status ok)", said)
+        self.assertIn(text, said)
+
+    def test_a_turn_that_completes_around_a_delivered_result_continues_in_a_follow_up_turn(self):
         codex_bridge.CODEX_SETTLE_S = 0.05                               # return the call before the fake completes
-        s = self.session()
+        s, log = self.late_session()
         try:
             s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
             blocks, stop, _ = s.run_turn(10)
             self.assertEqual(stop, "tool_use")
             [call] = blocks
             time.sleep(1.0)                                              # the fake's turn/completed is queued by now
-            s.deliver({call["id"]: {"content": [{"type": "text", "text": "late"}], "isError": False}})
-            with self.assertRaisesRegex(BridgeError, "without consuming the delivered tool results"):
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "late-content"}], "isError": False}})
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                blocks, stop, _ = s.run_turn(10)                         # no BridgeError: the result is handed over
+            self.assertEqual(stop, "end_turn")
+            self.assertIn("late-content", blocks[-1]["text"])            # the fake echoes the follow-up's input
+            self.assertTrue(any("follow-up turn 1/" in m for m in logs.output))
+            self.assert_followup_carries(log, call, "late-content")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_turn_that_ends_before_its_call_is_returned_still_hands_the_call_to_the_client(self):
+        s, log = self.late_session()                                     # default settle: turn/completed lands inside it
+        try:
+            s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            [call] = blocks
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "after-the-end"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assert_followup_carries(log, call, "after-the-end")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_late_sibling_followed_by_turn_completed_still_reaches_the_client(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "late sibling"}], timeout=10)
+            [first], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            s.deliver({first["id"]: {"content": [{"type": "text", "text": "one"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            [second] = [b for b in blocks if b["type"] == "tool_use"]
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertEqual(second["name"], "Read")
+            s.deliver({second["id"]: {"content": [{"type": "text", "text": "two"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assert_followup_carries(log, second, "two")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_sibling_and_message_queued_before_turn_completed_reach_the_client_in_order(self):
+        # While the client runs call A, Codex queues sibling B and an agent message, then turn/completed. Those two
+        # precede the completion, so they are the live turn's: B goes to the client as tool_use, the message as text.
+        # A's result goes once, as follow-up text (the completion was queued before it could be written to the cell).
+        codex_bridge.CODEX_SETTLE_S = 0.05                               # return A before the fake queues the rest
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "siblings before end"}], timeout=10)
+            [a], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            time.sleep(1.0)                                              # B, the message and turn/completed are queued
+            s.deliver({a["id"]: {"content": [{"type": "text", "text": "RESULT-A"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            self.assertEqual([x["type"] for x in blocks], ["tool_use", "text"])     # FIFO: B, then the message
+            b = blocks[0]
+            self.assertNotEqual(b["id"], a["id"])
+            self.assertEqual((b["name"], b["input"]), ("Read", {"file_path": "f1.md"}))
+            self.assertEqual(blocks[1]["text"], "sibling text")
+            s.deliver({b["id"]: {"content": [{"type": "text", "text": "RESULT-B"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assertIn("RESULT-A", blocks[-1]["text"])
+            self.assertIn("RESULT-B", blocks[-1]["text"])
+            said = [c["text"] for r in self.replies_to_codex(log).values() for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.ENDED_AROUND])   # no result in a cell
+            text = Path(log).read_text()
+            self.assertEqual((text.count("RESULT-A"), text.count("RESULT-B")), (1, 1))     # each once, in the follow-up
+            self.assert_followup_carries(log, a, "RESULT-A")
+            self.assert_followup_carries(log, b, "RESULT-B")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_sibling_queued_after_turn_completed_is_refused_and_never_reaches_the_client(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "sibling after end"}], timeout=10)
+            [a], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            time.sleep(1.0)                                              # turn/completed, then the stale B, are queued
+            s.deliver({a["id"]: {"content": [{"type": "text", "text": "RESULT-A"}], "isError": False}})
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assertEqual([x["type"] for x in blocks], ["text"])      # no tool_use for B
+            self.assertIn("RESULT-A", blocks[0]["text"])
+            self.assertIn("refused, not forwarded", "\n".join(logs.output))
+            said = [c["text"] for r in self.replies_to_codex(log).values() for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.TURN_ENDED])
+            self.assertEqual(Path(log).read_text().count("RESULT-A"), 1)
+            self.assert_followup_carries(log, a, "RESULT-A")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_follow_up_turns_are_bounded_per_user_message(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, _ = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
+            [call], _, _ = s.run_turn(10)
+            time.sleep(1.0)
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "x"}], "isError": False}})
+            s._followups = codex_bridge.MAX_FOLLOWUPS                    # as if this user message had used them all
+            with self.assertRaisesRegex(BridgeError, "refusing another follow-up turn.*" + call["id"]):
                 s.run_turn(10)
         finally:
             s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def replies_to_codex(self, log):
+        """Our replies to the server's requests, as the fake logged them: {server request id: result}."""
+        lines = [json.loads(l) for l in Path(log).read_text().splitlines() if l.strip()]
+        return {m["id"]: m.get("result") for m in lines if "method" not in m and isinstance(m.get("id"), int)}
+
+    def test_a_resumed_cell_of_an_ended_turn_can_neither_call_a_tool_nor_speak_and_its_result_goes_once(self):
+        # The old cell gets its answer after its turn ended and resumes: it calls a (possibly mutating) tool and then
+        # emits an answer. Neither may reach the client; the client's result for the call it was owed goes only to
+        # the follow-up turn, never also into the cell.
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "stale resume"}], timeout=10)
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as first:
+                blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            [call] = blocks
+            self.assertTrue(any("completed with calls" in m for m in first.output))
+            time.sleep(0.3)                                              # the resumed cell's stale call is queued by now
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "RESULT-ONCE"}], "isError": False}})
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assertEqual([b["type"] for b in blocks], ["text"])      # no tool_use for the stale call
+            self.assertNotIn("obsolete answer", json.dumps(blocks))
+            self.assertIn("RESULT-ONCE", blocks[0]["text"])               # the follow-up's echo
+            text = "\n".join(logs.output)
+            self.assertIn("refused, not forwarded", text)
+            self.assertIn("agentMessage from ended turn", text)
+            replies = list(self.replies_to_codex(log).values())
+            said = [c["text"] for r in replies for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.TURN_ENDED])   # the cell, then the stale call
+            self.assertEqual(Path(log).read_text().count("RESULT-ONCE"), 1)  # exactly once: in the follow-up turn/start
+            self.assert_followup_carries(log, call, "RESULT-ONCE")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_never_mind_after_an_outstanding_call_fails_it_and_starts_no_follow_up(self):
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "stale resume"}], timeout=10)
+            [call], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                s.send_user([{"type": "text", "text": "never mind"}], timeout=10)
+                blocks, stop, _ = s.run_turn(10)
+            self.assertEqual((blocks, stop), ([{"type": "text", "text": "echo: never mind"}], "end_turn"))
+            self.assertIn("no follow-up turn starts", "\n".join(logs.output))
+            starts = self.turn_starts(log)
+            self.assertEqual(len(starts), 2)                             # the first message and "never mind", nothing else
+            self.assertEqual(starts[1]["input"], [{"type": "text", "text": "never mind"}])
+            said = [c["text"] for r in self.replies_to_codex(log).values() for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.TURN_ENDED])
+            with self.assertRaisesRegex(BridgeError, "no longer waiting"):
+                s.deliver({call["id"]: {"content": [{"type": "text", "text": "late"}], "isError": False}})
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_tool_call_or_message_naming_a_turn_never_started_is_a_bridge_error(self):
+        s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
+        s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
+        for event in (("request", {"method": "item/tool/call", "id": 0, "params": {"turnId": "turn-x", "callId": "exec-1",
+                                                                                  "tool": "Read", "arguments": {}}}),
+                      ("request", {"method": "item/tool/call", "id": 0, "params": {"callId": "exec-1", "tool": "Read"}}),
+                      ("notify", {"method": "item/completed", "params": {"turnId": "turn-x", "item": {
+                          "type": "agentMessage", "text": "who?"}}}),
+                      ("notify", {"method": "turn/completed", "params": {"turn": {"id": "turn-x", "status": "completed"}}})):
+            s._events.put(event)
+            with self.assertRaisesRegex(BridgeError, "never started|not the current turn"):
+                s.run_turn(2)
+        # A turn that completes with a result written into its cell and never consumed: unknown whether it was read.
+        s._delivered = {"exec-9": True}
+        s._events.put(("notify", {"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}}))
+        with self.assertRaisesRegex(BridgeError, "without consuming the delivered tool results for \\['exec-9'\\]"):
+            s.run_turn(2)
+
+    def test_the_exec_yield_override_is_on_the_command_line_and_its_absence_is_refused(self):
+        want = "features.code_mode.default_exec_yield_time_ms=123000"
+        args = codex_isolation.command_line(["codex"], self.codex_home, 123000)
+        self.assertIn(want, [b for a, b in zip(args, args[1:]) if a == "-c"])
+        codex_isolation.check_command_line(args, 123000)
+        stripped = [a for a in args if a != want]
+        with self.assertRaisesRegex(BridgeError, f"lacks `-c {want}`"):
+            codex_isolation.check_command_line(stripped, 123000)
+        with self.assertRaisesRegex(BridgeError, "lacks"):
+            codex_isolation.check_command_line(args, 999)               # another budget than the one asked for
+        for bad in (0, -1, 1.5, True, None):
+            with self.assertRaisesRegex(BridgeError, "positive integer"):
+                codex_isolation.exec_yield_override(bad)
+
+    def test_an_effective_config_whose_exec_yield_differs_or_was_replaced_is_refused(self):
+        os.environ["FAKE_CODEX_ARGV"] = os.path.join(self.scratch, "argv.json")
+        s = self.session(exec_yield_ms=45000)
+        try:
+            argv = json.loads(Path(self.scratch, "argv.json").read_text())["argv"]
+            self.assertIn("features.code_mode.default_exec_yield_time_ms=45000", argv)
+        finally:
+            s.close()
+        for patch in ({"features": {"code_mode": {"default_exec_yield_time_ms": 30000}}},
+                      {"features": {"code_mode": False}}, {"features": {"code_mode": {"default_exec_yield_time_ms": None}}}):
+            os.environ["FAKE_CODEX_CONFIG_PATCH"] = json.dumps(patch)
+            try:
+                with self.assertRaisesRegex(BridgeError, "features.code_mode.default_exec_yield_time_ms=.*expected 45000"):
+                    self.session(exec_yield_ms=45000)
+            finally:
+                del os.environ["FAKE_CODEX_CONFIG_PATCH"]
+
+    def test_the_real_0_163_0_config_read_reports_the_yield_under_features_and_passes_the_check(self):
+        # Captured on the provider host (codex-cli 0.163.0, throwaway CODEX_HOME, no login, no thread or turn).
+        capture = json.loads(Path(__file__).with_name("fixtures").joinpath("codex-config-read-0.163.0.json").read_text())
+        cfg = capture["response"]["result"]["config"]
+        self.assertEqual(cfg["features"]["code_mode"], {"default_exec_yield_time_ms": 1800000})
+        self.assertNotIn("code_mode", cfg)                                # the top-level table is not a 0.163.0 key
+        self.assertIn("features.code_mode.default_exec_yield_time_ms", capture["response"]["result"]["origins"])
+        self.assertEqual([a for a in capture["_capture"]["argv"] if "code_mode." in a],
+                         [codex_isolation.exec_yield_override(1800000)])  # the capture used the bridge's own override
+        codex_isolation.check_effective_config(cfg, 1800000)
+        with self.assertRaisesRegex(BridgeError, "expected 45000"):
+            codex_isolation.check_effective_config(cfg, 45000)
+
+    def test_a_cli_that_does_not_report_the_yield_relies_on_the_command_line_and_says_so_once(self):
+        capture = json.loads(Path(__file__).with_name("fixtures").joinpath("codex-config-read-0.163.0.json").read_text())
+        cfg = json.loads(json.dumps(capture["response"]["result"]["config"]))
+        del cfg["features"]["code_mode"]
+        codex_isolation._yield_unreported_logged = False
+        try:
+            with self.assertLogs("cortados_router.provider.codex_isolation", "WARNING") as logs:
+                codex_isolation.check_effective_config(cfg, 1800000)
+                codex_isolation.check_effective_config(cfg, 1800000)
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("does not report features.code_mode.default_exec_yield_time_ms", logs.output[0])
+        finally:
+            codex_isolation._yield_unreported_logged = False
+
+    def test_a_session_whose_config_read_does_not_report_the_yield_starts_on_the_command_line_check(self):
+        os.environ["FAKE_CODEX_ARGV"] = os.path.join(self.scratch, "argv.json")
+        os.environ["FAKE_CODEX_CONFIG_PATCH"] = json.dumps({"features": {"code_mode": None}})
+        try:
+            with self.assertLogs("cortados_router.provider.codex_isolation", "WARNING"):
+                codex_isolation._yield_unreported_logged = False
+                s = self.session()                                          # not reported: the argv check carries it
+            s.close()
+        finally:
+            del os.environ["FAKE_CODEX_CONFIG_PATCH"]
+            codex_isolation._yield_unreported_logged = False
 
     def test_the_effective_config_check_accepts_the_real_isolated_config_and_names_every_violation(self):
         # The shape config/read answered on Codex CLI 0.163.0 under the bridge's own command line (P2 probe).
@@ -909,7 +1196,8 @@ class CodexSessionUnitTests(unittest.TestCase):
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
-                "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True}}
+                "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True,
+                             "code_mode": {"default_exec_yield_time_ms": codex_isolation.DEFAULT_EXEC_YIELD_MS}}}
         codex_isolation.check_effective_config(real)
         broken = dict(real, model_provider="mirror", chatgpt_base_url="https://mirror.invalid/", web_search="live",
                       model_providers={"openai": {"base_url": "https://mirror.invalid/v1"}},
@@ -935,8 +1223,9 @@ class CodexSessionUnitTests(unittest.TestCase):
         # A server that streams notifications without end re-arms the settle window on every one; the absolute
         # deadline must still end the turn: with calls collected they are returned, with none it is a failure.
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
         stop, settle = threading.Event(), codex_bridge.CODEX_SETTLE_S
 
         def chatter():
@@ -950,8 +1239,8 @@ class CodexSessionUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(BridgeError, "did not finish the turn within"):
                 s.run_turn(0.3)
             self.assertLess(time.time() - t0, 2.0)
-            s._events.put(("request", {"method": "item/tool/call", "id": 0,
-                                       "params": {"callId": "exec-1", "tool": "Read", "arguments": {"file_path": "a"}}}))
+            s._events.put(("request", {"method": "item/tool/call", "id": 0, "params": {
+                "turnId": "turn-1", "callId": "exec-1", "tool": "Read", "arguments": {"file_path": "a"}}}))
             t0 = time.time()
             blocks, stop_reason, _ = s.run_turn(0.3)
             self.assertEqual((stop_reason, blocks[0]["id"]), ("tool_use", "exec-1"))
@@ -959,6 +1248,111 @@ class CodexSessionUnitTests(unittest.TestCase):
         finally:
             stop.set()
             codex_bridge.CODEX_SETTLE_S = settle
+
+    def flood_session(self):
+        """A process-less session whose reader queue is pre-filled and kept non-empty by a producer thread; every event
+        carries a sequence number so loss or reordering shows. Replies are recorded, never written."""
+        s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
+        s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id = "unit", None, {}, {}, "t1"
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
+        s.route, s.last_used, s.dir = None, 0.0, Path(self.scratch)
+        s._ended.add("turn-0")
+        replies, seq, stop = [], [0], threading.Event()
+        s._reply = lambda rid, result=None, error=None, timeout=0: replies.append(rid)
+
+        def event(n):
+            if n % 50 == 7:                                     # a stale call of the ended turn, now and then
+                return ("request", {"method": "item/tool/call", "id": f"r{n}", "seq": n, "params": {
+                    "turnId": "turn-0", "callId": f"old-{n}", "tool": "Read", "arguments": {}}})
+            return ("notify", {"method": "item/agentMessage/delta", "seq": n, "params": {"delta": "x"}})
+
+        def put():
+            s._events.put(event(seq[0]))
+            seq[0] += 1
+        for _ in range(100000):
+            put()
+
+        def chatter():
+            while not stop.is_set():
+                put()
+        threading.Thread(target=chatter, daemon=True).start()
+
+        def left():
+            """Stop the producer; every event not yet consumed, backlog first, then the queue."""
+            stop.set()
+            time.sleep(0.05)
+            out = list(s._backlog)
+            while True:
+                try:
+                    out.append(s._events.get_nowait())
+                except queue.Empty:
+                    return out, seq[0]
+        return s, replies, left
+
+    def assert_all_kept_in_order(self, rest, produced, refused):
+        seqs = [m["seq"] for _, m in rest]
+        self.assertEqual(seqs, sorted(seqs))                    # FIFO kept
+        self.assertEqual(sorted(seqs + [int(r[1:]) for r in refused]), list(range(produced)))   # none lost, none twice
+
+    def test_deliver_keeps_its_deadline_under_a_notification_flood(self):
+        # Draining "until queue.Empty" never ends while the server streams; the drain is bounded by the queue length
+        # seen on entry and checks the deadline on every event. Expired before the drain finished, deliver cannot know
+        # whether a completion is queued, so it raises before writing any result; every event stays queued in order.
+        s, replies, left = self.flood_session()
+        s._pending, s.emitted = {"exec-1": 1}, {"exec-1"}
+        try:
+            t0 = time.time()
+            with self.assertRaisesRegex(BridgeError, "deadline passed while reading the queued events"):
+                s.deliver({"exec-1": {"content": [{"type": "text", "text": "r"}], "isError": False}}, timeout=0.02)
+            self.assertLess(time.time() - t0, 0.02 + 0.1)
+        finally:
+            rest, produced = left()
+        self.assertEqual(replies, [])
+        self.assertEqual(s._pending, {"exec-1": 1})             # still owed; nothing written to the cell
+        self.assert_all_kept_in_order(rest, produced, [])
+
+    def test_deliver_under_a_steady_stream_returns_after_the_events_queued_on_entry(self):
+        s, replies, left = self.flood_session()
+        while s._events.qsize() > 1000:                         # a short backlog, the producer still running
+            s._events.get_nowait()
+        s._backlog.clear()
+        try:
+            s._pending, s.emitted = {"exec-1": 1}, {"exec-1"}
+            t0 = time.time()
+            s.deliver({"exec-1": {"content": [{"type": "text", "text": "r"}], "isError": False}}, timeout=2.0)
+            self.assertLess(time.time() - t0, 0.5)              # not until the stream pauses
+        finally:
+            rest, _ = left()
+        self.assertEqual(replies, [1])                          # written once, to the live cell
+        seqs = [m["seq"] for _, m in rest]
+        self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))   # contiguous: nothing lost or reordered
+
+    def test_turn_start_servicing_keeps_its_deadline_under_a_notification_flood(self):
+        # _call(service=True) (turn/start) refuses stale calls while it waits; under a flood it must still give up at
+        # its deadline, refusing only stale calls and leaving everything else queued in order.
+        s, replies, left = self.flood_session()
+        s._next_id, s._replies, s._closed, s._exited, s._cv = 0, {}, False, None, threading.Condition()
+        s._write = lambda line, timeout: None
+        # The refusals log a warning each; silence them rather than assertLogs, which fails when a loaded machine lets
+        # a deadline pass before the first refusal (the timing bounds, not the log, are what this test is about).
+        disabled, codex_bridge.logger.disabled = codex_bridge.logger.disabled, True
+        try:
+            t0 = time.time()
+            with self.assertRaisesRegex(BridgeError, "did not answer turn/start"):
+                s._call("turn/start", {}, 0.05, service=True)
+            self.assertLess(time.time() - t0, 0.05 + 0.1)
+            t0 = time.time()
+            s._service_while_waiting(time.time() + 0.005)   # the helper alone, at the reproduced 5 ms
+            self.assertLess(time.time() - t0, 0.005 + 0.05)
+            # A generous deadline so at least one stale call (every 50th event) is refused even under load.
+            s._service_while_waiting(time.time() + 0.5)
+        finally:
+            codex_bridge.logger.disabled = disabled
+            rest, produced = left()
+        self.assertTrue(replies)                                # stale calls were refused while it waited
+        self.assertTrue(all(r.startswith("r") and int(r[1:]) % 50 == 7 for r in replies))
+        self.assert_all_kept_in_order(rest, produced, replies)
 
     def test_a_lone_surrogate_name_hashes_without_raising(self):
         # The wires refuse such names; the encoder must still never raise if one gets past them.
@@ -1046,8 +1440,9 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id = "unit", None, {}, {}, "t1", "turn-1"
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, {}, {}
         s._reply, s._call = (lambda *a, **k: None), (lambda *a, **k: {})
         stop, result = threading.Event(), {}
 
@@ -1087,8 +1482,9 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id, s.proc = "unit", None, {}, {}, "t1", "turn-1", Proc()
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), {}, {}
         s.route, s.last_used, s.dir = None, 0.0, Path(self.scratch)
         t0 = time.time()
         with self.assertRaises(BridgeError):
@@ -1108,7 +1504,8 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_usage_is_reported_in_the_messages_shape_with_the_cached_part_taken_out_of_codex_input(self):
         s = object.__new__(codex_bridge.CodexSession)
-        s._delivered, s._usage_mark = set(), {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
+        late_state(s)
+        s._delivered, s._usage_mark = {}, {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
         s._usage_total = {"totalTokens": 12419, "inputTokens": 12309, "cachedInputTokens": 3968, "cacheWriteInputTokens": 10,
                           "outputTokens": 110, "reasoningOutputTokens": 42}            # the live spike's second reading
         _, _, usage = s._finish([], "end_turn")
@@ -1130,8 +1527,9 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.proc, s.dir = "unit", None, {}, {}, Proc(), Path(self.scratch)
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
         s._events.put(("request", {"method": "item/tool/requestUserInput", "id": 7, "params": {"questions": []}}))
         t0 = time.time()
         with self.assertRaises(BridgeError):
