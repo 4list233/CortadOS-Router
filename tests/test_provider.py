@@ -575,6 +575,89 @@ class RunRecordTests(RoutedHarness):
         self.assertIsNone(runs.summary("run-00012"))
 
 
+class FailedSessionTombstoneTests(EndpointHarness):
+    """A conversation dropped because its backend failed answers a retry of the failed request with the real reason
+    (502 api_error), not the 409 of a conversation this endpoint never held."""
+
+    def failed_conversation(self):
+        """Open a conversation, fail its second turn in the backend, and return the failed request's body."""
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "backend failure"}]
+        body = {"tools": [READ_TOOL], "messages": history}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
+        self.assertEqual(self.reg.sessions, {})                        # the failed conversation was dropped
+        return body
+
+    def error_of(self, body):
+        try:
+            self.post(body)
+            self.fail("expected an HTTP error")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_a_retry_of_the_failed_request_gets_the_original_reason_not_a_409(self):
+        body = self.failed_conversation()
+        for _ in range(2):                                              # every retry, not only the first
+            code, err = self.error_of(body)
+            self.assertEqual((code, err["error"]["type"]), (502, "api_error"))
+            msg = err["error"]["message"]
+            self.assertIn("cache TTL ordering", msg)                   # the backend's own reason
+            self.assertRegex(msg, r"^cortados: conversation [0-9a-f]{8} failed at \d\d:\d\d:\d\d: .*start a new conversation$")
+            self.assertNotIn("no longer holds", msg)
+        self.assertEqual(self.reg.sessions, {})                        # a tombstone never restarts a backend
+
+    def test_a_streaming_retry_gets_the_reason_as_an_sse_error(self):
+        body = self.failed_conversation()
+        raw = self.post(dict(body, stream=True))
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events], ["message_start", "error"])
+        self.assertEqual(events[-1]["error"]["type"], "api_error")
+        self.assertIn("cache TTL ordering", events[-1]["error"]["message"])
+
+    def test_a_genuinely_unknown_history_is_still_a_409(self):
+        self.failed_conversation()
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "x"},
+                                                   {"role": "assistant", "content": "an answer from elsewhere"},
+                                                   {"role": "user", "content": "go on"}]}
+        code, err = self.error_of(body)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+
+    def test_the_tombstone_expires_after_its_ttl(self):
+        body = self.failed_conversation()
+        later = time.time() + server.TOMBSTONE_TTL_S + 1
+        with mock.patch.object(server.time, "time", return_value=later):
+            self.assertEqual(self.error_of(body)[0], 409)
+        self.assertEqual(self.reg.tombstones, {})                      # pruned, not only ignored
+
+    def test_the_store_keeps_only_the_newest_entries(self):
+        class Dead:
+            def __init__(self, i):
+                self.id, self.history = f"{i:08x}-dead", [f"fp-{i}"]
+            def close(self):
+                pass
+        with mock.patch.object(server, "TOMBSTONE_MAX", 3):
+            for i in range(5):
+                self.reg.fail(Dead(i), "x" * 10_000 + TOKEN)
+        self.assertEqual(list(self.reg.tombstones), [("fp-2",), ("fp-3",), ("fp-4",)])
+        reason = self.reg.tombstones[("fp-4",)][0]
+        self.assertLessEqual(len(reason), server.TOMBSTONE_REASON_CHARS)
+        self.reg.fail(Dead(9), "boom " + TOKEN)
+        self.assertNotIn(TOKEN, self.reg.tombstones[("fp-9",)][0])     # the endpoint token never lands in one
+
+    def test_an_idle_closed_conversation_leaves_no_tombstone(self):
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        s.last_used = time.time() - 10_000
+        self.reg.reap(1)
+        self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
+        follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
+        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": follow}), 409)
+
+
 class StartFailureTests(unittest.TestCase):
     def test_a_cli_that_cannot_start_is_a_bridge_error_and_leaks_no_scratch_dir(self):
         # Registry.new and _messages map BridgeError to 502; an OSError out of popen would instead drop the client's

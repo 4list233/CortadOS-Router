@@ -391,6 +391,22 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertIn("usageLimitExceeded", body["error"]["message"])
         self.assertEqual(self.reg.sessions, {})                        # a failed conversation is dropped
 
+    def test_a_retry_of_a_failed_mid_conversation_turn_gets_the_reason_not_a_409(self):
+        # /v1/responses shares Registry.find: Codex re-sending the failed request is told why, in its own shape.
+        items = [user("hi")]
+        _, r1 = self.post(request(*items))
+        items += r1["output"] + [user("fail")]
+        code, _ = self.error_of(request(*items))
+        self.assertEqual(code, 502)
+        code, body = self.error_of(request(*items))                   # the retry, identical history
+        self.assertEqual((code, body["error"]["type"]), (502, "api_error"))
+        self.assertIn("usageLimitExceeded", body["error"]["message"])
+        self.assertNotIn("no longer holds", body["error"]["message"])
+        _, events, _ = self.stream(request(*items))                    # streaming: response.failed with the reason
+        self.assertEqual([k for k, _ in events], ["response.created", "response.failed"])
+        self.assertIn("usageLimitExceeded", events[-1][1]["response"]["error"]["message"])
+        self.assertEqual(self.reg.sessions, {})
+
 
 if __name__ == "__main__":
     unittest.main()

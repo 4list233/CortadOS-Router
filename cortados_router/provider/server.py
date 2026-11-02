@@ -2,7 +2,9 @@
 
 Owner of the conversation registry: which bridge session a request belongs to. A request with no assistant messages
 starts a new session; any other goes to the one live session whose replies are exactly its assistant history, and
-fails with 409 when there is none or more than one. A request without tools always gets its own throwaway CLI.
+fails with 409 when there is none or more than one, or with 502 and the original reason when that history belongs to
+a conversation closed because its backend failed (a bounded, time-limited tombstone; both wires share the lookup).
+A request without tools always gets its own throwaway CLI.
 
 Run:  python3 -B -m cortados_router.provider.server [--port 8432]
       then  ANTHROPIC_BASE_URL=http://127.0.0.1:8432 ANTHROPIC_AUTH_TOKEN=<token> claude --model cortados
@@ -47,6 +49,16 @@ DEFAULT_PORT = 8432                                     # next to S1's 8431
 TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 # A conversation the client has not touched for this long is closed; its CLI process holds memory and a login slot.
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
+# A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request
+# (Claude Code retries an api_error with the same history) is told the real reason instead of a misleading 409.
+# TTL: a client's automatic retries finish within minutes; 15 minutes also covers a person re-sending by hand, and
+# after that the conversation is as unknown as any other (409). Max entries: one per recently failed conversation,
+# capped so a burst of failures (a vendor outage across many sessions) cannot grow memory without bound; the oldest
+# goes first. Reason chars: the bridge's error is one line about the backend; capped so a tombstone never holds more
+# than a short reason (no tool contents, no transcript), whatever an error message happens to carry.
+TOMBSTONE_TTL_S = 900.0
+TOMBSTONE_MAX = 256
+TOMBSTONE_REASON_CHARS = 300
 
 _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
@@ -302,6 +314,8 @@ class Registry:
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
+        # tuple(history) of a failed conversation -> (reason, failed_at, short id); under self._lock, oldest first.
+        self.tombstones: "OrderedDict[tuple, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
 
     def claude_config_dir(self, account: str | None) -> str | None:
@@ -349,8 +363,44 @@ class Registry:
         if len(matches) > 1:
             raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
         if not matches:
+            dead = self._tombstone(tuple(turn.history))
+            if dead:
+                reason, failed_at, short = dead
+                raise FailedSession(f"cortados: conversation {short} failed at "
+                                    f"{time.strftime('%H:%M:%S', time.localtime(failed_at))}: {reason}; "
+                                    "it was closed — start a new conversation")
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
+
+    def _tombstone(self, key: tuple):
+        """The live tombstone for this history, or None; expired ones are pruned on the way."""
+        now = time.time()
+        with self._lock:
+            while self.tombstones:
+                oldest = next(iter(self.tombstones))
+                if now - self.tombstones[oldest][1] <= TOMBSTONE_TTL_S:
+                    break
+                del self.tombstones[oldest]
+            return self.tombstones.get(key)
+
+    def fail(self, s, reason: object) -> None:
+        """Drop a conversation whose backend failed, leaving a tombstone keyed by its history: a request that failed
+        did not advance the history, so the failed request and any retry of it carry exactly this history. An opening
+        request (empty history) leaves none: its retry is a new conversation anyway (find never matches it). The
+        reason is one line, the endpoint token masked, truncated; nothing else of the conversation is kept."""
+        key = tuple(getattr(s, "history", None) or ())
+        if key:
+            text = " ".join(str(reason).split())
+            if self.token:
+                text = text.replace(self.token, "<token>")
+            if len(text) > TOMBSTONE_REASON_CHARS:
+                text = text[:TOMBSTONE_REASON_CHARS - 1] + "…"
+            with self._lock:
+                self.tombstones.pop(key, None)
+                self.tombstones[key] = (text or "backend error", time.time(), str(s.id)[:8])
+                while len(self.tombstones) > TOMBSTONE_MAX:
+                    self.tombstones.popitem(last=False)
+        self.drop(s)
 
     def get(self, session_id: str):
         with self._lock:
@@ -371,6 +421,11 @@ class Registry:
 
 class LostSession(LookupError):
     pass
+
+
+class FailedSession(LostSession):
+    """The history belongs to a conversation that was closed because its backend failed (a tombstone): answered 502
+    with the failure's reason, not the 409 of a conversation this endpoint never held or has forgotten."""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -629,6 +684,24 @@ class Handler(BaseHTTPRequestHandler):
                 turn.content, turn.tool_results = wire.one_shot_content(body), {}
         except wire.WireError as exc:
             return self._error(400, "invalid_request_error", str(exc), wire)
+        except FailedSession as exc:
+            logger.info("retry of a failed conversation refused: %s", exc)
+            if turn.stream:                             # the same SSE error a streaming client got when it failed
+                try:
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.send_header("cache-control", "no-cache")
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    msg_id = wire.new_message_id()
+                    self.wfile.write(wire.stream_start(msg_id, turn.model))
+                    self.wfile.write(wire.stream_error(msg_id, turn.model, str(exc)))
+                    self.wfile.flush()
+                except OSError as gone:
+                    logger.info("client gone before the failed-conversation error was sent (%s)", gone)
+                return
+            return self._error(502, "api_error", str(exc), wire)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         changed = self._model_change(session, body) if session is not None else None
@@ -782,7 +855,7 @@ class Handler(BaseHTTPRequestHandler):
             if "error" in outcome:
                 logger.warning("conversation %s failed: %s", session.id[:8], outcome["error"])
                 if not one_shot:
-                    reg.drop(session)
+                    reg.fail(session, outcome["error"])
                 if client_gone:
                     return
                 if turn.stream:
