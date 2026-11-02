@@ -45,13 +45,23 @@ class GateTests(unittest.TestCase):
 
     def test_fork_denied_in_main_loop_without_budget(self):
         for tool in ("Agent", "Task"):
-            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "f\u2014ork", "f\u2e5dork", "f\u0378ork", "\uff46\uff4f\uff52\uff4b"):
+            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "F.o.r.k", "f2ork"):
                 out, err = self.call(dict(self.event, tool_name=tool,
                                           tool_input={"subagent_type": kind, "prompt": "x"}))
                 self.assertEqual(err, "")
                 self.assertEqual(json.loads(out), {"hookSpecificOutput": {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny",
                     "permissionDecisionReason": gate.FORK_DENY_REASON}})
+        self.assertFalse(self.directory.exists())
+
+    def test_non_ascii_agent_type_denied_without_budget(self):
+        for kind in ("f\u2014ork", "f\u2e5dork", "\U0001CCDBork", "\uff46\uff4f\uff52\uff4b", "g\u00e9n\u00e9ral"):
+            for tool in ("Agent", "Task"):
+                out, err = self.call(dict(self.event, tool_name=tool, tool_input={"subagent_type": kind}),
+                                     {"CORTADOS_DELEGATE_BUDGET": "0"})
+                self.assertEqual(err, "")
+                self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"],
+                                 gate.NON_ASCII_DENY_REASON)
         self.assertFalse(self.directory.exists())
 
     def test_fork_allowed_inside_subagent_and_other_agents_unbudgeted(self):

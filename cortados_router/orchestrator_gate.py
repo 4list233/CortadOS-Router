@@ -21,6 +21,10 @@ FORK_DENY_REASON = (
     "(the session then fails with a 409). Spawn a fresh subagent instead (e.g. subagent_type \"general-purpose\") "
     "with a self-contained prompt."
 )
+NON_ASCII_DENY_REASON = (
+    "orchestrator: subagent_type must be plain ASCII in this mode (every agent type is), so the fork check cannot "
+    "be bypassed by Unicode look-alikes; use the agent type's exact ASCII name, e.g. \"general-purpose\"."
+)
 
 
 def state_path(directory, session_id):
@@ -58,10 +62,13 @@ def private_file(path, flags):
 
 def agent_type_key(name):
     # Claude Code 2.1.316 resolves an agent type after NFKC, lowercasing, and removing whitespace, Unicode dashes and
-    # underscores, so "f_ork", "f-ork" or a full-width "ｆｏｒｋ" all mean fork. Python's Unicode tables can be older than
-    # Claude Code's (Python 3.9 lacks dashes added in Unicode 14), so instead of copying that rule we keep ONLY letters:
-    # a stricter key that drops every separator, known or not. It can only deny more names as "fork", never fewer.
-    return "".join(c for c in unicodedata.normalize("NFKC", name).lower() if c.isalpha())
+    # underscores, so "f_ork", "f-ork" or a full-width "ｆｏｒｋ" all mean fork. Python's Unicode tables are older than
+    # Claude Code's ICU, so no local copy of that rule can be trusted on non-ASCII input. Non-ASCII names therefore get
+    # None (the caller denies them: every real agent type is ASCII), and ASCII names keep only their letters, which can
+    # only map more names to "fork", never fewer.
+    if not name.isascii():
+        return None
+    return "".join(c for c in name.lower() if c.isalpha())
 
 
 def decide(event, env, directory=None):
@@ -73,11 +80,13 @@ def decide(event, env, directory=None):
     # Forks are denied outright, whatever the budget and without spending it: a fork inherits the pinned orchestrator
     # model and its full history, so it skips S1, and the provider matches its requests to the parent's held backend
     # conversation by history fingerprint, advances it, and the parent's next request then gets a 409 (seen live, e2e C5).
-    if tool in ("Agent", "Task") and isinstance(subagent_type, str) and agent_type_key(subagent_type) == "fork":
-        return {"hookSpecificOutput": {
-            "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": FORK_DENY_REASON,
-        }}
+    if tool in ("Agent", "Task") and isinstance(subagent_type, str):
+        key = agent_type_key(subagent_type)
+        if key is None or key == "fork":
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": FORK_DENY_REASON if key == "fork" else NON_ASCII_DENY_REASON,
+            }}
     allowed_mcp = {name.strip() for name in env.get("CORTADOS_DELEGATE_ALLOW_MCP", "").split(",")}
     if tool in PLANNING_TOOLS or (tool.startswith("mcp__") and tool in allowed_mcp):
         return None
