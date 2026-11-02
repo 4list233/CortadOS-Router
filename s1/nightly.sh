@@ -120,6 +120,13 @@ evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdo
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
 mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
+report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
+eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
+  local hk inc
+  hk=$(CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --holdout-key) || return 1
+  inc=$(state fingerprint "$SERVE_POINTER" 2>/dev/null) || inc=none
+  echo "${hk}-${inc}"
+}
 report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['promote'] else 1)" "$1/report.json"; }
 cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
@@ -189,30 +196,48 @@ pending=0
 if [ ! -f "$RUN/report.json" ] && { [ -f "$RUN/segment-target" ] || compgen -G "$RUN/adapter/0*_adapters.safetensors" >/dev/null; }; then
   pending=1
 fi
-# A run approved but never published (PROMOTION FAILED): on the same data, publish it now instead of retraining or skipping;
-# new data supersedes it (tonight trains a fresh candidate).
-if [ -f data/pending-promotion ]; then
-  read -r p_hash p_run < data/pending-promotion
-  if [ "$p_hash" = "$sft_hash" ] && [ -d "$p_run/adapter" ]; then
-    # The approval is from an earlier night: the holdout labels or the serving incumbent may have changed since. Re-grade
-    # against today's holdout and incumbent and publish only if the run still promotes.
-    echo "pending promotion of $p_run: re-evaluating against the current holdout and incumbent before publishing"
+# A pending candidate is a trained run whose outcome is not final yet, kept in data/pending-candidate as
+#   "<sft fingerprint> <eval fingerprint> <reason> <run>"
+#   reason promotion_failed: approved but the pointer write failed → re-evaluate and publish on the next night;
+#   reason holdout_blocked:  evaluate.py refused for a too-small Claude holdout. Holdout labels never enter the SFT data, so the
+#                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
+#                            (effective holdout labels + settings + serving incumbent) changes.
+# Re-evaluation always grades against today's holdout and incumbent (an earlier approval may be stale). New SFT data supersedes it.
+if [ -f data/pending-candidate ]; then
+  read -r p_sft p_eval p_reason p_run < data/pending-candidate
+  if [ "$p_sft" = "$sft_hash" ] && [ -d "$p_run/adapter" ]; then
+    if ! now_eval=$(eval_fingerprint); then
+      echo "EVAL FINGERPRINT FAILED for pending $p_run; retried next night"; state event "$STATUS" pending_failure "$p_run eval fingerprint"; exit 1
+    fi
+    if [ "$p_reason" = holdout_blocked ] && [ "$now_eval" = "$p_eval" ]; then
+      echo "skipped: no new labels; pending $p_run waits for the holdout backfill (holdout and incumbent unchanged)"
+      state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"
+      echo "=== $(date) nightly end"; exit 0
+    fi
+    echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
     if ! evaluate_run "$p_run"; then
-      echo "re-evaluation of $p_run failed; publication retried next night"; state event "$STATUS" promotion_failure "$p_run (re-evaluation failed)"; exit 1
+      echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; exit 1
     fi
     if ! report_promotes "$p_run"; then
-      rm -f data/pending-promotion; mark_trained
-      state event "$STATUS" skip "pending $p_run no longer promotes"
-      echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
+      if report_blocked "$p_run"; then
+        echo "$sft_hash $now_eval holdout_blocked $p_run" > data/pending-candidate
+        echo "pending $p_run still blocked: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['promote_blocked'])" "$p_run/report.json")"
+        state event "$STATUS" skip "pending $p_run still holdout-blocked"
+      else
+        rm -f data/pending-candidate; mark_trained
+        state event "$STATUS" skip "pending $p_run no longer promotes"
+        echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
+      fi
       echo "=== $(date) nightly end"; exit 0
     fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
-      rm -f data/pending-promotion; state event "$STATUS" promotion "$p_run (retried)"; mark_trained
+      rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; mark_trained
       echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
     fi
+    echo "$sft_hash $now_eval promotion_failed $p_run" > data/pending-candidate
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
   fi
-  echo "pending promotion of $p_run superseded by new training data"; rm -f data/pending-promotion
+  echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
 fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 # Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
@@ -320,10 +345,15 @@ if report_promotes "$RUN"; then
     mark_trained
     echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
   else
-    echo "$sft_hash $RUN" > data/pending-promotion   # the next night retries publishing this run instead of skipping
+    echo "$sft_hash $(eval_fingerprint || echo unknown) promotion_failed $RUN" > data/pending-candidate   # retried next night
     state event "$STATUS" promotion_failure "$RUN → $SERVE_POINTER"
     echo "PROMOTION FAILED writing $SERVE_POINTER; incumbent stays; publication retried next night"; exit 1
   fi
+elif report_blocked "$RUN"; then
+  # not final: the holdout is too small to judge. Keep the run waiting for the backfill instead of marking the data trained.
+  echo "$sft_hash $(eval_fingerprint || echo unknown) holdout_blocked $RUN" > data/pending-candidate
+  state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"
+  echo "not promoted: holdout too small (see $RUN/report.json); $RUN waits and is re-evaluated when the holdout grows"
 else
   mark_trained
   echo "not promoted (see $RUN/report.json); incumbent stays"

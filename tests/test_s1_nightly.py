@@ -28,7 +28,7 @@ STUBS = {
         "have = sum(1 for _ in open(p)) if os.path.exists(p) else 0\n"
         "with open(p, 'a') as f:\n"
         "    for i in range(int(os.environ.get('STUB_NEW_LABELS', '0'))):\n"
-        "        f.write(json.dumps({'id': f'r{have + i}'}) + '\\n')\n"
+        "        f.write(json.dumps({'id': f'r{have + i}', 'teacher': 'claude-sonnet-5', 'sample': 0}) + '\\n')\n"
         "sys.exit(int(os.environ.get('STUB_LABEL_RC', '0')))   # partial labels are written before an early stop\n"
     ),
     "build_sft.py": (
@@ -43,11 +43,16 @@ STUBS = {
     "evaluate.py": (
         "import argparse, json, os\n"
         "ap = argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--adapter'); ap.add_argument('--out')\n"
-        "ap.add_argument('--baseline', action='store_true'); a = ap.parse_args()\n"
+        "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); a = ap.parse_args()\n"
+        "hk = open('data/stub-holdout').read() if os.path.exists('data/stub-holdout') else 'h0'\n"
+        "if a.holdout_key: print(hk); raise SystemExit(0)\n"
+        "open('data/eval-count', 'a').write('x')\n"
+        "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0'\n"
         "open('data/eval-pointer', 'w').write(os.environ.get('CORTADOS_S1_SERVE_POINTER', ''))\n"
         "c = {'band_accuracy': 0.9, 'under_routed': 0.01, 'over_routed': 0.1, 'outward_recall': 1.0}\n"
         "json.dump({'base': a.base, 'temperatures': {}, 'when': '2026-11-02', 'candidate': c,\n"
-        "           'promote': os.environ.get('STUB_PROMOTE', '1') == '1'}, open(os.path.join(a.out, 'report.json'), 'w'))\n"
+        "           'holdout_key': hk, **({'promote_blocked': 'teacher holdout too small'} if blocked else {}),\n"
+        "           'promote': os.environ.get('STUB_PROMOTE', '1') == '1' and not blocked}, open(os.path.join(a.out, 'report.json'), 'w'))\n"
     ),
 }
 
@@ -73,8 +78,10 @@ class NightlyEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.s1 = self.tmp / "repo" / "s1"
         (self.s1 / "data").mkdir(parents=True)
-        for name in ("nightly.sh", "nightly_state.py"):
+        for name in ("nightly.sh", "nightly_state.py", "common.py"):     # nightly_state counts labels with common's teacher filter
             shutil.copy(S1 / name, self.s1 / name)
+        for name in ("cortados_router", "tables"):                         # common.py loads the router's question set
+            (self.tmp / "repo" / name).symlink_to(S1.parent / name)
         for name, text in STUBS.items():
             (self.s1 / name).write_text(text)
         home = self.tmp / "home"
@@ -237,11 +244,11 @@ class NightlyEndToEnd(unittest.TestCase):
         ro.chmod(0o700)
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending promotion of runs/n1: re-evaluating", log)
+        self.assertIn("pending candidate runs/n1 (promotion_failed): re-evaluating", log)
         self.assertIn("PROMOTED (retry) runs/n1", log)
         self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertFalse((run2 / "adapter").exists(), "publishing the approved run needs no retraining")
-        self.assertFalse((self.s1 / "data/pending-promotion").exists())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertIn("skipped: no new labels", log)
 
@@ -256,7 +263,7 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertIn("pending runs/n1 no longer promotes", log)
         self.assertFalse(pointer.exists(), "a stale approval must not be published")
-        self.assertFalse((self.s1 / "data/pending-promotion").exists())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
         self.assertFalse((run2 / "adapter").exists())
         _, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertIn("skipped: no new labels", log)
@@ -267,6 +274,43 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertEqual((self.s1 / "data/label-env").read_text(), "http://cfg.invalid:8432")
         self.assertIn("train-config sets: CORTADOS_PROVIDER_URL", log)
         self.assertNotIn("cfg.invalid", log)
+
+    def test_holdout_blocked_candidate_waits_and_promotes_after_backfill(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("holdout too small", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "a holdout-blocked result is not final")
+        self.assertFalse(self.pointer.exists())
+        evals = (self.s1 / "data/eval-count").read_text()
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("waits for the holdout backfill", log)
+        self.assertEqual((self.s1 / "data/eval-count").read_text(), evals, "unchanged holdout: no re-evaluation")
+        self.assertFalse((run2 / "adapter").exists())
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")   # holdout labels never touch the SFT data
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending candidate runs/n1 (holdout_blocked): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertEqual(json.loads(self.pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
+        self.assertFalse((run3 / "adapter").exists(), "promoted without retraining")
+        self.assertFalse((self.s1 / "data/pending-candidate").exists())
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("skipped: no new labels", log)
+
+    def test_claude_backfill_of_codex_ids_counts_as_growth(self):
+        codex = [{"id": f"r{i}", "teacher": "gpt-6.1-sol", "sample": 0} for i in range(3)]
+        (self.s1 / "data/labels.jsonl").write_text("".join(json.dumps(r) + "\n" for r in codex))
+        for _ in range(3):
+            _, log, _ = self.run_night(STUB_LABEL_RC=2)
+        self.assertIn("ALERT", log)
+        self.assertEqual(self.status()["last_label_count"], 0, "Codex labels are not usable labels")
+        with (self.s1 / "data/labels.jsonl").open("a") as f:          # Claude backfill on the SAME ids
+            for r in codex:
+                f.write(json.dumps({**r, "teacher": "claude-sonnet-5"}) + "\n")
+        self.run_night(STUB_LABEL_RC=2)
+        st = self.status()
+        self.assertEqual(st["last_label_count"], 3)
+        self.assertNotIn("alert", st)
 
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
@@ -307,10 +351,7 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
         super().setUp()
         from tests.test_s1_teacher import FakeProvider, answers_for, err
         self.FakeProvider, self.answers_for, self.err = FakeProvider, answers_for, err
-        for name in ("label.py", "common.py"):
-            shutil.copy(S1 / name, self.s1 / name)
-        for name in ("cortados_router", "tables"):                 # common.py loads the live router's question set from the repo
-            (self.tmp / "repo" / name).symlink_to(S1.parent / name)
+        shutil.copy(S1 / "label.py", self.s1 / "label.py")
         reqs = [{"id": f"r{i}", "split": "train", "unit_kind": "interactive", "request": f"task {i}"} for i in range(4)]
         (self.s1 / "data/requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
         (self.tmp / "tok").write_text("tok-test\n")

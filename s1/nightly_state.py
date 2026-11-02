@@ -1,6 +1,6 @@
 """Small state helpers for s1/nightly.sh (stdlib only, so the nightly never depends on the training venv for bookkeeping).
 
-  labels <labels.jsonl>                       print the number of distinct labelled ids (0 when the file is missing); a corrupt
+  labels <labels.jsonl>                       print the number of usable Claude (id, teacher, sample) labels (0 when missing); a corrupt
                                               line exits non-zero so the nightly stops instead of recording a bogus count
   fingerprint <file>...                       print one sha256 over the files (the SFT data training reads); a missing file exits 1
   growth <status.json> <count> <stall-nights> record tonight's label count; print ALERT line when labels have not grown for
@@ -59,9 +59,14 @@ def save_status(path: Path, st: dict) -> None:
 
 
 def labels(path: Path) -> int:
+    """Usable teacher labels: distinct Claude (id, teacher, sample) triples, the same filter training applies
+    (common.is_claude_teacher, which common.read_labels uses). Counting ids would miss a Claude backfill of ids a Codex
+    teacher labelled before, and show it as a stall."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from common import is_claude_teacher       # one definition of "usable teacher"; loads the router's core (stdlib)
     if not path.exists():
         return 0
-    ids = set()
+    keys = set()
     for n, line in enumerate(path.read_text().splitlines(), 1):
         if not line.strip():
             continue
@@ -71,8 +76,9 @@ def labels(path: Path) -> int:
             raise ValueError(f"{path}:{n}: not JSON ({exc})") from None
         if not isinstance(row, dict) or not row.get("id"):
             raise ValueError(f"{path}:{n}: no id")
-        ids.add(row["id"])
-    return len(ids)
+        if is_claude_teacher(row.get("teacher")):
+            keys.add((row["id"], row["teacher"], row.get("sample")))
+    return len(keys)
 
 
 def fingerprint(paths: list[Path]) -> str:

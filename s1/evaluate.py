@@ -229,13 +229,23 @@ def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, s
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=False); ap.add_argument("--adapter"); ap.add_argument("--out", required=True)
+    ap.add_argument("--base", required=False); ap.add_argument("--adapter"); ap.add_argument("--out")
     ap.add_argument("--baseline", action="store_true", help="also grade the incumbent engine (ollama 14B) on the holdout; slow, cached")
     ap.add_argument("--fail-up", type=float, default=float(__import__("os").environ.get("CORTADOS_S1_FAIL_UP", "0.6")),
                     help="grade what production runs: a difficulty feature whose top probability is below this takes the higher of its two most likely levels (0 = off)")
     ap.add_argument("--engine", choices=["qwen", "laya"], default="qwen", help="qwen (default: --base/--adapter, MLX) or laya (--checkpoint, torch/MPS; run from s1/.venv-laya; the laya candidate code is not published)")
     ap.add_argument("--checkpoint", help="--engine laya: a directory s1/laya/train.py wrote (or s1/laya/base for the zero-shot upstream checkpoint)")
+    ap.add_argument("--holdout-key", action="store_true",
+                    help="print the evaluation fingerprint of the current holdout (effective teacher labels + settings) and exit; "
+                         "nightly.sh uses it to re-evaluate a waiting candidate only when its holdout changed")
     a = ap.parse_args()
+    if a.holdout_key:
+        reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+        holdout, _ = build_eval_sets(reqs, read_labels())
+        print(holdout_key(holdout, a.fail_up, OUTWARD_AT))
+        return 0
+    if not a.out:
+        ap.error("the following arguments are required: --out")
     if a.engine == "qwen" and not a.base:
         ap.error("the following arguments are required: --base")
     if a.engine == "laya" and not a.checkpoint:
