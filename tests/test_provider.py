@@ -638,8 +638,107 @@ class FailedSessionTombstoneTests(EndpointHarness):
         code, err, _ = self.error_of(other)
         self.assertEqual(code, 409)
         self.assertIn("no longer holds", err["error"]["message"])
-        other_system = dict(body, system="another client's system prompt")
-        self.assertEqual(self.error_of(other_system)[0], 409)
+
+    def test_client_churn_in_the_history_still_finds_the_tombstone(self):
+        # What a client re-renders between a request and its retry is not the conversation's identity: the system
+        # prompt, earlier <system-reminder> spans, thinking blocks, cache markers, mid-conversation system messages
+        # and whitespace. Each transformation alone must still meet the terminal error, never a retryable 409.
+        def first(reminder):
+            return [{"type": "text", "text": f"<system-reminder>\n{reminder}\n</system-reminder>"},
+                    {"type": "text", "text": "hi"}]
+        thinking = {"type": "thinking", "thinking": "let me see", "signature": "sig-1"}
+        body = self.failed_conversation(first("todo list: empty"))
+
+        def variant(edit):
+            msgs = json.loads(json.dumps(body["messages"]))
+            edit(msgs)
+            return dict(body, messages=msgs)
+
+        variants = {
+            "reminder changed": variant(lambda m: m[0].update(content=first("todo list: 3 items, date 2026-11-03"))),
+            "reminder removed": variant(lambda m: m[0].update(content=[{"type": "text", "text": "hi"}])),
+            "system changed": dict(body, system=[{"type": "text", "text": "a regenerated system prompt",
+                                                  "cache_control": {"type": "ephemeral"}}]),
+            "thinking added": variant(lambda m: m[1].update(content=[thinking] + m[1]["content"])),
+            "redacted thinking added": variant(lambda m: m[1].update(
+                content=[{"type": "redacted_thinking", "data": "opaque"}] + m[1]["content"])),
+            "cache_control changed": variant(lambda m: m[0]["content"][1].update(cache_control={"type": "ephemeral",
+                                                                                                "ttl": "1h"})),
+            "system message inserted": variant(lambda m: m.insert(1, {"role": "system", "content": "env: changed"})),
+            "whitespace changed": variant(lambda m: m[0]["content"][1].update(text="  hi \n")),
+        }
+        for name, retry in variants.items():
+            with self.subTest(name):
+                code, err, _ = self.error_of(retry)
+                self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+                self.assertIn("backend_reported_error", err["error"]["message"])
+
+    def test_thinking_removed_on_the_retry_still_finds_the_tombstone(self):
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        with_thinking = [{"type": "thinking", "thinking": "hmm", "signature": "s"}] + r1["content"]
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": with_thinking},
+                                                              {"role": "user", "content": "backend failure"}]}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            self.assertEqual(self.status_of(body), 502)
+        retry = dict(body, messages=history + [{"role": "assistant", "content": r1["content"]},
+                                               {"role": "user", "content": "backend failure"}])
+        self.assertEqual(self.error_of(retry)[0], 400)
+
+    def test_conversations_differing_only_in_real_user_text_do_not_collide(self):
+        body = self.failed_conversation([{"type": "text", "text": "<system-reminder>r</system-reminder>"},
+                                         {"type": "text", "text": "hi"}])
+        other = json.loads(json.dumps(body))
+        other["messages"][0]["content"][1]["text"] = "hi there"       # same reminder and reply, other user text
+        code, err, _ = self.error_of(other)
+        self.assertEqual(code, 409)
+        self.assertIn("no longer holds", err["error"]["message"])
+
+    def test_a_busy_timeout_never_closes_or_tombstones_the_owners_session(self):
+        # Deterministic overlap: request A owns the session lock; request B (same history) times out waiting for it.
+        # B's timeout is request-local: a retryable 529 overloaded_error, the session stays live and unclosed, no
+        # tombstone. When A's backend then really fails, A's own diagnostic is the one recorded, not backend_timeout.
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        [s] = self.reg.sessions.values()
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r1["content"]},
+                                                              {"role": "user", "content": "overlap"}]}
+        in_turn, release = threading.Event(), threading.Event()
+        closes, real_close = [], s.close
+
+        def send_user(content, timeout):
+            in_turn.set()
+            self.assertTrue(release.wait(30))
+            raise BridgeError("the headless CLI exited with code 9; see /secret/dir")
+
+        def close():
+            closes.append(time.time())
+            real_close()
+        s.send_user, s.close = send_user, close
+        results = {}
+
+        def call(name):
+            results[name] = self.error_of(body)
+
+        with mock.patch.object(server, "TURN_TIMEOUT_S", 0.5), self.assertLogs("cortados.provider", "WARNING"):
+            a = threading.Thread(target=call, args=("a",))
+            a.start()
+            self.assertTrue(in_turn.wait(10))
+            call("b")                                                   # waits 0.5 s for A's lock, then gives up
+            self.assertEqual(results["b"][0], server.BUSY_STATUS)
+            self.assertEqual(results["b"][1]["error"]["type"], "overloaded_error")
+            self.assertIn("conversation busy", results["b"][1]["error"]["message"])
+            self.assertNotEqual(results["b"][2].get("x-should-retry"), "false")
+            self.assertIs(self.reg.get(s.id), s)                       # the owner's session survives B's timeout
+            self.assertEqual((closes, len(self.reg.tombstones)), ([], 0))
+            release.set()
+            a.join(10)
+        self.assertEqual(results["a"][0], 502)                         # A's real failure
+        self.assertEqual((self.reg.sessions, len(closes)), ({}, 1))
+        code, err, _ = self.error_of(body)                             # the retry sees A's diagnostic
+        self.assertEqual(code, 400)
+        self.assertIn("backend_exited", err["error"]["message"])
+        self.assertNotIn("backend_timeout", err["error"]["message"])
 
     def test_another_client_or_run_with_the_same_history_never_gets_the_tombstone(self):
         body = self.failed_conversation()

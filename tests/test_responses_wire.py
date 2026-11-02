@@ -188,6 +188,39 @@ class HistoryTests(unittest.TestCase):
             wire.parse_request(request({"type": "message", "role": "user", "content": [{"type": "input_audio", "input_audio": {}}]}))
 
 
+class ConversationDigestTests(unittest.TestCase):
+    """prefix_digest (the failed-session tombstone's conversation identity) ignores what Codex regenerates between a
+    request and its retry, and still separates conversations that differ in real user text."""
+
+    def history(self, *, dev="<developer prompt>", env="<environment_context>cwd=/a</environment_context>",
+                reasoning=True, text="summarize README.md", output="# README\nhello", **extra):
+        items = [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": dev}]},
+                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": env},
+                                                                 {"type": "input_text", "text": text}]}]
+        if reasoning:
+            items.append({"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"})
+        items += [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I will read it"}]},
+                  {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{}"},
+                  {"type": "function_call_output", "call_id": "call_1", "output": output},
+                  {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+                  user("next")]
+        return wire.parse_request(request(*items, **extra)).prefix_digest
+
+    def test_client_churn_keeps_the_digest(self):
+        base = self.history()
+        self.assertTrue(base)
+        self.assertEqual(self.history(instructions="other instructions"), base)
+        self.assertEqual(self.history(dev="a regenerated developer prompt"), base)
+        self.assertEqual(self.history(env="<environment_context>cwd=/b date=tomorrow</environment_context>"), base)
+        self.assertEqual(self.history(reasoning=False), base)
+        self.assertEqual(self.history(text="<system-reminder>x</system-reminder> summarize   README.md "), base)
+
+    def test_real_user_text_and_tool_output_change_the_digest(self):
+        base = self.history()
+        self.assertNotEqual(self.history(text="summarize CHANGELOG.md"), base)
+        self.assertNotEqual(self.history(output="# README\nother"), base)
+
+
 class RefusalTests(unittest.TestCase):
     def test_previous_response_id_is_refused(self):
         with self.assertRaisesRegex(WireError, "previous_response_id"):

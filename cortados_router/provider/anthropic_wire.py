@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -27,8 +28,8 @@ class ClientTurn:
     history: list[str] = field(default_factory=list)   # reply_fingerprint of every earlier assistant message
     stream: bool = False
     model: str = MODEL_ID
-    # Digest of everything the request carried before its new turn (system, every earlier user and assistant
-    # message, cache metadata removed): it names the conversation itself, where `history` only proves the replies.
+    # Canonical digest of the conversation before its new turn (conversation_digest): what the user and the tools
+    # said, plus the assistant fingerprints. It names the conversation itself, where `history` only proves the replies.
     prefix_digest: str = ""
 
 
@@ -86,6 +87,63 @@ def reply_fingerprint(blocks: Any) -> str:
     text = "".join(b.get("text", "") for b in bs if b.get("type") == "text").strip()
     ids = [b.get("id") for b in bs if b.get("type") == "tool_use"]
     return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
+
+
+# Client-injected transient text inside user content. Claude Code wraps its reminders (todo state, file-change notes,
+# hook output) in <system-reminder> and re-renders earlier ones from turn to turn, so they say nothing about which
+# conversation a request belongs to. Non-greedy, multi-line; an unclosed tag is left alone (it is user text).
+_TRANSIENT_SPANS = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def canonical_text(text: Any) -> str:
+    """User or tool text with client-injected reminder spans removed and whitespace collapsed, so re-rendered
+    wrappers and spacing do not change a conversation's identity."""
+    return " ".join(_TRANSIENT_SPANS.sub(" ", str(text)).split())
+
+
+def canonical_parts(blocks: list[dict[str, Any]]) -> list[list[Any]]:
+    """Anthropic-shaped user blocks as conversation_digest tokens. Kept: text (canonical_text, empty dropped), images
+    (by a hash of their source), tool_result ids with their canonical content and error flag, any other block as
+    its JSON (cache metadata already removed by _blocks). Dropped: thinking / redacted_thinking (signatures and
+    summaries the client may add or strip)."""
+    out: list[list[Any]] = []
+    for b in blocks:
+        kind = b.get("type")
+        if kind == "text":
+            t = canonical_text(b.get("text", ""))
+            if t:
+                out.append(["t", t])
+        elif kind == "tool_result":
+            out.append(["r", str(b.get("tool_use_id")), bool(b.get("is_error")),
+                        canonical_parts(_blocks(b.get("content") if b.get("content") is not None else ""))])
+        elif kind == "image":
+            out.append(["i", history_digest(b.get("source"))])
+        elif kind in ("thinking", "redacted_thinking"):
+            continue
+        else:
+            out.append(["o", history_digest(b)])
+    return out
+
+
+def conversation_digest(messages: list[dict[str, Any]]) -> str:
+    """The canonical identity of a conversation's history (the messages before the new turn), for the failed-session
+    tombstone key (server.Registry.failure_key). It must survive what a client re-renders between a request and its
+    retry, and still tell two conversations apart:
+    - user content: in, as canonical_parts (real user text and tool results are the conversation). Message
+      boundaries are not: a client may merge or split consecutive user messages.
+    - assistant messages: in, as reply_fingerprint (text + tool_use ids, which already omits thinking blocks).
+    - mid-conversation `system` messages and the top-level system prompt: out. Both are operator text the client
+      regenerates (date, git status, environment), so a retry would miss its tombstone; separation between clients
+      comes from the user content, the User-Agent and the run id (failure_key).
+    - cache_control: out (_blocks strips it; it moves every turn)."""
+    tokens: list[list[Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            tokens.append(["a", reply_fingerprint(m.get("content"))])
+        elif role == "user":
+            tokens += canonical_parts(_blocks(m.get("content")))
+    return history_digest(tokens)
 
 
 def history_digest(*parts: Any) -> str:
@@ -152,8 +210,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
-                      prefix_digest=history_digest(_system_text(body.get("system")),
-                                                   [[m.get("role"), _blocks(m.get("content"))] for m in messages[:start]]))
+                      prefix_digest=conversation_digest(messages[:start]))
 
 
 def transcript_text(messages: list[dict[str, Any]]) -> str:

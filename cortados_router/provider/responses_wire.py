@@ -207,24 +207,41 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     # prompt, so it is passed as user text marked as the operator's, as the Messages wire does.
     start = max((i + 1 for i, (s, _) in enumerate(kept) if s == "assistant"), default=0)
     system_parts = [str(body["instructions"])] if body.get("instructions") else []
-    history, run = [], []
+    # `tokens`: the canonical conversation identity for the failed-session tombstone (anthropic_wire.conversation_digest
+    # documents the rule): user message content and function_call_output (call_id + canonical output) are in, as are
+    # the assistant reply fingerprints; `instructions`, developer/system items (Codex regenerates its base prompt,
+    # environment context and skills block), Codex's injected user context blocks and reasoning items (skipped by
+    # _classify: encrypted, client-optional) are out.
+    history, run, tokens = [], [], []
+
+    def end_run():
+        if run:
+            history.append(reply_fingerprint(run))
+            tokens.append(["a", history[-1]])
+            run.clear()
+
     for s, it in kept[:start]:
         if s == "system":
             system_parts += [b["text"] for b in _blocks_of(it.get("content")) if b["type"] == "text" and b["text"]]
-            if run:
-                # A developer item after a reply was served as its own turn (operator text, below), so the reply it
-                # follows ended there: without this boundary the two replies around it would merge into one
-                # fingerprint and a conversation this endpoint served would come back as a 409.
-                history.append(reply_fingerprint(run))
-                run = []
+            # A developer item after a reply was served as its own turn (operator text, below), so the reply it
+            # follows ended there: without this boundary the two replies around it would merge into one
+            # fingerprint and a conversation this endpoint served would come back as a 409.
+            end_run()
         elif s == "assistant":
             run += _blocks_of(it.get("content")) if it.get("type", "message") == "message" else [_tool_use_block(it)]
         else:
-            if run:
-                history.append(reply_fingerprint(run))
-                run = []
-    if run:
-        history.append(reply_fingerprint(run))
+            end_run()
+            if it.get("type") == "function_call_output":
+                output = it.get("output")
+                tokens.append(["r", str(it.get("call_id")), False, anthropic_wire.canonical_parts(
+                    _blocks_of(output) if isinstance(output, (str, list)) else [])])
+            else:
+                # Codex's own context blocks (CODEX_INJECTED_PREFIXES: AGENTS.md, environment_context) are the
+                # client's, regenerated each turn (cwd, date, shell), so they are out of the identity as well.
+                tokens += anthropic_wire.canonical_parts(
+                    [b for b in _blocks_of(it.get("content"))
+                     if not (b["type"] == "text" and b["text"].lstrip().startswith(CODEX_INJECTED_PREFIXES))])
+    end_run()
     content, results = [], {}
     for s, it in kept[start:]:
         if s == "system":
@@ -249,7 +266,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
         raise WireError("the new turn carries no user content and no tool outputs")
     return ClientTurn(system="\n\n".join(system_parts), tools=_parse_tools(body.get("tools")), content=content,
                       tool_results=results, history=history, stream=stream, model=MODEL_ID,
-                      prefix_digest=anthropic_wire.history_digest(body.get("instructions"), [it for _, it in kept[:start]]))
+                      prefix_digest=anthropic_wire.history_digest(tokens))
 
 
 def _messages_of(body: dict[str, Any], *, with_tools: bool) -> list[dict[str, Any]]:

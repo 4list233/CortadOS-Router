@@ -52,9 +52,9 @@ TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
 # A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request,
 # or its next message on the same history, is told why instead of a misleading 409. A tombstone is keyed by the
-# conversation itself (Registry.failure_key: the calling client, its run id, and a digest of the whole history the
-# request carried), so another conversation that happens to contain the same reply never receives it. It holds only
-# an allowlisted diagnostic (failure_diagnostic): a fixed category and message, never backend or tool text.
+# conversation itself (Registry.failure_key: the calling client, its run id, and a canonical digest of the history the
+# request carried, free of client-regenerated text: anthropic_wire.conversation_digest), so another conversation that
+# happens to contain the same reply never receives it. It holds only an allowlisted diagnostic (failure_diagnostic): a fixed category and message, never backend or tool text.
 # TTL: a client's automatic retries finish within minutes; 15 minutes also covers a person re-sending by hand, and
 # after that the conversation is as unknown as any other (409). Max entries: one per recently failed conversation,
 # capped so a burst of failures (a vendor outage across many sessions) cannot grow memory without bound; the oldest
@@ -68,6 +68,10 @@ TOMBSTONE_MAX = 256
 # conversation. The Responses wire uses its own non-retried code (responses_wire.TERMINAL_CODE).
 TERMINAL_ERROR = "invalid_request_error"
 TERMINAL_STATUS = 400
+# A request that waited TURN_TIMEOUT_S for a session another request still holds: the conversation is healthy, only
+# this request is late, so the answer is retryable. 529 overloaded_error is Anthropic's own "busy, retry" shape
+# (the SDK retries 5xx); Codex retries a 5xx too.
+BUSY_STATUS = 529
 
 # What a tombstone may say about a failure: (category, fixed message), chosen by matching the bridge's own BridgeError
 # templates. Only these fixed strings are ever replayed; an error message can embed tool arguments (a malformed
@@ -75,7 +79,7 @@ TERMINAL_STATUS = 400
 _FAILURE_CATEGORIES: tuple[tuple[str, str, str], ...] = (
     (r"^the Codex turn (failed|interrupted)", "codex_turn_failed", "the Codex backend failed the turn"),
     (r"^the headless CLI reported an error", "backend_reported_error", "the Claude backend reported an error"),
-    (r"within \d+s|deadline passed|produced nothing for|conversation busy", "backend_timeout",
+    (r"within \d+s|deadline passed|produced nothing for", "backend_timeout",
      "the backend did not answer in time"),
     (r"exited with code|is gone:|the session was closed", "backend_exited", "the backend process exited"),
     (r"^cannot start", "backend_start_failed", "the backend could not be started"),
@@ -410,8 +414,9 @@ class Registry:
     @staticmethod
     def failure_key(turn: anthropic_wire.ClientTurn, *, wire_path: str, client: str, run_id: str | None) -> str | None:
         """The identity of the conversation a request belongs to, for its tombstone: the wire, the calling client (its
-        User-Agent name), its x-cortados-run-id when it sends one, and the wire's digest of the whole history before
-        the new turn (system, every earlier user and assistant message). A retry of a failed request, and the next
+        User-Agent name), its x-cortados-run-id when it sends one, and the wire's canonical digest of the history before
+        the new turn (user content, tool results and assistant fingerprints; system text, reminders, thinking and cache
+        markers excluded: anthropic_wire.conversation_digest). A retry of a failed request, and the next
         message a person types after it, carry that same history; an unrelated conversation that contains the same
         reply does not. None for an opening request: it has no conversation to name, and find never matches it."""
         if not turn.history:
@@ -853,7 +858,11 @@ class Handler(BaseHTTPRequestHandler):
             # One deadline covers waiting for the session, writing to the CLI and reading its reply.
             deadline = time.time() + TURN_TIMEOUT_S
             if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
-                outcome["error"] = BridgeError(f"conversation busy for {TURN_TIMEOUT_S:.0f}s")
+                # Request-local: another request owns the session and is still running its turn. Closing, dropping
+                # or tombstoning here would kill that live backend (or overwrite its real failure diagnostic), so
+                # this request only answers a retryable busy error (BUSY_STATUS) and the conversation is untouched.
+                outcome["busy"] = (f"cortados: conversation busy: another request on this conversation has held it "
+                                   f"for over {TURN_TIMEOUT_S:.0f}s; retry once that request has finished")
                 return
             try:
                 if not created and reg.get(session.id) is not session:
@@ -906,7 +915,6 @@ class Handler(BaseHTTPRequestHandler):
                     # Still under the session lock: a request waiting for it finds the conversation gone (above), never
                     # a backend that just failed. The key is this request's own, computed before the turn ran.
                     reg.fail(session, exc, fail_key)
-                    outcome["failed"] = True
             finally:
                 session.lock.release()
                 if one_shot:
@@ -945,10 +953,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(stale)),
                                       headers={"x-should-retry": "false"})
                 return self._error(409, "invalid_request_error", str(stale), wire)
+            if "busy" in outcome:
+                logger.warning("conversation %s: %s", session.id[:8], outcome["busy"])
+                if client_gone:
+                    return
+                if turn.stream:                         # api_error / server_error: both wires retry it
+                    self.wfile.write(wire.stream_error(msg_id, model, outcome["busy"]))
+                    return
+                return self._error(BUSY_STATUS, "overloaded_error", outcome["busy"], wire)
             if "error" in outcome:
+                # A failed session turn was already closed and tombstoned by the worker, under the session lock.
                 logger.warning("conversation %s failed: %s", session.id[:8], outcome["error"])
-                if not one_shot and not outcome.get("failed"):   # busy: the worker never held the lock to do it
-                    reg.fail(session, outcome["error"], fail_key)
                 if client_gone:
                     return
                 if turn.stream:
