@@ -154,15 +154,32 @@ class FailedReadingTest(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.home, True)
+        # A throwaway HOME too: anything that still resolves ~/.cortados on its own lands here, where tearDown checks it.
+        self.user_home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.user_home, True)
         for name, value in (("STATE", self.home), ("CACHE", self.home / "scarcity.json"),
                             ("HISTORY", self.home / "scarcity-history.jsonl"),
                             ("PROBE_DIR", self.home / "usage-probe")):
             p = mock.patch.object(sc, name, value)
             p.start(); self.addCleanup(p.stop)
+        # _sample_locked re-learns unit costs when learned_at is absent, and unitcost resolves its own home: replace it
+        # outright, and point CORTADOS_HOME/HOME at temp dirs for the whole test in case anything else resolves one.
+        self.learner = mock.Mock(return_value=None)
         for p in (mock.patch.object(sc, "_plans", return_value={}),
                   mock.patch.object(sc._reaper, "sweep_stale", return_value=None),
-                  mock.patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"})):
+                  mock.patch.object(sc, "_learn_unit_costs", self.learner),
+                  mock.patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off", "CORTADOS_HOME": str(self.home),
+                                               "HOME": str(self.user_home)})):
             p.start(); self.addCleanup(p.stop)
+        self.addCleanup(self._assert_nothing_outside_the_temp_home)
+
+    def _assert_nothing_outside_the_temp_home(self):
+        self.assertFalse((self.user_home / ".cortados").exists(), "a test reached a ~/.cortados outside its temp home")
+        self.assertEqual(list(self.user_home.iterdir()), [], "a test wrote into HOME")
+
+    def test_the_unit_cost_learner_is_isolated(self):
+        self._run(lambda: (_ for _ in ()).throw(RuntimeError("Codex CLI not found: searched nothing")))
+        self.learner.assert_called_once_with()          # reached (learned_at absent) but replaced: no live history read
 
     def _codex_lane(self) -> dict:
         return (json.loads((self.home / "scarcity.json").read_text()).get("lanes") or {}).get("codex") or {}

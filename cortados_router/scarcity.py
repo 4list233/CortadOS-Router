@@ -727,6 +727,15 @@ def _write_cache(update: dict[str, Any], stamp: float | None, extra: dict[str, A
     return out
 
 
+def _learn_unit_costs() -> None:
+    """Re-learn unit costs from the history. unitcost resolves its own home (CORTADOS_HOME or ~/.cortados) at load time,
+    independent of this module's STATE; a named seam so tests can replace it and never reach a live home."""
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("cortados_unitcost", str(Path(__file__).with_name("unitcost.py")))
+    um = _ilu.module_from_spec(spec); spec.loader.exec_module(um)
+    um.learn()
+
+
 def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[str, Any]:
     with _lock:
         prev: dict[str, Any] = {}
@@ -781,9 +790,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         out = _write_cache({l: lanes[l] for l in results}, now if covers_subscriptions else None, {"probe_sweep": sweep})
         if results and "--learn" in sys.argv or (results and time.time() - float(prev.get("learned_at") or 0) > 6 * 3600):
             try:
-                import importlib.util as _ilu
-                spec = _ilu.spec_from_file_location("cortados_unitcost", str(Path(__file__).with_name("unitcost.py"))); um = _ilu.module_from_spec(spec); spec.loader.exec_module(um)
-                um.learn(); out["learned_at"] = time.time()
+                _learn_unit_costs(); out["learned_at"] = time.time()
             except Exception:
                 pass
         if results:

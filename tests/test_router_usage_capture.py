@@ -75,7 +75,7 @@ class Capture(unittest.TestCase):
     def test_a_refused_screen_makes_the_lane_stale_at_once(self):
         # The previous reading stays on disk for diagnostics, but routing must not keep using it for up to six hours.
         import json, time
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as user_home:
             home = Path(tmp)
             good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "pools": {},
                     "windows": [{"window": "week", "pool": "all", "used_pct": 3.0, "elapsed_pct": 95.0, "scarcity": -0.6, "expiring_pct": 90, "resets_at": "soon"}]}
@@ -85,9 +85,13 @@ class Capture(unittest.TestCase):
             with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
                  patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "PROBE_DIR", home / "usage-probe"), \
                  patch.dict(scarcity.SAMPLERS, {"codex": refused}), patch.object(scarcity, "_plans", return_value={}), \
-                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"}):
+                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), \
+                 patch.object(scarcity, "_learn_unit_costs") as learner, \
+                 patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off", "CORTADOS_HOME": str(home), "HOME": user_home}):
                 scarcity._sample_locked(force=True, only=["codex"])
                 lane = scarcity.lane_scarcity()["codex"]
+            learner.assert_not_called()                             # learned_at is fresh: no live history read
+            self.assertEqual(os.listdir(user_home), [])            # nothing resolved a ~/.cortados outside the temp home
             self.assertIsNone(lane["scarcity"])
             self.assertEqual((lane["tightest"], lane["expiring_pct"]), ({}, 0))      # no stale "expiring unused" credit either
             self.assertIn("not one this parser", lane["error"])
