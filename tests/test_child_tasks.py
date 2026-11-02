@@ -56,6 +56,11 @@ FAKE = textwrap.dedent('''\
             f.write(str(g.pid))
         time.sleep(0.3)
         sys.exit(3)
+    if mode == "echo-sleep":
+        sys.stderr.write("stderr has " + os.environ["ANTHROPIC_AUTH_TOKEN"] + "\\n")
+        sys.stderr.flush()
+        open(os.path.join(os.getcwd(), "echoed"), "w").close()
+        time.sleep(60)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -778,6 +783,102 @@ class ChildTaskTests(unittest.TestCase):
             self.assertEqual(st["state"], "failed")
             self.assertIn("redact_error", st)
             self.assertEqual(st["stderr_tail"], ct.REDACT_FAILED_PLACEHOLDER)
+
+    # --- review round 5 ---------------------------------------------------------------------------------------------
+
+    def _kill_runner(self, tid):
+        pid = _load(os.path.join(ct.task_path(tid), "meta.json"))["runner_pid"]
+        os.kill(pid, signal.SIGKILL)
+        ct._REAP[tid].wait()
+
+    def test_crash_then_token_rotation_withholds_logs(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-sleep"
+        tid = self.start()
+        self.assertTrue(_wait_file(os.path.join(self.work, "echoed")))
+        self._kill_runner(tid)
+        with open(self.cfg["token_file"], "w") as f:              # rotated after the crash
+            f.write("a-rotated-token-0004")
+        self.cfg["token"] = "a-rotated-token-0004"               # neither current credential is the launch one
+        r, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        self.assertEqual(st["stderr_tail"], ct.LOGS_WITHHELD_NOTE)
+        self.assertIn("logs_withheld", st)
+        self.assertNotIn("tok-test-000000001", r["content"][0]["text"])
+        self.assertNotIn("tok-test-000000001", json.dumps(st))
+
+    def test_crash_with_same_credentials_releases_redacted_logs(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-sleep"
+        tid = self.start()
+        self.assertTrue(_wait_file(os.path.join(self.work, "echoed")))
+        self._kill_runner(tid)
+        r, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        self.assertNotIn("logs_withheld", st)
+        self.assertIn("stderr has ***", st["stderr_tail"])
+        with open(os.path.join(ct.task_path(tid), "stderr.log")) as f:
+            self.assertNotIn("tok-test-000000001", f.read())        # redacted on disk too
+
+    def test_runner_death_stops_child_group(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stubborn"
+        tid = self.start()
+        gpath = os.path.join(self.work, "grandchild.pid")
+        self.assertTrue(_wait_file(gpath))
+        time.sleep(0.3)
+        with open(gpath) as f:
+            gpid = int(f.read())
+        cpid = _load(os.path.join(self.work, "fake-argv.json"))["pid"]
+        self._kill_runner(tid)
+        self.assertTrue(_pid_alive(cpid))                          # orphaned until recovery
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        end = time.time() + 5
+        while (_pid_alive(cpid) or _pid_alive(gpid)) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(cpid), "claude survived its runner's death")
+        self.assertFalse(_pid_alive(gpid), "the grandchild survived its runner's death")
+        self.assertEqual(_load(os.path.join(ct.task_path(tid), "result.json"))["child_cleanup"], "child group stopped")
+
+    def test_recovery_never_signals_a_reused_pid(self):
+        import subprocess
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        root = ct._private_root()
+        tid = "t20261102000000-00000ddd"
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": time.time() - 3600,
+                                                      "runner_pid": None})
+        open(os.path.join(d, "runner.lock"), "w").close()
+        # the recorded child is "this pgid", but with another start time: the pid now names an unrelated process
+        ct._write_json(os.path.join(d, "child.json"), {"pgid": other.pid, "start": "Thu Jan  1 00:00:00 1970"})
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        time.sleep(0.3)
+        self.assertIsNone(other.poll(), "an unrelated process group was signalled")
+        self.assertIn("not signalled", _load(os.path.join(d, "result.json"))["child_cleanup"])
+
+    def test_chrome_flag_enforced_both_ways(self):
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertIn("--no-chrome", a)
+        self.assertNotIn("--chrome", a)
+        tid = self.start(chrome=True)
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertIn("--chrome", a)
+        self.assertNotIn("--no-chrome", a)
+
+    def test_installed_claude_accepts_chrome_flags(self):
+        import shutil
+        import subprocess
+        exe = shutil.which("claude")
+        if not exe:
+            self.skipTest("no claude on PATH")
+        out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("--no-chrome", out)
+        self.assertIn("--chrome", out)
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

@@ -22,6 +22,7 @@ Stdlib only.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -81,6 +82,8 @@ KILL_GRACE_S = 30                   # after SIGTERM to claude's process group, w
 META_GRACE_S = 60                   # a task dir with no meta.json older than this is a failed start, not "running"
 RESULT_CHARS = 20_000               # result text returned through MCP; MCP clients choke on huge tool results
 REDACT_FAILED_PLACEHOLDER = "(withheld: the runner could not redact this log)"
+LOGS_WITHHELD_NOTE = ("logs withheld: the runner died before redaction, and the current credentials do not match the ones "
+                      "this task was launched with")
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
 WAIT_MAX_S = 540                    # MCP clients time a tool call out (~10 min); stay under it
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
@@ -156,6 +159,7 @@ class Redactor:
             raise TaskError(f"a configured provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
                             "provider token and could not be redacted safely (check CORTADOS_PROVIDER_TOKEN and the "
                             "token file)")
+        self.raw = sorted(toks)
         # Each credential's JSON-escaped spelling too: claude's JSON output escapes quotes and backslashes in it.
         toks |= {json.dumps(t)[1:-1] for t in toks}
         self.tokens = sorted(toks, key=len, reverse=True)
@@ -388,11 +392,7 @@ def _abort_runner(runner, d: str) -> None:
     except subprocess.TimeoutExpired:
         runner.kill()
         runner.wait()
-    try:
-        with open(os.path.join(d, "child.pid"), encoding="utf-8") as f:
-            _killpg(int(f.read().strip()), signal.SIGKILL)
-    except (FileNotFoundError, ValueError):
-        pass
+    _stop_recorded_child(d, 0)
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
@@ -411,8 +411,9 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     extra = ["-p", "--output-format", "json", "--permission-mode", permission_mode, "--permission-prompts", "none"]
     if tools:
         extra += ["--allowedTools", ",".join(tools)]
-    if chrome:
-        extra.append("--chrome")    # opt-in per task: the child acts in the user's real, signed-in Chrome (own tab group)
+    # Opt-in per task, enforced both ways: --chrome when asked (the child acts in the user's real, signed-in Chrome, in
+    # its own tab group), else an explicit --no-chrome, so a claudeInChromeDefaultEnabled setting cannot turn it on.
+    extra.append("--chrome" if chrome else "--no-chrome")
     conn = connectors_config()
     conn_note = None
     if os.path.isfile(conn):
@@ -428,6 +429,9 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     cmd[0] = exe
     _add_child_directive(cmd)
     env[NESTED_ENV] = "1"
+    # Fingerprints (sha256, never the secrets) of the credentials this child runs with: if the runner dies before it
+    # redacts the logs, they may be shown later only when today's credentials provably cover all of these.
+    launch_fps = credential_fingerprints(launch_tokens(env))
     if conn_note:
         with open(os.path.join(d, "runner.log"), "a", encoding="utf-8") as f:
             f.write(conn_note)
@@ -437,7 +441,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],   # redact, THEN slice
             "started_at": time.time(), "connectors_config": conn if not conn_note else None,
-            "chrome": chrome, "max_s": max_s, "runner_pid": None,
+            "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:]}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
@@ -550,7 +554,9 @@ def _recover(d: str, meta: dict):
         res = _read_json(os.path.join(d, "result.json"))    # recheck under the lock: the runner may just have finished
         if res is not None:
             return res
-        # The runner died without writing result.json, so it never removed the token-bearing settings file either.
+        # The runner died without writing result.json: its claude group may still be running (stop it before the
+        # terminal state is published, or it could never be cancelled), and it never removed the settings file.
+        child = _stop_recorded_child(d, KILL_GRACE_S)
         removed = _remove_settings(d)
         if os.path.exists(os.path.join(d, "cancelled")):
             res = {"cancelled": True, "settings_removed": removed, "ended_at": time.time(),
@@ -558,6 +564,8 @@ def _recover(d: str, meta: dict):
         else:
             res = {"error": "the runner exited without recording a result (killed or crashed); see runner.log",
                    "settings_removed": removed, "ended_at": time.time()}
+        res["child_cleanup"] = child
+        res["logs_unredacted"] = True           # the runner never redacted them; see status()
         _write_json(os.path.join(d, "result.json"), res)
         return res
     finally:
@@ -580,10 +588,27 @@ def _tail(path: str, n: int, red: "Redactor") -> str:
     return red.leading_fragment(text) if start > 0 else text
 
 
+def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> bool:
+    """A crashed runner left its logs unredacted. They may be shown only after redaction with credentials that
+    provably include every launch credential (by fingerprint); then they are redacted on disk and released."""
+    launch = set(meta.get("cred_fingerprints") or [])
+    if not launch or not launch <= set(credential_fingerprints(red.raw)):
+        return False
+    try:
+        for name in ("stdout.log", "stderr.log"):
+            redact_file(os.path.join(d, name), red)
+    except OSError:
+        return False
+    res["logs_unredacted"] = False
+    _write_json(os.path.join(d, "result.json"), res)
+    return True
+
+
 def status(task_id, red=None, provider_url="", token="") -> dict:
     red = red or Redactor((token,) if token else ())
     d = task_path(task_id)
     state, meta, res = _state(d)
+    withheld = bool(res and res.get("logs_unredacted")) and not _release_recovered_logs(d, meta, res, red)
     started = meta.get("started_at") or os.path.getmtime(d)
     ended = (res or {}).get("ended_at")
     out = {"task_id": task_id, "state": state, "elapsed_s": round((ended or time.time()) - started, 1),
@@ -620,7 +645,11 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             # A log the runner could not redact is never shown, not even through this call's own redaction (it only
             # knows today's credentials).
             out["stderr_tail"] = (REDACT_FAILED_PLACEHOLDER if res.get("redact_error") else
+                                  LOGS_WITHHELD_NOTE if withheld else
                                   _tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS, red))
+        if withheld:
+            out["logs_withheld"] = LOGS_WITHHELD_NOTE
+            out.pop("result", None)
     return red.tree(out)                        # every string (structured, before any serialization)
 
 
@@ -690,9 +719,42 @@ def _killpg(pgid: int, sig) -> bool:
         return False
 
 
+def _proc_start(pid: int):
+    """The process's start time as ps prints it (lstart), or None if there is no such process. With the pid it names
+    one process: a reused pid has a different start time."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.strip() or None
+
+
 def _note_child(d: str, pgid: int) -> None:
-    with open(os.path.join(d, "child.pid"), "w", encoding="utf-8") as f:
-        f.write(str(pgid))                      # lets start() kill the group if it must abort this runner
+    # pid and start time: lets start() or crash recovery stop exactly this group, never a reused pid's.
+    _write_json(os.path.join(d, "child.json"), {"pgid": pgid, "start": _proc_start(pgid)})
+
+
+def _stop_recorded_child(d: str, grace: float) -> str:
+    """Stop the claude process group a dead or aborted runner left behind. Safe against pid reuse: if the leader is
+    alive it must have the recorded start time; if the leader is gone but the group still has members, the group id
+    cannot have been reused (a pid is not reissued while it names a live process group). TERM, then KILL after grace.
+    Returns what was done."""
+    rec = _read_json(os.path.join(d, "child.json"))
+    if not isinstance(rec, dict) or not isinstance(rec.get("pgid"), int) or rec["pgid"] <= 1:
+        return "no child recorded"
+    pgid = rec["pgid"]
+    if not _killpg(pgid, 0):
+        return "child group already gone"
+    now_start = _proc_start(pgid)
+    if now_start is not None and (rec.get("start") is None or now_start != rec["start"]):
+        return "pid reused by another process; not signalled"
+    _killpg(pgid, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end and _killpg(pgid, 0):
+        time.sleep(0.1)
+    if _killpg(pgid, 0):
+        _killpg(pgid, signal.SIGKILL)
+    return "child group stopped"
 
 
 def _stop_group(proc, pgid: int, grace: float) -> None:
@@ -708,10 +770,20 @@ def _stop_group(proc, pgid: int, grace: float) -> None:
     proc.wait()
 
 
+LAUNCH_TOKEN_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CORTADOS_PROVIDER_TOKEN")
+
+
+def launch_tokens(env) -> list:
+    """The credentials in a launch environment (the runner's env is the child's launch env). Never written anywhere."""
+    return [env.get(k, "") for k in LAUNCH_TOKEN_KEYS if len(env.get(k, "")) >= MIN_TOKEN_LEN]
+
+
 def _launch_tokens() -> list:
-    """The exact credentials this child was launched with (the runner's env is the launch env): used to redact the
-    child's stored output before anything else reads it. Never written anywhere."""
-    return [os.environ.get(k, "") for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CORTADOS_PROVIDER_TOKEN")]
+    return launch_tokens(os.environ)
+
+
+def credential_fingerprints(tokens) -> list:
+    return sorted({hashlib.sha256(t.encode("utf-8")).hexdigest() for t in tokens if t})
 
 
 def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:

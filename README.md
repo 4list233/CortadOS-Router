@@ -318,13 +318,17 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   `~/.claude/CLAUDE.md` does not make it delegate again. With a pinned orchestrator the launcher's whole-session
   directive comes first and the child directive last, in the same flag.
 - `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
-  signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Chrome inside a
+  signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Without it the
+  child gets an explicit `--no-chrome`, so a `claudeInChromeDefaultEnabled` setting cannot turn Chrome on. Chrome inside a
   headless `-p` child is unverified until a live test.
 - Connectors: claude.ai connectors are disabled in token-auth sessions, so if `~/.config/cortados/connectors.mcp.json`
   exists (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`) the child gets it as `--mcp-config`, loading those
   servers directly; without it the child runs without connector servers (noted in `runner.log`).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.
+  If the runner itself dies, the next status call stops claude's leftover process group (pid and start time are
+  checked, so a reused pid is never signalled) and shows the unredacted logs only when the current credentials match
+  the launch ones by sha256 fingerprint; otherwise it withholds them.
 - Limits: no cap on parallel children (capacity is the router's job: S1 and the quota gates refuse or redirect a spent
   lane); 3 h per child (`CORTADOS_CHILD_MAX_S`), after which claude's process group gets SIGTERM, then SIGKILL 30 s
   later (cancel does the same); a child cannot start children.
