@@ -315,8 +315,8 @@ disabled in token-auth sessions, so if `~/.config/cortados/connectors.mcp.json` 
 child runs without connector servers (noted in `runner.log`). State lives in `~/.config/cortados/tasks/<task_id>/`
 (0700; logs, `result.json`); the token-bearing settings file is deleted when the child exits, and finished task dirs
 older than 14 days are pruned on the next `start_task`. `chrome: true` (default false) passes `--chrome` so the child
-can use Claude in Chrome; it acts in the user's real signed-in Chrome, so it is opt-in per task and only one chrome task
-may run at a time. Chrome inside a headless `-p` child is unverified until a live test. There is no cap on parallel children: capacity is the router's job (S1 and
+can use Claude in Chrome; it acts in the user's real signed-in Chrome, so it is opt-in per task; there is no concurrency
+limit (Claude in Chrome gives each session its own tab group). Chrome inside a headless `-p` child is unverified until a live test. There is no cap on parallel children: capacity is the router's job (S1 and
 the quota gates refuse or redirect a spent lane). Limits: 3 h per child (`CORTADOS_CHILD_MAX_S`), and a child cannot start children. The token is
 read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`); the desktop app starts servers with a
 thin PATH, so set `CORTADOS_CHILD_CLAUDE_BIN` to claude's absolute path.

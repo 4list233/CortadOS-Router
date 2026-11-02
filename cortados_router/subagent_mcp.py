@@ -72,7 +72,7 @@ CHILD_TOOLS = [
                              "tools denied; default: approval-needing tools denied; dontAsk: only pre-approved tools "
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
-                    "acts in the user's real signed-in Chrome. Only one chrome task may run at a time."},
+                    "acts in the user's real signed-in Chrome (each session gets its own tab group)."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
                            "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
          "required": ["task", "cwd"]}},

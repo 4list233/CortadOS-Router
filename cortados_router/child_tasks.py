@@ -227,17 +227,6 @@ def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
     return {k: data[k] for k in ("model", "label", "provider", "models", "builder_models") if k in data}
 
 
-def _running(root: str) -> list:
-    """meta of every running task."""
-    out = []
-    for name in os.listdir(root):
-        if TASK_ID_RE.match(name):
-            state, meta, _ = _state(os.path.join(root, name))
-            if state == "running":
-                out.append(meta)
-    return out
-
-
 def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION_MODE, allowed_tools=None,
           provider_url="", token_file=None, chrome=False) -> dict:
     if os.environ.get(NESTED_ENV):
@@ -251,13 +240,8 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     exe = claude_bin()
     root = _private_root()
     prune(root)
-    # No cap on parallel children: capacity is the router's job (S1 and the quota gates refuse or redirect a spent lane).
-    running = _running(root)
-    busy = [m.get("task_id") for m in running if m.get("chrome")]
-    if chrome and busy:
-        # Browser steps drive the user's real signed-in Chrome; two children steering it at once would trample each
-        # other's tabs and act on each other's pages.
-        raise TaskError(f"child task {busy[0]} is already driving Chrome; only one chrome task may run at a time")
+    # No cap on parallel children, chrome ones included: capacity is the router's job (S1 and the quota gates refuse or
+    # redirect a spent lane), and Claude in Chrome gives each session its own tab group.
     task_id = _new_id()
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
@@ -273,7 +257,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     if tools:
         extra += ["--allowedTools", ",".join(tools)]
     if chrome:
-        extra.append("--chrome")    # opt-in per task: the child acts in the user's real, signed-in Chrome
+        extra.append("--chrome")    # opt-in per task: the child acts in the user's real, signed-in Chrome (own tab group)
     conn = connectors_config()
     conn_note = None
     if os.path.isfile(conn):

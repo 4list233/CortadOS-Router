@@ -199,17 +199,21 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn(old, names)
         self.assertIn(live, names)
 
-    def test_chrome_opt_in_and_single_driver(self):
+    def test_chrome_opt_in_and_parallel(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
         tid = self.start(chrome=True)
-        self.assertTrue(_load(os.path.join(ct.task_path(tid), "meta.json"))["chrome"])
-        self.assertIn("--chrome", _load(os.path.join(ct.task_path(tid), "meta.json"))["argv"])
-        r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
-        self.assertTrue(r.get("isError"))
-        self.assertIn("already driving Chrome", r["content"][0]["text"])
-        other = self.start()                                  # a non-chrome task may still run alongside
+        tid2 = self.start(chrome=True)                        # two chrome tasks run together: no concurrency limit
+        for t in (tid, tid2):
+            meta = _load(os.path.join(ct.task_path(t), "meta.json"))
+            self.assertTrue(meta["chrome"])
+            self.assertIn("--chrome", meta["argv"])
+            _, st = self.call("task_status", task_id=t)
+            self.assertEqual(st["state"], "running")
+        other = self.start()
         self.assertNotIn("--chrome", _load(os.path.join(ct.task_path(other), "meta.json"))["argv"])
-        for t in (tid, other):
+        r, _ = self.call("start_task", task="x", cwd=self.work, chrome="yes")
+        self.assertIn("chrome must be true or false", r["content"][0]["text"])
+        for t in (tid, tid2, other):
             self.call("cancel_task", task_id=t)
             self.call("wait_task", task_id=t, timeout_s=30)
 
