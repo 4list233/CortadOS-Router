@@ -86,7 +86,8 @@ def window_view(name: str, used_pct: float, reset_at: float | None, window_s: fl
     # NEGATIVE as the reset nears: 0 at half-way, down to −(wasted share) at the reset. Long windows only; 5-hour windows renew too fast to matter.
     wasted = max(0.0, 100.0 - projected) if used_pct < 99 else 0.0
     # Forest 2026-09-26 (bias strongly towards expiring credits): from a quarter of the window on, the share that will be wasted at today's pace
-    # counts linearly against scarcity, reaching its full weight at the reset: a week 3 % used at 70 % elapsed reads ≈ −0.6, at 95 % ≈ −0.9.
+    # counts linearly against scarcity, reaching its full weight at the reset: for a week 3 % used this term is ≈ −0.57 at 70 % elapsed and
+    # ≈ −0.90 at 95 %; on top of the underused floor (−0.6) both clamp to −1.0.
     if reset_at and window_s >= 86400 and elapsed > 0.25:
         s = round(max(-1.0, s - (wasted / 100.0) * ((elapsed - 0.25) / 0.75)), 2)
     return {"window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
@@ -444,19 +445,200 @@ def parse_codex_status(text: str, now: float | None = None) -> list[dict[str, An
     return wins
 
 
-def _codex_binary(env: dict[str, str]) -> tuple[str, str | None]:
-    """The configured Codex CLI if it exists, else `codex` on PATH. Returns (binary, missing configured path or None):
-    ChatGPT.app stopped shipping Resources/codex (2026-10), and a dead configured path must not blind the probe."""
+# The app bundles that may ship a Codex CLI. Only the bundle roots are hardcoded: what lives inside them is read from
+# the bundle's own codex-package.json, so the next relocation inside Contents/Resources needs no code change here.
+CODEX_APP_BUNDLES = ("/Applications/ChatGPT.app", "~/Applications/ChatGPT.app", "/Applications/Codex.app")
+# Last resort only, for a bundle that ships no manifest. Until 2026-10 the CLI was Resources/codex; since then it lives in
+# Resources/codex-cli/bin/codex. The Air has no `codex` on PATH, so the old single default exec'd a missing file: the
+# forked child exited 127 at once and every probe read "stage=boot, eof=True".
+CODEX_APP_BINARIES = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+                      "/Applications/ChatGPT.app/Contents/Resources/codex")
+
+
+def _is_exe(path: str | None) -> bool:
+    """An executable *file*. os.access(X_OK) alone is true for a directory named `codex`, which would then be forked."""
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _bundle_codex_candidates(bundles, note, problem=None) -> list[str]:
+    """Codex binaries inside app bundles: each Contents/Resources/codex-package.json (or one directory below it) names
+    its CLI in "entrypoint", resolved against that manifest's own directory; then a bounded Resources/codex*/bin/codex
+    for a bundle that ships no manifest. Depth is bounded on purpose: an unbounded walk of a bundle is slow and would
+    happily find an unrelated `codex`. Every path considered is recorded via note(); every unreadable manifest or
+    unsearchable directory via problem() (default: note()), so a caller can keep those even when discovery succeeds.
+
+    Enumeration is explicit os.scandir (not Path.glob, which hides a PermissionError as "no match"): a directory that
+    cannot be listed is recorded as "<dir>: <error>" and skipped, and the rest of the search carries on.
+
+    Precedence holds ACROSS bundles: every bundle's manifest entrypoint comes before any bundle's glob match, so one
+    bundle's last-resort guess never outranks another bundle's own declaration."""
+    problem = problem or note
+
+    def listing(d: Path) -> dict[str, bool] | None:
+        """{name: is_dir} for one directory, or None with the reason recorded. Path.glob() swallows PermissionError,
+        so a denied directory would look merely empty; scandir raises, and the reason lands in the search list."""
+        try:
+            with os.scandir(d) as it:
+                out = {}
+                for e in it:
+                    try:
+                        out[e.name] = e.is_dir()
+                    except OSError:
+                        out[e.name] = False
+                return out
+        except (FileNotFoundError, NotADirectoryError) as exc:   # an absent bundle: searched, not a problem
+            note(f"{d}: {type(exc).__name__}")
+        except OSError as exc:
+            problem(f"{d}: {type(exc).__name__}: {exc.strerror or exc}")
+        return None
+
+    entries: list[str] = []
+    globbed_all: list[str] = []
+    for bundle in bundles:
+        res = Path(os.path.expanduser(bundle)) / "Contents" / "Resources"
+        patterns = ("codex-package.json", "*/codex-package.json", "codex*/bin/codex")
+        # Name every root and pattern searched, so a failure that matched nothing still says where it looked.
+        note(f"{res}/{{{','.join(patterns)}}}")
+        # Bounded explicit enumeration: Resources itself and one level below, nothing deeper.
+        top = listing(res)
+        if top is None:
+            continue
+        manifests = [res / "codex-package.json"] if top.get("codex-package.json") is False else []
+        for name in sorted(n for n, is_dir in top.items() if is_dir):
+            sub = listing(res / name)
+            if sub is None:
+                continue
+            if sub.get("codex-package.json") is False:
+                manifests.append(res / name / "codex-package.json")
+            if name.startswith("codex") and sub.get("bin"):
+                cand = res / name / "bin" / "codex"
+                if os.path.lexists(cand):
+                    globbed_all.append(str(cand))
+        for manifest in manifests:
+            try:
+                entry = json.loads(manifest.read_text())
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                problem(f"{manifest} (unreadable: {type(exc).__name__})")
+                continue
+            target = entry.get("entrypoint") if isinstance(entry, dict) else None
+            if not isinstance(target, str) or not target:
+                problem(f'{manifest} (no "entrypoint")')
+                continue
+            entries.append(os.path.normpath(os.path.join(str(manifest.parent), target)))
+    return entries + [g for g in globbed_all if g not in entries]
+
+
+def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None = None,
+                  notes: list[str] | None = None) -> tuple[str | None, str | None]:
+    """The Codex CLI to run, as (binary or None, missing configured path or None), appending everything considered to
+    `searched` so a failure can say where it looked, and every discovery problem (a dead configured path, a malformed
+    or unreadable manifest, an unsearchable directory) to `notes` too, which outlive a successful pick.
+
+    Precedence: CORTADOS_CODEX_BIN > `codex` on PATH > an app bundle's codex-package.json "entrypoint" > a bounded
+    Resources/codex*/bin/codex glob > the legacy CODEX_APP_BINARIES tuple. PATH beats the bundle because an explicitly
+    installed CLI is the one the user maintains and upgrades, while the bundled copy moves whenever the app is rebuilt;
+    both read the same ~/.codex credentials and config, so the reading is the same either way. A dead configured path
+    must not blind the probe: it is reported, not obeyed."""
     import shutil
-    configured = env.get("CORTADOS_CODEX_BIN") or "/Applications/ChatGPT.app/Contents/Resources/codex"
-    if os.access(configured, os.X_OK):
-        return configured, None
-    return shutil.which("codex", path=env.get("PATH")) or configured, configured
+    seen = searched if searched is not None else []
+
+    def problem(msg: str) -> None:
+        seen.append(msg)
+        if notes is not None:
+            notes.append(msg)
+    configured = env.get("CORTADOS_CODEX_BIN")
+    if configured:
+        if _is_exe(configured):
+            return configured, None
+        problem(f"CORTADOS_CODEX_BIN={configured} (not an executable file)")
+    on_path = shutil.which("codex", path=env.get("PATH"))
+    if _is_exe(on_path):
+        return on_path, configured
+    seen.append("`codex` on PATH")
+    cands = _bundle_codex_candidates(CODEX_APP_BUNDLES if bundles is None else bundles, seen.append, problem)
+    for cand in cands + [b for b in CODEX_APP_BINARIES if b not in cands]:
+        if _is_exe(cand):
+            return cand, configured
+        seen.append(cand)
+    return None, configured
+
+
+def failure_kind(err: str) -> str:
+    """A stable label for a failed reading (no counts, times or diagnostics), so the log line fires once per kind."""
+    head, _, rest = err.partition(": ")
+    msg = rest.strip() or head        # raise RuntimeError() with no message: label it by exception type, not "unknown"
+    if msg.startswith("Codex /status empty"):
+        m = re.search(r"stage=(\w+)", msg)
+        b = re.search(r"boot_failure=(\w+)", msg)
+        return "codex-status-empty:" + (m.group(1) if m else "?") + (f":{b.group(1)}" if b else "")
+    # Drop digit runs before slugging: a version or a count in the first clause ("CLI v0.170.0", "3 nodes") would
+    # otherwise make a new kind of the same failure and re-log it on every attempt.
+    prefix = re.sub(r"\d+", "", msg.split(":", 1)[0].lower())
+    return re.sub(r"[^a-z0-9]+", "-", prefix).strip("-")[:60] or "unknown"
+
+
+def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) -> dict[str, Any]:
+    """One lane's failed try: keep the last good reading's values for diagnostics, stamp error + error_kind (which
+    makes the lane stale at once in the routing view), and log loudly once per kind rather than every attempt. Shared
+    by every sampler path so a failure looks the same, and is as visible, wherever it happened."""
+    old = old or {}
+    err = f"{type(exc).__name__}: {str(exc)[:200]}"
+    kind = failure_kind(err)
+    rec = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
+    # The full list of places looked, beyond the 200-char summary above; dropped when this failure carries none, so a
+    # stale list from an earlier failure never describes a different one.
+    # The same for the binary a probe ran and the discovery problems met on the way (a malformed manifest that fell
+    # back to a glob): a boot or parser failure after discovery must still show how the binary was chosen.
+    for field in ("searched", "binary", "discovery_notes"):
+        value = getattr(exc, field, None)
+        if value:
+            rec[field] = list(value) if isinstance(value, (list, tuple)) else value
+        else:
+            rec.pop(field, None)
+    if kind != old.get("error_kind"):
+        try:
+            print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            # Diagnostics must never block recording the failure: a closed stderr or a broken pipe would otherwise
+            # raise out of here, no failed record would be published, and the stale quota would stay routable.
+            pass
+    return rec
+
+
+class CodexNotFound(RuntimeError):
+    """No Codex CLI anywhere; `searched` carries every place looked, in full, for the persisted record."""
+
+    def __init__(self, searched: list[str]):
+        super().__init__("Codex CLI not found: searched " + "; ".join(searched))
+        self.searched = list(searched)
+
+
+MAX_DISCOVERY_NOTES = 10        # a short list: enough to name the broken manifests, never a whole directory listing
 
 
 def _codex() -> dict[str, Any]:
     env = _cli_env()
-    binary, missing_bin = _codex_binary(env)
+    searched: list[str] = []
+    notes: list[str] = []
+    binary, missing_bin = _codex_binary(env, searched=searched, notes=notes)
+    if not binary:
+        # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen, and name
+        # every place looked so the next relocation is a one-line read of the error rather than a debugging session.
+        raise CodexNotFound(searched)
+    notes = [n[:200] for n in notes[:MAX_DISCOVERY_NOTES]]
+    try:
+        return _codex_probe(env, binary, missing_bin, notes)
+    except Exception as exc:
+        # Discovery succeeded but the probe did not: keep which binary ran and what discovery tripped over, so a
+        # fallback past a malformed manifest is visible next to the boot or parser failure it may explain.
+        try:
+            exc.binary, exc.discovery_notes = binary, notes
+        except AttributeError:          # an exception type that refuses attributes still propagates unchanged
+            pass
+        raise
+
+
+def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str]) -> dict[str, Any]:
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -479,7 +661,8 @@ def _codex() -> dict[str, Any]:
         raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
     wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
     return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
-            **({"configured_binary_missing": missing_bin, "binary": binary} if missing_bin else {})}
+            "binary": binary, "discovery_notes": notes,
+            **({"configured_binary_missing": missing_bin} if missing_bin else {})}
 
 
 def parse_cursor_usage(text: str) -> list[dict[str, Any]]:
@@ -633,6 +816,15 @@ def _write_cache(update: dict[str, Any], stamp: float | None, extra: dict[str, A
     return out
 
 
+def _learn_unit_costs() -> None:
+    """Re-learn unit costs from the history. unitcost resolves its own home (CORTADOS_HOME or ~/.cortados) at load time,
+    independent of this module's STATE; a named seam so tests can replace it and never reach a live home."""
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("cortados_unitcost", str(Path(__file__).with_name("unitcost.py")))
+    um = _ilu.module_from_spec(spec); spec.loader.exec_module(um)
+    um.learn()
+
+
 def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[str, Any]:
     with _lock:
         prev: dict[str, Any] = {}
@@ -645,8 +837,10 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         lanes = dict(prev.get("lanes") or {})
         # Expand the one `claude` sampler into one lane per configured account (claude, claude#b, …); every other vendor
         # is unchanged. Each account lane reads its own login's /usage, so another process spending on an account shows
-        # up in that account's own reading.
-        cl = claude_lanes()
+        # up in that account's own reading. A run that wants no Claude lane (only=["codex"]) never reads accounts.json:
+        # that file can live outside this run's home (CORTADOS_ROUTER_TABLES), and nothing here needs it.
+        wants_claude = not only or any(o == "claude" or o.startswith("claude#") for o in only)
+        cl = claude_lanes() if wants_claude else []
         claude_dir = {k: cd for k, cd in cl}
         plan = {k: SAMPLERS["claude"] for k, _ in cl}
         plan.update({name: fn for name, fn in SAMPLERS.items() if name != "claude"})
@@ -665,10 +859,9 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         def run(lane: str) -> None:
             try:
                 rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
-                results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
+                results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None, "error_kind": None}
             except Exception as exc:      # keep the last good reading, say so
-                old = lanes.get(lane) or {}
-                results[lane] = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                results[lane] = _failed_record(lane, lanes.get(lane), exc)
                 if lane == "claude":
                     try:
                         import traceback as _tb
@@ -688,9 +881,7 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         out = _write_cache({l: lanes[l] for l in results}, now if covers_subscriptions else None, {"probe_sweep": sweep})
         if results and "--learn" in sys.argv or (results and time.time() - float(prev.get("learned_at") or 0) > 6 * 3600):
             try:
-                import importlib.util as _ilu
-                spec = _ilu.spec_from_file_location("cortados_unitcost", str(Path(__file__).with_name("unitcost.py"))); um = _ilu.module_from_spec(spec); spec.loader.exec_module(um)
-                um.learn(); out["learned_at"] = time.time()
+                _learn_unit_costs(); out["learned_at"] = time.time()
             except Exception:
                 pass
         if results:
@@ -750,7 +941,7 @@ def _sample_local_managed() -> dict[str, Any]:
             old = (json.loads(CACHE.read_text()).get("lanes") or {}).get("local") or {}
         except Exception:
             old = {}
-        rec = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        rec = _failed_record("local", old, exc)      # same error_kind and once-per-kind log as the locked sampler
     rec["plan"] = _plans().get("local") or rec.get("plan")
     # No history line: the series feeds the unit-cost learner and the 24-hour change readout, both per window, and
     # local telemetry has no windows. A line a minute would only crowd the vendor samples out of the readout.

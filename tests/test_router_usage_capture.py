@@ -22,6 +22,19 @@ def codex_screen(left_pct):
 
 
 class Capture(unittest.TestCase):
+    def setUp(self):
+        # These tests are about the PTY capture, not about finding the CLI: pin discovery so they never read the host's
+        # PATH or /Applications (where a machine without Codex installed would raise "Codex CLI not found" instead).
+        self.real_codex_binary = scarcity._codex_binary
+        patcher = patch.object(scarcity, '_codex_binary', return_value=('codex', None))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def _real_discovery(self):
+        """Restore real discovery for the two tests that are about discovery, with no host bundles in the search."""
+        for p in (patch.object(scarcity, '_codex_binary', self.real_codex_binary),
+                  patch.object(scarcity, 'CODEX_APP_BUNDLES', ()), patch.object(scarcity, 'CODEX_APP_BINARIES', ())):
+            p.start(); self.addCleanup(p.stop)
+
     def test_startup_exit_retains_metadata_without_boot_text(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(scarcity, 'PROBE_DIR', Path(tmp)):
             diagnostic = {}
@@ -62,7 +75,7 @@ class Capture(unittest.TestCase):
     def test_a_refused_screen_makes_the_lane_stale_at_once(self):
         # The previous reading stays on disk for diagnostics, but routing must not keep using it for up to six hours.
         import json, time
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as user_home:
             home = Path(tmp)
             good = {"scarcity": -0.6, "fetched_at": time.time() - 900, "tried_at": time.time() - 900, "error": None, "pools": {},
                     "windows": [{"window": "week", "pool": "all", "used_pct": 3.0, "elapsed_pct": 95.0, "scarcity": -0.6, "expiring_pct": 90, "resets_at": "soon"}]}
@@ -72,9 +85,17 @@ class Capture(unittest.TestCase):
             with patch.object(scarcity, "STATE", home), patch.object(scarcity, "CACHE", home / "scarcity.json"), \
                  patch.object(scarcity, "HISTORY", home / "scarcity-history.jsonl"), patch.object(scarcity, "PROBE_DIR", home / "usage-probe"), \
                  patch.dict(scarcity.SAMPLERS, {"codex": refused}), patch.object(scarcity, "_plans", return_value={}), \
-                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off"}):
+                 patch.object(scarcity._reaper, "sweep_stale", return_value=None), \
+                 patch.object(scarcity, "_learn_unit_costs") as learner, \
+                 patch.object(scarcity, "claude_lanes", side_effect=AssertionError("must not read accounts.json")) as lanes_fn, \
+                 patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off", "CORTADOS_HOME": str(home), "HOME": user_home}):
+                for name in ("CORTADOS_ROUTER_TABLES", "WANGCAI_ROUTER_TABLES"):   # restored by patch.dict
+                    os.environ.pop(name, None)
                 scarcity._sample_locked(force=True, only=["codex"])
                 lane = scarcity.lane_scarcity()["codex"]
+            lanes_fn.assert_not_called()                            # codex-only: accounts.json never read
+            learner.assert_not_called()                             # learned_at is fresh: no live history read
+            self.assertEqual(os.listdir(user_home), [])            # nothing resolved a ~/.cortados outside the temp home
             self.assertIsNone(lane["scarcity"])
             self.assertEqual((lane["tightest"], lane["expiring_pct"]), ({}, 0))      # no stale "expiring unused" credit either
             self.assertIn("not one this parser", lane["error"])
@@ -120,6 +141,7 @@ class Capture(unittest.TestCase):
 
     def test_codex_probe_survives_a_dead_configured_binary(self):
         # 2026-10-13: ChatGPT.app dropped Resources/codex while 13 profiles still pointed CORTADOS_CODEX_BIN at it.
+        self._real_discovery()
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / 'codex'
             fake.write_text('#!/bin/sh\n'); fake.chmod(0o755)
@@ -133,6 +155,7 @@ class Capture(unittest.TestCase):
                          'scarcity._codex: the fallback must stay visible in the reading')
 
     def test_codex_probe_keeps_a_working_configured_binary(self):
+        self._real_discovery()
         with patch.object(scarcity, '_cli_env', return_value={'CORTADOS_CODEX_BIN': sys.executable, 'PATH': ''}), \
              patch.object(scarcity, 'tui_capture', return_value=codex_screen(63)) as call:
             result = scarcity._codex()
