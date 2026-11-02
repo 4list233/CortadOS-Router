@@ -87,9 +87,13 @@ class Capture(unittest.TestCase):
                  patch.dict(scarcity.SAMPLERS, {"codex": refused}), patch.object(scarcity, "_plans", return_value={}), \
                  patch.object(scarcity._reaper, "sweep_stale", return_value=None), \
                  patch.object(scarcity, "_learn_unit_costs") as learner, \
+                 patch.object(scarcity, "claude_lanes", side_effect=AssertionError("must not read accounts.json")) as lanes_fn, \
                  patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off", "CORTADOS_HOME": str(home), "HOME": user_home}):
+                for name in ("CORTADOS_ROUTER_TABLES", "WANGCAI_ROUTER_TABLES"):   # restored by patch.dict
+                    os.environ.pop(name, None)
                 scarcity._sample_locked(force=True, only=["codex"])
                 lane = scarcity.lane_scarcity()["codex"]
+            lanes_fn.assert_not_called()                            # codex-only: accounts.json never read
             learner.assert_not_called()                             # learned_at is fresh: no live history read
             self.assertEqual(os.listdir(user_home), [])            # nothing resolved a ~/.cortados outside the temp home
             self.assertIsNone(lane["scarcity"])

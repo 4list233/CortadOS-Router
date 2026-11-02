@@ -776,8 +776,10 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         lanes = dict(prev.get("lanes") or {})
         # Expand the one `claude` sampler into one lane per configured account (claude, claude#b, …); every other vendor
         # is unchanged. Each account lane reads its own login's /usage, so another process spending on an account shows
-        # up in that account's own reading.
-        cl = claude_lanes()
+        # up in that account's own reading. A run that wants no Claude lane (only=["codex"]) never reads accounts.json:
+        # that file can live outside this run's home (CORTADOS_ROUTER_TABLES), and nothing here needs it.
+        wants_claude = not only or any(o == "claude" or o.startswith("claude#") for o in only)
+        cl = claude_lanes() if wants_claude else []
         claude_dir = {k: cd for k, cd in cl}
         plan = {k: SAMPLERS["claude"] for k, _ in cl}
         plan.update({name: fn for name, fn in SAMPLERS.items() if name != "claude"})

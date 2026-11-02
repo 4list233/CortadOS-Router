@@ -186,6 +186,14 @@ class FailedReadingTest(unittest.TestCase):
                   mock.patch.dict(os.environ, {"CORTADOS_SCARCITY_REFRESH": "off", "CORTADOS_HOME": str(self.home),
                                                "HOME": str(self.user_home)})):
             p.start(); self.addCleanup(p.stop)
+        # accounts.json is resolved through CORTADOS_ROUTER_TABLES (or its legacy alias), which can point outside the
+        # temp homes: drop both (patch.dict restores them), and fail if a codex-only run reaches the Claude lane list.
+        for name in ("CORTADOS_ROUTER_TABLES", "WANGCAI_ROUTER_TABLES"):
+            os.environ.pop(name, None)
+        self.claude_lanes = mock.Mock(side_effect=AssertionError("codex-only run must not read accounts.json"))
+        p = mock.patch.object(sc, "claude_lanes", self.claude_lanes)
+        p.start(); self.addCleanup(p.stop)
+        self.addCleanup(self.claude_lanes.assert_not_called)
         self.addCleanup(self._assert_nothing_outside_the_temp_home)
 
     def _assert_nothing_outside_the_temp_home(self):
