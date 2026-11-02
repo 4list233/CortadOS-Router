@@ -10,12 +10,20 @@ import json
 import os
 import sqlite3
 import sys
+from collections import Counter
 from pathlib import Path
 
-from common import DATA, clean_request, read_jsonl, split_of
+from common import DATA, LABELER_MARKER, clean_request, read_jsonl, split_of
 
 SHEET = Path(__file__).resolve().parent / "sources/labeling-sheet.csv"
 ROUTER_DB = Path.home() / ".cortados/router.db"
+# Router rows that are machine traffic, not requests a person or job made: training on them would feed the pipeline its own output.
+#   labeler  — s1/label.py's teacher calls go through the provider and land in routes; each user message starts with this marker
+#              (common.LABELER_MARKER; the provider keeps no run-id column, so the text is the durable mark). The text is a JSON array of
+#              OTHER requests already in the dataset: a duplicate, and a mis-shaped one.
+#   review   — cortados_router/reviews.py's templated review hand-offs ("[cortados-review:<ticket>:<role>] Review requested; …"): one fixed
+#              template that differs only by ticket, so it would add hundreds of near-identical rows.
+MACHINE_MARKERS = {"labeler": LABELER_MARKER, "review": "[cortados-review:"}
 
 
 def _router_dbs() -> list[Path]:
@@ -44,14 +52,28 @@ def _source_tag(db: Path) -> str:
     return db.stem + "-" + hashlib.sha1(str(db.resolve()).encode()).hexdigest()[:8]
 
 
-def _rows_from_db(db: Path) -> list:
+def machine_kind(request) -> str | None:
+    """Which MACHINE_MARKERS kind a raw router request carries, or None for a real request."""
+    for kind, marker in MACHINE_MARKERS.items():
+        if marker in (request or ""):
+            return kind
+    return None
+
+
+def _rows_from_db(db: Path, excluded: Counter | None = None) -> list:
     """Requests from one router db (read-only). Raises on an unreadable/locked/malformed db; the caller isolates that so
-    one bad source never discards rows already collected from the healthy ones."""
+    one bad source never discards rows already collected from the healthy ones. Machine traffic (MACHINE_MARKERS) is
+    skipped and counted into `excluded` by kind."""
     tag = _source_tag(db)
     c = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
     try:
         rows = []
         for tid, kind, plat, req in c.execute("SELECT turn_id, unit_kind, platform, request FROM routes ORDER BY ts"):
+            kind = machine_kind(req)
+            if kind:
+                if excluded is not None:
+                    excluded[kind] += 1
+                continue
             rid = "rt." + tid if not tag else f"rt.{tag}.{tid}"
             rows.append({"id": rid, "source": "hermes-" + (plat or "unknown"), "unit_kind": kind, "request": clean_request(req)})
         return rows
@@ -64,6 +86,7 @@ def main() -> None:
     have = {r["id"] for r in read_jsonl(out)}
     seen_text = {r["request"] for r in read_jsonl(out)}
     new = []
+    excluded: Counter = Counter()
     if SHEET.exists():
         for r in csv.DictReader(SHEET.open()):
             new.append({"id": r["id"], "source": "1.0-sheet", "unit_kind": "interactive", "request": clean_request(r["request"])})
@@ -71,9 +94,11 @@ def main() -> None:
         try:
             if not db.exists():                             # a synced copy that has not arrived yet is simply skipped
                 continue
-            new.extend(_rows_from_db(db))
+            new.extend(_rows_from_db(db, excluded))
         except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
             print(f"dataset: skipping router db {db}: {exc}", file=sys.stderr)   # one bad/unreadable source never loses the others
+    print(f"dataset: excluded machine router rows {json.dumps(dict(sorted(excluded.items())))} (labeler = s1/label.py teacher calls, "
+          "review = templated review hand-offs)")
     added = 0
     with out.open("a") as f:
         for r in new:
