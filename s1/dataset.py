@@ -53,9 +53,11 @@ def _source_tag(db: Path) -> str:
 
 
 def machine_kind(request) -> str | None:
-    """Which MACHINE_MARKERS kind a raw router request carries, or None for a real request."""
+    """Which MACHINE_MARKERS kind a raw router request STARTS with, or None for a real request. Head only: a person quoting or
+    discussing a marker mid-message is still a real request."""
+    head = (request or "").lstrip()
     for kind, marker in MACHINE_MARKERS.items():
-        if marker in (request or ""):
+        if head.startswith(marker):
             return kind
     return None
 
