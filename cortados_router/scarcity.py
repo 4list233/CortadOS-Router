@@ -467,9 +467,31 @@ def _bundle_codex_candidates(bundles, note, problem=None) -> list[str]:
     happily find an unrelated `codex`. Every path considered is recorded via note(); every unreadable manifest or
     unsearchable directory via problem() (default: note()), so a caller can keep those even when discovery succeeds.
 
+    Enumeration is explicit os.scandir (not Path.glob, which hides a PermissionError as "no match"): a directory that
+    cannot be listed is recorded as "<dir>: <error>" and skipped, and the rest of the search carries on.
+
     Precedence holds ACROSS bundles: every bundle's manifest entrypoint comes before any bundle's glob match, so one
     bundle's last-resort guess never outranks another bundle's own declaration."""
     problem = problem or note
+
+    def listing(d: Path) -> dict[str, bool] | None:
+        """{name: is_dir} for one directory, or None with the reason recorded. Path.glob() swallows PermissionError,
+        so a denied directory would look merely empty; scandir raises, and the reason lands in the search list."""
+        try:
+            with os.scandir(d) as it:
+                out = {}
+                for e in it:
+                    try:
+                        out[e.name] = e.is_dir()
+                    except OSError:
+                        out[e.name] = False
+                return out
+        except (FileNotFoundError, NotADirectoryError) as exc:   # an absent bundle: searched, not a problem
+            note(f"{d}: {type(exc).__name__}")
+        except OSError as exc:
+            problem(f"{d}: {type(exc).__name__}: {exc.strerror or exc}")
+        return None
+
     entries: list[str] = []
     globbed_all: list[str] = []
     for bundle in bundles:
@@ -477,13 +499,21 @@ def _bundle_codex_candidates(bundles, note, problem=None) -> list[str]:
         patterns = ("codex-package.json", "*/codex-package.json", "codex*/bin/codex")
         # Name every root and pattern searched, so a failure that matched nothing still says where it looked.
         note(f"{res}/{{{','.join(patterns)}}}")
-        try:
-            manifests = sorted(res.glob(patterns[0])) + sorted(res.glob(patterns[1]))
-            globbed = sorted(res.glob(patterns[2]))
-        except OSError as exc:          # an unreadable or disappearing bundle: skip it with a reason, never silently
-            problem(f"{res}/ (unsearchable: {type(exc).__name__})")
+        # Bounded explicit enumeration: Resources itself and one level below, nothing deeper.
+        top = listing(res)
+        if top is None:
             continue
-        globbed_all.extend(str(p) for p in globbed)
+        manifests = [res / "codex-package.json"] if top.get("codex-package.json") is False else []
+        for name in sorted(n for n, is_dir in top.items() if is_dir):
+            sub = listing(res / name)
+            if sub is None:
+                continue
+            if sub.get("codex-package.json") is False:
+                manifests.append(res / name / "codex-package.json")
+            if name.startswith("codex") and sub.get("bin"):
+                cand = res / name / "bin" / "codex"
+                if os.path.lexists(cand):
+                    globbed_all.append(str(cand))
         for manifest in manifests:
             try:
                 entry = json.loads(manifest.read_text())

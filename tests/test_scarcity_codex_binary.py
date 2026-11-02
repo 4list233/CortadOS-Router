@@ -143,6 +143,49 @@ class CodexBinaryTest(unittest.TestCase):
         with mock.patch.object(sc, "CODEX_APP_BINARIES", ()):
             self.assertEqual(sc._codex_binary(env, bundles=(str(app),)), (None, str(self.tmp / "conf/codex")))
 
+    def test_a_denied_directory_is_recorded_and_the_rest_still_searched(self):
+        # Path.glob() swallowed PermissionError, so a denied search read as "matched nothing" behind a generic pattern.
+        app = self.tmp / "ChatGPT.app"
+        found = _exe(app, "Contents/Resources/codex-cli/bin/codex")
+        denied = app / "Contents/Resources/locked"
+        denied.mkdir(parents=True)
+        real = os.scandir
+
+        def scandir(path):
+            if Path(path) == denied:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        searched: list = []
+        notes: list = []
+        with mock.patch.object(sc, "CODEX_APP_BINARIES", ()), mock.patch.object(sc.os, "scandir", side_effect=scandir):
+            got = sc._codex_binary({"PATH": self.empty_path}, bundles=(str(app),), searched=searched, notes=notes)
+        self.assertEqual(got[0], found)
+        line = f"{denied}: PermissionError: Permission denied"
+        self.assertIn(line, searched)
+        self.assertIn(line, notes)
+
+    def test_a_denied_resources_root_is_recorded_not_mistaken_for_empty(self):
+        app = self.tmp / "ChatGPT.app"
+        _exe(app, "Contents/Resources/codex-cli/bin/codex")
+        res = app / "Contents/Resources"
+        real = os.scandir
+
+        def scandir(path):
+            if Path(path) == res:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        searched: list = []
+        with mock.patch.object(sc, "CODEX_APP_BINARIES", ()), mock.patch.object(sc.os, "scandir", side_effect=scandir):
+            got = sc._codex_binary({"PATH": self.empty_path}, bundles=(str(app),), searched=searched)
+        self.assertEqual(got, (None, None))
+        self.assertIn(f"{res}: PermissionError: Permission denied", searched)
+
+    def test_enumeration_stays_bounded_to_one_level_below_resources(self):
+        app = self.tmp / "ChatGPT.app"
+        _bundle(app, "Contents/Resources/a/b/codex", {"entrypoint": "codex"}, manifest_at="Contents/Resources/a/b")
+        _exe(app, "Contents/Resources/x/codex-deep/bin/codex")
+        self.assertEqual(sc._bundle_codex_candidates((str(app),), lambda _: None), [])
+
     # --- discovery notes outlive a successful pick ----------------------------------------------------------------
     def _malformed_manifest_fallback(self):
         app = self.tmp / "ChatGPT.app"
