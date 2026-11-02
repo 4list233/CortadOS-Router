@@ -23,13 +23,12 @@ STUBS = {
     "label.py": (
         "import json, os, sys\n"
         "open('data/label-args', 'w').write(' '.join(sys.argv[1:]))\n"
-        "rc = int(os.environ.get('STUB_LABEL_RC', '0'))\n"
-        "if rc: sys.exit(rc)\n"
         "p = 'data/labels.jsonl'\n"
         "have = sum(1 for _ in open(p)) if os.path.exists(p) else 0\n"
         "with open(p, 'a') as f:\n"
         "    for i in range(int(os.environ.get('STUB_NEW_LABELS', '0'))):\n"
         "        f.write(json.dumps({'id': f'r{have + i}'}) + '\\n')\n"
+        "sys.exit(int(os.environ.get('STUB_LABEL_RC', '0')))   # partial labels are written before an early stop\n"
     ),
     "build_sft.py": (
         "import os\n"
@@ -104,6 +103,36 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertFalse((run / "adapter").exists(), "no training after a labeling failure")
         self.assertFalse(self.pointer.exists())
         self.assertIn("label.py rc 7", self.status()["last_labeling_failure"]["detail"])
+
+    def test_label_config_error_stops(self):
+        rc, log, run = self.run_night(STUB_LABEL_RC=2, STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 3, log)
+        self.assertIn("LABELING FAILED (label.py rc 2)", log)
+        self.assertFalse((run / "adapter").exists())
+
+    def test_label_stopped_early_with_growth_trains(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        rc, log, run = self.run_night(STUB_LABEL_RC=3, STUB_NEW_LABELS=2)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("LABELING STOPPED EARLY", log)
+        self.assertIn("training tonight", log)
+        self.assertTrue((run / "report.json").exists(), log)
+        self.assertIn("label.py rc 3", self.status()["last_labeling_stopped_early"]["detail"])
+
+    def test_label_stopped_early_without_growth_skips(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        rc, log, run = self.run_night(STUB_LABEL_RC=3, STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("LABELING STOPPED EARLY", log)
+        self.assertIn("skipped: no new labels", log)
+        self.assertFalse((run / "adapter").exists())
+
+    def test_stale_synced_router_db_is_reported(self):
+        db = self.tmp / "router-air.db"; db.write_text("")
+        os.utime(db, (1_700_000_000, 1_700_000_000))
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_ROUTER_DB_EXTRA=db)
+        self.assertIn("WARNING: synced router db", log)
+        self.assertIn("min old", self.status()["last_stale_router_db"]["detail"])
 
     def test_teacher_args_reach_label_py(self):
         self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_TEACHER_ARGS="--workers 1 --teacher provider",

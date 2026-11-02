@@ -14,9 +14,11 @@
 #   CORTADOS_S1_LABEL_PY        python that runs s1/label.py                      (default python3; label.py runs from this repo)
 #   CORTADOS_S1_TEACHER_ARGS    extra args for label.py (teacher selection etc.)  (default "--workers 3")
 #   CORTADOS_PROVIDER_URL, CORTADOS_PROVIDER_TOKEN_FILE   provider-backed teacher settings, passed to label.py through the env
+#                               (URL has no default and is never committed; token file defaults to ~/.config/cortados/provider-token)
 #   CORTADOS_ROUTER_DB_EXTRA    extra router dbs for dataset.py (os.pathsep list) (default ~/.cortados/router-air.db when it exists)
 #   CORTADOS_MCP_LEARNING_V1, CORTADOS_TRAINING_TEACHER_V1, CORTADOS_MCP_LEARNING_SITE_PACKAGES   feature flags read by
 #                               label.py / build_sft.py; =1 MCP learning also runs build_sft.py under CORTADOS_S1_PY
+#   CORTADOS_S1_DB_MAX_AGE_MIN  synced router db older than this is logged as stale (default 60)
 #   CORTADOS_S1_STATUS          status file for the dashboard (default data/status.json)
 #   CORTADOS_S1_STALL_NIGHTS    nights without label growth before the ALERT (default 2)
 #   CORTADOS_S1_LOG_KEEP        nightly logs kept (default 14)
@@ -53,6 +55,7 @@ SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortado
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
 STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"   # one quiet night is normal (weekend); two in a row means the labeler is stuck
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
+DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 export CORTADOS_S1_BASE="$BASE"
 # Forest 2026-10-26: fold the Air's synced routed usage into training (another machine rsyncs its router.db here);
@@ -111,16 +114,31 @@ else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
 # every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case.
 if [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then "$REPO_ROOT/bin/refresh-tiers.sh" || echo "refresh-tiers.sh failed (rc $?)"
 else echo "refresh-tiers.sh not found under $REPO_ROOT: skipped"; fi
+# The Air's router.db is rsynced here every 15 min by another machine; a stale copy means its recent usage is missing tonight.
+# Stale data is still valid data, so the night goes on, but the gap is logged and put in the status file for the dashboard.
+for db in $(echo "${CORTADOS_ROUTER_DB_EXTRA:-}" | tr ':' ' '); do
+  if [ ! -f "$db" ]; then echo "WARNING: synced router db $db is missing"; state event "$STATUS" stale_router_db "$db missing"; continue; fi
+  age_min=$(( ($(date +%s) - $(stat -f %m "$db" 2>/dev/null || stat -c %Y "$db")) / 60 ))
+  if [ "$age_min" -gt "$DB_MAX_AGE_MIN" ]; then
+    echo "WARNING: synced router db $db is ${age_min} min old (limit $DB_MAX_AGE_MIN): its newest usage is missing tonight"
+    state event "$STATUS" stale_router_db "$db ${age_min} min old"
+  else echo "synced router db $db fresh (${age_min} min)"; fi
+done
 python3 dataset.py || { rc=$?; echo "DATASET FAILED (rc $rc): training skipped"; state event "$STATUS" dataset_failure "rc $rc"; exit 1; }
 # label.py runs from THIS checkout (not a release venv); the provider teacher reads CORTADOS_PROVIDER_URL / CORTADOS_PROVIDER_TOKEN_FILE
 # from the env. Only whether they are set is logged: the URL may name an internal host and the token file is a secret's path.
 purl=unset; [ -n "${CORTADOS_PROVIDER_URL:-}" ] && purl=set
-ptok=unset; [ -n "${CORTADOS_PROVIDER_TOKEN_FILE:-}" ] && ptok=set
+ptok="default (~/.config/cortados/provider-token)"; [ -n "${CORTADOS_PROVIDER_TOKEN_FILE:-}" ] && ptok=set
 echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file $ptok)"
 # shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
 "$LABEL_PY" -B label.py $TEACHER_ARGS
 rc=$?
-if [ "$rc" -ne 0 ]; then
+# label.py exit codes: 0 completed, 2 config error, 3 stopped early (quota/auth/retries; the labels it wrote are kept).
+if [ "$rc" -eq 3 ]; then
+  # partial labels are real labels: go on, and let the no-new-labels check below decide whether there is anything to train on
+  echo "LABELING STOPPED EARLY (label.py rc 3): continuing with the labels written so far"
+  state event "$STATUS" labeling_stopped_early "label.py rc 3"
+elif [ "$rc" -ne 0 ]; then
   # 2026-11-02: a failed labeler used to be ignored and the night retrained on yesterday's data.
   echo "LABELING FAILED (label.py rc $rc): training skipped"
   state event "$STATUS" labeling_failure "label.py rc $rc"
