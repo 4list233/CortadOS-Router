@@ -186,6 +186,17 @@ def _digest_blocks_of(content: Any) -> list[dict[str, Any]]:
 
 
 def parse_request(body: dict[str, Any]) -> ClientTurn:
+    """The request as a ClientTurn, or WireError. The earlier-item digest walks client-nested content (json.dumps in
+    history_digest); a body nested close to json.loads' limit can exhaust a handler thread's stack, and a
+    RecursionError is not a WireError and would escape the handler, so it is answered as the request-shape error it is
+    (the same guard as anthropic_wire.parse_request)."""
+    try:
+        return _parse_request(body)
+    except RecursionError:
+        raise WireError("input content is nested too deeply") from None
+
+
+def _parse_request(body: dict[str, Any]) -> ClientTurn:
     if body.get("model") != MODEL_ID:
         # Codex checks the model the response echoes against the one it asked for; serving any other name would
         # fail on its side after the turn ran. Refuse first.

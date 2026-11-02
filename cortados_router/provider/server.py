@@ -94,6 +94,11 @@ _FAILURE_CATEGORIES: tuple[tuple[str, str, str], ...] = (
      "tool_result_mismatch", "the tool results did not match the backend's pending tool calls"),
     (r"malformed|reused tool call id|refused|without a (thread|turn) id|cliVersion", "backend_protocol_error",
      "the backend broke its protocol"),
+    # Turn-identity breaks from the Codex code-mode yield handling (events or calls naming a turn that is not the live
+    # one, ended-turn bookkeeping that cannot continue): the app-server broke the turn protocol.
+    (r"the id of an earlier turn|belongs? to no live turn|this session never started|is neither current"
+     r"|not the current turn|no late results to continue from|outstanding at once",
+     "backend_protocol_error", "the backend broke its protocol"),
 )
 # Codex's codexErrorInfo values (app-server protocol enum): the one detail of a failed Codex turn safe to replay,
 # because it is a fixed identifier from this list, never free text.

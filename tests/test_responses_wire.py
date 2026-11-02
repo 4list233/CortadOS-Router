@@ -244,6 +244,20 @@ class ConversationDigestTests(unittest.TestCase):
             wire.parse_request(request({"type": "message", "role": "user", "content": 42}))
 
 
+class RecursionGuardTests(unittest.TestCase):
+    def test_a_recursion_error_while_parsing_is_a_wire_error(self):
+        # The earlier-item digest follows client nesting; exhausting the handler's stack must come back as a request
+        # error, never as a RecursionError escaping the handler.
+        def deep(_body):
+            raise RecursionError("maximum recursion depth exceeded")
+        original, wire._parse_request = wire._parse_request, deep
+        try:
+            with self.assertRaisesRegex(WireError, "nested too deeply"):
+                wire.parse_request({"model": wire.MODEL_ID, "input": []})
+        finally:
+            wire._parse_request = original
+
+
 class RefusalTests(unittest.TestCase):
     def test_previous_response_id_is_refused(self):
         with self.assertRaisesRegex(WireError, "previous_response_id"):
