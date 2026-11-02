@@ -183,7 +183,7 @@ class CodexSession:
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
             logger.info("codex conversation %s: client tools Codex would refuse or swallow are declared as %s", self.id[:8],
-                        ", ".join(f"{wire} -> {client}" for wire, client in sorted(self._aliases.items())))
+                        ", ".join(f"{wire} -> {client!a}" for wire, client in sorted(self._aliases.items())))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             "baseInstructions": system or "You are a helpful assistant.",
