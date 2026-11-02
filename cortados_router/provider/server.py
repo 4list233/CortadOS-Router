@@ -619,8 +619,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/models"):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
-            return self._json(200, {"data": [{"type": "model", "id": wire.MODEL_ID, "display_name": "CortadOS"}],
-                                    "has_more": False, "first_id": wire.MODEL_ID, "last_id": wire.MODEL_ID})
+            data = [{"type": "model", "id": wire.MODEL_ID, "display_name": "CortadOS"}]
+            # The sub/ pins are offered only when this endpoint routes: a --fixed-model endpoint runs every conversation
+            # on its one model, so listing pins it would not honour would mislead the client's model picker.
+            if self.server.registry.router is not None:
+                from cortados_router import core
+                try:
+                    pins = routing.pinnable_models(core)
+                except Exception as exc:        # a broken table: say so, rather than offer a picker that hides models
+                    logger.warning("/v1/models: cannot list the pinnable models: %s", exc)
+                    return self._error(500, "api_error", f"cortados: cannot list the pinnable models: {exc}")
+                data += [{"type": "model", "id": f"{routing.SUB_PREFIX}{m}",
+                          "display_name": f"{routing.readable_model_name(m)} · CortadOS"} for _, m in pins]
+            return self._json(200, {"data": data, "has_more": False, "first_id": data[0]["id"],
+                                    "last_id": data[-1]["id"]})
         if self.path == "/resources":
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")

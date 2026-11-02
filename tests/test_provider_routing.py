@@ -194,9 +194,80 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertEqual(r.get("model"), "claude-haiku-4-5-20251001")
 
     def test_unknown_model_is_a_client_error(self):
-        r = self.pin("sub/gpt-5.6-terra")
+        r = self.pin("sub/gpt-9-imaginary")
         self.assertTrue(r.get("client_error"))
-        self.assertIn("not a Claude model", r["error"])
+        self.assertIn("sub/gpt-9-imaginary is not a model this endpoint serves", r["error"])
+        self.assertIn("gpt-6.1-sol", r["error"])            # the refusal names what can be pinned, Codex included
+        self.assertIn("claude-opus-5-5", r["error"])
+        self.assertFalse((core.STATE / "router.db").exists())
+
+    def codex_served(self):
+        return sorted(m for p, m in routing.served_routes(core) if p == "codex-cli")
+
+    def test_pinnable_models_are_the_served_routes_of_both_backends(self):
+        pins = routing.pinnable_models(core)
+        self.assertEqual([m for p, m in pins if p == "codex-cli"], self.codex_served())
+        self.assertIn(("claude-cli", "claude-opus-5-5"), pins)
+        self.assertTrue(self.codex_served())                # the tables do serve Codex models
+        self.assertEqual(pins[0][0], "claude-cli")          # Claude first, then Codex
+
+    def test_codex_pin_runs_the_named_model_on_the_codex_backend_without_s1(self):
+        for model in self.codex_served():
+            r = self.pin(f"sub/{model}")
+            self.assertNotIn("error", r, model)
+            self.assertEqual((r["provider"], r["model"], r["band"], r["pinned"], r["account"]),
+                             ("codex-cli", model, "pin", True, None))
+            self.assertEqual(r["route"]["chosen"]["lane"], "codex")
+            self.assertEqual(r["context_length"],
+                             int(core._context_cfg().get("provider_ceiling_tokens", {}).get("codex-cli", 200000)))
+        with sqlite3.connect(core.STATE / "router.db") as db:
+            row = db.execute("SELECT engine, provider, model FROM routes WHERE turn_id=?", (r["route_id"],)).fetchone()
+        self.assertEqual(row, ("pin", "codex-cli", self.codex_served()[-1]))
+
+    def test_codex_pin_needs_the_codex_binary(self):
+        body = {"model": "sub/gpt-6.1-sol", "messages": [{"role": "user", "content": "x"}]}
+        r = routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3",
+                           codex_bin="no-such-codex-anywhere")
+        self.assertIn("no-such-codex-anywhere is not on PATH", r["error"])
+        self.assertFalse(r.get("client_error"))
+
+    def test_spent_codex_lane_refuses_without_an_api_hint(self):
+        core.lane_health = lambda: {"codex": {"ok": False, "why": "week 100% used", "pools": {}}}
+        r = self.pin("sub/gpt-6.1-sol")
+        self.assertIn("no Codex subscription account can take this request", r["error"])
+        self.assertIn("week 100% used", r["error"])
+        self.assertNotIn("api/", r["error"])                # the API-credit lane is Anthropic's only
+
+    def test_oversized_codex_pin_is_refused_on_the_codex_cli_ceiling(self):
+        cap = int(core._context_cfg().get("provider_ceiling_tokens", {}).get("codex-cli", 200000))
+        body = {"model": "sub/gpt-6.1-sol", "messages": [{"role": "user", "content": "x" * ((cap + 10) * 4)}]}
+        r = routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3", codex_bin="python3")
+        self.assertTrue(r.get("fit_blocked"))
+        self.assertIn("any Codex account", r["error"])
+
+    def test_excluded_codex_pin_is_refused(self):
+        body = {"model": "sub/gpt-6.1-sol", "messages": [{"role": "user", "content": "x"}]}
+        r = routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3",
+                           codex_bin="python3", exclude_model="claude-opus-5-5, GPT-6.1-Sol")
+        self.assertTrue(r.get("client_error"))
+        self.assertIn("sub/gpt-6.1-sol is the excluded model", r["error"])
+        r = routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3",
+                           codex_bin="python3", exclude_model="gpt-6-sol")
+        self.assertEqual(r.get("model"), "gpt-6.1-sol")     # another model excluded: the pin runs
+
+    def test_broken_claude_accounts_refuses_a_claude_pin_but_not_a_codex_one(self):
+        def broken(*a):
+            raise core.AccountsConfigError("accounts.json is present but unreadable")
+        core._vendor_accounts = broken
+        self.assertIn("unreadable", self.pin("sub/opus")["error"])
+        self.assertEqual(self.pin("sub/gpt-6.1-sol").get("provider"), "codex-cli")
+
+    def test_readable_model_names(self):
+        for model, want in (("claude-fable-5-1", "Claude Fable 5.1"), ("gpt-6.1-sol", "GPT-6.1 Sol"),
+                            ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"), ("gpt-5.5", "GPT-5.5"),
+                            ("claude-opus-5", "Claude Opus 5"), ("gpt-6-astra", "GPT-6 Astra"),
+                            ("muse-spark-1.3", "muse-spark-1.3")):
+            self.assertEqual(routing.readable_model_name(model), want)
 
     def test_missing_cli_refuses(self):
         r = self.pin("sub/opus", claude_bin="no-such-cli-anywhere")

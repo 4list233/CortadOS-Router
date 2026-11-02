@@ -445,6 +445,21 @@ trust boundary, since the record only labels runs and steers reviews and never a
 `x-cortados-exclude-model` now takes a comma list of up to 8 model ids (empty items are ignored). Each listed model is
 excluded under the single-model rules, and a pin on any of them is refused.
 
+## Subscription pins on both backends (2026-11-02)
+
+`sub/<model>` now pins any model this endpoint serves, Claude or Codex: the pinnable set is `routing.pinnable_models`,
+the `served_routes` pairs (read from `tables/`, the `openai-codex` rows served as their `codex-cli` clone), one per
+model. A Claude pin runs on claude-cli (bridge.py) as before; a Codex pin (e.g. `sub/gpt-6.1-sol`) runs on codex-cli
+(codex_bridge.py) through the same `SESSION_FACTORIES` dispatch an S1 route uses. Both go through `choose_pinned`: no
+S1, but the binary-on-PATH check, the input-fit gate (codex-cli uses `provider_ceiling_tokens.codex-cli`, as
+`core.resolve` does), lane capacity, `x-cortados-exclude-model` and a `routes` row (engine `pin`). Codex has one
+login here (the backend's `--codex-home`), so a Codex pin is a single candidate on the `codex` lane; a spent Codex
+lane is refused without an `api/` hint (that lane is Anthropic's). A name the tables do not serve is a 400 that lists
+the pinnable ids. `GET /v1/models` lists `cortados` ("CortadOS") and every pin as `sub/<id>` with display name
+`<readable name> · CortadOS` (`routing.readable_model_name`, derived from the id: `Claude Fable 5.1`, `GPT-6.1 Sol`),
+so a client's model picker (the Claude desktop app) can choose the orchestrator. A `--fixed-model` endpoint lists only
+`cortados`, since it does not honour pins.
+
 ## Open
 
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
