@@ -1334,16 +1334,21 @@ class CodexSessionUnitTests(unittest.TestCase):
         s, replies, left = self.flood_session()
         s._next_id, s._replies, s._closed, s._exited, s._cv = 0, {}, False, None, threading.Condition()
         s._write = lambda line, timeout: None
+        # The refusals log a warning each; silence them rather than assertLogs, which fails when a loaded machine lets
+        # a deadline pass before the first refusal (the timing bounds, not the log, are what this test is about).
+        disabled, codex_bridge.logger.disabled = codex_bridge.logger.disabled, True
         try:
-            with self.assertLogs(codex_bridge.logger, "WARNING"):   # the refusals log; keep them out of the run's output
-                t0 = time.time()
-                with self.assertRaisesRegex(BridgeError, "did not answer turn/start"):
-                    s._call("turn/start", {}, 0.05, service=True)
-                self.assertLess(time.time() - t0, 0.05 + 0.1)
-                t0 = time.time()
-                s._service_while_waiting(time.time() + 0.005)   # the helper alone, at the reproduced 5 ms
-                self.assertLess(time.time() - t0, 0.005 + 0.05)
+            t0 = time.time()
+            with self.assertRaisesRegex(BridgeError, "did not answer turn/start"):
+                s._call("turn/start", {}, 0.05, service=True)
+            self.assertLess(time.time() - t0, 0.05 + 0.1)
+            t0 = time.time()
+            s._service_while_waiting(time.time() + 0.005)   # the helper alone, at the reproduced 5 ms
+            self.assertLess(time.time() - t0, 0.005 + 0.05)
+            # A generous deadline so at least one stale call (every 50th event) is refused even under load.
+            s._service_while_waiting(time.time() + 0.5)
         finally:
+            codex_bridge.logger.disabled = disabled
             rest, produced = left()
         self.assertTrue(replies)                                # stale calls were refused while it waited
         self.assertTrue(all(r.startswith("r") and int(r[1:]) % 50 == 7 for r in replies))

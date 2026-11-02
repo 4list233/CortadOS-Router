@@ -434,7 +434,13 @@ class CodexSession:
             kind, msg = event
             if (kind == "request" and msg.get("method") == "item/tool/call"
                     and (msg.get("params") or {}).get("turnId") in self._ended):
-                self._refuse_stale_call(msg, self._budget(deadline, "while refusing a stale tool call"))
+                # Never raise on the clock here (nothing must complete): out of time, the call is kept in order and
+                # run_turn refuses it later; raising would lose it and the events still in `old`.
+                left = deadline - time.time()
+                if left <= 0:
+                    self._backlog.append(event)
+                    break
+                self._refuse_stale_call(msg, min(REPLY_WRITE_S, left))
             else:
                 self._backlog.append(event)
         self._backlog.extend(old)                       # not reached before the deadline: kept, in order
@@ -590,7 +596,8 @@ class CodexSession:
         later is the ordinary race _end_turn guards) and keeps the deadline. Unlike _service_while_waiting this must
         complete: results written without having looked for a queued completion could reach an ended turn's cells. So
         on expiry it raises the request-deadline BridgeError before any result is written, with every event not yet
-        classified kept in the backlog (or the queue) in order."""
+        classified kept in the backlog (or the queue) in order. That restore only guarantees nothing was written: any
+        BridgeError from deliver ends the session (the server drops it), so no later pass resumes from this state."""
         if not self._drain_snapshot(deadline):
             self._budget(deadline, "while reading the queued events before the tool results")
         if self._turn_id in self._ended:
@@ -598,8 +605,9 @@ class CodexSession:
         events = list(self._backlog)
         boundary = next((i for i, (kind, msg) in enumerate(events)
                          if kind == "notify" and msg.get("method") == "turn/completed"
-                         and ((msg.get("params") or {}).get("turn") or {}).get("id") == self._turn_id
-                         and ((msg.get("params") or {}).get("turn") or {}).get("status") == "completed"), None)
+                         # Any status: a failed or interrupted turn has ended too, and its cells must not be written
+                         # to; _handle_event raises the failed-turn BridgeError at the boundary before any result is.
+                         and ((msg.get("params") or {}).get("turn") or {}).get("id") == self._turn_id), None)
         if boundary is None:
             return
         logger.warning("codex conversation %s: turn %s completed before the client's results arrived; they go to a "
