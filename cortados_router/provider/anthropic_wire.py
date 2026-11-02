@@ -101,11 +101,29 @@ def canonical_text(text: Any) -> str:
     return " ".join(_TRANSIENT_SPANS.sub(" ", str(text)).split())
 
 
-def canonical_parts(blocks: list[dict[str, Any]]) -> list[list[Any]]:
+# How deep canonical_parts follows tool_result content nested inside tool_result content. Real clients nest one level
+# (a tool_result holding text and images); 64 is far past any real shape. Past it the block is hashed whole
+# (history_digest) instead of recursed into, so the digest still covers every byte while its recursion stays bounded:
+# each level costs several Python frames, and a body json.loads accepted could otherwise raise RecursionError, which
+# is not a WireError and would escape the request handler.
+DIGEST_MAX_DEPTH = 64
+
+
+def _digest_blocks(content: Any) -> list[dict[str, Any]]:
+    """_blocks for the conversation digest only. Earlier messages were already served (or are the client's own
+    business), so content _blocks refuses (null, a number, an object) is hashed as one opaque `_raw` block instead of
+    turning a conversation the endpoint used to serve into a 400. The new turn still goes through _blocks."""
+    try:
+        return _blocks(content)
+    except WireError:
+        return [{"type": "_raw", "raw": history_digest(content)}]
+
+
+def canonical_parts(blocks: list[dict[str, Any]], depth: int = 0) -> list[list[Any]]:
     """Anthropic-shaped user blocks as conversation_digest tokens. Kept: text (canonical_text, empty dropped), images
     (by a hash of their source), tool_result ids with their canonical content and error flag, any other block as
     its JSON (cache metadata already removed by _blocks). Dropped: thinking / redacted_thinking (signatures and
-    summaries the client may add or strip)."""
+    summaries the client may add or strip). A tool_result nested past DIGEST_MAX_DEPTH is hashed whole."""
     out: list[list[Any]] = []
     for b in blocks:
         kind = b.get("type")
@@ -113,9 +131,12 @@ def canonical_parts(blocks: list[dict[str, Any]]) -> list[list[Any]]:
             t = canonical_text(b.get("text", ""))
             if t:
                 out.append(["t", t])
+        elif kind == "tool_result" and depth >= DIGEST_MAX_DEPTH:
+            out.append(["o", history_digest(b)])
         elif kind == "tool_result":
             out.append(["r", str(b.get("tool_use_id")), bool(b.get("is_error")),
-                        canonical_parts(_blocks(b.get("content") if b.get("content") is not None else ""))])
+                        canonical_parts(_digest_blocks(b.get("content") if b.get("content") is not None else ""),
+                                        depth + 1)])
         elif kind == "image":
             out.append(["i", history_digest(b.get("source"))])
         elif kind in ("thinking", "redacted_thinking"):
@@ -135,14 +156,15 @@ def conversation_digest(messages: list[dict[str, Any]]) -> str:
     - mid-conversation `system` messages and the top-level system prompt: out. Both are operator text the client
       regenerates (date, git status, environment), so a retry would miss its tombstone; separation between clients
       comes from the user content, the User-Agent and the run id (failure_key).
-    - cache_control: out (_blocks strips it; it moves every turn)."""
+    - cache_control: out (_blocks strips it; it moves every turn).
+    - content _blocks would refuse: hashed opaque (_digest_blocks), never a 400 for an earlier message."""
     tokens: list[list[Any]] = []
     for m in messages:
         role = m.get("role")
         if role == "assistant":
             tokens.append(["a", reply_fingerprint(m.get("content"))])
         elif role == "user":
-            tokens += canonical_parts(_blocks(m.get("content")))
+            tokens += canonical_parts(_digest_blocks(m.get("content")))
     return history_digest(tokens)
 
 
@@ -166,6 +188,17 @@ def check_tool_name(name: str, what: str = "tool name") -> str:
 
 
 def parse_request(body: dict[str, Any]) -> ClientTurn:
+    """The request as a ClientTurn, or WireError. DIGEST_MAX_DEPTH bounds the digest's own recursion; the remaining
+    recursive steps (without_cache_control, json.dumps of a block) follow the client's nesting, and a body nested
+    close to json.loads' limit, arriving on a handler thread's deeper stack, can still exhaust it. A RecursionError
+    is not a WireError and would escape the handler, so it is answered as the request-shape error it is."""
+    try:
+        return _parse_request(body)
+    except RecursionError:
+        raise WireError("message content is nested too deeply") from None
+
+
+def _parse_request(body: dict[str, Any]) -> ClientTurn:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise WireError("messages must be a non-empty list")

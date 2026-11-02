@@ -92,6 +92,62 @@ class WireTests(unittest.TestCase):
         self.assertEqual(turn.tool_results["t"], {"content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}], "isError": True})
 
 
+class ConversationDigestRobustnessTests(unittest.TestCase):
+    """The tombstone digest reads earlier messages the wire never used to parse; it must not refuse or crash on them."""
+
+    def test_malformed_earlier_user_content_is_still_served(self):
+        def turn(content):
+            return wire.parse_request({"messages": [
+                {"role": "user", "content": content}, {"role": "assistant", "content": "a"},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": content}]},
+                {"role": "assistant", "content": "b"}, {"role": "user", "content": "next"}]})
+        clean = turn("hi")
+        digests = {turn(bad).prefix_digest for bad in (None, 42, {"x": 1})}
+        self.assertEqual(len(digests), 3)
+        self.assertNotIn(clean.prefix_digest, digests)
+        self.assertEqual(turn(42).history, clean.history)
+        with self.assertRaises(wire.WireError):                 # the new turn itself is still checked
+            wire.parse_request({"messages": [{"role": "user", "content": 42}]})
+
+    def nested(self, depth, leaf="x"):
+        content: object = leaf
+        for i in range(depth):
+            content = [{"type": "tool_result", "tool_use_id": f"t{i}", "content": content}]
+        return content
+
+    def test_deep_nesting_never_raises_recursion_error(self):
+        # The deepest tool_result nesting json.loads accepts here (about 490 levels, ~980 JSON levels): the deepest
+        # body the server can ever hand to parse_request. Built as text, since json.dumps has the same limit.
+        def text(depth):
+            head = "".join('[{"type": "tool_result", "tool_use_id": "t", "content": ' for _ in range(depth))
+            return ('{"messages": [{"role": "user", "content": ' + head + '"x"' + "}]" * depth + '}, '
+                    '{"role": "assistant", "content": "a"}, {"role": "user", "content": "next"}]}')
+        depth, body = 495, None
+        while body is None:
+            try:
+                body = json.loads(text(depth))
+            except RecursionError:
+                depth -= 5
+        self.assertGreater(depth, 400)
+
+        def from_deeper_stack(frames, b):           # a handler thread calls parse_request below its own frames
+            return from_deeper_stack(frames - 1, b) if frames else wire.parse_request(b)
+
+        for b, frames in ((body, 0), ({"messages": body["messages"][:1]}, 0), (body, 300)):
+            try:
+                from_deeper_stack(frames, b)
+            except wire.WireError:
+                pass
+            except RecursionError:
+                self.fail("parse_request raised RecursionError")
+
+    def test_content_past_the_depth_limit_still_changes_the_digest(self):
+        deep = wire.DIGEST_MAX_DEPTH + 5
+        a = wire.conversation_digest([{"role": "user", "content": self.nested(deep, "x")}])
+        b = wire.conversation_digest([{"role": "user", "content": self.nested(deep, "y")}])
+        self.assertNotEqual(a, b)
+
+
 class EndpointHarness(unittest.TestCase):
     """The provider endpoint over the fake CLI: setUp/tearDown and request helpers only, no tests (so a subclass
     reuses the harness without re-running inherited tests)."""
@@ -885,6 +941,46 @@ class FailedSessionTombstoneTests(EndpointHarness):
                 self.assertNotIn(leak, diag)
         self.assertTrue(server.failure_diagnostic(BridgeError("the Codex turn failed: x (usageLimitExceeded)"))
                         .endswith("(usageLimitExceeded)"))           # an allowlisted enum value is kept
+
+    def test_every_bridge_error_template_has_a_category(self):
+        # Drift guard: a new or reworded BridgeError in either bridge must land in a named category, not the generic
+        # backend_error. f-string placeholders are rendered as "1" (a count, a code, seconds, a status).
+        import ast
+
+        def render(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                return "".join(v.value if isinstance(v, ast.Constant) else "1" for v in node.values)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left, right = render(node.left), render(node.right)
+                return None if left is None or right is None else left + right
+            return None
+
+        provider_dir = Path(server.__file__).parent
+        seen = 0
+        for name in ("bridge.py", "codex_bridge.py"):
+            for node in ast.walk(ast.parse((provider_dir / name).read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "BridgeError" and node.args:
+                    text = render(node.args[0])
+                    self.assertIsNotNone(text, f"{name}:{node.lineno}: BridgeError message is not a literal template")
+                    diag = server.failure_diagnostic(BridgeError(text))
+                    self.assertFalse(diag.startswith("backend_error:"), f"{name}:{node.lineno}: {text!r} -> {diag}")
+                    seen += 1
+        self.assertGreater(seen, 30)
+
+    def test_an_unknown_codex_turn_status_keeps_its_detail(self):
+        diag = server.failure_diagnostic(BridgeError("the Codex turn cancelledByServer: quota (usageLimitExceeded)"))
+        self.assertEqual(diag, "codex_turn_failed: the Codex backend failed the turn (usageLimitExceeded)")
+        self.assertTrue(server.failure_diagnostic(BridgeError("the Codex turn completed with 1 tool call(s) unanswered"))
+                        .startswith("tool_result_mismatch: "))
+
+    def test_an_uncategorised_failure_is_logged_without_its_text(self):
+        with self.assertLogs("cortados.provider", level="INFO") as logs:
+            diag = server.failure_diagnostic(BridgeError("something new: sk-SECRET"))
+        self.assertEqual(diag, "backend_error: the backend failed")
+        self.assertIn("add a pattern to _FAILURE_CATEGORIES", logs.output[0])
+        self.assertNotIn("SECRET", "".join(logs.output))
 
     def test_an_idle_closed_conversation_leaves_no_tombstone(self):
         history = [{"role": "user", "content": "hi"}]

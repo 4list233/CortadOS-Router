@@ -176,6 +176,15 @@ def _parse_tools(tools: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _digest_blocks_of(content: Any) -> list[dict[str, Any]]:
+    """_blocks_of for the tombstone digest only (anthropic_wire._digest_blocks): content it refuses in an EARLIER item
+    is hashed as one opaque `_raw` block, so the digest never turns a conversation the endpoint served into a 400."""
+    try:
+        return _blocks_of(content)
+    except WireError:
+        return [{"type": "_raw", "raw": anthropic_wire.history_digest(content)}]
+
+
 def parse_request(body: dict[str, Any]) -> ClientTurn:
     if body.get("model") != MODEL_ID:
         # Codex checks the model the response echoes against the one it asked for; serving any other name would
@@ -234,12 +243,12 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
             if it.get("type") == "function_call_output":
                 output = it.get("output")
                 tokens.append(["r", str(it.get("call_id")), False, anthropic_wire.canonical_parts(
-                    _blocks_of(output) if isinstance(output, (str, list)) else [])])
+                    _digest_blocks_of(output) if isinstance(output, (str, list)) else [])])
             else:
                 # Codex's own context blocks (CODEX_INJECTED_PREFIXES: AGENTS.md, environment_context) are the
                 # client's, regenerated each turn (cwd, date, shell), so they are out of the identity as well.
                 tokens += anthropic_wire.canonical_parts(
-                    [b for b in _blocks_of(it.get("content"))
+                    [b for b in _digest_blocks_of(it.get("content"))
                      if not (b["type"] == "text" and b["text"].lstrip().startswith(CODEX_INJECTED_PREFIXES))])
     end_run()
     content, results = [], {}

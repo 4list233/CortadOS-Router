@@ -220,6 +220,29 @@ class ConversationDigestTests(unittest.TestCase):
         self.assertNotEqual(self.history(text="summarize CHANGELOG.md"), base)
         self.assertNotEqual(self.history(output="# README\nother"), base)
 
+    def test_malformed_earlier_content_is_still_served(self):
+        # Before the digest existed, earlier user content and tool outputs were never parsed, so a conversation with
+        # one the wire refuses was served; the digest hashes it opaquely instead of turning it into a 400.
+        def turn(content, output="ok"):
+            return wire.parse_request(request(
+                {"type": "message", "role": "user", "content": content},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}]},
+                {"type": "function_call", "call_id": "c1", "name": "Read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": output},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "b"}]},
+                user("next")))
+        clean = turn([{"type": "input_text", "text": "hi"}])
+        digests = set()
+        for bad in (42, {"x": 1}, [7], [{"type": "input_audio", "data": "zz"}]):
+            t = turn(bad)
+            self.assertEqual(t.history, clean.history)
+            digests.add(t.prefix_digest)
+        self.assertEqual(len(digests), 4)                       # still tells malformed conversations apart
+        self.assertNotIn(clean.prefix_digest, digests)
+        self.assertTrue(turn("hi", output=[{"type": "input_audio", "data": "zz"}]).prefix_digest)
+        with self.assertRaises(WireError):                      # the new turn itself is still checked
+            wire.parse_request(request({"type": "message", "role": "user", "content": 42}))
+
 
 class RefusalTests(unittest.TestCase):
     def test_previous_response_id_is_refused(self):

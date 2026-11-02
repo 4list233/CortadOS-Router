@@ -80,7 +80,9 @@ BUSY_STATUS = 529
 # templates. Only these fixed strings are ever replayed; an error message can embed tool arguments (a malformed
 # item/tool/call), backend output or paths, and none of that may reach another request. First match wins.
 _FAILURE_CATEGORIES: tuple[tuple[str, str, str], ...] = (
-    (r"^the Codex turn (failed|interrupted)", "codex_turn_failed", "the Codex backend failed the turn"),
+    # Any status but "completed" (codex_bridge raises `the Codex turn {status}: ...` for every one of them, including
+    # statuses this endpoint has never seen); a completed turn with leftover tool calls is a tool_result_mismatch.
+    (r"^the Codex turn (?!completed )", "codex_turn_failed", "the Codex backend failed the turn"),
     (r"^the headless CLI reported an error", "backend_reported_error", "the Claude backend reported an error"),
     (r"within \d+s|deadline passed|produced nothing for", "backend_timeout",
      "the backend did not answer in time"),
@@ -110,6 +112,9 @@ def failure_diagnostic(exc: object) -> str:
             break
     else:
         kind, message = "backend_error", "the backend failed"
+        # Not silent: an unmatched BridgeError template loses its category (and any safe detail). Only the category
+        # is logged, never the reason text, which can carry tool arguments or backend output.
+        logger.info("uncategorised backend failure replayed as backend_error; add a pattern to _FAILURE_CATEGORIES")
     detail = ""
     if kind == "backend_reported_error":
         m = re.match(r"^the headless CLI reported an error: API Error: ([1-5]\d\d)\b", text)
