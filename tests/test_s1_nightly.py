@@ -45,9 +45,10 @@ STUBS = {
         "ap = argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--adapter'); ap.add_argument('--out')\n"
         "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); a = ap.parse_args()\n"
         "hk = open('data/stub-holdout').read() if os.path.exists('data/stub-holdout') else 'h0'\n"
-        "if a.holdout_key: print(hk); raise SystemExit(0)\n"
+        "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
+        "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
-        "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0'\n"
+        "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0' and floor > 50   # the stub holdout has 50 rows\n"
         "open('data/eval-pointer', 'w').write(os.environ.get('CORTADOS_S1_SERVE_POINTER', ''))\n"
         "c = {'band_accuracy': 0.9, 'under_routed': 0.01, 'over_routed': 0.1, 'outward_recall': 1.0}\n"
         "json.dump({'base': a.base, 'temperatures': {}, 'when': '2026-11-02', 'candidate': c,\n"
@@ -297,6 +298,23 @@ class NightlyEndToEnd(unittest.TestCase):
         _, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertIn("skipped: no new labels", log)
 
+    def test_lowering_the_holdout_floor_wakes_a_waiting_candidate(self):
+        _, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("holdout too small", log)
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1, CORTADOS_S1_MIN_HOLDOUT=40)   # only the floor changes
+        self.assertEqual(rc, 0, log)
+        self.assertIn("pending candidate runs/n1 (holdout_blocked): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertFalse((run2 / "adapter").exists())
+
+    def test_force_train_bypasses_a_waiting_candidate(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        (self.s1 / "data/force-train").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("forced training: pending candidate runs/n1 (holdout_blocked) superseded", log)
+        self.assertNotIn("waits for the holdout backfill", log)
+        self.assertTrue((run2 / "adapter").exists(), log)
+
     def test_claude_backfill_of_codex_ids_counts_as_growth(self):
         codex = [{"id": f"r{i}", "teacher": "gpt-6.1-sol", "sample": 0} for i in range(3)]
         (self.s1 / "data/labels.jsonl").write_text("".join(json.dumps(r) + "\n" for r in codex))
@@ -311,6 +329,27 @@ class NightlyEndToEnd(unittest.TestCase):
         st = self.status()
         self.assertEqual(st["last_label_count"], 3)
         self.assertNotIn("alert", st)
+
+    def test_label_count_is_distinct_claude_triples(self):
+        rows = [{"id": "a", "teacher": "claude-sonnet-5", "sample": 0}]
+        steps = [
+            ([{"id": "a", "teacher": "claude-sonnet-5", "sample": 0}], 1),                       # raw duplicate row: no change
+            ([{"id": "a", "teacher": "claude-sonnet-5", "sample": 1}], 2),                       # another sample, same id: +1
+            ([{"id": "a", "teacher": "claude-opus-5", "sample": 0}], 3),                         # another Claude teacher, same id: +1
+            ([{"id": "a", "teacher": "claude-opus-5", "sample": 0, "ts": 2}], 3),                # same triple, other fields: once
+            ([{"id": "a", "teacher": "gpt-6.1-sol", "sample": 2}], 3),                           # Codex: not usable
+        ]
+        p = self.s1 / "data/labels.jsonl"
+        def count():
+            out = subprocess.run(["python3", "-B", str(self.s1 / "nightly_state.py"), "labels", str(p)], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return int(out.stdout)
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        self.assertEqual(count(), 1)
+        for add, want in steps:
+            rows += add
+            p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            self.assertEqual(count(), want, add)
 
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
@@ -439,6 +478,23 @@ class EvaluateHoldoutGuards(unittest.TestCase):
         self.assertNotEqual(k1, legacy, "a legacy id-only cache must miss")
         src = (S1 / "evaluate.py").read_text()
         self.assertNotIn('"|".join(sorted(r["id"] for r, _ in holdout))', src, "every teacher-bar cache uses holdout_key")
+
+
+class EvaluateHoldoutKeyCli(unittest.TestCase):
+    def test_holdout_key_output_includes_the_floor(self):
+        import importlib.util, io, sys
+        from contextlib import redirect_stdout
+        sys.path.insert(0, str(S1))
+        spec = importlib.util.spec_from_file_location("s1_evaluate_cli", S1 / "evaluate.py")
+        ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev)
+        def key(floor):
+            with mock.patch.object(ev, "read_jsonl", return_value=[]), mock.patch.object(ev, "read_labels", return_value=[]), \
+                 mock.patch.object(ev, "MIN_TEACHER_HOLDOUT", floor), mock.patch.object(sys, "argv", ["evaluate.py", "--holdout-key"]), \
+                 redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ev.main(), 0)
+            return out.getvalue().strip()
+        self.assertNotEqual(key(200), key(40))
+        self.assertTrue(key(200).endswith("-min200"))
 
 
 class AtomicPointer(unittest.TestCase):

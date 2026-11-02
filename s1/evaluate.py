@@ -242,7 +242,9 @@ def main() -> int:
     if a.holdout_key:
         reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
         holdout, _ = build_eval_sets(reqs, read_labels())
-        print(holdout_key(holdout, a.fail_up, OUTWARD_AT))
+        # + every setting that changes the promote decision beyond the holdout itself: lowering CORTADOS_S1_MIN_HOLDOUT must
+        # wake a candidate that waits on the floor
+        print(f"{holdout_key(holdout, a.fail_up, OUTWARD_AT)}-min{MIN_TEACHER_HOLDOUT}")
         return 0
     if not a.out:
         ap.error("the following arguments are required: --out")

@@ -203,6 +203,12 @@ fi
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
 # Re-evaluation always grades against today's holdout and incumbent (an earlier approval may be stale). New SFT data supersedes it.
+force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
+if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
+  # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one
+  read -r _ _ p_reason p_run < data/pending-candidate
+  echo "forced training: pending candidate $p_run ($p_reason) superseded"; rm -f data/pending-candidate
+fi
 if [ -f data/pending-candidate ]; then
   read -r p_sft p_eval p_reason p_run < data/pending-candidate
   if [ "$p_sft" = "$sft_hash" ] && [ -d "$p_run/adapter" ]; then
@@ -239,7 +245,6 @@ if [ -f data/pending-candidate ]; then
   fi
   echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
 fi
-force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 # Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
 # 2026-11-02, the same labels + a warm start from the same adapter reproduce the incumbent, so a night with no new labels skips.
 # An interrupted run still resumes (its steps are unfinished work, not a repeat).
