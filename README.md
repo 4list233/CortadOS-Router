@@ -297,6 +297,15 @@ codex mcp add cortados-route \
 No address or token is committed; `.mcp.json` reads both from the environment, and a test (`tests/test_mcp_config.py`)
 fails if a literal value is ever placed there.
 
+## Local models (pin-only)
+
+The owner's machines can serve their Ollama models through the provider as pins: `claude --model sub/qwen-27b`
+relays each turn to that node's Ollama Messages API. S1 never routes there (the `auto_route` switch is off and
+refused when on until local lanes are evaluated); an asleep or busy node fails the pin with a clear 503, never a
+fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
+(`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
+`docs/LOCAL-RESOURCES.md` ("Local models").
+
 ## Delegating whole tasks from the Claude app
 
 The same `cortados-route` server also hands off WHOLE tasks: each one runs as a separate headless Claude Code session

@@ -41,7 +41,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
-from cortados_router.provider import anthropic_wire, responses_wire, routing
+from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
@@ -383,6 +383,21 @@ def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: s
 SESSION_FACTORIES: dict[str, Callable[..., Any]] = {"claude-cli": _claude_session, "codex-cli": _codex_session}
 
 
+class LocalSession:
+    """A local-pinned conversation (local_lane.py). The turns are relayed statelessly, so there is no backend to hold;
+    what is kept is the conversation's binding to its model and the fingerprints of the replies it sent, which is how
+    find() continues it and _model_change keeps it on its model, exactly as for a Claude or Codex pin."""
+
+    def __init__(self, reg: "Registry", *, model: str, **_):
+        self.id, self.model = uuid.uuid4().hex, model
+        self.history: list[str] = []
+        self.lock = threading.Lock()
+        self.last_used = time.time()
+
+    def close(self) -> None:
+        pass
+
+
 class Registry:
     """`router(body, client[, exclude_model=])` picks the route of a new conversation (routing.choose); without one every conversation
     runs on `model` with the Claude CLI (the P0 behaviour, kept for testing the bridge alone). `executed(route)`
@@ -421,6 +436,8 @@ class Registry:
             scope: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
+        if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
+            factory = LocalSession                  # a local pin: no backend process, only the conversation's binding
         if factory is None:
             raise UnservedProvider(f"routed to provider {provider!r}, which this endpoint has no backend for "
                                    f"(served: {', '.join(sorted(self._factories))})")
@@ -631,6 +648,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(500, "api_error", f"cortados: cannot list the pinnable models: {exc}")
                 data += [{"type": "model", "id": f"{routing.SUB_PREFIX}{m}",
                           "display_name": f"{routing.readable_model_name(m)} · CortadOS"} for _, m in pins]
+                try:
+                    local = routing.local_pins(core)
+                except local_lane.LocalConfigError as exc:   # same stance as a broken table, without the file paths
+                    logger.warning("/v1/models: cannot list the local pins: %s", exc)
+                    return self._error(500, "api_error", "cortados: cannot list the local pins: local node "
+                                       f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider "
+                                       "(see provider log)")
+                data += [{"type": "model", "id": f"{routing.SUB_PREFIX}{local_lane.pin_id(m)}",
+                          "display_name": f"{m['name']} · CortadOS ({n['label']})"} for n, m in local]
             return self._json(200, {"data": data, "has_more": False, "first_id": data[0]["id"],
                                     "last_id": data[-1]["id"]})
         if self.path == "/resources":
@@ -776,6 +802,74 @@ class Handler(BaseHTTPRequestHandler):
                 logger.error("anthropic-api settle gave up for %s: reservation $%.4f retained, charge was $%.4f; "
                              "the API overage-off cap remains the hard backstop", res_id, max_cost, charge)
 
+    def _relay_local(self, session: "LocalSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
+                     wire: Wire) -> None:
+        """One turn of a local-pinned conversation: relayed statelessly to its Ollama node (local_lane.serve), under
+        the conversation's lock and the same stale-history rule as a CLI turn. The reply's fingerprint is appended to
+        the session's history, so the next turn finds this conversation and keeps its model (_model_change). A node
+        that fails a turn leaves the conversation as it was: the laptop may wake, and the same history retried
+        continues it. A conversation whose opening turn failed is dropped (no reply exists to continue from)."""
+        reg = self.server.registry
+        route = session.route or {}
+        if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
+            return self._json(BUSY_STATUS, wire.error_json("overloaded_error", "cortados: conversation busy; retry once "
+                              "the other request on it has finished"))
+        try:
+            if not created and session.history != turn.history:
+                return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
+                                   "for it: another request with the same history was served first; send the current "
+                                   "history", wire)
+            if created and route.get("model"):
+                self._record_run(provider=str(route.get("provider") or ""), model=str(route["model"]),
+                                 label=str(route["model"]), tools=not one_shot)
+            reply: list = []
+            local = route["local"]
+            # The same input-fit gate as the opener (routing._choose_local), on every turn: the conversation grows,
+            # and Ollama would silently truncate an over-long one. A refusal keeps the history (nothing was sent).
+            need = int(routing.request_fit(body)["input_tokens"])
+            cap = int(local["model"]["context_length"])
+            if need > cap:
+                return self._error(413, "request_too_large",
+                                   f"cortados: sub/{local_lane.pin_id(local['model'])}: the conversation (≈{need // 1000}k "
+                                   f"tokens) now exceeds {local['model']['id']}'s configured context ({cap // 1000}k); "
+                                   "compact it or start a new conversation", wire)
+            t0 = time.time()
+            try:
+                outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
+                                           reply=reply)
+            except Exception as exc:             # serve handles its own I/O; anything else must still clean up
+                logger.exception("local lane: relay failed")
+                outcome = "incomplete"
+                try:
+                    self._error(502, "api_error", f"cortados: local relay failed: {type(exc).__name__}", wire)
+                except Exception:
+                    pass                         # headers may already be out; the client sees a broken response
+            turn_ms = int((time.time() - t0) * 1000)
+            session.last_used = time.time()
+            if outcome == "completed":
+                session.history.append(anthropic_wire.reply_fingerprint(reply))
+                if route.get("route_id") and not session.route_logged and reg.executed:
+                    try:
+                        reg.executed(route)
+                        session.route_logged = True
+                    except Exception as exc:     # the answer was delivered; only its record failed
+                        logger.warning("local lane: route record failed: %s", exc)
+                    else:
+                        if reg.log_outcome:      # size and duration, once per conversation, as on the CLI path
+                            chars = sum(len(b.get("text", "")) for b in reply
+                                        if isinstance(b, dict) and b.get("type") == "text")
+
+                            def _log_outcome(route=route, chars=chars, ms=turn_ms):
+                                try:
+                                    reg.log_outcome(route, chars, ms)
+                                except Exception:
+                                    logger.exception("outcome log for route %s failed", route.get("route_id"))
+                            threading.Thread(target=_log_outcome, name="cortados-outcome-log", daemon=True).start()
+            elif created:
+                reg.drop(session)
+        finally:
+            session.lock.release()
+
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
         reg = self.server.registry
@@ -895,6 +989,8 @@ class Handler(BaseHTTPRequestHandler):
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
                 logger.warning("backend start failed: %s", exc)
                 return self._error(502, "api_error", str(exc), wire)
+        if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
+            return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
         msg_id = wire.new_message_id()
         # The model this response names: what the client asked for, unless it asked to see the real route (the
         # routed-subagents mod does; the main session does not and keeps seeing `cortados`).
@@ -1119,9 +1215,17 @@ class Handler(BaseHTTPRequestHandler):
         if not pinned:
             return None
         r = getattr(session, "route", None) or {}
-        if r.get("pinned") and r.get("model") == pinned:
-            return None
-        now = f"pinned to sub/{r.get('model')}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
+        local = r.get("local")
+        if local:                       # a local pin answers to its alias or its tag, case-insensitively
+            names = {local["model"]["id"].casefold(), local_lane.pin_id(local["model"]).casefold()}
+            if r.get("pinned") and pinned.strip().casefold() in names:
+                return None
+            shown = local_lane.pin_id(local["model"])
+        else:
+            if r.get("pinned") and r.get("model") == pinned:
+                return None
+            shown = r.get("model")
+        now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
                 f"sub/{pinned}; start a new conversation to change models")
 

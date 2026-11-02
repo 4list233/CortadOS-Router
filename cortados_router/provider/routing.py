@@ -8,6 +8,8 @@ Owner of two rules:
                     skips the table's non-Claude fallback routes, so this host enforces the rule itself: while S1 is
                     down a Claude route is not offered; the conversation runs on a Codex lane, and when no Codex
                     lane survives (binary missing, capacity spent) the request is refused.
+  local pins        `sub/<local model or alias>` names a model a local Ollama node offers (local_lane.py): pin-only,
+                    never in SERVED_PROVIDERS, so S1 auto-routing cannot pick it (its auto_route switch stays off).
   sub/ pin          a client that names `sub/<model>` (any model the tables serve on claude-cli or codex-cli) chose the
                     model itself: S1 and the band are skipped, but the served-model, account, capacity, fit and
                     route-log rules still apply (choose_pinned). pinnable_models is the list GET /v1/models offers.
@@ -17,11 +19,15 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import logging
 import uuid
 from typing import Any, Callable
 
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import local_lane
+
+logger = logging.getLogger("cortados.provider.routing")
 
 # The Claude CLI (P1, bridge.py) and the Codex CLI (P2, codex_bridge.py). Local models need the 2026-09-28 "no local
 # routes" ruling lifted and local entries in the generated model scores. `openai-codex` is deliberately absent: it is
@@ -166,6 +172,61 @@ def model_key(name: str | None) -> str | None:
     return re.sub(r"-\d{8}$", "", name.casefold()) if name else name
 
 
+def canonical_model(name: str | None) -> str | None:
+    """The identity a model name resolves to, for exclusion checks: a local pin's alias and its Ollama tag are one
+    model (the tag, model_key'd); any other name is its model_key. A broken local config resolves nothing locally
+    (choose_pinned reports it)."""
+    if not name:
+        return name
+    try:
+        loc = local_lane.find(name)
+    except local_lane.LocalConfigError:
+        loc = None
+    return model_key(loc[1]["id"] if loc else name)
+
+
+RESERVED_NAMES = ("sub", "api", "cortados", "opusplan", "default")
+
+
+def local_clashes(core) -> dict[str, str]:
+    """Local pin names (alias or tag, as model keys) that equal a model this endpoint serves, a SUB_ALIASES key or a
+    reserved name, mapped to their node. A clash would let a local entry take over `sub/<served id>` and blur model
+    exclusions, so any clash is a config error the owner must fix (choose_pinned and /v1/models refuse it)."""
+    served = {model_key(m) for _, m in pinnable_models(core)}
+    served |= {model_key(a) for a in SUB_ALIASES} | set(RESERVED_NAMES)
+    out = {}
+    for n, m in local_lane.pins():
+        for name in {m["id"], local_lane.pin_id(m)}:
+            if model_key(name) in served:
+                out[model_key(name)] = n["node"]
+    return out
+
+
+def local_pins(core) -> list:
+    """local_lane.pins(), refused with a LocalConfigError when any local name clashes (local_clashes)."""
+    clashes = local_clashes(core)
+    if clashes:
+        raise local_lane.LocalConfigError("local pin names collide with served or reserved model names: "
+                                          + ", ".join(f"{k} (node {v})" for k, v in sorted(clashes.items()))
+                                          + "; rename the alias", next(iter(clashes.values())))
+    return local_lane.pins()
+
+
+def misconfigured(model: str, exc: "local_lane.LocalConfigError") -> str:
+    """What a client is told about a broken local config: the node, never the message (it can hold the provider's
+    file paths). The full message goes to the provider log."""
+    logger.warning("local config error for sub/%s: %s", model, exc)
+    node = getattr(exc, "node", None) or "?"
+    return f"sub/{model}: local node {node} is misconfigured on the provider (see provider log)"
+
+
+def _is_local(name: str) -> bool:
+    try:
+        return local_lane.find(name) is not None
+    except local_lane.LocalConfigError:
+        return False
+
+
 def pinnable_models(core) -> list[tuple[str, str]]:
     """Every `(provider, model)` a client may pin as `sub/<model>`: the routes this endpoint serves (served_routes, read
     from the tables, never a list kept here), one entry per model on its base provider (accounts are chosen at pin
@@ -207,6 +268,19 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     (engine `pin`, no answers: S1's drift check skips it, and the dataset only harvests the request text for
     labelling). A Codex pin runs on the provider's one Codex login (codex_bridge on --codex-home): this endpoint
     has no per-account Codex backend yet (server._codex_session), so it is a single candidate on the `codex` lane."""
+    try:
+        clashes = local_clashes(core)
+        local = local_lane.find(model)
+    except local_lane.LocalConfigError as exc:      # a broken local config refuses local pins, never guesses a node
+        clashes, local, local_error = {}, None, exc
+    else:
+        local_error = None
+    if model_key(model) in clashes:                 # the name is both a served model and a local pin: refuse, loudly
+        exc = local_lane.LocalConfigError(f"local pin name {model!r} on node {clashes[model_key(model)]} collides with "
+                                          "a served or reserved model name; rename the alias", clashes[model_key(model)])
+        return {"router": execution_routing.ROUTER, "error": misconfigured(model, exc)}
+    if local is not None:
+        return _choose_local(core, body, *local, client=client, conversation_id=conversation_id)
     # Accounts first: served_routes drops every Claude pair on a broken config, which would misreport a Claude model as
     # unknown. Only a Claude-shaped name is refused for it, so a broken Claude config never blocks a Codex pin.
     try:
@@ -218,9 +292,11 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     pinnable = pinnable_models(core)
     provider = next((p for p, m in pinnable if m == model), None)
     if provider is None:
+        if local_error:
+            return {"router": execution_routing.ROUTER, "error": misconfigured(model, local_error)}
+        names = [m for _, m in pinnable] + [local_lane.pin_id(m) for _, m in local_lane.pins()]
         return {"router": execution_routing.ROUTER, "client_error": True,
-                "error": f"sub/{model} is not a model this endpoint serves; pin one of: "
-                         f"{', '.join(m for _, m in pinnable)}"}
+                "error": f"sub/{model} is not a model this endpoint serves; pin one of: {', '.join(names)}"}
     vendor = PIN_VENDORS[provider]
     family = vendor["family"]
     if provider == "claude-cli":
@@ -306,6 +382,46 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
             "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
 
 
+def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *, client: str,
+                  conversation_id: str) -> dict[str, Any]:
+    """The local-lane kind of a sub/ pin (choose_pinned's one branch for it): the node must answer /api/tags and list
+    the model (no quota: available or not), the request must fit the model's configured context, and the opening
+    request of a conversation is put on record as a routes row (engine `pin`, lane local-<node>). The lane is
+    stateless, so every turn is checked again but only the opener is logged: one row per conversation, as other pins.
+    Never a fallback: an unavailable node is an error the person sees, not a quiet hop to another model."""
+    pin = local_lane.pin_id(entry)
+    try:
+        tags = local_lane.probe(node)
+    except local_lane.LocalUnavailable as exc:
+        return {"router": execution_routing.ROUTER, "error": f"sub/{pin}: {exc}; no other model was tried"}
+    if entry["id"] not in tags:
+        return {"router": execution_routing.ROUTER,
+                "error": f"sub/{pin}: node {node['node']} does not list {entry['id']} (ollama pull it there); "
+                         "no other model was tried"}
+    need = int(request_fit(body)["input_tokens"])
+    if need > entry["context_length"]:
+        return {"router": execution_routing.ROUTER, "fit_blocked": True,
+                "error": f"sub/{pin}: the request (≈{need // 1000}k tokens) exceeds {entry['id']}'s configured "
+                         f"context ({entry['context_length'] // 1000}k) on {node['lane']}"}
+    chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+              "config_dir": None, "reserve": False, "pool": None}
+    route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
+             "hard_rules": [f"pinned by the client: sub/{pin}"], "skipped": None}
+    decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": None}
+    opener = not any(m.get("role") == "assistant" for m in body.get("messages") or [])
+    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}" if opener else None
+    if opener:
+        core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}",
+                                  "unit_kind": "interactive", "actual_model": None,
+                                  "request": request_text(body.get("messages") or [],
+                                                          standalone=not body.get("tools"))[:8000]},
+                       decision, route)
+    return {"router": execution_routing.ROUTER, "provider": node["lane"], "model": entry["id"], "account": None,
+            "config_dir": None, "context_length": entry["context_length"], "route_id": route_id,
+            "api_request_id": "", "degraded": False, "band": "pin", "pinned": True, "decision": decision,
+            "route": route, "local": {"node": node, "model": entry}}
+
+
 def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, codex_bin: str) -> bool | None:
     """Whether any excluded route would itself have served this request had it not been excluded: its binary on PATH,
     its lane (and pool) healthy by core.candidate_health, and the request within its token ceiling. That is a subset
@@ -367,15 +483,25 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
                              "the review could not be kept off it"}
         if m and m not in excluded_models:
             excluded_models.append(m)
-    excluded_keys = {model_key(m) for m in excluded_models}
+    # Both identities of each name: the canonical one (a local alias and its tag are one model) and the plain model
+    # key (what the name means on the served lanes), so neither recheck below can miss a model by spelling.
+    excluded_keys = {canonical_model(m) for m in excluded_models} | {model_key(m) for m in excluded_models}
+    hit = lambda name: bool({canonical_model(name), model_key(name)} & excluded_keys)
     names = ", ".join(excluded_models)            # one model: exactly the single-model wording
     pinned = sub_pin(body)
     if pinned:
-        if model_key(pinned) in excluded_keys:
+        if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
-        return choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
-                             codex_bin=codex_bin)
+        r = choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
+                          codex_bin=codex_bin)
+        if not r.get("error") and hit(r.get("model")):
+            # Defence in depth, as on the S1 path: the review guarantee must hold on what was selected, not only on
+            # how the client spelled the pin.
+            return {"router": execution_routing.ROUTER,
+                    "error": f"internal: sub/{pinned} resolved to the excluded model {r.get('model')}; refused "
+                             "(x-cortados-exclude-model)"}
+        return r
     constraints: dict[str, Any] = {"allowed_routes": list(served_routes(core))}
     if excluded_models:
         constraints["excluded_routes"] = []
@@ -384,6 +510,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             if not m:                              # `cortados`: names no model to stay off
                 continue
             routes = [[p, r] for p, r in constraints["allowed_routes"] if model_key(r) == model_key(m)]
+            if not routes and _is_local(m):
+                continue                           # only a local model: S1 never routes there, so it is avoided
             if not routes:
                 # Loud beats silent: routing normally could land the review on its builder's model (e.g. a typo'd id).
                 return {"router": execution_routing.ROUTER, "client_error": True,

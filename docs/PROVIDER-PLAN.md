@@ -460,6 +460,22 @@ the pinnable ids. `GET /v1/models` lists `cortados` ("CortadOS") and every pin a
 so a client's model picker (the Claude desktop app) can choose the orchestrator. A `--fixed-model` endpoint lists only
 `cortados`, since it does not honour pins.
 
+## Local models (pin-only) (2026-11-02)
+
+`sub/<local model or alias>` (e.g. `sub/qwen-27b`) relays a `/v1/messages` turn to an Ollama node declared in the
+local-resources config (schema: `docs/LOCAL-RESOURCES.md`, "Local models"). It is a lane kind of the one pin path:
+`choose_pinned` hands a local name to `_choose_local` (node answers `/api/tags` and lists the tag, input fits the
+configured `context_length`, opener logged as a `routes` row on lane `local-<node>`). The registry holds the
+conversation as a `LocalSession` (no backend process: the model binding and reply fingerprints), so `find` and
+`_model_change` keep it on its model like any pin (409 on a switch, in either direction); the server relays each turn
+statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed line by line, `tool_use` untouched).
+An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
+local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local
+lane: they are absent from `SERVED_PROVIDERS`, and the config's `auto_route` switch is refused unless `false` until
+local lanes are evaluated. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
+(`cortados_router/local_gate.py`) on its Tailscale address; the lane sends the gate's token (`token_file_env`) on every
+probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does not take local pins.
+
 ## Open
 
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
