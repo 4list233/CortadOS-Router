@@ -140,8 +140,8 @@ A node with an `ollama` block offers its Ollama models to the provider as `sub/<
 | `base_url` | the URL itself, for the git-ignored `tables/resources.json` only; never commit a real address |
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | the S1 auto-routing switch; default `false`. `true` is refused with a config error: a local lane must be evaluated and given routing-table candidates before S1 may pick it |
-| `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute) |
-| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (tokens; default 32768, the input-fit gate) |
+| `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (tokens; default 32768, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro) |
 
 Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
 
@@ -170,7 +170,7 @@ tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
   0600 file (default `~/.config/cortados/local-gate-token`); it refuses to start when the file is missing, shorter than
   32 characters or readable by group/others. A wrong token is a fixed 401 that echoes nothing;
 - streams SSE through line by line; bounds the body (32 MiB), concurrent connections (8, then 503), the loopback
-  connect (3 s) and each read (300 s); logs method, path and status only, never the token or a body.
+  connect (3 s), each read (300 s) and an idle client socket (30 s, so idle or dropped connections cannot hold every slot); logs method, path and status only, never the token or a body.
 
 A launchd template is `integrations/local-gate/com.cortados.local-gate.plist` (RunAtLoad + KeepAlive; placeholders
 only). Check a setup with `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` (validates the

@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import ipaddress
 import http.client
 import json
 import logging
 import os
+import socket
 import stat
 import sys
 import threading
@@ -34,7 +36,8 @@ logger = logging.getLogger("cortados.local_gate")
 DEFAULT_PORT = 11435                      # next to Ollama's 11434, which stays on loopback
 DEFAULT_UPSTREAM = "http://127.0.0.1:11434"
 DEFAULT_TOKEN_FILE = "~/.config/cortados/local-gate-token"
-# A guessable token would make the gate decoration: 32 characters is `openssl rand -hex 16`, 128 bits.
+# A guessable token would make the gate decoration. The floor is 32 hex characters (128 bits, what
+# `openssl rand -hex 16` prints); the documented command, `openssl rand -hex 32`, prints 64 (256 bits).
 MIN_TOKEN_CHARS = 32
 # A Claude Code conversation is resent whole every turn, tool results included; several MB is normal, tens is not.
 # The bound keeps one request from holding the laptop's memory hostage.
@@ -47,9 +50,12 @@ MAX_CONNECTIONS = 8
 # pins a gate thread forever.
 CONNECT_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 300.0
+# A connection holds one of the MAX_CONNECTIONS slots from accept, before it has sent anything. Without a socket
+# timeout, a few idle sockets (or Tailscale links dropped mid-request, which never send a FIN) would hold every slot
+# forever and lock the lane out. 30 s is far more than a provider needs to send its request line and body.
+IDLE_TIMEOUT_S = 30.0
 # The only routes the provider's local lane uses (local_lane.probe and local_lane.serve).
 ROUTES = {("GET", "/api/tags"), ("POST", "/v1/messages")}
-ANY_ADDRESSES = {"", "0.0.0.0", "::", "[::]"}
 
 _UNAUTHORIZED = json.dumps({"type": "error", "error": {"type": "authentication_error",
                                                         "message": "local gate: bad or missing token"}}).encode()
@@ -77,14 +83,25 @@ def read_token(path: str | os.PathLike) -> str:
     except (OSError, UnicodeDecodeError) as exc:
         raise GateConfigError(f"token file {p} unreadable ({type(exc).__name__})") from exc
     if len(token) < MIN_TOKEN_CHARS:
-        raise GateConfigError(f"token in {p} is shorter than {MIN_TOKEN_CHARS} characters (openssl rand -hex 32)")
+        raise GateConfigError(f"token in {p} is shorter than {MIN_TOKEN_CHARS} characters (128 bits); make one with "
+                              "`openssl rand -hex 32`")
     return token
 
 
 def check_listen(host: str, allow_any: bool) -> None:
     """Refuse an all-interfaces bind unless asked: on a laptop that joins cafe Wi-Fi, 0.0.0.0 puts the gate on every
     network it meets, and the token would be the node's only defence there. The Tailscale address is the intended one."""
-    if (host or "").strip() in ANY_ADDRESSES and not allow_any:
+    h = (host or "").strip().strip("[]")
+    try:
+        unspecified = not h or ipaddress.ip_address(h).is_unspecified
+    except ValueError:
+        # Not a canonical address. The socket layer also accepts legacy IPv4 spellings ("0", "0.0", "0x0"), which
+        # inet_aton normalises; anything it rejects is a hostname, not an all-interfaces spelling.
+        try:
+            unspecified = socket.inet_aton(h) == b"\0\0\0\0"
+        except OSError:
+            unspecified = False
+    if unspecified and not allow_any:
         raise GateConfigError(f"refusing to listen on all interfaces ({host or 'empty'}): listen on the node's "
                               "Tailscale address, or pass --allow-any if every network this machine joins is trusted")
 
@@ -94,13 +111,14 @@ class GateServer(ThreadingHTTPServer):
 
     def __init__(self, addr, *, token: str, upstream: str, max_body: int = MAX_BODY_BYTES,
                  max_connections: int = MAX_CONNECTIONS, connect_timeout: float = CONNECT_TIMEOUT_S,
-                 read_timeout: float = READ_TIMEOUT_S):
+                 read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S):
         u = urllib.parse.urlparse(upstream)
         if u.scheme != "http" or not u.hostname:
             raise GateConfigError(f"upstream must be http://host:port (Ollama on loopback), got {upstream!r}")
         self.token = token.encode()
         self.upstream_host, self.upstream_port = u.hostname, u.port or 80
         self.max_body, self.connect_timeout, self.read_timeout = max_body, connect_timeout, read_timeout
+        self.idle_timeout = idle_timeout
         self.slots = threading.BoundedSemaphore(max_connections)
         super().__init__(addr, GateHandler)
 
@@ -130,6 +148,13 @@ class GateServer(ThreadingHTTPServer):
 class GateHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server: GateServer
+    # The socket timeout for every read and write on the client connection (IDLE_TIMEOUT_S explains why it must
+    # exist); the server's idle_timeout overrides it in setup().
+    timeout = IDLE_TIMEOUT_S
+
+    def setup(self):
+        self.timeout = self.server.idle_timeout
+        super().setup()
 
     def log_message(self, fmt, *args):          # http.server's line has the request line only: no token, no body
         logger.info("%s %s", self.address_string(), fmt % args)
@@ -151,6 +176,24 @@ class GateHandler(BaseHTTPRequestHandler):
         given = auth[7:].strip() if auth[:7].lower() == "bearer " else (self.headers.get("x-api-key") or "").strip()
         return hmac.compare_digest(given.encode(), self.server.token)
 
+    def _drain(self) -> None:
+        """Read and discard a refused request's body (up to max_body), so the client receives the 401 instead of a
+        reset: closing with unread bytes in the socket makes the kernel send RST, which the client sees as EPIPE.
+        A body over the limit, or with no length, is not read: the connection just closes."""
+        try:
+            n = int(self.headers.get("content-length") or "0")
+        except ValueError:
+            return
+        if 0 < n <= self.server.max_body:
+            try:
+                while n > 0:
+                    chunk = self.rfile.read(min(n, 65536))
+                    if not chunk:
+                        break
+                    n -= len(chunk)
+            except OSError:
+                pass
+
     def do_GET(self):
         self._handle("GET")
 
@@ -165,6 +208,7 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _handle(self, method: str) -> None:
         if not self._authorized():               # before the path or body is looked at
+            self._drain()
             return self._send(401, _UNAUTHORIZED)
         path = self.path.split("?", 1)[0]
         if (method, path) not in ROUTES:

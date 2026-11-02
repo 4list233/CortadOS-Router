@@ -18,10 +18,10 @@
                 "label": "Pro", "auto_route": false,
                 "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 300,
                 "models": [
-                  {"id": "hf.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic", "context_length": 32768},
-                  {"id": "huihui_ai/Qwen3.8-abliterated:latest", "alias": "qwen-abliterated", "name": "Qwen3.8 Abliterated", "context_length": 32768},
+                  {"id": "hf.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic", "context_length": 65536},
+                  {"id": "huihui_ai/Qwen3.8-abliterated:latest", "alias": "qwen-abliterated", "name": "Qwen3.8 Abliterated", "context_length": 65536},
                   {"id": "hf.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF:Q6_K", "alias": "qwythos-9b", "name": "Qwythos 9B", "context_length": 65536},
-                  {"id": "hf.co/ThalisAI/phi-4-heretic:Q4_K_M", "alias": "phi-4", "name": "Phi-4 Heretic", "context_length": 16384}
+                  {"id": "hf.co/ThalisAI/phi-4-heretic:Q4_K_M", "alias": "phi-4", "name": "Phi-4 Heretic", "context_length": 65536}
                 ]}}
   ],
   "deployments": []

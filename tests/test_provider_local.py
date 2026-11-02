@@ -362,6 +362,18 @@ class LocalAutoRoutingOffTests(unittest.TestCase):
         self.assertEqual(local_lane.pins(), [])
         self.assertIsNone(local_lane.find("qwen-27b"))
 
+    def test_non_positive_timeouts_are_config_errors(self):
+        path = os.environ[local_lane.CONFIG_ENV]
+        for key in ("read_timeout_s", "connect_timeout_s", "probe_timeout_s"):
+            for bad in (0, -1, "x"):
+                cfg = json.loads(Path(path).read_text())
+                cfg["nodes"][0]["ollama"][key] = bad
+                Path(path).write_text(json.dumps(cfg))
+                with self.assertRaises(local_lane.LocalConfigError) as cm:
+                    local_lane.nodes()
+                self.assertIn(key, str(cm.exception))
+            write_config(self.dir, "http://127.0.0.1:9")
+
     def test_missing_base_url_is_a_config_error(self):
         os.environ["TEST_LOCAL_PRO_URL"] = ""
         with self.assertRaises(local_lane.LocalConfigError):

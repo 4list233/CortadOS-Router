@@ -98,11 +98,18 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                     raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})")
                 seen[pin] = nid
             models.append(entry)
+        timeouts = {}
+        for key, default in (("probe_timeout_s", PROBE_TIMEOUT_S), ("connect_timeout_s", CONNECT_TIMEOUT_S),
+                             ("read_timeout_s", READ_TIMEOUT_S)):
+            try:
+                timeouts[key] = float(block.get(key, default))
+            except (TypeError, ValueError):
+                timeouts[key] = -1.0
+            if not timeouts[key] > 0:            # 0 would make the socket non-blocking; negative raises mid-turn
+                raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds")
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
-                    "probe_timeout_s": float(block.get("probe_timeout_s", PROBE_TIMEOUT_S)),
-                    "connect_timeout_s": float(block.get("connect_timeout_s", CONNECT_TIMEOUT_S)),
-                    "read_timeout_s": float(block.get("read_timeout_s", READ_TIMEOUT_S))})
+                    **timeouts})
     return out
 
 
@@ -166,17 +173,6 @@ def probe(node: dict[str, Any]) -> set[str]:
     return {str(m.get("name") or m.get("model") or "") for m in (data.get("models") or []) if isinstance(m, dict)}
 
 
-def health(path: str | None = None) -> dict[str, dict[str, Any]]:
-    """Per lane: {ok, models (listed tags), why}. No quota: a local lane is available or not."""
-    out = {}
-    for n in nodes(path):
-        try:
-            out[n["lane"]] = {"ok": True, "models": sorted(probe(n)), "why": None}
-        except LocalUnavailable as exc:
-            out[n["lane"]] = {"ok": False, "models": [], "why": str(exc)}
-    return out
-
-
 def _send_json(handler, code: int, data: dict[str, Any]) -> None:
     raw = json.dumps(data).encode()
     try:
@@ -234,15 +230,22 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
     try:
         try:
             conn.connect()
+        except (OSError, http.client.HTTPException) as exc:
+            _send_json(handler, 503, _error("overloaded_error",
+                       f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
+                       f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
+            return "unreachable"
+        try:
             conn.sock.settimeout(node["read_timeout_s"])        # connect bounded short, each read bounded long
             conn.request("POST", _prefix(node["base_url"]) + "/v1/messages", body=data,
                          headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
                                   **_auth(node)})
             resp = conn.getresponse()
         except (OSError, http.client.HTTPException) as exc:
+            # Connected, so the node is awake: it (or its gate) refused or dropped the request.
             _send_json(handler, 503, _error("overloaded_error",
-                       f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
-                       f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
+                       f"cortados: local node {node['node']} accepted the connection for sub/{pin_id(model)}, then "
+                       f"refused or dropped the request ({type(exc).__name__}: {exc}). No other model was tried."))
             return "unreachable"
         if resp.status == 401:                                   # the gate's refusal is the provider's problem,
             resp.read()                                          # not the client's: a 503 that says so

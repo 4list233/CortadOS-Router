@@ -67,6 +67,41 @@ class GateTests(GateHarness):
             self.assertNotIn("nope", raw)
         self.assertEqual(FakeOllama.seen, [])
 
+    def test_a_refused_large_body_still_gets_the_401(self):
+        import http.client
+        body = json.dumps({**self.MSG, "pad": "x" * (2 * 2 ** 20)}).encode()     # 2 MiB, under max_body
+        conn = http.client.HTTPConnection("127.0.0.1", self.gate.server_port, timeout=10)
+        try:
+            conn.request("POST", "/v1/messages", body=body,
+                         headers={"content-type": "application/json", "authorization": "Bearer wrong"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 401)
+            self.assertNotIn(b"pad", resp.read())
+        finally:
+            conn.close()
+
+    def test_idle_connections_cannot_hold_every_slot(self):
+        import socket
+        import time
+        self.gate.idle_timeout = 0.5
+        idle = []
+        for _ in range(local_gate.MAX_CONNECTIONS):       # every slot taken by a socket that sends nothing
+            idle.append(socket.create_connection(("127.0.0.1", self.gate.server_port)))
+        time.sleep(0.2)
+        try:
+            self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 503)   # full right now
+            deadline = time.time() + 5
+            code = None
+            while time.time() < deadline:
+                time.sleep(0.2)
+                code = self.call("/api/tags", headers={"x-api-key": TOKEN})[0]
+                if code == 200:
+                    break
+            self.assertEqual(code, 200)                   # the idle ones timed out and gave their slots back
+        finally:
+            for sock in idle:
+                sock.close()
+
     def test_other_paths_are_404(self):
         auth = {"authorization": f"Bearer {TOKEN}"}
         for method, path, body in (("POST", "/api/pull", {"name": "x"}), ("DELETE", "/api/delete", {"name": TAG}),
@@ -107,11 +142,12 @@ class GateConfigTests(unittest.TestCase):
             local_gate.read_token(os.path.join(self.dir, "missing"))
 
     def test_all_interfaces_refused_without_the_flag(self):
-        for host in ("0.0.0.0", "::", ""):
+        for host in ("0.0.0.0", "::", "", "0", "::0", "0:0:0:0:0:0:0:0", "[::]", " 0.0.0.0 ", "0.0", "0x0"):
             with self.assertRaises(local_gate.GateConfigError):
                 local_gate.check_listen(host, allow_any=False)
             local_gate.check_listen(host, allow_any=True)
-        local_gate.check_listen("127.0.0.1", allow_any=False)
+        for host in ("127.0.0.1", "100.64.0.1", "fd7a::1", "pro.example"):
+            local_gate.check_listen(host, allow_any=False)
         self.assertEqual(local_gate.main(["--listen", "0.0.0.0", "--token-file", token_file(self.dir)]), 2)
 
     def test_print_config_checks_without_printing_the_token(self):
@@ -158,6 +194,88 @@ class ProviderThroughGateTests(LocalHarness):
         self.assertEqual(code, 503)
         self.assertIn("local gate on node pro refused the provider token", msg)
         self.assertEqual(FakeOllama.seen, [])
+
+    def test_outcome_is_logged_once_per_conversation(self):
+        import time
+        logged = []
+        self.reg.log_outcome = lambda route, chars, ms: logged.append((route["route_id"], chars, ms))
+        body = {**self.BODY, "tools": [{"name": "Read", "input_schema": {"type": "object"}}]}
+        got = self.post(body)
+        follow = {**body, "messages": body["messages"] + [
+            {"role": "assistant", "content": got["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": got["content"][0]["id"], "content": "ok"}]}]}
+        self.post(follow)
+        deadline = time.time() + 3
+        while not logged and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        self.assertEqual(len(logged), 1)
+        rid, chars, ms = logged[0]
+        self.assertTrue(rid.startswith("execution:provider:pin:"))
+        self.assertEqual(chars, 0)                       # a tool_use reply has no text
+        self.assertGreaterEqual(ms, 0)
+
+    def test_text_reply_chars_are_logged(self):
+        import time
+        logged = []
+        self.reg.log_outcome = lambda route, chars, ms: logged.append(chars)
+        orig = FakeOllama.do_POST
+
+        def text_only(handler):                          # a tools conversation answered in text
+            n = int(handler.headers["content-length"])
+            b = json.loads(handler.rfile.read(n))
+            b.pop("tools", None)
+            raw = json.dumps(b).encode()
+            handler.headers.replace_header("content-length", str(len(raw)))
+            import io
+            handler.rfile = io.BytesIO(raw)
+            orig(handler)
+        FakeOllama.do_POST = text_only
+        try:
+            self.post({**self.BODY, "tools": [{"name": "Read", "input_schema": {"type": "object"}}]})
+        finally:
+            FakeOllama.do_POST = orig
+        deadline = time.time() + 3
+        while not logged and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(logged, [len("hello from qwen")])
+
+    def test_dropped_request_after_connect_is_not_called_asleep(self):
+        import socket
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(4)
+
+        def accept_and_drop():
+            for _ in range(2):
+                try:
+                    c, _ = lsn.accept()
+                except OSError:
+                    return
+                c.close()
+        threading.Thread(target=accept_and_drop, daemon=True).start()
+        from cortados_router.provider import local_lane as ll
+        node = {"node": "pro", "base_url": f"http://127.0.0.1:{lsn.getsockname()[1]}", "token": None,
+                "connect_timeout_s": 1, "read_timeout_s": 2}
+
+        class H:
+            sent = []
+            def send_response(self, code): self.code = code
+            def send_header(self, *a): pass
+            def end_headers(self): pass
+            class wfile:
+                buf = b""
+                @classmethod
+                def write(cls, b): cls.buf += b
+        h = H()
+        try:
+            out = ll.serve(h, {"messages": []}, node, {"id": TAG, "alias": "qwen-27b"}, echo_model="sub/qwen-27b")
+        finally:
+            lsn.close()
+        self.assertEqual((out, h.code), ("unreachable", 503))
+        msg = json.loads(h.wfile.buf)["error"]["message"]
+        self.assertIn("accepted the connection", msg)
+        self.assertNotIn("asleep", msg)
 
     def test_a_refusal_after_the_probe_is_also_a_503(self):
         real = local_lane.probe

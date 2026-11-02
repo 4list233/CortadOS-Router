@@ -822,7 +822,9 @@ class Handler(BaseHTTPRequestHandler):
                                  label=str(route["model"]), tools=not one_shot)
             reply: list = []
             local = route["local"]
+            t0 = time.time()
             outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model, reply=reply)
+            turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
             if outcome == "completed":
                 session.history.append(anthropic_wire.reply_fingerprint(reply))
@@ -832,6 +834,17 @@ class Handler(BaseHTTPRequestHandler):
                         session.route_logged = True
                     except Exception as exc:     # the answer was delivered; only its record failed
                         logger.warning("local lane: route record failed: %s", exc)
+                    else:
+                        if reg.log_outcome:      # size and duration, once per conversation, as on the CLI path
+                            chars = sum(len(b.get("text", "")) for b in reply
+                                        if isinstance(b, dict) and b.get("type") == "text")
+
+                            def _log_outcome(route=route, chars=chars, ms=turn_ms):
+                                try:
+                                    reg.log_outcome(route, chars, ms)
+                                except Exception:
+                                    logger.exception("outcome log for route %s failed", route.get("route_id"))
+                            threading.Thread(target=_log_outcome, name="cortados-outcome-log", daemon=True).start()
             elif created:
                 reg.drop(session)
         finally:
