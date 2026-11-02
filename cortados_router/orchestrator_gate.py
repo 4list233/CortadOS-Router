@@ -14,6 +14,12 @@ PLANNING_TOOLS = frozenset((
     "AskUserQuestion", "ExitPlanMode", "EnterPlanMode",
 ))
 PRUNE_AGE = 7 * 24 * 3600
+FORK_DENY_REASON = (
+    "orchestrator: do not use fork subagents in this mode. A fork inherits this orchestrator's model and "
+    "conversation history, so it is not routed by S1 and it collides with this session's backend conversation "
+    "(the session then fails with a 409). Spawn a fresh subagent instead (e.g. subagent_type \"general-purpose\") "
+    "with a self-contained prompt."
+)
 
 
 def state_path(directory, session_id):
@@ -53,6 +59,16 @@ def decide(event, env, directory=None):
     if "agent_id" in event:
         return None
     tool = event["tool_name"]
+    tool_input = event.get("tool_input")
+    subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+    # Forks are denied outright, whatever the budget and without spending it: a fork inherits the pinned orchestrator
+    # model and its full history, so it skips S1, and the provider matches its requests to the parent's held backend
+    # conversation by history fingerprint, advances it, and the parent's next request then gets a 409 (seen live, e2e C5).
+    if tool in ("Agent", "Task") and isinstance(subagent_type, str) and subagent_type.strip().lower() == "fork":
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": FORK_DENY_REASON,
+        }}
     allowed_mcp = {name.strip() for name in env.get("CORTADOS_DELEGATE_ALLOW_MCP", "").split(",")}
     if tool in PLANNING_TOOLS or (tool.startswith("mcp__") and tool in allowed_mcp):
         return None

@@ -43,6 +43,26 @@ class GateTests(unittest.TestCase):
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
 
+    def test_fork_denied_in_main_loop_without_budget(self):
+        for tool in ("Agent", "Task"):
+            for kind in ("fork", " Fork ", "FORK"):
+                out, err = self.call(dict(self.event, tool_name=tool,
+                                          tool_input={"subagent_type": kind, "prompt": "x"}))
+                self.assertEqual(err, "")
+                self.assertEqual(json.loads(out), {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": gate.FORK_DENY_REASON}})
+        self.assertFalse(self.directory.exists())
+
+    def test_fork_allowed_inside_subagent_and_other_agents_unbudgeted(self):
+        fork = dict(self.event, tool_name="Agent", tool_input={"subagent_type": "fork"})
+        self.assertEqual(self.call(dict(fork, agent_id="child")), ("", ""))
+        for tool_input in ({"subagent_type": "general-purpose"}, {"prompt": "x"}, "not a dict", None):
+            for _ in range(5):
+                self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input),
+                                           {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
+        self.assertFalse(self.directory.exists())
+
     def test_budget_then_exact_deny(self):
         for _ in range(3):
             self.assertEqual(self.call(), ("", ""))
