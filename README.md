@@ -258,6 +258,8 @@ What runs where:
   Set `CORTADOS_DELEGATE_ALLOW_MCP` to a comma-separated list of **exact** `mcp__...` tool names to exempt owner-approved
   MCP tools (default none; no wildcards). The launcher writes `CORTADOS_DELEGATE_BUDGET` into settings env.
   `--no-gate` disables enforcement independently of `--no-delegate-directive`.
+  Fork subagents (`subagent_type: "fork"`) are always denied in the main loop, budget or not: a fork inherits the
+  pinned orchestrator model and its history, so it skips S1 and collides with the parent's backend conversation (409).
   Counters live in `~/.config/cortados/gate/` (0700 directory, 0600 files), keyed by a hashed session ID and then
   prompt ID (missing prompt ID uses `none`). Atomic replacements and a shared file lock protect parallel calls;
   counter files older than seven days are pruned. Any internal error **fails open** with one stderr diagnostic:
