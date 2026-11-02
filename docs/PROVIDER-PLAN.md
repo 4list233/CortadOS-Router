@@ -172,8 +172,9 @@ Both live acceptance checks passed on 2026-10-21 (P2 live findings below); each 
   request. `ephemeral` writes no session files (verified).
 - A tool call is the server request `item/tool/call {callId, tool, arguments}`. `callId` equals the
   `dynamicToolCall` item id and becomes the `tool_use` id (Messages) or `call_id` (Responses) the client sees, so
-  the result is matched by id, never by order. It is answered when the client's next request arrives:
-  `{success: not isError, contentItems: [inputText | inputImage]}`; images travel as data URLs, because Codex
+  the result is matched by id, never by order. While the call's turn is live it is answered when the client's next
+  request carries the result: `{success: not isError, contentItems: [inputText | inputImage]}`; if that turn ended
+  first, the result reaches the model only as text in a follow-up turn (code-mode bullet below); images travel as data URLs, because Codex
   refuses remote image URLs. Sibling calls of one model message are collected for the same settle window as the
   Claude bridge. Every pending call must be answered in one request (Codex continues only then); a partial set is
   refused.
@@ -192,6 +193,36 @@ Both live acceptance checks passed on 2026-10-21 (P2 live findings below); each 
 - A new user message while a tool call is unanswered (a client interrupt): every pending call is answered
   `success: false` with "cortados: the client moved on without a result", then `turn/interrupt`, drain to that turn's
   `turn/completed`, then the new `turn/start`. A `turn/start` during a live turn would be steering, not a new turn.
+- Code-mode yield. Codex 0.163.0 runs dynamic tool calls inside a code-mode exec cell, and the cell yields back to
+  the model after its exec yield time (~30 s default). The model can then end the turn while a client tool call is
+  still unanswered. To stop that, the child starts with
+  `-c features.code_mode.default_exec_yield_time_ms=<TURN_TIMEOUT_S in ms>` and `config/read` must show that value.
+  Without it, any client tool that takes longer than ~30 s (a test run, a build, a slow human approval) would end the
+  turn around its own call. The model can still pass its own `yield_time_ms`, so the bridge also handles turns that
+  end early:
+  - Each call is recorded with the `turnId` that issued it (`item/tool/call` and `item/completed` both carry
+    `turnId`). A turn whose `turn/completed` has arrived is ended for good. A call or `agentMessage` naming a turn
+    this session never started is a BridgeError.
+  - A call from an ended turn (a cell that outlived its turn) is answered at once with "cortados: turn already
+    ended; call refused" (`TURN_ENDED`). It is never forwarded to the client, so a superseded turn cannot make the
+    client run mutating work. That turn's agent messages are dropped from client output, and each drop is logged.
+  - Calls still outstanding when their turn completes are answered to the waiting cell with `ENDED_AROUND` ("the
+    turn ended before this call's result arrived; the result is given to the model in the next turn instead"). The
+    client still runs them. Their results reach the model only as text in a follow-up `turn/start` (each result by
+    call id, tool and status, cut at `LATE_RESULT_CHARS`), never also to the cell: each result is delivered exactly
+    once.
+  - Queued events are classified in FIFO order. A sibling `tool_use` or `agentMessage` the turn emitted before its
+    completion still belongs to that turn and is carried to the client on the next reply, as `tool_use`. Its result
+    joins the late ones in the same follow-up.
+  - `MAX_FOLLOWUPS = 3` follow-up turns per user message. Each follow-up is an extra model request on the
+    subscription, so a model that keeps ending turns around calls cannot loop. Past the cap the bridge raises a
+    BridgeError naming the calls; it never replies with a result missing. A new user message instead of the results
+    starts no follow-up: the new message supersedes them.
+  - Live check, 2026-11-02, Air, codex-cli 0.163.0, branch `codex-yield` fed9a95: `item/tool/call` params were
+    `{arguments, callId, namespace, threadId, tool, turnId}`, and `item/completed` (dynamicToolCall, agentMessage)
+    carried `turnId` equal to the `turn/started` id. `config/read` showed `code_mode.default_exec_yield_time_ms =
+    1800000`. The result was held for 45 s and nothing arrived during the wait (no yield, no `turn/completed`).
+    After delivery the turn ended with exactly "hello-cortados".
 - Close: `thread/unsubscribe`, close stdin ("stdin closed" ends the process), kill after 5 s.
 
 **Isolation of the child.** There is no `--ignore-user-config` for `app-server`, and a throwaway `CODEX_HOME` has no
