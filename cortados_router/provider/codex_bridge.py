@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -89,6 +90,24 @@ def _turn_input(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             out.append({"type": "text", "text": json.dumps(b)})     # unknown block: the model still sees it, as JSON
     return out
+
+
+# Codex 0.166.0's thread/start refusals of one dynamic tool name (app-server thread_processor; the name always ends the
+# message after ": "). Namespace refusals ("dynamic tool namespace ...") are deliberately not matched: this bridge
+# declares no namespaces. _call appends " (code N)" to the message, which is not part of the name.
+_REFUSAL = re.compile(
+    r"(?:dynamic tool name is reserved"
+    r"|duplicate dynamic tool name"
+    r"|dynamic tool name has leading/trailing whitespace"
+    r"|dynamic tool name must match \S+ to match Responses API"
+    r"|dynamic tool name must be at most \d+ characters to match Responses API)"
+    r": (?P<name>.*?)(?: \(code -?\d+\))?$", re.S)
+
+
+def refused_tool_name(message: str) -> str | None:
+    """The wire name a Codex dynamic-tool refusal spells out, or None when the message is in no known format."""
+    m = _REFUSAL.search(message)
+    return m.group("name") if m else None
 
 
 class CodexSession:
@@ -163,8 +182,8 @@ class CodexSession:
         self._aliases = tool_aliases(tools)
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
-            logger.info("codex conversation %s: client tools named like Codex's own are declared as %s", self.id[:8],
-                        sorted(self._aliases))
+            logger.info("codex conversation %s: client tools Codex would refuse or swallow are declared as %s", self.id[:8],
+                        ", ".join(f"{wire} -> {client!a}" for wire, client in sorted(self._aliases.items())))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             "baseInstructions": system or "You are a helpful assistant.",
@@ -173,7 +192,10 @@ class CodexSession:
                               "inputSchema": t.get("input_schema") or {"type": "object"}} for t in tools]}
         if model:
             params["model"] = model
-        started = self._call("thread/start", params, HANDSHAKE_S)
+        try:
+            started = self._call("thread/start", params, HANDSHAKE_S)
+        except BridgeError as exc:
+            raise self._tool_refusal(exc, params["dynamicTools"]) from exc
         thread = started.get("thread") or {}
         version = thread.get("cliVersion")
         if version not in SUPPORTED_CLI_VERSIONS:
@@ -196,6 +218,22 @@ class CodexSession:
         logger.info("codex conversation %s: thread %s, model %s, codexHome %s, instructionSources %s", self.id[:8],
                     self.thread_id, started.get("model"), info.get("codexHome"), started.get("instructionSources"))
         self._check_fatal()
+
+    def _tool_refusal(self, exc: BridgeError, declared: list[dict[str, Any]]) -> BridgeError:
+        """A thread/start refusal that names a declared dynamic tool, restated with the client's own tool name: the
+        client must learn which of its tools Codex refused, never get a silently shortened tool set. Only the name
+        Codex spelled out in one of its known refusal formats is looked up; the rest of the message is never scanned,
+        so a client tool named like a word of the boilerplate ("tool", "reserved", ...) is never blamed."""
+        msg = str(exc)
+        if "dynamic tool" not in msg:
+            return exc
+        wire = refused_tool_name(msg)
+        if wire is None or wire not in {d["name"] for d in declared}:
+            return BridgeError(f"codex app-server refused a dynamic tool name this bridge cannot match to any of the "
+                               f"client's declared tools (none of them is known to be wrong): {msg}")
+        client = self._aliases.get(wire, wire)
+        shown = f"{client!r}" + (f" (declared to Codex as {wire!r})" if client != wire else "")
+        return BridgeError(f"codex app-server refused client tool {shown}: {msg}")
 
     def _read_stdout(self) -> None:
         try:

@@ -333,6 +333,7 @@ class Registry:
             kw["account"], kw["config_dir"] = route["account"], cfg
         s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
+        s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         if keep:
             with self._lock:
                 self.sessions[s.id] = s
@@ -613,6 +614,15 @@ class Handler(BaseHTTPRequestHandler):
                 # rather than nowhere (P2 known limit: the conversation would otherwise have to be restarted).
                 logger.warning("conversation %s: the system prompt changed mid-conversation; the running CLI keeps the "
                                "one it started with", session.id[:8])
+            names = {t["name"] for t in turn.tools}
+            if session is not None and not getattr(session, "tools_warned", True) and names != session.tool_names:
+                # Same limit for the tool set: find() continues by history and the backend was started with the
+                # opening request's tools (Codex declares them once, on thread/start), so a tool added or dropped
+                # mid-conversation is never re-declared. Said once per conversation, names only; routing is unchanged.
+                session.tools_warned = True
+                logger.warning("conversation %s: the tool set changed mid-conversation (added %s, dropped %s); the "
+                               "running backend keeps the tools it started with", session.id[:8],
+                               sorted(names - session.tool_names), sorted(session.tool_names - names))
             if one_shot:
                 # The transcript re-reads the whole history, so a shape error in an older user item surfaces here,
                 # not in parse_request: it is a request-shape error all the same and answers 400.

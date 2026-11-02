@@ -71,6 +71,19 @@ def reply_fingerprint(blocks: Any) -> str:
     return hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
 
 
+def check_tool_name(name: str, what: str = "tool name") -> str:
+    """`name` if it is a valid Unicode scalar string. JSON can carry a lone surrogate ("\\ud800"), which Python decodes
+    into a str that cannot be encoded as UTF-8 and so cannot be hashed, logged or sent to a backend: refused here, at
+    the wire, as a client error instead of failing somewhere downstream."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        # !a escapes every non-ASCII code point, so the message itself can always be encoded (é and a surrogate alike).
+        raise WireError(f"{what} {name!a} is not valid Unicode "
+                        "(it contains a lone surrogate)") from None
+    return name
+
+
 def parse_request(body: dict[str, Any]) -> ClientTurn:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -103,6 +116,9 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     tools = body.get("tools") or []
     if not isinstance(tools, list):
         raise WireError("tools must be a list")
+    for t in tools:
+        if isinstance(t, dict) and isinstance(t.get("name"), str):
+            check_tool_name(t["name"])
     # The CLI session's tool set is fixed when it starts and the CLI decides itself whether to call one, so only
     # `auto` can be honoured. Anything else is refused, never silently ignored. (max_tokens is not enforced either:
     # the CLI has no output cap flag; docs/PROVIDER-PLAN.md lists it as a known limit.)
