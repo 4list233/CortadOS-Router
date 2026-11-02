@@ -805,6 +805,9 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("logs_withheld", st)
         self.assertNotIn("tok-test-000000001", r["content"][0]["text"])
         self.assertNotIn("tok-test-000000001", json.dumps(st))
+        self.assertNotIn("stdout_log", st)                         # no pointer to the raw, credential-bearing logs
+        self.assertNotIn("stderr_log", st)
+        self.assertIn("must not be read", st["logs_withheld"])
 
     def test_crash_with_same_credentials_releases_redacted_logs(self):
         os.environ["FAKE_CLAUDE_MODE"] = "echo-sleep"
@@ -879,6 +882,99 @@ class ChildTaskTests(unittest.TestCase):
         out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=30).stdout
         self.assertIn("--no-chrome", out)
         self.assertIn("--chrome", out)
+
+    # --- review round 6 ---------------------------------------------------------------------------------------------
+
+    def _dead_task_with_child(self, child_rec):
+        """A crashed task whose recorded child group is a live, unrelated session leader started here."""
+        import subprocess
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        root = ct._private_root()
+        tid = ct._new_id()
+        d = os.path.join(root, tid)
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": time.time() - 3600,
+                                                      "runner_pid": None})
+        open(os.path.join(d, "runner.lock"), "w").close()
+        rec = dict(child_rec, pgid=other.pid)
+        if rec.get("start") == "LIVE":
+            rec["start"] = ct._proc_start(other.pid)
+        ct._write_json(os.path.join(d, "child.json"), rec)
+        return tid, d, other
+
+    def _only_probes(self, calls):
+        self.assertTrue(all(sig == 0 for _, sig in calls), calls)
+
+    def test_unknown_start_time_is_never_signalled(self):
+        tid, d, other = self._dead_task_with_child({"start": "LIVE"})
+        calls = []
+        real = os.killpg
+
+        def spy(pgid, sig):
+            calls.append((pgid, sig))
+            return real(pgid, sig)
+        with mock.patch.object(ct, "_proc_start", return_value=ct.UNKNOWN), mock.patch.object(ct.os, "killpg", spy):
+            _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "failed")
+        self._only_probes(calls)
+        self.assertIsNone(other.poll())
+        self.assertIn("start time unknown", _load(os.path.join(d, "result.json"))["child_cleanup"])
+
+    def test_unrecorded_start_with_live_leader_is_not_signalled(self):
+        tid, d, other = self._dead_task_with_child({"start": None})   # died between the two child.json writes
+        self.call("task_status", task_id=tid)
+        time.sleep(0.2)
+        self.assertIsNone(other.poll())
+        note = _load(os.path.join(d, "result.json"))["child_cleanup"]
+        self.assertIn("not signalled", note)
+        self.assertIn("may still be running", note)
+
+    def test_eperm_group_is_foreign_not_gone(self):
+        tid, d, other = self._dead_task_with_child({"start": "LIVE"})
+        calls = []
+
+        def eperm(pgid, sig):
+            calls.append((pgid, sig))
+            raise PermissionError(1, "Operation not permitted")
+        with mock.patch.object(ct.os, "killpg", eperm):
+            self.call("task_status", task_id=tid)
+        self._only_probes(calls)
+        self.assertEqual(_load(os.path.join(d, "result.json"))["child_cleanup"],
+                         "pgid reused by another user's process; not signalled")
+
+    def test_ps_by_absolute_path(self):
+        self.assertTrue(os.path.isabs(ct.PS))
+        self.assertIsInstance(ct._proc_start(os.getpid()), str)
+        with mock.patch.object(ct, "PS", "/nonexistent/ps"):
+            self.assertIs(ct._proc_start(os.getpid()), ct.UNKNOWN)   # not "no such process"
+
+    def test_recovery_grace_is_short(self):
+        self.assertLessEqual(ct.RECOVERY_GRACE_S, 5)
+        os.environ["FAKE_CLAUDE_MODE"] = "stubborn"
+        with mock.patch.object(ct, "KILL_GRACE_S", 30):
+            tid = self.start()
+            self.assertTrue(_wait_file(os.path.join(self.work, "grandchild.pid")))
+            time.sleep(0.3)
+            self._kill_runner(tid)
+            t0 = time.time()
+            self.call("task_status", task_id=tid)
+            self.assertLess(time.time() - t0, 15, "recovery waited the full 30 s kill grace")
+
+    def test_note_child_writes_pgid_before_start(self):
+        tid, d = self._manual_task("ok")
+        writes = []
+        real = ct._write_json
+
+        def spy(path, obj):
+            if path.endswith("child.json"):
+                writes.append(dict(obj))
+            return real(path, obj)
+        with mock.patch.object(ct, "_write_json", spy):
+            ct._note_child(d, os.getpid())
+        self.assertEqual(writes[0], {"pgid": os.getpid(), "start": None})
+        self.assertIsInstance(writes[-1]["start"], str)
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

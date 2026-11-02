@@ -78,12 +78,16 @@ ORCHESTRATOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,80}")
 MIN_TOKEN_LEN = 8                   # same floor as subagent_mcp.route_task: shorter is not a provider token, and a
                                     # shorter one could not be redacted without mangling ordinary words
 CHILD_MAX_S_DEFAULT = 3 * 3600      # an unattended child that never ends burns quota (override: CORTADOS_CHILD_MAX_S)
+# Recovery runs inside status/list/prune/wait calls, so its TERM->KILL wait is short: a full KILL_GRACE_S per crashed
+# task would stall every such call; a child that was going to exit cleanly on TERM does so within seconds.
+RECOVERY_GRACE_S = 5
 KILL_GRACE_S = 30                   # after SIGTERM to claude's process group, wait this long, then SIGKILL the group
 META_GRACE_S = 60                   # a task dir with no meta.json older than this is a failed start, not "running"
 RESULT_CHARS = 20_000               # result text returned through MCP; MCP clients choke on huge tool results
 REDACT_FAILED_PLACEHOLDER = "(withheld: the runner could not redact this log)"
 LOGS_WITHHELD_NOTE = ("logs withheld: the runner died before redaction, and the current credentials do not match the ones "
-                      "this task was launched with")
+                      "this task was launched with. The raw stdout/stderr logs in the task dir contain the launch "
+                      "credential and must not be read or shared.")
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
 WAIT_MAX_S = 540                    # MCP clients time a tool call out (~10 min); stay under it
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
@@ -492,7 +496,7 @@ def _is_our_runner(pid, d: str) -> bool:
     if not isinstance(pid, int) or pid <= 1:
         return False
     try:
-        cmdline = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+        cmdline = subprocess.run([PS, "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                                  timeout=10).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -556,7 +560,7 @@ def _recover(d: str, meta: dict):
             return res
         # The runner died without writing result.json: its claude group may still be running (stop it before the
         # terminal state is published, or it could never be cancelled), and it never removed the settings file.
-        child = _stop_recorded_child(d, KILL_GRACE_S)
+        child = _stop_recorded_child(d, RECOVERY_GRACE_S)
         removed = _remove_settings(d)
         if os.path.exists(os.path.join(d, "cancelled")):
             res = {"cancelled": True, "settings_removed": removed, "ended_at": time.time(),
@@ -649,7 +653,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
                                   _tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS, red))
         if withheld:
             out["logs_withheld"] = LOGS_WITHHELD_NOTE
-            out.pop("result", None)
+            for k in ("result", "stdout_log", "stderr_log"):   # no pointer to files that hold the raw credential
+                out.pop(k, None)
     return red.tree(out)                        # every string (structured, before any serialization)
 
 
@@ -719,19 +724,39 @@ def _killpg(pgid: int, sig) -> bool:
         return False
 
 
-def _proc_start(pid: int):
-    """The process's start time as ps prints it (lstart), or None if there is no such process. With the pid it names
-    one process: a reused pid has a different start time."""
+PS = "/bin/ps"           # absolute: MCP servers start with a thin PATH, and an unfound ps must never look like "no process"
+UNKNOWN = object()       # _proc_start could not tell (ps failed or hung): never a reason to signal
+
+
+def _probe_group(pgid: int) -> str:
+    """'alive', 'gone', or 'foreign' (EPERM: the group exists but belongs to another user, so the id was reused)."""
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+        os.killpg(pgid, 0)
+        return "alive"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "foreign"
+
+
+def _proc_start(pid: int):
+    """The process's start time as ps prints it (lstart); None if ps ran and found no such process; UNKNOWN if ps could
+    not be run or timed out. With the pid it names one process: a reused pid has a different start time."""
+    try:
+        # timeout guards against a hung ps; the same bound as _is_our_runner's ps call
+        r = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.strip() or None
+        return UNKNOWN
+    return r.stdout.strip() or None
 
 
 def _note_child(d: str, pgid: int) -> None:
-    # pid and start time: lets start() or crash recovery stop exactly this group, never a reused pid's.
-    _write_json(os.path.join(d, "child.json"), {"pgid": pgid, "start": _proc_start(pgid)})
+    # pid first (atomic), then pid + start time: lets start() or crash recovery stop exactly this group, never a reused
+    # pid's. The first write closes most of the window in which a dying runner would leave no record at all.
+    path = os.path.join(d, "child.json")
+    _write_json(path, {"pgid": pgid, "start": None})
+    start = _proc_start(pgid)
+    _write_json(path, {"pgid": pgid, "start": start if isinstance(start, str) else None})
 
 
 def _stop_recorded_child(d: str, grace: float) -> str:
@@ -743,16 +768,25 @@ def _stop_recorded_child(d: str, grace: float) -> str:
     if not isinstance(rec, dict) or not isinstance(rec.get("pgid"), int) or rec["pgid"] <= 1:
         return "no child recorded"
     pgid = rec["pgid"]
-    if not _killpg(pgid, 0):
+    probe = _probe_group(pgid)
+    if probe == "gone":
         return "child group already gone"
+    if probe == "foreign":
+        return "pgid reused by another user's process; not signalled"
     now_start = _proc_start(pgid)
-    if now_start is not None and (rec.get("start") is None or now_start != rec["start"]):
-        return "pid reused by another process; not signalled"
+    if now_start is UNKNOWN:
+        return "start time unknown (ps failed); not signalled; the child may still be running"
+    if now_start is not None:                   # the leader is alive: it must be the very process recorded
+        if rec.get("start") is None:
+            return "start time unknown (not recorded); not signalled; the child may still be running"
+        if now_start != rec["start"]:
+            return "pid reused by another process; not signalled"
+    # (leader gone but group alive: the id cannot have been reused while the group exists)
     _killpg(pgid, signal.SIGTERM)
     end = time.monotonic() + grace
-    while time.monotonic() < end and _killpg(pgid, 0):
+    while time.monotonic() < end and _probe_group(pgid) == "alive":
         time.sleep(0.1)
-    if _killpg(pgid, 0):
+    if _probe_group(pgid) == "alive":
         _killpg(pgid, signal.SIGKILL)
     return "child group stopped"
 
