@@ -51,10 +51,12 @@ PLUGIN_ID = "cortados-routed-subagents@cortados-router"
 # policy outranks it, so a managed env that sets any of these keys refuses the launch.
 # Each launch gets its own file (mkstemp: O_EXCL, 0600) in this verified private directory, so concurrent launches never
 # read each other's provider or token. The launcher execs claude and cannot delete its file, so each launch prunes the
-# directory's own session-*.json files older than PRUNE_AGE.
+# directory's own session-*.json files older than PRUNE_AGE. Seven days, not one: Claude Code may re-read its settings
+# sources mid-session, so pruning the file of a session that is still open could drop its provider env; a week covers
+# any realistic session while still clearing stale token copies.
 SETTINGS_DIR = "~/.config/cortados/sessions"
 SETTINGS_PATTERN = "session-*.json"
-PRUNE_AGE = 24 * 3600
+PRUNE_AGE = 7 * 24 * 3600
 # Passthrough args that would add a settings source after ours or replace the launcher's model.
 REFUSED_ARGS = ("--settings", "--setting-sources", "--model")
 MANAGED_SETTINGS_DIRS = ("/Library/Application Support/ClaudeCode", "/etc/claude-code")

@@ -241,7 +241,7 @@ What runs where:
   variable, token included, is written to a private per-session settings file,
   `~/.config/cortados/sessions/session-<random>.json` (a new 0600 file per launch, so concurrent launches never share
   one; the directory must be 0700 and it and its ancestors must not be symlinks or owned by another user; files
-  older than 24 h are pruned at launch), and passed with `--settings <path>`. Args after `--` may not include
+  older than 7 days are pruned at launch), and passed with `--settings <path>`. Args after `--` may not include
   `--settings`, `--setting-sources` or `--model`. That is flag precedence, which beats user, project and local settings; the token is never
   in argv. The same variables stay in the process env. Only managed policy settings outrank flag settings, so if
   `/Library/Application Support/ClaudeCode/managed-settings.json` (or `/etc/claude-code/…`, or a
