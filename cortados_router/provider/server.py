@@ -52,9 +52,12 @@ TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
 # A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request,
 # or its next message on the same history, is told why instead of a misleading 409. A tombstone is keyed by the
-# conversation itself (Registry.failure_key: the calling client, its run id, and a canonical digest of the history the
-# request carried, free of client-regenerated text: anthropic_wire.conversation_digest), so another conversation that
-# happens to contain the same reply never receives it. It holds only an allowlisted diagnostic (failure_diagnostic): a fixed category and message, never backend or tool text.
+# conversation itself (Registry.failure_key: the wire, the calling client, the conversation identity the client sends
+# (CONVERSATION_ID_HEADERS) and a canonical digest of the history the request carried, free of client-regenerated text:
+# anthropic_wire.conversation_digest), so another conversation that happens to contain the same reply never receives
+# it. A request without a client conversation identity is never tombstoned and never matches one: the digest alone
+# cannot tell two independent conversations with the same prefix apart (it keeps the ordinary 409).
+# It holds only an allowlisted diagnostic (failure_diagnostic): a fixed category and message, never backend or tool text.
 # TTL: a client's automatic retries finish within minutes; 15 minutes also covers a person re-sending by hand, and
 # after that the conversation is as unknown as any other (409). Max entries: one per recently failed conversation,
 # capped so a burst of failures (a vendor outage across many sessions) cannot grow memory without bound; the oldest
@@ -221,6 +224,16 @@ RUN_ID_HEADER = "x-cortados-run-id"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _RUN_ID_BAD = "cortados: x-cortados-run-id is not a run id"
 RUNS_PATH = "/v1/cortados/runs/"
+# Headers a client sends that name its conversation, for the failed-session tombstone (Registry.failure_key). Each was
+# confirmed on the real client's own requests to a capture endpoint (2026-11-02):
+#   x-cortados-run-id          this endpoint's own run header; the headless tools set it per run.
+#   x-claude-code-session-id   Claude Code 2.1.316 sends X-Claude-Code-Session-Id on every /v1/messages request (the
+#                              same id is the session_id inside metadata.user_id). The main loop and its subagents
+#                              share it; their histories differ, so identity + digest still names one conversation.
+#   session-id                 Codex 0.166.0 sends its thread id as `session-id` (and `thread-id`, x-client-request-id,
+#                              prompt_cache_key) on /v1/responses; the 0.163.0 binary carries the same header names.
+# Every one present is part of the identity; with none, the request has no identity and gets no tombstone.
+CONVERSATION_ID_HEADERS = (RUN_ID_HEADER, "x-claude-code-session-id", "session-id")
 
 
 class RunRecords:
@@ -412,16 +425,19 @@ class Registry:
         return s
 
     @staticmethod
-    def failure_key(turn: anthropic_wire.ClientTurn, *, wire_path: str, client: str, run_id: str | None) -> str | None:
+    def failure_key(turn: anthropic_wire.ClientTurn, *, wire_path: str, client: str,
+                    identity: str | None) -> str | None:
         """The identity of the conversation a request belongs to, for its tombstone: the wire, the calling client (its
-        User-Agent name), its x-cortados-run-id when it sends one, and the wire's canonical digest of the history before
-        the new turn (user content, tool results and assistant fingerprints; system text, reminders, thinking and cache
-        markers excluded: anthropic_wire.conversation_digest). A retry of a failed request, and the next
-        message a person types after it, carry that same history; an unrelated conversation that contains the same
-        reply does not. None for an opening request: it has no conversation to name, and find never matches it."""
-        if not turn.history:
+        User-Agent name), the conversation identity the client sent (Handler._conversation_identity), and the wire's
+        canonical digest of the history before the new turn (user content, tool results and assistant fingerprints;
+        system text, reminders, thinking and cache markers excluded: anthropic_wire.conversation_digest). A retry of a
+        failed request, and the next message a person types after it, carry that same identity and history; an
+        unrelated conversation does not. None for an opening request (no conversation to name) and for a request
+        without an identity: two independent conversations can share a prefix, so the digest alone would hand one the
+        other's failure. find never matches None, and fail publishes nothing under it."""
+        if not turn.history or not identity:
             return None
-        return anthropic_wire.history_digest(wire_path, client, run_id or "", turn.prefix_digest)
+        return anthropic_wire.history_digest(wire_path, client, identity, turn.prefix_digest)
 
     def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
@@ -459,13 +475,19 @@ class Registry:
                              f"{time.strftime('%H:%M:%S', time.localtime(failed_at))} ({diagnostic}; details are in "
                              "the provider log) and was closed: start a new conversation")
 
-    def fail(self, s, exc: object, key: str | None) -> None:
+    def fail(self, s, exc: object, key: str | None, *, unkeyed_reason: str | None = None) -> None:
         """Close a conversation whose backend failed. The caller holds `s.lock` and passes the failing request's own
         failure_key, so no request can reach the backend in between and the key never depends on session state.
         Removing the session and installing the tombstone happen together under the registry lock: no request ever
         sees both the live session and its tombstone, or neither. The backend is closed after, outside that lock (a
-        slow close must not stall every other request). The tombstone keeps only failure_diagnostic(exc)."""
+        slow close must not stall every other request). The tombstone keeps only failure_diagnostic(exc).
+        `unkeyed_reason`: why a continuation has no key (no client identity); logged once per process."""
+        global _unkeyed_logged
         diagnostic = failure_diagnostic(exc)
+        if not key and unkeyed_reason and not _unkeyed_logged:
+            _unkeyed_logged = True
+            logger.info("failed conversation left no tombstone (%s); its retries get the ordinary 409. "
+                        "Logged once per process.", unkeyed_reason)
         with self._lock:
             self.sessions.pop(s.id, None)
             if key:
@@ -490,6 +512,9 @@ class Registry:
         for s in stale:
             logger.info("closing idle conversation %s", s.id[:8])
             self.drop(s)
+
+
+_unkeyed_logged = False                    # Registry.fail has logged a continuation it could not tombstone
 
 
 class LostSession(LookupError):
@@ -738,8 +763,11 @@ class Handler(BaseHTTPRequestHandler):
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools
+            identity = self._conversation_identity()
             fail_key = None if one_shot else reg.failure_key(turn, wire_path=self.path.split("?")[0],
-                                                              client=self._client(), run_id=self._run_id()[0])
+                                                              client=self._client(), identity=identity)
+            unkeyed = (None if identity or not turn.history else
+                       "the client sent no conversation identity: none of " + ", ".join(CONVERSATION_ID_HEADERS))
             session = None if one_shot else reg.find(turn, fail_key)
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
@@ -914,7 +942,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not one_shot:
                     # Still under the session lock: a request waiting for it finds the conversation gone (above), never
                     # a backend that just failed. The key is this request's own, computed before the turn ran.
-                    reg.fail(session, exc, fail_key)
+                    reg.fail(session, exc, fail_key, unkeyed_reason=unkeyed)
             finally:
                 session.lock.release()
                 if one_shot:
@@ -998,6 +1026,16 @@ class Handler(BaseHTTPRequestHandler):
         """The calling tool, from its User-Agent ("claude-cli/2.1.304 (external, cli)" → "claude-cli",
         "codex_exec/0.163.0 (Mac OS 27.0.1; arm64)" → "codex_exec"); it names the route log's platform."""
         return (self.headers.get("user-agent") or "unknown").split("/")[0].strip() or "unknown"
+
+    def _conversation_identity(self) -> str | None:
+        """The conversation identity the client sent (CONVERSATION_ID_HEADERS, every one present, as name=value
+        lines), or None. Only ever hashed into Registry.failure_key, never logged."""
+        parts = []
+        for name in CONVERSATION_ID_HEADERS:
+            v = (self.headers.get(name) or "").strip()
+            if v:
+                parts.append(f"{name}={v}")
+        return "\n".join(parts) or None
 
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""

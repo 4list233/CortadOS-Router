@@ -412,6 +412,23 @@ class ResponsesOnCodexTests(ResponsesEndpointTests):
         self.assertEqual(self.reg.sessions, {})
         other = [user("another conversation")] + items[1:]             # same reply, another conversation: 409
         self.assertEqual(self.error_of(request(*other))[0], 409)
+        self.assertEqual(len(self.reg.tombstones), 1)                  # keyed by Codex's session-id header
+        no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 409)   # same history, no identity: no match
+
+    def test_a_failed_turn_without_a_session_id_leaves_no_tombstone(self):
+        # Without a conversation identity the digest alone cannot tell two conversations with the same prefix apart,
+        # so the failure is not published and its retry gets the ordinary 409.
+        no_id = {k: v for k, v in CODEX_HEADERS.items() if k != "session-id"}
+        items = [user("hi")]
+        with self.send(request(*items), headers=no_id) as r:
+            r1 = json.loads(r.read())
+        items += r1["output"] + [user("fail")]
+        self.assertEqual(self.error_of(request(*items), headers=no_id)[0], 502)
+        self.assertEqual((self.reg.sessions, len(self.reg.tombstones)), ({}, 0))
+        code, body = self.error_of(request(*items), headers=no_id)
+        self.assertEqual(code, 409)
+        self.assertNotIn("usageLimitExceeded", body["error"]["message"])
 
 if __name__ == "__main__":
     unittest.main()

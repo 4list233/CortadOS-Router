@@ -113,16 +113,19 @@ class EndpointHarness(unittest.TestCase):
             self.reg.drop(s)
         os.environ.pop("FAKE_CLAUDE_ARGV", None)
 
-    def post(self, body, token=TOKEN, path="/v1/messages"):
+    HEADERS: dict = {}                       # sent on every request of the helpers below (a subclass sets them)
+
+    def post(self, body, token=TOKEN, path="/v1/messages", headers=None):
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST",
-                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {token}",
+                                              **self.HEADERS, **(headers or {})})
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode()
             return json.loads(raw) if r.headers.get("content-type") == "application/json" else raw
 
-    def status_of(self, body, token=TOKEN):
+    def status_of(self, body, token=TOKEN, headers=None):
         try:
-            self.post(body, token=token)
+            self.post(body, token=token, headers=headers)
             return 200
         except urllib.error.HTTPError as e:
             return e.code
@@ -578,24 +581,91 @@ class RunRecordTests(RoutedHarness):
 class FailedSessionTombstoneTests(EndpointHarness):
     """A conversation dropped because its backend failed answers the next request on it (a retry of the failed request,
     or a new message on the same history) with a terminal error naming the failure's category, not the 409 of a
-    conversation this endpoint never held; the tombstone belongs to that conversation and client only."""
+    conversation this endpoint never held; the tombstone belongs to that conversation and client only. Requests carry
+    Claude Code's X-Claude-Code-Session-Id (the conversation identity a tombstone needs) unless a test says otherwise."""
 
-    def failed_conversation(self, first="hi"):
+    SID = "55fdfd5e-174a-4af2-acab-f4bc918051ab"
+    HEADERS = {"X-Claude-Code-Session-Id": SID}
+
+    def failed_conversation(self, first="hi", headers=None):
         """Open a conversation, fail its second turn in the backend, and return the failed request's body."""
         history = [{"role": "user", "content": first}]
-        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
         history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "backend failure"}]
         body = {"tools": [READ_TOOL], "messages": history}
         with self.assertLogs("cortados.provider", "WARNING"):
-            self.assertEqual(self.status_of(body), 502)
+            self.assertEqual(self.status_of(body, headers=headers), 502)
         self.assertEqual(self.reg.sessions, {})                        # the failed conversation was dropped
         return body
 
     def send(self, body, headers=None):
         req = urllib.request.Request(self.url + "/v1/messages", data=json.dumps(body).encode(), method="POST",
                                      headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
-                                              **(headers or {})})
+                                              **self.HEADERS, **(headers or {})})
         return urllib.request.urlopen(req, timeout=30)
+
+    def lose_a_reply(self, headers):
+        """Conversation B: opens with "hi" (A's prefix, A's reply), advances its live session one turn, then retries as
+        a client that lost that turn's response would: the history no longer matches B's live session."""
+        history = [{"role": "user", "content": "hi"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "next step"}]
+        retry = {"tools": [READ_TOOL], "messages": history}
+        self.post(retry, headers=headers)                              # B's session advances; the reply is "lost"
+        self.assertEqual(len(self.reg.sessions), 1)                    # B is healthy and live
+        return retry
+
+    def test_without_an_identity_an_independent_conversation_never_gets_another_ones_failure(self):
+        # The round-3 reproduction: A fails after "hi -> OK"; independent B (same prefix, same UA, no identity)
+        # advances, loses a response and retries. B must get the ordinary 409, never A's terminal failure.
+        none = {"X-Claude-Code-Session-Id": ""}
+        server._unkeyed_logged = False
+        with mock.patch.object(server.logger, "info") as info:
+            body = self.failed_conversation(headers=none)
+        lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
+        self.assertEqual(len(self.reg.tombstones), 0)                  # no identity: nothing published
+        self.assertEqual(self.error_of(body, none)[0], 409)            # A's own retry: the ordinary 409 too
+        code, err, _ = self.error_of(self.lose_a_reply(none), none)
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+
+    def test_the_missing_identity_is_logged_once_per_process(self):
+        none = {"X-Claude-Code-Session-Id": ""}
+        server._unkeyed_logged = False
+        with mock.patch.object(server.logger, "info") as info:
+            self.failed_conversation(headers=none)
+            self.failed_conversation("hello", headers=none)
+        lines = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
+
+    def test_identity_values_are_never_logged(self):
+        with mock.patch.object(server.logger, "info") as info:          # INFO: the level the brief forbids
+            body = self.failed_conversation()
+            self.error_of(body)
+        logged = [c.args[0] % c.args[1:] for c in info.call_args_list]
+        self.assertTrue(logged)
+        self.assertFalse([line for line in logged if self.SID in line])
+
+    def test_distinct_identities_never_share_a_tombstone(self):
+        self.failed_conversation(headers={"X-Claude-Code-Session-Id": "session-a"})
+        b = {"X-Claude-Code-Session-Id": "session-b"}
+        code, err, _ = self.error_of(self.lose_a_reply(b), b)
+        self.assertEqual(code, 409)
+        self.assertNotIn("failed at", err["error"]["message"])
+
+    def test_the_same_identity_and_history_gets_the_terminal_error(self):
+        body = self.failed_conversation()
+        self.assertEqual(len(self.reg.tombstones), 1)
+        code, err, _ = self.error_of(body)
+        self.assertEqual((code, err["error"]["type"]), (400, "invalid_request_error"))
+        self.assertIn("failed at", err["error"]["message"])
+        self.assertEqual(self.error_of(body, {"X-Claude-Code-Session-Id": ""})[0], 409)   # identity dropped: no match
+
+    def test_a_run_id_alone_is_an_identity(self):
+        run = {"X-Claude-Code-Session-Id": "", server.RUN_ID_HEADER: "run-00077"}
+        body = self.failed_conversation(headers=run)
+        self.assertEqual(self.error_of(body, run)[0], 400)
 
     def error_of(self, body, headers=None):
         try:
