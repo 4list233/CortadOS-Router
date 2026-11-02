@@ -20,7 +20,8 @@ Exit codes (nightly branches on these, not on log text):
   2  config error before any call (no CORTADOS_PROVIDER_URL, unreadable/empty token file, a non-Claude teacher, --max-scarcity on
      the provider backend, --min-left-pct outside [0, 100))
   3  stopped early (the reason, one word, is written to s1/data/label-stop-reason: unknown_headroom, low_headroom,
-     provider_stop, error_limit, scarcity): quota refusal, auth/other 4xx, x-should-retry: false, retries exhausted, the routed account below
+     quota, auth, rejected, unreachable, abandoned, unconfigured,
+     error_limit, scarcity): quota refusal, auth/other 4xx, x-should-retry: false, retries exhausted, the routed account below
      --min-left-pct, or (cli backend) the scarcity gate;
      the labels written before the stop are kept and the next run resumes from them
   python3 label.py [--limit N] [--k 3] [--batch 12] [--workers 3] [--split train|holdout|all] [--train-teacher M] [--holdout-teacher M]"""
@@ -146,7 +147,21 @@ _reveal_missing_logged = threading.Event()
 
 
 class TeacherStop(Exception):
-    """Stop the whole pass (quota refused, auth/config rejected, provider unreachable after retries). Logged, never a crash."""
+    """Stop the whole pass (quota refused, auth/config rejected, provider unreachable after retries). Logged, never a crash.
+    `reason` (quota | auth | rejected | unreachable | abandoned | unconfigured) becomes the stop reason the nightly sees."""
+
+    def __init__(self, message: str, reason: str = "unreachable"):
+        super().__init__(message)
+        self.reason = reason
+
+
+def stop_reason_for(status: int, message: str) -> str:
+    """Why a 'stop' verdict stopped the pass: spent quota, a refused credential, or any other refusal."""
+    if QUOTA_RE.search(message or ""):
+        return "quota"
+    if status in (401, 403):
+        return "auth"
+    return "rejected"
 
 
 class TeacherSkip(Exception):
@@ -223,10 +238,10 @@ def call_provider(model: str, content: str, system: str, *, url: str, token: str
     for attempt in range(PROVIDER_ATTEMPTS):
         if attempt:
             if _stop.is_set():                              # another worker already stopped the pass: do not spend another call
-                raise TeacherStop(f"{tag}: pass stopping; retry abandoned ({last})")
+                raise TeacherStop(f"{tag}: pass stopping; retry abandoned ({last})", "abandoned")
             sleep(PROVIDER_BACKOFF_S[min(attempt - 1, len(PROVIDER_BACKOFF_S) - 1)])
             if _stop.is_set():
-                raise TeacherStop(f"{tag}: pass stopping; retry abandoned ({last})")
+                raise TeacherStop(f"{tag}: pass stopping; retry abandoned ({last})", "abandoned")
         req = urllib.request.Request(url + "/v1/messages", data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=PROVIDER_TIMEOUT_S) as r:
@@ -239,7 +254,7 @@ def call_provider(model: str, content: str, system: str, *, url: str, token: str
             verdict = classify(exc.code, exc.headers.get("x-should-retry"), msg)
             last = f"HTTP {exc.code}: {msg}"
             if verdict == "stop":
-                raise TeacherStop(f"{tag}: {last}")
+                raise TeacherStop(f"{tag}: {last}", stop_reason_for(exc.code, msg))
             if verdict == "skip":
                 raise TeacherSkip(f"{tag}: {last}")
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:     # unreachable / reset / timed out: retryable
@@ -248,7 +263,7 @@ def call_provider(model: str, content: str, system: str, *, url: str, token: str
             raise TeacherSkip(f"{tag}: unparseable response: {exc}")
         print(f"  ~ {model} {tag}: attempt {attempt + 1}/{PROVIDER_ATTEMPTS} failed ({last})"
               + ("; retrying" if attempt + 1 < PROVIDER_ATTEMPTS else ""), flush=True)
-    raise TeacherStop(f"{tag}: provider still failing after {PROVIDER_ATTEMPTS} attempts ({last})")
+    raise TeacherStop(f"{tag}: provider still failing after {PROVIDER_ATTEMPTS} attempts ({last})", "unreachable")
 
 
 PROVIDER: tuple[str, str] | None = None                  # (url, token), set by main() for the provider backend
@@ -265,7 +280,7 @@ def call_teacher(model: str, batch: list[dict]) -> tuple[list[dict], dict]:
         text, meta = call_teacher_cli(model, batch)
     else:
         if PROVIDER is None:
-            raise TeacherStop("provider backend not configured")
+            raise TeacherStop("provider backend not configured", "unconfigured")
         text, meta = call_provider(model, _payload(batch), system_prompt(), url=PROVIDER[0], token=PROVIDER[1])
         # Headroom first: the response metadata says how much of the account is left whatever the answer text looks like, so a
         # prose / truncated / invalid answer (TeacherSkip below) must not hide a 12%-left reading and let later calls spend more.
@@ -325,7 +340,7 @@ def work(job: tuple[str, int, list[dict]]) -> int:
         answers, meta = call_teacher(model, batch)
     except TeacherStop as exc:
         print(f"  ! {model} s{sample}: stopping the pass: {exc}", flush=True)
-        stop_pass("provider_stop")
+        stop_pass(getattr(exc, "reason", None) or "provider_stop")
         return 0
     except TeacherSkip as exc:
         print(f"  ! {model} s{sample}: batch dropped: {exc}", flush=True)

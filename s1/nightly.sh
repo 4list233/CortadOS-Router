@@ -8,7 +8,8 @@
 # This file is the ONE canonical nightly (2026-11-02: replaces the Studio's forked ~/cortados/train/nightly.sh). Run it from the
 # checkout the scorer serves from, so a promotion lands where s1/serve.py reads. Every machine-specific value is an env var
 # (set them in the launchd plist or data/train-config.env); none of them names a host:
-#   CORTADOS_S1_SERVE_POINTER   file the scorer reads; promotion writes it atomically + keeps <file>.prev   (default: s1/current.json)
+#   CORTADOS_S1_SERVE_POINTER   file the scorer reads; promotion writes it atomically + keeps <file>.prev   (default: s1/current.json).
+#                               It must name <scorer checkout>/s1/current.json: serve.py reads only the current.json beside itself.
 #   CORTADOS_S1_SCORER_PLIST    scorer LaunchAgent unloaded during training      (default ~/Library/LaunchAgents/com.cortados.s1-scorer.plist)
 #   CORTADOS_S1_PY              training python with mlx_lm                      (default <repo>/.venv-mlx/bin/python)
 #   CORTADOS_S1_LABEL_PY        python that runs s1/label.py                      (default python3; label.py runs from this repo)
@@ -58,9 +59,11 @@ export CORTADOS_S1_SERVE_POINTER="$SERVE_POINTER"   # evaluate.py grades against
 SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
 NIGHT="${CORTADOS_S1_NIGHT_DATE:-$(date +%F)}"   # the stall tracker counts nights by this date (override for tests / backfilled runs)
+# one quiet night is normal (weekend); two in a row means the labeler is stuck
 STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"
 EARLY_STOP_NIGHTS="${CORTADOS_S1_EARLY_STOP_NIGHTS:-2}"   # same label.py stop reason this many nights running → ALERT
-EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailable/crashed this many nights running → ALERT   # one quiet night is normal (weekend); two in a row means the labeler is stuck
+EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailable/crashed this many nights running → ALERT
+HOLDOUT_BLOCKED_NIGHTS="${CORTADOS_S1_HOLDOUT_BLOCKED_NIGHTS:-2}"   # a candidate blocked by the holdout floor this many nights → ALERT
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
@@ -129,7 +132,25 @@ mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-t
 alert_line() { [ -n "$1" ] && echo "$1"; return 0; }
 eval_failed() { alert_line "$(state streak "$STATUS" evaluation_failed hit "$NIGHT" "$EVAL_FAIL_NIGHTS" "evaluation unavailable or crashed")"; }
 eval_ok() { state streak "$STATUS" evaluation_failed clear "$NIGHT" "$EVAL_FAIL_NIGHTS"; }
-report_unavailable() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('evaluation_status') == 'unavailable' else 1)" "$1/report.json"; }
+# report.json readers exit 2 when the file is unreadable or malformed (no boolean "promote"); report_unavailable treats that
+# like an unavailable evaluation, so a broken report goes to the evaluation_failed branch, never to a verdict.
+report_check() { python3 - "$1/report.json" <<'PY'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+    assert isinstance(r, dict) and isinstance(r.get("promote"), bool)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if r.get("evaluation_status") == "unavailable" else 1)
+PY
+}
+report_unavailable() { report_check "$1"; [ $? -ne 1 ]; }
+report_why() { python3 -c "import json,sys
+try: print(json.load(open(sys.argv[1])).get('evaluation_unavailable') or 'report.json unreadable or malformed')
+except Exception: print('report.json unreadable or malformed')" "$1/report.json"; }
+holdout_count() { CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --holdout-count; }
+holdout_hit() { alert_line "$(state streak "$STATUS" holdout_blocked hit "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS" "candidate waits for the Claude holdout backfill")"; }
+holdout_clear() { state streak "$STATUS" holdout_blocked clear "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS"; }
 report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
 eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
   local hk inc
@@ -237,7 +258,7 @@ if [ -f data/pending-candidate ]; then
     fi
     if [ "$p_reason" = holdout_blocked ] && [ "$now_eval" = "$p_eval" ]; then
       echo "skipped: no new labels; pending $p_run waits for the holdout backfill (holdout and incumbent unchanged)"
-      state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"
+      state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
     echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
@@ -246,7 +267,7 @@ if [ -f data/pending-candidate ]; then
     fi
     if report_unavailable "$p_run"; then
       echo "$sft_hash $now_eval evaluation_failed $p_run" > data/pending-candidate
-      echo "EVALUATION UNAVAILABLE again for $p_run: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$p_run/report.json"); retried next night"
+      echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
       state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
     fi
     eval_ok
@@ -254,21 +275,32 @@ if [ -f data/pending-candidate ]; then
       if report_blocked "$p_run"; then
         echo "$sft_hash $now_eval holdout_blocked $p_run" > data/pending-candidate
         echo "pending $p_run still blocked: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['promote_blocked'])" "$p_run/report.json")"
-        state event "$STATUS" skip "pending $p_run still holdout-blocked"
+        state event "$STATUS" skip "pending $p_run still holdout-blocked"; holdout_hit
       else
-        rm -f data/pending-candidate; mark_trained
+        rm -f data/pending-candidate; mark_trained; holdout_clear
         state event "$STATUS" skip "pending $p_run no longer promotes"
         echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
       fi
       echo "=== $(date) nightly end"; exit 0
     fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
-      rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; mark_trained
+      rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; mark_trained; holdout_clear
       echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
     fi
     echo "$sft_hash $now_eval promotion_failed $p_run" > data/pending-candidate
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
   else
+    # New train labels. A holdout-blocked candidate means the bar cannot judge ANY candidate yet: retraining on the new labels
+    # would only produce another blocked run every night (a GPU loop). Hold until the Claude holdout reaches the floor
+    # (or --train / data/force-train, handled above).
+    hc=""; [ "$p_reason" = holdout_blocked ] && hc=$(holdout_count)
+    read -r h_rows h_floor <<< "$hc"
+    if [ "$p_reason" = holdout_blocked ] && [ -n "${h_rows:-}" ] && [ "$h_rows" -lt "$h_floor" ]; then
+      echo "holdout still $h_rows/$h_floor; not retraining (pending $p_run waits; --train or data/force-train overrides)"
+      state event "$STATUS" skip "holdout still $h_rows/$h_floor; $p_run waits"; holdout_hit
+      echo "=== $(date) nightly end"; exit 0
+    fi
+    [ "$p_reason" = holdout_blocked ] && [ -z "${h_rows:-}" ] && echo "holdout count unavailable; training normally"
     echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
   fi
 fi
@@ -377,7 +409,7 @@ state event "$STATUS" train "$RUN ($labelled labels)"
 if report_unavailable "$RUN"; then
   echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
   state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"; eval_failed
-  echo "EVALUATION UNAVAILABLE for $RUN: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$RUN/report.json"); not a rejection: re-evaluated next night"
+  echo "EVALUATION UNAVAILABLE for $RUN: $(report_why "$RUN"); not a rejection: re-evaluated next night"
   exit 1
 fi
 eval_ok
@@ -386,7 +418,7 @@ if report_promotes "$RUN"; then
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
     state event "$STATUS" promotion "$RUN"
-    mark_trained
+    mark_trained; holdout_clear
     echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
   else
     echo "$sft_hash $(eval_fingerprint || echo unknown) promotion_failed $RUN" > data/pending-candidate   # retried next night
@@ -396,10 +428,10 @@ if report_promotes "$RUN"; then
 elif report_blocked "$RUN"; then
   # not final: the holdout is too small to judge. Keep the run waiting for the backfill instead of marking the data trained.
   echo "$sft_hash $(eval_fingerprint || echo unknown) holdout_blocked $RUN" > data/pending-candidate
-  state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"
+  state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"; holdout_hit
   echo "not promoted: holdout too small (see $RUN/report.json); $RUN waits and is re-evaluated when the holdout grows"
 else
-  mark_trained
+  mark_trained; holdout_clear
   echo "not promoted (see $RUN/report.json); incumbent stays"
 fi
 echo "=== $(date) nightly end"

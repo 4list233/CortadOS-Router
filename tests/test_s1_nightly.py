@@ -45,10 +45,12 @@ STUBS = {
     "evaluate.py": (
         "import argparse, json, os\n"
         "ap = argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--adapter'); ap.add_argument('--out')\n"
-        "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); a = ap.parse_args()\n"
+        "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); ap.add_argument('--holdout-count', action='store_true'); a = ap.parse_args()\n"
         "hk = open('data/stub-holdout').read() if os.path.exists('data/stub-holdout') else 'h0'\n"
         "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
         "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
+        "if a.holdout_count: print(50 if hk == 'h0' else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
+        "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
         "if os.environ.get('STUB_EVAL_RC'): raise SystemExit(int(os.environ['STUB_EVAL_RC']))\n"
         "unavailable = os.environ.get('STUB_EVAL_UNAVAILABLE') == '1'\n"
@@ -457,6 +459,49 @@ class NightlyEndToEnd(unittest.TestCase):
         self.run_night(STUB_NEW_LABELS=0)                                           # evaluates again: cleared
         self.assertNotIn("evaluation_failed", self.status().get("alerts", {}))
 
+    def test_holdout_blocked_holds_retraining_below_the_floor_and_alerts(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)      # new TRAIN labels, holdout still short
+        self.assertEqual(rc, 0, log)
+        self.assertIn("holdout still 50/200; not retraining", log)
+        self.assertFalse((run2 / "adapter").exists(), "no GPU loop while the bar cannot judge any candidate")
+        self.assertIn("holdout_blocked runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertIn("ALERT: holdout_blocked", log)
+        self.assertIn("holdout_blocked", self.status()["alerts"])
+        # the holdout backfill reaches the floor while train labels also changed: retrain normally, alert cleared on promotion
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=1, STUB_HOLDOUT_BLOCKED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("superseded by new training data", log)
+        self.assertTrue((run3 / "report.json").exists(), log)
+        self.assertIn("PROMOTED →", log)
+        self.assertNotIn("holdout_blocked", self.status().get("alerts", {}))
+
+    def test_holdout_blocked_force_train_retrains_below_the_floor(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        (self.s1 / "data/force-train").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)
+        self.assertNotIn("not retraining", log)
+        self.assertTrue((run2 / "adapter").exists(), log)
+
+    def test_holdout_blocked_alert_clears_on_not_promoted(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("holdout_blocked", self.status()["alerts"])
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0)               # re-evaluated: a genuine rejection
+        self.assertIn("no longer promotes", log)
+        self.assertNotIn("holdout_blocked", self.status().get("alerts", {}))
+
+    def test_malformed_report_takes_the_evaluation_failed_branch(self):
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_GARBAGE=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("EVALUATION UNAVAILABLE for runs/2026-01-01: report.json unreadable or malformed", log)
+        self.assertIn("evaluation_failed", (self.s1 / "data/pending-candidate").read_text())
+        self.assertFalse((self.s1 / "data/last-train-labels").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
         rc, log, _ = self.run_night(STUB_NEW_LABELS=4, STUB_PROMOTE=0)
@@ -494,7 +539,8 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
 
     def setUp(self):
         super().setUp()
-        from tests.test_s1_teacher import FakeProvider, answers_for, err
+        from tests.test_s1_teacher import SPENT_503, FakeProvider, answers_for, err
+        self.SPENT_503 = SPENT_503
         self.FakeProvider, self.answers_for, self.err = FakeProvider, answers_for, err
         shutil.copy(S1 / "label.py", self.s1 / "label.py")
         reqs = [{"id": f"r{i}", "split": "train", "unit_kind": "interactive", "request": f"task {i}"} for i in range(4)]
@@ -506,11 +552,12 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
         self.addCleanup(lambda: self.fake and self.fake.close())
 
     def test_quota_refusal_takes_the_stopped_early_path(self):
-        self.fake = self.FakeProvider([(200, {}, self.answers_for),
-                                       (503, {}, self.err("no claude subscription account can take this request"))])
+        self.fake = self.FakeProvider([(200, {}, self.answers_for), (503, {}, self.err(self.SPENT_503))]
+                                      + [(200, {}, self.answers_for)] * 2)
         rc, log, run = self.run_night(CORTADOS_PROVIDER_URL=self.fake.url)
         self.assertEqual(rc, 0, log)
-        self.assertIn("LABELING STOPPED EARLY (label.py rc 3, reason provider_stop)", log)
+        self.assertEqual(len(self.fake.seen), 2, "spent quota stops the pass at once")
+        self.assertIn("LABELING STOPPED EARLY (label.py rc 3, reason quota)", log)
         self.assertIn("training tonight", log)                    # the first batch's labels are new data
         self.assertIn("last_labeling_stopped_early", self.status())
         self.assertEqual(self.status()["last_label_count"], 2)
