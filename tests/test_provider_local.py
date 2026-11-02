@@ -29,11 +29,16 @@ class FakeOllama(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    gets = 0
+    tags_body = None            # a raw /api/tags body to answer instead (review round 3: non-object JSON)
+
     def do_GET(self):
         if self.path != "/api/tags":
             self.send_error(404)
             return
-        raw = json.dumps({"models": [{"name": t, "model": t} for t in self.tags]}).encode()
+        FakeOllama.gets += 1
+        raw = (FakeOllama.tags_body or
+               json.dumps({"models": [{"name": t, "model": t} for t in self.tags]}).encode())
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
@@ -228,6 +233,15 @@ class LocalPinTests(LocalHarness):
         self.assertIn("phi:latest", msg)
         self.assertIn("claude-opus-5-5", msg)
 
+    def test_probe_refuses_a_non_object_tags_body(self):
+        FakeOllama.tags_body = b"[]"
+        try:
+            code, msg = self.error_of(self.BODY)
+        finally:
+            FakeOllama.tags_body = None
+        self.assertEqual(code, 503)
+        self.assertIn("not an object", msg)
+
     def test_too_large_for_the_context_is_413(self):
         big = {**self.BODY, "messages": [{"role": "user", "content": "x" * (4 * 40000)}]}
         self.assertEqual(self.error_of(big)[0], 413)
@@ -281,8 +295,8 @@ class LocalPinTests(LocalHarness):
                 code, msg = self.error_of(body)
             finally:
                 FakeOllama.mode = "ok"
-            self.assertIn(code, (500, 502), mode)
-            self.assertIn("cortados", msg)
+            self.assertEqual(code, 502, mode)
+            self.assertIn("truncated or stalled", msg, mode)
             self.assertLess(len(msg), 1000)
             self.assertEqual(self.reg.sessions, {}, mode)              # the failed opener was cleaned up
 
@@ -455,6 +469,56 @@ class LocalAutoRoutingOffTests(unittest.TestCase):
                     local_lane.nodes()
                 self.assertIn(key, str(cm.exception))
             write_config(self.dir, "http://127.0.0.1:9")
+
+    def test_context_length_must_be_a_positive_integer(self):
+        path = os.environ[local_lane.CONFIG_ENV]
+        for bad in ("64k", 0, -1, True, 1.5, [], "x"):
+            cfg = json.loads(Path(path).read_text())
+            cfg["nodes"][0]["ollama"]["models"][0]["context_length"] = bad
+            Path(path).write_text(json.dumps(cfg))
+            with self.assertRaises(local_lane.LocalConfigError, msg=repr(bad)) as cm:
+                local_lane.nodes()
+            self.assertIn("context_length", str(cm.exception))
+        for good, want in ((65536, 65536), ("65536", 65536), (65536.0, 65536)):
+            cfg = json.loads(Path(path).read_text())
+            cfg["nodes"][0]["ollama"]["models"][0]["context_length"] = good
+            Path(path).write_text(json.dumps(cfg))
+            self.assertEqual(local_lane.nodes()[0]["models"][0]["context_length"], want)
+        del cfg["nodes"][0]["ollama"]["models"][0]["context_length"]
+        Path(path).write_text(json.dumps(cfg))
+        self.assertEqual(local_lane.nodes()[0]["models"][0]["context_length"], local_lane.DEFAULT_CONTEXT)
+
+    def test_a_local_name_colliding_with_a_served_model_is_refused(self):
+        served = "claude-sonnet-5"
+        cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
+        cfg["nodes"][0]["ollama"]["models"][0]["alias"] = served
+        Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
+        self.assertIn(served, routing.local_clashes(core))
+        with self.assertRaises(local_lane.LocalConfigError):
+            routing.local_pins(core)
+        keep = (core.STATE, core.lane_health, core.decide)
+        core.STATE = Path(tempfile.mkdtemp())
+        core.lane_health = lambda: {}
+        try:
+            # the pin is refused, loudly, instead of the local entry taking over sub/<served id>
+            r = routing.choose(core, {"model": f"sub/{served}", "messages": [{"role": "user", "content": "hi"}]},
+                               client="t", conversation_id="c")
+            self.assertIn("misconfigured", r["error"])
+            self.assertNotIn(local_lane.CONFIG_ENV, r["error"])
+            # and on the S1 path the exclusion still keeps the served model out
+            seen = {}
+            real = routing.execution_routing.select
+            routing.execution_routing.select = lambda core_, **kw: (seen.update(kw) or
+                                                                     {"provider": "codex-cli", "model": "gpt-6.1-sol"})
+            try:
+                routing.choose(core, {"model": "cortados", "messages": [{"role": "user", "content": "hi"}]},
+                               client="t", conversation_id="c", exclude_model=served)
+            finally:
+                routing.execution_routing.select = real
+            self.assertTrue(seen["constraints"]["excluded_routes"])
+            self.assertTrue(all(r == served for _, r in seen["constraints"]["excluded_routes"]))
+        finally:
+            core.STATE, core.lane_health, core.decide = keep
 
     def test_missing_base_url_is_a_config_error(self):
         os.environ["TEST_LOCAL_PRO_URL"] = ""

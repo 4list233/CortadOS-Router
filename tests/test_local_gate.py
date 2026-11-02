@@ -227,6 +227,32 @@ class GateTests(GateHarness):
             for sock in socks:
                 sock.close()
 
+    def test_expired_header_deadline_never_forwards_partial_headers(self):
+        import socket
+        import time
+        self.gate.header_deadline = 0.5
+        FakeOllama.gets = 0
+        sock = socket.create_connection(("127.0.0.1", self.gate.server_port))
+        try:
+            # a whole, authorised request line and token header, but never the blank line that ends the headers
+            sock.sendall(b"GET /api/tags HTTP/1.1\r\nx-api-key: " + TOKEN.encode() + b"\r\n")
+            sock.settimeout(3)
+            got = b""
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+            except OSError:
+                pass
+        finally:
+            sock.close()
+        time.sleep(0.2)
+        self.assertEqual(FakeOllama.gets, 0)                # nothing was forwarded
+        self.assertNotIn(b"HTTP/1.1 ", got)                 # and nothing answered: not even a 401
+        self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 200)
+
     def test_other_paths_are_404(self):
         auth = {"authorization": f"Bearer {TOKEN}"}
         for method, path, body in (("POST", "/api/pull", {"name": "x"}), ("DELETE", "/api/delete", {"name": TAG}),
@@ -441,7 +467,9 @@ class ProviderThroughGateTests(LocalHarness):
         os.chmod(os.path.join(self.tok_dir, "gate-token"), 0o644)
         code, msg = self.error_of(self.BODY)
         self.assertEqual(code, 503)
-        self.assertIn("chmod 600", msg)
+        self.assertIn("local node pro is misconfigured on the provider (see provider log)", msg)
+        self.assertNotIn(self.tok_dir, msg)                 # the provider's file paths never reach the client
+        self.assertNotIn("chmod", msg)
 
 
 if __name__ == "__main__":

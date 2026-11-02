@@ -649,10 +649,12 @@ class Handler(BaseHTTPRequestHandler):
                 data += [{"type": "model", "id": f"{routing.SUB_PREFIX}{m}",
                           "display_name": f"{routing.readable_model_name(m)} · CortadOS"} for _, m in pins]
                 try:
-                    local = local_lane.pins()
-                except local_lane.LocalConfigError as exc:   # same stance as a broken table: say so, hide nothing
+                    local = routing.local_pins(core)
+                except local_lane.LocalConfigError as exc:   # same stance as a broken table, without the file paths
                     logger.warning("/v1/models: cannot list the local pins: %s", exc)
-                    return self._error(500, "api_error", f"cortados: cannot list the local pins: {exc}")
+                    return self._error(500, "api_error", "cortados: cannot list the local pins: local node "
+                                       f"{getattr(exc, 'node', None) or '?'} is misconfigured on the provider "
+                                       "(see provider log)")
                 data += [{"type": "model", "id": f"{routing.SUB_PREFIX}{local_lane.pin_id(m)}",
                           "display_name": f"{m['name']} · CortadOS ({n['label']})"} for n, m in local]
             return self._json(200, {"data": data, "has_more": False, "first_id": data[0]["id"],

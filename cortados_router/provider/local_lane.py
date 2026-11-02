@@ -35,7 +35,12 @@ READ_TIMEOUT_S = 300.0
 
 
 class LocalConfigError(ValueError):
-    """The local-resources config is unreadable or its `ollama` block is malformed."""
+    """The local-resources config is unreadable or its `ollama` block is malformed. `node` names the node when known:
+    the full message (which may hold a file path) is for the provider log; a client is told only the node."""
+
+    def __init__(self, message: str, node: str | None = None):
+        super().__init__(message)
+        self.node = node
 
 
 class LocalUnavailable(RuntimeError):
@@ -67,35 +72,35 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
             raise LocalConfigError("an `ollama` block needs a node `id` and must be an object")
         if block.get("auto_route", False) is not False:
             raise LocalConfigError(f"node {nid}: auto_route is not built yet (local lanes are pin-only until they are "
-                                   "evaluated and given routing-table candidates); set it to false")
+                                   "evaluated and given routing-table candidates); set it to false", nid)
         env_name = block.get("base_url_env")
         base = (os.environ.get(env_name) if env_name else None) or block.get("base_url") or ""
         base = base.strip().rstrip("/")
         u = urllib.parse.urlparse(base)
         if u.scheme not in ("http", "https") or not u.hostname:
             where = f"${env_name}" if env_name else "base_url"
-            raise LocalConfigError(f"node {nid}: no usable Ollama base URL (set {where} to http://<host>:11434)")
+            raise LocalConfigError(f"node {nid}: no usable Ollama base URL (set {where} to http://<host>:11434)", nid)
         token = None
         tf_env = block.get("token_file_env")
         token_file = (os.environ.get(tf_env) if tf_env else None) or block.get("token_file")
         if tf_env and not token_file:
-            raise LocalConfigError(f"node {nid}: ${tf_env} is not set (the path of the local gate's token file)")
+            raise LocalConfigError(f"node {nid}: ${tf_env} is not set (the path of the local gate's token file)", nid)
         if token_file:
             from cortados_router.local_gate import GateConfigError, read_token   # same file rules as the gate
             try:
                 token = read_token(token_file)
             except GateConfigError as exc:
-                raise LocalConfigError(f"node {nid}: {exc}") from exc
+                raise LocalConfigError(f"node {nid}: {exc}", nid) from exc
         models = []
         for m in block.get("models") or []:
             mid = str(m.get("id") or "").strip()
             if not mid:
-                raise LocalConfigError(f"node {nid}: every model needs an `id` (the Ollama tag)")
+                raise LocalConfigError(f"node {nid}: every model needs an `id` (the Ollama tag)", nid)
             entry = {"id": mid, "alias": (str(m["alias"]).strip() or None) if m.get("alias") else None,
-                     "name": m.get("name") or mid, "context_length": int(m.get("context_length") or 32768)}
+                     "name": m.get("name") or mid, "context_length": _context_length(m, nid, mid)}
             for pin in {mid.casefold(), (entry["alias"] or mid).casefold()}:
                 if pin in seen:
-                    raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})")
+                    raise LocalConfigError(f"pin name {pin!r} is offered twice (nodes {seen[pin]} and {nid})", nid)
                 seen[pin] = nid
             models.append(entry)
         timeouts = {}
@@ -106,11 +111,32 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
             except (TypeError, ValueError):
                 timeouts[key] = -1.0
             if not timeouts[key] > 0:            # 0 would make the socket non-blocking; negative raises mid-turn
-                raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds")
+                raise LocalConfigError(f"node {nid}: {key} must be a positive number of seconds", nid)
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
                     "base_url": base, "models": models, "token": token,
                     **timeouts})
     return out
+
+
+DEFAULT_CONTEXT = 32768
+
+
+def _context_length(m: dict[str, Any], nid: str, mid: str) -> int:
+    """A model's configured context in tokens: the input-fit gate. Absent means DEFAULT_CONTEXT; anything else must be
+    a positive integer ("64k", 0, true are refused, not guessed at: a wrong value lets oversized turns through)."""
+    if "context_length" not in m or m["context_length"] is None:
+        return DEFAULT_CONTEXT
+    v = m["context_length"]
+    try:
+        if isinstance(v, bool) or isinstance(v, float) and not v.is_integer():
+            raise ValueError
+        n = int(v)
+    except (TypeError, ValueError):
+        raise LocalConfigError(f"node {nid}: model {mid}: context_length must be a positive integer of tokens, "
+                               f"got {v!r}", nid) from None
+    if n <= 0:
+        raise LocalConfigError(f"node {nid}: model {mid}: context_length must be positive, got {v!r}", nid)
+    return n
 
 
 def pin_id(model: dict[str, Any]) -> str:
@@ -165,6 +191,8 @@ def probe(node: dict[str, Any]) -> set[str]:
         if resp.status != 200:
             raise LocalUnavailable(f"node {node['node']} answered /api/tags with HTTP {resp.status}")
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("/api/tags answered JSON that is not an object")
     except (OSError, http.client.HTTPException, ValueError) as exc:
         raise LocalUnavailable(f"node {node['node']} did not answer /api/tags within {node['probe_timeout_s']:g}s "
                                f"(asleep, offline or busy?): {type(exc).__name__}: {exc}") from exc
@@ -178,11 +206,17 @@ ERROR_BODY_MAX = 65536      # an error body is a short JSON message; more is not
 
 def _bounded_read(resp) -> bytes | None:
     """At most ERROR_BODY_MAX bytes of an error response, or None when it is truncated (IncompleteRead), stalls past
-    the read timeout, or the connection drops."""
+    the read timeout, or the connection drops. read(amt) returns a short read at EOF rather than raising, so the
+    length the response declared is checked: fewer bytes than min(declared, cap) is a truncated body."""
+    declared = resp.length                      # None for a chunked or close-delimited body
+    want = ERROR_BODY_MAX if declared is None else min(declared, ERROR_BODY_MAX)
     try:
-        return resp.read(ERROR_BODY_MAX)
+        data = resp.read(want)
     except (OSError, http.client.HTTPException):
         return None
+    if declared is not None and len(data) < want:
+        return None
+    return data
 
 
 def _send_json(handler, code: int, data: dict[str, Any]) -> None:

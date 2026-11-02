@@ -193,11 +193,15 @@ class GateHandler(BaseHTTPRequestHandler):
         super().setup()
         # The header deadline (HEADER_DEADLINE_S): http.server reads the request line and headers itself, so a timer
         # shuts the socket if they have not all arrived in time; _handle cancels it once they have.
+        self._expired = False
         self._header_timer = threading.Timer(self.server.header_deadline, self._expire)
         self._header_timer.daemon = True
         self._header_timer.start()
 
     def _expire(self) -> None:
+        # Flag first: http.server may already hold a partial header block (the shutdown makes its readline return
+        # early), and a request parsed from partial headers must never be forwarded or answered.
+        self._expired = True
         try:
             self.connection.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -280,12 +284,14 @@ class GateHandler(BaseHTTPRequestHandler):
     def _handle(self, method: str) -> None:
         try:
             self._handle_one(method)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
-            self.close_connection = True           # the client left or stalled mid-response: nothing to tell it
+        except OSError:                            # the client left, reset, stalled or was shut by a deadline
+            self.close_connection = True           # nothing to tell it
 
     def _handle_one(self, method: str) -> None:
         self._header_timer.cancel()              # the headers are in
         self.close_connection = True             # one request per connection: no keep-alive slot holding
+        if self._expired:                        # the header deadline fired: these headers may be partial
+            return
         if not self._authorized():               # before the path or body is looked at
             if self._drain():
                 self._send(401, _UNAUTHORIZED)
