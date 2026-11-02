@@ -39,11 +39,25 @@ def _system_text(system: Any) -> str:
     raise WireError("system must be a string or a list of text blocks")
 
 
+def without_cache_control(block: dict[str, Any]) -> dict[str, Any]:
+    """Copy a client block without cache metadata, including nested content blocks.
+
+    The backend CLI owns its cache breakpoints. Client markers collided with its own live on
+    2026-11-02: API Error: 400 messages.103.content.0.cache_control.ttl: a ttl='1h'
+    cache_control block must not come after a ttl='5m' cache_control block.
+    Only block metadata is stripped: tool inputs and JSON schemas are application data.
+    """
+    out = {k: v for k, v in block.items() if k != "cache_control"}
+    if isinstance(out.get("content"), list):
+        out["content"] = [without_cache_control(b) if isinstance(b, dict) else b for b in out["content"]]
+    return out
+
+
 def _blocks(content: Any) -> list[dict[str, Any]]:
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if isinstance(content, list):
-        return [b for b in content if isinstance(b, dict)]
+        return [without_cache_control(b) for b in content if isinstance(b, dict)]
     raise WireError("message content must be a string or a list of blocks")
 
 
@@ -125,7 +139,7 @@ def parse_request(body: dict[str, Any]) -> ClientTurn:
     choice = (body.get("tool_choice") or {"type": "auto"}).get("type")
     if choice != "auto":
         raise WireError(f"tool_choice {choice!r} is not supported by the cortados model; only 'auto'")
-    return ClientTurn(system=_system_text(body.get("system")), tools=[t for t in tools if t.get("name")],
+    return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools if t.get("name")],
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID))

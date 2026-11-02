@@ -47,6 +47,20 @@ FOLLOW_UP = request(
 
 
 class ParseCaptureTests(unittest.TestCase):
+    def test_cache_markers_are_discarded_for_content_results_and_replay(self):
+        body = request(user("old"),
+            {"role": "assistant", "content": [{"type": "output_text", "text": "reply",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}}]},
+            {"type": "function_call_output", "call_id": "t", "output": [
+                {"type": "input_text", "text": "result", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]},
+            user("new"))
+        body["input"][0]["content"][0]["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+        turn = wire.parse_request(body)
+        self.assertNotIn("cache_control", json.dumps(turn.tool_results))
+        self.assertNotIn("cache_control", json.dumps(wire.one_shot_content(body)))
+        self.assertNotIn("cache_control", json.dumps(wire.parse_request(request(body["input"][0])).content))
+
+
     def test_the_real_request_parses_into_system_content_and_tools(self):
         turn = wire.parse_request(capture())
         self.assertEqual(turn.system, "<developer prompt>\n\n<skills instructions>\n\n<permissions instructions>")

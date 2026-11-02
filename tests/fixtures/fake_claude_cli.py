@@ -61,9 +61,20 @@ def assistant(blocks):
                                           "usage": {"input_tokens": 10, "output_tokens": 5}}})
 
 
+def check_cache(value):
+    """Reject leaked client cache metadata, including serialized fallback blocks."""
+    if '"cache_control"' in json.dumps(value).replace('\\\"', '"'):
+        out({"type": "result", "is_error": True, "result": "client cache_control reached backend"})
+        sys.exit(0)
+
+
 for line in sys.stdin:
     msg = json.loads(line)["message"]
+    check_cache(msg)
     text = " ".join(b.get("text", "") for b in msg["content"] if b.get("type") == "text")
+    if "backend failure" in text:
+        out({"type": "result", "is_error": True, "result": "API Error: 400 cache TTL ordering"})
+        continue
     n = 2 if "use two tools" in text else 1 if "use tool" in text else 0
     if "garbled" in text or "misnamed" in text or "ran locally" in text:
         # A model calls a tool that does not exist; the real CLI answers it with a tool error and the model goes on.
@@ -83,6 +94,7 @@ for line in sys.stdin:
         said = []
         for u in uses:
             r = rpc("tools/call", {"name": tools[0], "arguments": u["input"], "_meta": {"claudecode/toolUseId": u["id"]}})
+            check_cache(r)
             said.append(("ERR " if r.get("isError") else "") + " ".join(c.get("text", "") for c in r["content"]))
         assistant([{"type": "text", "text": "tool said: " + " | ".join(said)}])
     else:
