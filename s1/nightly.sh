@@ -4,6 +4,24 @@
 #   - it is Sunday night (weekly cadence), or
 #   - at least 150 newly labelled requests since the last training run (a busy week should not wait).
 # Forest 2026-09-21: cadence is Claude's call. Reason: a day adds <10% data; nightly retrains on that are noise and churn promotions.
+#
+# This file is the ONE canonical nightly (2026-11-02: replaces the Studio's forked ~/cortados/train/nightly.sh). Run it from the
+# checkout the scorer serves from, so a promotion lands where s1/serve.py reads. Every machine-specific value is an env var
+# (set them in the launchd plist or data/train-config.env); none of them names a host:
+#   CORTADOS_S1_SERVE_POINTER   file the scorer reads; promotion writes it atomically + keeps <file>.prev   (default: s1/current.json)
+#   CORTADOS_S1_SCORER_PLIST    scorer LaunchAgent unloaded during training      (default ~/Library/LaunchAgents/com.cortados.s1-scorer.plist)
+#   CORTADOS_S1_PY              training python with mlx_lm                      (default <repo>/.venv-mlx/bin/python)
+#   CORTADOS_S1_LABEL_PY        python that runs s1/label.py                      (default python3; label.py runs from this repo)
+#   CORTADOS_S1_TEACHER_ARGS    extra args for label.py (teacher selection etc.)  (default "--workers 3")
+#   CORTADOS_PROVIDER_URL, CORTADOS_PROVIDER_TOKEN_FILE   provider-backed teacher settings, passed to label.py through the env
+#   CORTADOS_ROUTER_DB_EXTRA    extra router dbs for dataset.py (os.pathsep list) (default ~/.cortados/router-air.db when it exists)
+#   CORTADOS_MCP_LEARNING_V1, CORTADOS_TRAINING_TEACHER_V1, CORTADOS_MCP_LEARNING_SITE_PACKAGES   feature flags read by
+#                               label.py / build_sft.py; =1 MCP learning also runs build_sft.py under CORTADOS_S1_PY
+#   CORTADOS_S1_STATUS          status file for the dashboard (default data/status.json)
+#   CORTADOS_S1_STALL_NIGHTS    nights without label growth before the ALERT (default 2)
+#   CORTADOS_S1_LOG_KEEP        nightly logs kept (default 14)
+#   CORTADOS_ROUTER_REPO        repo root for unitcost.py / bin/refresh-tiers.sh  (default ..)
+# Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
 PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop
@@ -25,9 +43,23 @@ fi
 [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && { echo "nightly already running (pid $(cat "$PIDFILE"))"; exit 0; }
 echo $$ > "$PIDFILE"; rm -f "$STOPFLAG"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-PY=../.venv-mlx/bin/python
-BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 [ -f data/train-config.env ] && . data/train-config.env
+PY="${CORTADOS_S1_PY:-../.venv-mlx/bin/python}"
+LABEL_PY="${CORTADOS_S1_LABEL_PY:-python3}"
+TEACHER_ARGS="${CORTADOS_S1_TEACHER_ARGS:---workers 3}"   # the teacher builder (s1-router-teacher) puts its flags here
+REPO_ROOT="${CORTADOS_ROUTER_REPO:-..}"
+SERVE_POINTER="${CORTADOS_S1_SERVE_POINTER:-$PWD/current.json}"   # serve.py reads current.json beside itself
+SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
+STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
+STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"   # one quiet night is normal (weekend); two in a row means the labeler is stuck
+LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
+BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
+export CORTADOS_S1_BASE="$BASE"
+# Forest 2026-10-26: fold the Air's synced routed usage into training (another machine rsyncs its router.db here);
+# dataset.py namespaces those rows by the db stem so they cannot collide.
+if [ -z "${CORTADOS_ROUTER_DB_EXTRA+x}" ] && [ -f "$HOME/.cortados/router-air.db" ]; then
+  export CORTADOS_ROUTER_DB_EXTRA="$HOME/.cortados/router-air.db"
+fi
 newest_unfinished_run() {   # most recent run that began a training segment but never wrote a report
   local d
   for d in $(ls -td runs/20*/ 2>/dev/null); do
@@ -37,7 +69,7 @@ newest_unfinished_run() {   # most recent run that began a training segment but 
 }
 prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfinished runs' checkpoints (~0.65 GB each) are dead weight
   local d promoted
-  promoted=$(python3 -c "import json;print(json.load(open('current.json'))['adapter'])" 2>/dev/null)
+  promoted=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'])" "${SERVE_POINTER:-current.json}" 2>/dev/null)
   for d in runs/20*/; do
     d=${d%/}
     [ "$d" = "$RUN" ] || [ -f "$d/report.json" ] || [ ! -d "$d/adapter" ] && continue
@@ -56,22 +88,53 @@ exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
 prune_unresumable_runs
 [ -f data/train-config.env ] && echo "train-config: $(grep -v '^#' data/train-config.env | tr '\n' ' ')"
+rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapters, reports) are untouched
+  local old
+  old=$(ls -t runs/*/nightly.log 2>/dev/null | tail -n +"$((LOG_KEEP + 1))")
+  [ -n "$old" ] && echo "$old" | while IFS= read -r f; do rm -f -- "$f"; done && echo "log rotation: removed $(echo "$old" | wc -l | tr -d ' ') old nightly log(s)"
+  return 0
+}
+rotate_logs
 gpu_alone() {   # Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
-  launchctl unload ~/Library/LaunchAgents/com.cortados.s1-scorer.plist 2>/dev/null; sleep 3; echo "scorer stopped for training; ollama + memory gateway stay up"
+  launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "${CORTADOS_S1_GPU_SETTLE:-3}"; echo "scorer stopped for training; ollama + memory gateway stay up"
 }
 gpu_share() {
-  launchctl load ~/Library/LaunchAgents/com.cortados.s1-scorer.plist 2>/dev/null; echo "scorer back"
+  launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
+state() { python3 -B ./nightly_state.py "$@"; }
 cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
 trap 'echo "stop requested"; touch "$STOPFLAG"; exit 130' TERM INT
-python3 ../cortados_router/unitcost.py > /dev/null 2>&1   # daily re-normalisation: tokens per percent per pool
-../bin/refresh-tiers.sh      # every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case. New models appear in routing the next morning, nobody edits a list.
-python3 dataset.py
-python3 label.py --workers 3
-python3 build_sft.py || exit 1
+# unitcost / refresh-tiers live in the router checkout; a missing one is logged, never fatal (labelling and training do not need them)
+if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
+else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
+# every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case.
+if [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then "$REPO_ROOT/bin/refresh-tiers.sh" || echo "refresh-tiers.sh failed (rc $?)"
+else echo "refresh-tiers.sh not found under $REPO_ROOT: skipped"; fi
+python3 dataset.py || { rc=$?; echo "DATASET FAILED (rc $rc): training skipped"; state event "$STATUS" dataset_failure "rc $rc"; exit 1; }
+# label.py runs from THIS checkout (not a release venv); the provider teacher reads CORTADOS_PROVIDER_URL / CORTADOS_PROVIDER_TOKEN_FILE
+# from the env. Only whether they are set is logged: the URL may name an internal host and the token file is a secret's path.
+purl=unset; [ -n "${CORTADOS_PROVIDER_URL:-}" ] && purl=set
+ptok=unset; [ -n "${CORTADOS_PROVIDER_TOKEN_FILE:-}" ] && ptok=set
+echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file $ptok)"
+# shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
+"$LABEL_PY" -B label.py $TEACHER_ARGS
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  # 2026-11-02: a failed labeler used to be ignored and the night retrained on yesterday's data.
+  echo "LABELING FAILED (label.py rc $rc): training skipped"
+  state event "$STATUS" labeling_failure "label.py rc $rc"
+  exit 3
+fi
+if [ "${CORTADOS_MCP_LEARNING_V1:-}" = "1" ]; then
+  "$PY" build_sft.py || exit 1
+else
+  python3 build_sft.py || exit 1
+fi
 
-labelled=$(python3 -c "import json;print(len({json.loads(l)['id'] for l in open('data/labels.jsonl')}))")
+read -r labelled labels_hash <<< "$(state labels data/labels.jsonl)"
+alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS")
+[ -n "$alert" ] && echo "$alert"
 last=$(cat data/last-train-count 2>/dev/null || echo 0)
 new=$((labelled - last))
 pending=0
@@ -79,7 +142,14 @@ if [ ! -f "$RUN/report.json" ] && { [ -f "$RUN/segment-target" ] || compgen -G "
   pending=1
 fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
-# Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence).
+# Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
+# 2026-11-02, the same labels + a warm start from the same adapter reproduce the incumbent, so a night with no new labels skips.
+# An interrupted run still resumes (its steps are unfinished work, not a repeat).
+if [ "$force" != "--train" ] && [ "$pending" -eq 0 ] && [ "$(cat data/last-train-labels 2>/dev/null)" = "$labelled $labels_hash" ]; then
+  echo "skipped: no new labels ($labelled labels, same as the last training run)"
+  state event "$STATUS" skip "no new labels ($labelled)"
+  echo "=== $(date) nightly end"; exit 0
+fi
 echo "labelled $labelled (+$new since last training); training tonight (pending run: $pending)"
 [ "$force" != "--train" ] && [ -f data/no-train-tonight ] && { echo "data/no-train-tonight present (another session holds the GPU): labelling only"; exit 0; }
 # laya night (Forest 2026-09-29: an overnight trial of how it affects the router model): when data/laya-tonight is present the
@@ -118,8 +188,8 @@ MAX_ITERS="${CORTADOS_S1_MAX_ITERS:-3600}"                          # a night is
 # sized to finish AND be evaluated before the 07:00 stop. 1,500 steps: ~3.2 h at the measured 0.13 step/s from ~02:00, leaving
 # ~1 h for evaluation; too many and the run is cut off unevaluated (the 10-03..10-13 failure), too few and a night adds little.
 # Warm LR 5e-5: half the from-scratch rate, so one night's continued training refines the adapter rather than overwriting it.
-if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f current.json ]; then
-  CORTADOS_S1_INIT=$(python3 -c "import json;print(json.load(open('current.json'))['adapter'] + '/adapters.safetensors')")
+if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f "${SERVE_POINTER:-current.json}" ]; then
+  CORTADOS_S1_INIT=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'] + '/adapters.safetensors')" "${SERVE_POINTER:-current.json}")
   MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
 fi
 if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then mkdir -p "$RUN/adapter"; cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/" 2>/dev/null; echo "warm start from $CORTADOS_S1_INIT"; fi
@@ -165,12 +235,20 @@ while :; do
   sleep 60
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
-gpu_share; sleep 20                                              # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
+gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
 HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --base "$BASE" --adapter "$RUN/adapter" --out "$RUN" --baseline || exit 1
 echo "$labelled" > data/last-train-count
+echo "$labelled $labels_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels   # the no-new-labels marker
+state event "$STATUS" train "$RUN ($labelled labels)"
 if python3 -c "import json,sys;sys.exit(0 if json.load(open('$RUN/report.json'))['promote'] else 1)"; then
-  python3 -c "import json;r=json.load(open('$RUN/report.json'));json.dump({'base':r['base'],'adapter':'$PWD/$RUN/adapter','temperatures':r['temperatures'],'promoted':r['when'],'report':'$PWD/$RUN/report.json','inference':{'fail_up_below':r.get('fail_up_below'),'outward_at':r.get('outward_at')},'holdout':{k:r['candidate'][k] for k in ('band_accuracy','under_routed','over_routed','outward_recall')}},open('current.json','w'),indent=1)"
-  echo "PROMOTED → current.json"
+  # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
+  # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
+  if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
+    state event "$STATUS" promotion "$RUN"
+    echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
+  else
+    echo "PROMOTION FAILED writing $SERVE_POINTER; incumbent stays"; exit 1
+  fi
 else
   echo "not promoted (see $RUN/report.json); incumbent stays"
 fi
