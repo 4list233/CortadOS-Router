@@ -229,7 +229,7 @@ class ChildTaskTests(unittest.TestCase):
         self.assertFalse([n for n in os.listdir(w["dir"]) if n.startswith("session-")])
         self.assertIn("-p", a)
         self.assertEqual(a[a.index("--output-format") + 1], "json")
-        self.assertNotIn("--append-system-prompt", a)          # cortados orchestrator: no directive
+        self.assertEqual(a[a.index("--append-system-prompt") + 1], ct.CHILD_DIRECTIVE)   # cortados: child directive only
         self.assertNotIn("tok-test-000000001", " ".join(a))    # token never in argv
         self.assertEqual(seen["nested"], "1")
         self.assertEqual(seen["subagent"], "cortados")
@@ -691,6 +691,17 @@ class ChildTaskTests(unittest.TestCase):
         ct.redact_file(path, ct.Redactor([tok]), chunk=13)   # chunk boundaries fall inside both tokens
         with open(path) as f:
             self.assertEqual(f.read(), "x" * 10 + "***" + "y" * 7 + "***")
+
+    def test_child_directive_in_argv(self):
+        for orch in ("cortados", "opus"):
+            tid = self.start(orchestrator=orch)
+            self.call("wait_task", task_id=tid, timeout_s=30)
+            a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+            self.assertEqual(a.count("--append-system-prompt"), 1, orch)
+            prompt = a[a.index("--append-system-prompt") + 1]
+            self.assertTrue(prompt.endswith(ct.CHILD_DIRECTIVE), orch)       # last, so it wins
+            if orch == "opus":
+                self.assertGreater(len(prompt), len(ct.CHILD_DIRECTIVE))      # the launcher's directive comes first
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

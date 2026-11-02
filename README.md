@@ -312,6 +312,10 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
   anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
   with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead.
+- Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
+  `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
+  `~/.claude/CLAUDE.md` does not make it delegate again. With a pinned orchestrator the launcher's whole-session
+  directive comes first and the child directive last, in the same flag.
 - `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
   signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Chrome inside a
   headless `-p` child is unverified until a live test.

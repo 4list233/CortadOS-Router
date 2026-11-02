@@ -86,6 +86,12 @@ NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start 
 # Claude Code refuses to start inside another Claude Code session when it sees this; the child is a fresh session.
 STRIP_ENV = ("CLAUDECODE",)
 MANAGED_DIRS = session.MANAGED_SETTINGS_DIRS   # tests point this elsewhere
+# Children load the same ~/.claude/CLAUDE.md as the user's top-level sessions, whose ORCHESTRATOR directive says to
+# delegate via start_task/route_task; this tells the child unambiguously that it is the delegate.
+CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do the task yourself, directly and "
+                   "completely; do not delegate it again and do not call start_task. Your final message is returned to "
+                   "the orchestrator: end with a concise report of what you did, what you verified, and anything left "
+                   "undone.")
 
 
 class TaskError(Exception):
@@ -404,6 +410,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     except session.SessionError as exc:
         raise TaskError(f"cannot prepare the child session: {exc}") from None
     cmd[0] = exe
+    _add_child_directive(cmd)
     env[NESTED_ENV] = "1"
     if conn_note:
         with open(os.path.join(d, "runner.log"), "a", encoding="utf-8") as f:
@@ -421,6 +428,19 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
                                               "event": _event_fields(meta), "started_at": meta["started_at"]})
     _write_json(os.path.join(d, "meta.json"), meta)    # before Popen: a task dir always has its meta
     return meta, env, cmd
+
+
+def _add_child_directive(cmd: list) -> None:
+    """Append CHILD_DIRECTIVE to the system prompt, LAST. Order: claude's own prompt, then CLAUDE.md, then the
+    --append-system-prompt text; within that text a pinned orchestrator's whole-session directive comes first and the
+    child directive after it, so the child directive is the final word. One flag only: the launcher's value is
+    extended rather than a second --append-system-prompt added (whether a repeated flag concatenates or replaces is
+    not documented)."""
+    if "--append-system-prompt" in cmd:
+        i = cmd.index("--append-system-prompt") + 1
+        cmd[i] = cmd[i] + "\n\n" + CHILD_DIRECTIVE
+    else:
+        cmd += ["--append-system-prompt", CHILD_DIRECTIVE]
 
 
 def _event_fields(meta: dict) -> dict:
