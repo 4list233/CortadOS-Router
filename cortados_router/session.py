@@ -9,19 +9,20 @@ subagents, which keep every tool including MCP, are sent to `cortados` so S1 rou
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
-ORCHESTRATORS = {
-    "fable": "sub/claude-fable-5-1",
-    "opus": "sub/claude-opus-5-5",
-    "sonnet": "sub/claude-sonnet-5-5",
-}
+from cortados_router.provider import routing
+
+# Short names map to the ids the provider itself serves (routing.SUB_ALIASES is the provider's alias table, checked
+# against the tables' claude-cli models), so the launcher can never pin a model the provider would refuse.
+ORCHESTRATORS = {name: routing.SUB_PREFIX + model for name, model in routing.SUB_ALIASES.items()}
 DEFAULT_ORCHESTRATOR = "fable"
 DEFAULT_TOKEN_FILE = "~/.config/cortados/provider-token"
 # Side calls (titles, summaries) skip S1: they are tiny, and S1 scoring would add latency to every one.
-SMALL_FAST_MODEL = "sub/claude-haiku-5-5"
+SMALL_FAST_MODEL = routing.SUB_PREFIX + routing.SUB_ALIASES["haiku"]
 DIRECTIVE_FILE = Path(__file__).resolve().parent.parent / "integrations" / "orchestrator-directive.md"
 # Same list the plugin blanks (integrations/claude-mod/cortados-routed-subagents/hooks/register.ts) so no
 # alternative provider in the user's env can take the session away from ANTHROPIC_BASE_URL.
@@ -39,7 +40,13 @@ SECRET_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 # its directive a second time. It is turned off for this session only (`enabledPlugins` is the settings key in
 # Claude Code 2.1.316; explicit enabledPlugins values win over defaults).
 PLUGIN_ID = "cortados-routed-subagents@cortados-router"
-SETTINGS_JSON = '{"enabledPlugins":{"%s":false}}' % PLUGIN_ID
+# Claude Code applies a settings file's `env` over the process environment, so a user/project settings.json with its
+# own ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL would win over the launcher's env and could send the session (and a real
+# key) elsewhere. Settings sources merge user < project < local < flag < policy (Claude Code 2.1.316), so the launcher
+# writes its env into a private file passed with `--settings` (flag precedence; never secrets in argv). Only managed
+# policy outranks it, so a managed env that sets any of these keys refuses the launch.
+SETTINGS_FILE = "~/.config/cortados/session-settings.json"
+MANAGED_SETTINGS_DIRS = ("/Library/Application Support/ClaudeCode", "/etc/claude-code")
 
 
 class SessionError(Exception):
@@ -68,9 +75,9 @@ def read_token(path: str) -> str:
     return token
 
 
-def build_env(base: dict, provider_url: str, token: str) -> dict:
-    env = dict(base)
-    env.update(
+def launcher_env(provider_url: str, token: str) -> dict:
+    """Every variable the launcher sets (BLANKED ones as empty)."""
+    env = dict(
         {
             "ANTHROPIC_BASE_URL": provider_url,
             # Both, so a saved Console key cannot leak in through either variable.
@@ -94,8 +101,75 @@ def build_env(base: dict, provider_url: str, token: str) -> dict:
     return env
 
 
-def build_argv(model: str, directive: str | None, extra: list) -> list:
-    argv = ["claude", "--model", model, "--settings", SETTINGS_JSON]
+def build_env(base: dict, provider_url: str, token: str) -> dict:
+    # Kept in the process env too, so anything that reads the environment before settings load sees the same values.
+    return {**base, **launcher_env(provider_url, token)}
+
+
+def settings_content(provider_url: str, token: str) -> dict:
+    return {"env": launcher_env(provider_url, token), "enabledPlugins": {PLUGIN_ID: False}}
+
+
+def write_settings(path: str, content: dict) -> str:
+    """Write the per-session settings privately: directory 0700, file created 0600 under a temp name and atomically
+    renamed over the previous launch's file, so the token is never readable by others, even briefly."""
+    p = Path(os.path.expanduser(path))
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(p.parent, 0o700)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        os.unlink(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(content, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return str(p)
+
+
+def managed_settings_files(dirs=MANAGED_SETTINGS_DIRS) -> list:
+    files = []
+    for d in dirs:
+        root = Path(d)
+        files.append(root / "managed-settings.json")
+        drop = root / "managed-settings.d"
+        try:
+            files += sorted(f for f in drop.iterdir() if f.name.endswith(".json") and not f.name.startswith("."))
+        except OSError:
+            pass
+    return files
+
+
+def check_managed(keys, dirs=MANAGED_SETTINGS_DIRS) -> None:
+    """Managed policy settings outrank `--settings`; refuse to launch if one sets any variable the launcher owns."""
+    for f in managed_settings_files(dirs):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise SessionError(f"cannot read managed settings {f}: {exc}") from None
+        env = data.get("env") if isinstance(data, dict) else None
+        clash = sorted(k for k in (env or {}) if k in keys) if isinstance(env, dict) else []
+        if clash:
+            raise SessionError(
+                f"managed settings {f} set {', '.join(clash)} in env; they override the launcher, so the session "
+                "would not run on the cortados provider. Ask the administrator to remove them."
+            )
+
+
+def build_argv(model: str, directive: str | None, extra: list, settings_path: str) -> list:
+    argv = ["claude", "--model", model, "--settings", settings_path]
     if directive:
         argv += ["--append-system-prompt", directive]
     return argv + list(extra)
@@ -121,10 +195,11 @@ def parse(argv: list):
     ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     ap.add_argument("--no-delegate-directive", action="store_true")
     ap.add_argument("--print-env", action="store_true")
+    ap.add_argument("--settings-file", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
-def prepare(argv: list, base_env: dict):
+def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS):
     args, extra = parse(argv)
     url = (args.provider_url or base_env.get("CORTADOS_PROVIDER_URL") or "").strip()
     if not url:
@@ -134,13 +209,15 @@ def prepare(argv: list, base_env: dict):
     directive = None
     if not args.no_delegate_directive:
         directive = DIRECTIVE_FILE.read_text(encoding="utf-8").strip()
-    return args, build_env(base_env, url, token), build_argv(model, directive, extra)
+    check_managed(set(launcher_env(url, token)), managed_dirs)
+    settings_path = write_settings(args.settings_file or SETTINGS_FILE, settings_content(url, token))
+    return args, build_env(base_env, url, token), build_argv(model, directive, extra, settings_path)
 
 
-def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr) -> int:
+def main(argv=None, base_env=None, out=sys.stdout, err=sys.stderr, managed_dirs=MANAGED_SETTINGS_DIRS) -> int:
     base = dict(os.environ if base_env is None else base_env)
     try:
-        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base)
+        args, env, cmd = prepare(list(sys.argv[1:] if argv is None else argv), base, managed_dirs)
     except SessionError as exc:
         print(f"cortados session: {exc}", file=err)
         return 2

@@ -216,24 +216,33 @@ Legacy `WANGCAI_*` names still work and log a deprecation warning.
 
 ```sh
 export CORTADOS_PROVIDER_URL=http://<provider-host>:<port>   # token in ~/.config/cortados/provider-token
-python3 -m cortados_router.session                           # --orchestrator fable|opus|sonnet|<model id>|cortados
+python3 -m cortados_router.session                           # --orchestrator fable|opus|sonnet|haiku|<model id>|cortados
 ```
 
 What runs where:
 
-- **Main loop (orchestrator):** pinned with `--model sub/claude-fable-5-1` (default; `opus`/`sonnet` or any Claude id
-  get `sub/` prepended). No S1. `--orchestrator cortados` lets S1 route the main loop too.
+- **Main loop (orchestrator):** pinned with `--model sub/claude-fable-5-1` (default). The short names come from the
+  provider's own `sub/` alias table (`routing.SUB_ALIASES`): `opus` = `claude-opus-5-5`, `sonnet` = `claude-sonnet-5`,
+  `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
   calls back to this Claude Code, which runs them locally.
-- **Side calls** (titles, summaries): `ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-5-5`, so they stay cheap and skip
+- **Side calls** (titles, summaries): `ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-4-5-20251001`, so they stay cheap and skip
   S1 latency.
 - The provider token is set as both `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`; Bedrock/Vertex/Foundry selectors
   are blanked; `x-cortados-reveal: 1` is sent; `CORTADOS_WHOLE_SESSION=1` is set.
+- Claude Code applies a settings file's `env` over the process environment, so a saved `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` (or a project's) would override the launcher. So every launcher
+  variable, token included, is written to a private per-session settings file,
+  `~/.config/cortados/session-settings.json` (directory 0700, file 0600, atomically replaced each launch), and passed
+  with `--settings <path>`. That is flag precedence, which beats user, project and local settings; the token is never
+  in argv. The same variables stay in the process env. Only managed policy settings outrank flag settings, so if
+  `/Library/Application Support/ClaudeCode/managed-settings.json` (or `/etc/claude-code/…`, or a
+  `managed-settings.d/*.json` drop-in) sets any of these variables in `env`, the launcher refuses to start.
 - The orchestrator directive (`integrations/orchestrator-directive.md`) is appended with `--append-system-prompt`
-  (`--no-delegate-directive` skips it). The routed-subagents plugin is turned off for this session with
-  `--settings '{"enabledPlugins":{"cortados-routed-subagents@cortados-router":false}}'` so subagents are not routed
-  twice and the directive is not added twice.
+  (`--no-delegate-directive` skips it). The same settings file turns the routed-subagents plugin off for this session
+  (`"enabledPlugins": {"cortados-routed-subagents@cortados-router": false}`) so subagents are not routed twice and the
+  directive is not added twice.
 - `--print-env` shows the env (token masked) and the `claude` argv without launching. Args after `--` go to `claude`.
 
 Known limits: terminal Claude Code only. Desktop-app-only MCP tools (for example the in-app browser) are not
