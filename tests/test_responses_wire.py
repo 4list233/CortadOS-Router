@@ -245,17 +245,33 @@ class ConversationDigestTests(unittest.TestCase):
 
 
 class RecursionGuardTests(unittest.TestCase):
-    def test_a_recursion_error_while_parsing_is_a_wire_error(self):
-        # The earlier-item digest follows client nesting; exhausting the handler's stack must come back as a request
-        # error, never as a RecursionError escaping the handler.
-        def deep(_body):
-            raise RecursionError("maximum recursion depth exceeded")
-        original, wire._parse_request = wire._parse_request, deep
-        try:
-            with self.assertRaisesRegex(WireError, "nested too deeply"):
-                wire.parse_request({"model": wire.MODEL_ID, "input": []})
-        finally:
-            wire._parse_request = original
+    def test_deep_nesting_in_an_earlier_item_never_raises_recursion_error(self):
+        # The earlier-item digest follows client nesting. At the deepest body json.loads accepts, and called from a
+        # deeper stack as a handler thread would, parse_request must return or raise WireError, never RecursionError.
+        def text(depth):
+            nested = "[" * depth + '"x"' + "]" * depth
+            return ('{"model": "' + wire.MODEL_ID + '", "input": ['
+                    '{"type": "message", "role": "user", "content": ' + nested + '}, '
+                    '{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}]}, '
+                    '{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}]}')
+        depth, body = 1000, None
+        while body is None:
+            try:
+                body = json.loads(text(depth))
+            except RecursionError:
+                depth -= 10
+        self.assertGreater(depth, 400)
+
+        def from_deeper_stack(frames, b):
+            return from_deeper_stack(frames - 1, b) if frames else wire.parse_request(b)
+
+        for frames in (0, 120, 300):
+            try:
+                from_deeper_stack(frames, body)
+            except WireError:
+                pass
+            except RecursionError:
+                self.fail("parse_request raised RecursionError")
 
 
 class RefusalTests(unittest.TestCase):

@@ -115,6 +115,21 @@ class ConversationDigestRobustnessTests(unittest.TestCase):
             content = [{"type": "tool_result", "tool_use_id": f"t{i}", "content": content}]
         return content
 
+    def test_reminder_stripping_is_linear_and_matches_the_span_rule(self):
+        import random, re, time
+        # Quadratic before (a regex rescanning to the end for each unclosed opening): 32 000 unclosed openings in
+        # ~750 KB took 55 s. The scan must stay fast and keep the old rule's result.
+        poisoned = ("<system-reminder> " + "y" * 6) * 32000
+        t0 = time.time()
+        wire.conversation_digest([{"role": "user", "content": poisoned}])
+        self.assertLess(time.time() - t0, 2.0)
+        old = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+        parts = ["<system-reminder>", "</system-reminder>", "<system-", "reminder>", " ", "\n", "a", "b"]
+        rng = random.Random(7)
+        for _ in range(5000):
+            text = "".join(rng.choice(parts) for _ in range(rng.randint(0, 12)))
+            self.assertEqual(wire.canonical_text(text), " ".join(old.sub(" ", text).split()), text)
+
     def test_deep_nesting_never_raises_recursion_error(self):
         # The deepest tool_result nesting json.loads accepts here (about 490 levels, ~980 JSON levels): the deepest
         # body the server can ever hand to parse_request. Built as text, since json.dumps has the same limit.

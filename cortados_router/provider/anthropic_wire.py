@@ -91,14 +91,28 @@ def reply_fingerprint(blocks: Any) -> str:
 
 # Client-injected transient text inside user content. Claude Code wraps its reminders (todo state, file-change notes,
 # hook output) in <system-reminder> and re-renders earlier ones from turn to turn, so they say nothing about which
-# conversation a request belongs to. Non-greedy, multi-line; an unclosed tag is left alone (it is user text).
-_TRANSIENT_SPANS = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+# conversation a request belongs to. An unclosed tag is left alone (it is user text).
+_OPEN, _CLOSE = "<system-reminder>", "</system-reminder>"
 
 
 def canonical_text(text: Any) -> str:
     """User or tool text with client-injected reminder spans removed and whitespace collapsed, so re-rendered
-    wrappers and spacing do not change a conversation's identity."""
-    return " ".join(_TRANSIENT_SPANS.sub(" ", str(text)).split())
+    wrappers and spacing do not change a conversation's identity. Scanned with str.find, not a regex:
+    `<system-reminder>.*?</system-reminder>` rescans to the end of the string for every opening tag without a closing
+    one, which is quadratic in a client-sized tool result (a 368 KB body cost 4.7 s, paid again on every later turn).
+    An unclosed opening ends the scan: no later opening can have a closing tag after it either."""
+    s, out, i = str(text), [], 0
+    while True:
+        a = s.find(_OPEN, i)
+        if a < 0:
+            break
+        b = s.find(_CLOSE, a)
+        if b < 0:
+            break
+        out.append(s[i:a])
+        i = b + len(_CLOSE)
+    out.append(s[i:])
+    return " ".join(" ".join(out).split())
 
 
 # How deep canonical_parts follows tool_result content nested inside tool_result content. Real clients nest one level
