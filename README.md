@@ -212,6 +212,33 @@ Legacy `WANGCAI_*` names still work and log a deprecation warning.
 | `x-cortados-run-id` | request | tag this request as part of a client-tracked run (`[A-Za-z0-9_-]{8,64}`), so later requests and `GET /v1/cortados/runs/<id>` can learn what it actually ran on |
 | `GET /v1/cortados/runs/<id>` | — | returns `{run_id, model, label, provider, models, builder_models}` for a tagged run (404 unknown id, 400 invalid); advisory, since any token holder can write to a run id |
 
+## Whole session on the router (recommended)
+
+```sh
+export CORTADOS_PROVIDER_URL=http://<provider-host>:<port>   # token in ~/.config/cortados/provider-token
+python3 -m cortados_router.session                           # --orchestrator fable|opus|sonnet|<model id>|cortados
+```
+
+What runs where:
+
+- **Main loop (orchestrator):** pinned with `--model sub/claude-fable-5-1` (default; `opus`/`sonnet` or any Claude id
+  get `sub/` prepended). No S1. `--orchestrator cortados` lets S1 route the main loop too.
+- **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
+  each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
+  calls back to this Claude Code, which runs them locally.
+- **Side calls** (titles, summaries): `ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-5-5`, so they stay cheap and skip
+  S1 latency.
+- The provider token is set as both `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`; Bedrock/Vertex/Foundry selectors
+  are blanked; `x-cortados-reveal: 1` is sent; `CORTADOS_WHOLE_SESSION=1` is set.
+- The orchestrator directive (`integrations/orchestrator-directive.md`) is appended with `--append-system-prompt`
+  (`--no-delegate-directive` skips it). The routed-subagents plugin is turned off for this session with
+  `--settings '{"enabledPlugins":{"cortados-routed-subagents@cortados-router":false}}'` so subagents are not routed
+  twice and the directive is not added twice.
+- `--print-env` shows the env (token masked) and the `claude` argv without launching. Args after `--` go to `claude`.
+
+Known limits: terminal Claude Code only. Desktop-app-only MCP tools (for example the in-app browser) are not
+available. Whether claude.ai connectors load when the session uses a provider token is untested.
+
 ## Delegating sub-agent work through the router
 
 Point a whole tool at `cortados` to route everything, or keep your main session on its own model and route only the
