@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -164,7 +165,7 @@ class CodexSession:
         declared = {v: k for k, v in self._aliases.items()}
         if self._aliases:
             logger.info("codex conversation %s: client tools Codex would refuse or swallow are declared as %s", self.id[:8],
-                        sorted(self._aliases))
+                        ", ".join(f"{wire} -> {client}" for wire, client in sorted(self._aliases.items())))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
             "baseInstructions": system or "You are a helpful assistant.",
@@ -206,10 +207,15 @@ class CodexSession:
         msg = str(exc)
         if "dynamic tool" not in msg:
             return exc
-        hits = sorted({d["name"] for d in declared if d["name"] in msg}, key=len, reverse=True)
+        # A declared name counts only as a whole token of the message: a client tool named "tool", "name" or "is"
+        # would otherwise match the words of every refusal. The longest match wins, as a name may contain a shorter one.
+        hits = sorted({d["name"] for d in declared
+                       if re.search(r"(?<![A-Za-z0-9_-])" + re.escape(d["name"]) + r"(?![A-Za-z0-9_-])", msg)},
+                      key=len, reverse=True)
         if not hits:
-            return BridgeError(f"codex app-server refused a client tool name: {msg}")
-        wire = hits[0]                                  # the longest match: a name may contain a shorter one
+            return BridgeError(f"codex app-server refused a dynamic tool name this bridge cannot match to any of the "
+                               f"client's declared tools (none of them is known to be wrong): {msg}")
+        wire = hits[0]
         client = self._aliases.get(wire, wire)
         shown = f"{client!r}" + (f" (declared to Codex as {wire!r})" if client != wire else "")
         return BridgeError(f"codex app-server refused client tool {shown}: {msg}")

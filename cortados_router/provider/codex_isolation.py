@@ -8,7 +8,8 @@ and EXPECTED_ACCOUNT_TYPE, because a managed layer or a later edit of the home c
 leak detection used while a turn runs (LEAKED_ITEMS, BENIGN_MCP_TOOLS, the approval requests) and the tool-name
 aliases Codex needs live here too. codex_bridge.CodexSession drives the protocol; it decides nothing about isolation.
 
-Verified against Codex CLI 0.163.0 (docs/PROVIDER-PLAN.md, P2 status and live findings).
+Verified against Codex CLI 0.163.0 (docs/PROVIDER-PLAN.md, P2 status and live findings); the dynamic tool naming
+rule (SAFE_TOOL_NAME, MAX_TOOL_NAME, the reserved mcp namespace) was derived from the strings of codex-cli 0.166.0.
 """
 from __future__ import annotations
 
@@ -178,19 +179,26 @@ def _encode(name: str, taken: set[str]) -> str:
         base = ALIAS_PREFIX + name
     elif name.lower().startswith(RESERVED_TOOL_PREFIX):
         base = ENCODED_MCP_PREFIX + name[len(RESERVED_TOOL_PREFIX):]
+    elif name.lower() == "mcp":
+        # codex_safe rejects the bare name (conservative: Codex reserves the mcp namespace, and a tool called "mcp"
+        # is the root of it), so it must not go on the wire unchanged: mcp -> cx_mcp, MCP -> cx_MCP.
+        base = "cx_" + name
     else:
         base = name
     readable = re.sub(r"[^A-Za-z0-9_-]", "_", base) or "tool"
-    if readable.lower().startswith(RESERVED_TOOL_PREFIX):   # e.g. " mcp__x" after substitution
-        readable = "cx_" + readable
+    if readable.lower().startswith(RESERVED_TOOL_PREFIX) or readable.lower() == "mcp":
+        readable = "cx_" + readable                     # e.g. "mcp..x" -> "mcp__x" after substitution
     lossy = readable != base or len(readable) > MAX_TOOL_NAME
     if not lossy and readable not in taken:
         return readable
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
-    for n in range(8, len(digest) + 1):
+    # The suffix must stay shorter than MAX_TOOL_NAME (at most MAX - 2 hex digits plus "_"), or the slice below would
+    # go negative and the name would exceed the limit Codex enforces.
+    for n in range(8, min(len(digest), MAX_TOOL_NAME - 2) + 1):
         suffix = "_" + digest[:n]
         out = readable[:MAX_TOOL_NAME - len(suffix)] + suffix
         if out not in taken:
+            assert len(out) <= MAX_TOOL_NAME, out
             return out
     raise BridgeError(f"cannot find a Codex-safe name for client tool {name!r}")   # unreachable in practice
 

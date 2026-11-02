@@ -464,6 +464,37 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertIn("cx_mcp_srv__do_it", msg)
         self.assertIn("-32600", msg)
 
+    def test_a_decoy_tool_named_like_a_word_of_the_refusal_is_not_blamed(self):
+        # "dynamic tool name is reserved: ..." contains the words tool, name and is: a client tool of one of those
+        # names must not be reported as the refused one; the name Codex actually spelled out is.
+        tools = [{"name": "tool", "input_schema": {"type": "object"}}, {"name": "is", "input_schema": {"type": "object"}},
+                 {"name": "mcp__srv__do_it", "input_schema": {"type": "object"}}, READ_TOOL]
+        os.environ["FAKE_CODEX_RESERVED"] = "cx_mcp_srv__do_it"
+        try:
+            with self.assertRaises(BridgeError) as cm:
+                codex_bridge.CodexSession(system="s", tools=tools, codex_bin=[sys.executable, str(FAKE_CODEX)],
+                                          codex_home=self.codex_home, scratch_root=self.scratch)
+        finally:
+            del os.environ["FAKE_CODEX_RESERVED"]
+        msg = str(cm.exception)
+        self.assertIn("refused client tool 'mcp__srv__do_it'", msg)
+        self.assertNotIn("refused client tool 'tool'", msg)
+        self.assertNotIn("refused client tool 'is'", msg)
+
+    def test_a_refusal_naming_no_declared_tool_blames_none(self):
+        s = object.__new__(codex_bridge.CodexSession)
+        s._aliases = {}
+        # "toolname" is inside "zzz_toolname" but not a whole token of it: no declared tool is named by this message.
+        declared = [{"name": "toolname"}, {"name": "zzz"}, {"name": "Read"}]
+        err = s._tool_refusal(BridgeError("-32600: dynamic tool name is reserved: zzz_toolname"), declared)
+        msg = str(err)
+        self.assertIn("none of them is known to be wrong", msg)
+        self.assertNotIn("refused client tool", msg)
+        self.assertIn("zzz_toolname", msg)
+        # A declared name that is a whole token of the message still wins, the longest first.
+        err = s._tool_refusal(BridgeError("-32600: dynamic tool name is reserved: Read"), declared)
+        self.assertIn("refused client tool 'Read'", str(err))
+
     def test_a_client_gone_before_the_first_event_still_closes_the_one_shot_backend(self):
         # A tool-less streaming request whose client disconnects while the backend starts: the first SSE write fails
         # before the worker's cleanup exists. The one-shot's app-server is in no registry, so it must be closed here.
@@ -501,6 +532,26 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertTrue(any("system prompt changed mid-conversation" in line for line in logs.output))
         start = [m for m in self.inbound() if m.get("method") == "thread/start"]
         self.assertEqual([m["params"]["baseInstructions"] for m in start], ["A"])   # one thread, the original prompt
+
+    def test_a_changed_tool_set_on_a_continuation_is_warned_about_once_and_served_on_the_original_thread(self):
+        # find() continues by history; the thread declared its tools on thread/start, so a tool added mid-conversation
+        # is never declared to Codex. The limit is said once, names only; the conversation is served as before.
+        edit_tool = {"name": "Edit", "description": "edit", "input_schema": {"type": "object"}}
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"system": "A", "tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            r2 = self.post({"system": "A", "tools": [READ_TOOL, edit_tool], "messages": history})
+        self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
+        lines = [l for l in logs.output if "tool set changed mid-conversation" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("added ['Edit'], dropped []", lines[0])
+        [session] = self.reg.sessions.values()
+        self.assertTrue(session.tools_warned)
+        start = [m for m in self.inbound() if m.get("method") == "thread/start"]
+        self.assertEqual([[t["name"] for t in m["params"]["dynamicTools"]] for m in start], [["Read"]])   # one thread
 
     def test_two_overlapping_continuations_serve_one_and_refuse_the_other_without_losing_the_session(self):
         # Both pass Registry.find (same history) before either holds the session lock: the test holds the lock so
@@ -861,7 +912,7 @@ class CodexSessionUnitTests(unittest.TestCase):
             stop.set()
             codex_bridge.CODEX_SETTLE_S = settle
 
-    def test_tool_aliases_cover_the_codex_client_tool_set_and_refuse_a_taken_alias(self):
+    def test_tool_aliases_cover_the_codex_client_tool_set_and_hash_around_a_taken_alias(self):
         codex_client = [{"name": n} for n in ("exec_command", "write_stdin", "request_user_input", "view_image",
                                               "get_goal", "create_goal", "update_goal", "apply_patch", "update_plan")]
         aliases = codex_isolation.tool_aliases(codex_client + [{"name": "Read"}])
@@ -908,6 +959,34 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_safe_names_pass_through_unchanged(self):
         names = ["Read", "Edit", "Bash", "web-fetch", "Task_2", "z" * 64]
         self.assertEqual(codex_isolation.tool_aliases([{"name": n} for n in names]), {})
+
+    def test_the_bare_mcp_name_is_encoded_in_any_case_and_round_trips(self):
+        # codex_safe rejects "mcp" (the root of the namespace Codex reserves), so the wire name must differ from it.
+        self.assertFalse(codex_isolation.codex_safe("mcp"))
+        self.assertFalse(codex_isolation.codex_safe("MCP"))
+        wire = self.assert_codex_safe_round_trip(["mcp", "MCP", "Mcp", "mcp..x", "cx_mcp"])
+        self.assertTrue(wire["mcp"].startswith("cx_mcp_"), wire["mcp"])  # cx_mcp is a client tool here: hashed around
+        self.assertEqual(wire["cx_mcp"], "cx_mcp")
+        self.assertEqual(wire["MCP"], "cx_MCP")
+        self.assertEqual(wire["Mcp"], "cx_Mcp")
+        for n in ("mcp", "MCP", "Mcp", "mcp..x"):
+            self.assertNotEqual(wire[n], n)
+            self.assertNotEqual(wire[n].lower(), "mcp")
+        self.assertTrue(wire["mcp..x"].startswith("cx_mcp__x_"))         # mcp..x -> mcp__x after substitution -> cx_
+        self.assertEqual(codex_isolation.tool_aliases([{"name": "mcp"}]), {"cx_mcp": "mcp"})
+
+    def test_the_hash_suffix_never_pushes_a_name_past_64_even_when_every_shorter_suffix_is_taken(self):
+        taken, seen = set(), []
+        with self.assertRaises(BridgeError):                              # exhausts the 8..62 digit suffixes, then refuses
+            for _ in range(200):
+                out = codex_isolation._encode("mcp__server__" + "x" * 100, taken)
+                self.assertLessEqual(len(out), codex_isolation.MAX_TOOL_NAME, out)
+                self.assertRegex(out, r"^[A-Za-z0-9_-]{1,64}$")
+                self.assertNotIn(out, taken)
+                taken.add(out)
+                seen.append(out)
+        self.assertEqual(len(seen), codex_isolation.MAX_TOOL_NAME - 2 - 8 + 1)   # every suffix length 8..62 was used
+        self.assertEqual(len(set(seen)), len(seen))
 
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
