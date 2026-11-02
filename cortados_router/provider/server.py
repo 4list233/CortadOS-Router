@@ -368,7 +368,9 @@ def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: 
 
 
 def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> CodexSession:
-    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, **kw)   # Codex multi-account is Phase B
+    # Code mode must not yield to the model before the request's turn budget is spent (codex_isolation.EXEC_YIELD_KEY).
+    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, exec_yield_ms=int(TURN_TIMEOUT_S * 1000),
+                        **kw)   # Codex multi-account is Phase B
 
 
 # Backend per route provider. Each factory takes the registry (for its binary and gateway settings, read at call time
