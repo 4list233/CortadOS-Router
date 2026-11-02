@@ -34,7 +34,7 @@ def late_state(s):
     """The turn-tracking state CodexSession.__init__ sets, for sessions the unit tests build without a process: one
     live turn, "turn-1"."""
     s._call_tools, s._call_turn, s._orphaned, s._late, s._followups = {}, {}, {}, [], 0
-    s._turn_id, s._turns, s._ended, s._backlog = "turn-1", {"turn-1"}, set(), collections.deque()
+    s._turn_id, s._turns, s._ended, s._backlog, s._carried = "turn-1", {"turn-1"}, set(), collections.deque(), []
 
 
 class CodexEndpointTests(unittest.TestCase):
@@ -964,6 +964,63 @@ class CodexSessionUnitTests(unittest.TestCase):
             blocks, stop, _ = s.run_turn(10)
             self.assertEqual(stop, "end_turn")
             self.assert_followup_carries(log, second, "two")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_sibling_and_message_queued_before_turn_completed_reach_the_client_in_order(self):
+        # While the client runs call A, Codex queues sibling B and an agent message, then turn/completed. Those two
+        # precede the completion, so they are the live turn's: B goes to the client as tool_use, the message as text.
+        # A's result goes once, as follow-up text (the completion was queued before it could be written to the cell).
+        codex_bridge.CODEX_SETTLE_S = 0.05                               # return A before the fake queues the rest
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "siblings before end"}], timeout=10)
+            [a], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            time.sleep(1.0)                                              # B, the message and turn/completed are queued
+            s.deliver({a["id"]: {"content": [{"type": "text", "text": "RESULT-A"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            self.assertEqual([x["type"] for x in blocks], ["tool_use", "text"])     # FIFO: B, then the message
+            b = blocks[0]
+            self.assertNotEqual(b["id"], a["id"])
+            self.assertEqual((b["name"], b["input"]), ("Read", {"file_path": "f1.md"}))
+            self.assertEqual(blocks[1]["text"], "sibling text")
+            s.deliver({b["id"]: {"content": [{"type": "text", "text": "RESULT-B"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assertIn("RESULT-A", blocks[-1]["text"])
+            self.assertIn("RESULT-B", blocks[-1]["text"])
+            said = [c["text"] for r in self.replies_to_codex(log).values() for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.ENDED_AROUND])   # no result in a cell
+            text = Path(log).read_text()
+            self.assertEqual((text.count("RESULT-A"), text.count("RESULT-B")), (1, 1))     # each once, in the follow-up
+            self.assert_followup_carries(log, a, "RESULT-A")
+            self.assert_followup_carries(log, b, "RESULT-B")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_sibling_queued_after_turn_completed_is_refused_and_never_reaches_the_client(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "sibling after end"}], timeout=10)
+            [a], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            time.sleep(1.0)                                              # turn/completed, then the stale B, are queued
+            s.deliver({a["id"]: {"content": [{"type": "text", "text": "RESULT-A"}], "isError": False}})
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assertEqual([x["type"] for x in blocks], ["text"])      # no tool_use for B
+            self.assertIn("RESULT-A", blocks[0]["text"])
+            self.assertIn("refused, not forwarded", "\n".join(logs.output))
+            said = [c["text"] for r in self.replies_to_codex(log).values() for c in (r or {}).get("contentItems") or []]
+            self.assertEqual(said, [codex_bridge.ENDED_AROUND, codex_bridge.TURN_ENDED])
+            self.assertEqual(Path(log).read_text().count("RESULT-A"), 1)
+            self.assert_followup_carries(log, a, "RESULT-A")
         finally:
             s.close()
             os.environ.pop("FAKE_CODEX_LOG", None)

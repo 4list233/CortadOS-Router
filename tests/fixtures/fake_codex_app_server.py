@@ -17,6 +17,12 @@ integers from 0, replies echo the client's string ids. Triggers on the text of t
                    ({"file_path": "stale.md"}) still naming the ended turn, and after that call's reply an agentMessage
                    "obsolete answer" of the ended turn. Requests that arrive meanwhile (a turn/start) are served
                    after it, in order, as a server reading one stdin would;
+  "siblings before end"  one call A; 0.5 s later, without waiting for A's reply, a sibling call B
+                   ({"file_path": "f1.md"}), an agentMessage "sibling text" and turn/completed (status completed), in
+                   that order: code mode queueing a sibling and a message just before the turn ends;
+  "sibling after end"  one call A; 0.5 s later turn/completed, then a call B ({"file_path": "f1.md"}) still naming the
+                   ended turn. In both, the replies to A and B are read and dropped; requests that arrive meanwhile are
+                   served after them, in order;
   "fail"           turn/completed with status failed and codexErrorInfo usageLimitExceeded;
   "leak builtin"   an item/started carrying a commandExecution item (a built-in tool ran), then a normal completion;
   "reroute"        a model/rerouted notification (Codex moved the turn to another model), then "echo: <text>";
@@ -244,6 +250,35 @@ def run_turn(mid, params):
                 break
             state["deferred"].append(msg)
         agent_message(turn_id, "obsolete answer")
+        return
+    if ("siblings before end" in text or "sibling after end" in text) and state["tools"]:
+        tool, rids = state["tools"][0], set()
+
+        def call(i):
+            call_id, rid, args = "exec-" + str(uuid.uuid4()), next(server_ids), {"file_path": f"f{i}.md"}
+            item(turn_id, "item/started", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": tool,
+                                           "arguments": args, "status": "inProgress", "contentItems": None, "success": None})
+            out({"method": "item/tool/call", "id": rid, "params": {"threadId": state["thread"], "turnId": turn_id,
+                                                                   "callId": call_id, "namespace": None, "tool": tool,
+                                                                   "arguments": args}})
+            rids.add(rid)
+        call(0)
+        time.sleep(0.5)
+        if "siblings before end" in text:
+            call(1)
+            agent_message(turn_id, "sibling text")
+            completed(turn_id, "completed")
+        else:
+            completed(turn_id, "completed")
+            call(1)
+        while rids:                                     # both replies; anything else is served afterwards
+            msg = read()
+            if msg is None:
+                sys.exit(0)
+            if "method" not in msg and msg.get("id") in rids:
+                rids.discard(msg["id"])
+            else:
+                state["deferred"].append(msg)
         return
     if "late sibling" in text and state["tools"]:
         tool = state["tools"][0]
