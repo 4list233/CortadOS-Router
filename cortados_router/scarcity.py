@@ -464,16 +464,24 @@ def _bundle_codex_candidates(bundles, note) -> list[str]:
     """Codex binaries inside app bundles: each Contents/Resources/codex-package.json (or one directory below it) names
     its CLI in "entrypoint", resolved against that manifest's own directory; then a bounded Resources/codex*/bin/codex
     for a bundle that ships no manifest. Depth is bounded on purpose: an unbounded walk of a bundle is slow and would
-    happily find an unrelated `codex`. Every path considered and every unreadable manifest is recorded via note()."""
-    out: list[str] = []
+    happily find an unrelated `codex`. Every path considered and every unreadable manifest is recorded via note().
+
+    Precedence holds ACROSS bundles: every bundle's manifest entrypoint comes before any bundle's glob match, so one
+    bundle's last-resort guess never outranks another bundle's own declaration."""
+    entries: list[str] = []
+    globbed_all: list[str] = []
     for bundle in bundles:
         res = Path(os.path.expanduser(bundle)) / "Contents" / "Resources"
+        patterns = ("codex-package.json", "*/codex-package.json", "codex*/bin/codex")
+        # Name every root and pattern searched, so a failure that matched nothing still says where it looked.
+        note(f"{res}/{{{','.join(patterns)}}}")
         try:
-            manifests = sorted(res.glob("codex-package.json")) + sorted(res.glob("*/codex-package.json"))
-            globbed = sorted(res.glob("codex*/bin/codex"))
+            manifests = sorted(res.glob(patterns[0])) + sorted(res.glob(patterns[1]))
+            globbed = sorted(res.glob(patterns[2]))
         except OSError as exc:          # an unreadable or disappearing bundle: skip it with a reason, never silently
             note(f"{res}/ (unsearchable: {type(exc).__name__})")
             continue
+        globbed_all.extend(str(p) for p in globbed)
         for manifest in manifests:
             try:
                 entry = json.loads(manifest.read_text())
@@ -484,9 +492,8 @@ def _bundle_codex_candidates(bundles, note) -> list[str]:
             if not isinstance(target, str) or not target:
                 note(f'{manifest} (no "entrypoint")')
                 continue
-            out.append(os.path.normpath(os.path.join(str(manifest.parent), target)))
-        out.extend(str(p) for p in globbed)
-    return out
+            entries.append(os.path.normpath(os.path.join(str(manifest.parent), target)))
+    return entries + [g for g in globbed_all if g not in entries]
 
 
 def _codex_binary(env: dict[str, str], bundles=None, searched: list[str] | None = None) -> tuple[str | None, str | None]:

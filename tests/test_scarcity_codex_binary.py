@@ -110,6 +110,21 @@ class CodexBinaryTest(unittest.TestCase):
         self.assertIn("`codex` on PATH", searched)
         self.assertIn(legacy, searched)
 
+    def test_every_manifest_entrypoint_beats_every_glob_across_bundles(self):
+        # ChatGPT.app is searched first but ships no manifest (glob-only); Codex.app declares its entrypoint. The
+        # declaration must win: one bundle's last-resort guess never outranks another bundle's manifest.
+        chatgpt, codex_app = self.tmp / "ChatGPT.app", self.tmp / "Codex.app"
+        guessed = _exe(chatgpt, "Contents/Resources/codex-cli/bin/codex")
+        declared = _bundle(codex_app, "Contents/Resources/cli/vendor/codex", {"entrypoint": "vendor/codex"},
+                           manifest_at="Contents/Resources/cli")
+        legacy = _exe(self.tmp, "legacy/codex")
+        bundles = (str(chatgpt), str(codex_app))
+        self.assertEqual(sc._bundle_codex_candidates(bundles, lambda _: None), [declared, guessed])
+        with mock.patch.object(sc, "CODEX_APP_BINARIES", (legacy,)):
+            self.assertEqual(sc._codex_binary({"PATH": self.empty_path}, bundles=bundles)[0], declared)
+            os.remove(declared)          # the declared one gone: the glob guess next, still ahead of the legacy tuple
+            self.assertEqual(sc._codex_binary({"PATH": self.empty_path}, bundles=bundles)[0], guessed)
+
     def test_path_beats_the_bundle(self):
         # An explicitly installed CLI is the one the user maintains; both read the same ~/.codex.
         app, bindir = self.tmp / "ChatGPT.app", self.tmp / "bin"
