@@ -86,7 +86,8 @@ def window_view(name: str, used_pct: float, reset_at: float | None, window_s: fl
     # NEGATIVE as the reset nears: 0 at half-way, down to −(wasted share) at the reset. Long windows only; 5-hour windows renew too fast to matter.
     wasted = max(0.0, 100.0 - projected) if used_pct < 99 else 0.0
     # Forest 2026-09-26 (bias strongly towards expiring credits): from a quarter of the window on, the share that will be wasted at today's pace
-    # counts linearly against scarcity, reaching its full weight at the reset: a week 3 % used at 70 % elapsed reads ≈ −0.6, at 95 % ≈ −0.9.
+    # counts linearly against scarcity, reaching its full weight at the reset: for a week 3 % used this term is ≈ −0.57 at 70 % elapsed and
+    # ≈ −0.90 at 95 %; on top of the underused floor (−0.6) both clamp to −1.0.
     if reset_at and window_s >= 86400 and elapsed > 0.25:
         s = round(max(-1.0, s - (wasted / 100.0) * ((elapsed - 0.25) / 0.75)), 2)
     return {"window": name, "used_pct": round(used_pct, 1), "elapsed_pct": round(elapsed * 100, 1), "headroom_pct": round(headroom, 1),
@@ -444,19 +445,41 @@ def parse_codex_status(text: str, now: float | None = None) -> list[dict[str, An
     return wins
 
 
-def _codex_binary(env: dict[str, str]) -> tuple[str, str | None]:
-    """The configured Codex CLI if it exists, else `codex` on PATH. Returns (binary, missing configured path or None):
-    ChatGPT.app stopped shipping Resources/codex (2026-10), and a dead configured path must not blind the probe."""
+# Where ChatGPT.app ships its Codex CLI, newest layout first. Until 2026-10 it was Resources/codex; since then it lives in
+# Resources/codex-cli/bin/codex (codex-package.json "entrypoint"). The Air has no `codex` on PATH, so the old single
+# default exec'd a missing file: the forked child exited 127 at once and every probe read "stage=boot, eof=True".
+CODEX_APP_BINARIES = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+                      "/Applications/ChatGPT.app/Contents/Resources/codex")
+
+
+def _codex_binary(env: dict[str, str]) -> tuple[str | None, str | None]:
+    """The Codex CLI to run. Returns (binary or None, missing configured path or None): a set CORTADOS_CODEX_BIN that
+    exists wins; else `codex` on PATH; else the ChatGPT.app layouts. A dead configured path must not blind the probe."""
     import shutil
-    configured = env.get("CORTADOS_CODEX_BIN") or "/Applications/ChatGPT.app/Contents/Resources/codex"
-    if os.access(configured, os.X_OK):
+    configured = env.get("CORTADOS_CODEX_BIN")
+    if configured and os.access(configured, os.X_OK):
         return configured, None
-    return shutil.which("codex", path=env.get("PATH")) or configured, configured
+    found = shutil.which("codex", path=env.get("PATH")) or next((b for b in CODEX_APP_BINARIES if os.access(b, os.X_OK)), None)
+    return found, configured
+
+
+def failure_kind(err: str) -> str:
+    """A stable label for a failed reading (no counts, times or diagnostics), so the log line fires once per kind."""
+    msg = err.split(": ", 1)[-1]
+    if msg.startswith("Codex /status empty"):
+        m = re.search(r"stage=(\w+)", msg)
+        b = re.search(r"boot_failure=(\w+)", msg)
+        return "codex-status-empty:" + (m.group(1) if m else "?") + (f":{b.group(1)}" if b else "")
+    return re.sub(r"[^a-z0-9]+", "-", msg.split(":", 1)[0].lower()).strip("-")[:60] or "unknown"
 
 
 def _codex() -> dict[str, Any]:
     env = _cli_env()
     binary, missing_bin = _codex_binary(env)
+    if not binary:
+        # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen.
+        raise RuntimeError("Codex CLI not found: " + (f"CORTADOS_CODEX_BIN={missing_bin} is not executable; " if missing_bin else "")
+                           + "no `codex` on PATH and none of " + ", ".join(CODEX_APP_BINARIES))
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -665,10 +688,14 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         def run(lane: str) -> None:
             try:
                 rec = plan[lane](lanes.get(lane), claude_dir[lane]) if lane in claude_dir else plan[lane]()
-                results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None}
+                results[lane] = {**(finish(lane, rec) if lane != "local" else rec), "fetched_at": time.time(), "tried_at": time.time(), "error": None, "error_kind": None}
             except Exception as exc:      # keep the last good reading, say so
                 old = lanes.get(lane) or {}
-                results[lane] = {**old, "tried_at": time.time(), "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                err = f"{type(exc).__name__}: {str(exc)[:200]}"
+                kind = failure_kind(err)
+                results[lane] = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
+                if kind != old.get("error_kind"):     # loud once per failure kind, not every 15-minute attempt
+                    print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
                 if lane == "claude":
                     try:
                         import traceback as _tb
