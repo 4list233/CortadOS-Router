@@ -12,6 +12,11 @@ integers from 0, replies echo the client's string ids. Triggers on the text of t
                    as when code mode yields and the model ends the turn;
   "late sibling"   one call; once it is answered (item/completed), a second call followed at once by turn/completed
                    (the second result is read and dropped afterwards): a sibling issued just before the turn ended;
+  "stale resume"   one call, then turn/completed while it is outstanding; once that call gets its reply, the old
+                   cell RESUMES as a real code-mode cell can: an item/completed for it, a NEW item/tool/call
+                   ({"file_path": "stale.md"}) still naming the ended turn, and after that call's reply an agentMessage
+                   "obsolete answer" of the ended turn. Requests that arrive meanwhile (a turn/start) are served
+                   after it, in order, as a server reading one stdin would;
   "fail"           turn/completed with status failed and codexErrorInfo usageLimitExceeded;
   "leak builtin"   an item/started carrying a commandExecution item (a built-in tool ran), then a normal completion;
   "reroute"        a model/rerouted notification (Codex moved the turn to another model), then "echo: <text>";
@@ -24,7 +29,9 @@ the requested one; FAKE_CODEX_SANDBOX makes it answer that sandbox type instead 
 emits mcpServer/startupStatus/updated before the thread/start reply, like a configured MCP server starting;
 FAKE_CODEX_ACCOUNT is the JSON `account` object account/read answers (default a chatgpt pro login; "null" = no login);
 FAKE_CODEX_CONFIG_PATCH is JSON deep-merged over the effective config that config/read answers, which is otherwise
-built from this process's own `-c` overrides and `--disable` flags exactly as the real server reflects them.
+built from this process's own `-c` overrides and `--disable` flags exactly as the real server reflects them. As on
+the real 0.163.0 (tests/fixtures/codex-config-read-0.163.0.json), a top-level `code_mode` override is ignored with a
+configWarning; the yield setting lives under features.code_mode.
 thread/start with dynamicTools and no experimentalApi
 capability is refused with the real -32600 error. Token usage: every model request adds 100 input / 10 output tokens
 to the thread total, reported as the real server does, after the tool results and after the final message.
@@ -49,6 +56,10 @@ FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_image", "ima
             "collaboration_modes", "code_mode_host")
 
 
+# Top-level tables 0.163.0 does not know and drops from the effective config with a configWarning (seen live).
+IGNORED_TABLES = ("code_mode",)
+
+
 def toml_value(raw):
     """The value of a `-c key=value` override: TOML scalars and the empty array, which JSON reads the same way."""
     try:
@@ -64,6 +75,9 @@ def effective_config(argv):
            "mcp_servers": {}, "notify": None, "web_search": None, "include_environment_context": True,
            "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
     for i, a in enumerate(argv):
+        if a == "-c" and i + 1 < len(argv) and argv[i + 1].split("=", 1)[0].split(".")[0] in IGNORED_TABLES:
+            state["ignored"].add(argv[i + 1].split(".")[0])
+            continue
         if a == "--disable" and i + 1 < len(argv):
             cfg["features"][argv[i + 1]] = False
         if a == "--enable" and i + 1 < len(argv):
@@ -89,7 +103,8 @@ if os.environ.get("FAKE_CODEX_ARGV"):
 stdin = os.fdopen(0, "rb", buffering=0)     # unbuffered, so select() sees exactly what readline() has not consumed
 server_ids = itertools.count()
 state = {"experimental": False, "tools": [], "thread": None, "total": {"inputTokens": 0, "outputTokens": 0,
-                                                                        "cachedInputTokens": 0, "totalTokens": 0}}
+                                                                        "cachedInputTokens": 0, "totalTokens": 0},
+         "ignored": set(), "deferred": []}
 
 
 def out(msg):
@@ -203,6 +218,33 @@ def run_turn(mid, params):
         completed(turn_id, "completed")
         wait_replies({rid}, turn_id)                    # the late result is read so the pipe never fills, and dropped
         return
+    if "stale resume" in text and state["tools"]:
+        tool = state["tools"][0]
+        call_id, rid, args = "exec-" + str(uuid.uuid4()), next(server_ids), {"file_path": "f0.md"}
+        item(turn_id, "item/started", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": tool,
+                                       "arguments": args, "status": "inProgress", "contentItems": None, "success": None})
+        out({"method": "item/tool/call", "id": rid, "params": {"threadId": state["thread"], "turnId": turn_id,
+                                                               "callId": call_id, "namespace": None, "tool": tool,
+                                                               "arguments": args}})
+        time.sleep(0.5)
+        completed(turn_id, "completed")
+        r = wait_replies({rid}, turn_id)[rid]           # whatever the bridge answers the cell with
+        item(turn_id, "item/completed", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": tool,
+                                         "arguments": args, "status": "completed", "contentItems": r.get("contentItems"),
+                                         "success": r.get("success"), "durationMs": 0})
+        stale_id, stale_rid, stale_args = "exec-" + str(uuid.uuid4()), next(server_ids), {"file_path": "stale.md"}
+        out({"method": "item/tool/call", "id": stale_rid, "params": {"threadId": state["thread"], "turnId": turn_id,
+                                                                     "callId": stale_id, "namespace": None, "tool": tool,
+                                                                     "arguments": stale_args}})
+        while True:                                     # the stale call's reply; anything else is served afterwards
+            msg = read()
+            if msg is None:
+                sys.exit(0)
+            if "method" not in msg and msg.get("id") == stale_rid:
+                break
+            state["deferred"].append(msg)
+        agent_message(turn_id, "obsolete answer")
+        return
     if "late sibling" in text and state["tools"]:
         tool = state["tools"][0]
         for i in range(2):
@@ -269,7 +311,7 @@ def run_turn(mid, params):
 
 def main():
     while True:
-        msg = read()
+        msg = state["deferred"].pop(0) if state["deferred"] else read()
         if msg is None:
             return
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
@@ -280,6 +322,11 @@ def main():
         elif method == "initialized":
             notify("remoteControl/status/changed", {"status": "disabled", "serverName": "fake", "installationId": "x"})
             notify("account/updated", {"authMode": "chatgpt", "planType": "pro"})
+            effective_config(sys.argv[1:])              # notes the ignored tables for the warning
+            if state["ignored"]:
+                notify("configWarning", {"summary": "Codex is ignoring 1 unrecognized configuration setting.\n  "
+                                         + "".join(f"session-flags: `{t}` is ignored." for t in sorted(state["ignored"])),
+                                         "details": None})
         elif method == "account/read":
             account = json.loads(os.environ.get("FAKE_CODEX_ACCOUNT") or '{"type": "chatgpt", "email": "x@example.invalid", "planType": "pro"}')
             out({"id": mid, "result": {"account": account, "requiresOpenaiAuth": True}})

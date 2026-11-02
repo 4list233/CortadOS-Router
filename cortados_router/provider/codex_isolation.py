@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from cortados_router.provider.bridge import STRIPPED_ENV as CLAUDE_STRIPPED_ENV, BridgeError
+
+logger = logging.getLogger(__name__)
 
 # OPENAI_BASE_URL would point the built-in openai provider at another endpoint.
 STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL") + CLAUDE_STRIPPED_ENV
@@ -53,18 +56,22 @@ DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_ima
 # for on the command line and checked in the effective config like the disabled ones.
 ENABLED_FEATURES = ("code_mode_host",)
 # Code mode's `exec` tool runs the model's JS cell, and the dynamic tools are called from inside it (callIds
-# `exec-<uuid>`). After code_mode.default_exec_yield_time_ms (~30 s by default) the cell YIELDS to the model while our
-# item/tool/call is still waiting on the client: the model then polls, starts other cells and can end the turn around
-# the outstanding call, which this bridge cannot answer into. The yield time is therefore raised to the request's whole
-# turn budget (server.TURN_TIMEOUT_S), so a cell waits for the client's result instead of yielding. Confirmed in the
-# strings of the pinned codex-cli 0.163.0 binary: the `code_mode` config table (CodeModeConfigToml) with the field
-# default_exec_yield_time_ms, and the exec tool text "`yield_time_ms` asks `exec` to yield early ... Defaults to
-# {{ default_exec_yield_time_ms }}". The model can still pass its own yield_time_ms, so codex_bridge also tolerates a
-# turn that ends early. Like every other -c override it is checked in the effective config (a managed layer wins).
-# Not used: code_mode.direct_only_tool_namespaces (also in 0.163.0) would need the dynamic tools declared as a
-# namespace, whose wire shape for thread/start.dynamicTools could not be verified from the strings alone.
+# `exec-<uuid>`). After the code_mode feature's default_exec_yield_time_ms (~30 s by default) the cell YIELDS to the
+# model while our item/tool/call is still waiting on the client: the model then polls, starts other cells and can end
+# the turn around the outstanding call. The yield time is therefore raised to the request's whole turn budget
+# (server.TURN_TIMEOUT_S), so a cell waits for the client's result instead of yielding. The setting is the typed
+# feature config `features.code_mode` (CodeModeConfigToml; `code_mode` sits next to `code_mode_host` in the 0.163.0
+# FeatureToml key list). Captured live on 0.163.0 (tests/fixtures/codex-config-read-0.163.0.json): a top-level
+# `-c code_mode.default_exec_yield_time_ms=...` is IGNORED (configWarning "session-flags: `code_mode` is ignored."),
+# while `-c features.code_mode.default_exec_yield_time_ms=...` raises no warning and config/read reports it as
+# features.code_mode.default_exec_yield_time_ms. The model can still pass its own yield_time_ms, so codex_bridge also
+# handles a turn that ends around a call. Like every other -c override it is checked in the effective config.
+# Not used: code_mode.direct_only_tool_namespaces would need the dynamic tools declared as a namespace, whose wire
+# shape for thread/start.dynamicTools could not be verified from the strings alone.
 DEFAULT_EXEC_YIELD_MS = 1800 * 1000         # server.TURN_TIMEOUT_S's default, for a session built without one
 EXEC_YIELD_KEY = "default_exec_yield_time_ms"
+EXEC_YIELD_PATH = ("features", "code_mode", EXEC_YIELD_KEY)
+EXEC_YIELD_NAME = ".".join(EXEC_YIELD_PATH)
 # Thread items that only a built-in tool produces: their appearance means isolation failed (brief §A.11, plus `sleep`
 # and `imageGeneration`, the items of the sleep_tool and image_generation features: the invariant is "no built-in ran",
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
@@ -124,17 +131,36 @@ def mcp_server_names(codex_home: str) -> list[str]:
     return sorted(set(MCP_TABLE.findall(text)))
 
 
+_yield_unreported_logged = False
+
+
+def _log_yield_unreported() -> None:
+    """Logged once per process: repeating it on every session would bury the other warnings."""
+    global _yield_unreported_logged
+    if not _yield_unreported_logged:
+        _yield_unreported_logged = True
+        logger.warning("codex app-server's config/read does not report %s on this CLI version; the exec yield rests on "
+                       "the command-line override alone", EXEC_YIELD_NAME)
+
+
 def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS) -> None:
     """Refuse an effective config (config/read, every layer merged) under which the thread would not be the isolated
     subscription thread this bridge promises. Runs before thread/start, which is when MCP servers are started, so a
     server this check names never ran. Raises BridgeError naming every violation."""
     bad = []
-    code_mode = cfg.get("code_mode")
-    got = code_mode.get(EXEC_YIELD_KEY) if isinstance(code_mode, dict) else None
-    if got != exec_yield_ms:
-        # Missing or different: code mode would yield to the model while a client tool call is outstanding.
-        bad.append(f"code_mode.{EXEC_YIELD_KEY}={json.dumps(got)} (expected {exec_yield_ms}: a shorter yield lets the "
-                   f"model end the turn around an unanswered client tool call)")
+    features_cfg = cfg.get("features")
+    code_mode = features_cfg.get("code_mode") if isinstance(features_cfg, dict) else None
+    if code_mode is None:
+        # Not reported at all: a CLI version whose config/read does not show the typed feature config (0.163.0 does,
+        # see the fixture). The command line carries the override (check_command_line); that is all this can rely on.
+        _log_yield_unreported()
+    else:
+        got = code_mode.get(EXEC_YIELD_KEY) if isinstance(code_mode, dict) else code_mode
+        if got != exec_yield_ms:
+            # Different, or the table replaced by a bool or a table without the key (a managed layer wins over -c):
+            # code mode would yield to the model while a client tool call is outstanding.
+            bad.append(f"{EXEC_YIELD_NAME}={json.dumps(got)} (expected {exec_yield_ms}: a shorter yield lets the model "
+                       f"end the turn around an unanswered client tool call)")
     for key, want in EXPECTED_CONFIG.items():
         if cfg.get(key) != want:
             bad.append(f"{key}={json.dumps(cfg.get(key))} (expected {json.dumps(want)})")
@@ -241,8 +267,8 @@ def tool_aliases(tools: list[dict[str, Any]]) -> dict[str, str]:
 def exec_yield_override(exec_yield_ms: int) -> str:
     """The `-c` override that keeps code mode from yielding before the request's turn budget is spent."""
     if not isinstance(exec_yield_ms, int) or isinstance(exec_yield_ms, bool) or exec_yield_ms <= 0:
-        raise BridgeError(f"code_mode.{EXEC_YIELD_KEY} must be a positive integer of milliseconds, not {exec_yield_ms!r}")
-    return f"code_mode.{EXEC_YIELD_KEY}={exec_yield_ms}"
+        raise BridgeError(f"{EXEC_YIELD_NAME} must be a positive integer of milliseconds, not {exec_yield_ms!r}")
+    return f"{EXEC_YIELD_NAME}={exec_yield_ms}"
 
 
 def check_command_line(args: list[str], exec_yield_ms: int) -> None:

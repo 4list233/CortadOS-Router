@@ -201,6 +201,9 @@ done. The backend therefore runs on the real Codex home with everything switched
 ```
 codex app-server -c notify=[] -c web_search="disabled" -c include_environment_context=false -c project_doc_max_bytes=0
   -c model_provider="openai"                 # the built-in provider: a config.toml model_provider cannot redirect the lane
+  -c features.code_mode.default_exec_yield_time_ms=<turn budget ms>   # code mode must not yield before the turn budget
+                                             # (a top-level `code_mode` table is ignored by 0.163.0: captured live in
+                                             # tests/fixtures/codex-config-read-0.163.0.json)
   -c mcp_servers.<name>.enabled=false        # for every [mcp_servers.<name>] table of $CODEX_HOME/config.toml
                                              # (the one read of it; `-c mcp_servers={}` merges and does nothing)
   --disable shell_tool --disable unified_exec --disable unified_exec_tty --disable view_image --disable image_generation
@@ -220,7 +223,8 @@ codex app-server -c notify=[] -c web_search="disabled" -c include_environment_co
   the subscription), and `config/read`, the effective config with every layer merged (config.toml, the `-c`
   overrides, a managed `requirements.toml`), and requires `model_provider="openai"`, no redefined
   `model_providers.openai`, the default `chatgpt_base_url`, the four overrides above, every `mcp_servers.*.enabled`
-  false, every disabled feature false and `code_mode_host` true in `features`, and `openai_base_url` and
+  false, every disabled feature false and `code_mode_host` true in `features`, `features.code_mode.default_exec_yield_time_ms`
+  equal to the turn budget when reported (unreported: the command-line check stands, logged once), and `openai_base_url` and
   `model_catalog_json` unset: `ollama launch codex` writes both into config.toml, and Codex then sends a
   ChatGPT-authenticated turn to the local Ollama endpoint (seen on the build Mac on 2026-10-21, when that config
   appeared mid-review: the bridge would have run the "subscription" lane on a local model). `thread/start` is when Codex starts MCP servers and binds the
