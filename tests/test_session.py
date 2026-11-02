@@ -229,6 +229,43 @@ class SessionTests(unittest.TestCase):
         self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
         self.assertEqual(len(self.settings_files()), 1)
 
+    def test_managed_dropin_dir_errors_fail_closed(self):
+        from pathlib import Path
+        os.makedirs(os.path.join(self.managed, "managed-settings.d"))
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaises(session.SessionError) as cm:
+                self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+        self.assertIn(os.path.join(self.managed, "managed-settings.d"), str(cm.exception))
+        self.assertEqual(self.settings_files(), [])
+        for exc in (FileNotFoundError(2, "x"), NotADirectoryError(20, "x")):       # absent dir: no drop-ins
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(Path, "iterdir", side_effect=exc):
+                    self.assertEqual(session.managed_settings_files((self.managed,)),
+                                     [Path(self.managed) / "managed-settings.json"])
+
+    def test_managed_unreadable_or_invalid_refuses(self):
+        from pathlib import Path
+        self.write_managed("managed-settings.d/20-bad.json", {})
+        bad = os.path.join(self.managed, "managed-settings.d", "20-bad.json")
+        with open(bad, "w") as f:
+            f.write("{not json")
+        with self.assertRaises(session.SessionError) as cm:
+            self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+        self.assertIn(bad, str(cm.exception))
+        os.unlink(bad)
+        self.write_managed("managed-settings.json", {"env": {}})
+        real = Path.read_text
+
+        def unreadable(p, *a, **k):
+            if str(p).startswith(self.managed):
+                raise PermissionError(13, "Permission denied", str(p))
+            return real(p, *a, **k)
+        with mock.patch.object(Path, "read_text", unreadable):
+            with self.assertRaises(session.SessionError) as cm:
+                self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok])
+        self.assertIn("managed-settings.json", str(cm.exception))
+        self.assertEqual(self.settings_files(), [])
+
     def test_launcher_models_are_served(self):
         """Every launcher default and short name goes through the provider's real normalize_model and choose (real
         tables and core on throwaway state, lane health stubbed, S1 forbidden) and is served, never a client error."""

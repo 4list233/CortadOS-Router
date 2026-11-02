@@ -201,8 +201,11 @@ def managed_settings_files(dirs=MANAGED_SETTINGS_DIRS) -> list:
         drop = root / "managed-settings.d"
         try:
             files += sorted(f for f in drop.iterdir() if f.name.endswith(".json") and not f.name.startswith("."))
-        except OSError:
-            pass
+        except (FileNotFoundError, NotADirectoryError):
+            pass                                # no drop-in directory
+        except OSError as exc:
+            # Fail closed: an unlistable policy directory may hold a drop-in that overrides the launcher.
+            raise SessionError(f"cannot list managed settings directory {drop}: {exc.strerror or exc}") from None
     return files
 
 
@@ -211,7 +214,7 @@ def check_managed(keys, dirs=MANAGED_SETTINGS_DIRS) -> None:
     for f in managed_settings_files(dirs):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
         except (OSError, ValueError) as exc:
             raise SessionError(f"cannot read managed settings {f}: {exc}") from None
