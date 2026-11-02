@@ -33,13 +33,17 @@ STUBS = {
     "build_sft.py": (
         "import os\n"
         "os.makedirs('data/sft', exist_ok=True)\n"
-        "open('data/sft/train.jsonl', 'w').write('{}\\n' * 4)\n"
+        # deterministic like the real one: the SFT files follow the labels (+ STUB_SFT_EXTRA standing in for outcome/override rows)
+        "labels = open('data/labels.jsonl').read() if os.path.exists('data/labels.jsonl') else ''\n"
+        "open('data/sft/train.jsonl', 'w').write('{}\\n' + labels + os.environ.get('STUB_SFT_EXTRA', ''))\n"
+        "open('data/sft/valid.jsonl', 'w').write('{}\\n')\n"
         "open('data/ran-build-sft', 'a').write('x')\n"
     ),
     "evaluate.py": (
         "import argparse, json, os\n"
         "ap = argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--adapter'); ap.add_argument('--out')\n"
         "ap.add_argument('--baseline', action='store_true'); a = ap.parse_args()\n"
+        "open('data/eval-pointer', 'w').write(os.environ.get('CORTADOS_S1_SERVE_POINTER', ''))\n"
         "c = {'band_accuracy': 0.9, 'under_routed': 0.01, 'over_routed': 0.1, 'outward_recall': 1.0}\n"
         "json.dump({'base': a.base, 'temperatures': {}, 'when': '2026-11-02', 'candidate': c,\n"
         "           'promote': os.environ.get('STUB_PROMOTE', '1') == '1'}, open(os.path.join(a.out, 'report.json'), 'w'))\n"
@@ -134,6 +138,58 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertIn("WARNING: synced router db", log)
         self.assertIn("min old", self.status()["last_stale_router_db"]["detail"])
 
+    def test_changed_sft_data_trains_even_with_unchanged_labels(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        rc, log, run = self.run_night(STUB_NEW_LABELS=0, STUB_SFT_EXTRA='{"outcome": 1}\n')   # e.g. a new outcome-loop example
+        self.assertEqual(rc, 0, log)
+        self.assertIn("training tonight", log)
+        self.assertTrue((run / "report.json").exists(), log)
+
+    def test_corrupt_labels_stop_without_poisoning_the_marker(self):
+        (self.s1 / "data/labels.jsonl").write_text('{"id": "r0"}\nnot json\n')
+        rc, log, run = self.run_night(STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("LABEL COUNT FAILED", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists())
+        self.assertFalse((run / "adapter").exists())
+        self.assertIn("last_label_count_failure", self.status())
+
+    def test_failing_nights_count_toward_the_stall_alert(self):
+        self.run_night(STUB_NEW_LABELS=3)
+        _, log, _ = self.run_night(STUB_LABEL_RC=2)
+        self.assertNotIn("ALERT", log)
+        rc, log, _ = self.run_night(STUB_LABEL_RC=2)
+        self.assertEqual(rc, 3, log)
+        self.assertIn("ALERT: S1 labels have not grown for 2 consecutive nights", log)
+        self.assertIn("alert", self.status())
+
+    def test_evaluate_sees_the_serve_pointer(self):
+        other = self.tmp / "serving" / "current.json"
+        self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_SERVE_POINTER=other)
+        self.assertEqual((self.s1 / "data/eval-pointer").read_text(), str(other))
+        self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual((self.s1 / "data/eval-pointer").read_text(), str(self.pointer))
+
+    def test_log_keep_is_validated(self):
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_LOG_KEEP="lots")
+        self.assertIn("is not a whole number; keeping 14", log)
+        _, log, run = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_LOG_KEEP=0)
+        self.assertIn("keeping 1", log)
+        self.assertEqual([p.parent.name for p in self.s1.glob("runs/*/nightly.log")], [run.name])
+
+    def test_router_db_path_with_spaces(self):
+        d = self.tmp / "dir with space"; d.mkdir()
+        fresh = d / "router-air.db"; fresh.write_text("")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_ROUTER_DB_EXTRA=f"{fresh}:{self.tmp / 'gone.db'}")
+        self.assertIn(f"synced router db {fresh} fresh", log)
+        self.assertIn(f"WARNING: synced router db {self.tmp / 'gone.db'} is missing", log)
+
+    def test_corrupt_status_is_kept_with_a_timestamped_name(self):
+        (self.s1 / "data/status.json").write_text("{broken")
+        self.run_night(STUB_NEW_LABELS=1)
+        self.assertEqual(len(list((self.s1 / "data").glob("status.json.corrupt-*"))), 1)
+        self.assertIn("last_train", self.status())
+
     def test_teacher_args_reach_label_py(self):
         self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_TEACHER_ARGS="--workers 1 --teacher provider",
                        CORTADOS_PROVIDER_URL="http://example.invalid", CORTADOS_PROVIDER_TOKEN_FILE="/nonexistent")
@@ -198,6 +254,62 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertIn("log rotation: removed", log)
         self.assertEqual(sorted(p.parent.name for p in self.s1.glob("runs/*/nightly.log")), ["n3", "n4"])
         self.assertTrue((self.s1 / "runs/n1/report.json").exists(), "rotation removes logs only")
+
+
+class NightlyWithRealLabeler(NightlyEndToEnd):
+    """The exit-code contract against the REAL s1/label.py talking to an in-thread fake provider, not a stub."""
+
+    def setUp(self):
+        super().setUp()
+        from tests.test_s1_teacher import FakeProvider, answers_for, err
+        self.FakeProvider, self.answers_for, self.err = FakeProvider, answers_for, err
+        for name in ("label.py", "common.py"):
+            shutil.copy(S1 / name, self.s1 / name)
+        for name in ("cortados_router", "tables"):                 # common.py loads the live router's question set from the repo
+            (self.tmp / "repo" / name).symlink_to(S1.parent / name)
+        reqs = [{"id": f"r{i}", "split": "train", "unit_kind": "interactive", "request": f"task {i}"} for i in range(4)]
+        (self.s1 / "data/requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
+        (self.tmp / "tok").write_text("tok-test\n")
+        self.env.update(CORTADOS_S1_TEACHER_ARGS="--k 2 --batch 2 --workers 1 --split train",
+                        CORTADOS_PROVIDER_TOKEN_FILE=str(self.tmp / "tok"))
+        self.fake = None
+        self.addCleanup(lambda: self.fake and self.fake.close())
+
+    def test_quota_refusal_takes_the_stopped_early_path(self):
+        self.fake = self.FakeProvider([(200, {}, self.answers_for),
+                                       (503, {}, self.err("no claude subscription account can take this request"))])
+        rc, log, run = self.run_night(CORTADOS_PROVIDER_URL=self.fake.url)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("LABELING STOPPED EARLY (label.py rc 3)", log)
+        self.assertIn("training tonight", log)                    # the first batch's labels are new data
+        self.assertIn("last_labeling_stopped_early", self.status())
+        self.assertEqual(self.status()["last_label_count"], 2)
+
+    def test_missing_provider_url_takes_the_config_error_path(self):
+        rc, log, run = self.run_night()
+        self.assertEqual(rc, 3, log)
+        self.assertIn("LABELING FAILED (label.py rc 2)", log)
+        self.assertFalse((run / "adapter").exists())
+
+
+# the stub-based scenarios already ran in NightlyEndToEnd; the subclass keeps only its own two tests
+for _name in [n for n in vars(NightlyEndToEnd) if n.startswith("test_")]:
+    setattr(NightlyWithRealLabeler, _name, None)
+
+
+class EvaluatePointer(unittest.TestCase):
+    def test_evaluate_reads_the_serve_pointer(self):
+        import importlib.util, sys
+        sys.path.insert(0, str(S1))
+        spec = importlib.util.spec_from_file_location("s1_evaluate_ptr", S1 / "evaluate.py")
+        ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev)
+        with mock.patch.dict(os.environ, {"CORTADOS_S1_SERVE_POINTER": "/srv/s1/current.json"}):
+            self.assertEqual(ev.current_pointer(), Path("/srv/s1/current.json"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CORTADOS_S1_SERVE_POINTER", None)
+            self.assertEqual(ev.current_pointer(), S1 / "current.json")
+        src = (S1 / "evaluate.py").read_text()
+        self.assertNotIn('parent / "current.json").read_text()', src, "every incumbent read goes through current_pointer()")
 
 
 class AtomicPointer(unittest.TestCase):

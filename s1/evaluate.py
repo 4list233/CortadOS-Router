@@ -7,6 +7,7 @@ bar is the stronger teacher; when Forest corrects routes in Discord those rows o
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import json
 import math
@@ -15,6 +16,13 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+
+
+def current_pointer() -> Path:
+    """The promoted pointer the incumbent bar is read from: CORTADOS_S1_SERVE_POINTER when the nightly sets it (the file the
+    scorer serves), else current.json beside this file. Reading a different file than the nightly promotes into would grade
+    candidates against a stale incumbent."""
+    return Path(os.environ.get("CORTADOS_S1_SERVE_POINTER") or Path(__file__).resolve().parent / "current.json")
 
 from build_sft import OUTCOME_UNIT_KIND                # the one reading outcome tasks are graded under (interactive)
 from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
@@ -173,7 +181,7 @@ def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, s
     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
     writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
     same inference settings. Never loads MLX here (the laya venv has none; only the 8B may sit beside the trainer). Returns (bar, source)."""
-    cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+    cur = json.loads(current_pointer().read_text())
     if not cur.get("adapter"):
         return None, None
     hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
@@ -257,7 +265,7 @@ def main() -> int:
     else:
         cur, inc = {}, None
         try:
-            cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+            cur = json.loads(current_pointer().read_text())
         except Exception as exc:
             report["bar_error"] = f"{type(exc).__name__}: {exc}"
         if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:

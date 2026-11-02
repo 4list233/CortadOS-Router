@@ -1,6 +1,8 @@
 """Small state helpers for s1/nightly.sh (stdlib only, so the nightly never depends on the training venv for bookkeeping).
 
-  labels <labels.jsonl>                       print "<distinct ids> <sha256 of the file>" (0 and "none" when the file is missing)
+  labels <labels.jsonl>                       print the number of distinct labelled ids (0 when the file is missing); a corrupt
+                                              line exits non-zero so the nightly stops instead of recording a bogus count
+  fingerprint <file>...                       print one sha256 over the files (the SFT data training reads); a missing file exits 1
   growth <status.json> <count> <stall-nights> record tonight's label count; print ALERT line when labels have not grown for
                                               <stall-nights> consecutive nights (the router dashboard reads the same file)
   event <status.json> <key> [<detail>]        stamp last_<key> (train, promotion, labeling_failure, skip) with now + detail
@@ -46,8 +48,9 @@ def load_status(path: Path) -> dict:
     try:
         return json.loads(path.read_text())
     except json.JSONDecodeError as exc:   # a corrupt status must be visible, not silently reset; keep the bad copy
-        os.replace(path, path.with_suffix(".corrupt"))
-        print(f"nightly_state: {path} was not JSON ({exc}); moved to .corrupt and started fresh", file=sys.stderr)
+        backup = path.with_name(f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%dT%H%M%S')}")   # never overwrite an earlier one
+        os.replace(path, backup)
+        print(f"nightly_state: {path} was not JSON ({exc}); moved to {backup.name} and started fresh", file=sys.stderr)
         return {}
 
 
@@ -55,15 +58,28 @@ def save_status(path: Path, st: dict) -> None:
     write_atomic(path, json.dumps(st, indent=1, sort_keys=True) + "\n")
 
 
-def labels(path: Path) -> str:
+def labels(path: Path) -> int:
     if not path.exists():
-        return "0 none"
-    raw = path.read_bytes()
+        return 0
     ids = set()
-    for line in raw.decode().splitlines():
-        if line.strip():
-            ids.add(json.loads(line)["id"])
-    return f"{len(ids)} {hashlib.sha256(raw).hexdigest()[:16]}"
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{n}: not JSON ({exc})") from None
+        if not isinstance(row, dict) or not row.get("id"):
+            raise ValueError(f"{path}:{n}: no id")
+        ids.add(row["id"])
+    return len(ids)
+
+
+def fingerprint(paths: list[Path]) -> str:
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(p.name.encode() + b"\0" + p.read_bytes() + b"\0")   # FileNotFoundError → non-zero exit
+    return h.hexdigest()[:16]
 
 
 def growth(path: Path, count: int, stall_nights: int) -> str:
@@ -99,13 +115,25 @@ def promote(report: Path, adapter: Path, pointer: Path) -> None:
            "holdout": {k: r["candidate"][k] for k in ("band_accuracy", "under_routed", "over_routed", "outward_recall")}}
     if pointer.exists():
         write_atomic(pointer.with_name(pointer.name + ".prev"), pointer.read_text())
+    # mkstemp creates the temp file 0600 and the rename keeps that mode, so the pointer ends up 0600: fine because serve.py
+    # (launchd com.cortados.s1-scorer) runs as the same user as the nightly; a scorer under another user would need a chmod here.
     write_atomic(pointer, json.dumps(cfg, indent=1) + "\n")
 
 
 def main(argv: list[str]) -> int:
     cmd, args = argv[0], argv[1:]
     if cmd == "labels":
-        print(labels(Path(args[0])))
+        try:
+            print(labels(Path(args[0])))
+        except ValueError as exc:
+            print(f"nightly_state: {exc}", file=sys.stderr)
+            return 1
+    elif cmd == "fingerprint":
+        try:
+            print(fingerprint([Path(a) for a in args]))
+        except OSError as exc:
+            print(f"nightly_state: {exc}", file=sys.stderr)
+            return 1
     elif cmd == "growth":
         alert = growth(Path(args[0]), int(args[1]), int(args[2]))
         if alert:

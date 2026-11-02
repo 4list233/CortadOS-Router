@@ -7,6 +7,8 @@ s1/runs/
 s1/sources/
 s1/laya/
 s1/current.json
+s1/current.json.prev
+s1/current.json.corrupt-*
 *.safetensors
 # the real S1 endpoints map holds this machine's tailnet addresses: local only (ship the .example instead)
 tables/s1-endpoints.json

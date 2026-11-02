@@ -12,7 +12,8 @@
 #   CORTADOS_S1_SCORER_PLIST    scorer LaunchAgent unloaded during training      (default ~/Library/LaunchAgents/com.cortados.s1-scorer.plist)
 #   CORTADOS_S1_PY              training python with mlx_lm                      (default <repo>/.venv-mlx/bin/python)
 #   CORTADOS_S1_LABEL_PY        python that runs s1/label.py                      (default python3; label.py runs from this repo)
-#   CORTADOS_S1_TEACHER_ARGS    extra args for label.py (teacher selection etc.)  (default "--workers 3")
+#   CORTADOS_S1_TEACHER_ARGS    extra args for label.py, e.g. "--workers 3 --train-teacher <model> --holdout-teacher <model>"
+#                               (default "--workers 3"; label.py exits 0 done, 2 config error, 3 stopped early)
 #   CORTADOS_PROVIDER_URL, CORTADOS_PROVIDER_TOKEN_FILE   provider-backed teacher settings, passed to label.py through the env
 #                               (URL has no default and is never committed; token file defaults to ~/.config/cortados/provider-token)
 #   CORTADOS_ROUTER_DB_EXTRA    extra router dbs for dataset.py (os.pathsep list) (default ~/.cortados/router-air.db when it exists)
@@ -48,9 +49,10 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 [ -f data/train-config.env ] && . data/train-config.env
 PY="${CORTADOS_S1_PY:-../.venv-mlx/bin/python}"
 LABEL_PY="${CORTADOS_S1_LABEL_PY:-python3}"
-TEACHER_ARGS="${CORTADOS_S1_TEACHER_ARGS:---workers 3}"   # the teacher builder (s1-router-teacher) puts its flags here
+TEACHER_ARGS="${CORTADOS_S1_TEACHER_ARGS:---workers 3}"   # label.py's own flags (--train-teacher, --holdout-teacher, --workers, --k, ...)
 REPO_ROOT="${CORTADOS_ROUTER_REPO:-..}"
 SERVE_POINTER="${CORTADOS_S1_SERVE_POINTER:-$PWD/current.json}"   # serve.py reads current.json beside itself
+export CORTADOS_S1_SERVE_POINTER="$SERVE_POINTER"   # evaluate.py grades against the incumbent named here
 SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
 STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"   # one quiet night is normal (weekend); two in a row means the labeler is stuck
@@ -93,6 +95,9 @@ prune_unresumable_runs
 [ -f data/train-config.env ] && echo "train-config: $(grep -v '^#' data/train-config.env | tr '\n' ' ')"
 rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapters, reports) are untouched
   local old
+  case "$LOG_KEEP" in ''|*[!0-9]*) echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14 ;; esac
+  # 0 would delete tonight's own log (tail -n +1 lists every file): keep at least the current one
+  [ "$LOG_KEEP" -lt 1 ] && { echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP would delete tonight's log; keeping 1"; LOG_KEEP=1; }
   old=$(ls -t runs/*/nightly.log 2>/dev/null | tail -n +"$((LOG_KEEP + 1))")
   [ -n "$old" ] && echo "$old" | while IFS= read -r f; do rm -f -- "$f"; done && echo "log rotation: removed $(echo "$old" | wc -l | tr -d ' ') old nightly log(s)"
   return 0
@@ -116,9 +121,15 @@ if [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then "$REPO_ROOT/bin/refresh-tiers.
 else echo "refresh-tiers.sh not found under $REPO_ROOT: skipped"; fi
 # The Air's router.db is rsynced here every 15 min by another machine; a stale copy means its recent usage is missing tonight.
 # Stale data is still valid data, so the night goes on, but the gap is logged and put in the status file for the dashboard.
-for db in $(echo "${CORTADOS_ROUTER_DB_EXTRA:-}" | tr ':' ' '); do
+IFS=: read -ra extra_dbs <<< "${CORTADOS_ROUTER_DB_EXTRA:-}"   # os.pathsep list, as dataset.py reads it; paths may contain spaces
+for db in "${extra_dbs[@]+"${extra_dbs[@]}"}"; do
+  [ -n "$db" ] || continue
   if [ ! -f "$db" ]; then echo "WARNING: synced router db $db is missing"; state event "$STATUS" stale_router_db "$db missing"; continue; fi
-  age_min=$(( ($(date +%s) - $(stat -f %m "$db" 2>/dev/null || stat -c %Y "$db")) / 60 ))
+  mtime=$(stat -f %m "$db" 2>/dev/null || stat -c %Y "$db" 2>/dev/null)
+  if [ -z "$mtime" ]; then
+    echo "WARNING: synced router db $db: age unknown (stat failed)"; state event "$STATUS" stale_router_db "$db age unknown"; continue
+  fi
+  age_min=$(( ($(date +%s) - mtime) / 60 ))
   if [ "$age_min" -gt "$DB_MAX_AGE_MIN" ]; then
     echo "WARNING: synced router db $db is ${age_min} min old (limit $DB_MAX_AGE_MIN): its newest usage is missing tonight"
     state event "$STATUS" stale_router_db "$db ${age_min} min old"
@@ -133,6 +144,12 @@ echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file 
 # shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
 "$LABEL_PY" -B label.py $TEACHER_ARGS
 rc=$?
+# Count labels and update the stall tracker BEFORE branching on rc: a labeler that fails every night is exactly the stall to alert on.
+if ! labelled=$(state labels data/labels.jsonl); then
+  echo "LABEL COUNT FAILED (data/labels.jsonl unreadable): training skipped"; state event "$STATUS" label_count_failure "labels.jsonl unreadable"; exit 1
+fi
+alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS")
+[ -n "$alert" ] && echo "$alert"
 # label.py exit codes: 0 completed, 2 config error, 3 stopped early (quota/auth/retries; the labels it wrote are kept).
 if [ "$rc" -eq 3 ]; then
   # partial labels are real labels: go on, and let the no-new-labels check below decide whether there is anything to train on
@@ -150,9 +167,11 @@ else
   python3 build_sft.py || exit 1
 fi
 
-read -r labelled labels_hash <<< "$(state labels data/labels.jsonl)"
-alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS")
-[ -n "$alert" ] && echo "$alert"
+# The no-new-data marker fingerprints what training actually reads: build_sft also merges outcome-loop examples and
+# labels-override-*.jsonl, and it is deterministic (fixed seeds), so the same SFT files mean the same training data.
+if ! sft_hash=$(state fingerprint data/sft/train.jsonl data/sft/valid.jsonl); then
+  echo "SFT FINGERPRINT FAILED (data/sft missing after build_sft.py): training skipped"; state event "$STATUS" sft_fingerprint_failure "data/sft"; exit 1
+fi
 last=$(cat data/last-train-count 2>/dev/null || echo 0)
 new=$((labelled - last))
 pending=0
@@ -163,8 +182,8 @@ force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-t
 # Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
 # 2026-11-02, the same labels + a warm start from the same adapter reproduce the incumbent, so a night with no new labels skips.
 # An interrupted run still resumes (its steps are unfinished work, not a repeat).
-if [ "$force" != "--train" ] && [ "$pending" -eq 0 ] && [ "$(cat data/last-train-labels 2>/dev/null)" = "$labelled $labels_hash" ]; then
-  echo "skipped: no new labels ($labelled labels, same as the last training run)"
+if [ "$force" != "--train" ] && [ "$pending" -eq 0 ] && [ "$(cat data/last-train-labels 2>/dev/null)" = "$sft_hash" ]; then
+  echo "skipped: no new labels ($labelled labels; training data identical to the last training run)"
   state event "$STATUS" skip "no new labels ($labelled)"
   echo "=== $(date) nightly end"; exit 0
 fi
@@ -256,7 +275,7 @@ done
 gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
 HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --base "$BASE" --adapter "$RUN/adapter" --out "$RUN" --baseline || exit 1
 echo "$labelled" > data/last-train-count
-echo "$labelled $labels_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels   # the no-new-labels marker
+echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels   # the no-new-labels marker
 state event "$STATUS" train "$RUN ($labelled labels)"
 if python3 -c "import json,sys;sys.exit(0 if json.load(open('$RUN/report.json'))['promote'] else 1)"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
