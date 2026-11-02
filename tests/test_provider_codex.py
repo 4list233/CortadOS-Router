@@ -29,6 +29,11 @@ READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
 CODEX_ROUTE = {"provider": "codex-cli", "model": "gpt-test", "band": "R2", "route_id": "r1"}
 
 
+def late_state(s):
+    """The late-result state CodexSession.__init__ sets, for sessions the unit tests build without a process."""
+    s._call_tools, s._turn_done, s._late, s._followups, s._turn_id = {}, False, [], 0, None
+
+
 class CodexEndpointTests(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.mkdtemp()
@@ -403,7 +408,8 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--enable"], ["code_mode_host"])
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false"):
+                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
+                         f"code_mode.default_exec_yield_time_ms={int(provider_server.TURN_TIMEOUT_S * 1000)}"):
             self.assertIn(override, overrides)
         self.assertEqual(len([o for o in overrides if o.startswith("mcp_servers.")]), 2)   # [mcp_servers.x.env] is not a server
         self.assertIsNone(seen["env"]["OPENAI_API_KEY"])
@@ -887,20 +893,121 @@ class CodexSessionUnitTests(unittest.TestCase):
         self.assertEqual(seen["env"]["CODEX_HOME"], os.path.abspath(self.codex_home))
         self.assertNotEqual(seen["cwd"], os.getcwd())                   # the child's cwd is the scratch work dir
 
-    def test_a_turn_that_completes_around_a_delivered_result_is_refused_not_an_empty_reply(self):
+    def turn_starts(self, log):
+        return [json.loads(l)["params"] for l in Path(log).read_text().splitlines()
+                if json.loads(l).get("method") == "turn/start"]
+
+    def late_session(self):
+        log = os.path.join(self.scratch, "log.jsonl")
+        os.environ["FAKE_CODEX_LOG"] = log
+        return self.session(), log
+
+    def assert_followup_carries(self, log, call, text):
+        starts = self.turn_starts(log)
+        self.assertEqual(len(starts), 2)                                 # the client's turn, then one follow-up
+        said = " ".join(i.get("text", "") for i in starts[1]["input"] if i.get("type") == "text")
+        self.assertIn(f"call {call['id']} (tool Read, status ok)", said)
+        self.assertIn(text, said)
+
+    def test_a_turn_that_completes_around_a_delivered_result_continues_in_a_follow_up_turn(self):
         codex_bridge.CODEX_SETTLE_S = 0.05                               # return the call before the fake completes
-        s = self.session()
+        s, log = self.late_session()
         try:
             s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
             blocks, stop, _ = s.run_turn(10)
             self.assertEqual(stop, "tool_use")
             [call] = blocks
             time.sleep(1.0)                                              # the fake's turn/completed is queued by now
-            s.deliver({call["id"]: {"content": [{"type": "text", "text": "late"}], "isError": False}})
-            with self.assertRaisesRegex(BridgeError, "without consuming the delivered tool results"):
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "late-content"}], "isError": False}})
+            with self.assertLogs("cortados_router.provider.codex_bridge", "WARNING") as logs:
+                blocks, stop, _ = s.run_turn(10)                         # no BridgeError: the result is handed over
+            self.assertEqual(stop, "end_turn")
+            self.assertIn("late-content", blocks[-1]["text"])            # the fake echoes the follow-up's input
+            self.assertTrue(any("follow-up turn 1/" in m for m in logs.output))
+            self.assert_followup_carries(log, call, "late-content")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_turn_that_ends_before_its_call_is_returned_still_hands_the_call_to_the_client(self):
+        s, log = self.late_session()                                     # default settle: turn/completed lands inside it
+        try:
+            s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            [call] = blocks
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "after-the-end"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assert_followup_carries(log, call, "after-the-end")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_a_late_sibling_followed_by_turn_completed_still_reaches_the_client(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, log = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "late sibling"}], timeout=10)
+            [first], stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            s.deliver({first["id"]: {"content": [{"type": "text", "text": "one"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "tool_use")
+            [second] = [b for b in blocks if b["type"] == "tool_use"]
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertEqual(second["name"], "Read")
+            s.deliver({second["id"]: {"content": [{"type": "text", "text": "two"}], "isError": False}})
+            blocks, stop, _ = s.run_turn(10)
+            self.assertEqual(stop, "end_turn")
+            self.assert_followup_carries(log, second, "two")
+        finally:
+            s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_follow_up_turns_are_bounded_per_client_request(self):
+        codex_bridge.CODEX_SETTLE_S = 0.05
+        s, _ = self.late_session()
+        try:
+            s.send_user([{"type": "text", "text": "complete around call"}], timeout=10)
+            [call], _, _ = s.run_turn(10)
+            time.sleep(1.0)
+            s.deliver({call["id"]: {"content": [{"type": "text", "text": "x"}], "isError": False}})
+            s._followups = codex_bridge.MAX_FOLLOWUPS                    # as if this request had used them all
+            with self.assertRaisesRegex(BridgeError, "refusing another follow-up turn.*" + call["id"]):
                 s.run_turn(10)
         finally:
             s.close()
+            os.environ.pop("FAKE_CODEX_LOG", None)
+
+    def test_the_exec_yield_override_is_on_the_command_line_and_its_absence_is_refused(self):
+        args = codex_isolation.command_line(["codex"], self.codex_home, 123000)
+        self.assertIn("code_mode.default_exec_yield_time_ms=123000", [b for a, b in zip(args, args[1:]) if a == "-c"])
+        codex_isolation.check_command_line(args, 123000)
+        stripped = [a for a in args if a != "code_mode.default_exec_yield_time_ms=123000"]
+        with self.assertRaisesRegex(BridgeError, "lacks `-c code_mode.default_exec_yield_time_ms=123000`"):
+            codex_isolation.check_command_line(stripped, 123000)
+        with self.assertRaisesRegex(BridgeError, "lacks"):
+            codex_isolation.check_command_line(args, 999)               # another budget than the one asked for
+        for bad in (0, -1, 1.5, True, None):
+            with self.assertRaisesRegex(BridgeError, "positive integer"):
+                codex_isolation.exec_yield_override(bad)
+
+    def test_an_effective_config_whose_exec_yield_differs_or_is_missing_is_refused(self):
+        os.environ["FAKE_CODEX_ARGV"] = os.path.join(self.scratch, "argv.json")
+        s = self.session(exec_yield_ms=45000)
+        try:
+            argv = json.loads(Path(self.scratch, "argv.json").read_text())["argv"]
+            self.assertIn("code_mode.default_exec_yield_time_ms=45000", argv)
+        finally:
+            s.close()
+        for patch in ({"code_mode": {"default_exec_yield_time_ms": 30000}}, {"code_mode": None}):
+            os.environ["FAKE_CODEX_CONFIG_PATCH"] = json.dumps(patch)
+            try:
+                with self.assertRaisesRegex(BridgeError, "code_mode.default_exec_yield_time_ms=.*expected 45000"):
+                    self.session(exec_yield_ms=45000)
+            finally:
+                del os.environ["FAKE_CODEX_CONFIG_PATCH"]
 
     def test_the_effective_config_check_accepts_the_real_isolated_config_and_names_every_violation(self):
         # The shape config/read answered on Codex CLI 0.163.0 under the bridge's own command line (P2 probe).
@@ -909,7 +1016,8 @@ class CodexSessionUnitTests(unittest.TestCase):
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
-                "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True}}
+                "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True},
+                "code_mode": {"default_exec_yield_time_ms": codex_isolation.DEFAULT_EXEC_YIELD_MS}}
         codex_isolation.check_effective_config(real)
         broken = dict(real, model_provider="mirror", chatgpt_base_url="https://mirror.invalid/", web_search="live",
                       model_providers={"openai": {"base_url": "https://mirror.invalid/v1"}},
@@ -935,8 +1043,9 @@ class CodexSessionUnitTests(unittest.TestCase):
         # A server that streams notifications without end re-arms the settle window on every one; the absolute
         # deadline must still end the turn: with calls collected they are returned, with none it is a failure.
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
         stop, settle = threading.Event(), codex_bridge.CODEX_SETTLE_S
 
         def chatter():
@@ -1046,8 +1155,9 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id = "unit", None, {}, {}, "t1", "turn-1"
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, {}, {}
         s._reply, s._call = (lambda *a, **k: None), (lambda *a, **k: {})
         stop, result = threading.Event(), {}
 
@@ -1087,8 +1197,9 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id, s.proc = "unit", None, {}, {}, "t1", "turn-1", Proc()
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), {}, {}
         s.route, s.last_used, s.dir = None, 0.0, Path(self.scratch)
         t0 = time.time()
         with self.assertRaises(BridgeError):
@@ -1108,7 +1219,8 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_usage_is_reported_in_the_messages_shape_with_the_cached_part_taken_out_of_codex_input(self):
         s = object.__new__(codex_bridge.CodexSession)
-        s._delivered, s._usage_mark = set(), {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
+        late_state(s)
+        s._delivered, s._usage_mark = {}, {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
         s._usage_total = {"totalTokens": 12419, "inputTokens": 12309, "cachedInputTokens": 3968, "cacheWriteInputTokens": 10,
                           "outputTokens": 110, "reasoningOutputTokens": 42}            # the live spike's second reading
         _, _, usage = s._finish([], "end_turn")
@@ -1130,8 +1242,9 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.proc, s.dir = "unit", None, {}, {}, Proc(), Path(self.scratch)
-        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), set(), {}
+        s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
         s._events.put(("request", {"method": "item/tool/requestUserInput", "id": 7, "params": {"questions": []}}))
         t0 = time.time()
         with self.assertRaises(BridgeError):

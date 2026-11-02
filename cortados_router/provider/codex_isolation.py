@@ -52,6 +52,19 @@ DISABLED_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty", "view_ima
 # whose advertised client tools cannot run (the first spike, with it off: "Read tool is unavailable"), so it is asked
 # for on the command line and checked in the effective config like the disabled ones.
 ENABLED_FEATURES = ("code_mode_host",)
+# Code mode's `exec` tool runs the model's JS cell, and the dynamic tools are called from inside it (callIds
+# `exec-<uuid>`). After code_mode.default_exec_yield_time_ms (~30 s by default) the cell YIELDS to the model while our
+# item/tool/call is still waiting on the client: the model then polls, starts other cells and can end the turn around
+# the outstanding call, which this bridge cannot answer into. The yield time is therefore raised to the request's whole
+# turn budget (server.TURN_TIMEOUT_S), so a cell waits for the client's result instead of yielding. Confirmed in the
+# strings of the pinned codex-cli 0.163.0 binary: the `code_mode` config table (CodeModeConfigToml) with the field
+# default_exec_yield_time_ms, and the exec tool text "`yield_time_ms` asks `exec` to yield early ... Defaults to
+# {{ default_exec_yield_time_ms }}". The model can still pass its own yield_time_ms, so codex_bridge also tolerates a
+# turn that ends early. Like every other -c override it is checked in the effective config (a managed layer wins).
+# Not used: code_mode.direct_only_tool_namespaces (also in 0.163.0) would need the dynamic tools declared as a
+# namespace, whose wire shape for thread/start.dynamicTools could not be verified from the strings alone.
+DEFAULT_EXEC_YIELD_MS = 1800 * 1000         # server.TURN_TIMEOUT_S's default, for a session built without one
+EXEC_YIELD_KEY = "default_exec_yield_time_ms"
 # Thread items that only a built-in tool produces: their appearance means isolation failed (brief §A.11, plus `sleep`
 # and `imageGeneration`, the items of the sleep_tool and image_generation features: the invariant is "no built-in ran",
 # so every ThreadItem variant a built-in produces is listed, whether or not its feature flag is expected to hold).
@@ -111,11 +124,17 @@ def mcp_server_names(codex_home: str) -> list[str]:
     return sorted(set(MCP_TABLE.findall(text)))
 
 
-def check_effective_config(cfg: dict[str, Any]) -> None:
+def check_effective_config(cfg: dict[str, Any], exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS) -> None:
     """Refuse an effective config (config/read, every layer merged) under which the thread would not be the isolated
     subscription thread this bridge promises. Runs before thread/start, which is when MCP servers are started, so a
     server this check names never ran. Raises BridgeError naming every violation."""
     bad = []
+    code_mode = cfg.get("code_mode")
+    got = code_mode.get(EXEC_YIELD_KEY) if isinstance(code_mode, dict) else None
+    if got != exec_yield_ms:
+        # Missing or different: code mode would yield to the model while a client tool call is outstanding.
+        bad.append(f"code_mode.{EXEC_YIELD_KEY}={json.dumps(got)} (expected {exec_yield_ms}: a shorter yield lets the "
+                   f"model end the turn around an unanswered client tool call)")
     for key, want in EXPECTED_CONFIG.items():
         if cfg.get(key) != want:
             bad.append(f"{key}={json.dumps(cfg.get(key))} (expected {json.dumps(want)})")
@@ -219,11 +238,27 @@ def tool_aliases(tools: list[dict[str, Any]]) -> dict[str, str]:
     return aliases
 
 
-def command_line(prefix: list[str], codex_home: str) -> list[str]:
+def exec_yield_override(exec_yield_ms: int) -> str:
+    """The `-c` override that keeps code mode from yielding before the request's turn budget is spent."""
+    if not isinstance(exec_yield_ms, int) or isinstance(exec_yield_ms, bool) or exec_yield_ms <= 0:
+        raise BridgeError(f"code_mode.{EXEC_YIELD_KEY} must be a positive integer of milliseconds, not {exec_yield_ms!r}")
+    return f"code_mode.{EXEC_YIELD_KEY}={exec_yield_ms}"
+
+
+def check_command_line(args: list[str], exec_yield_ms: int) -> None:
+    """Refuse an argv that lacks the exec-yield override: without it the launch would run code mode's ~30 s default."""
+    want = exec_yield_override(exec_yield_ms)
+    if not any(a == "-c" and b == want for a, b in zip(args, args[1:])):
+        raise BridgeError(f"codex app-server command line lacks `-c {want}`; code mode would yield to the model while "
+                          f"a client tool call is outstanding")
+
+
+def command_line(prefix: list[str], codex_home: str, exec_yield_ms: int = DEFAULT_EXEC_YIELD_MS) -> list[str]:
     """The argv that starts an isolated app-server: `prefix` is the binary (a list lets tests run a fake), `codex_home`
-    the home whose config.toml names the MCP servers to disable (the one read of it)."""
+    the home whose config.toml names the MCP servers to disable (the one read of it), `exec_yield_ms` the request's
+    turn budget, which code mode must not yield before (DEFAULT_EXEC_YIELD_MS)."""
     args = prefix + ["app-server"]
-    for override in CONFIG_OVERRIDES:
+    for override in CONFIG_OVERRIDES + (exec_yield_override(exec_yield_ms),):
         args += ["-c", override]
     for name in mcp_server_names(codex_home):
         args += ["-c", f"mcp_servers.{name}.enabled=false"]

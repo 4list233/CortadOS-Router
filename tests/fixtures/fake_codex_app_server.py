@@ -8,7 +8,10 @@ integers from 0, replies echo the client's string ids. Triggers on the text of t
                    function_call payload still streaming);
   "use tool"       one such call ({"file_path": "f0.md"}) and the same answer;
   "complete around call"  one call, then after 0.5 s a turn/completed with status completed while the call is still
-                   outstanding (the client's result is read and dropped afterwards): a turn that ends around a call;
+                   outstanding (the client's result is read and dropped afterwards): a turn that ends around a call,
+                   as when code mode yields and the model ends the turn;
+  "late sibling"   one call; once it is answered (item/completed), a second call followed at once by turn/completed
+                   (the second result is read and dropped afterwards): a sibling issued just before the turn ended;
   "fail"           turn/completed with status failed and codexErrorInfo usageLimitExceeded;
   "leak builtin"   an item/started carrying a commandExecution item (a built-in tool ran), then a normal completion;
   "reroute"        a model/rerouted notification (Codex moved the turn to another model), then "echo: <text>";
@@ -199,6 +202,26 @@ def run_turn(mid, params):
         time.sleep(0.5)
         completed(turn_id, "completed")
         wait_replies({rid}, turn_id)                    # the late result is read so the pipe never fills, and dropped
+        return
+    if "late sibling" in text and state["tools"]:
+        tool = state["tools"][0]
+        for i in range(2):
+            call_id, rid, args = "exec-" + str(uuid.uuid4()), next(server_ids), {"file_path": f"f{i}.md"}
+            item(turn_id, "item/started", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": tool,
+                                           "arguments": args, "status": "inProgress", "contentItems": None, "success": None})
+            out({"method": "item/tool/call", "id": rid, "params": {"threadId": state["thread"], "turnId": turn_id,
+                                                                   "callId": call_id, "namespace": None,
+                                                                   "tool": tool, "arguments": args}})
+            if i:
+                completed(turn_id, "completed")
+            replies = wait_replies({rid}, turn_id)
+            if replies is None:
+                return
+            if not i:
+                r = replies[rid]
+                item(turn_id, "item/completed", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": tool,
+                                                 "arguments": args, "status": "completed", "contentItems": r.get("contentItems"),
+                                                 "success": r.get("success"), "durationMs": 0})
         return
     if "ask user" in text:
         rid = next(server_ids)
