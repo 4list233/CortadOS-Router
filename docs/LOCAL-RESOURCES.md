@@ -141,7 +141,7 @@ A node with an `ollama` block offers its Ollama models to the provider as `sub/<
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | the S1 auto-routing switch; default `false`. `true` is refused with a config error: a local lane must be evaluated and given routing-table candidates before S1 may pick it |
 | `probe_timeout_s` / `connect_timeout_s` / `read_timeout_s` | `/api/tags` probe (2), connect (3), wait per response chunk (300; a first model load can take a minute); each must be positive |
-| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (tokens; default 32768, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro) |
+| `models[]` | `id` (the Ollama tag, required), `alias` (the short pin name), `name` (display name), `context_length` (a positive integer of tokens; default 32768 when absent, the input-fit gate; set it to the node's Ollama context, 65536 for Ollama.app's setting on the Pro) |
 
 Pin names (aliases and tags, case-insensitive) must be unique across nodes. Behaviour:
 
@@ -164,8 +164,8 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
 models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the
 tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
 
-- listens on the node's Tailscale address (`--listen <tailscale-ip>`, default port 11435), given as a numeric ASCII
-  IP literal in canonical form and bound exactly as checked (hostnames, legacy forms like `0` and non-ASCII digits are
+- listens on the node's Tailscale address (`--listen <tailscale-ip>`, default port 11435), parsed as a numeric
+  ASCII IP literal and bound in its canonical form, exactly as checked (hostnames, legacy forms like `0` and non-ASCII digits are
   refused); `0.0.0.0`/`::` is refused unless `--allow-any` (a laptop joins untrusted networks);
 - forwards only `POST /v1/messages` and `GET /api/tags` to `http://127.0.0.1:11434`; every other path is a 404;
 - requires `Authorization: Bearer <token>` or `x-api-key: <token>`, compared in constant time with the token in a

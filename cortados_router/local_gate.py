@@ -100,7 +100,8 @@ def read_token(path: str | os.PathLike) -> str:
 
 
 def check_listen(host: str, allow_any: bool) -> str:
-    """The address to bind, validated: a numeric ASCII IP literal in canonical form (the node's Tailscale address).
+    """The address to bind, validated: parsed as a numeric ASCII IP literal and bound in its canonical form (the node's
+    Tailscale address).
     Hostnames, legacy spellings ("0", "0x0") and non-ASCII digits are refused, because the socket layer resolves or
     normalises them (fullwidth "０.０.０.０" binds as 0.0.0.0), so what was checked would not be what is bound.
     An all-interfaces address is refused unless asked: on a laptop that joins cafe Wi-Fi, 0.0.0.0 puts the gate on
