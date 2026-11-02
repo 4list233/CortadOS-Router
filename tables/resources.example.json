@@ -13,8 +13,9 @@
     {"id": "pro", "role": "client", "target": "local", "pool_eligible": false,
      "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 6,
      "inventory": {"chip": "M5 Max", "unified_gib": 48, "memory_scope": "unified"},
-     "ollama": {"_comment": "Pin-only local lane (docs/LOCAL-RESOURCES.md, Local models). The URL comes from the env var named here (or base_url); never commit a real address. auto_route must stay false.",
-                "base_url_env": "CORTADOS_LOCAL_PRO_OLLAMA_URL", "label": "Pro", "auto_route": false,
+     "ollama": {"_comment": "Pin-only local lane (docs/LOCAL-RESOURCES.md, Local models). The URL is the node's local gate (http://<tailscale-ip>:11435), from the env var named here (or base_url); the token file path likewise. Never commit a real address or token. auto_route must stay false.",
+                "base_url_env": "CORTADOS_LOCAL_PRO_OLLAMA_URL", "token_file_env": "CORTADOS_LOCAL_PRO_GATE_TOKEN_FILE",
+                "label": "Pro", "auto_route": false,
                 "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 300,
                 "models": [
                   {"id": "hf.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M", "alias": "qwen-27b", "name": "Qwen3.8 27B Heretic", "context_length": 32768},

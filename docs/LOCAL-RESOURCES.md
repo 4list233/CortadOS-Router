@@ -135,7 +135,8 @@ A node with an `ollama` block offers its Ollama models to the provider as `sub/<
 
 | key | meaning |
 | --- | --- |
-| `base_url_env` | name of an env var holding the node's Ollama URL, e.g. `http://<tailscale-ip>:11434` (wins over `base_url`) |
+| `base_url_env` | name of an env var holding the node's URL: its local gate, e.g. `http://<tailscale-ip>:11435` (wins over `base_url`) |
+| `token_file_env` / `token_file` | env var naming, or the path of, the file holding the gate's token on the provider host (same rules as the gate: mode 0600, ≥ 32 chars); sent as `Authorization: Bearer` on the probe and every turn |
 | `base_url` | the URL itself, for the git-ignored `tables/resources.json` only; never commit a real address |
 | `label` | the suffix `/v1/models` shows: `<name> · CortadOS (<label>)` (default: the node id, capitalised) |
 | `auto_route` | the S1 auto-routing switch; default `false`. `true` is refused with a config error: a local lane must be evaluated and given routing-table candidates before S1 may pick it |
@@ -158,9 +159,23 @@ Pin names (aliases and tags, case-insensitive) must be unique across nodes. Beha
   tailnet or busy, it fails the pin with a 503 that says so. Nothing falls back to another model.
 - Not listed in `served_routes`, so S1 cannot choose a local lane.
 
-**Exposure.** Ollama has no authentication: anyone who reaches the port can run models. On the node, listen only on
-the Tailscale address (`OLLAMA_HOST=<tailscale-ip>:11434`), or on localhost with a tunnel (SSH `-L`) from the provider
-host, never on `0.0.0.0` on an untrusted network. This repository configures neither.
+**Exposure and the local gate.** Ollama has no authentication: anyone who reaches its port can run, pull or delete
+models. So Ollama listens on `127.0.0.1:11434` only (its default; leave `OLLAMA_HOST` unset), and the one door from the
+tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
+
+- listens on the node's Tailscale address (`--listen <tailscale-ip>`, default port 11435); `0.0.0.0`/`::` is refused
+  unless `--allow-any` (a laptop joins untrusted networks);
+- forwards only `POST /v1/messages` and `GET /api/tags` to `http://127.0.0.1:11434`; every other path is a 404;
+- requires `Authorization: Bearer <token>` or `x-api-key: <token>`, compared in constant time with the token in a
+  0600 file (default `~/.config/cortados/local-gate-token`); it refuses to start when the file is missing, shorter than
+  32 characters or readable by group/others. A wrong token is a fixed 401 that echoes nothing;
+- streams SSE through line by line; bounds the body (32 MiB), concurrent connections (8, then 503), the loopback
+  connect (3 s) and each read (300 s); logs method, path and status only, never the token or a body.
+
+A launchd template is `integrations/local-gate/com.cortados.local-gate.plist` (RunAtLoad + KeepAlive; placeholders
+only). Check a setup with `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` (validates the
+token file and prints the settings, never the token). On the provider, a 401 from the gate is a 503 "local gate on
+node <id> refused the provider token", with no fallback.
 
 ## What this setup does not claim
 

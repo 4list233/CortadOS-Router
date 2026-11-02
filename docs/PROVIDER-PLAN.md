@@ -472,8 +472,9 @@ statelessly (`local_lane.serve`: bounded connect and read timeouts, SSE passed l
 An unreachable node or unlisted model is a 503 naming the cause; an unknown name is a 400 listing every pinnable id,
 local ones included. `GET /v1/models` lists each as `<name> · CortadOS (<node label>)`. S1 never routes to a local
 lane: they are absent from `SERVED_PROVIDERS`, and the config's `auto_route` switch is refused unless `false` until
-local lanes are evaluated. Ollama has no auth: bind it to the node's Tailscale address (`OLLAMA_HOST=<tailscale-ip>:11434`)
-or localhost plus a tunnel. `/v1/responses` (Codex) does not take local pins.
+local lanes are evaluated. Ollama has no auth, so it stays on `127.0.0.1` and the node runs the token gate
+(`cortados_router/local_gate.py`) on its Tailscale address; the lane sends the gate's token (`token_file_env`) on every
+probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does not take local pins.
 
 ## Open
 

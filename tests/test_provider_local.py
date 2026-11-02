@@ -87,10 +87,11 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.wfile.flush()
 
 
-def write_config(directory, base_url, auto_route=False):
+def write_config(directory, base_url, auto_route=False, token_file=None):
     cfg = {"nodes": [{"id": "pro", "role": "client", "target": "local", "pool_eligible": False,
                       "ollama": {"base_url_env": "TEST_LOCAL_PRO_URL", "auto_route": auto_route, "probe_timeout_s": 1,
                                  "connect_timeout_s": 1, "read_timeout_s": 5,
+                                 **({"token_file": token_file} if token_file else {}),
                                  "models": [{"id": TAG, "alias": "qwen-27b", "name": "Qwen 27B", "context_length": 32768},
                                             {"id": "phi:latest"}]}}]}
     p = Path(directory) / "resources.json"

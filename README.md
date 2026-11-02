@@ -302,8 +302,9 @@ fails if a literal value is ever placed there.
 The owner's machines can serve their Ollama models through the provider as pins: `claude --model sub/qwen-27b`
 relays each turn to that node's Ollama Messages API. S1 never routes there (the `auto_route` switch is off and
 refused when on until local lanes are evaluated); an asleep or busy node fails the pin with a clear 503, never a
-fallback. Ollama has no auth, so bind it to the node's Tailscale address or localhost plus a tunnel. Config schema and
-details: `docs/LOCAL-RESOURCES.md` ("Local models").
+fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
+(`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
+`docs/LOCAL-RESOURCES.md` ("Local models").
 
 ## The resource pool at a glance
 

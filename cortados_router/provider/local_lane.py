@@ -75,6 +75,17 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
         if u.scheme not in ("http", "https") or not u.hostname:
             where = f"${env_name}" if env_name else "base_url"
             raise LocalConfigError(f"node {nid}: no usable Ollama base URL (set {where} to http://<host>:11434)")
+        token = None
+        tf_env = block.get("token_file_env")
+        token_file = (os.environ.get(tf_env) if tf_env else None) or block.get("token_file")
+        if tf_env and not token_file:
+            raise LocalConfigError(f"node {nid}: ${tf_env} is not set (the path of the local gate's token file)")
+        if token_file:
+            from cortados_router.local_gate import GateConfigError, read_token   # same file rules as the gate
+            try:
+                token = read_token(token_file)
+            except GateConfigError as exc:
+                raise LocalConfigError(f"node {nid}: {exc}") from exc
         models = []
         for m in block.get("models") or []:
             mid = str(m.get("id") or "").strip()
@@ -88,7 +99,7 @@ def nodes(path: str | None = None) -> list[dict[str, Any]]:
                 seen[pin] = nid
             models.append(entry)
         out.append({"node": nid, "lane": LANE_PREFIX + nid, "label": block.get("label") or nid.capitalize(),
-                    "base_url": base, "models": models,
+                    "base_url": base, "models": models, "token": token,
                     "probe_timeout_s": float(block.get("probe_timeout_s", PROBE_TIMEOUT_S)),
                     "connect_timeout_s": float(block.get("connect_timeout_s", CONNECT_TIMEOUT_S)),
                     "read_timeout_s": float(block.get("read_timeout_s", READ_TIMEOUT_S))})
@@ -126,13 +137,24 @@ def _prefix(base_url: str) -> str:
     return urllib.parse.urlparse(base_url).path.rstrip("/")
 
 
+GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the provider's token file does not "
+                "match the gate's")
+
+
+def _auth(node: dict[str, Any]) -> dict[str, str]:
+    """The gate's credential (local_gate.py), when the node is behind one. Never logged."""
+    return {"authorization": f"Bearer {node['token']}"} if node.get("token") else {}
+
+
 def probe(node: dict[str, Any]) -> set[str]:
     """The tags the node lists (GET /api/tags) within its probe timeout. LocalUnavailable when it does not answer."""
     conn = _connection(node["base_url"], node["probe_timeout_s"])
     try:
-        conn.request("GET", _prefix(node["base_url"]) + "/api/tags")
+        conn.request("GET", _prefix(node["base_url"]) + "/api/tags", headers=_auth(node))
         resp = conn.getresponse()
         raw = resp.read()
+        if resp.status == 401:
+            raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
         if resp.status != 200:
             raise LocalUnavailable(f"node {node['node']} answered /api/tags with HTTP {resp.status}")
         data = json.loads(raw)
@@ -214,12 +236,18 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             conn.connect()
             conn.sock.settimeout(node["read_timeout_s"])        # connect bounded short, each read bounded long
             conn.request("POST", _prefix(node["base_url"]) + "/v1/messages", body=data,
-                         headers={"content-type": "application/json", "anthropic-version": "2023-06-01"})
+                         headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                  **_auth(node)})
             resp = conn.getresponse()
         except (OSError, http.client.HTTPException) as exc:
             _send_json(handler, 503, _error("overloaded_error",
                        f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
                        f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
+            return "unreachable"
+        if resp.status == 401:                                   # the gate's refusal is the provider's problem,
+            resp.read()                                          # not the client's: a 503 that says so
+            _send_json(handler, 503, _error("overloaded_error", "cortados: " + GATE_REFUSED.format(node=node["node"])
+                                            + "; no other model was tried"))
             return "unreachable"
         if resp.status != 200:
             raw = resp.read()

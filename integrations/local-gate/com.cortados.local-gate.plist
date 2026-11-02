@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- CortadOS local gate on the node (the Pro): token-checked door to Ollama, which listens on 127.0.0.1 only.
+     Template: replace every __PLACEHOLDER__ before installing to ~/Library/LaunchAgents/ (docs/LOCAL-RESOURCES.md,
+     "Local gate"). Holds no secret: the token stays in its 0600 file. Never commit a filled-in copy. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cortados.local-gate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-B</string>
+    <string>-m</string>
+    <string>cortados_router.local_gate</string>
+    <string>--listen</string>
+    <string>__TAILSCALE_IP__</string>
+    <string>--port</string>
+    <string>11435</string>
+    <string>--token-file</string>
+    <string>__HOME__/.config/cortados/local-gate-token</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_CHECKOUT__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart after a crash, and keep retrying while Tailscale is not up yet (the bind fails until it is). -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/cortados-local-gate.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/cortados-local-gate.log</string>
+</dict>
+</plist>
