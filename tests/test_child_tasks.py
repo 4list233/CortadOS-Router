@@ -807,6 +807,7 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn("tok-test-000000001", json.dumps(st))
         self.assertNotIn("stdout_log", st)                         # no pointer to the raw, credential-bearing logs
         self.assertNotIn("stderr_log", st)
+        self.assertNotIn("dir", st)                                # nor the dir that holds them
         self.assertIn("must not be read", st["logs_withheld"])
 
     def test_crash_with_same_credentials_releases_redacted_logs(self):
@@ -975,6 +976,77 @@ class ChildTaskTests(unittest.TestCase):
             ct._note_child(d, os.getpid())
         self.assertEqual(writes[0], {"pgid": os.getpid(), "start": None})
         self.assertIsInstance(writes[-1]["start"], str)
+
+    # --- round-7 P3s ------------------------------------------------------------------------------------------------
+
+    def test_failed_ps_is_unknown_and_never_signalled(self):
+        import subprocess
+        fake = subprocess.CompletedProcess(["ps"], 1, stdout="", stderr="ps: boom")
+        with mock.patch.object(ct.subprocess, "run", return_value=fake):
+            self.assertIs(ct._proc_start(os.getpid()), ct.UNKNOWN)
+        for rc, err in ((-9, ""), (2, "")):
+            with mock.patch.object(ct.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess(["ps"], rc, stdout="", stderr=err)):
+                self.assertIs(ct._proc_start(os.getpid()), ct.UNKNOWN, rc)
+        # a real exited pid: exit 1, nothing printed -> "no such process"
+        p = subprocess.Popen(["true"])
+        p.wait()
+        self.assertIsNone(ct._proc_start(p.pid))
+        tid, d, other = self._dead_task_with_child({"start": "LIVE"})
+        calls = []
+        real = os.killpg
+
+        def spy(pgid, sig):
+            calls.append((pgid, sig))
+            return real(pgid, sig)
+        with mock.patch.object(ct.subprocess, "run", return_value=fake), mock.patch.object(ct.os, "killpg", spy):
+            self.call("task_status", task_id=tid)
+        self._only_probes(calls)
+        self.assertIsNone(other.poll())
+        self.assertIn("start time unknown", _load(os.path.join(d, "result.json"))["child_cleanup"])
+
+    def test_child_record_written_from_preexec(self):
+        tid, d = self._manual_task("ok")
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        with mock.patch.object(ct, "_note_child", lambda *a: None):     # only the forked child writes the record
+            ct._run(d)
+        rec = _load(os.path.join(d, "child.json"))
+        self.assertEqual(rec["pgid"], _load(os.path.join(self.work, "fake-argv.json"))["pid"])
+        self.assertFalse([n for n in os.listdir(d) if n.endswith(".tmp")])
+
+    def test_subprocess_error_at_spawn_is_a_recorded_failure(self):
+        import subprocess
+        tid, d = self._manual_task("ok")
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        with mock.patch.object(ct.subprocess, "Popen", side_effect=subprocess.SubprocessError("preexec failed")):
+            ct._run(d)
+        res = _load(os.path.join(d, "result.json"))
+        self.assertIn("could not start the child: SubprocessError", res["error"])
+        self.assertEqual(ct.classify(res), "failed")
+
+    def test_prune_failure_in_one_dir_does_not_block_start(self):
+        root = ct._private_root()
+        bad, good = "t20200101000000-000000c1", "t20200101000000-000000c2"
+        for tid in (bad, good):
+            os.mkdir(os.path.join(root, tid), 0o700)
+            ct._write_json(os.path.join(root, tid, "meta.json"), {"started_at": 1.0, "runner_pid": None})
+            ct._write_json(os.path.join(root, tid, "result.json"), {"exit_code": 0, "ended_at": 2.0})
+        real = ct.shutil.rmtree
+
+        def rmtree(path, *a, **kw):
+            if os.path.basename(path) == bad:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path, *a, **kw)
+        with mock.patch.object(ct.shutil, "rmtree", rmtree):
+            r, out = self.call("start_task", task="x", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        self.assertTrue(any(e.startswith(bad) for e in out["prune_errors"]), out)
+        names = os.listdir(root)
+        self.assertIn(bad, names)
+        self.assertNotIn(good, names)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

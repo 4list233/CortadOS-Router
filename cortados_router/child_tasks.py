@@ -248,21 +248,27 @@ def connectors_config() -> str:
     return os.path.abspath(os.path.expanduser(os.environ.get("CORTADOS_CONNECTORS_MCP_CONFIG") or CONNECTORS_CONFIG))
 
 
-def prune(root: str, now: float | None = None) -> list:
-    """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids."""
+def prune(root: str, now: float | None = None, errors: list | None = None) -> list:
+    """Remove task dirs whose task started more than PRUNE_AGE_S ago and is not running. Returns the removed ids. Each
+    dir is handled on its own: one that cannot be read or removed is recorded in `errors` and skipped, so it never
+    blocks every later start_task."""
     cutoff = (time.time() if now is None else now) - PRUNE_AGE_S
     removed = []
     for name in os.listdir(root):
         d = os.path.join(root, name)
-        if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
-            continue
-        state, meta, _ = _state(d)
-        started = meta.get("started_at")
-        if not isinstance(started, (int, float)):
-            started = os.path.getmtime(d)
-        if state != "running" and started < cutoff:
-            shutil.rmtree(d)
-            removed.append(name)
+        try:
+            if not TASK_ID_RE.fullmatch(name) or os.path.islink(d) or not os.path.isdir(d):
+                continue
+            state, meta, _ = _state(d)
+            started = meta.get("started_at")
+            if not isinstance(started, (int, float)):
+                started = os.path.getmtime(d)
+            if state != "running" and started < cutoff:
+                shutil.rmtree(d)
+                removed.append(name)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
     return removed
 
 
@@ -342,7 +348,8 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     max_s = _max_s()
     exe = claude_bin()
     root = _private_root()
-    prune(root)
+    prune_errors: list = []
+    prune(root, errors=prune_errors)
     # No cap on parallel children, chrome ones included: capacity is the router's job (S1 and the quota gates refuse or
     # redirect a spent lane), and Claude in Chrome gives each session its own tab group.
     task_id = _new_id()
@@ -384,7 +391,10 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
         raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__}: "
                         f"{exc})") from None
     _REAP[task_id] = runner
-    return {"task_id": task_id, "state": "running", "dir": d}
+    out = {"task_id": task_id, "state": "running", "dir": d}
+    if prune_errors:
+        out["prune_errors"] = prune_errors[:20]     # bounded: it goes into a tool result
+    return out
 
 
 def _abort_runner(runner, d: str) -> None:
@@ -653,7 +663,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
                                   _tail(os.path.join(d, "stderr.log"), LOG_TAIL_CHARS, red))
         if withheld:
             out["logs_withheld"] = LOGS_WITHHELD_NOTE
-            for k in ("result", "stdout_log", "stderr_log"):   # no pointer to files that hold the raw credential
+            # No pointer to the files that hold the raw credential: not the logs, and not the task dir that holds them.
+            for k in ("result", "stdout_log", "stderr_log", "dir"):
                 out.pop(k, None)
     return red.tree(out)                        # every string (structured, before any serialization)
 
@@ -747,12 +758,36 @@ def _proc_start(pid: int):
         r = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return UNKNOWN
-    return r.stdout.strip() or None
+    out, err = r.stdout.strip(), (r.stderr or "").strip()
+    if r.returncode == 0 and out:
+        return out
+    if r.returncode == 1 and not out and not err:
+        return None                             # macOS ps for a pid with no process: exit 1, nothing printed
+    return UNKNOWN                              # any other outcome (a signal, a diagnostic) is a failed ps, not "gone"
+
+
+def _child_record_writer(d: str):
+    """preexec_fn for claude's Popen: runs in the forked child AFTER setsid (start_new_session) and BEFORE exec, so
+    child.json names the new group before Popen even returns: no window in which a dying runner leaves no record.
+    Plain os calls only (it runs between fork and exec); the start time is added by _note_child afterwards."""
+    path = os.path.join(d, "child.json")
+
+    def write():
+        pid = os.getpid()
+        tmp = f"{path}.{pid}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, json.dumps({"pgid": pid, "start": None}).encode())
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+    return write
 
 
 def _note_child(d: str, pgid: int) -> None:
-    # pid first (atomic), then pid + start time: lets start() or crash recovery stop exactly this group, never a reused
-    # pid's. The first write closes most of the window in which a dying runner would leave no record at all.
+    # pid + start time: lets start() or crash recovery stop exactly this group, never a reused pid's. (The child's
+    # preexec_fn already wrote the pgid before Popen returned; the pgid-only rewrite here keeps the record correct even
+    # if that write was skipped, then the start time is added.)
     path = os.path.join(d, "child.json")
     _write_json(path, {"pgid": pgid, "start": None})
     start = _proc_start(pgid)
@@ -904,7 +939,7 @@ def _run(d: str, lock_fd=None) -> int:
                 raise _CancelledBeforeSpawn()
             # claude leads its own process group, so stopping it also stops the tools and servers it spawned.
             proc = subprocess.Popen(spec["argv"], cwd=spec["cwd"], stdin=stdin, stdout=so, stderr=se,
-                                    start_new_session=True)
+                                    start_new_session=True, preexec_fn=_child_record_writer(d))
             holder["proc"] = proc
             pgid = proc.pid
             try:
@@ -932,7 +967,7 @@ def _run(d: str, lock_fd=None) -> int:
     except _CancelledBeforeSpawn:
         result["cancelled"] = True
         result["error"] = "cancelled before the child was started"
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:   # SubprocessError: e.g. preexec_fn failed in the child
         result["error"] = f"could not start the child: {type(exc).__name__}: {exc}"
     finally:
         # The settings file holds the provider token; once the child has exited (normally, cancelled or timed out)
