@@ -19,7 +19,8 @@ Exit codes (nightly branches on these, not on log text):
   0  pass completed (every scheduled call made; individual batches may still have been dropped, e.g. a 413, and are logged)
   2  config error before any call (no CORTADOS_PROVIDER_URL, unreadable/empty token file, a non-Claude teacher, --max-scarcity on
      the provider backend, --min-left-pct outside [0, 100))
-  3  stopped early: quota refusal, auth/other 4xx, x-should-retry: false, retries exhausted, the routed account below
+  3  stopped early (the reason, one word, is written to s1/data/label-stop-reason: unknown_headroom, low_headroom,
+     provider_stop, error_limit, scarcity): quota refusal, auth/other 4xx, x-should-retry: false, retries exhausted, the routed account below
      --min-left-pct, or (cli backend) the scarcity gate;
      the labels written before the stop are kept and the next run resumes from them
   python3 label.py [--limit N] [--k 3] [--batch 12] [--workers 3] [--split train|holdout|all] [--train-teacher M] [--holdout-teacher M]"""
@@ -51,6 +52,19 @@ EXIT_OK, EXIT_CONFIG, EXIT_STOPPED = 0, 2, 3          # see the module docstring
 SCARCITY_STOP = 0.7
 _write = threading.Lock()
 _stop = threading.Event()
+# Why the pass stopped early (first reason wins), written to DATA/label-stop-reason for nightly.sh: the exit code stays 3 for
+# every early stop, and the nightly ALERTs when the same reason stops the pass on consecutive nights (an unknown-headroom stop
+# after one batch every night still "grows" labels, so the growth stall alone would never fire).
+STOP_REASON: str | None = None
+STOP_REASON_FILE = "label-stop-reason"
+
+
+def stop_pass(reason: str) -> None:
+    global STOP_REASON
+    with _write:
+        if STOP_REASON is None:
+            STOP_REASON = reason
+    _stop.set()
 
 SYSTEM = (core.SYSTEM + "\n\nYou are the TEACHER producing training labels. You receive a JSON array of requests Forest (a founder running a fleet of AI "
           "agents for his business and personal life) sent to his agents; `unit_kind` says whether a person was waiting (interactive) or a scheduled job "
@@ -277,7 +291,7 @@ def check_headroom(model: str, meta: dict) -> None:
             print(f"  ! {model}: provider sent no '% left' (model {meta.get('model')!r}); headroom unknown: stopping the pass after "
                   "this batch (--allow-unknown-headroom / CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM=1 continues on the provider's own "
                   "quota gate)", flush=True)
-            _stop.set()
+            stop_pass("unknown_headroom")
             return
         if not _reveal_missing_logged.is_set():          # opted in: logged once per pass, not per call
             _reveal_missing_logged.set()
@@ -287,7 +301,7 @@ def check_headroom(model: str, meta: dict) -> None:
     if left < MIN_LEFT_PCT:
         print(f"  ! {model}: account at {left:g}% left < --min-left-pct {MIN_LEFT_PCT:g}: stopping the pass to leave headroom for "
               "interactive use (rerun after the reset; resume-safe)", flush=True)
-        _stop.set()
+        stop_pass("low_headroom")
 
 
 def call_teacher_cli(model: str, batch: list[dict]) -> tuple[str, dict]:
@@ -311,7 +325,7 @@ def work(job: tuple[str, int, list[dict]]) -> int:
         answers, meta = call_teacher(model, batch)
     except TeacherStop as exc:
         print(f"  ! {model} s{sample}: stopping the pass: {exc}", flush=True)
-        _stop.set()
+        stop_pass("provider_stop")
         return 0
     except TeacherSkip as exc:
         print(f"  ! {model} s{sample}: batch dropped: {exc}", flush=True)
@@ -320,7 +334,7 @@ def work(job: tuple[str, int, list[dict]]) -> int:
         msg = str(exc)
         print(f"  ! {model} s{sample}: {type(exc).__name__}: {msg[:160]}", flush=True)
         if re.search(r"limit|429|quota|overloaded", msg, re.I):
-            _stop.set()
+            stop_pass("error_limit")
         return 0
     good = 0
     with _write, LABELS.open("a") as f:
@@ -336,7 +350,8 @@ def work(job: tuple[str, int, list[dict]]) -> int:
                 f.write(json.dumps({"id": batch[a["i"]]["id"], "teacher": model, "sample": sample, "ts": int(time.time()),
                                     "answers": {q: a[q] for q in QUESTIONS}}, ensure_ascii=False) + "\n")
                 good += 1
-    if BACKEND != "cli":                                   # (headroom was already checked in call_teacher, before parsing)                                   # the provider meters its own routed requests per account; recording here would double-count
+    # Headroom was already checked in call_teacher, before parsing.
+    if BACKEND != "cli":                                   # the provider meters its own routed requests per account; recording here would double-count
         return good
     try:                                                   # the subscription ledger sees teacher work like any other lane use
         # The usage ledger is CortadOS's PTY plugin ($CORTADOS_PTY_PLUGIN, else <CORTADOS_REPO>/plugins/cortados-pty).
@@ -361,9 +376,9 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=3); ap.add_argument("--split", default="all"); ap.add_argument("--only", default=""); ap.add_argument("--max-scarcity", type=float, default=None, help="cli backend only: the local pool gate (default %s)" % SCARCITY_STOP)
     ap.add_argument("--min-left-pct", type=float, default=MIN_LEFT_PCT_DEFAULT, help="provider backend: stop once the routed account has less "
                     "than this %% left (default %(default)s; interactive sessions, reviews and routed subagents share these accounts)")
-    ap.add_argument("--allow-unknown-headroom", action="store_true",
+    ap.add_argument("--allow-unknown-headroom", action=argparse.BooleanOptionalAction,   # --no-allow-... overrides the env
                     default=os.environ.get("CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM") == "1",
-                    help="provider backend: keep labelling when the provider reveals no %% left (default: stop the pass with exit 3)")
+                    help="provider backend: keep labelling when the provider reveals no %% left (default: stop the pass with exit 3; env CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM=1 flips the default)")
     a = ap.parse_args()
     global BACKEND, PROVIDER, ALLOW_UNKNOWN_HEADROOM
     ALLOW_UNKNOWN_HEADROOM = a.allow_unknown_headroom
@@ -386,6 +401,7 @@ def main() -> int:
         PROVIDER = provider_config()
     elif a.max_scarcity is None:
         a.max_scarcity = SCARCITY_STOP
+    (DATA / STOP_REASON_FILE).unlink(missing_ok=True)   # tonight's reason only; a completed pass leaves none
     global ONLY
     ONLY = [q for q in a.only.split(",") if q]
     global LABELS
@@ -421,9 +437,12 @@ def main() -> int:
                 print(f"  {n}/{len(jobs)} calls · {total} labels · {int(time.time() - t0)} s · claude scarcity {worst}", flush=True)
                 if worst >= a.max_scarcity:
                     print(f"  claude pool scarcity {worst} ≥ {a.max_scarcity}: stopping; rerun after the reset (resume-safe)", flush=True)
-                    _stop.set()
-    print(f"done: {total} labels written" + (" (stopped early)" if _stop.is_set() else ""), flush=True)
-    return EXIT_STOPPED if _stop.is_set() else EXIT_OK
+                    stop_pass("scarcity")
+    print(f"done: {total} labels written" + (f" (stopped early: {STOP_REASON or 'stop'})" if _stop.is_set() else ""), flush=True)
+    if _stop.is_set():
+        (DATA / STOP_REASON_FILE).write_text((STOP_REASON or "stop") + "\n")
+        return EXIT_STOPPED
+    return EXIT_OK
 
 
 if __name__ == "__main__":

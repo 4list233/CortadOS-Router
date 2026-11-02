@@ -58,7 +58,9 @@ export CORTADOS_S1_SERVE_POINTER="$SERVE_POINTER"   # evaluate.py grades against
 SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
 NIGHT="${CORTADOS_S1_NIGHT_DATE:-$(date +%F)}"   # the stall tracker counts nights by this date (override for tests / backfilled runs)
-STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"   # one quiet night is normal (weekend); two in a row means the labeler is stuck
+STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"
+EARLY_STOP_NIGHTS="${CORTADOS_S1_EARLY_STOP_NIGHTS:-2}"   # same label.py stop reason this many nights running → ALERT
+EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailable/crashed this many nights running → ALERT   # one quiet night is normal (weekend); two in a row means the labeler is stuck
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
@@ -76,11 +78,14 @@ newest_unfinished_run() {   # most recent run that began a training segment but 
   done
 }
 prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfinished runs' checkpoints (~0.65 GB each) are dead weight
-  local d promoted
+  local d promoted pending_run=""
   promoted=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'])" "${SERVE_POINTER:-current.json}" 2>/dev/null)
+  # a pending candidate (e.g. its evaluation crashed, so it has no report.json) is kept: it is re-evaluated, not retrained
+  [ -f data/pending-candidate ] && read -r _ _ _ pending_run < data/pending-candidate
   for d in runs/20*/; do
     d=${d%/}
     [ "$d" = "$RUN" ] || [ -f "$d/report.json" ] || [ ! -d "$d/adapter" ] && continue
+    [ -n "$pending_run" ] && [ "$d" = "$pending_run" ] && continue
     case "$promoted" in *"/$d/"*) continue ;; esac
     rm -rf -- "$d/adapter" && echo "retention: removed checkpoints of unfinished $d (logs kept)"
   done
@@ -121,6 +126,9 @@ evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdo
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
 mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
+alert_line() { [ -n "$1" ] && echo "$1"; return 0; }
+eval_failed() { alert_line "$(state streak "$STATUS" evaluation_failed hit "$NIGHT" "$EVAL_FAIL_NIGHTS" "evaluation unavailable or crashed")"; }
+eval_ok() { state streak "$STATUS" evaluation_failed clear "$NIGHT" "$EVAL_FAIL_NIGHTS"; }
 report_unavailable() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('evaluation_status') == 'unavailable' else 1)" "$1/report.json"; }
 report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
 eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
@@ -173,9 +181,14 @@ alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT")
 # label.py exit codes: 0 completed, 2 config error, 3 stopped early (quota/auth/retries; the labels it wrote are kept).
 if [ "$rc" -eq 3 ]; then
   # partial labels are real labels: go on, and let the no-new-labels check below decide whether there is anything to train on
-  echo "LABELING STOPPED EARLY (label.py rc 3): continuing with the labels written so far"
-  state event "$STATUS" labeling_stopped_early "label.py rc 3"
-elif [ "$rc" -ne 0 ]; then
+  stop_reason=$(head -1 data/label-stop-reason 2>/dev/null | tr -cd 'a-z_'); stop_reason=${stop_reason:-unknown}
+  echo "LABELING STOPPED EARLY (label.py rc 3, reason $stop_reason): continuing with the labels written so far"
+  state event "$STATUS" labeling_stopped_early "label.py rc 3: $stop_reason"
+  # one batch then a stop still "grows" labels, so the growth stall never fires: alert on the same stop reason night after night
+  alert_line "$(state streak "$STATUS" label_early_stop hit "$NIGHT" "$EARLY_STOP_NIGHTS" "$stop_reason")"
+elif [ "$rc" -eq 0 ]; then
+  state streak "$STATUS" label_early_stop clear "$NIGHT" "$EARLY_STOP_NIGHTS"
+else
   # 2026-11-02: a failed labeler used to be ignored and the night retrained on yesterday's data.
   echo "LABELING FAILED (label.py rc $rc): training skipped"
   state event "$STATUS" labeling_failure "label.py rc $rc"
@@ -215,7 +228,10 @@ if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
 fi
 if [ -f data/pending-candidate ]; then
   read -r p_sft p_eval p_reason p_run < data/pending-candidate
-  if [ "$p_sft" = "$sft_hash" ] && [ -d "$p_run/adapter" ]; then
+  if [ ! -d "$p_run/adapter" ]; then
+    echo "pending candidate $p_run adapter missing; dropped"; state event "$STATUS" pending_failure "$p_run adapter missing"
+    rm -f data/pending-candidate
+  elif [ "$p_sft" = "$sft_hash" ]; then
     if ! now_eval=$(eval_fingerprint); then
       echo "EVAL FINGERPRINT FAILED for pending $p_run; retried next night"; state event "$STATUS" pending_failure "$p_run eval fingerprint"; exit 1
     fi
@@ -226,13 +242,14 @@ if [ -f data/pending-candidate ]; then
     fi
     echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
     if ! evaluate_run "$p_run"; then
-      echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; exit 1
+      echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
     fi
     if report_unavailable "$p_run"; then
       echo "$sft_hash $now_eval evaluation_failed $p_run" > data/pending-candidate
       echo "EVALUATION UNAVAILABLE again for $p_run: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$p_run/report.json"); retried next night"
-      state event "$STATUS" evaluation_failure "$p_run (retry)"; exit 1
+      state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
     fi
+    eval_ok
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
         echo "$sft_hash $now_eval holdout_blocked $p_run" > data/pending-candidate
@@ -251,8 +268,9 @@ if [ -f data/pending-candidate ]; then
     fi
     echo "$sft_hash $now_eval promotion_failed $p_run" > data/pending-candidate
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
+  else
+    echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
   fi
-  echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
 fi
 # Forest 2026-10-13: retrain every night (supersedes the 2026-09-21 Sunday / +150 labels / drift cadence) — but only on new data:
 # 2026-11-02, the same labels + a warm start from the same adapter reproduce the incumbent, so a night with no new labels skips.
@@ -351,17 +369,19 @@ gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                               
 if ! evaluate_run "$RUN"; then
   # a crashed evaluation is not a verdict: keep the run pending and re-evaluate it next night, data unchanged or not
   echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
-  state event "$STATUS" evaluation_failure "$RUN (evaluate.py failed)"
+  state event "$STATUS" evaluation_failure "$RUN (evaluate.py failed)"; eval_failed
   echo "EVALUATION FAILED for $RUN; it stays pending and is re-evaluated next night"; exit 1
 fi
 echo "$labelled" > data/last-train-count
 state event "$STATUS" train "$RUN ($labelled labels)"
 if report_unavailable "$RUN"; then
   echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
-  state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"
+  state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"; eval_failed
   echo "EVALUATION UNAVAILABLE for $RUN: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$RUN/report.json"); not a rejection: re-evaluated next night"
   exit 1
-elif report_promotes "$RUN"; then
+fi
+eval_ok
+if report_promotes "$RUN"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then

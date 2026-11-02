@@ -82,7 +82,7 @@ FIT_413 = ("cortados: sub/claude-sonnet-5: the request (≈250k tokens) does not
 
 def reset_pass_state():
     label._stop.clear(); label._reveal_missing_logged.clear()
-    label.PASS_RUN_ID = None; label.ONLY = []; label.MIN_LEFT_PCT = label.MIN_LEFT_PCT_DEFAULT; label.ALLOW_UNKNOWN_HEADROOM = False
+    label.PASS_RUN_ID = None; label.ONLY = []; label.MIN_LEFT_PCT = label.MIN_LEFT_PCT_DEFAULT; label.ALLOW_UNKNOWN_HEADROOM = False; label.STOP_REASON = None
 
 
 def err(msg, kind="overloaded_error"):
@@ -398,6 +398,25 @@ class MainExitCodeTests(unittest.TestCase):
         os.environ["CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM"] = "1"
         try:
             self.assertEqual(self._main([(200, {}, unrevealed)] * 4)[0], label.EXIT_OK)
+        finally:
+            os.environ.pop("CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM", None)
+
+    def test_stop_reason_is_written_for_the_nightly(self):
+        unrevealed = lambda body: answers_for(body, "claude-sonnet-5")
+        self.assertEqual(self._main([(200, {}, unrevealed)] * 4)[0], label.EXIT_STOPPED)
+        self.assertEqual((label.DATA / label.STOP_REASON_FILE).read_text().strip(), "unknown_headroom")
+        self.fake.close(); reset_pass_state()
+        self.assertEqual(self._main([(200, {}, revealed(12))] * 4)[0], label.EXIT_STOPPED)
+        self.assertEqual((label.DATA / label.STOP_REASON_FILE).read_text().strip(), "low_headroom")
+        self.fake.close(); reset_pass_state(); label.LABELS.unlink()
+        self.assertEqual(self._main([(200, {}, answers_for)] * 4)[0], label.EXIT_OK)
+        self.assertFalse((label.DATA / label.STOP_REASON_FILE).exists(), "a completed pass leaves no stop reason")
+
+    def test_no_allow_unknown_headroom_overrides_the_env(self):
+        unrevealed = lambda body: answers_for(body, "claude-sonnet-5")
+        os.environ["CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM"] = "1"
+        try:
+            self.assertEqual(self._main([(200, {}, unrevealed)] * 4, extra=("--no-allow-unknown-headroom",))[0], label.EXIT_STOPPED)
         finally:
             os.environ.pop("CORTADOS_S1_ALLOW_UNKNOWN_HEADROOM", None)
 

@@ -6,6 +6,9 @@
   growth <status.json> <count> <stall-nights> [<night YYYY-MM-DD>]
                                               record tonight's label count; print ALERT line when labels have not grown for
                                               <stall-nights> consecutive nights (distinct dates; the dashboard reads the same file)
+  streak <status.json> <name> hit|clear <night> <threshold> [<detail>]
+                                              consecutive-night tracker (label early stops, evaluation failures); prints an ALERT
+                                              line at <threshold> nights and keeps it in status["alerts"][<name>]
   event <status.json> <key> [<detail>]        stamp last_<key> (train, promotion, labeling_failure, skip) with now + detail
   promote <report.json> <adapter dir> <pointer>
                                               write the promoted pointer the scorer reads (s1/serve.py reloads on mtime change),
@@ -113,6 +116,30 @@ def growth(path: Path, count: int, stall_nights: int, night: str | None = None) 
     return st.get("alert", "")
 
 
+def streak(path: Path, name: str, outcome: str, night: str, threshold: int, detail: str = "") -> str:
+    """Consecutive NIGHTS (distinct dates) a condition held: outcome "hit" extends the streak (a new detail, e.g. a different
+    stop reason, restarts it at 1), "clear" ends it. At `threshold` nights an ALERT goes into status["alerts"][name] and is
+    returned; clearing removes it. Used for label early stops (same reason) and evaluation failures."""
+    st = load_status(path)
+    streaks, alerts = st.setdefault("streaks", {}), st.setdefault("alerts", {})
+    cur = streaks.get(name) or {}
+    if outcome == "clear":
+        streaks.pop(name, None); alerts.pop(name, None)
+    else:
+        if cur.get("detail") != detail:
+            cur = {"detail": detail, "nights": 0}
+        if cur.get("last_night") != night:
+            cur["nights"] = int(cur.get("nights", 0)) + 1
+            cur["last_night"] = night
+        streaks[name] = cur
+        if cur["nights"] >= threshold:
+            alerts[name] = f"ALERT: {name} {detail} on {cur['nights']} consecutive nights (last {night})".replace("  ", " ")
+        else:
+            alerts.pop(name, None)
+    save_status(path, st)
+    return alerts.get(name, "")
+
+
 def event(path: Path, key: str, detail: str) -> None:
     st = load_status(path)
     st[f"last_{key}"] = {"when": now(), "detail": detail}
@@ -148,6 +175,10 @@ def main(argv: list[str]) -> int:
             return 1
     elif cmd == "growth":
         alert = growth(Path(args[0]), int(args[1]), int(args[2]), args[3] if len(args) > 3 else None)
+        if alert:
+            print(alert)
+    elif cmd == "streak":
+        alert = streak(Path(args[0]), args[1], args[2], args[3], int(args[4]), args[5] if len(args) > 5 else "")
         if alert:
             print(alert)
     elif cmd == "event":

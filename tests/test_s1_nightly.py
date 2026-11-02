@@ -30,6 +30,7 @@ STUBS = {
         "with open(p, 'a') as f:\n"
         "    for i in range(int(os.environ.get('STUB_NEW_LABELS', '0'))):\n"
         "        f.write(json.dumps({'id': f'r{have + i}', 'teacher': 'claude-sonnet-5', 'sample': 0}) + '\\n')\n"
+        "if os.environ.get('STUB_STOP_REASON'): open('data/label-stop-reason', 'w').write(os.environ['STUB_STOP_REASON'] + '\\n')\n"
         "sys.exit(int(os.environ.get('STUB_LABEL_RC', '0')))   # partial labels are written before an early stop\n"
     ),
     "build_sft.py": (
@@ -103,7 +104,7 @@ class NightlyEndToEnd(unittest.TestCase):
 
     def run_night(self, **env):
         self.night += 1
-        run = f"runs/n{self.night}"
+        run = f"runs/2026-01-{self.night:02d}"   # production-style: the runs/20*/ globs (retention, resume) run here
         out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh")], cwd=self.tmp,
                              env={**self.env, "CORTADOS_S1_RUN": run,
                                   "CORTADOS_S1_NIGHT_DATE": (date(2026, 1, 1) + timedelta(days=self.night)).isoformat(),
@@ -252,8 +253,8 @@ class NightlyEndToEnd(unittest.TestCase):
         ro.chmod(0o700)
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending candidate runs/n1 (promotion_failed): re-evaluating", log)
-        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertIn("pending candidate runs/2026-01-01 (promotion_failed): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
         self.assertEqual(json.loads(pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertFalse((run2 / "adapter").exists(), "publishing the approved run needs no retraining")
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
@@ -269,7 +270,7 @@ class NightlyEndToEnd(unittest.TestCase):
         # same SFT data, but the holdout / incumbent changed: the re-evaluation no longer approves the run
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0, CORTADOS_S1_SERVE_POINTER=pointer)
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending runs/n1 no longer promotes", log)
+        self.assertIn("pending runs/2026-01-01 no longer promotes", log)
         self.assertFalse(pointer.exists(), "a stale approval must not be published")
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
         self.assertFalse((run2 / "adapter").exists())
@@ -297,8 +298,8 @@ class NightlyEndToEnd(unittest.TestCase):
         (self.s1 / "data/stub-holdout").write_text("h-backfilled")   # holdout labels never touch the SFT data
         rc, log, run3 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending candidate runs/n1 (holdout_blocked): re-evaluating", log)
-        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertIn("pending candidate runs/2026-01-01 (holdout_blocked): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
         self.assertEqual(json.loads(self.pointer.read_text())["adapter"], str((run1 / "adapter").resolve()))
         self.assertFalse((run3 / "adapter").exists(), "promoted without retraining")
         self.assertFalse((self.s1 / "data/pending-candidate").exists())
@@ -310,15 +311,15 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertIn("holdout too small", log)
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1, CORTADOS_S1_MIN_HOLDOUT=40)   # only the floor changes
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending candidate runs/n1 (holdout_blocked): re-evaluating", log)
-        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertIn("pending candidate runs/2026-01-01 (holdout_blocked): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
         self.assertFalse((run2 / "adapter").exists())
 
     def test_force_train_bypasses_a_waiting_candidate(self):
         self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
         (self.s1 / "data/force-train").write_text("")
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
-        self.assertIn("forced training: pending candidate runs/n1 (holdout_blocked) superseded", log)
+        self.assertIn("forced training: pending candidate runs/2026-01-01 (holdout_blocked) superseded", log)
         self.assertNotIn("waits for the holdout backfill", log)
         self.assertTrue((run2 / "adapter").exists(), log)
 
@@ -361,13 +362,13 @@ class NightlyEndToEnd(unittest.TestCase):
     def test_unavailable_evaluation_stays_pending_and_recovers(self):
         rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_UNAVAILABLE=1)
         self.assertEqual(rc, 1, log)
-        self.assertIn("EVALUATION UNAVAILABLE for runs/n1", log)
+        self.assertIn("EVALUATION UNAVAILABLE for runs/2026-01-01", log)
         self.assertFalse((self.s1 / "data/last-train-labels").exists(), "an unavailable evaluation is not a rejection")
-        self.assertIn("evaluation_failed runs/n1", (self.s1 / "data/pending-candidate").read_text())
+        self.assertIn("evaluation_failed runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
         rc, log, run2 = self.run_night(STUB_NEW_LABELS=0)           # bar loads again; data and fingerprints unchanged
         self.assertEqual(rc, 0, log)
-        self.assertIn("pending candidate runs/n1 (evaluation_failed): re-evaluating", log)
-        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertIn("pending candidate runs/2026-01-01 (evaluation_failed): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
         self.assertFalse((run2 / "adapter").exists(), "recovered without retraining")
         _, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertIn("skipped: no new labels", log)
@@ -375,13 +376,13 @@ class NightlyEndToEnd(unittest.TestCase):
     def test_crashed_evaluation_stays_pending_and_recovers(self):
         rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
         self.assertEqual(rc, 1, log)
-        self.assertIn("EVALUATION FAILED for runs/n1", log)
+        self.assertIn("EVALUATION FAILED for runs/2026-01-01", log)
         self.assertFalse((self.s1 / "data/last-train-labels").exists())
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_EVAL_UNAVAILABLE=1)   # still unavailable: stays pending
         self.assertEqual(rc, 1, log)
-        self.assertIn("EVALUATION UNAVAILABLE again for runs/n1", log)
+        self.assertIn("EVALUATION UNAVAILABLE again for runs/2026-01-01", log)
         rc, log, run3 = self.run_night(STUB_NEW_LABELS=0)
-        self.assertIn("PROMOTED (retry) runs/n1", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
         self.assertFalse((run3 / "adapter").exists())
 
     def test_reruns_on_one_night_count_as_one_stalled_night(self):
@@ -407,6 +408,55 @@ class NightlyEndToEnd(unittest.TestCase):
         _, log, _ = self.run_night(STUB_LABEL_RC=2, CORTADOS_S1_NIGHT_DATE=night)  # that night grew: not a stalled night
         self.assertEqual(self.status()["nights_without_growth"], 0)
 
+    def test_pending_candidate_adapter_survives_retention(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)          # crash: adapter, no report.json
+        self.assertIn("EVALUATION FAILED for runs/2026-01-01", log)
+        self.assertFalse((run1 / "report.json").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_EVAL_RC=1)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertNotIn("superseded", log)
+        self.assertTrue((run1 / "adapter").is_dir(), "the pending candidate's adapter must survive the retention pass")
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertFalse((run3 / "adapter").exists())
+
+    def test_retention_still_prunes_other_unfinished_runs(self):
+        stale = self.s1 / "runs/2025-12-01/adapter"; stale.mkdir(parents=True)
+        (stale / "0000100_adapters.safetensors").write_text("w")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertIn("retention: removed checkpoints of unfinished runs/2025-12-01", log)
+
+    def test_pending_candidate_with_a_missing_adapter_is_dropped_not_superseded(self):
+        _, _, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
+        shutil.rmtree(run1 / "adapter")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1)
+        self.assertIn("pending candidate runs/2026-01-01 adapter missing; dropped", log)
+        self.assertNotIn("superseded", log)
+        self.assertTrue((run2 / "report.json").exists(), log)
+
+    def test_same_early_stop_reason_two_nights_alerts(self):
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_LABEL_RC=3, STUB_STOP_REASON="unknown_headroom")
+        self.assertIn("reason unknown_headroom", log)
+        self.assertNotIn("ALERT", log)
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_LABEL_RC=3, STUB_STOP_REASON="unknown_headroom")
+        self.assertIn("ALERT: label_early_stop unknown_headroom on 2 consecutive nights", log)
+        self.assertNotIn("alert", self.status(), "labels grew: the growth stall is not what fires here")
+        self.assertIn("label_early_stop", self.status()["alerts"])
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_LABEL_RC=3, STUB_STOP_REASON="low_headroom")   # new reason: restarts
+        self.assertNotIn("ALERT", log)
+        self.run_night(STUB_NEW_LABELS=1)                                           # a completed pass clears it
+        self.assertNotIn("label_early_stop", self.status().get("alerts", {}))
+        self.assertNotIn("label_early_stop", self.status().get("streaks", {}))
+
+    def test_repeated_evaluation_failures_alert(self):
+        _, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_UNAVAILABLE=1)
+        self.assertNotIn("ALERT", log)
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_EVAL_UNAVAILABLE=1)
+        self.assertIn("ALERT: evaluation_failed evaluation unavailable or crashed on 2 consecutive nights", log)
+        self.assertIn("evaluation_failed", self.status()["alerts"])
+        self.run_night(STUB_NEW_LABELS=0)                                           # evaluates again: cleared
+        self.assertNotIn("evaluation_failed", self.status().get("alerts", {}))
+
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
         rc, log, _ = self.run_night(STUB_NEW_LABELS=4, STUB_PROMOTE=0)
@@ -431,12 +481,12 @@ class NightlyEndToEnd(unittest.TestCase):
     def test_old_logs_rotate(self):
         for i in range(3):
             self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_LOG_KEEP=2)
-            log = self.s1 / f"runs/n{i + 1}/nightly.log"
+            log = self.s1 / f"runs/2026-01-{i + 1:02d}/nightly.log"
             os.utime(log, (1_700_000_000 + i, 1_700_000_000 + i))
         _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_LOG_KEEP=2)
         self.assertIn("log rotation: removed", log)
-        self.assertEqual(sorted(p.parent.name for p in self.s1.glob("runs/*/nightly.log")), ["n3", "n4"])
-        self.assertTrue((self.s1 / "runs/n1/report.json").exists(), "rotation removes logs only")
+        self.assertEqual(sorted(p.parent.name for p in self.s1.glob("runs/*/nightly.log")), ["2026-01-03", "2026-01-04"])
+        self.assertTrue((self.s1 / "runs/2026-01-01/report.json").exists(), "rotation removes logs only")
 
 
 class NightlyWithRealLabeler(NightlyEndToEnd):
@@ -460,7 +510,7 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
                                        (503, {}, self.err("no claude subscription account can take this request"))])
         rc, log, run = self.run_night(CORTADOS_PROVIDER_URL=self.fake.url)
         self.assertEqual(rc, 0, log)
-        self.assertIn("LABELING STOPPED EARLY (label.py rc 3)", log)
+        self.assertIn("LABELING STOPPED EARLY (label.py rc 3, reason provider_stop)", log)
         self.assertIn("training tonight", log)                    # the first batch's labels are new data
         self.assertIn("last_labeling_stopped_early", self.status())
         self.assertEqual(self.status()["last_label_count"], 2)
