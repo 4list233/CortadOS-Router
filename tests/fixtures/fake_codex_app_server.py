@@ -269,11 +269,25 @@ def main():
             # Codex 0.166.0's dynamic-tool name check: ^[a-zA-Z0-9_-]+$, at most 64 characters, mcp__ reserved;
             # FAKE_CODEX_RESERVED (comma-separated) adds names refused as reserved, to test the refusal path.
             extra = set(filter(None, os.environ.get("FAKE_CODEX_RESERVED", "").split(",")))
-            bad = [t["name"] for t in params.get("dynamicTools") or []
-                   if t["name"].startswith("mcp__") or t["name"] in extra
-                   or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", t["name"])]
-            if bad:
-                out({"id": mid, "error": {"code": -32600, "message": f"dynamic tool name is reserved: {bad[0]}"}})
+            # Refusals are worded as Codex 0.166.0 words them (app-server thread_processor strings); the first bad
+            # name wins.
+            names = [t["name"] for t in params.get("dynamicTools") or []]
+            refusal = None
+            for i, n in enumerate(names):
+                if n != n.strip():
+                    refusal = f"dynamic tool name has leading/trailing whitespace: {n}"
+                elif n in names[:i]:
+                    refusal = f"duplicate dynamic tool name: {n}"
+                elif n.startswith("mcp__") or n in extra:
+                    refusal = f"dynamic tool name is reserved: {n}"
+                elif not re.fullmatch(r"[a-zA-Z0-9_-]+", n):
+                    refusal = f"dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: {n}"
+                elif len(n) > 64:
+                    refusal = f"dynamic tool name must be at most 64 characters to match Responses API: {n}"
+                if refusal:
+                    break
+            if refusal:
+                out({"id": mid, "error": {"code": -32600, "message": refusal}})
                 continue
             state["tools"] = [t["name"] for t in params.get("dynamicTools") or []]
             state["thread"] = str(uuid.uuid4())

@@ -495,6 +495,54 @@ class CodexEndpointTests(unittest.TestCase):
         err = s._tool_refusal(BridgeError("-32600: dynamic tool name is reserved: Read"), declared)
         self.assertIn("refused client tool 'Read'", str(err))
 
+    def test_a_tool_named_like_a_refusal_word_is_not_blamed_over_the_refused_one(self):
+        s = object.__new__(codex_bridge.CodexSession)
+        s._aliases = {}
+        # "reserved" is a whole word of the message and longer than "foo"; only the name Codex spelled out counts.
+        declared = [{"name": "reserved"}, {"name": "foo"}]
+        err = s._tool_refusal(BridgeError("codex app-server refused thread/start: dynamic tool name is reserved: foo "
+                                          "(code -32600)"), declared)
+        self.assertIn("refused client tool 'foo'", str(err))
+        self.assertNotIn("'reserved'", str(err))
+
+    def test_an_undeclared_refused_name_blames_no_tool_even_a_boilerplate_one(self):
+        s = object.__new__(codex_bridge.CodexSession)
+        s._aliases = {}
+        for msg in ("codex app-server refused thread/start: dynamic tool name is reserved: other (code -32600)",
+                    "codex app-server refused thread/start: dynamic tool namespace is reserved: tool (code -32600)",
+                    "codex app-server refused thread/start: some new dynamic tool rule about tool (code -32600)"):
+            err = str(s._tool_refusal(BridgeError(msg), [{"name": "tool"}]))
+            self.assertIn("none of them is known to be wrong", err, msg)
+            self.assertNotIn("refused client tool", err, msg)
+            self.assertIn(msg, err)
+
+    def test_every_known_refusal_format_yields_the_refused_name(self):
+        cases = {
+            "dynamic tool name is reserved: mcp__x": "mcp__x",
+            "duplicate dynamic tool name: Read": "Read",
+            "dynamic tool name has leading/trailing whitespace:  Read ": " Read ",
+            "dynamic tool name must match ^[a-zA-Z0-9_-]+$ to match Responses API: fs.read": "fs.read",
+            "dynamic tool name must be at most 64 characters to match Responses API: " + "a" * 65: "a" * 65,
+        }
+        for raw, name in cases.items():
+            for wrapped in (raw, f"codex app-server refused thread/start: {raw} (code -32600)"):
+                self.assertEqual(codex_bridge.refused_tool_name(wrapped), name, wrapped)
+        for other in ("dynamic tool namespace is reserved: mcp", "thread/start.dynamicTools requires experimentalApi "
+                      "capability", "dynamic tool name must not be empty", ""):
+            self.assertIsNone(codex_bridge.refused_tool_name(other), other)
+
+    def test_the_fake_refusal_formats_round_trip_through_the_bridge(self):
+        # Driven through the fake app-server, so the formats the fake emits are the ones the parser reads.
+        tools = [{"name": "reserved", "input_schema": {"type": "object"}}, {"name": "foo", "input_schema": {"type": "object"}}]
+        os.environ["FAKE_CODEX_RESERVED"] = "foo"
+        try:
+            with self.assertRaises(BridgeError) as cm:
+                codex_bridge.CodexSession(system="s", tools=tools, codex_bin=[sys.executable, str(FAKE_CODEX)],
+                                          codex_home=self.codex_home, scratch_root=self.scratch)
+        finally:
+            del os.environ["FAKE_CODEX_RESERVED"]
+        self.assertIn("refused client tool 'foo'", str(cm.exception))
+
     def test_a_client_gone_before_the_first_event_still_closes_the_one_shot_backend(self):
         # A tool-less streaming request whose client disconnects while the backend starts: the first SSE write fails
         # before the worker's cleanup exists. The one-shot's app-server is in no registry, so it must be closed here.
