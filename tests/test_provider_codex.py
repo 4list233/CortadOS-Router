@@ -436,6 +436,34 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(call["name"], "exec_command")                 # the fake calls its first dynamic tool
         self.assertEqual(r["stop_reason"], "tool_use")
 
+    def test_mcp_and_odd_client_tool_names_reach_codex_encoded_and_come_back_original(self):
+        # Codex refuses mcp__ names ("dynamic tool name is reserved", -32600) and anything outside ^[a-zA-Z0-9_-]{1,64}$;
+        # the fake enforces the same rule, so this thread only starts because the names were encoded.
+        tools = [{"name": "mcp__cortados-route__route_task", "description": "route", "input_schema": {"type": "object"}},
+                 {"name": "fs.read", "input_schema": {"type": "object"}}, READ_TOOL]
+        r = self.post({"tools": tools, "messages": [{"role": "user", "content": "use tool"}]})
+        start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
+        declared = [t["name"] for t in start["dynamicTools"]]
+        self.assertEqual(declared[0], "cx_mcp_cortados-route__route_task")
+        self.assertTrue(declared[1].startswith("fs_read_"))
+        self.assertEqual(declared[2], "Read")
+        [call] = [b for b in r["content"] if b["type"] == "tool_use"]
+        self.assertEqual(call["name"], "mcp__cortados-route__route_task")   # the client's own name, not the wire name
+
+    def test_a_tool_name_codex_still_refuses_is_named_in_the_error(self):
+        tools = [{"name": "mcp__srv__do_it", "input_schema": {"type": "object"}}, READ_TOOL]
+        os.environ["FAKE_CODEX_RESERVED"] = "cx_mcp_srv__do_it"
+        try:
+            with self.assertRaises(BridgeError) as cm:
+                codex_bridge.CodexSession(system="s", tools=tools, codex_bin=[sys.executable, str(FAKE_CODEX)],
+                                          codex_home=self.codex_home, scratch_root=self.scratch)
+        finally:
+            del os.environ["FAKE_CODEX_RESERVED"]
+        msg = str(cm.exception)
+        self.assertIn("refused client tool 'mcp__srv__do_it'", msg)
+        self.assertIn("cx_mcp_srv__do_it", msg)
+        self.assertIn("-32600", msg)
+
     def test_a_client_gone_before_the_first_event_still_closes_the_one_shot_backend(self):
         # A tool-less streaming request whose client disconnects while the backend starts: the first SSE write fails
         # before the worker's cleanup exists. The one-shot's app-server is in no registry, so it must be closed here.
@@ -839,8 +867,47 @@ class CodexSessionUnitTests(unittest.TestCase):
         aliases = codex_isolation.tool_aliases(codex_client + [{"name": "Read"}])
         self.assertEqual(aliases, {"client_" + t["name"]: t["name"] for t in codex_client})
         self.assertEqual(codex_isolation.tool_aliases([{"name": "Read"}, {"name": "Edit"}]), {})
-        with self.assertRaisesRegex(BridgeError, "client_sleep"):
-            codex_isolation.tool_aliases([{"name": "sleep"}, {"name": "client_sleep"}])
+        # A client tool already named like an alias keeps its name; the Codex-named one gets a hashed alias instead.
+        taken = codex_isolation.tool_aliases([{"name": "sleep"}, {"name": "client_sleep"}])
+        [(alias, orig)] = taken.items()
+        self.assertEqual(orig, "sleep")
+        self.assertNotEqual(alias, "client_sleep")
+        self.assertTrue(alias.startswith("client_sleep_"))
+
+    def assert_codex_safe_round_trip(self, names):
+        aliases = codex_isolation.tool_aliases([{"name": n} for n in names])
+        wire = [next((a for a, o in aliases.items() if o == n), n) for n in names]
+        self.assertEqual(len(set(wire)), len(names), wire)                 # collision-free
+        for w in wire:
+            self.assertRegex(w, r"^[A-Za-z0-9_-]{1,64}$")
+            self.assertFalse(w.lower().startswith("mcp__"), w)
+        self.assertEqual([aliases.get(w, w) for w in wire], names)       # reversible
+        self.assertEqual(codex_isolation.tool_aliases([{"name": n} for n in names]), aliases)   # deterministic
+        return dict(zip(names, wire))
+
+    def test_mcp_tool_names_are_encoded_for_codex_and_mapped_back(self):
+        wire = self.assert_codex_safe_round_trip(["mcp__cortados-route__route_task", "mcp__github__create_issue"])
+        self.assertEqual(wire["mcp__cortados-route__route_task"], "cx_mcp_cortados-route__route_task")
+        self.assertEqual(wire["mcp__github__create_issue"], "cx_mcp_github__create_issue")
+
+    def test_names_with_dots_and_odd_characters_are_encoded(self):
+        wire = self.assert_codex_safe_round_trip(["fs.read", "my tool", "émoji✓", "a/b:c", " padded ", ""])
+        self.assertTrue(wire["fs.read"].startswith("fs_read_"))
+
+    def test_very_long_names_are_cut_to_64_with_a_distinguishing_hash(self):
+        a, b = "mcp__server__" + "x" * 100 + "a", "mcp__server__" + "x" * 100 + "b"
+        wire = self.assert_codex_safe_round_trip([a, b, "y" * 65])
+        self.assertTrue(all(len(w) == 64 for w in wire.values()))
+
+    def test_names_that_would_collide_after_encoding_get_distinct_names(self):
+        wire = self.assert_codex_safe_round_trip(["fs.read", "fs_read", "fs:read", "mcp__a__b", "cx_mcp_a__b"])
+        self.assertEqual(wire["fs_read"], "fs_read")                     # the safe name keeps its own name
+        self.assertEqual(wire["cx_mcp_a__b"], "cx_mcp_a__b")
+        self.assertNotEqual(wire["mcp__a__b"], "cx_mcp_a__b")
+
+    def test_safe_names_pass_through_unchanged(self):
+        names = ["Read", "Edit", "Bash", "web-fetch", "Task_2", "z" * 64]
+        self.assertEqual(codex_isolation.tool_aliases([{"name": n} for n in names]), {})
 
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
