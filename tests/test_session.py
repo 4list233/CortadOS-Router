@@ -40,6 +40,24 @@ class SessionTests(unittest.TestCase):
                           out=out, err=err, managed_dirs=(self.managed,), home=self.home)
         return rc, out.getvalue(), err.getvalue()
 
+    def test_custom_headers(self):
+        self.assertEqual(session.custom_headers(None), "x-cortados-reveal: 1")
+        self.assertEqual(session.custom_headers("t20261102000000-0000abcd"),
+                         "x-cortados-reveal: 1\nx-cortados-run-id: t20261102000000-0000abcd")
+
+    def test_invalid_run_id_refused(self):
+        for bad in ("short", "has space in it", "x" * 65, "bad\nnewline-id"):
+            with self.assertRaises(session.SessionError):
+                self.prepare(["--provider-url", "http://r.example", "--token-file", self.tok, "--run-id", bad])
+        self.assertEqual(self.settings_files(), [], "no token file is written for a refused run id")
+
+    def test_print_env_shows_run_id_header(self):
+        rc, out, err = self.run_main("--provider-url", "http://r.example", "--token-file", self.tok,
+                                     "--run-id", "t20261102000000-0000abcd", "--print-env")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("x-cortados-run-id: t20261102000000-0000abcd", out)
+        self.assertNotIn(SECRET, out)
+
     def settings_files(self):
         return sorted(os.listdir(self.sdir)) if os.path.isdir(self.sdir) else []
 

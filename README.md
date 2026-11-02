@@ -15,7 +15,7 @@ It works in three steps:
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
 - **The `cortados-routed-subagents` Claude Code mod** (`integrations/claude-mod/cortados-routed-subagents/`) intercepts every Agent-tool subagent the session spawns and runs it as a headless `claude` against the provider instead: S1 scores and routes the subagent's model, while its tools still execute on your machine. Built-in tools only (no MCP, no browser); worktree-isolated, remote, forked and named agents pass through unrouted; a routed subagent runs under a 10-minute cap. An optional **orchestrator mode** directs the main session to plan and delegate rather than do substantive work itself (guidance by default; `orchestratorEnforce` makes it a hard allowlist). Each run's real backend model and the lane's remaining window are shown via the run record (below), not just `cortados`.
-- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
+- **The `cortados-route` MCP tool**, `route_task(task, context?, max_tokens?, model?)` (`cortados_router/subagent_mcp.py`), is text-only delegation: the main session keeps its own model and tools, and hands a self-contained subtask to the provider for S1 to score and route; the answer comes back as text, with no tool access of its own. `model` (optional) pins a model instead of S1: any name `start_task`'s `orchestrator` accepts (`fable`, `opus`, `claude-*`, `gpt-*`; one validation, `child_tasks.pin_model`), sent as `sub/<id>`; the result's `_meta` carries the requested and the routed model. Token from `CORTADOS_PROVIDER_TOKEN`/`_FILE` or `~/.config/cortados/provider-token` by default. Setup below (Delegating sub-agent work).
 
 **Recommended setup:** pin the main session to a strong model with `claude --model sub/opus` against the provider, and let the routed-subagents mod send its workers through S1 (`model: cortados` in the mod config, the default). S1 only scores a conversation's first message and the route is then fixed for that conversation — good for a worker whose task is stated up front, not for an orchestrating session whose first message ("let's get started") is too thin to score well. Pinning the planner sidesteps that; routing the workers still gets each one the cheapest capable model.
 
@@ -305,6 +305,77 @@ refused when on until local lanes are evaluated); an asleep or busy node fails t
 fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
+
+## Delegating whole tasks from the Claude app
+
+The same `cortados-route` server also hands off WHOLE tasks: each one runs as a separate headless Claude Code session
+on the machine that runs the server (`claude -p` launched through `cortados_router.session`, so the provider env, the
+`sub/<model>` pin and S1-routed native subagents are exactly those of a `cortados` session), with every tool and MCP
+server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
+
+Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?)` returns a `task_id` at once;
+`task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
+
+- `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
+  ...), which pins the child's MAIN model; the child's subagents are still routed by S1.
+- `permission_mode`: `auto` (default: a safety classifier approves or denies each action, so a child can run Bash and
+  tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
+  anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
+  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead.
+- Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
+  `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
+  `~/.claude/CLAUDE.md` does not make it delegate again. With a pinned orchestrator the launcher's whole-session
+  directive comes first and the child directive last, in the same flag.
+- `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
+  signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Without it the
+  child gets an explicit `--no-chrome`, so a `claudeInChromeDefaultEnabled` setting cannot turn Chrome on. Chrome inside a
+  headless `-p` child is unverified until a live test.
+- Connectors: claude.ai connectors are disabled in token-auth sessions, so if `~/.config/cortados/connectors.mcp.json`
+  exists (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`) the child gets it as `--mcp-config`, loading those
+  servers directly; without it the child runs without connector servers (noted in `runner.log`).
+- State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
+  when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.
+  If the runner itself dies, the next status call stops claude's leftover process group (pid and start time are
+  checked, so a reused pid is never signalled) and shows the unredacted logs only when the current credentials match
+  the launch ones by sha256 fingerprint; otherwise it withholds them.
+- Limits: no cap on parallel children (capacity is the router's job: S1 and the quota gates refuse or redirect a spent
+  lane); 3 h per child (`CORTADOS_CHILD_MAX_S`), after which claude's process group gets SIGTERM, then SIGKILL 30 s
+  later (cancel does the same); a child cannot start children.
+- The token is read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`). Both it and
+  `CORTADOS_PROVIDER_TOKEN` are redacted from everything the tools return; a token shorter than 8 characters is refused
+  (it could not be redacted safely). The desktop app
+  starts servers with a thin PATH, so set `CORTADOS_CHILD_CLAUDE_BIN` to claude's absolute path.
+
+Router logs: the child sends `x-cortados-run-id: <task_id>` on every provider request (added to
+`ANTHROPIC_CUSTOM_HEADERS` next to `x-cortados-reveal`), so the provider's run record holds it under the task id; when
+the task is done, `task_status`/`wait_task` fetch `GET /v1/cortados/runs/<task_id>` and return it as `router_run`
+(models, primary lane; a fetch failure is a field, not an error). The run record is in memory, bounded (16 entries per
+run, 512 runs) and forgotten on a provider restart. Each lifecycle event (`started`, `finished` with status, exit code
+and duration, `cancelled`) is also appended as one JSON line to `$CORTADOS_HOME/child-tasks.jsonl` (default
+`~/.cortados`): task id, cwd, orchestrator, permission mode, chrome flag, status and timings; never the prompt or a
+secret.
+
+Claude desktop app (`claude_desktop_config.json`, under `mcpServers`):
+
+```json
+"cortados-route": {
+  "command": "python3",
+  "args": ["/ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py"],
+  "env": {
+    "CORTADOS_PROVIDER_URL": "http://<provider-host>:8432",
+    "CORTADOS_CHILD_CLAUDE_BIN": "/ABSOLUTE/PATH/TO/claude"
+  }
+}
+```
+
+Claude Code, user scope:
+
+```bash
+claude mcp add -s user cortados-route \
+  --env CORTADOS_PROVIDER_URL=http://<provider-host>:8432 \
+  --env CORTADOS_CHILD_CLAUDE_BIN="$(command -v claude)" \
+  -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
+```
 
 ## The resource pool at a glance
 
