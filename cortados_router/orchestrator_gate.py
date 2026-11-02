@@ -8,6 +8,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 
 PLANNING_TOOLS = frozenset((
     "Agent", "Task", "TodoWrite", "Read", "Grep", "Glob", "ToolSearch", "Skill",
@@ -55,6 +56,13 @@ def private_file(path, flags):
     return fd
 
 
+def agent_type_key(name):
+    # Mirrors how Claude Code 2.1.316 resolves an agent type (NFKC, lowercase, whitespace, Unicode dashes and
+    # underscores removed), so spellings like "f_ork", "f-ork" or a full-width "ｆｏｒｋ" cannot slip a fork past us.
+    name = unicodedata.normalize("NFKC", name).lower()
+    return "".join(c for c in name if not c.isspace() and c != "_" and unicodedata.category(c) != "Pd")
+
+
 def decide(event, env, directory=None):
     if "agent_id" in event:
         return None
@@ -64,7 +72,7 @@ def decide(event, env, directory=None):
     # Forks are denied outright, whatever the budget and without spending it: a fork inherits the pinned orchestrator
     # model and its full history, so it skips S1, and the provider matches its requests to the parent's held backend
     # conversation by history fingerprint, advances it, and the parent's next request then gets a 409 (seen live, e2e C5).
-    if tool in ("Agent", "Task") and isinstance(subagent_type, str) and subagent_type.strip().lower() == "fork":
+    if tool in ("Agent", "Task") and isinstance(subagent_type, str) and agent_type_key(subagent_type) == "fork":
         return {"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
             "permissionDecisionReason": FORK_DENY_REASON,

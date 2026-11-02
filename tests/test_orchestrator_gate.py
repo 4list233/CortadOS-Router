@@ -45,7 +45,7 @@ class GateTests(unittest.TestCase):
 
     def test_fork_denied_in_main_loop_without_budget(self):
         for tool in ("Agent", "Task"):
-            for kind in ("fork", " Fork ", "FORK"):
+            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "f\u2014ork", "\uff46\uff4f\uff52\uff4b"):
                 out, err = self.call(dict(self.event, tool_name=tool,
                                           tool_input={"subagent_type": kind, "prompt": "x"}))
                 self.assertEqual(err, "")
@@ -57,7 +57,7 @@ class GateTests(unittest.TestCase):
     def test_fork_allowed_inside_subagent_and_other_agents_unbudgeted(self):
         fork = dict(self.event, tool_name="Agent", tool_input={"subagent_type": "fork"})
         self.assertEqual(self.call(dict(fork, agent_id="child")), ("", ""))
-        for tool_input in ({"subagent_type": "general-purpose"}, {"prompt": "x"}, "not a dict", None):
+        for tool_input in ({"subagent_type": "general-purpose"}, {"subagent_type": "forked"}, {"prompt": "x"}, "not a dict", None):
             for _ in range(5):
                 self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input),
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
