@@ -49,6 +49,9 @@ STUBS = {
         "hk = open('data/stub-holdout').read() if os.path.exists('data/stub-holdout') else 'h0'\n"
         "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
         "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_RC'): print('Traceback: KeyError answers'); raise SystemExit(1)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_GARBAGE'): print('fifty', floor); raise SystemExit(0)\n"
+        "if a.holdout_count: print('labels: kept N Claude-teacher rows', file=__import__('sys').stderr)   # like read_labels\n"
         "if a.holdout_count: print(50 if hk == 'h0' else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
         "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
@@ -476,6 +479,27 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertTrue((run3 / "report.json").exists(), log)
         self.assertIn("PROMOTED →", log)
         self.assertNotIn("holdout_blocked", self.status().get("alerts", {}))
+
+    def _count_failure_keeps_candidate(self, **env):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        for night in (1, 2):
+            rc, log, run = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1, **env)
+            self.assertEqual(rc, 1, log)
+            self.assertIn("HOLDOUT COUNT FAILED", log)
+            self.assertNotIn("superseded", log)
+            self.assertFalse((run / "adapter").exists(), "no training on a failed holdout count")
+            self.assertIn("holdout_blocked runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertIn("ALERT: holdout_count_failed", log)
+        self.assertIn("holdout_count_failed", self.status()["alerts"])
+        (self.s1 / "data/force-train").write_text("")                              # an explicit override still trains
+        rc, log, run = self.run_night(STUB_NEW_LABELS=1, STUB_HOLDOUT_BLOCKED=1, **env)
+        self.assertTrue((run / "adapter").exists(), log)
+
+    def test_failed_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_RC=1)
+
+    def test_malformed_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_GARBAGE=1)
 
     def test_holdout_blocked_force_train_retrains_below_the_floor(self):
         self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)

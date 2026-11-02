@@ -293,14 +293,31 @@ if [ -f data/pending-candidate ]; then
     # New train labels. A holdout-blocked candidate means the bar cannot judge ANY candidate yet: retraining on the new labels
     # would only produce another blocked run every night (a GPU loop). Hold until the Claude holdout reaches the floor
     # (or --train / data/force-train, handled above).
-    hc=""; [ "$p_reason" = holdout_blocked ] && hc=$(holdout_count)
-    read -r h_rows h_floor <<< "$hc"
-    if [ "$p_reason" = holdout_blocked ] && [ -n "${h_rows:-}" ] && [ "$h_rows" -lt "$h_floor" ]; then
-      echo "holdout still $h_rows/$h_floor; not retraining (pending $p_run waits; --train or data/force-train overrides)"
-      state event "$STATUS" skip "holdout still $h_rows/$h_floor; $p_run waits"; holdout_hit
-      echo "=== $(date) nightly end"; exit 0
+    if [ "$p_reason" = holdout_blocked ]; then
+      # The count must be trustworthy: a failed or garbled count (e.g. malformed holdout answers crash build_eval_sets) must not
+      # fall through to discarding the candidate and training — that is the GPU loop this hold exists to stop.
+      h_rows=""; h_floor=""; hc_ok=0
+      # stdout only: evaluate.py's label loader reports its Claude-only filter on stderr, which must not reach the parse
+      hc_err=$(mktemp "${TMPDIR:-/tmp}/holdout-count.XXXXXX")
+      if hc=$(holdout_count 2>"$hc_err"); then
+        read -r h_rows h_floor h_extra <<< "$hc"
+        case "$h_rows$h_floor" in ''|*[!0-9]*) ;; *) [ -n "$h_rows" ] && [ -n "$h_floor" ] && [ -z "${h_extra:-}" ] && hc_ok=1 ;; esac
+      fi
+      if [ "$hc_ok" -ne 1 ]; then
+        echo "HOLDOUT COUNT FAILED (evaluate.py --holdout-count: $( { echo "$hc"; cat "$hc_err"; } | grep -v '^$' | tail -1 | cut -c1-160)); pending $p_run kept, not retraining"
+        rm -f "$hc_err"
+        state event "$STATUS" pending_failure "$p_run holdout count failed"
+        alert_line "$(state streak "$STATUS" holdout_count_failed hit "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS" "evaluate.py --holdout-count failed")"
+        exit 1
+      fi
+      rm -f "$hc_err"
+      state streak "$STATUS" holdout_count_failed clear "$NIGHT" "$HOLDOUT_BLOCKED_NIGHTS"
+      if [ "$h_rows" -lt "$h_floor" ]; then
+        echo "holdout still $h_rows/$h_floor; not retraining (pending $p_run waits; --train or data/force-train overrides)"
+        state event "$STATUS" skip "holdout still $h_rows/$h_floor; $p_run waits"; holdout_hit
+        echo "=== $(date) nightly end"; exit 0
+      fi
     fi
-    [ "$p_reason" = holdout_blocked ] && [ -z "${h_rows:-}" ] && echo "holdout count unavailable; training normally"
     echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
   fi
 fi
