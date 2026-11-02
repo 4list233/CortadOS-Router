@@ -545,9 +545,30 @@ def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) ->
     old = old or {}
     err = f"{type(exc).__name__}: {str(exc)[:200]}"
     kind = failure_kind(err)
+    rec = {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
+    # The full list of places looked, beyond the 200-char summary above; dropped when this failure carries none, so a
+    # stale list from an earlier failure never describes a different one.
+    searched = getattr(exc, "searched", None)
+    if searched:
+        rec["searched"] = list(searched)
+    else:
+        rec.pop("searched", None)
     if kind != old.get("error_kind"):
-        print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
-    return {**old, "tried_at": time.time(), "error": err, "error_kind": kind}
+        try:
+            print(f"cortados scarcity: {lane} reading failed ({kind}): {err}", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            # Diagnostics must never block recording the failure: a closed stderr or a broken pipe would otherwise
+            # raise out of here, no failed record would be published, and the stale quota would stay routable.
+            pass
+    return rec
+
+
+class CodexNotFound(RuntimeError):
+    """No Codex CLI anywhere; `searched` carries every place looked, in full, for the persisted record."""
+
+    def __init__(self, searched: list[str]):
+        super().__init__("Codex CLI not found: searched " + "; ".join(searched))
+        self.searched = list(searched)
 
 
 def _codex() -> dict[str, Any]:
@@ -557,7 +578,7 @@ def _codex() -> dict[str, Any]:
     if not binary:
         # Say so plainly instead of forking a child that can only exit 127 and read as an empty boot screen, and name
         # every place looked so the next relocation is a one-line read of the error rather than a debugging session.
-        raise RuntimeError("Codex CLI not found: searched " + "; ".join(searched))
+        raise CodexNotFound(searched)
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}

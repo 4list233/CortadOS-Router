@@ -233,6 +233,45 @@ class FailedReadingTest(unittest.TestCase):
         self.assertIsNone(lane["error_kind"])
         self.assertIsNone(lane["error"])
 
+    def test_a_broken_stderr_never_blocks_recording_the_failure(self):
+        # Regression: print() raising out of _failed_record left no failed record, so the stale quota stayed routable.
+        class Broken(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        def boom():
+            raise RuntimeError("Codex CLI not found: searched nothing")
+        with mock.patch.dict(sc.SAMPLERS, {"codex": boom}), mock.patch.object(sc.sys, "stderr", Broken()):
+            sc._sample_locked(force=True, only=["codex"])
+        lane = self._codex_lane()
+        self.assertEqual(lane["error_kind"], "codex-cli-not-found")
+        self.assertIn("Codex CLI not found", lane["error"])
+
+    def test_a_not_found_failure_persists_every_root_and_pattern_searched(self):
+        gone = [str(self.home / f"Gone{i}.app") for i in range(6)]      # long enough to overrun the 200-char summary
+        legacy = str(self.home / "legacy/codex")
+        with mock.patch.object(sc, "CODEX_APP_BUNDLES", tuple(gone)), \
+             mock.patch.object(sc, "CODEX_APP_BINARIES", (legacy,)), \
+             mock.patch.object(sc, "_cli_env", return_value={"PATH": str(self.home / "nobin")}), \
+             mock.patch.object(sc, "tui_capture", side_effect=AssertionError("must not fork")):
+            self._run(sc._codex)
+        lane = self._codex_lane()
+        self.assertEqual(lane["error_kind"], "codex-cli-not-found")
+        searched = lane["searched"]
+        for g in gone:
+            root = f"{g}/Contents/Resources/"
+            self.assertTrue(any(s.startswith(root) and "codex-package.json" in s and "codex*/bin/codex" in s
+                                for s in searched), (root, searched))
+        self.assertIn("`codex` on PATH", searched)
+        self.assertIn(legacy, searched)
+        self.assertIn("Gone0.app/Contents/Resources/", lane["error"])   # the summary names the roots too, as far as it fits
+        # A later failure of another kind does not inherit a stale list.
+        self._run(lambda: (_ for _ in ()).throw(ValueError("Codex /status screen is not one this parser accepts")))
+        self.assertNotIn("searched", self._codex_lane())
+
     def test_the_managed_local_refresh_records_a_kind_and_logs_like_the_locked_sampler(self):
         # Regression: _sample_local_managed wrote `error` with no error_kind and never logged, so a node-telemetry
         # failure was silent and re-logged nothing while routing quietly lost the lane.
