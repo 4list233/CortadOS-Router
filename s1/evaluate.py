@@ -7,6 +7,7 @@ bar is the stronger teacher; when Forest corrects routes in Discord those rows o
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import json
 import math
@@ -21,6 +22,13 @@ from common import DATA, QUESTIONS, core, read_jsonl, read_labels, valid_answers
 from student import N_OPTIONS, Scorer, encode
 
 BANDS = ["R0", "R1", "R2", "R3", "R4"]
+
+
+def current_pointer() -> Path:
+    """The promoted pointer the incumbent bar is read from: CORTADOS_S1_SERVE_POINTER when the nightly sets it (the file the
+    scorer serves), else current.json beside this file. Reading a different file than the nightly promotes into would grade
+    candidates against a stale incumbent."""
+    return Path(os.environ.get("CORTADOS_S1_SERVE_POINTER") or Path(__file__).resolve().parent / "current.json")
 
 
 def outcome_holdout() -> list[tuple[dict, str]]:
@@ -149,14 +157,45 @@ def _no_outcome_regression(co: dict, obar: dict) -> bool:
             and co["under"] * obar["n"] <= obar["under"] * co["n"])
 
 
-def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, bool]:
+# The smallest teacher holdout a promotion may rest on. Claude-only grading (common.read_labels drops Codex labels) can shrink the
+# holdout far below its normal ~610 rows while train labels remain, e.g. after a quota-stopped Claude backfill; graded on zero rows
+# both models tie and the old rule promoted. 200 keeps the one-request noise slack at 0.5 points of band accuracy and means at
+# least a third of the usual holdout is Claude-labelled; below it the comparison is noise and nothing is promoted.
+MIN_TEACHER_HOLDOUT = int(os.environ.get("CORTADOS_S1_MIN_HOLDOUT", "200"))
+
+
+def build_eval_sets(reqs: dict, labels: list[dict]) -> tuple[list, list]:
+    """(holdout, valid) from the requests and the effective (Claude-only, override-merged) labels."""
+    samples = defaultdict(list)
+    for l in labels:
+        samples[l["id"]].append(l["answers"])
+    holdout = [(reqs[i], teacher_view(s)) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "holdout"]
+    valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "train" and int(hashlib.sha1(("v" + i).encode()).hexdigest(), 16) % 10 == 0]
+    return holdout, valid
+
+
+def holdout_key(holdout: list, fail_up: float, outward_at: float) -> str:
+    """Grading-cache key: the holdout ids AND the effective teacher truth on them (the per-question distributions after Claude-only
+    filtering and overrides) AND the inference settings. Keyed on ids alone, dropping Codex samples changed the truth under the same
+    key and a stale bar was reused. The "v2" prefix makes every legacy id-only cache a miss, so it is regraded, never trusted."""
+    h = hashlib.sha1(b"v2")
+    for r, tv in sorted(holdout, key=lambda x: x[0]["id"]):
+        h.update(json.dumps([r["id"], tv["dist"], tv["band"]], sort_keys=True).encode())
+    h.update(f"|{fail_up}|{outward_at}".encode())
+    return h.hexdigest()[:12]
+
+
+def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
+                     holdout_rows: int | None = None) -> tuple[bool, bool]:
     """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
     to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
     never regress. When held-out outcomes exist a valid outcome bar is REQUIRED, and on the SAME outcome holdout the
     candidate may regress on neither outcome band accuracy nor outcome under-routing (strict, no slack — these are the
     actual-task ground truth, so no degradation is allowed; Forest/Codex review 2026-10-25). A missing/failed outcome
-    baseline blocks promotion rather than defaulting to OK."""
+    baseline blocks promotion rather than defaulting to OK. A teacher holdout under MIN_TEACHER_HOLDOUT rows blocks promotion."""
     if not bar:
+        return False, False
+    if holdout_rows is not None and holdout_rows < MIN_TEACHER_HOLDOUT:
         return False, False
     slack = 1.0 / max(c["n"], 1)
     better_under = c["under_routed"] < bar["under_routed"]
@@ -173,41 +212,49 @@ def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, s
     """The bar for a non-MLX candidate (--engine laya): the promoted Qwen adapter's grade on THIS holdout, read from the cache the qwen engine
     writes (bar-<run>-<hkey>.json) or, failing that, from the promoted run's own report when it graded the same number of holdout rows with the
     same inference settings. Never loads MLX here (the laya venv has none; only the 8B may sit beside the trainer). Returns (bar, source)."""
-    cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+    cur = json.loads(current_pointer().read_text())
     if not cur.get("adapter"):
         return None, None
-    hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+    hkey = holdout_key(holdout, fail_up, OUTWARD_AT)
     cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
     if cache_p.exists():
         return json.loads(cache_p.read_text()), f"promoted adapter {cur['adapter']} re-graded on this holdout (cached {cache_p.name})"
     rep_p = Path(cur.get("report") or "")
     if rep_p.exists():
         rep = json.loads(rep_p.read_text())
-        if rep.get("holdout_rows") == len(holdout) and rep.get("fail_up_below") == fail_up and rep.get("outward_at") == OUTWARD_AT and rep.get("candidate"):
-            return rep["candidate"], f"promoted adapter's own report {rep_p} (same {len(holdout)} holdout rows, same fail-up/outward settings; not re-graded)"
+        if rep.get("holdout_key") == hkey and rep.get("fail_up_below") == fail_up and rep.get("outward_at") == OUTWARD_AT and rep.get("candidate"):
+            return rep["candidate"], f"promoted adapter's own report {rep_p} (same holdout labels {hkey}, same fail-up/outward settings; not re-graded)"
     raise RuntimeError(f"no cached bar for {cur['adapter']} on this holdout ({cache_p.name}); grade it once with the qwen engine to create the cache")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=False); ap.add_argument("--adapter"); ap.add_argument("--out", required=True)
+    ap.add_argument("--base", required=False); ap.add_argument("--adapter"); ap.add_argument("--out")
     ap.add_argument("--baseline", action="store_true", help="also grade the incumbent engine (ollama 14B) on the holdout; slow, cached")
     ap.add_argument("--fail-up", type=float, default=float(__import__("os").environ.get("CORTADOS_S1_FAIL_UP", "0.6")),
                     help="grade what production runs: a difficulty feature whose top probability is below this takes the higher of its two most likely levels (0 = off)")
     ap.add_argument("--engine", choices=["qwen", "laya"], default="qwen", help="qwen (default: --base/--adapter, MLX) or laya (--checkpoint, torch/MPS; run from s1/.venv-laya; the laya candidate code is not published)")
     ap.add_argument("--checkpoint", help="--engine laya: a directory s1/laya/train.py wrote (or s1/laya/base for the zero-shot upstream checkpoint)")
+    ap.add_argument("--holdout-key", action="store_true",
+                    help="print the evaluation fingerprint of the current holdout (effective teacher labels + settings) and exit; "
+                         "nightly.sh uses it to re-evaluate a waiting candidate only when its holdout changed")
     a = ap.parse_args()
+    if a.holdout_key:
+        reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+        holdout, _ = build_eval_sets(reqs, read_labels())
+        # + every setting that changes the promote decision beyond the holdout itself: lowering CORTADOS_S1_MIN_HOLDOUT must
+        # wake a candidate that waits on the floor
+        print(f"{holdout_key(holdout, a.fail_up, OUTWARD_AT)}-min{MIN_TEACHER_HOLDOUT}")
+        return 0
+    if not a.out:
+        ap.error("the following arguments are required: --out")
     if a.engine == "qwen" and not a.base:
         ap.error("the following arguments are required: --base")
     if a.engine == "laya" and not a.checkpoint:
         ap.error("--engine laya requires --checkpoint <dir>")
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
-    samples = defaultdict(list)
-    for l in read_labels():
-        samples[l["id"]].append(l["answers"])
-    holdout = [(reqs[i], teacher_view(s)) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "holdout"]
-    valid = [(reqs[i], s) for i, s in samples.items() if i in reqs and reqs[i]["split"] == "train" and int(hashlib.sha1(("v" + i).encode()).hexdigest(), 16) % 10 == 0]
+    holdout, valid = build_eval_sets(reqs, read_labels())
     if a.engine == "laya":
         sys.path.insert(0, str(Path(__file__).resolve().parent / "laya"))
         from predict import LayaScorer                    # duck-types Scorer: .T and .score(request, unit_kind) -> answers/probs/confidence/ms
@@ -218,6 +265,7 @@ def main() -> int:
     scorer.T = T
     report = {"when": time.strftime("%Y-%m-%d %H:%M"), "base": a.base, "adapter": a.adapter, "engine": a.engine, "checkpoint": a.checkpoint,
               "temperatures": T, "holdout_rows": len(holdout), "valid_rows": len(valid),
+              "holdout_key": holdout_key(holdout, a.fail_up, OUTWARD_AT), "min_holdout_rows": MIN_TEACHER_HOLDOUT,
               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
               "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
     o_holdout = outcome_holdout()                              # the loop's held-out tasks; truth = the band they needed
@@ -257,12 +305,13 @@ def main() -> int:
     else:
         cur, inc = {}, None
         try:
-            cur = json.loads((Path(__file__).resolve().parent / "current.json").read_text())
+            # no pointer at all = no incumbent yet (the first model), not a failure; an unreadable one is a failure
+            cur = json.loads(current_pointer().read_text()) if current_pointer().exists() else {}
         except Exception as exc:
             report["bar_error"] = f"{type(exc).__name__}: {exc}"
         if cur.get("adapter") and Path(cur["adapter"]).exists() and cur["adapter"] != str(Path(a.adapter).resolve()) and cur["adapter"] != a.adapter:
             try:
-                hkey = hashlib.sha1(("|".join(sorted(r["id"] for r, _ in holdout)) + f"|{a.fail_up}|{OUTWARD_AT}").encode()).hexdigest()[:12]
+                hkey = holdout_key(holdout, a.fail_up, OUTWARD_AT)
                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
                 if cache_p.exists():
                     bar = json.loads(cache_p.read_text())
@@ -297,9 +346,19 @@ def main() -> int:
     # against the CURRENTLY PROMOTED model on under-routing, outward recall, band accuracy AND the outcome band, so the
     # live scorer can never get worse. No hold-first/arm ceremony — the bar alone guards every promotion.
     report["promote"], report["outcome_regression_checked"] = promote_decision(
-        c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout))
+        c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout), holdout_rows=len(holdout))
+    if len(holdout) < MIN_TEACHER_HOLDOUT:
+        report["promote_blocked"] = (f"teacher holdout has {len(holdout)} Claude-labelled rows < {MIN_TEACHER_HOLDOUT} "
+                                     "(CORTADOS_S1_MIN_HOLDOUT): too few to compare models; finish the holdout backfill")
+    # A bar that could not be built (incumbent pointer unreadable, incumbent or outcome-bar grading failed) makes promote=False a
+    # verdict nobody reached: say so, so nightly.sh retries the evaluation instead of finalising the candidate as rejected.
+    errors = {k: report[k] for k in ("bar_error", "outcome_bar_error") if report.get(k)}
+    report["evaluation_status"] = "unavailable" if errors else "ok"
+    if errors:
+        report["promote"] = False
+        report["evaluation_unavailable"] = "; ".join(f"{k}: {v}" for k, v in errors.items())
     (out / "report.json").write_text(json.dumps(report, indent=1))
-    print(json.dumps({k: report[k] for k in ("holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
+    print(json.dumps({k: report[k] for k in ("evaluation_status", "holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
                                               "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
     return 0
 
