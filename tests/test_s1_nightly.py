@@ -27,6 +27,7 @@ STUBS = {
     "label.py": (
         "import json, os, sys\n"
         "open('data/label-args', 'w').write(' '.join(sys.argv[1:]))\n"
+        "if os.environ.get('STUB_LABEL_SLEEP'): __import__('time').sleep(float(os.environ['STUB_LABEL_SLEEP']))   # a long cycle\n"
         "open('data/label-env', 'w').write(os.environ.get('CORTADOS_PROVIDER_URL', '<unset>'))\n"
         "p = 'data/labels.jsonl'\n"
         "have = sum(1 for _ in open(p)) if os.path.exists(p) else 0\n"
@@ -291,6 +292,67 @@ class NightlyEndToEnd(unittest.TestCase):
         child.wait(timeout=10)
         self.assertTrue(mark.exists(), "the stopped run handled TERM (it was continued), not SIGKILLed")
         self.assertTrue((self.s1 / "data/nightly.stop").exists())
+
+    def _supervisor(self, scorer_port, **env):
+        """overnight.py --continuous over the real nightly.sh in the temp s1; its probe hits the test's stub scorer, never :8431."""
+        shutil.copy(S1 / "overnight.py", self.s1 / "overnight.py")
+        out = open(self.tmp / f"sup-{time.monotonic_ns()}.log", "w+")
+        self.addCleanup(out.close)
+        e = {k: v for k, v in self.env.items() if k != "CORTADOS_NIGHTLY_SUPERVISED"}
+        e.update({"CORTADOS_S1_URL": f"http://127.0.0.1:{scorer_port}", "CORTADOS_S1_MIN_FREE_GB": "0",
+                  "CORTADOS_S1_CYCLE_IDLE_S": "60", **{k: str(v) for k, v in env.items()}})
+        p = subprocess.Popen([sys.executable, "-B", str(self.s1 / "overnight.py"), "--continuous", "--", "/bin/bash",
+                              str(self.s1 / "nightly.sh")], cwd=self.tmp, env=e, stdout=out, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: p.poll() is None and (p.kill(), p.wait()))
+        return p, out
+
+    def _wait_for(self, what, cond, timeout=30):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(f"timed out waiting for {what}")
+
+    def test_supervisor_term_leaves_no_stop_flag_and_stop_still_prevents_relaunch(self):
+        import http.server, threading
+        class Scorer(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Scorer)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        port, flag, args = srv.server_port, self.s1 / "data/nightly.stop", self.s1 / "data/label-args"
+        text = lambda f: (f.flush(), f.seek(0), f.read())[2]
+        # 1. TERM the supervisor mid-cycle (launchctl unload / kickstart -k / logout / shutdown): no stop flag is left behind
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        self._wait_for("the first cycle to start labelling", args.exists)
+        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        self.assertFalse(flag.exists(), "a supervisor TERM must not look like nightly.sh --stop: " + text(out))
+        self.assertFalse((self.s1 / "data/nightly.pid").exists(), text(out))
+        # 2. restarted (launchd KeepAlive / the next boot), it runs a cycle
+        args.unlink()
+        sup, out = self._supervisor(port, STUB_NEW_LABELS=0)
+        self._wait_for("a cycle after the restart", lambda: "cycle 1 ended rc 0" in text(out))
+        self.assertTrue(args.exists(), text(out))
+        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        self.assertFalse(flag.exists(), text(out))
+        # 3. nightly.sh --stop during a cycle still flags the stop, and a restarted supervisor does not relaunch
+        args.unlink()
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        self._wait_for("the cycle to start labelling", args.exists)
+        stop = self._bare("--stop")
+        self.assertIn("stopped nightly", stop.stdout, stop.stdout + stop.stderr)
+        self.assertEqual(sup.wait(timeout=40), 130, text(out))
+        self.assertTrue(flag.exists())
+        args.unlink()
+        sup, out = self._supervisor(port)
+        self.assertEqual(sup.wait(timeout=40), 0, text(out))
+        self.assertIn("stop flag", text(out))
+        self.assertFalse(args.exists(), "no cycle runs while the stop flag is there")
 
     def test_continuous_cleanup_does_not_reload_the_scorer(self):
         rc, log, _, _ = self._cycle(STUB_NEW_LABELS=0)

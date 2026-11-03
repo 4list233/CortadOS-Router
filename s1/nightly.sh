@@ -102,7 +102,8 @@ if [ "${1:-}" = "--stop" ]; then                       # the one supported way t
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     # SIGCONT first: overnight.py --continuous may have SIGSTOPped the tree (latency guard); a stopped process does not act on
     # TERM, so without CONT it would sit out the grace period and then be SIGKILLed with no cleanup.
-    p=$(cat "$PIDFILE"); pkill -CONT -P "$p" 2>/dev/null; kill -CONT "$p" 2>/dev/null
+    # The group CONT reaches stopped grandchildren too (the trainer under a python wrapper), which -P (direct children) misses.
+    p=$(cat "$PIDFILE"); kill -CONT -- -"$p" 2>/dev/null; pkill -CONT -P "$p" 2>/dev/null; kill -CONT "$p" 2>/dev/null
     pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null
     for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
     kill -0 "$p" 2>/dev/null && { pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; }
@@ -331,7 +332,11 @@ eval_fingerprint() {   # effective holdout labels + inference settings (evaluate
 report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['promote'] else 1)" "$1/report.json"; }
 cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
-trap 'echo "stop requested"; touch "$STOPFLAG"; exit 130' TERM INT
+# Continuous mode: the stop flag means "the operator ran nightly.sh --stop" (only --stop creates it) and overnight.py will not
+# relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
+# shutdown): flagging that would leave continuous training stopped for good after a reboot, so the trap does not touch it.
+# Window mode keeps the old behaviour (a TERM is a stop for tonight; the next night clears the flag).
+trap 'echo "stop requested"; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
 # unitcost / refresh-tiers live in the router checkout; a missing one is logged, never fatal (labelling and training do not need them)
 if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
 else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
