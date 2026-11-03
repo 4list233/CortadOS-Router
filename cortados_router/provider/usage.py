@@ -53,7 +53,7 @@ _HW_MODEL_KEYS = ("name", "size", "size_vram")      # hardware.parse_ollama_ps's
 # An unavailable field's reason is reduced to its kind (the part before the first colon), published only when it
 # looks like an exception type name (<= 40 chars); anything else (a message, a path, a command line) becomes "error".
 _KIND_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
-# A hardware file name is published only when it is a plain bounded name; anything else is "<unnamed>".
+# A hardware file name is published only when it is a plain bounded name; anything else is "<unnamed:i>".
 _FNAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Lanes without general (pool "all") windows are headlined by this pool: the same fallback scarcity.finish uses.
 _FALLBACK_POOL = {"cursor": "cursor-models", "antigravity": "gemini"}
@@ -105,9 +105,6 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
         for k in ("window", "pool"):    # both come from captured vendor screen text (scarcity slugs pool from it)
             if isinstance(w.get(k), str):
                 w[k] = w[k][:WINDOW_NAME_MAX]
-        for k, x in list(w.items()):
-            if isinstance(x, float) and not math.isfinite(x):
-                w[k] = None
         if _num(w.get("headroom_pct")):
             w["left_pct"] = float(w["headroom_pct"])
         elif _num(w.get("used_pct")):
@@ -120,9 +117,13 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
         general = [w for w in usable if w.get("pool") == _FALLBACK_POOL.get(lane.split("#", 1)[0])]
     lefts = [w["left_pct"] for w in general if isinstance(w.get("left_pct"), (int, float))]
     pools: dict[str, float] = {}
+    pools_dropped = False
     for w in usable:
         p = w.get("pool", "all")
-        if p not in ("all", "info") and isinstance(w.get("left_pct"), (int, float)) and (p in pools or len(pools) < POOLS_MAX):
+        if p not in ("all", "info") and isinstance(w.get("left_pct"), (int, float)):
+            if p not in pools and len(pools) >= POOLS_MAX:
+                pools_dropped = True
+                continue
             left = w["left_pct"]
             pools[p] = left if p not in pools else min(pools[p], left)
     if v.get("error_kind"):
@@ -146,6 +147,8 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
     shared = SHARED_WITH.get(lane.split("#", 1)[0])
     if shared:
         entry["shared_with"] = shared
+    if pools_dropped and entry["pools"]:
+        entry["_pools_truncated"] = True   # popped by collect into errors[]: a clipped pool map is said to be clipped
     return entry
 
 
@@ -173,10 +176,17 @@ def _routed(db_path: Path, now: float) -> dict[str, Any]:
             rows = c.execute("SELECT COALESCE(lane, '(none)'), COALESCE(model, '(none)'), COUNT(*) FROM routes "
                              "WHERE ts >= ? GROUP BY 1, 2 ORDER BY 3 DESC LIMIT ?", (since, ROUTED_TOP)).fetchall()
             return [{"lane": l, "model": m, "calls": n} for l, m, n in rows]
+        today, week = by(day0), by(now - 7 * 86400)
         bands = c.execute("SELECT COALESCE(band, '(none)'), COUNT(*) FROM routes WHERE ts >= ? GROUP BY 1 ORDER BY 2 DESC LIMIT ?",
                           (now - 7 * 86400, BAND_TOP)).fetchall()
-        return {"source": "router.db", "today": by(day0), "last_7d": by(now - 7 * 86400),
-                "top_bands_7d": [{"band": b, "calls": n} for b, n in bands]}
+        res = {"source": "router.db", "today": today, "last_7d": week,
+               "top_bands_7d": [{"band": b, "calls": n} for b, n in bands]}
+        # a list that filled its LIMIT may have been cut: said so (a count equal to the cap cannot tell "exactly N")
+        if len(today) >= ROUTED_TOP or len(week) >= ROUTED_TOP:
+            res["truncated"] = True
+        if len(bands) >= BAND_TOP:
+            res["bands_truncated"] = True
+        return res
     finally:
         c.close()
 
@@ -260,9 +270,10 @@ def _hw_value(x: Any, *, key: str = "") -> Any:
     return x[:WINDOW_NAME_MAX] if isinstance(x, str) else x
 
 
-def _hw_name(name: str) -> str:
-    """A hardware file name as published: plain and bounded, or '<unnamed>' (a name is attacker-chosen text)."""
-    return name if _FNAME_RE.fullmatch(name) else "<unnamed>"
+def _hw_name(name: str, i: int) -> str:
+    """A hardware file name as published: plain and bounded, or '<unnamed:i>' (a name is attacker-chosen text; `i`,
+    the freshest-first position, keeps two odd names apart in errors[] and hardware[])."""
+    return name if _FNAME_RE.fullmatch(name) else f"<unnamed:{i}>"
 
 
 def _hw_sample(raw: Any, truncated: list[str] | None = None) -> dict[str, Any]:
@@ -307,8 +318,8 @@ def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
         errors.append({"source": "hardware", "error": "too_many_files"})
         files = files[:HW_MAX_FILES]
     out = []
-    for f in files:
-        name = _hw_name(f.name)
+    for i, f in enumerate(files):
+        name = _hw_name(f.name, i)
         src = f"hardware/{name}"
         try:
             # lstat, never stat: a FIFO (or a link to one) would block the open forever and leak a request thread per
@@ -345,6 +356,16 @@ def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
 _COLLECT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _COLLECT_LOCK = threading.Lock()                       # guards the two dicts; never held across a collect
 _COLLECT_FLIGHT: dict[str, threading.Lock] = {}        # one per state dir: held across a miss (single flight)
+# Keys are state dirs: one in production, a handful in tests. Bounded so a caller passing many dirs cannot grow either
+# dict without limit; past the cap the oldest entries go (an evicted flight lock only costs one duplicate collect).
+_COLLECT_KEYS_MAX = 8
+
+
+def _evict_locked() -> None:
+    """Called with _COLLECT_LOCK held: drops the oldest keys of both dicts past _COLLECT_KEYS_MAX (insertion order)."""
+    for d in (_COLLECT_CACHE, _COLLECT_FLIGHT):
+        while len(d) > _COLLECT_KEYS_MAX:
+            del d[next(iter(d))]
 
 
 def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], refusals: list[dict[str, Any]],
@@ -361,6 +382,7 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
         if res is None:
             with _COLLECT_LOCK:
                 flight = _COLLECT_FLIGHT.setdefault(key, threading.Lock())
+                _evict_locked()
             with flight:      # concurrent misses wait here; the first collects, the rest read its result
                 res = fresh()
                 if res is None:
@@ -368,7 +390,9 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
                                   runs_since_start=runs_since_start, s1_url=s1_url, s1_probe=s1_probe,
                                   freshness=freshness, claude_lanes=claude_lanes, now=time.time())
                     with _COLLECT_LOCK:
+                        _COLLECT_CACHE.pop(key, None)   # re-inserted last, so eviction drops the stalest
                         _COLLECT_CACHE[key] = (time.monotonic(), res)
+                        _evict_locked()
         return json.loads(json.dumps(res))
     errors: list[dict[str, str]] = []
     notes: list[str] = []
@@ -386,6 +410,9 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
     # claude_lanes: scarcity.claude_lanes()'s (lane_key, config_dir), the configured login per lane key (None: unchecked)
     configured = dict(claude_lanes) if claude_lanes is not None else None
     out["lanes"] = guard("scarcity", lambda: _lanes(scarcity_reader(), now, freshness, configured), [])
+    for lane in out["lanes"]:
+        if lane.pop("_pools_truncated", False):
+            errors.append({"source": "scarcity", "error": "pools_truncated"})
     db = state_dir / "router.db"
     if db.exists():
         out["routed"] = guard("router.db", lambda: _routed(db, now), {})
@@ -417,4 +444,6 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
         out["hardware"] = []
     out["notes"] = notes
     out["errors"] = errors
-    return out
+    # last step, over the whole view: a non-finite float at any depth of any section becomes null, so the strict
+    # encoding in the server never turns one stray NaN into a 500
+    return _finite(out)

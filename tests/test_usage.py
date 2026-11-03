@@ -164,7 +164,10 @@ class CollectTest(unittest.TestCase):
         sc = {"lanes": {"x": {"fetched_at": float("inf"), "windows": [
             {"window": "w", "pool": "p" * 500, "used_pct": 10.0}] + [
             {"window": f"w{i}", "pool": f"q{i}", "used_pct": 10.0} for i in range(40)]}}}
-        lane = self.collect(fixture_home(), scarcity_reader=lambda: sc)["lanes"][0]
+        out = self.collect(fixture_home(), scarcity_reader=lambda: sc)
+        lane = out["lanes"][0]
+        self.assertIn({"source": "scarcity", "error": "pools_truncated"}, out["errors"])
+        self.assertNotIn("_pools_truncated", lane)
         self.assertIsNone(lane["sample_age_s"]); self.assertTrue(lane["stale"])
         self.assertEqual(len(lane["windows"][0]["pool"]), usage.WINDOW_NAME_MAX)
         self.assertEqual(len(lane["pools"]), usage.POOLS_MAX)
@@ -256,9 +259,16 @@ class CollectTest(unittest.TestCase):
     def _hw_collect(self, home, timeout=10):
         """collect() in a thread with a deadline, so a regression that blocks (a FIFO open) fails instead of hanging."""
         box = {}
-        t = threading.Thread(target=lambda: box.setdefault("out", self.collect(home)), daemon=True)
+        def run():
+            try:
+                box["out"] = self.collect(home)
+            except BaseException as exc:   # re-raised below, so a failure shows its cause, not a KeyError
+                box["exc"] = exc
+        t = threading.Thread(target=run, daemon=True)
         t.start(); t.join(timeout)
         self.assertFalse(t.is_alive(), "collect blocked on a hardware file")
+        if "exc" in box:
+            raise box["exc"]
         return box["out"]
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
@@ -286,9 +296,15 @@ class CollectTest(unittest.TestCase):
     def test_hardware_name_sanitised(self):
         home = fixture_home()
         (home / "hardware" / "bad name ü.json").write_text(json.dumps(HW_SAMPLE))
+        (home / "hardware" / "other odd!.json").write_text("not json")
         out = self.collect(home)
-        self.assertIn("<unnamed>", [h["file"] for h in out["hardware"]])
-        self.assertNotIn("bad name", json.dumps(out))
+        files = [h["file"] for h in out["hardware"]]
+        odd = [f for f in files if f.startswith("<unnamed:")]
+        self.assertEqual(len(odd), 1)
+        err_src = [e["source"] for e in out["errors"] if e["source"].startswith("hardware/<unnamed:")]
+        self.assertEqual(len(err_src), 1)
+        self.assertNotEqual(err_src[0], f"hardware/{odd[0]}")    # two odd names stay distinct
+        self.assertNotIn("bad name", json.dumps(out)); self.assertNotIn("odd!", json.dumps(out))
 
     def test_hardware_error_text_and_kinds_sanitised(self):
         home = fixture_home()
@@ -359,6 +375,9 @@ class CollectTest(unittest.TestCase):
             usage.ROUTED_TOP, usage.BAND_TOP = keep
         self.assertEqual(r["last_7d"], [{"lane": "claude", "model": "sonnet", "calls": 2}])
         self.assertEqual(r["top_bands_7d"], [{"band": "B", "calls": 2}])
+        self.assertTrue(r["truncated"]); self.assertTrue(r["bands_truncated"])
+        full = self.collect(home)["routed"]
+        self.assertNotIn("truncated", full); self.assertNotIn("bands_truncated", full)
 
     def test_window_nan_used_pct_has_no_left(self):
         sc = {"lanes": {"x": {"fetched_at": NOW, "windows": [{"window": "w", "pool": "all", "used_pct": float("nan")}]}}}
@@ -406,10 +425,22 @@ class CollectTest(unittest.TestCase):
             for t in ts:
                 t.join(10)
         finally:
-            usage._COLLECT_CACHE.clear()
+            usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(outs), 3)
         self.assertEqual(outs[0]["lanes"], outs[2]["lanes"])
+
+
+    def test_collect_memo_bounded(self):
+        usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
+        try:
+            for _ in range(usage._COLLECT_KEYS_MAX + 4):
+                usage.collect(state_dir=fixture_home(), scarcity_reader=lambda: {}, refusals=[],
+                              s1_probe=lambda url: {"available": True})
+            self.assertLessEqual(len(usage._COLLECT_CACHE), usage._COLLECT_KEYS_MAX)
+            self.assertLessEqual(len(usage._COLLECT_FLIGHT), usage._COLLECT_KEYS_MAX)
+        finally:
+            usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
 
 
 class EndpointTest(unittest.TestCase):
@@ -449,6 +480,15 @@ class EndpointTest(unittest.TestCase):
         self.assertIn("usage view unavailable", body); self.assertNotIn("/Users/", body)
         self.assertTrue(any("usage: view failed: RuntimeError" in m for m in logs.output))
         self.assertFalse(any("/Users/" in m for m in logs.output))
+
+    def test_nested_nan_in_lane_window_is_null_not_500(self):
+        home = fixture_home()
+        sc = {"lanes": {"x": {"fetched_at": NOW, "windows": [
+            {"window": "w", "pool": "all", "used_pct": 10.0, "resets_at": {"deep": [float("nan")]}}]}}}
+        self.httpd.usage_view = lambda reg: usage.collect(
+            state_dir=home, scarcity_reader=lambda: sc, refusals=[], s1_probe=lambda u: {"available": True}, now=NOW)
+        out = self.get(TOKEN)
+        self.assertEqual(out["lanes"][0]["windows"][0]["resets_at"], {"deep": [None]})
 
     def test_non_finite_view_is_a_500_not_invalid_json(self):
         self.httpd.usage_view = lambda reg: {"x": [float("inf")]}

@@ -854,10 +854,11 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a JSON object")
         return body
 
-    def _json(self, code: int, data: dict[str, Any], session=None, headers: dict[str, str] | None = None, *,
+    def _json(self, code: int, data: dict[str, Any] | bytes, session=None, headers: dict[str, str] | None = None, *,
               strict: bool = False) -> None:
+        # bytes: a body the caller already encoded (and validated), sent as is, so a large view is serialised once.
         # strict: NaN/Infinity raise ValueError (before anything is sent) instead of emitting invalid JSON
-        raw = json.dumps(data, allow_nan=not strict).encode()
+        raw = data if isinstance(data, bytes) else json.dumps(data, allow_nan=not strict).encode()
         self.send_response(code)
         self._route_header(session)
         for k, v in (headers or {}).items():
@@ -947,11 +948,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "authentication_error", "bad or missing token")
             try:   # a bug in a source must not drop the connection: a clean 500, detail (type only) in the log
                 view = self.server.usage_view(self.server.registry)
-                json.dumps(view, allow_nan=False)    # strict JSON for dashboards; checked before any byte is sent
+                body = json.dumps(view, allow_nan=False).encode()   # strict JSON for dashboards; before any byte is sent
             except Exception as exc:
                 logger.warning("usage: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: usage view unavailable (see provider log)")
-            return self._json(200, view, strict=True)
+            return self._json(200, body)
         if self.path.split("?")[0].startswith(RUNS_PATH):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
