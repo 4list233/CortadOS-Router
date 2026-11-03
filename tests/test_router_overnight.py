@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
+import os
 import signal
 import sys
 import unittest
@@ -76,3 +77,60 @@ class Overnight(unittest.TestCase):
 
 
 if __name__ == '__main__':unittest.main()
+
+
+class Continuous(unittest.TestCase):
+    def guard(self, lats, mems=None):
+        sig = []; t = [0.0]
+        lat_it = iter(lats); mem_it = iter(mems or [100.0] * len(lats))
+        g = night.Guard(latency=lambda: next(lat_it), memory=lambda: next(mem_it), clock=lambda: t[0],
+                        signaller=lambda pid, s: sig.append(s), budget_s=1.0, min_free_gb=8, interval_s=30, log=lambda m: None)
+        return g, sig, t
+
+    def test_latency_pause_and_hysteresis_resume(self):
+        g, sig, t = self.guard([1.0, 2.5, 1.1, 1.0, 1.2])
+        g.idle_probe()
+        for _ in range(3):
+            t[0] += 30; g.tick(1)
+        self.assertEqual(sig, [signal.SIGSTOP]); self.assertTrue(g.paused)   # 2 good probes: not yet
+        t[0] += 30; g.tick(1)
+        self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT]); self.assertFalse(g.paused)
+
+    def test_probe_rate_limited(self):
+        g, sig, t = self.guard([1.0, 9.0])
+        g.idle_probe(); t[0] += 5; g.tick(1)
+        self.assertEqual(sig, [])
+
+    def test_memory_guard(self):
+        g, sig, t = self.guard([1.0, 1.0], [4.0])
+        g.idle_probe(); t[0] += 30; g.tick(1)
+        self.assertEqual(sig, [signal.SIGSTOP])
+
+    def test_idle_vs_immediate_next_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rf = Path(tmp) / 'r'
+            g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, log=lambda m: None)
+            sleeps = []
+            idle = [sys.executable, '-c', 'import os;open(os.environ["CORTADOS_S1_CYCLE_RESULT"],"w").write("idle")']
+            night.run_continuous(idle, g, result_file=rf, idle_s=900, sleep=sleeps.append, cycles=2, poll_s=0)
+            self.assertEqual(sleeps.count(900), 2)
+            sleeps.clear()
+            night.run_continuous([sys.executable, '-c', 'pass'], g, result_file=rf, idle_s=900, sleep=sleeps.append, cycles=2, poll_s=0)
+            self.assertNotIn(900, sleeps)
+
+    def test_term_while_paused_conts_first(self):
+        proc = Mock(pid=7); proc.wait.return_value = 0
+        with patch.object(night, 'signal_group') as kill:
+            night.stop_tree(proc, grace=.1)
+        self.assertEqual([c.args[1] for c in kill.call_args_list][:2], [signal.SIGCONT, signal.SIGTERM])
+
+    def test_real_stopped_child_terminates(self):
+        p = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'], start_new_session=True)
+        os.killpg(p.pid, signal.SIGSTOP)
+        night.stop_tree(p, grace=5)
+        self.assertEqual(p.returncode, -signal.SIGTERM)
+
+    def test_min_left_default_15_and_env(self):
+        root = Path(__file__).resolve().parents[1] / 's1'
+        self.assertIn('MIN_LEFT_PCT_DEFAULT = 15.0', (root / 'label.py').read_text())
+        self.assertIn('--min-left-pct "${CORTADOS_S1_MIN_LEFT_PCT:-15}"', (root / 'nightly.sh').read_text())

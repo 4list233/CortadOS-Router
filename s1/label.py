@@ -8,7 +8,7 @@ the provider picks the subscription account by scarcity and refuses on its own q
 new provider needs no recoding. `--backend cli` keeps the old local `claude -p` path for an explicit manual pass only (never a fallback).
 Provider config: CORTADOS_PROVIDER_URL (required), token from CORTADOS_PROVIDER_TOKEN_FILE or ~/.config/cortados/provider-token.
 Headroom: every call asks the provider to reveal the routed account's "% left"; the pass stops once it drops below --min-left-pct (default
-30), because interactive sessions, reviews and routed subagents share these accounts and the provider itself refuses only at spent.
+15), because interactive sessions, reviews and routed subagents share these accounts and the provider itself refuses only at spent.
 --max-scarcity is the cli backend's local gate; given on the provider backend it is a config error (exit 2), never silently ignored.
 
 Only Claude teachers: Codex-labelled rows rated tasks much easier and caused under-routing (Forest 2026-11-02), so a non-Claude teacher is refused
@@ -132,7 +132,8 @@ MAX_TOKENS = 8192
 # Headroom the labeler leaves in the account it was routed to (% left, from the provider's x-cortados-reveal answer). The provider's pin
 # path only refuses at SPENT; interactive sessions, reviews and routed subagents share these Claude accounts, so a nightly pass must stop
 # while they still have room. 30% ~ the old --max-scarcity 0.7 gate. Override with --min-left-pct.
-MIN_LEFT_PCT_DEFAULT = 30.0
+# Forest 2026-11-03: default lowered 30 -> 15 (two Claude accounts, under-utilized; labeling now runs in the daytime too).
+MIN_LEFT_PCT_DEFAULT = 15.0
 MIN_LEFT_PCT = MIN_LEFT_PCT_DEFAULT
 # Unknown headroom (the provider sent no "% left": its usage reading is stale, failed, or of another login) stops the pass by
 # default, after keeping the batch that came back: --min-left-pct cannot be honoured blind, and a whole backlog run blind could

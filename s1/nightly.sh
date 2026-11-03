@@ -33,6 +33,10 @@
 #   CORTADOS_S1_NOW             HHMM that replaces the clock for the deadline check (tests); not HHMM → logged, the clock is used
 #   nightly.sh --minutes-left [HHMM]   prints the minutes from HHMM (or now) to the deadline plus any settings notes and exits;
 #                               no pid file, stop flag or overnight.py (diagnostic / tests). An invalid HHMM exits 2.
+# Continuous mode (Forest 2026-11-03; window mode stays the default until the launchd job is switched): a launchd KeepAlive job runs
+#   python3 <repo>/s1/overnight.py --continuous -- /bin/bash <repo>/s1/nightly.sh
+# which loops cycles with no window/deadline, keeps the scorer up, and pauses this tree on scorer latency / low memory.
+#   CORTADOS_S1_MIN_LEFT_PCT    label.py --min-left-pct per-account quota floor (default 15, Forest 2026-11-03)
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -129,6 +133,8 @@ setting GPU_SETTLE 3; setting EVAL_SETTLE 20
 deadline_settings
 eval_time_ok() {   # eval_time_ok <run> <reason>: true when an evaluation can finish before the deadline; else logs why, raises
   # the eval_deferred streak (a candidate deferred night after night is a stall someone must see) and is false
+  # Forest 2026-11-03: continuous mode (overnight.py --continuous sets CORTADOS_S1_CONTINUOUS=1) has no deadline, so evaluation is never skipped.
+  [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && return 0
   local left; left=$(minutes_left)
   [ "$EVAL_MINUTES" -eq 0 ] || [ "$left" -ge "$EVAL_MINUTES" ] && return 0
   echo "not evaluating $1: $left min to the $DEADLINE deadline, evaluation needs ~$EVAL_MINUTES (CORTADOS_S1_EVAL_MINUTES); it stays pending ($2) and is evaluated first next night"
@@ -230,8 +236,13 @@ rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapter
 }
 rotate_logs
 gpu_alone() {   # Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
+  # Forest 2026-11-03: in continuous mode the live scorer has priority and STAYS UP; overnight.py pauses this tree instead when
+  # scorer latency rises more than CORTADOS_S1_LATENCY_BUDGET_S above baseline.
+  [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && { echo "continuous mode: scorer stays up during training (overnight.py latency guard)"; return 0; }
   launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "$GPU_SETTLE"; echo "scorer stopped for training; ollama + memory gateway stay up"
 }
+# idle_cycle: tell overnight.py --continuous this cycle did nothing (no new data, nothing pending) so it sleeps CORTADOS_S1_CYCLE_IDLE_S
+idle_cycle() { [ -n "${CORTADOS_S1_CYCLE_RESULT:-}" ] && echo idle > "$CORTADOS_S1_CYCLE_RESULT"; return 0; }
 gpu_share() {
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
@@ -315,7 +326,8 @@ purl=unset; [ -n "${CORTADOS_PROVIDER_URL:-}" ] && purl=set
 ptok="default (~/.config/cortados/provider-token)"; [ -n "${CORTADOS_PROVIDER_TOKEN_FILE:-}" ] && ptok=set
 echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file $ptok)"
 # shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
-"$LABEL_PY" -B label.py $TEACHER_ARGS
+# Forest 2026-11-03: two Claude accounts are under-utilized, so labeling may run in the daytime down to a 15% per-account floor.
+"$LABEL_PY" -B label.py --min-left-pct "${CORTADOS_S1_MIN_LEFT_PCT:-15}" $TEACHER_ARGS
 rc=$?
 # Count labels and update the stall tracker BEFORE branching on rc: a labeler that fails every night is exactly the stall to alert on.
 if ! labelled=$(state labels data/labels.jsonl) || ! whole "$labelled"; then
@@ -398,6 +410,7 @@ if read_pending; then
     fi
     if [ "$p_reason" = holdout_blocked ] && [ "$now_eval" = "$p_eval" ]; then
       echo "skipped: no new labels; pending $p_run waits for the holdout backfill (holdout and incumbent unchanged)"
+      idle_cycle
       state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
@@ -478,6 +491,7 @@ fi
 if [ "$force" != "--train" ] && [ "$pending" -eq 0 ] && [ "$(cat data/last-train-labels 2>/dev/null)" = "$sft_hash" ]; then
   echo "skipped: no new labels ($labelled labels; training data identical to the last training run)"
   state event "$STATUS" skip "no new labels ($labelled)"
+  idle_cycle
   echo "=== $(date) nightly end"; exit 0
 fi
 echo "labelled $labelled (+$new since last training); training tonight (pending run: $pending)"
