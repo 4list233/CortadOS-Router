@@ -76,6 +76,10 @@ CHILD_TOOLS = [
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
                     "acts in the user's real signed-in Chrome (each session gets its own tab group)."},
+         "connectors": {"type": "array", "items": {"type": "string"}, "description": "Optional: names of servers "
+                        "from ~/.config/cortados/connectors.mcp.json the child needs (default none). Each server's "
+                        "tool schemas are sent with every request; loading them all can exceed the model's context "
+                        "(the provider then refuses with 413)."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
                            "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
          "required": ["task", "cwd"]}},
@@ -133,7 +137,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
-                           cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red)
+                           cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
+                           a.get("connectors"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -195,7 +200,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     body = json.dumps({"model": requested, "max_tokens": mx,
                        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]}).encode()
     req = urllib.request.Request(provider_url.rstrip("/") + "/v1/messages", data=body, method="POST",
-                                 headers={"content-type": "application/json", "x-api-key": token})
+                                 # reveal: the provider answers with the backend model (and the lane's % left)
+                                 # instead of `cortados`, so the trailer below can name what really ran
+                                 headers={"content-type": "application/json", "x-api-key": token,
+                                          "x-cortados-reveal": "1"})
     try:
         with urlopen(req, timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read())
@@ -231,7 +239,9 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     # The delegate's own text is model-visible too: scrub it in case the provider or the delegate echoes the credential.
     # One trailing line names the model that really ran, so the orchestrator can see and report it (MCP clients may not
     # show _meta to the model).
-    body_text = (scrub(text) or "(the delegate returned no text)") + f"\n\n[cortados: {scrub(model)}]"
+    shown = scrub(model)
+    shown = f"S1 → {shown}" if requested == "cortados" else shown      # routed by S1, or the pin that ran
+    body_text = (scrub(text) or "(the delegate returned no text)") + f"\n\n[cortados: {shown}]"
     return {"content": [{"type": "text", "text": body_text}],
             "_meta": {"cortados/routed_model": scrub(model), "cortados/requested_model": requested}}
 

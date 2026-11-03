@@ -46,10 +46,19 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     mode = "ok"                 # "truncated" / "stalled": a broken error body (review round 2, item 4)
+    error_body = None           # bytes: answer every POST with this 400 body
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeOllama.seen.append((self.path, body))
+        if FakeOllama.error_body is not None:            # a node error answered verbatim (its text is backend text)
+            raw = FakeOllama.error_body
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if FakeOllama.mode in ("truncated", "stalled"):
             self.send_response(500)
             self.send_header("content-type", "application/json")
@@ -90,6 +99,13 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         events = [{"type": "message_start", "message": {**msg, "content": [], "stop_reason": None}}]
+        if FakeOllama.mode == "stall-stream":           # starts the answer, then goes quiet past the read timeout
+            ev = events[0]
+            self.wfile.write(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(2)
+            self.close_connection = True
+            return
         for i, b in enumerate(content):
             if b["type"] == "text":                       # text streams as deltas, as Ollama sends it
                 events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}]
@@ -284,7 +300,19 @@ class LocalPinTests(LocalHarness):
         self.assertIn("resolved to the excluded model", r["error"])
 
     def test_truncated_or_stalled_error_body_is_a_bounded_502_and_cleans_up(self):
+        # The failed opener is dropped after the 502 is written, so the client can see the answer before the drop has
+        # run: the test waits for the drop itself (an Event set once reg.drop returns), never for a fixed time.
+        dropped = threading.Event()
+        real_drop = self.reg.drop
+
+        def drop(session):
+            try:
+                return real_drop(session)
+            finally:
+                dropped.set()
+        self.reg.drop = drop
         for mode in ("truncated", "stalled"):
+            dropped.clear()
             FakeOllama.mode = mode
             if mode == "stalled":
                 cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
@@ -298,7 +326,55 @@ class LocalPinTests(LocalHarness):
             self.assertEqual(code, 502, mode)
             self.assertIn("truncated or stalled", msg, mode)
             self.assertLess(len(msg), 1000)
+            self.assertTrue(dropped.wait(10), mode)
             self.assertEqual(self.reg.sessions, {}, mode)              # the failed opener was cleaned up
+
+    def test_a_local_timeout_is_recorded_under_the_run_id(self):
+        cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
+        cfg["nodes"][0]["ollama"]["read_timeout_s"] = 0.5
+        Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
+        FakeOllama.mode = "stall-stream"
+        try:
+            raw = self.post({**self.BODY, "stream": True}, headers={"x-cortados-run-id": "run-local-stall"})
+        finally:
+            FakeOllama.mode = "ok"
+        self.assertIn("event: error", raw)                              # said in the stream, not a silent truncation
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/run-local-stall",
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            got = json.loads(r.read())
+        last = got["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (502, "api_error"))
+        self.assertEqual(last["reason"], "the local node stopped mid-answer (stalled or dropped)")
+        self.assertEqual(set(last), {"status", "type", "reason", "at"})
+
+    def runs_of(self, run_id):
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/" + run_id,
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def test_a_node_error_echoing_a_token_never_reaches_the_record_or_the_log(self):
+        # The node's error body is backend text; one that echoes the gate's token (here past a 300-byte cut, where a
+        # slice-then-redact would keep its prefix) must reach neither the run record nor the refusal log line.
+        secret = "gate-token-0123456789abcdef"
+        for pad in (280, 290, 295, 299):
+            FakeOllama.error_body = json.dumps({"type": "error", "error": {
+                "type": "invalid_request_error", "message": "x" * pad + secret}}).encode()
+            try:
+                with self.assertLogs("cortados.provider", level="WARNING") as logs:
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        self.post(self.BODY, headers={"x-cortados-run-id": f"run-echo-{pad:04d}"})
+            finally:
+                FakeOllama.error_body = None
+            self.assertEqual(ctx.exception.code, 400)
+            last = self.runs_of(f"run-echo-{pad:04d}")["refusals"][-1]
+            self.assertEqual(last["reason"], "the local node answered an HTTP error")
+            self.assertEqual(set(last), {"status", "type", "reason", "at"})
+            for text in (json.dumps(last), "\n".join(logs.output)):
+                for i in range(len(secret) - 3):
+                    self.assertNotIn(secret[i:i + 4], text)
+                self.assertNotIn("xxxxxxxx", text)
 
     def test_a_relay_crash_still_answers_and_cleans_up(self):
         real = local_lane.serve
@@ -333,6 +409,29 @@ class LocalConversationPinTests(LocalHarness):
         self.assertEqual(code, 409)
         self.assertIn("fixed per conversation", msg)
         return msg
+
+    def test_a_lock_timeout_is_a_529_recorded_under_the_run_id(self):
+        run = {"x-cortados-run-id": "run-local-busy"}       # part of the conversation identity: sent on every turn
+        first = self.opener("sub/qwen-27b")
+        got = self.post(first, headers=run)
+        (session,) = self.reg.sessions.values()
+        self.assertTrue(session.lock.acquire(timeout=5))   # another request holds the conversation
+        real = server.TURN_TIMEOUT_S
+        server.TURN_TIMEOUT_S = 0.05                       # the wait gives up at once; no sleep in the test
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.post(self.follow(first, got["content"], "sub/qwen-27b"), headers=run)
+        finally:
+            server.TURN_TIMEOUT_S = real
+            session.lock.release()
+        self.assertEqual(ctx.exception.code, server.BUSY_STATUS)
+        self.assertEqual(json.loads(ctx.exception.read())["error"]["type"], "overloaded_error")
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/run-local-busy",
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            last = json.loads(r.read())["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (server.BUSY_STATUS, "overloaded_error"))
+        self.assertEqual(len(FakeOllama.seen), 1)          # nothing was sent to the node for the refused turn
 
     def test_a_local_conversation_continues_on_its_model(self):
         first = self.opener("sub/qwen-27b")

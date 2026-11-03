@@ -61,6 +61,10 @@ FAKE = textwrap.dedent('''\
         sys.stderr.flush()
         open(os.path.join(os.getcwd(), "echoed"), "w").close()
         time.sleep(60)
+    if mode == "too-large":
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "api_error_status": 413,
+                          "result": "Request too large (max 32MB). Accumulated images..."}}))
+        sys.exit(1)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -234,9 +238,9 @@ class ChildTaskTests(unittest.TestCase):
         a = seen["argv"]
         self.assertEqual(a[a.index("--model") + 1], "cortados")
         self.assertEqual(a[a.index("--permission-mode") + 1], "auto")
-        self.assertNotIn("--mcp-config", a)                      # no connectors file: no flag, a note in the log
+        self.assertNotIn("--mcp-config", a)                      # no connectors selected: no flag, a note in the log
         with open(os.path.join(w["dir"], "runner.log")) as f:
-            self.assertIn("connectors MCP config", f.read())
+            self.assertIn("no connectors selected", f.read())
         self.assertTrue(w["settings_removed"])                   # the token-bearing settings file is gone
         self.assertFalse([n for n in os.listdir(w["dir"]) if n.startswith("session-")])
         self.assertIn("-p", a)
@@ -261,16 +265,39 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(a[a.index("--permission-mode") + 1], "plan")
         self.assertEqual(a[a.index("--allowedTools") + 1], "Bash(git diff:*),Read")
 
-    def test_connectors_config_passed_when_present(self):
+    def test_connectors_are_opt_in_and_filtered(self):
         conn = os.path.join(self.tmp, "connectors.mcp.json")
+        servers = {"vercel": {"type": "http", "url": "https://vercel.example/mcp"},
+                   "notion": {"type": "http", "url": "https://notion.example/mcp"},
+                   "slack": {"type": "http", "url": "https://slack.example/mcp"}}
         with open(conn, "w") as f:
-            json.dump({"mcpServers": {}}, f)
+            json.dump({"mcpServers": servers}, f)
         os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
-        tid = self.start(permission_mode="dontAsk")
+        tid = self.start(permission_mode="dontAsk")                 # default: none, even though the file exists
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertNotIn("--mcp-config", _load(os.path.join(self.work, "fake-argv.json"))["argv"])
+        tid = self.start(connectors=["notion"])
+        d = ct.task_path(tid)
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
-        self.assertEqual(a[a.index("--mcp-config") + 1], conn)
-        self.assertEqual(a[a.index("--permission-mode") + 1], "dontAsk")
+        path = a[a.index("--mcp-config") + 1]
+        self.assertEqual(os.path.dirname(path), d)                 # a private per-task file, not the full config
+        self.assertFalse(os.path.exists(path), "the selection (it may carry credentials) is removed at exit")
+        self.assertEqual(_load(os.path.join(d, "meta.json"))["connectors"], ["notion"])
+        r, _ = self.call("start_task", task="x", cwd=self.work, connectors=["nope"])
+        self.assertIn("unknown connector(s) nope; available: notion, slack, vercel", r["content"][0]["text"])
+
+    def test_selected_connectors_file_content(self):
+        conn = os.path.join(self.tmp, "connectors.mcp.json")
+        with open(conn, "w") as f:
+            json.dump({"mcpServers": {"a": {"command": "x"}, "b": {"command": "y"}}}, f)
+        os.environ["CORTADOS_CONNECTORS_MCP_CONFIG"] = conn
+        self.assertIsNone(ct.select_connectors(None))
+        self.assertIsNone(ct.select_connectors([]))
+        self.assertEqual(ct.select_connectors(["b"]), {"b": {"command": "y"}})
+        for bad in ("a", [1], ["a"] * 40):
+            with self.assertRaises(ct.TaskError):
+                ct.select_connectors(bad)
 
     def test_settings_file_exists_while_running(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
@@ -717,9 +744,12 @@ class ChildTaskTests(unittest.TestCase):
             a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
             self.assertEqual(a.count("--append-system-prompt"), 1, orch)
             prompt = a[a.index("--append-system-prompt") + 1]
-            self.assertTrue(prompt.endswith(ct.CHILD_DIRECTIVE), orch)       # last, so it wins
-            if orch == "opus":
-                self.assertGreater(len(prompt), len(ct.CHILD_DIRECTIVE))      # the launcher's directive comes first
+            # The child directive only: never the whole-session ORCHESTRATOR directive, for any orchestrator.
+            self.assertEqual(prompt, ct.CHILD_DIRECTIVE, orch)
+            self.assertNotIn("ORCHESTRATOR", prompt)
+            self.assertNotIn("orchestrator_gate", json.dumps(_load(os.path.join(self.work, "fake-argv.json"))))
+            settings = a[a.index("--settings") + 1]
+            self.assertTrue(os.path.basename(settings).startswith("session-"))
 
     # --- review round 4 ---------------------------------------------------------------------------------------------
 
@@ -1047,6 +1077,20 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn(bad, names)
         self.assertNotIn(good, names)
         self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_provider_refusal_surfaced_in_status(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "too-large"
+        tid = self.start()
+        self.runs[tid] = {"run_id": tid, "model": None, "label": None, "provider": None, "models": [],
+                          "builder_models": [], "refusals": [{"status": 413, "type": "request_too_large",
+                                                              "reason": "the request is larger than every eligible "
+                                                                        "model's context"}]}
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "failed")
+        self.assertEqual(w["api_error_status"], 413)
+        self.assertIn("HTTP 413 request_too_large", w["provider_refusal"])
+        self.assertIn("larger than every eligible model's context", w["provider_refusal"])
+        self.assertIn("connectors", w["hint"])
 
     def test_failure_exit(self):
         os.environ["FAKE_CLAUDE_MODE"] = "fail"

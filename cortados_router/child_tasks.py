@@ -42,7 +42,7 @@ if __name__ == "__main__" and not __package__:
     # environment (it would shadow `tests`, `s1`, `cortados_router` in unrelated repos); put the root on sys.path here.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cortados_router import paths, session  # noqa: E402
+from cortados_router import paths, redact, session  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
@@ -153,9 +153,10 @@ def _write_json(path: str, obj) -> None:
         raise
 
 
-class Redactor:
-    """Removes provider credentials from model-visible output. Every token must be at least MIN_TOKEN_LEN long (a
-    shorter one is refused, not silently left in). Redact strings BEFORE serializing or truncating."""
+class Redactor(redact.Redactor):
+    """Removes provider credentials from model-visible output (the shared cortados_router.redact implementation).
+    Every token must be at least MIN_TOKEN_LEN long (a shorter one is refused, not silently left in). Redact strings
+    BEFORE serializing or truncating."""
 
     def __init__(self, tokens=()):
         toks = {t for t in tokens if t}
@@ -163,33 +164,7 @@ class Redactor:
             raise TaskError(f"a configured provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
                             "provider token and could not be redacted safely (check CORTADOS_PROVIDER_TOKEN and the "
                             "token file)")
-        self.raw = sorted(toks)
-        # Each credential's JSON-escaped spelling too: claude's JSON output escapes quotes and backslashes in it.
-        toks |= {json.dumps(t)[1:-1] for t in toks}
-        self.tokens = sorted(toks, key=len, reverse=True)
-        # One alternation, longest first: at any position the longest credential wins (a shorter one that is a prefix
-        # of a longer one never splits it).
-        self._re = re.compile("|".join(re.escape(t) for t in self.tokens)) if self.tokens else None
-
-    def text(self, s: str) -> str:
-        return self._re.sub("***", s) if self._re else s
-
-    def leading_fragment(self, s: str) -> str:
-        """Mask a token suffix at the very start of `s` (text read from mid-file may begin mid-token)."""
-        for t in self.tokens:
-            for k in range(len(t) - 1, 0, -1):
-                if s.startswith(t[-k:]):
-                    return "***" + s[k:]
-        return s
-
-    def tree(self, obj):
-        if isinstance(obj, str):
-            return self.text(obj)
-        if isinstance(obj, list):
-            return [self.tree(x) for x in obj]
-        if isinstance(obj, dict):
-            return {self.text(str(k)): self.tree(v) for k, v in obj.items()}
-        return obj
+        super().__init__(toks)
 
 
 def pin_model(name) -> str:
@@ -318,7 +293,7 @@ def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
         return {"error": scrub(f"could not reach the provider ({type(exc).__name__}: {exc})")[:300]}
     if not isinstance(data, dict):
         return {"error": f"unexpected run record ({type(data).__name__})"}
-    return {k: data[k] for k in ("model", "label", "provider", "models", "builder_models") if k in data}
+    return {k: data[k] for k in ("model", "label", "provider", "models", "builder_models", "refusals") if k in data}
 
 
 def _max_s() -> int:
@@ -334,13 +309,42 @@ def _max_s() -> int:
     return v
 
 
+MAX_CONNECTORS = 32                 # a selection longer than this is not a selection
+
+
+def select_connectors(names) -> dict | None:
+    """The connector servers a child gets: None for none (the default), else {name: server config} for exactly the
+    named servers in the connectors MCP config. Why opt-in: every connected server's tool schemas go up front in
+    every request (a custom provider URL gets no client-side tool search), and the full set measured ~1.1 MB (~290k
+    tokens, 495 MCP tools) on 2026-11-02, over a 200k model's input ceiling: the provider refused every such child
+    with 413 before it ran."""
+    if names is None or names == []:
+        return None
+    if not isinstance(names, list) or len(names) > MAX_CONNECTORS or not all(isinstance(n, str) and n for n in names):
+        raise TaskError(f"connectors must be a list of at most {MAX_CONNECTORS} server names from "
+                        f"{connectors_config()}")
+    path = connectors_config()
+    try:
+        with open(path, encoding="utf-8") as f:
+            servers = (json.load(f) or {}).get("mcpServers") or {}
+    except FileNotFoundError:
+        raise TaskError(f"connectors were requested but {path} does not exist") from None
+    except (OSError, ValueError, AttributeError) as exc:
+        raise TaskError(f"cannot read the connectors MCP config {path}: {type(exc).__name__}") from None
+    unknown = [n for n in names if n not in servers]
+    if unknown:
+        raise TaskError(f"unknown connector(s) {', '.join(unknown)}; available: {', '.join(sorted(servers)) or 'none'}")
+    return {n: servers[n] for n in dict.fromkeys(names)}
+
+
 def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION_MODE, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False, red=None) -> dict:
+          provider_url="", token_file=None, chrome=False, red=None, connectors=None) -> dict:
     """`red` carries the launch credentials (env token and token file's token as they are now)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    selected = select_connectors(connectors)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
     if not provider_url:
@@ -364,7 +368,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
-                                  chrome, max_s, exe)
+                                  chrome, max_s, exe, selected)
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
                                        "--lock-fd", str(lock_fd)],
@@ -410,16 +414,16 @@ def _abort_runner(runner, d: str) -> None:
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe):
+             exe, selected=None):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
         launch += ["--token-file", token_file]
-    if orchestrator == "cortados":
-        # S1 already routes every turn; the delegate-first directive and its gate exist to keep a pinned top model
-        # from doing the work itself, which does not apply here.
-        launch += ["--no-delegate-directive", "--no-gate"]
+    # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
+    # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
+    # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
+    launch += ["--no-delegate-directive", "--no-gate"]
     # --permission-prompts none: nobody is there to answer, so anything that would prompt is denied deterministically
     # (as s1/outcome/agents.py runs its headless claude).
     extra = ["-p", "--output-format", "json", "--permission-mode", permission_mode, "--permission-prompts", "none"]
@@ -428,13 +432,16 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     # Opt-in per task, enforced both ways: --chrome when asked (the child acts in the user's real, signed-in Chrome, in
     # its own tab group), else an explicit --no-chrome, so a claudeInChromeDefaultEnabled setting cannot turn it on.
     extra.append("--chrome" if chrome else "--no-chrome")
-    conn = connectors_config()
-    conn_note = None
-    if os.path.isfile(conn):
+    conn, conn_note = None, None
+    if selected:
+        # Only the named servers, in a private file (session-*.json: removed with the settings when the child exits,
+        # since server entries may carry their own credentials).
+        conn = os.path.join(d, "session-connectors.json")
+        with open(os.open(conn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": selected}, f)
         extra += ["--mcp-config", conn]
     else:
-        # Not an error: the child still gets the user's Claude Code MCP servers, just not the connector ones.
-        conn_note = f"connectors MCP config {conn} not found; the child runs without connector servers\n"
+        conn_note = "no connectors selected; the child has the user's Claude Code MCP servers only\n"
     base = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     try:
         _args, env, cmd = session.prepare(launch + ["--"] + extra, base, MANAGED_DIRS)
@@ -454,7 +461,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
         f.write(task)
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],   # redact, THEN slice
-            "started_at": time.time(), "connectors_config": conn if not conn_note else None,
+            "started_at": time.time(), "connectors": sorted(selected) if selected else [],
             "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:]}
@@ -655,6 +662,18 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
         out["router_run"] = fetch_run(provider_url, token, task_id)
+        # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
+        # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
+        refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
+        if refusals:
+            last = refusals[-1]
+            out["provider_refusal"] = f"HTTP {last.get('status')} {last.get('type')}: {last.get('reason')}"
+        api_status = o.get("api_error_status") if isinstance(o, dict) else None
+        if api_status is not None:
+            out["api_error_status"] = api_status
+        if api_status == 413 or (refusals and refusals[-1].get("status") == 413):
+            out["hint"] = ("the request was too large for the model: usually the tool schemas of the connected MCP "
+                           "servers; start the task with fewer `connectors` (default none)")
         if state != "succeeded":
             # A log the runner could not redact is never shown, not even through this call's own redaction (it only
             # knows today's credentials).

@@ -26,6 +26,7 @@ from cortados_router.provider.server import ProviderServer, Registry
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "test-token"
+RUNS_PATH_FOR_TESTS = "/v1/cortados/runs/"
 READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
     "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
 
@@ -586,6 +587,139 @@ class RunRecordTests(RoutedHarness):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.lookup("short")[0], 400)
 
+    def test_refusals_are_logged_and_recorded_under_the_run_id(self):
+        def too_big(body, client):
+            return {"error": "sub/x: the request (≈293k tokens) does not fit any Claude account's input ceiling",
+                    "fit_blocked": True}
+        self.reg.router = too_big
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            code, err = self.send({"messages": [{"role": "user", "content": "hi"}]}, "t20261102182559-5ca0fe09")
+        self.assertEqual((code, err["type"]), (413, "request_too_large"))
+        self.assertTrue(any("413" in line and "larger than every eligible" in line for line in logs.output), logs.output)
+        self.assertFalse(any("does not fit" in line for line in logs.output), logs.output)   # no backend text
+        code, got = self.lookup("t20261102182559-5ca0fe09")
+        self.assertEqual(code, 200)                              # no longer "no routed request recorded"
+        self.assertEqual(got["models"], [])
+        last = got["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (413, "request_too_large"))
+        self.assertEqual(last["reason"], "the request is larger than every eligible model's context")
+        self.assertEqual(set(last), {"status", "type", "reason", "at"})   # no raw or backend text is stored
+
+    # ---- P1: records and refusal log lines hold status, type and a fixed reason only: no backend text, no token
+    def refused_with(self, error, run_id, **router_extra):
+        self.reg.router = lambda body, client: {"error": error, **router_extra}
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            self.send({"messages": [{"role": "user", "content": "hi"}]}, run_id)
+        return self.lookup(run_id)[1]["refusals"][-1], "\n".join(logs.output)
+
+    def assert_no_fragment(self, text, secret, k=4):
+        for i in range(len(secret) - k + 1):
+            self.assertNotIn(secret[i:i + k], text)
+
+    def assert_clean(self, last, logs, *secrets):
+        self.assertEqual(set(last), {"status", "type", "reason", "at"})
+        record = json.dumps(last)
+        for secret in secrets:
+            self.assert_no_fragment(record, secret)
+            self.assert_no_fragment(logs, secret)
+
+    def test_a_full_token_in_backend_text_reaches_neither_record_nor_log(self):
+        last, logs = self.refused_with(f"backend said Authorization: Bearer {TOKEN} and quit", "run-redact-full",
+                                       fit_blocked=True)
+        self.assert_clean(last, logs, TOKEN, "backend said")
+
+    def test_a_token_across_a_truncation_boundary_reaches_neither_record_nor_log(self):
+        # The review's "x"*490+token case: a token straddling any cut a slice might make. Every offset around the
+        # old 200 and 300 cuts and the reviewer's 500 is tried; nothing of the token (or the padding) survives.
+        for pad in [*range(185, 205), *range(285, 305), 490, 495]:
+            last, logs = self.refused_with("x" * pad + TOKEN + "tail", f"run-cut-{pad:04d}", fit_blocked=True)
+            self.assert_clean(last, logs, TOKEN, "xxxxxxxx", "tail")
+
+    def test_a_json_escaped_credential_reaches_neither_record_nor_log(self):
+        key = 'sk-ant-api"quoted\\back-0123456789'
+        escaped = json.dumps(key)[1:-1]
+        with mock.patch.dict(os.environ, {"CORTADOS_ANTHROPIC_API_KEY": key}):
+            last, logs = self.refused_with(f'upstream body {{"key": "{escaped}"}} and raw {key}', "run-escaped",
+                                           fit_blocked=True)
+        self.assert_clean(last, logs, key, escaped, "quoted", "upstream body")
+
+    # ---- P2: refusal log lines name an allowlisted endpoint, never the raw path
+    def test_refusal_logs_never_carry_the_request_path(self):
+        secret = "pathsecret0123456789"
+        cases = [("GET", RUNS_PATH_FOR_TESTS + secret + ".bad", TOKEN, 400, "runs"),       # malformed run id
+                 ("GET", RUNS_PATH_FOR_TESTS + secret, "wrong-token-0123", 401, "runs"),   # unauthenticated
+                 ("GET", "/nope/" + secret, TOKEN, 404, "other"),                          # unknown path
+                 ("POST", "/nope/" + secret + "?k=" + secret, TOKEN, 404, "other")]
+        for method, path, token, want, where in cases:
+            req = urllib.request.Request(self.url + path, method=method,
+                                         data=b"{}" if method == "POST" else None,
+                                         headers={"authorization": f"Bearer {token}",
+                                                  "content-type": "application/json"})
+            with self.assertLogs("cortados.provider", level="WARNING") as logs:
+                try:
+                    urllib.request.urlopen(req, timeout=30).close()
+                    self.fail("expected an HTTP error")
+                except urllib.error.HTTPError as e:
+                    self.assertEqual(e.code, want, path)
+            out = "\n".join(logs.output)
+            self.assertNotIn(secret, out)
+            self.assertIn(f"{method} {where} ", out)
+
+    def test_request_derived_text_is_never_stored(self):
+        secret_pin = "sub/please-dont-store-this-0123"
+        last, logs = self.refused_with(f"{secret_pin}: not a served model", "run-pin-text", client_error=True)
+        self.assertEqual(last["reason"], "the pin or exclusion names no model this endpoint can serve")
+        self.assertNotIn("detail", last)
+        self.assertNotIn(secret_pin, json.dumps(last))
+        self.assertNotIn(secret_pin, logs)
+
+    # ---- P2: only an authenticated request creates, changes or evicts a run record
+    def test_an_unauthenticated_request_cannot_create_modify_or_evict_a_record(self):
+        self.reg.runs.MAX_RUNS = 2
+        self.reg.router = lambda body, client: {"error": "too big", "fit_blocked": True}
+        self.send({"messages": [{"role": "user", "content": "hi"}]}, "run-owner-1")
+        before = self.lookup("run-owner-1")[1]
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            for token in ("wrong-token-0123456789", ""):
+                for rid in ("run-owner-1", "run-intruder-1", "run-intruder-2", "run-intruder-3"):
+                    code, err = self.send({"messages": [{"role": "user", "content": "hi"}]}, rid, token=token)
+                    self.assertEqual((code, err["type"]), (401, "authentication_error"))
+        self.assertTrue(all("unauthenticated" in line for line in logs.output if "401" in line), logs.output)
+        self.assertEqual(self.lookup("run-owner-1"), (200, before))      # neither modified nor evicted
+        for rid in ("run-intruder-1", "run-intruder-2", "run-intruder-3"):
+            self.assertEqual(self.lookup(rid)[0], 404)                   # never created
+        self.assertEqual(list(self.reg.runs._refusals), ["run-owner-1"])
+
+    # ---- P2: every failure path records through the one helper
+    def test_a_streaming_bridge_error_is_recorded(self):
+        history = [{"role": "user", "content": "hi"}]
+        code, r1 = self.send({"tools": [READ_TOOL], "messages": history}, "run-stream-fail")
+        self.assertEqual(code, 200)
+        history += [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "backend failure"}]
+        req = urllib.request.Request(self.url + "/v1/messages", method="POST",
+                                     data=json.dumps({"stream": True, "tools": [READ_TOOL], "messages": history}).encode(),
+                                     headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}",
+                                              "x-cortados-run-id": "run-stream-fail"})
+        with self.assertLogs("cortados.provider", level="WARNING"):
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        self.assertEqual(events[-1]["type"], "error")                     # HTTP 200 + an SSE error event
+        last = self.lookup("run-stream-fail")[1]["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (502, "api_error"))
+        self.assertTrue(last["reason"].startswith("backend_reported_error"), last)
+        self.assertEqual(set(last), {"status", "type", "reason", "at"})
+
+    def test_a_400_refusal_is_recorded_too(self):
+        def bad_pin(body, client):
+            return {"error": "sub/nope: not a served model", "client_error": True}
+        self.reg.router = bad_pin
+        code, _ = self.send({"messages": [{"role": "user", "content": "hi"}]}, "run_bad-pin-1")
+        self.assertEqual(code, 400)
+        last = self.lookup("run_bad-pin-1")[1]["refusals"][-1]
+        self.assertEqual(last["status"], 400)
+        self.assertNotIn("sub/nope", json.dumps(last))           # the client's own pin is not echoed into the record
+
     def test_a_routed_request_is_retrievable_by_run_id(self):
         code, _ = self.send({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "please use tool"}]},
                             "run_abc-123")
@@ -633,7 +767,10 @@ class RunRecordTests(RoutedHarness):
                               "run-nostart")
         self.assertEqual((code, err["type"]), (502, "api_error"))
         self.assertEqual(len(self.calls), 1)                          # it was routed, then the backend failed
-        self.assertEqual(self.lookup("run-nostart")[0], 404)
+        code, got = self.lookup("run-nostart")
+        self.assertEqual(code, 200)                                   # no route entry: only the refusal is recorded
+        self.assertEqual((got["models"], got["model"]), ([], None))
+        self.assertEqual(got["refusals"][-1]["status"], 502)
 
     def test_the_api_lane_records_its_label(self):
         from types import SimpleNamespace
@@ -845,6 +982,22 @@ class FailedSessionTombstoneTests(EndpointHarness):
             self.assertRegex(msg, r"^cortados: conversation [0-9a-f]{8} failed at \d\d:\d\d:\d\d .*start a new conversation$")
             self.assertNotIn("no longer holds", msg)
         self.assertEqual(self.reg.sessions, {})                        # a tombstone never restarts a backend
+
+    def test_a_request_on_a_failed_conversation_is_recorded_under_its_run_id(self):
+        run = {"x-cortados-run-id": "run-after-fail"}      # part of the conversation identity: sent on every turn
+        body = self.failed_conversation(headers=run)
+        code, _, _ = self.error_of(body, headers=run)
+        self.assertEqual(code, 400)
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/run-after-fail",
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            last = json.loads(r.read())["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (400, "invalid_request_error"))
+        self.assertEqual(last["reason"], "the conversation already failed (terminal): backend_reported_error: the "
+                                         "Claude backend reported an error (API status 400)")
+        self.assertNotIn("cache TTL ordering", json.dumps(last))       # backend text is never replayed here either
+        self.assertEqual([r["status"] for r in json.loads(urllib.request.urlopen(req, timeout=30).read())["refusals"]],
+                         [502, 400])                                     # the failed turn itself, then the retry
 
     def test_a_new_message_on_the_failed_history_also_gets_the_terminal_error(self):
         body = self.failed_conversation()
