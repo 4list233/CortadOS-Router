@@ -26,7 +26,11 @@ FAKE = textwrap.dedent('''\
                    "subagent": os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                    "claudecode": os.environ.get("CLAUDECODE"),
                    "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS"),
-                   "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid()}}, f)
+                   "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid(),
+                   "env": {{k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL",
+                           "CORTADOS_PROVIDER_TOKEN_FILE", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL",
+                           "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
+                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH")}}}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "stubborn":
@@ -269,6 +273,10 @@ class ChildTaskTests(unittest.TestCase):
         us = mock.patch.object(ct, "USER_CLAUDE_SETTINGS", self.user_settings)
         us.start()
         self.addCleanup(us.stop)
+        # the fake binary's control vars must survive the chrome child's env allowlist (tests only)
+        ap = mock.patch.object(ct, "LOGIN_ENV_ALLOW_PREFIXES", ct.LOGIN_ENV_ALLOW_PREFIXES + ("FAKE_",))
+        ap.start()
+        self.addCleanup(ap.stop)
         self.runs = {}
 
         def fake_urlopen(req, timeout=None):
@@ -1370,7 +1378,10 @@ class ChildTaskTests(unittest.TestCase):
         os.environ.update({"ANTHROPIC_BASE_URL": "http://x.invalid", "ANTHROPIC_AUTH_TOKEN": "tok-test-000000001",
                            "ANTHROPIC_API_KEY": "", "ANTHROPIC_CUSTOM_HEADERS": "h: v", "ANTHROPIC_UNIX_SOCKET": "/s",
                            "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "cortados",
-                           "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados"})
+                           "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
+                           "CORTADOS_PROVIDER_TOKEN": "tok-test-000000002", "CORTADOS_PROVIDER_URL": "http://p.invalid",
+                           "CORTADOS_PROVIDER_TOKEN_FILE": "/t", "ANTHROPIC_SMALL_FAST_MODEL": "m",
+                           "ANTHROPIC_MODEL": "m", "ANTHROPIC_DEFAULT_OPUS_MODEL": "m", "CLAUDE_CONFIG_DIR": "/c"})
         r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True)
         self.assertEqual(out["lane"], ct.LOGIN_LANE)
         self.assertEqual(out["model"], "claude-sonnet-5-5")
@@ -1380,19 +1391,36 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("login mode", st["router_run"]["note"])
         meta = _load(os.path.join(d, "meta.json"))
         self.assertEqual((meta["lane"], meta["model"]), (ct.LOGIN_LANE, "claude-sonnet-5-5"))
-        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
-        self.assertNotIn("--settings", a)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+                  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR",
+                  "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+            self.assertIsNone(seen["env"][k], k)
+        self.assertEqual(seen["env"]["HOME"], os.environ["HOME"])
+        self.assertEqual(seen["nested"], "1")
+        self.assertEqual(meta["cred_fingerprints"], [])
+        sp = a[a.index("--settings") + 1]
+        self.assertEqual(os.stat(sp).st_mode & 0o777, 0o600)
+        self.assertEqual(_load(sp), {"enabledPlugins": {ct.session.PLUGIN_ID: False}})
         self.assertEqual(a[a.index("--model") + 1], "claude-sonnet-5-5")
         self.assertIn("--chrome", a)
         dis = a[a.index("--disallowedTools") + 1]
-        for t in ("Bash(osascript:*)", "Bash(open -a *)", "Bash(*puppeteer*)", "mcp__playwright", "mcp__puppeteer"):
+        for t in ("Bash(osascript:*)", "Bash(*osascript*)", "Bash(open -a *)", "Bash(*open -a*)", "Bash(*puppeteer*)",
+                  "mcp__playwright", "mcp__puppeteer", "mcp__cortados-route"):
             self.assertIn(t, dis)
         self.assertIn("mcp__claude-in-chrome__", a[a.index("--append-system-prompt") + 1])
         env = ct.login_env(dict(os.environ, CLAUDECODE="1"))
         for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
                   "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_SUBAGENT_MODEL",
-                  "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL", "CLAUDECODE"):
+                  "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL", "CLAUDECODE",
+                  "CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+                  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR"):
             self.assertNotIn(k, env)
+        # even an allowlist that admitted them could not pass the forbidden names through
+        with mock.patch.object(ct, "LOGIN_ENV_ALLOW", ct.LOGIN_ENV_ALLOW + ("CORTADOS_PROVIDER_TOKEN", "ANTHROPIC_MODEL")):
+            self.assertNotIn("CORTADOS_PROVIDER_TOKEN", ct.login_env(os.environ))
+            self.assertNotIn("ANTHROPIC_MODEL", ct.login_env(os.environ))
         with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
             self.assertIn(ct.LOGIN_LANE, f.read())
 
@@ -1421,6 +1449,31 @@ class ChildTaskTests(unittest.TestCase):
             r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
             self.assertIn("chrome task refused", r["content"][0]["text"])
             os.unlink(path)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+
+    def test_chrome_refuses_managed_policy(self):
+        md = os.path.join(self.tmp, "managed")
+        os.makedirs(os.path.join(md, "managed-settings.d"))
+        with mock.patch.object(ct, "MANAGED_DIRS", (md,)):
+            for path, cfg in ((os.path.join(md, "managed-settings.json"), {"env": {"ANTHROPIC_BASE_URL": "x"}}),
+                              (os.path.join(md, "managed-settings.d", "a.json"), {"apiKeyHelper": "x"})):
+                with open(path, "w") as f:
+                    json.dump(cfg, f)
+                r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
+                self.assertIn("chrome task refused", r["content"][0]["text"])
+                os.unlink(path)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+
+    def test_login_logs_released_after_crash(self):
+        # [] fingerprints (login mode: no launch credential) release; a missing field still withholds
+        red = ct.Redactor()
+        d = os.path.join(self.tmp, "crashed")
+        os.mkdir(d)
+        for n in ("stdout.log", "stderr.log"):
+            with open(os.path.join(d, n), "w") as f:
+                f.write("")
+        self.assertFalse(ct._release_recovered_logs(d, {}, {}, red))
+        self.assertTrue(ct._release_recovered_logs(d, {"cred_fingerprints": []}, {}, red))
 
     def test_routed_argv_unchanged_without_chrome(self):
         tid = self.start()
@@ -1430,6 +1483,9 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn("--disallowedTools", a)
         self.assertNotIn("BROWSER RULES", a[a.index("--append-system-prompt") + 1])
         self.assertNotIn("lane", _load(os.path.join(ct.task_path(tid), "meta.json")))
+        self.assertNotIn("mcp__cortados-route", " ".join(a))
+        self.assertTrue(_load(os.path.join(ct.task_path(tid), "meta.json"))["cred_fingerprints"])
+        self.assertTrue(os.path.basename(a[a.index("--settings") + 1]).startswith("session-"))
 
     def test_installed_claude_accepts_chrome_flags(self):
         import shutil

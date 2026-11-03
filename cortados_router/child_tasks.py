@@ -151,23 +151,33 @@ CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do
 LOGIN_LANE = "login (unrouted, chrome)"
 # S1 cannot route a login-mode session, so the routed orchestrator `cortados` maps to this fixed model.
 LOGIN_DEFAULT_MODEL = "claude-sonnet-5-5"
-# Removed from a chrome child's env: each either sends the session to the provider/another backend or makes Claude Code
-# drop the login auth (which disables Claude in Chrome).
-LOGIN_STRIP_ENV = ("ANTHROPIC_BASE_URL",          # would route the session to the provider
-                   "ANTHROPIC_AUTH_TOKEN",        # token auth: Claude in Chrome does not load
-                   "ANTHROPIC_API_KEY",           # API-key auth (even empty): Claude in Chrome does not load
-                   "ANTHROPIC_CUSTOM_HEADERS",    # provider routing headers (run id, reveal) have no meaning here
-                   "ANTHROPIC_UNIX_SOCKET")       # another transport to a non-login backend
-LOGIN_STRIP_PREFIXES = ("CLAUDE_CODE_USE_",                # Bedrock/Vertex/Foundry/...: a different backend, no login
-                        "CLAUDE_CODE_SUBAGENT_MODEL")      # `cortados` subagent pin: meaningless without the provider
-LOGIN_STRIP_EXTRA = ("CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL",)  # same reason as the subagent pin
+# A chrome child's env is built from an ALLOWLIST, not a denylist: the session holds a signed-in browser, so it must
+# not inherit the provider credential (CORTADOS_PROVIDER_TOKEN/_FILE), the provider's internal address
+# (CORTADOS_PROVIDER_URL), API keys/tokens/base URLs that drop the login auth (which disables Claude in Chrome), model
+# overrides (ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL, ANTHROPIC_DEFAULT_*_MODEL, CLAUDE_CODE_SUBAGENT_MODEL) or
+# CLAUDE_CONFIG_DIR. A denylist misses whatever is added next; an allowlist cannot. Passed: what a shell session needs,
+# plus the bookkeeping paths the runner (same env) reads so its state stays in the caller's (test's) throwaway dirs.
+LOGIN_ENV_ALLOW = ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "COLORTERM",
+                   "__CF_USER_TEXT_ENCODING", "SSH_AUTH_SOCK",
+                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR")
+LOGIN_ENV_ALLOW_PREFIXES = ("LC_",)   # tests add their fake binary's control vars here
+# Never passed even if a future allowlist edit would admit them (asserted by tests).
+LOGIN_FORBIDDEN_ENV = ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_TOKEN_FILE",
+                       "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+                       "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CONFIG_DIR")
+LOGIN_FORBIDDEN_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "CORTADOS_PROVIDER_")
 # Settings files a login child reads; any of these keys in them would disable Chrome or send the session elsewhere.
+# The child always uses ~/.claude: CLAUDE_CONFIG_DIR is not in LOGIN_ENV_ALLOW, so it never reaches the child.
 USER_CLAUDE_SETTINGS = "~/.claude/settings.json"   # tests point this elsewhere
 LOGIN_BAD_SETTINGS_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
-# Browser control other than Claude in Chrome is hard-blocked: a routed child without Chrome tools once drove the real
-# Chrome through osascript (17 Bash calls) and kept stealing screen focus; Playwright/Puppeteer are unwanted (security).
-CHROME_DISALLOWED_TOOLS = ("Bash(osascript:*)", "Bash(osascript *)", "Bash(open -a *)", "Bash(npx playwright*)",
-                           "Bash(playwright*)", "Bash(*puppeteer*)", "mcp__playwright", "mcp__puppeteer")
+# Browser control other than Claude in Chrome: a routed child without Chrome tools once drove the real Chrome through
+# osascript (17 Bash calls) and kept stealing screen focus; Playwright/Puppeteer are unwanted (security). These Bash
+# patterns only raise the cost of the osascript path (a shell can always spell it another way); CHROME_DIRECTIVE is the
+# real control. mcp__cortados-route is removed because a child must not route or start tasks: this session is unrouted
+# on the user's login and holds a signed-in browser, and the server would hand it the provider credential path.
+CHROME_DISALLOWED_TOOLS = ("Bash(osascript:*)", "Bash(osascript *)", "Bash(*osascript*)", "Bash(open -a *)",
+                           "Bash(*open -a*)", "Bash(npx playwright*)", "Bash(playwright*)", "Bash(*puppeteer*)",
+                           "mcp__playwright", "mcp__puppeteer", "mcp__cortados-route")
 CHROME_DIRECTIVE = ("BROWSER RULES: for any browser work use only the mcp__claude-in-chrome__* tools, working in your "
                     "own tab group. Never control a browser through AppleScript/osascript, Playwright, Puppeteer, "
                     "Selenium or by opening apps. If the Claude in Chrome tools are unavailable, stop and report that "
@@ -193,13 +203,19 @@ def login_model(name) -> str:
 
 def check_login_settings(cwd: str) -> None:
     """Fail closed: refuse a chrome child if a settings file it would load sets an API key/token/base URL in env or an
-    apiKeyHelper; each would disable Claude in Chrome or send the session away from the login."""
-    for path in (os.path.expanduser(USER_CLAUDE_SETTINGS), os.path.join(cwd, ".claude", "settings.json"),
-                 os.path.join(cwd, ".claude", "settings.local.json")):
+    apiKeyHelper; each would disable Claude in Chrome or send the session away from the login. Managed policy files
+    outrank every file checked here, so they are checked too (env keys via session.check_managed, plus apiKeyHelper)."""
+    try:
+        session.check_managed(LOGIN_BAD_SETTINGS_ENV, MANAGED_DIRS)
+        managed = [str(f) for f in session.managed_settings_files(MANAGED_DIRS)]
+    except session.SessionError as exc:
+        raise TaskError(f"chrome task refused: {exc}") from None
+    for path in managed + [os.path.expanduser(USER_CLAUDE_SETTINGS), os.path.join(cwd, ".claude", "settings.json"),
+                           os.path.join(cwd, ".claude", "settings.local.json")]:
         try:
             with open(path, encoding="utf-8") as f:
                 cfg = json.load(f)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
         except (OSError, ValueError) as exc:
             raise TaskError(f"chrome task refused: cannot read {path} to check it ({type(exc).__name__})") from None
@@ -213,9 +229,10 @@ def check_login_settings(cwd: str) -> None:
 
 
 def login_env(environ) -> dict:
+    """The chrome child's env: only LOGIN_ENV_ALLOW / LOGIN_ENV_ALLOW_PREFIXES, never LOGIN_FORBIDDEN_* (see above)."""
     return {k: v for k, v in environ.items()
-            if k not in STRIP_ENV and k not in LOGIN_STRIP_ENV and k not in LOGIN_STRIP_EXTRA
-            and not k.startswith(LOGIN_STRIP_PREFIXES)}
+            if (k in LOGIN_ENV_ALLOW or k.startswith(LOGIN_ENV_ALLOW_PREFIXES))
+            and k not in LOGIN_FORBIDDEN_ENV and not k.startswith(LOGIN_FORBIDDEN_PREFIXES)}
 
 
 def tasks_dir() -> str:
@@ -639,17 +656,23 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
            permission_mode, "--permission-prompts", "none"]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
-    cmd += ["--disallowedTools", ",".join(CHROME_DISALLOWED_TOOLS), "--chrome",
+    # Only the routed-subagents plugin switch: no env, no secret (it would route this session's subagents through the
+    # provider, which a login session neither has nor should reach).
+    settings = os.path.join(d, "login-settings.json")
+    with open(os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+        json.dump({"enabledPlugins": {session.PLUGIN_ID: False}}, f)
+    cmd += ["--settings", settings, "--disallowedTools", ",".join(CHROME_DISALLOWED_TOOLS), "--chrome",
             "--append-system-prompt", CHILD_DIRECTIVE + "\n\n" + CHROME_DIRECTIVE]
     env = login_env(os.environ)
     env[NESTED_ENV] = "1"
+    launch_fps = credential_fingerprints(launch_tokens(env))   # the allowlist admits none, so this is []
     with open(os.open(os.path.join(d, "prompt.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
               encoding="utf-8") as f:
         f.write(task)
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
             "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
-            "max_s": max_s, "runner_pid": None, "cred_fingerprints": [], "argv": cmd[1:]}
+            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:]}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
                                               "event": _event_fields(meta), "started_at": meta["started_at"]})
     _write_json(os.path.join(d, "meta.json"), meta)
@@ -800,8 +823,10 @@ def _tail(path: str, n: int, red: "Redactor") -> str:
 def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> bool:
     """A crashed runner left its logs unredacted. They may be shown only after redaction with credentials that
     provably include every launch credential (by fingerprint); then they are redacted on disk and released."""
-    launch = set(meta.get("cred_fingerprints") or [])
-    if not launch or not launch <= set(credential_fingerprints(red.raw)):
+    # None = an old/odd meta: withhold. [] = the child provably ran with no launch credential (login mode), so nothing
+    # needs covering and the logs are released after the usual redaction instead of being withheld forever.
+    launch = meta.get("cred_fingerprints")
+    if not isinstance(launch, list) or not set(launch) <= set(credential_fingerprints(red.raw)):
         return False
     stdout = os.path.join(d, "stdout.log")
     structural_error = None

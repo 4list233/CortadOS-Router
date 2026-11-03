@@ -55,6 +55,11 @@ TOOL = {
 }
 
 
+# Set in every child task (mirrors child_tasks.NESTED_ENV; checked by a test). A child must not route: start_task is
+# refused there already, and route_task is refused the same way, so a child (above all an unrouted chrome/login child
+# holding a signed-in browser) cannot reach the provider through this server.
+NESTED_ENV = "CORTADOS_CHILD_TASK"
+
 # Whole-task delegation: a separate headless Claude Code session on this machine (cortados_router/child_tasks.py).
 _MODES = ["auto", "acceptEdits", "manual", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
 CHILD_TOOLS = [
@@ -196,6 +201,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
     # leaking a short credential and mangling ordinary words that happen to contain it.
     scrub = lambda s: s.replace(token, "***") if token else s
+    if os.environ.get(NESTED_ENV):
+        return _err("route_task is not available inside a CortadOS child task: do the work yourself")
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
     if len(token) < MIN_TOKEN_LEN:
