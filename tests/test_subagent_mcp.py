@@ -29,6 +29,16 @@ def ok_provider(obj):
 
 
 class RouteTaskTests(unittest.TestCase):
+    def test_refused_inside_a_child_task(self):
+        from cortados_router import child_tasks
+        self.assertEqual(m.NESTED_ENV, child_tasks.NESTED_ENV)
+        def _never(*a, **k):
+            raise AssertionError("a child must not reach the provider")
+        with unittest.mock.patch.dict("os.environ", {m.NESTED_ENV: "1"}):
+            r = m.route_task("http://x:8432", "tok-test-0001", "do a thing", urlopen=_never)
+        self.assertTrue(r["isError"])
+        self.assertIn("child task", r["content"][0]["text"])
+
     def test_returns_the_routed_models_text(self):
         prov = ok_provider({"type": "message", "model": "gpt-6.1-sol",
                             "content": [{"type": "text", "text": "the answer"}]})

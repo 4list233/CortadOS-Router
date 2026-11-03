@@ -55,6 +55,11 @@ TOOL = {
 }
 
 
+# Set in every child task (mirrors child_tasks.NESTED_ENV; checked by a test). A child must not route: start_task is
+# refused there already, and route_task is refused the same way, so a child (above all an unrouted chrome/login child
+# holding a signed-in browser) cannot reach the provider through this server.
+NESTED_ENV = "CORTADOS_CHILD_TASK"
+
 # Whole-task delegation: a separate headless Claude Code session on this machine (cortados_router/child_tasks.py).
 _MODES = ["auto", "acceptEdits", "manual", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
 CHILD_TOOLS = [
@@ -75,8 +80,12 @@ CHILD_TOOLS = [
                              "than claude-haiku-5-5 have no auto mode: unset, they get acceptEdits; 'auto' is refused); acceptEdits: edits in cwd allowed, other approval-needing "
                              "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
-         "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
-                    "acts in the user's real signed-in Chrome (each session gets its own tab group)."},
+         "chrome": {"type": "boolean", "description": "Opt-in (default false): LOGIN MODE. The child runs directly on "
+                    "the user's claude.ai login (NOT routed by S1; spends the main Claude subscription) so Claude in "
+                    "Chrome loads; it acts in the user's real signed-in Chrome in its own tab group. Model: cortados -> "
+                    "claude-sonnet-5-5, a claude-* or sub/claude-* model as given; non-Claude models are refused. "
+                    "osascript/open -a/Playwright/Puppeteer are blocked. connectors are refused (the login loads the "
+                    "user's claude.ai connectors). Refused if Claude settings set an API key/token/base URL."},
          "connectors": {"type": "array", "items": {"type": "string"}, "description": "Optional: names of servers "
                         "from ~/.config/cortados/connectors.mcp.json the child needs (default none). Each server's "
                         "tool schemas are sent with every request; loading them all can exceed the model's context "
@@ -88,12 +97,7 @@ CHILD_TOOLS = [
      "description": "State of a child task (running/succeeded/failed/cancelled), elapsed time, models used, and the final "
                     "result text when done (bounded; the full log path is included).",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
-    {"name": "wait_task",
-     "description": "Block until a child task ends or timeout_s passes (max 540 s, under MCP client tool timeouts), then "
-                    "return what task_status returns. Call again to keep waiting.",
-     "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"},
-                                                      "timeout_s": {"type": "number", "description": "0-540, default 540"}},
-                     "required": ["task_id"]}},
+    {"name": "wait_task"},              # built at tools/list time by _wait_task_tool(): its cap comes from the env
     {"name": "list_tasks",
      "description": "Most recent child tasks, newest first, with state and a short preview.",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "1-200, default 20"}}}},
@@ -102,6 +106,35 @@ CHILD_TOOLS = [
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
 ]
 _CHILD_NAMES = {t["name"] for t in CHILD_TOOLS}
+
+
+def _wait_task_tool() -> dict:
+    """The wait_task entry with the cap in force now (CORTADOS_WAIT_MAX_S, or the 50 s default) interpolated. A bad
+    CORTADOS_WAIT_MAX_S is named in the description; wait_task itself then fails with the same error."""
+    try:
+        ct = _child_module()
+        default = f"{ct.WAIT_MAX_S:g}"
+        try:
+            cap, bad = f"{ct.wait_max_s():g}", ""
+        except ct.TaskError as exc:
+            cap, bad = default, f" Misconfigured: {exc}; wait_task returns this error until it is fixed."
+    except ImportError:
+        cap = default = "50"
+        bad = ""
+    dflt = default if float(default) <= float(cap) else cap
+    return {"name": "wait_task",
+            "description": f"Block until a child task ends or timeout_s passes (default {dflt} s, max {cap} s: the "
+                           "Claude desktop app times MCP requests out at 60 s; CORTADOS_WAIT_MAX_S raises the cap for "
+                           "other clients), then return what task_status returns. If the result says state "
+                           "'running', the task is not done: call wait_task again to keep waiting." + bad,
+            "inputSchema": {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "timeout_s": {"type": "number", "description": f"0-{cap}, default {dflt}"}},
+                "required": ["task_id"]}}
+
+
+def _child_tools() -> list:
+    return [_wait_task_tool() if t["name"] == "wait_task" else t for t in CHILD_TOOLS]
 
 
 def _child_module():
@@ -143,8 +176,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
-            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), red, provider_url=cfg.get("url", ""),
-                          token=token)
+            out = ct.wait(a.get("task_id"), a.get("timeout_s"), red, provider_url=cfg.get("url", ""),
+                          token=token)              # wait() reads the cap via wait_max_s(); a bad one is a TaskError
         elif name == "list_tasks":
             out = {"tasks": ct.list_recent(a.get("limit", 20))}
         else:
@@ -168,6 +201,8 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
     # token (a real one is a long random string) is refused instead of sent, so the scrub never has to choose between
     # leaking a short credential and mangling ordinary words that happen to contain it.
     scrub = lambda s: s.replace(token, "***") if token else s
+    if os.environ.get(NESTED_ENV):
+        return _err("route_task is not available inside a CortadOS child task: do the work yourself")
     if not (provider_url and token):
         return _err("cortados route_task is not configured: set CORTADOS_PROVIDER_URL and CORTADOS_PROVIDER_TOKEN")
     if len(token) < MIN_TOKEN_LEN:
@@ -268,7 +303,7 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         return {**base, "result": {"protocolVersion": version, "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "cortados-route", "version": "0"}}}
     if method == "tools/list":
-        return {**base, "result": {"tools": [TOOL] + CHILD_TOOLS}}
+        return {**base, "result": {"tools": [TOOL] + _child_tools()}}
     if method == "tools/call":
         a = params.get("arguments")
         if not isinstance(a, dict):

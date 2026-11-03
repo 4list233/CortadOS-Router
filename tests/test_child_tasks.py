@@ -26,7 +26,13 @@ FAKE = textwrap.dedent('''\
                    "subagent": os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                    "claudecode": os.environ.get("CLAUDECODE"),
                    "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS"),
-                   "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid()}}, f)
+                   "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid(),
+                   "settings": (lambda p: p and {{"mode": os.stat(p).st_mode & 0o777, "body": json.load(open(p))}})(
+                       sys.argv[sys.argv.index("--settings") + 1] if "--settings" in sys.argv else None),
+                   "env": {{k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL",
+                           "CORTADOS_PROVIDER_TOKEN_FILE", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL",
+                           "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
+                           "ANTHROPIC_AUTH_TOKEN", "HOME", "PATH")}}}}, f)
     if mode == "sleep":
         time.sleep(60)
     if mode == "stubborn":
@@ -265,6 +271,14 @@ class ChildTaskTests(unittest.TestCase):
         p = mock.patch.object(ct, "MANAGED_DIRS", (os.path.join(self.tmp, "no-managed"),))
         p.start()
         self.addCleanup(p.stop)
+        self.user_settings = os.path.join(self.tmp, "user-settings.json")
+        us = mock.patch.object(ct, "USER_CLAUDE_SETTINGS", self.user_settings)
+        us.start()
+        self.addCleanup(us.stop)
+        # the fake binary's control vars must survive the chrome child's env allowlist (tests only)
+        ap = mock.patch.object(ct, "LOGIN_ENV_ALLOW_PREFIXES", ct.LOGIN_ENV_ALLOW_PREFIXES + ("FAKE_",))
+        ap.start()
+        self.addCleanup(ap.stop)
         self.runs = {}
 
         def fake_urlopen(req, timeout=None):
@@ -1362,6 +1376,132 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("--chrome", a)
         self.assertNotIn("--no-chrome", a)
 
+    def test_chrome_login_mode_env_and_argv(self):
+        os.environ.update({"ANTHROPIC_BASE_URL": "http://x.invalid", "ANTHROPIC_AUTH_TOKEN": "tok-test-000000001",
+                           "ANTHROPIC_API_KEY": "sk-ant-test-" + "0" * 40, "ANTHROPIC_CUSTOM_HEADERS": "h: v", "ANTHROPIC_UNIX_SOCKET": "/s",
+                           "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "cortados",
+                           "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
+                           "CORTADOS_PROVIDER_TOKEN": "tok-test-000000002", "CORTADOS_PROVIDER_URL": "http://p.invalid",
+                           "CORTADOS_PROVIDER_TOKEN_FILE": "/t", "ANTHROPIC_SMALL_FAST_MODEL": "m",
+                           "ANTHROPIC_MODEL": "m", "ANTHROPIC_DEFAULT_OPUS_MODEL": "m", "CLAUDE_CONFIG_DIR": "/c"})
+        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True)
+        self.assertEqual(out["lane"], ct.LOGIN_LANE)
+        self.assertEqual(out["model"], "claude-sonnet-5-5")
+        d = ct.task_path(out["task_id"])
+        _, st = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(st["lane"], ct.LOGIN_LANE)
+        self.assertIn("login mode", st["router_run"]["note"])
+        meta = _load(os.path.join(d, "meta.json"))
+        self.assertEqual((meta["lane"], meta["model"]), (ct.LOGIN_LANE, "claude-sonnet-5-5"))
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        a = seen["argv"]
+        for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+                  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR",
+                  "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+            self.assertIsNone(seen["env"][k], k)
+        self.assertEqual(seen["env"]["HOME"], os.environ["HOME"])
+        self.assertEqual(seen["nested"], "1")
+        self.assertEqual(meta["cred_fingerprints"], [])
+        sp = a[a.index("--settings") + 1]
+        self.assertEqual(os.path.basename(sp), "session-login.json")
+        self.assertEqual(seen["settings"], {"mode": 0o600, "body": {"enabledPlugins": {ct.session.PLUGIN_ID: False}}})
+        self.assertFalse(os.path.exists(sp))   # removed with the child, like the routed child's settings file
+        self.assertEqual(a[a.index("--model") + 1], "claude-sonnet-5-5")
+        self.assertIn("--chrome", a)
+        dis = a[a.index("--disallowedTools") + 1]
+        for t in ("Bash(osascript:*)", "Bash(*osascript*)", "Bash(open -a *)", "Bash(*open -a*)", "Bash(*puppeteer*)",
+                  "mcp__playwright", "mcp__puppeteer", "mcp__cortados-route"):
+            self.assertIn(t, dis)
+        self.assertIn("mcp__claude-in-chrome__", a[a.index("--append-system-prompt") + 1])
+        # crash logs are released when the fingerprints are []: safe only while every launch-token key is forbidden
+        self.assertLessEqual(set(ct.LAUNCH_TOKEN_KEYS), set(ct.LOGIN_FORBIDDEN_ENV))
+        self.assertIn("SSH_AUTH_SOCK", ct.LOGIN_FORBIDDEN_ENV)
+        self.assertIn("CLAUDECODE", ct.LOGIN_FORBIDDEN_ENV)
+        self.assertNotIn("SSH_AUTH_SOCK", ct.LOGIN_ENV_ALLOW)
+        self.assertEqual(ct.credential_fingerprints(ct.launch_tokens(ct.login_env(os.environ))), [])
+        px = ct.login_env({"HTTPS_PROXY": "http://proxy:3128", "http_proxy": "http://u:p@proxy:3128",
+                           "HTTP_PROXY": "u@proxy:1", "NO_PROXY": "localhost", "SSL_CERT_FILE": "/ca.pem",
+                           "NODE_EXTRA_CA_CERTS": "/ca2.pem", "SSH_AUTH_SOCK": "/agent"})
+        self.assertEqual(px, {"HTTPS_PROXY": "http://proxy:3128", "NO_PROXY": "localhost",
+                              "SSL_CERT_FILE": "/ca.pem", "NODE_EXTRA_CA_CERTS": "/ca2.pem"})
+        self.assertRaises(ct.TaskError, ct.wait_max_s, {"CORTADOS_WAIT_MAX_S": 30})
+        env = ct.login_env(dict(os.environ, CLAUDECODE="1"))
+        for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
+                  "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_SUBAGENT_MODEL",
+                  "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL", "CLAUDECODE",
+                  "CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+                  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR"):
+            self.assertNotIn(k, env)
+        # even an allowlist that admitted them could not pass the forbidden names through
+        with mock.patch.object(ct, "LOGIN_ENV_ALLOW", ct.LOGIN_ENV_ALLOW + ("CORTADOS_PROVIDER_TOKEN", "ANTHROPIC_MODEL")):
+            self.assertNotIn("CORTADOS_PROVIDER_TOKEN", ct.login_env(os.environ))
+            self.assertNotIn("ANTHROPIC_MODEL", ct.login_env(os.environ))
+        with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
+            self.assertIn(ct.LOGIN_LANE, f.read())
+
+    def test_chrome_model_mapping_and_refusals(self):
+        self.assertEqual(ct.login_model("cortados"), "claude-sonnet-5-5")
+        self.assertEqual(ct.login_model("claude-opus-5-5"), "claude-opus-5-5")
+        self.assertEqual(ct.login_model("sub/claude-haiku-5-5"), "claude-haiku-5-5")
+        for bad in ("gpt-6.1-sol", "qwen-27b"):
+            r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True, orchestrator=bad)
+            self.assertIn("only run Claude models", r["content"][0]["text"])
+        r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True, connectors=["a"])
+        self.assertIn("connectors are not used with chrome", r["content"][0]["text"])
+        r, out = self.call("start_task", task="x", cwd=self.work, chrome=True,
+                           orchestrator="claude-haiku-4-5-20251001")
+        self.assertEqual(out["permission_mode"], "acceptEdits")
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_chrome_refuses_api_settings(self):
+        cases = [(self.user_settings, {"env": {"ANTHROPIC_API_KEY": "x"}}),
+                 (os.path.join(self.work, ".claude", "settings.json"), {"apiKeyHelper": "x"}),
+                 (os.path.join(self.work, ".claude", "settings.local.json"), {"env": {"ANTHROPIC_BASE_URL": "x"}})]
+        os.makedirs(os.path.join(self.work, ".claude"))
+        for path, cfg in cases:
+            with open(path, "w") as f:
+                json.dump(cfg, f)
+            r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
+            self.assertIn("chrome task refused", r["content"][0]["text"])
+            os.unlink(path)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+
+    def test_chrome_refuses_managed_policy(self):
+        md = os.path.join(self.tmp, "managed")
+        os.makedirs(os.path.join(md, "managed-settings.d"))
+        with mock.patch.object(ct, "MANAGED_DIRS", (md,)):
+            for path, cfg in ((os.path.join(md, "managed-settings.json"), {"env": {"ANTHROPIC_BASE_URL": "x"}}),
+                              (os.path.join(md, "managed-settings.d", "a.json"), {"apiKeyHelper": "x"})):
+                with open(path, "w") as f:
+                    json.dump(cfg, f)
+                r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
+                self.assertIn("chrome task refused", r["content"][0]["text"])
+                os.unlink(path)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")), "no child was spawned")
+
+    def test_login_logs_released_after_crash(self):
+        # [] fingerprints (login mode: no launch credential) release; a missing field still withholds
+        red = ct.Redactor()
+        d = os.path.join(self.tmp, "crashed")
+        os.mkdir(d)
+        for n in ("stdout.log", "stderr.log"):
+            with open(os.path.join(d, n), "w") as f:
+                f.write("")
+        self.assertFalse(ct._release_recovered_logs(d, {}, {}, red))
+        self.assertTrue(ct._release_recovered_logs(d, {"cred_fingerprints": []}, {}, red))
+
+    def test_routed_argv_unchanged_without_chrome(self):
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertIn("--settings", a)
+        self.assertNotIn("--disallowedTools", a)
+        self.assertNotIn("BROWSER RULES", a[a.index("--append-system-prompt") + 1])
+        self.assertNotIn("lane", _load(os.path.join(ct.task_path(tid), "meta.json")))
+        self.assertNotIn("mcp__cortados-route", " ".join(a))
+        self.assertTrue(_load(os.path.join(ct.task_path(tid), "meta.json"))["cred_fingerprints"])
+        self.assertTrue(os.path.basename(a[a.index("--settings") + 1]).startswith("session-"))
+
     def test_installed_claude_accepts_chrome_flags(self):
         import shutil
         import subprocess
@@ -1599,6 +1739,93 @@ class ChildTaskTests(unittest.TestCase):
     def test_wait_timeout_capped(self):
         r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=9999)
         self.assertTrue(r.get("isError"))
+
+    def test_wait_cap_is_50s_for_the_desktop_app(self):
+        # The Claude desktop app times MCP requests out at 60 s (observed 2026-11-03).
+        os.environ.pop("CORTADOS_WAIT_MAX_S", None)
+        self.assertEqual(ct.wait_max_s(), 50)
+        r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=60)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("between 0 and 50", r["content"][0]["text"])
+
+    def test_wait_cap_env_override(self):
+        self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": "300"}), 300)
+        self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": ""}), 50)
+        self.assertEqual(ct.wait_max_s({}), 50)
+        for bad in ("abc", "50s", "0", "-5", "5000", "99999", "nan"):
+            with self.assertRaises(ct.TaskError, msg=bad):
+                ct.wait_max_s({"CORTADOS_WAIT_MAX_S": bad})
+        with self.assertRaises(ct.TaskError):
+            ct.wait("t20261102000000-0000000a", 120, max_s=50)
+        for bad in (float("nan"), 0, -1, "x"):
+            with self.assertRaises(ct.TaskError, msg=repr(bad)):
+                ct.wait("t20261102000000-0000000a", 1, max_s=bad)
+
+    def test_wait_bad_env_cap_is_a_clear_tool_error(self):
+        os.environ["CORTADOS_WAIT_MAX_S"] = "50s"
+        r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=1)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("CORTADOS_WAIT_MAX_S='50s'", r["content"][0]["text"])
+
+    def test_wait_default_honours_the_override(self):
+        # default = min(WAIT_MAX_S, cap): a lower cap lowers the default, a higher cap does not raise it
+        seen = []
+        with mock.patch.object(ct, "_state", lambda d: ("running", {}, {})), \
+                mock.patch.object(ct, "task_path", lambda tid: "/nonexistent"), \
+                mock.patch.object(ct, "status", lambda *a, **k: {"state": "running"}), \
+                mock.patch.object(ct.time, "sleep", lambda s: seen.append(s)):
+            with mock.patch.dict(os.environ, {"CORTADOS_WAIT_MAX_S": "0.05"}):
+                out = ct.wait("t20261102000000-0000000a", poll_s=0.01)
+            self.assertIn("waited 0.05 s", out["wait_ended"])
+            with mock.patch.dict(os.environ, {"CORTADOS_WAIT_MAX_S": "300"}):
+                with mock.patch.object(ct, "WAIT_MAX_S", 0.02):
+                    out = ct.wait("t20261102000000-0000000a", poll_s=0.01)
+            self.assertIn("waited 0.02 s", out["wait_ended"])
+
+    def test_tools_list_shows_the_wait_cap_in_force(self):
+        def wait_entry():
+            r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.cfg)
+            return next(t for t in r["result"]["tools"] if t["name"] == "wait_task")
+        os.environ.pop("CORTADOS_WAIT_MAX_S", None)
+        self.assertIn("0-50", wait_entry()["inputSchema"]["properties"]["timeout_s"]["description"])
+        os.environ["CORTADOS_WAIT_MAX_S"] = "300"
+        w = wait_entry()
+        self.assertIn("0-300, default 50", w["inputSchema"]["properties"]["timeout_s"]["description"])
+        self.assertIn("max 300 s", w["description"])
+
+    def test_wait_still_running_says_call_again(self):
+        # a real sleeping fake child through the MCP call path
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start()
+        r, out = self.call("wait_task", task_id=tid, timeout_s=0.1)
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(out["state"], "running")
+        self.assertIn("call wait_task again", out["wait_ended"])
+        self.call("cancel_task", task_id=tid)
+        self.call("wait_task", task_id=tid, timeout_s=30)
+
+    def test_wait_reply_lands_inside_the_client_budget_when_the_fetch_hangs(self):
+        # P1: a finished task's run-record fetch hanging must not push the reply past the client's 60 s timeout;
+        # the fetch timeout shrinks to what is left of the deadline (min RUN_FETCH_MIN_S).
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)        # let it finish
+        timeouts = []
+
+        def hanging(req, timeout=None):
+            timeouts.append(timeout)
+            time.sleep(timeout)
+            raise urllib.error.URLError("timed out")
+        with mock.patch.object(ct, "_urlopen", hanging), mock.patch.object(ct, "POST_WAIT_RESERVE_S", 6.5):
+            t0 = time.monotonic()
+            r, out = self.call("wait_task", task_id=tid, timeout_s=0.5)
+            elapsed = time.monotonic() - t0
+        self.assertFalse(r.get("isError"), r)
+        self.assertNotEqual(out["state"], "running")
+        self.assertIn("error", out["router_run"])
+        # budget: timeout_s 0.5 + reserve 6.5 = 7 s; the fetch gets end + reserve - recovery grace = ~2 s from now
+        self.assertLessEqual(timeouts[0], 2.0 + 0.01)
+        self.assertLess(elapsed, 0.5 + 6.5)
+        self.assertLess(elapsed, 3.0)                              # the unbounded fetch would have taken 10 s
 
     def test_unconfigured_url(self):
         self.cfg["url"] = ""

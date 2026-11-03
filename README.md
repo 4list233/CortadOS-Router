@@ -276,6 +276,8 @@ Point a whole tool at `cortados` to route everything, or keep your main session 
 sub-tasks it chooses to hand off. The repo ships a project MCP server, `cortados-route` (`.mcp.json`), exposing one tool,
 `route_task(task, context?, max_tokens?)`: it sends a self-contained sub-task to the provider, S1 scores it, the cheapest
 capable model runs it, and the text comes back. The main session keeps its own model and login.
+`route_task` is refused inside a child task (`CORTADOS_CHILD_TASK` set): children may not route, as they may not start
+children (the child's directive says so too).
 
 Set two environment variables and have the provider running:
 
@@ -314,7 +316,7 @@ on the machine that runs the server (`claude -p` launched through `cortados_rout
 server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
 
 Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
-`task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
+`task_status(task_id)`, `wait_task(task_id, timeout_s≤50)` (50 s default and cap: the Claude desktop app times MCP requests out at 60 s, and the reply, post-wait status work included, lands inside it; `CORTADOS_WAIT_MAX_S` (0-3600 s; a bad value is an error) raises it for clients with a longer timeout; a result with state `running` means call again), `list_tasks(limit?)`, `cancel_task(task_id)`.
 
 - `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
   ...), which pins the child's MAIN model; the child's subagents are still routed by S1.
@@ -370,10 +372,25 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
 - `claude -p` and deferred tool loading: with tool search on, a headless session may not have an MCP tool's schema
   loaded and report e.g. "start_task is not a function". Run such sessions with `ENABLE_TOOL_SEARCH=false` so every
   MCP tool is loaded up front.
-- `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
-  signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Without it the
-  child gets an explicit `--no-chrome`, so a `claudeInChromeDefaultEnabled` setting cannot turn Chrome on. Chrome inside a
-  headless `-p` child is unverified until a live test.
+- `chrome: true` (default false) runs the child in LOGIN MODE (decided 2026-11-03): `claude` directly on the user's
+  claude.ai login. Its env is an ALLOWLIST (`LOGIN_ENV_ALLOW`: shell basics, the bookkeeping paths, proxy/CA vars
+  with any `user:pass@` proxy URL dropped); `LOGIN_FORBIDDEN_ENV` / `_PREFIXES` can never pass (provider URL and
+  token, every `ANTHROPIC_*` / `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`, `SSH_AUTH_SOCK`, `CLAUDECODE`), so the provider
+  credential never reaches a session that holds a signed-in browser. Its `--settings` file is secret-free (0600,
+  `session-login.json`, removed when the child exits): only the routed-subagents plugin switched off. Refused when a
+  managed-policy settings file sets those auth keys or `apiKeyHelper` (managed policy outranks the files below). `mcp__cortados-route` is in `--disallowedTools`. Why: through the provider (token
+  or API-key auth) Claude Code 2.1.316 loads no `claude-in-chrome` server; on the login it does. So chrome tasks are
+  NOT routed by S1 and spend the main Claude subscription; status shows `lane: "login (unrouted, chrome)"` and the
+  model. Model: `cortados` -> `claude-sonnet-5-5`; a `claude-*` or `sub/claude-*` model as given; anything else is
+  refused. Refused (fail closed) when `~/.claude/settings.json` or the cwd's `.claude/settings{,.local}.json` sets env
+  `ANTHROPIC_API_KEY/AUTH_TOKEN/BASE_URL` or `apiKeyHelper`. `connectors` is refused for chrome tasks (the login loads
+  the user's claude.ai connectors itself). Other browser control is blocked with `--disallowedTools` (osascript,
+  `open -a`, Playwright, Puppeteer) and the child is told to use only `mcp__claude-in-chrome__*` and to stop and report
+  if those tools are missing: a routed child once drove Chrome through osascript and kept stealing focus. Without
+  `chrome` the child gets an explicit `--no-chrome` and is routed exactly as before.
+  Caveat (verified 2026-11-03): a headless `-p` login child does load the 22 `mcp__claude-in-chrome__*` tools, but its
+  calls returned "Browser extension is not connected" while the Claude desktop app held the extension. The child then
+  stops and reports; a chrome task works only when no other session holds the extension.
 - Connectors (opt-in): claude.ai connectors are disabled in token-auth sessions, so their servers are listed in
   `~/.config/cortados/connectors.mcp.json` (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`). A child gets only
   the servers named in `connectors` (default none), written to a private per-task `--mcp-config` file that is removed

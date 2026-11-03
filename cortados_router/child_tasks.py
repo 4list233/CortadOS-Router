@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -101,7 +102,41 @@ LOGS_WITHHELD_NOTE = ("logs withheld: the runner died before redaction, and the 
                       "this task was launched with. The raw stdout/stderr logs in the task dir contain the launch "
                       "credential and must not be read or shared.")
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
-WAIT_MAX_S = 540                    # MCP clients time a tool call out (~10 min); stay under it
+# The Claude desktop app's Code session times every MCP request out at 60 s (observed 2026-11-03: "Request timed out"
+# at ~61 s on wait_task calls). The reply must land before that, end to end: the polling loop AND the status() work
+# after it (a crashed child's recovery: RECOVERY_GRACE_S + ps calls; the run-record fetch, which shrinks to what is
+# left of the deadline, min 1 s). POST_WAIT_RESERVE_S covers that work plus a margin, so the default wait is 50 s.
+# ASSUMPTION: ps returns promptly (well under 1 s on a healthy macOS). Its PS_TIMEOUT_S guard only stops a hung ps
+# from blocking forever; under a stuck process table two ps calls can still push one reply past the client timeout.
+# Not derived from the deadline because a ps cut short reads as UNKNOWN/False and would skip the recovery.
+# Clients with a longer request timeout raise the cap with CORTADOS_WAIT_MAX_S (read via wait_max_s()).
+CLIENT_REQUEST_TIMEOUT_S = 60
+POST_WAIT_RESERVE_S = 10            # recovery (5 s grace + prompt ps calls) + >= 1 s run fetch + slack for disk and JSON-RPC
+WAIT_MAX_S = CLIENT_REQUEST_TIMEOUT_S - POST_WAIT_RESERVE_S
+# No MCP client the router serves holds a request open for an hour; a larger value is almost surely a unit slip
+# (milliseconds), and taking it would let one wait_task call block its client far past any request timeout.
+WAIT_MAX_S_CEILING = 3600
+PS_TIMEOUT_S = 10                   # guards a hung ps only (see the ASSUMPTION above)
+RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not worth starting short of zero
+
+
+def wait_max_s(env=None) -> float:
+    """The wait cap: WAIT_MAX_S, or CORTADOS_WAIT_MAX_S when set. A set value that is not a number of seconds in
+    (0, WAIT_MAX_S_CEILING] raises TaskError (like CORTADOS_CHILD_MAX_S): a typo must not silently become 50 s."""
+    raw = (os.environ if env is None else env).get("CORTADOS_WAIT_MAX_S")
+    if raw is not None and not isinstance(raw, str):   # an injected dict may carry a non-str: refused like junk
+        raise TaskError(f"CORTADOS_WAIT_MAX_S={raw!r} is not a number of seconds")
+    if raw is None or raw.strip() == "":
+        return float(WAIT_MAX_S)
+    try:
+        v = float(raw)
+    except ValueError:
+        raise TaskError(f"CORTADOS_WAIT_MAX_S={raw!r} is not a number of seconds") from None
+    if v != v or not 0 < v <= WAIT_MAX_S_CEILING:
+        raise TaskError(f"CORTADOS_WAIT_MAX_S={raw!r} must be more than 0 and at most {WAIT_MAX_S_CEILING} seconds")
+    return v
+
+
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
 # Claude Code refuses to start inside another Claude Code session when it sees this; the child is a fresh session.
 STRIP_ENV = ("CLAUDECODE",)
@@ -110,13 +145,121 @@ MANAGED_DIRS = session.MANAGED_SETTINGS_DIRS   # tests point this elsewhere
 # delegate via start_task/route_task; this tells the child unambiguously that it is the delegate.
 # Native subagents are fine (S1 routes them); starting further child tasks or re-handing the whole task off is not.
 CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do the task yourself and completely. You may "
-                   "use your own subagents for parts of it (they are routed by S1), but do not call start_task or hand "
-                   "the whole task off again. Your final message is returned to the orchestrator: end with a concise "
+                   "use your own subagents for parts of it (they are routed by S1), but do not call start_task or "
+                   "route_task (both are refused inside a child task) or hand the whole task off again. Your final message is returned to the orchestrator: end with a concise "
                    "report of what you did, what you verified, and anything left undone.")
+
+
+# --- chrome: true = LOGIN MODE (Forest's decision, 2026-11-03) ---------------------------------------------------
+# Measured with Claude Code 2.1.316: a session pointed at the provider (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, or
+# ANTHROPIC_API_KEY set, even empty) loads 30 tools and NO claude-in-chrome server; a plain claude.ai-login session loads
+# claude-in-chrome (22 mcp__claude-in-chrome__* tools). So a chrome child runs directly on the user's login, unrouted by
+# S1, spending the main Claude subscription. chrome: false is untouched.
+LOGIN_LANE = "login (unrouted, chrome)"
+# S1 cannot route a login-mode session, so the routed orchestrator `cortados` maps to this fixed model.
+LOGIN_DEFAULT_MODEL = "claude-sonnet-5-5"
+# A chrome child's env is built from an ALLOWLIST, not a denylist: the session holds a signed-in browser, so it must
+# not inherit the provider credential (CORTADOS_PROVIDER_TOKEN/_FILE), the provider's internal address
+# (CORTADOS_PROVIDER_URL), API keys/tokens/base URLs that drop the login auth (which disables Claude in Chrome), model
+# overrides (ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL, ANTHROPIC_DEFAULT_*_MODEL, CLAUDE_CODE_SUBAGENT_MODEL) or
+# CLAUDE_CONFIG_DIR. A denylist misses whatever is added next; an allowlist cannot. Passed: what a shell session needs,
+# plus the bookkeeping paths the runner (same env) reads so its state stays in the caller's (test's) throwaway dirs.
+LOGIN_ENV_ALLOW = ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "COLORTERM",
+                   "__CF_USER_TEXT_ENCODING",
+                   "CORTADOS_HOME", "CORTADOS_HERMES_HOME", "CORTADOS_TASKS_DIR",
+                   # Network config: without it a proxied or custom-CA network cannot reach claude.ai. These carry no
+                   # credential, EXCEPT a proxy URL with userinfo (http://user:pass@host): login_env drops those.
+                   "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+                   "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS")
+LOGIN_PROXY_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+LOGIN_ENV_ALLOW_PREFIXES = ("LC_",)   # tests add their fake binary's control vars here
+# Never passed even if a future allowlist edit would admit them (asserted by tests).
+LOGIN_FORBIDDEN_ENV = ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_TOKEN_FILE",
+                       "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+                       "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CONFIG_DIR",
+                       # the ssh agent signs as the user (git push, ssh host): a browser task does not need it and an
+                       # unattended auto-mode child must not hold it; git over ssh would be an explicit per-task opt-in
+                       "SSH_AUTH_SOCK",
+                       # Claude Code refuses to start inside another session when it sees this (STRIP_ENV)
+                       "CLAUDECODE")
+LOGIN_FORBIDDEN_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "CORTADOS_PROVIDER_")
+# Settings files a login child reads; any of these keys in them would disable Chrome or send the session elsewhere.
+# The child always uses ~/.claude: CLAUDE_CONFIG_DIR is not in LOGIN_ENV_ALLOW, so it never reaches the child.
+USER_CLAUDE_SETTINGS = "~/.claude/settings.json"   # tests point this elsewhere
+LOGIN_BAD_SETTINGS_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
+# Browser control other than Claude in Chrome: a routed child without Chrome tools once drove the real Chrome through
+# osascript (17 Bash calls) and kept stealing screen focus; Playwright/Puppeteer are unwanted (security). These Bash
+# patterns only raise the cost of the osascript path (a shell can always spell it another way); CHROME_DIRECTIVE is the
+# real control. mcp__cortados-route is removed because a child must not route or start tasks: this session is unrouted
+# on the user's login and holds a signed-in browser, and the server would hand it the provider credential path.
+CHROME_DISALLOWED_TOOLS = ("Bash(osascript:*)", "Bash(osascript *)", "Bash(*osascript*)", "Bash(open -a *)",
+                           "Bash(*open -a*)", "Bash(npx playwright*)", "Bash(playwright*)", "Bash(*puppeteer*)",
+                           "mcp__playwright", "mcp__puppeteer", "mcp__cortados-route")
+CHROME_DIRECTIVE = ("BROWSER RULES: for any browser work use only the mcp__claude-in-chrome__* tools, working in your "
+                    "own tab group. Never control a browser through AppleScript/osascript, Playwright, Puppeteer, "
+                    "Selenium or by opening apps. If the Claude in Chrome tools are unavailable, stop and report that "
+                    "instead of improvising.")
 
 
 class TaskError(Exception):
     pass
+
+
+def login_model(name) -> str:
+    """The model a chrome (login-mode) child runs: `cortados` -> LOGIN_DEFAULT_MODEL (S1 cannot route a login session);
+    a Claude model or sub/<claude model> -> that model id; anything else is refused (the login only runs Claude)."""
+    if name == "cortados":
+        return LOGIN_DEFAULT_MODEL
+    model = pin_model(name)
+    model = model.split("/", 1)[1] if model.startswith("sub/") else model
+    if not model.startswith("claude-"):
+        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {name!r} "
+                        f"({model}) is not one. Use cortados (= {LOGIN_DEFAULT_MODEL}) or a claude-* model.")
+    return model
+
+
+def check_login_settings(cwd: str) -> None:
+    """Fail closed: refuse a chrome child if a settings file it would load sets an API key/token/base URL in env or an
+    apiKeyHelper; each would disable Claude in Chrome or send the session away from the login. Managed policy files
+    outrank every file checked here, so they are checked too (env keys via session.check_managed, plus apiKeyHelper)."""
+    try:
+        session.check_managed(LOGIN_BAD_SETTINGS_ENV, MANAGED_DIRS)
+        managed = [str(f) for f in session.managed_settings_files(MANAGED_DIRS)]
+    except session.SessionError as exc:
+        raise TaskError(f"chrome task refused: {exc}") from None
+    for path in managed + [os.path.expanduser(USER_CLAUDE_SETTINGS), os.path.join(cwd, ".claude", "settings.json"),
+                           os.path.join(cwd, ".claude", "settings.local.json")]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError) as exc:
+            raise TaskError(f"chrome task refused: cannot read {path} to check it ({type(exc).__name__})") from None
+        if not isinstance(cfg, dict):
+            continue
+        env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+        bad = [k for k in LOGIN_BAD_SETTINGS_ENV if k in env] + (["apiKeyHelper"] if "apiKeyHelper" in cfg else [])
+        if bad:
+            raise TaskError(f"chrome task refused: {path} sets {', '.join(bad)}, which would disable Claude in Chrome "
+                            "or send the session away from the claude.ai login; remove it or run without chrome")
+
+
+def login_env(environ) -> dict:
+    """The chrome child's env: only LOGIN_ENV_ALLOW / LOGIN_ENV_ALLOW_PREFIXES, never LOGIN_FORBIDDEN_* (see above)."""
+    return {k: v for k, v in environ.items()
+            if (k in LOGIN_ENV_ALLOW or k.startswith(LOGIN_ENV_ALLOW_PREFIXES))
+            and k not in LOGIN_FORBIDDEN_ENV and not k.startswith(LOGIN_FORBIDDEN_PREFIXES)
+            and not (k in LOGIN_PROXY_ENV and _has_userinfo(v))}
+
+
+def _has_userinfo(url) -> bool:
+    """A proxy URL that embeds a credential (user[:pass]@host). Unparseable counts as yes: fail closed."""
+    u = str(url)
+    try:
+        return "@" in urllib.parse.urlsplit(u if "://" in u else "//" + u).netloc
+    except ValueError:
+        return True
 
 
 def tasks_dir() -> str:
@@ -314,7 +457,7 @@ def log_event(event: str, **fields):
     return None
 
 
-def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
+def fetch_run(provider_url: str, token: str, run_id: str, timeout_s: float = RUN_FETCH_TIMEOUT_S) -> dict:
     """The provider's record of this run (GET /v1/cortados/runs/<id>): models and lanes it routed to. Failures come back
     as {"error": ...}, never raised; the token never appears in the text."""
     scrub = (lambda s: s.replace(token, "***")) if token else (lambda s: s)
@@ -323,7 +466,7 @@ def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
     req = urllib.request.Request(provider_url.rstrip("/") + "/v1/cortados/runs/" + run_id, method="GET",
                                  headers={"x-api-key": token})
     try:
-        with _urlopen(req, timeout=RUN_FETCH_TIMEOUT_S) as resp:
+        with _urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return {"error": f"provider returned HTTP {exc.code}" + (" (no routed request recorded under this run id)"
@@ -384,19 +527,30 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
-    permission_mode, mode_note = resolve_permission_mode(permission_mode, orchestrator)
-    selected = select_connectors(connectors)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
-    if not provider_url:
+    login = None
+    if chrome:
+        login = login_model(orchestrator)
+        if connectors:
+            # Refused, not ignored: in login mode the user's claude.ai connectors load through the login itself, and a
+            # silently dropped list would hide that from the caller.
+            raise TaskError("connectors are not used with chrome: true (login mode loads the user's claude.ai "
+                            "connectors through the login itself); omit connectors")
+        check_login_settings(cwd)
+    permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
+    selected = select_connectors(None if chrome else connectors)
+    if not provider_url and not chrome:
         raise TaskError("start_task is not configured: set CORTADOS_PROVIDER_URL for the cortados-route MCP server")
     max_s = _max_s()
     exe = claude_bin()
     root = _private_root()
     prune_errors: list = []
     prune(root, errors=prune_errors)
-    # No cap on parallel children, chrome ones included: capacity is the router's job (S1 and the quota gates refuse or
-    # redirect a spent lane), and Claude in Chrome gives each session its own tab group.
+    # No cap on parallel children. Routed children: capacity is the router's job (S1 and the quota gates refuse or
+    # redirect a spent lane). Chrome (login-mode) children bypass S1 and the quota gates, so NOTHING here bounds N of
+    # them against the main Claude subscription; the orchestrator decides how many to run (Claude in Chrome gives each
+    # session its own tab group). A cap would be an [ESCALATE] decision, not added silently.
     task_id = _new_id()
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)
@@ -409,7 +563,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
-                                  chrome, max_s, exe, selected)
+                                  chrome, max_s, exe, selected, login)
         if mode_note:
             meta["permission_mode_note"] = mode_note
             _write_json(os.path.join(d, "meta.json"), meta)
@@ -440,6 +594,8 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
                         f"{exc})") from None
     _REAP[task_id] = runner
     out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode}
+    if login:
+        out.update(lane=LOGIN_LANE, model=login)
     if mode_note:
         out["permission_mode_note"] = mode_note
     if prune_errors:
@@ -460,9 +616,11 @@ def _abort_runner(runner, d: str) -> None:
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None):
+             exe, selected=None, login=None):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
+    if login:
+        return _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, login)
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
         launch += ["--token-file", token_file]
@@ -521,6 +679,36 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     return meta, env, cmd
 
 
+def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model):
+    """chrome: true. No launcher, no --settings provider file, no provider env: claude on the user's own login."""
+    cmd = [exe, "--model", model, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
+           permission_mode, "--permission-prompts", "none"]
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
+    # Only the routed-subagents plugin switch: no env, no secret (it would route this session's subagents through the
+    # provider, which a login session neither has nor should reach).
+    # named session-*.json so _remove_settings deletes it like the routed child's file when the child exits
+    settings = os.path.join(d, "session-login.json")
+    with open(os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+        json.dump({"enabledPlugins": {session.PLUGIN_ID: False}}, f)
+    cmd += ["--settings", settings, "--disallowedTools", ",".join(CHROME_DISALLOWED_TOOLS), "--chrome",
+            "--append-system-prompt", CHILD_DIRECTIVE + "\n\n" + CHROME_DIRECTIVE]
+    env = login_env(os.environ)
+    env[NESTED_ENV] = "1"
+    launch_fps = credential_fingerprints(launch_tokens(env))   # the allowlist admits none, so this is []
+    with open(os.open(os.path.join(d, "prompt.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
+              encoding="utf-8") as f:
+        f.write(task)
+    meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
+            "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
+            "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
+            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:]}
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
+                                              "event": _event_fields(meta), "started_at": meta["started_at"]})
+    _write_json(os.path.join(d, "meta.json"), meta)
+    return meta, env, cmd
+
+
 def _add_child_directive(cmd: list) -> None:
     """Append CHILD_DIRECTIVE to the system prompt, LAST. Order: claude's own prompt, then CLAUDE.md, then the
     --append-system-prompt text; within that text a pinned orchestrator's whole-session directive comes first and the
@@ -535,7 +723,10 @@ def _add_child_directive(cmd: list) -> None:
 
 
 def _event_fields(meta: dict) -> dict:
-    return {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    out = {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    if meta.get("lane"):
+        out.update(lane=meta["lane"], model=meta.get("model"))
+    return out
 
 
 _REAP: dict = {}    # Popen handles of runners this server started: polled so an exited runner is reaped, not a zombie
@@ -564,7 +755,7 @@ def _is_our_runner(pid, d: str) -> bool:
         return False
     try:
         cmdline = subprocess.run([PS, "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
-                                 timeout=10).stdout
+                                 timeout=PS_TIMEOUT_S).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
     return f"--run {d} " in cmdline + " "
@@ -662,8 +853,10 @@ def _tail(path: str, n: int, red: "Redactor") -> str:
 def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> bool:
     """A crashed runner left its logs unredacted. They may be shown only after redaction with credentials that
     provably include every launch credential (by fingerprint); then they are redacted on disk and released."""
-    launch = set(meta.get("cred_fingerprints") or [])
-    if not launch or not launch <= set(credential_fingerprints(red.raw)):
+    # None = an old/odd meta: withhold. [] = the child provably ran with no launch credential (login mode), so nothing
+    # needs covering and the logs are released after the usual redaction instead of being withheld forever.
+    launch = meta.get("cred_fingerprints")
+    if not isinstance(launch, list) or not set(launch) <= set(credential_fingerprints(red.raw)):
         return False
     stdout = os.path.join(d, "stdout.log")
     structural_error = None
@@ -693,7 +886,9 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     return True
 
 
-def status(task_id, red=None, provider_url="", token="") -> dict:
+def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
+    """deadline (time.monotonic()) bounds the run-record fetch: its timeout shrinks to what is left, min
+    RUN_FETCH_MIN_S, so wait_task's reply lands inside the client's request timeout."""
     red = red or Redactor((token,) if token else ())
     d = task_path(task_id)
     state, meta, res = _state(d)
@@ -704,6 +899,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
            "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
            "permission_mode": meta.get("permission_mode"), "dir": d,
            "stdout_log": os.path.join(d, "stdout.log"), "stderr_log": os.path.join(d, "stderr.log")}
+    if meta.get("lane"):
+        out.update(lane=meta["lane"], model=meta.get("model"))
     if res is not None:
         o = res.get("output") or {}
         out["exit_code"] = res.get("exit_code")
@@ -738,7 +935,9 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         if res.get("error"):
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
-        out["router_run"] = fetch_run(provider_url, token, task_id)
+        # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
+        out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
+                             else fetch_run(provider_url, token, task_id, _fetch_timeout(deadline)))
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
         # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
@@ -816,19 +1015,40 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     return warnings
 
 
-def wait(task_id, timeout_s=WAIT_MAX_S, red=None, poll_s=0.5, provider_url="", token="") -> dict:
+def _fetch_timeout(deadline) -> float:
+    if deadline is None:
+        return RUN_FETCH_TIMEOUT_S
+    return max(RUN_FETCH_MIN_S, min(RUN_FETCH_TIMEOUT_S, deadline - time.monotonic()))
+
+
+def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="", max_s=None) -> dict:
+    """Poll for up to timeout_s, then status(). End to end the call takes at most timeout_s + POST_WAIT_RESERVE_S
+    (the status() work after the loop is bounded by the same deadline), under CLIENT_REQUEST_TIMEOUT_S at the default."""
+    start = time.monotonic()
     try:
-        t = float(timeout_s)
+        cap = wait_max_s() if max_s is None else float(max_s)
+    except (TypeError, ValueError):
+        raise TaskError("max_s must be a number of seconds") from None
+    if cap != cap or cap <= 0:
+        raise TaskError("max_s must be a positive number of seconds")
+    try:
+        t = float(min(WAIT_MAX_S, cap) if timeout_s is None else timeout_s)
     except (TypeError, ValueError):
         raise TaskError("timeout_s must be a number of seconds") from None
-    if t < 0 or t > WAIT_MAX_S:
-        raise TaskError(f"timeout_s must be between 0 and {WAIT_MAX_S} (MCP clients time out longer tool calls); "
+    if t != t or t < 0 or t > cap:
+        raise TaskError(f"timeout_s must be between 0 and {cap:g} (MCP clients time out longer tool calls); "
                         "call wait_task again to keep waiting")
     d = task_path(task_id)
-    end = time.monotonic() + t
-    while _state(d)[0] == "running" and time.monotonic() < end:
-        time.sleep(poll_s)
-    return status(task_id, red, provider_url, token)
+    end = start + t
+    while time.monotonic() < end and _state(d)[0] == "running":     # deadline first: no state read past it
+        time.sleep(max(0.0, min(poll_s, end - time.monotonic())))
+    # The fetch gets what the reserve leaves after a possible recovery (RECOVERY_GRACE_S): at most ~5 s past the loop,
+    # or RUN_FETCH_MIN_S after a recovery that used its grace. Worst case ~t + 6 s + a ps call, under t + reserve.
+    out = status(task_id, red, provider_url, token, deadline=end + POST_WAIT_RESERVE_S - RECOVERY_GRACE_S)
+    if out.get("state") == "running":
+        out["wait_ended"] = (f"waited {t:g} s; the task is still running: call wait_task again to keep waiting "
+                             "(or task_status to poll)")
+    return out
 
 
 def list_recent(n=20) -> list:
@@ -902,7 +1122,7 @@ def _proc_start(pid: int):
     not be run or timed out. With the pid it names one process: a reused pid has a different start time."""
     try:
         # timeout guards against a hung ps; the same bound as _is_our_runner's ps call
-        r = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=PS_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return UNKNOWN
     out, err = r.stdout.strip(), (r.stderr or "").strip()
