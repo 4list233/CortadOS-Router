@@ -11,10 +11,14 @@ import json
 import re
 
 MASK = "***"
+# What replaces content that cannot be redacted structurally (too deep to decode or walk, or not JSON where JSON was
+# required): never a partial text redaction, which could miss a credential escaped more often than ESCAPE_DEPTH.
+WITHHELD = "[withheld: content could not be safely redacted]"
 # Escaping layers matched per credential: JSON inside a JSON string escapes it again at each level (a tool result
 # holding JSON text, inside claude's stream-json event, is two levels). Four covers every nesting seen in claude's
-# output with room to spare; the structural pass (deep) decodes embedded JSON so its depth is relative anyway.
-ESCAPE_DEPTH = 4
+# output with room to spare (8: backslashes double per layer, so this stays cheap); the structural pass (deep) decodes
+# embedded JSON so its depth is relative anyway, and fails closed (WITHHELD) where it cannot decode.
+ESCAPE_DEPTH = 8
 
 
 class Redactor:
@@ -50,21 +54,42 @@ class Redactor:
         return obj
 
     def deep(self, obj):
-        """Like tree, and a string that is itself JSON (an object or array, e.g. a tool result holding JSON text) is
-        decoded, redacted the same way and re-encoded, so a credential at any nesting depth is found decoded."""
+        """deep_count's value only."""
+        return self.deep_count(obj)[0]
+
+    def deep_count(self, obj):
+        """(value, withheld): like tree, and a string that is itself JSON (an object or array, e.g. a tool result
+        holding JSON text) is decoded, redacted the same way and re-encoded, so a credential at any nesting depth is
+        found decoded. Fail closed: a JSON-looking string that cannot be decoded and walked for depth (RecursionError,
+        ~1000 levels) is replaced wholesale by WITHHELD and counted, never left to text(), which matches only
+        ESCAPE_DEPTH escaping layers; a structure too deep to walk at all comes back as WITHHELD."""
+        counter = [0]
+        try:
+            value = self._deep(obj, counter)
+        except RecursionError:
+            counter[0] += 1
+            value = WITHHELD
+        return value, counter[0]
+
+    def _deep(self, obj, counter):
         if isinstance(obj, str):
             if obj.lstrip()[:1] in ("{", "["):
-                # RecursionError too: json.loads (and this walk) recurse per nesting level, so a string like
-                # "[[[[…" a thousand deep raises it instead of ValueError. Such a string is treated as plain text.
                 try:
                     inner = json.loads(obj)
-                    if isinstance(inner, (dict, list)):
-                        return self.text(json.dumps(self.deep(inner), ensure_ascii=False))
-                except (ValueError, RecursionError):
-                    pass
+                except ValueError:              # not JSON after all: plain text
+                    return self.text(obj)
+                except RecursionError:
+                    counter[0] += 1
+                    return WITHHELD
+                if isinstance(inner, (dict, list)):
+                    try:
+                        return json.dumps(self._deep(inner, counter))
+                    except RecursionError:
+                        counter[0] += 1
+                        return WITHHELD
             return self.text(obj)
         if isinstance(obj, list):
-            return [self.deep(x) for x in obj]
+            return [self._deep(x, counter) for x in obj]
         if isinstance(obj, dict):
-            return {self.text(str(k)): self.deep(v) for k, v in obj.items()}
+            return {self.text(str(k)): self._deep(v, counter) for k, v in obj.items()}
         return obj

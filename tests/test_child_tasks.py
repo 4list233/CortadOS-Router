@@ -75,6 +75,25 @@ FAKE = textwrap.dedent('''\
         print(nested)
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}))
         sys.exit(0)
+    if mode == "stream-deep-escaped":
+        # the token escaped six times, inside 1500-deep JSON, both in a tool-result string and as a raw line
+        esc = os.environ["ANTHROPIC_AUTH_TOKEN"]
+        for _ in range(6):
+            esc = json.dumps(esc)
+        nested = "[" * 1500 + esc + "]" * 1500
+        print(json.dumps({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "t1",
+            "content": nested}}]}}}}))
+        print(nested)
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}))
+        sys.exit(0)
+    if mode == "legacy-pretty":
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "pretty"}}, indent=2))
+        sys.exit(0)
+    if mode == "stream-u2028":
+        print(json.dumps({{"type": "system", "subtype": "init", "permissionMode": "auto"}}))
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False,
+                          "result": "a\u2028b\u2029c\x85d"}}, ensure_ascii=False))
+        sys.exit(0)
     if mode == "stream-manual":
         print(json.dumps({{"type": "system", "subtype": "init", "permissionMode": "default"}}))   # 2.1.316 for manual
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}))
@@ -945,7 +964,7 @@ class ChildTaskTests(unittest.TestCase):
             f.write("a-rotated-token-0006")
         r, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertEqual(w["state"], "succeeded", w)
-        self.assertEqual(w["redact_unparsed_lines"], 1)            # the non-JSON line got the raw pass, and is marked
+        self.assertEqual(w["redact_unparsed_lines"], 1)            # the non-JSON line was withheld, and is counted
         d = ct.task_path(tid)
         for name in ("stdout.log", "stderr.log", "result.json"):
             with open(os.path.join(d, name)) as f:
@@ -963,8 +982,8 @@ class ChildTaskTests(unittest.TestCase):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertIn(w["state"], ("succeeded", "failed"), w)
-        self.assertTrue(w.get("redact_unparsed_lines") == 1 or "redact_error" in w, w)
-        self.assertEqual(w.get("redact_unparsed_lines"), 1)       # this build: the deep raw line, raw-redacted
+        self.assertTrue(w.get("redact_unparsed_lines", 0) >= 1 or "redact_error" in w, w)
+        self.assertEqual(w.get("redact_unparsed_lines"), 2)       # the deep string and the deep line, both withheld
         d = ct.task_path(tid)
         for name in ("stdout.log", "stderr.log", "result.json"):
             with open(os.path.join(d, name)) as f:
@@ -973,18 +992,19 @@ class ChildTaskTests(unittest.TestCase):
         _, again = self.call("task_status", task_id=tid)            # status keeps answering
         self.assertEqual(again["state"], w["state"])
 
-    def test_deep_cleans_what_text_leaks_at_six_levels(self):
+    def test_deep_cleans_what_text_leaks_beyond_the_raw_escape_depth(self):
         tok = 'ab"QQZZ\\ef-123456'                          # a quote and a backslash
         red = ct.Redactor([tok])
+        levels = ct.redact.ESCAPE_DEPTH + 2                 # >= 6, and deeper than the raw pass matches
         value = {"token": tok}
-        for _ in range(6):                                  # JSON text inside a string, six levels down
+        for _ in range(levels):                             # JSON text inside a string, `levels` down
             value = {"wrapped": json.dumps(value)}
         line = json.dumps(value)
         self.assertIn("QQZZ", red.text(line))                # the raw pass alone leaks it at this depth
         clean = json.dumps(red.deep(json.loads(line)))
         self.assertNotIn("QQZZ", clean)
         inner = json.loads(clean)
-        for _ in range(6):
+        for _ in range(levels):
             inner = json.loads(inner["wrapped"])
         self.assertEqual(inner, {"token": "***"})            # still the same structure, decodable
 
@@ -998,7 +1018,65 @@ class ChildTaskTests(unittest.TestCase):
         with open(path) as f:
             data = f.read()
         self.assertNotIn(tok, data)
-        self.assertEqual(json.loads(data.splitlines()[0]), {"type": "a", "t": "***"})
+        lines = data.split("\n")
+        self.assertEqual(json.loads(lines[0]), {"type": "a", "t": "***"})
+        self.assertEqual(lines[1], ct.WITHHELD_EVENT)            # replaced wholesale, not text-redacted
+        self.assertEqual(lines[3], ct.WITHHELD_EVENT)
+
+    def _assert_no_token_anywhere(self, d, fragment, extra=()):
+        for name in ("stdout.log", "stderr.log", "result.json"):
+            with open(os.path.join(d, name)) as f:
+                data = f.read()
+            self.assertNotIn(fragment, data, name)
+        for text in extra:
+            self.assertNotIn(fragment, text)
+
+    def test_deep_nesting_with_six_escaping_layers_is_withheld_in_the_runner(self):
+        tok = 'tok"QQZZ\\deep-0007'                       # a quote and a backslash
+        with open(self.cfg["token_file"], "w") as f:
+            f.write(tok)
+        self.cfg["token"] = "env-token-unrelated-03"
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-deep-escaped"
+        tid = self.start()
+        r, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertGreaterEqual(w["redact_unparsed_lines"], 1, w)
+        self._assert_no_token_anywhere(ct.task_path(tid), "QQZZ", [r["content"][0]["text"]])
+        with open(os.path.join(ct.task_path(tid), "stdout.log")) as f:
+            self.assertIn("could not be safely redacted", f.read())
+
+    def test_deep_nesting_with_six_escaping_layers_is_withheld_in_recovery(self):
+        def lines(tok):
+            esc = tok
+            for _ in range(6):
+                esc = json.dumps(esc)
+            nested = "[" * 1500 + esc + "]" * 1500
+            return [json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                                                        "content": nested}]}}), nested]
+        d, _, meta, res = self._recovered(lambda tok: lines('rec"QQZZ\\deep-0008'))
+        tok = 'rec"QQZZ\\deep-0008'
+        meta["cred_fingerprints"] = ct.credential_fingerprints([tok])
+        self.assertTrue(ct._release_recovered_logs(d, meta, res, ct.Redactor([tok])))
+        self.assertGreaterEqual(res["redact_unparsed_lines"], 1)
+        with open(os.path.join(d, "stdout.log")) as f:
+            data = f.read()
+        self.assertNotIn("QQZZ", data)
+        self.assertNotIn("QQZZ", json.dumps(res))
+
+    def test_a_result_with_line_separators_is_still_the_result(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-u2028"
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["result"], "a\u2028b\u2029c\x85d")
+        with open(os.path.join(w["dir"], "stdout.log"), encoding="utf-8") as f:
+            self.assertNotIn("\u2028", f.read())                 # re-serialized ASCII-only
+
+    def test_a_pretty_printed_legacy_record_is_still_the_result(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "legacy-pretty"
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["result"], "pretty")
+        self.assertEqual(ct.parse_output(json.dumps({"type": "result", "is_error": False, "result": "x"}, indent=2)),
+                         ({"type": "result", "is_error": False, "result": "x"}, None))
 
     def test_a_manual_child_is_not_warned_about_its_reported_default_mode(self):
         os.environ["FAKE_CLAUDE_MODE"] = "stream-manual"

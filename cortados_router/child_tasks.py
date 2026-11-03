@@ -683,7 +683,9 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     if unparsed:
         res["redact_unparsed_lines"] = unparsed
     try:
-        res["activity"] = red.deep(summarize_stream(stdout, meta.get("cwd") or d))
+        res["activity"], n = red.deep_count(summarize_stream(stdout, meta.get("cwd") or d))
+        if n:
+            res["redact_unparsed_lines"] = res.get("redact_unparsed_lines", 0) + n
     except OSError as exc:
         res["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     res["logs_unredacted"] = False
@@ -757,7 +759,7 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             # No pointer to the files that hold the raw credential: not the logs, and not the task dir that holds them.
             for k in ("result", "stdout_log", "stderr_log", "dir"):
                 out.pop(k, None)
-    return red.tree(out)                        # every string (structured, before any serialization)
+    return red.deep(out)                        # every string (structured, before any serialization; fails closed)
 
 
 def _activity(out: dict, o: dict, act, meta: dict) -> list:
@@ -985,30 +987,62 @@ def credential_fingerprints(tokens) -> list:
     return sorted({hashlib.sha256(t.encode("utf-8")).hexdigest() for t in tokens if t})
 
 
+# A stdout line that could not be redacted structurally is replaced by this event (still one JSON object per line, so
+# the file stays a valid stream; readers skip its type).
+WITHHELD_EVENT = json.dumps({"type": "cortados_withheld", "reason": redact.WITHHELD})
+
+
+def _structural(red: "Redactor", value):
+    """(serialized, withheld) for one decoded record: redacted by red.deep_count and re-serialized ASCII-only (so no
+    U+2028 or other line separator is written literally); WITHHELD_EVENT if it cannot be walked or serialized."""
+    try:
+        cleaned, withheld = red.deep_count(value)
+        return json.dumps(cleaned), withheld
+    except (ValueError, RecursionError):
+        return WITHHELD_EVENT, 1
+
+
 def redact_stream_file(path: str, red: "Redactor") -> int:
-    """Structural redaction of claude's stream-json stdout: each line is parsed and its strings redacted (red.deep,
-    which also decodes JSON held inside strings), then re-serialized. A raw pass misses a credential escaped more often
-    than it matches (a tool result with JSON text inside an event). A line that does not parse is redacted raw and
-    counted; the count is returned (result.json records it). redact_file runs after this as the second layer."""
+    """Structural redaction of claude's stdout, returning how much was withheld (result.json records it as
+    redact_unparsed_lines). A legacy `--output-format json` record (one object, maybe pretty-printed) is parsed whole;
+    otherwise each stream-json record (split on "\n" only: a JSON line holds no raw newline, but may hold U+2028) is
+    parsed, its strings redacted (red.deep_count, which also decodes JSON held inside strings) and re-serialized. Fail
+    closed: a record that does not parse, or is too deep to decode or walk, is replaced wholesale by WITHHELD_EVENT
+    and counted, never redacted as text (a credential escaped more often than the raw pass matches would survive).
+    redact_file runs after this as the second layer."""
     if not red.tokens or not os.path.exists(path):
         return 0
-    unparsed = 0
+    with open(path, encoding="utf-8", errors="replace", newline="") as src:
+        whole = src.read()
+    withheld = 0
+    try:
+        legacy = json.loads(whole) if whole.strip() else None
+    except (ValueError, RecursionError):
+        legacy = None
+    if isinstance(legacy, dict):
+        text, withheld = _structural(red, legacy)
+        text += "\n"
+    else:
+        out = []
+        for line in whole.split("\n"):
+            body = line.rstrip("\r")
+            if not body.strip():
+                out.append(body)
+                continue
+            try:
+                record = json.loads(body)
+            except (ValueError, RecursionError):
+                out.append(WITHHELD_EVENT)
+                withheld += 1
+                continue
+            cleaned, n = _structural(red, record)
+            out.append(cleaned)
+            withheld += n
+        text = "\n".join(out)
     fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as src, \
-                os.fdopen(fd, "w", encoding="utf-8", newline="") as dst:
-            for line in src:
-                body = line.rstrip("\r\n")
-                end = line[len(body):]
-                cleaned = None
-                if body.strip():
-                    # RecursionError as well as ValueError: a line nested ~1000 deep (a file the child cat'ed)
-                    # overflows json.loads, red.deep or json.dumps; that line gets the raw pass only.
-                    try:
-                        cleaned = json.dumps(red.deep(json.loads(body)), ensure_ascii=False)
-                    except (ValueError, RecursionError):
-                        unparsed += 1
-                dst.write((red.text(body) if cleaned is None else cleaned) + end)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as dst:
+            dst.write(text)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -1016,7 +1050,7 @@ def redact_stream_file(path: str, red: "Redactor") -> int:
         except FileNotFoundError:
             pass
         raise
-    return unparsed
+    return withheld
 
 
 def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:
@@ -1065,22 +1099,25 @@ def parse_output(raw: str):
     raw = raw.strip()
     if not raw:
         return None, "the child printed nothing on stdout (no result record)"
-    lines = raw.splitlines()
-    if len(lines) > 1:
+    # The whole of stdout first: a legacy record (also pretty-printed over several lines) or a one-line stream. Then
+    # stream records, split on "\n" only (str.splitlines would also split inside a record at U+2028/U+2029).
+    try:
+        out = json.loads(raw)
+    except (ValueError, RecursionError):
+        out = None
+        lines = raw.split("\n")
         for line in reversed(lines):
             try:
                 ev = json.loads(line)
             except (ValueError, RecursionError):  # not the result record (a deep line overflows json.loads)
                 continue
             if isinstance(ev, dict) and ev.get("type") == "result":
-                raw = line
+                out = ev
                 break
-        else:
+        if out is None:
+            if len(lines) == 1:
+                return None, "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
             return None, "stdout has no result record (the event stream ended without one); see stdout_log"
-    try:
-        out = json.loads(raw) if raw.startswith("{") else json.loads(raw.splitlines()[-1])
-    except (ValueError, RecursionError):
-        return None, "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
     if not isinstance(out, dict):
         return None, f"stdout is JSON but not a result record ({type(out).__name__})"
     if out.get("type") != "result" or not isinstance(out.get("is_error"), bool) or not isinstance(out.get("result"), str):
@@ -1105,7 +1142,7 @@ def summarize_stream(path: str, cwd: str) -> dict:
     attempts: dict = {}                     # tool_use id -> resolved path, in call order (dicts keep insertion order)
     outcome: dict = {}                      # tool_use id -> "ok" | "failed"
     root = os.path.realpath(cwd)
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace", newline="\n") as f:   # records end in "\n" only
         for line in f:
             try:
                 ev = json.loads(line)
@@ -1228,14 +1265,15 @@ def _run(d: str, lock_fd=None) -> int:
         pass
     out, err = parse_output(raw)
     if out is not None:
-        try:
-            result["output"] = red.deep(out)
-        except RecursionError:                   # parsed, but too deep to walk: not kept, and the task fails
-            err = err or "the result record is nested too deeply to redact; see stdout_log"
+        result["output"], n = red.deep_count(out)      # fails closed: what cannot be walked is WITHHELD, and counted
+        if n:
+            result["redact_unparsed_lines"] = result.get("redact_unparsed_lines", 0) + n
     if err:
         result["output_error"] = err
     try:
-        result["activity"] = red.deep(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
+        result["activity"], n = red.deep_count(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
+        if n:
+            result["redact_unparsed_lines"] = result.get("redact_unparsed_lines", 0) + n
     except OSError as exc:                       # no stdout at all (the child never started): nothing to summarize
         result["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     result["ended_at"] = time.time()
