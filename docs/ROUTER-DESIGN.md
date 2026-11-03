@@ -333,7 +333,7 @@ Cadence (Claude's call, Forest 2026-09-21): label every night 01:30 (`com.cortad
 or when ≥150 newly labelled requests have accumulated. Serving the promoted model in place of the 14B engine is the next build.
 
 ### 4d.1 Continuous mode (Forest 2026-11-03: no night window)
-`python3 s1/overnight.py --continuous` runs `s1/nightly.sh` cycles back to back instead of the 01:30 job, with
+`python3 s1/overnight.py --continuous -- /bin/bash s1/nightly.sh` runs `s1/nightly.sh` cycles back to back instead of the 01:30 job, with
 `CORTADOS_NIGHTLY_SUPERVISED=1 CORTADOS_S1_CONTINUOUS=1 CORTADOS_S1_CYCLE_RESULT=<file> TZ=America/Toronto`. In continuous mode the
 live scorer stays loaded during training; the supervisor pauses (SIGSTOP) the cycle's tree when probed scorer latency rises more than
 the budget above baseline, and evaluation is never skipped for a deadline. A cycle writes `worked` (labels added, training ran, an
@@ -368,7 +368,8 @@ crash is relaunched and a stop-flag exit 0 is not:
 ```xml
 <key>Label</key><string>com.cortados.s1-continuous</string>
 <key>ProgramArguments</key>
-<array><string>/usr/bin/python3</string><string>/path/to/CortadOS-Router/s1/overnight.py</string><string>--continuous</string></array>
+<array><string>/usr/bin/python3</string><string>/path/to/CortadOS-Router/s1/overnight.py</string><string>--continuous</string>
+       <string>--</string><string>/bin/bash</string><string>/path/to/CortadOS-Router/s1/nightly.sh</string></array>
 <key>WorkingDirectory</key><string>/path/to/CortadOS-Router/s1</string>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 <key>EnvironmentVariables</key><dict><key>CORTADOS_S1_LATENCY_BUDGET_S</key><string>1.0</string></dict>
