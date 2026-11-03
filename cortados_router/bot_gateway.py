@@ -30,11 +30,20 @@ USAGE_LOG = "bot-usage.jsonl"
 # disk. Past the limit the file is rotated once to .1 (the previous .1 is dropped), keeping roughly 2x this on disk.
 USAGE_MAX_BYTES = 5 * 1024 * 1024
 MAX_BODY = 1024 * 1024                    # a JSON-RPC request larger than this is not a tool call; refuse it
-DEFAULTS = {"max_concurrent": 2,          # bounds unattended subscription spend running at once
+DEFAULTS = {"max_concurrent": 2,          # bounds unattended subscription spend running at once (tasks and routes each)
             "max_tasks_per_day": 30,      # bounds child sessions per UTC day
             "max_routes_per_day": 200}    # route_task is cheaper (one text answer), so a higher daily bound
 POLICY_ERROR = -32001                     # JSON-RPC server-defined error code for a policy refusal
 FINAL_STATES = ("succeeded", "failed", "cancelled")
+ROUTED = (None, "", "cortados")           # GROKBOT-BRIDGE.md 3.3: bots are routed only, never sub/ or api/ pins
+# Reason: children run as the owner's user until the per-user boundary (phase 2 B5) ships, so a bot may only get a
+# read-only planning child; any other mode (or a pre-approved tool list) would hand a remote bot the owner's shell.
+ALLOWED_PERMISSION_MODES = (None, "", "plan")
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+MAX_BATCH = 20                            # MCP batches are a handful of calls; a longer list is not a real client
+MAX_INFLIGHT = 16                         # bounds handler threads doing work at once; past it the server answers 503
+REQUEST_TIMEOUT_S = 30                    # a bot sends its JSON-RPC at once or is gone; a slow sender holds a thread
+_PENDING = "__pending__"                  # placeholder prefix reserving a concurrency slot while a child starts
 
 
 class GatewayError(Exception):
@@ -83,9 +92,12 @@ class Gateway:
         self.route = route or subagent_mcp.route_task
         self.lock = threading.Lock()
         self.tasks: dict = {}             # task_id -> client that started it
-        self.running: set = set()         # task ids not yet seen in a final state
+        self.running: set = set()         # task ids not yet seen in a final state (+ pending start placeholders)
+        self.routes_inflight = 0          # route_task calls currently waiting on the provider
         self.counts: dict = {}            # (day, kind) -> n  kind: tasks | routes | refused
         self._load_owned()
+        # After a restart, every owned task may still be running; _refresh_running prunes the finished ones.
+        self.running.update(t for t, c in self.tasks.items() if c == CLIENT)
 
     # -- auth ------------------------------------------------------------------------------------------------------
     def authorized(self, header) -> bool:
@@ -161,14 +173,20 @@ class Gateway:
         return real == self.root or real.startswith(self.root + os.sep)
 
     def _refresh_running(self) -> None:
-        for tid in list(self.running):
+        """Drop finished tasks from self.running. Called WITHOUT self.lock held: task_status may take seconds."""
+        with self.lock:
+            ids = [t for t in self.running if not t.startswith(_PENDING)]
+        done = []
+        for tid in ids:
             res = self.child("task_status", {"task_id": tid}, self.cfg)
             try:
                 state = json.loads(res["content"][0]["text"]).get("state")
             except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                 state = None
             if res.get("isError") or state in FINAL_STATES:
-                self.running.discard(tid)
+                done.append(tid)
+        with self.lock:
+            self.running.difference_update(done)
 
     def call(self, name: str, a: dict) -> dict:
         if name not in EXPOSED:
@@ -176,16 +194,29 @@ class Gateway:
         if name == "start_task":
             return self._start(a)
         if name == "route_task":
+            if a.get("model") not in ROUTED:
+                self._refuse(name, "model pins are not allowed through the bot gateway: bots are routed only "
+                                   "(cortados), never sub/ or api/ pins")
             with self.lock:
-                over = self.count("routes") >= self.limits["max_routes_per_day"]
-                if not over:
+                if self.routes_inflight >= self.limits["max_concurrent"]:
+                    reason = (f"route_task concurrency cap reached ({self.limits['max_concurrent']} in flight): it "
+                              "bounds unattended subscription spend at once")
+                elif self.count("routes") >= self.limits["max_routes_per_day"]:
+                    reason = (f"route_task daily cap reached ({self.limits['max_routes_per_day']}/day): "
+                              "it bounds unattended subscription spend")
+                else:
+                    reason = None
                     self._bump("routes")
-            if over:
-                self._refuse(name, f"route_task daily cap reached ({self.limits['max_routes_per_day']}/day): "
-                                   "it bounds unattended subscription spend")
-            res = self.route(self.cfg.get("url", ""), self.cfg.get("token", ""), a.get("task", ""),
-                             a.get("context", ""), a.get("max_tokens", subagent_mcp.DEFAULT_MAX_TOKENS),
-                             model=a.get("model"), client=CLIENT)
+                    self.routes_inflight += 1
+            if reason:
+                self._refuse(name, reason)
+            try:
+                res = self.route(self.cfg.get("url", ""), self.cfg.get("token", ""), a.get("task", ""),
+                                 a.get("context", ""), a.get("max_tokens", subagent_mcp.DEFAULT_MAX_TOKENS),
+                                 client=CLIENT)
+            finally:
+                with self.lock:
+                    self.routes_inflight -= 1
             self.record(name, "error" if res.get("isError") else "ok")
             return res
         if name == "list_tasks":
@@ -218,10 +249,17 @@ class Gateway:
         if a.get("chrome") not in (None, False):
             self._refuse("start_task", "chrome is never allowed through the bot gateway (it would act in the "
                                        "owner's signed-in browser on the main subscription)")
+        if a.get("orchestrator") not in ROUTED:
+            self._refuse("start_task", "model pins are not allowed through the bot gateway: bots are routed only "
+                                       "(cortados), never sub/ or api/ pins")
+        if a.get("permission_mode") not in ALLOWED_PERMISSION_MODES or a.get("allowed_tools") not in (None, [], ""):
+            self._refuse("start_task", "permission_mode other than 'plan' and allowed_tools are refused until the "
+                                       "per-user boundary (phase 2 B5) ships: children run as the owner's user")
         if not self._inside_root(a.get("cwd")):
             self._refuse("start_task", "cwd must be an absolute path inside the gateway's workspace root")
+        self._refresh_running()
+        slot = f"{_PENDING}{threading.get_ident()}-{time.monotonic_ns()}"
         with self.lock:
-            self._refresh_running()
             if len(self.running) >= self.limits["max_concurrent"]:
                 reason = (f"concurrency cap reached ({self.limits['max_concurrent']} running): it bounds unattended "
                           "subscription spend at once")
@@ -230,21 +268,25 @@ class Gateway:
             else:
                 reason = None
                 self._bump("tasks")
+                self.running.add(slot)    # reserve the slot now, so parallel starts cannot all pass the cap
         if reason:
             self._refuse("start_task", reason)
-        args = {k: a[k] for k in ("task", "cwd", "orchestrator", "permission_mode", "allowed_tools") if k in a}
+        args = {k: a[k] for k in ("task", "cwd", "permission_mode") if a.get(k)}
         args["chrome"] = False
-        res = self.child("start_task", args, {**self.cfg, "client": CLIENT})
         tid = None
-        if not res.get("isError"):
-            try:
-                tid = json.loads(res["content"][0]["text"]).get("task_id")
-            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-                tid = None
-        if tid:
+        try:
+            res = self.child("start_task", args, {**self.cfg, "client": CLIENT})
+            if not res.get("isError"):
+                try:
+                    tid = json.loads(res["content"][0]["text"]).get("task_id")
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                    tid = None
+        finally:
             with self.lock:
-                self.tasks[tid] = CLIENT
-                self.running.add(tid)
+                self.running.discard(slot)
+                if tid:
+                    self.tasks[tid] = CLIENT
+                    self.running.add(tid)
         self.record("start_task", "ok" if tid else "error", tid)
         return res
 
@@ -280,7 +322,7 @@ class PolicyRefusal(Exception):
 
 
 def tool_list() -> list:
-    """The six tools, with chrome and connectors removed from start_task's schema (both are refused here)."""
+    """The six tools, with the refused arguments (chrome, connectors, pins, permission/tool grants) removed."""
     tools = [subagent_mcp.TOOL] + subagent_mcp._child_tools()
     out = []
     for t in tools:
@@ -288,16 +330,24 @@ def tool_list() -> list:
             continue
         if t["name"] == "start_task":
             t = json.loads(json.dumps(t))
-            for k in ("chrome", "connectors"):
+            for k in ("chrome", "connectors", "orchestrator", "permission_mode", "allowed_tools"):
                 t["inputSchema"]["properties"].pop(k, None)
-            t["description"] += " (Bot gateway: cwd must be inside the gateway's workspace root; no chrome.)"
+            t["description"] += (" (Bot gateway: cwd must be inside the gateway's workspace root; no chrome, no model "
+                                 "pins, no pre-approved tools.)")
+        elif t["name"] == "route_task":
+            t = json.loads(json.dumps(t))
+            t["inputSchema"]["properties"].pop("model", None)
+            t["description"] += " (Bot gateway: routed only, no model pins.)"
         out.append(t)
     return out
 
 
 def make_handler(gw: Gateway):
+    inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
+
     class H(BaseHTTPRequestHandler):
         server_version = "cortados-bot-gateway"
+        timeout = REQUEST_TIMEOUT_S
 
         def log_message(self, fmt, *args):          # path + status only; headers (the token) are never logged
             sys.stderr.write("bot-gateway: %s %s\n" % (self.command, self.path.split("?")[0][:100]))
@@ -314,6 +364,14 @@ def make_handler(gw: Gateway):
             self._send(405, {"error": "use POST /mcp"})   # no SSE stream offered
 
         def do_POST(self):
+            if not inflight.acquire(blocking=False):
+                return self._send(503, {"error": "busy: too many requests in flight"})
+            try:
+                self._post()
+            finally:
+                inflight.release()
+
+        def _post(self):
             if self.path.split("?")[0] != "/mcp":
                 return self._send(404, {"error": "not found"})
             if not gw.authorized(self.headers.get("authorization")):
@@ -330,6 +388,9 @@ def make_handler(gw: Gateway):
                 return self._send(400, {"jsonrpc": "2.0", "id": None,
                                         "error": {"code": -32700, "message": "parse error"}})
             if isinstance(msg, list):
+                if len(msg) > MAX_BATCH:
+                    return self._send(200, {"jsonrpc": "2.0", "id": None,
+                                            "error": {"code": -32600, "message": f"batch longer than {MAX_BATCH}"}})
                 replies = [r for r in (gw.handle(m) for m in msg) if r is not None]
                 return self._send(200, replies) if replies else self._send(202, {})
             reply = gw.handle(msg)
@@ -352,10 +413,17 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace-root", default=os.environ.get("CORTADOS_BOT_WORKSPACE_ROOT", ""))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8434)
+    ap.add_argument("--children-run-as-me", action="store_true",
+                    help="allow a non-loopback --host although children run as the owner's user (no per-user "
+                         "boundary until phase 2 B5)")
     ap.add_argument("--max-concurrent", type=int, default=DEFAULTS["max_concurrent"])
     ap.add_argument("--max-tasks-per-day", type=int, default=DEFAULTS["max_tasks_per_day"])
     ap.add_argument("--max-routes-per-day", type=int, default=DEFAULTS["max_routes_per_day"])
     o = ap.parse_args(argv)
+    if o.host not in LOOPBACK and not o.children_run_as_me:
+        sys.stderr.write(f"bot-gateway: refusing to listen on {o.host!r}: children run as the owner's user and the "
+                         "per-user boundary (phase 2 B5) is not built yet; pass --children-run-as-me to accept that\n")
+        return 2
     try:
         token = read_token_file(o.token_file)
         cfg = {"url": subagent_mcp._resolve_url(), "token": subagent_mcp._resolve_token(),

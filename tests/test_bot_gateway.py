@@ -123,6 +123,10 @@ class GatewayTest(unittest.TestCase):
         gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
         self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
         self.assertEqual(gw2.count("tasks"), 1)
+        self.assertEqual(gw2.running, {"task-0001-abcdef"})   # still counted against the cap until seen final
+        self.child.states["task-0001-abcdef"] = "succeeded"
+        gw2._refresh_running()
+        self.assertEqual(gw2.running, set())
 
     def test_concurrency_cap(self):
         self.start(); self.start()
@@ -157,6 +161,113 @@ class GatewayTest(unittest.TestCase):
                 self.tcall("route_task", task="q")
         self.assertTrue(os.path.exists(os.path.join(self.home, bg.USAGE_LOG + ".1")))
         self.assertLess(os.path.getsize(os.path.join(self.home, bg.USAGE_LOG)), 400)
+
+    def test_model_pins_refused(self):
+        for pin in ("sub/opus", "api/claude-opus", "gpt-6"):
+            r = self.start(orchestrator=pin)
+            self.assertIn("model pins", r["error"]["message"], pin)
+            r = self.tcall("route_task", task="q", model=pin)
+            self.assertIn("model pins", r["error"]["message"], pin)
+        self.assertEqual(self.child.calls, [])
+        self.assertEqual(self.routes, [])
+        self.assertIn("result", self.start(orchestrator="cortados"))
+        self.assertNotIn("orchestrator", self.child.calls[-1][1])
+        self.assertIn("result", self.tcall("route_task", task="q", model="cortados"))
+        tools = {t["name"]: t for t in bg.tool_list()}
+        self.assertNotIn("orchestrator", tools["start_task"]["inputSchema"]["properties"])
+        self.assertNotIn("model", tools["route_task"]["inputSchema"]["properties"])
+        self.assertIn("model", subagent_mcp.TOOL["inputSchema"]["properties"])
+
+    def test_permission_grants_refused(self):
+        for kw in ({"permission_mode": "dontAsk"}, {"permission_mode": "bypassPermissions"},
+                   {"allowed_tools": ["Bash"]}, {"allowed_tools": "Bash"}):
+            r = self.start(**kw)
+            self.assertIn("phase 2 B5", r["error"]["message"], kw)
+        self.assertEqual(self.child.calls, [])
+        self.assertIn("result", self.start(permission_mode="plan"))
+        a = self.child.calls[-1][1]
+        self.assertEqual(a.get("permission_mode"), "plan")
+        self.assertNotIn("allowed_tools", a)
+        props = {t["name"]: t for t in bg.tool_list()}["start_task"]["inputSchema"]["properties"]
+        self.assertFalse({"permission_mode", "allowed_tools"} & set(props))
+
+    def test_parallel_starts_respect_cap(self):
+        self.start()                                  # 1 of 2 running
+        gate, entered = threading.Event(), []
+        inner = self.child
+
+        def blocking(name, a, cfg):
+            if name == "start_task":
+                entered.append(1)
+                gate.wait(5)
+            return inner(name, a, cfg)
+        self.gw.child = blocking
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(self.start())) for _ in range(3)]
+        for t in ts:
+            t.start()
+        for _ in range(200):
+            if len(out) >= 2:
+                break
+            threading.Event().wait(0.01)
+        gate.set()
+        for t in ts:
+            t.join(5)
+        self.assertEqual(len(entered), 1)
+        self.assertEqual(sum("result" in r for r in out), 1)
+        self.assertEqual(sum("concurrency cap" in r.get("error", {}).get("message", "") for r in out), 2)
+        self.assertFalse(any(t.startswith(bg._PENDING) for t in self.gw.running))
+
+    def test_failed_start_releases_slot(self):
+        def boom(name, a, cfg):
+            if name == "start_task":
+                raise RuntimeError("child died")
+            return self.child(name, a, cfg)
+        self.gw.child = boom
+        with self.assertRaises(RuntimeError):
+            self.start()
+        self.assertEqual(self.gw.running, set())
+
+    def test_refresh_does_not_hold_lock(self):
+        self.start()
+        held = []
+
+        def probe(name, a, cfg):
+            held.append(self.gw.lock.locked())
+            return self.child(name, a, cfg)
+        self.gw.child = probe
+        self.gw._refresh_running()
+        self.assertEqual(held, [False])
+
+    def test_route_concurrency_cap(self):
+        gate, out = threading.Event(), []
+
+        def slow(url, token, task, context="", max_tokens=0, model=None, client=None):
+            gate.wait(5)
+            return {"content": [{"type": "text", "text": "a"}]}
+        self.gw.route = slow
+        ts = [threading.Thread(target=lambda: out.append(self.tcall("route_task", task="q"))) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for _ in range(200):
+            if self.gw.routes_inflight == 2:
+                break
+            threading.Event().wait(0.01)
+        r = self.tcall("route_task", task="q3")
+        self.assertIn("route_task concurrency cap", r["error"]["message"])
+        gate.set()
+        for t in ts:
+            t.join(5)
+        self.assertEqual(self.gw.routes_inflight, 0)
+        self.assertIn("result", self.tcall("route_task", task="q4"))
+
+    def test_main_refuses_non_loopback_host(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(bg.main(["--token-file", "/nonexistent", "--workspace-root", self.root,
+                                      "--host", "0.0.0.0"]), 2)
+        self.assertIn("--children-run-as-me", err.getvalue())
+        self.assertIn("phase 2 B5", err.getvalue())
 
     def test_no_workspace_root_refuses(self):
         with self.assertRaises(bg.GatewayError):
@@ -256,6 +367,26 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         self.assertNotIn(TOKEN, self.err.getvalue())
         self.assertIn("POST /mcp", self.err.getvalue())
+
+    def test_batch_cap_and_timeout(self):
+        one = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        code, body = self.post([one] * bg.MAX_BATCH)
+        self.assertEqual((code, len(json.loads(body))), (200, bg.MAX_BATCH))
+        code, body = self.post([one] * (bg.MAX_BATCH + 1))
+        self.assertEqual(json.loads(body)["error"]["code"], -32600)
+        self.assertEqual(bg.make_handler(self.gw).timeout, bg.REQUEST_TIMEOUT_S)
+
+    def test_inflight_cap_503(self):
+        with mock.patch.object(bg, "MAX_INFLIGHT", 0):
+            srv = bg.build_server(self.gw, "127.0.0.1", 0)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+            self.assertEqual(self.post({"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 503)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
