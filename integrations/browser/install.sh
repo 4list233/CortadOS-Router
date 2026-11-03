@@ -3,7 +3,8 @@
 # Design: docs/BROWSER-TOOL.md. Nothing global: no npm -g, browsers under the prefix, never ~/Library/Caches/ms-playwright.
 #   install.sh install [--browsers]            npm ci the committed lockfile into $PREFIX, check versions and tool list
 #                                              (with --browsers, also download Playwright's chromium headless shell)
-#   install.sh config <task_dir> <proxy_url>   write <task_dir>/browser/config.json and <task_dir>/browser-mcp.json (0600)
+#   install.sh config <task_dir> < proxy_url   write <task_dir>/browser/config.json and <task_dir>/browser-mcp.json (0600);
+#                                              the proxy URL (it carries the token) is read from stdin, never argv
 #   install.sh tools                           print the installed server's tools/list (same launch as a task)
 set -eu
 PIN_MCP=0.0.84        # >= 0.0.40 (CVE-2025-9611 DNS rebinding), >= 0.0.55 (file:// blocked); tools-0.0.84.txt pins its tools
@@ -21,13 +22,13 @@ check_proxy() {
 }
 
 # write_config <task_dir> <proxy_url>: <task>/browser/config.json (0600, carries the proxy token) and
-# <task>/browser-mcp.json (0600). The token is in the config file, not argv, so ps does not show it.
-write_config() {
-  mkdir -p "$1/browser/out" "$1/browser/home" "$1/browser/tmp"
-  ( umask 077; python3 -I - "$HERE/run-mcp.sh" "$PREFIX" "$1" "$2" <<'PY'
+# <task>/browser-mcp.json (0600). The token is in the config file, never in any argv, so ps does not show it: the URL
+# reaches python on stdin (printf is a shell builtin, no process), so the program itself is passed with -c.
+WRITE_CONFIG_PY="$(cat <<'PY'
 import json, os, sys
 from urllib.parse import urlsplit
-wrapper, prefix, task, proxy = sys.argv[1:5]
+wrapper, prefix, task = sys.argv[1:4]
+proxy = sys.stdin.readline().strip()
 u = urlsplit(proxy)
 px = {"server": f"http://{u.hostname}:{u.port}", "username": u.username, "password": ""}
 # Playwright config file: only what has no safe CLI flag. The proxy is set for launch and for the context (--isolated
@@ -48,7 +49,10 @@ write(f"{task}/browser/config.json", pw)
 write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": wrapper, "args": [task, prefix]}}})
 print(f"{task}/browser-mcp.json")
 PY
-  )
+)"
+write_config() {
+  mkdir -p "$1/browser/out" "$1/browser/home" "$1/browser/tmp"
+  ( umask 077; printf '%s\n' "$2" | python3 -I -c "$WRITE_CONFIG_PY" "$HERE/run-mcp.sh" "$PREFIX" "$1" )
 }
 
 # tools/list of the installed server, one name per line, sorted. Started through run-mcp.sh on a throwaway task with
@@ -72,19 +76,27 @@ msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocol
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
 p.stdin.write("".join(json.dumps(m) + "\n" for m in msgs)); p.stdin.flush()
 out = {}
+# A stdio MCP server's stdout carries only JSON-RPC messages, so a line that is not one (or an id:2 answer without a
+# tools list) is a broken or unexpected server: fail with the line shown, never skip it and pass on what follows.
 def read():
     for line in p.stdout:
         try:
             m = json.loads(line)
-        except ValueError:
-            continue
-        if m.get("id") == 2:
-            out["names"] = sorted(t["name"] for t in m["result"]["tools"])
+            if not isinstance(m, dict):
+                raise ValueError("not a JSON-RPC object")
+            if m.get("id") == 2:
+                out["names"] = sorted(t["name"] for t in m["result"]["tools"])
+                return
+        except (ValueError, KeyError, TypeError) as e:
+            out["bad"] = f"{e.__class__.__name__}: {e}; line: {line.strip()[:200]!r}"
             return
 th = threading.Thread(target=read, daemon=True); th.start(); th.join(30)
 if p.poll() is None:   # still running (the normal case: a stdio server waits for more input)
     os.killpg(p.pid, signal.SIGKILL)
 p.wait(); errf.seek(0); err = errf.read()
+if "bad" in out:
+    sys.stderr.write("list_tools: malformed MCP protocol output (" + out["bad"] + "); server stderr:\n" + err)
+    sys.exit(1)
 if "names" not in out:
     sys.stderr.write("list_tools: no tools/list answer within 30 s; server stderr:\n" + err)
     sys.exit(1)
@@ -124,9 +136,13 @@ install)
     echo "browsers not downloaded; run: $INSTALL_CMD"
   fi ;;
 config)
-  TASK="${2:?usage: install.sh config <task_dir> <proxy_url>}"
+  TASK="${2:?usage: install.sh config <task_dir> < proxy_url}"
+  # The proxy URL carries the token, and argv is visible to every local user through ps: it is read from stdin only.
+  # A third argument is refused (not ignored) so a caller that still passes it in argv finds out.
+  [ $# -eq 2 ] || { echo "config: the proxy URL is read from stdin, never argv: install.sh config <task_dir> < proxy_url" >&2; exit 2; }
   # No proxy, no config: a browser without the egress proxy has no network boundary.
-  PROXY="${3:-}"
+  PROXY=""
+  IFS= read -r PROXY || true
   [ -n "$PROXY" ] || { echo "config: proxy_url is required (the per-task egress proxy is the network boundary)" >&2; exit 2; }
   check_proxy "$PROXY"
   [ -x "$BIN" ] || { echo "config: $BIN missing; run: $INSTALL_CMD" >&2; exit 2; }
@@ -137,5 +153,5 @@ tools)
   # The installed server's tool list (the install gate's input), for review of a pin bump.
   [ -x "$BIN" ] || { echo "tools: $BIN missing; run: $INSTALL_CMD" >&2; exit 2; }
   list_tools ;;
-*) echo "usage: $0 install [--browsers] | config <task_dir> <proxy_url> | tools" >&2; exit 2 ;;
+*) echo "usage: $0 install [--browsers] | config <task_dir> < proxy_url | tools" >&2; exit 2 ;;
 esac

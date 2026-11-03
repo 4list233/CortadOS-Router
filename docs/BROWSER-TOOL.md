@@ -62,15 +62,17 @@ Both need the same egress proxy; the proxy is what actually enforces "no private
 - Gates, any failure aborts the install: installed `@playwright/mcp` version == `PIN_MCP`; `playwright-core` >= 1.55.1;
   `tools/list` of the installed server == `tools-0.0.84.txt` byte for byte. The listing starts the server through
   `run-mcp.sh` on a throwaway task with a dummy proxy (no page is opened), so flags and env are exactly a task's; it
-  reads until the `id:2` answer with a 30 s cap and prints the server's stderr when there is none
+  reads until the `id:2` answer with a 30 s cap and prints the server's stderr when there is none. A stdout line that
+  is not a JSON-RPC object, or an `id:2` answer without a tools list, fails the listing at once with the line and the
+  server's stderr (a stdio server's stdout carries only protocol messages; garbage is never skipped)
   (`install.sh tools` shows the list on its own).
 - Browsers: `PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers <prefix>/node_modules/.bin/playwright install --only-shell chromium`
   (headless shell only; nothing global, nothing under `~/Library/Caches/ms-playwright`).
 - Script: `integrations/browser/install.sh`. The router package stays stdlib-only and never imports it.
 
 ### Per-task launch (stdio, no port)
-`install.sh config <task_dir> <proxy_url>` (B3 moves this into `child_tasks._prepare`) refuses with exit 2 unless the
-proxy URL is given, has the exact shape `http://<token>@127.0.0.1:<port>` (token of at least 16 `[A-Za-z0-9_-]`; no
+`install.sh config <task_dir> < proxy_url` (B3 moves this into `child_tasks._prepare`) reads the proxy URL from stdin,
+never argv (a third argument is refused with exit 2), and refuses with exit 2 unless the proxy URL is given, has the exact shape `http://<token>@127.0.0.1:<port>` (token of at least 16 `[A-Za-z0-9_-]`; no
 other host, no https, no password, no path or bypass), and the pinned binary is executable (message carries the
 install command); there is no boundary-less config. It writes two files, both 0600 (inside the 0700 task dir), and
 the child gets `--mcp-config <task_dir>/browser-mcp.json`:
@@ -86,7 +88,9 @@ the child gets `--mcp-config <task_dir>/browser-mcp.json`:
   "contextOptions": {"proxy": {"server": "http://127.0.0.1:<egress_port>", "username": "<token>", "password": ""}}}}
 ```
 The proxy token lives only in this file, never in argv (`ps` shows argv to every local user) and never in
-`browser-mcp.json`. `run-mcp.sh` refuses with exit 2 unless both proxies are present, point at `127.0.0.1`, carry a
+`browser-mcp.json`. That holds end to end: the caller pipes the URL to `install.sh config` on stdin, the shape check
+reads it through a pipe from the `printf` builtin, and the config writer gets it on stdin with its program passed as
+`python3 -I -c` (tests record every external command's argv and assert the token is absent). `run-mcp.sh` refuses with exit 2 unless both proxies are present, point at `127.0.0.1`, carry a
 username and have no `bypass`; then it runs `cd <task>/browser && exec env -i PATH=<node dir>:/usr/bin:/bin
 HOME=<task>/browser/home TMPDIR=<task>/browser/tmp PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers
 <prefix>/node_modules/.bin/playwright-mcp --config <task>/browser/config.json --headless --isolated --sandbox

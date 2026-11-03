@@ -4,6 +4,7 @@ boundary claims (scrubbed env, fixed flags, proxy only in a 0600 config, fail-cl
 browser. Every test runs on a throwaway CORTADOS_HOME."""
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -26,8 +27,10 @@ d="$(dirname "$0")"
 env > "$PWD/stub.env"; printf '%s\n' "$@" > "$PWD/stub.argv"; pwd -P > "$PWD/stub.cwd"
 exec /usr/bin/python3 "$d/stub.py" "$d/tools"
 '''
-STUB_PY = r'''import json, sys
+STUB_PY = r'''import json, os, sys
 names = open(sys.argv[1]).read().split()
+if open(os.path.join(os.path.dirname(sys.argv[1]), "mode")).read() == "notjson":
+    print("NOT JSON", flush=True)     # protocol garbage before an otherwise valid answer
 for line in sys.stdin:
     m = json.loads(line)
     if m.get("id") is not None:
@@ -48,6 +51,14 @@ class BrowserScriptsTests(unittest.TestCase):
         fake.mkdir()
         (fake / "node").write_text("#!/bin/sh\nexit 0\n")
         (fake / "node").chmod(0o755)
+        # argv recorders: every external command install.sh / run-mcp.sh run through PATH appends its argv to argv.log
+        # (NUL-separated, one record per line), then execs the real binary. The proxy token must never appear there.
+        self.argv_log = self.tmp / "argv.log"
+        for name in ("python3", "grep", "mkdir", "cat", "dirname", "env", "rm", "mktemp"):
+            real = shutil.which(name, path="/usr/bin:/bin")
+            (fake / name).write_text(f"#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" >> '{self.argv_log}'\n"
+                                     f"printf '\\n' >> '{self.argv_log}'\nexec '{real}' \"$@\"\n")
+            (fake / name).chmod(0o755)
         self.env = {"PATH": f"{fake}:/usr/bin:/bin", "CORTADOS_HOME": str(self.home), "HOME": str(self.tmp)}
 
     def tearDown(self):
@@ -62,12 +73,13 @@ class BrowserScriptsTests(unittest.TestCase):
         (self.bindir / "mode").write_text(mode)
         (self.bindir / "tools").write_text(tools)
 
-    def sh(self, script, *args, env=None):
+    def sh(self, script, *args, env=None, input=""):
         return subprocess.run(["sh", str(script), *map(str, args)], env=env or self.env, capture_output=True,
-                              text=True, timeout=60)
+                              text=True, timeout=60, input=input)
 
     def config(self, proxy=PROXY):
-        return self.sh(INSTALL, "config", self.task, proxy)
+        # The proxy URL goes on stdin: it carries the token, and argv is visible to every local user through ps.
+        return self.sh(INSTALL, "config", self.task, input=proxy + "\n" if proxy else "")
 
     # install.sh config
     def test_config_refuses_without_proxy_or_binary(self):
@@ -102,6 +114,20 @@ class BrowserScriptsTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)
         self.assertNotIn(TOKEN, mcp.read_text())
 
+    def test_config_takes_proxy_on_stdin_never_argv(self):
+        self.stub()
+        r = self.config()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads((self.task / "browser" / "config.json").read_text())
+                         ["browser"]["launchOptions"]["proxy"]["username"], TOKEN)
+        log = self.argv_log.read_text()
+        self.assertIn("python3", log)              # the recorders saw the config writer's python
+        self.assertNotIn(TOKEN, log)
+        # The old argv form is refused, not silently accepted or ignored.
+        r = self.sh(INSTALL, "config", self.task, PROXY)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("stdin", r.stderr)
+
     # run-mcp.sh
     def test_wrapper_scrubs_env_and_passes_fixed_flags(self):
         self.stub()
@@ -130,6 +156,7 @@ class BrowserScriptsTests(unittest.TestCase):
                                         "--block-service-workers", "--timeout-navigation", "30000",
                                         "--timeout-action", "10000"])
         self.assertNotIn(TOKEN, " ".join(seen["argv"]))
+        self.assertNotIn(TOKEN, self.argv_log.read_text())
 
     def test_wrapper_fails_closed(self):
         run = lambda: subprocess.run(["sh", str(RUN), str(self.task), str(self.prefix)], env=self.env,
@@ -163,6 +190,14 @@ class BrowserScriptsTests(unittest.TestCase):
         r = self.sh(INSTALL, "tools")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("stub: boom", r.stderr)
+
+    def test_tool_listing_fails_on_malformed_protocol_output(self):
+        self.stub(mode="notjson")
+        r = self.sh(INSTALL, "tools")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("malformed MCP protocol output", r.stderr)
+        self.assertIn("NOT JSON", r.stderr)
 
 
 if __name__ == "__main__":
