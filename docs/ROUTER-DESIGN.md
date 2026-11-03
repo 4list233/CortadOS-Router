@@ -332,6 +332,40 @@ The scorer never sees a model name: it scores the TASK. Models, tiers and scarci
 Cadence (Claude's call, Forest 2026-09-21): label every night 01:30 (`com.cortados.router-nightly`); train when there is no promoted model, on Sunday nights,
 or when ≥150 newly labelled requests have accumulated. Serving the promoted model in place of the 14B engine is the next build.
 
+### 4d.1 Continuous mode (Forest 2026-11-03: no night window)
+`python3 s1/overnight.py --continuous` runs `s1/nightly.sh` cycles back to back instead of the 01:30 job, with
+`CORTADOS_NIGHTLY_SUPERVISED=1 CORTADOS_S1_CONTINUOUS=1 CORTADOS_S1_CYCLE_RESULT=<file> TZ=America/Toronto`. In continuous mode the
+live scorer stays loaded during training; the supervisor pauses (SIGSTOP) the cycle's tree when probed scorer latency rises more than
+the budget above baseline, and evaluation is never skipped for a deadline. A cycle writes `worked` (labels added, training ran, an
+evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude headroom floor, `low_headroom`/`unknown_headroom`;
+`quota` wins over `worked`) to the result file, or nothing (idle). Exit codes: 0 normal, 130 stop requested, anything else a failure.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CORTADOS_S1_LATENCY_BUDGET_S` | 1.0 | scorer latency allowed above baseline before training is paused |
+| `CORTADOS_S1_MIN_FREE_GB` | 8 | free memory below which training is paused |
+| `CORTADOS_S1_PROBE_S` | 30 | seconds between scorer latency probes |
+| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause; past it the tree is resumed and `guard_forced_resume` alerts |
+| `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle |
+| `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle |
+| `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
+| `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |
+
+Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S`), `scorer_probe_config` (the probe settings are unusable).
+Stop: `s1/nightly.sh --stop` touches `s1/data/nightly.stop`, continues a paused tree (SIGCONT) and then TERMs it; the supervisor exits 0
+and a cycle refuses to start (exit 130) while the flag exists. Resume: remove `s1/data/nightly.stop`, then
+`launchctl kickstart gui/$(id -u)/com.cortados.s1-continuous`. Run it under launchd with `KeepAlive` = `SuccessfulExit` false, so a
+crash is relaunched and a stop-flag exit 0 is not:
+
+```xml
+<key>Label</key><string>com.cortados.s1-continuous</string>
+<key>ProgramArguments</key>
+<array><string>/usr/bin/python3</string><string>/path/to/CortadOS-Router/s1/overnight.py</string><string>--continuous</string></array>
+<key>WorkingDirectory</key><string>/path/to/CortadOS-Router/s1</string>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>EnvironmentVariables</key><dict><key>CORTADOS_S1_LATENCY_BUDGET_S</key><string>1.0</string></dict>
+```
+
 ## 5. Hard rules before any scoring (deterministic, cannot be out-voted)
 1. Fable only by escalation evidence (G112 / INV-RES-003).
 2. Outward effect (Q7 true or outward verb) → blast_radius 3 → at least R3, and the Door still requires Forest's yes.
