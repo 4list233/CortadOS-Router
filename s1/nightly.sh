@@ -33,6 +33,10 @@
 #   CORTADOS_S1_NOW             HHMM that replaces the clock for the deadline check (tests); not HHMM → logged, the clock is used
 #   nightly.sh --minutes-left [HHMM]   prints the minutes from HHMM (or now) to the deadline plus any settings notes and exits;
 #                               no pid file, stop flag or overnight.py (diagnostic / tests). An invalid HHMM exits 2.
+# Continuous mode (Forest 2026-11-03; window mode stays the default until the launchd job is switched): a launchd KeepAlive job runs
+#   python3 <repo>/s1/overnight.py --continuous -- /bin/bash <repo>/s1/nightly.sh
+# which loops cycles with no window/deadline, keeps the scorer up, and pauses this tree on scorer latency / low memory.
+#   CORTADOS_S1_MIN_LEFT_PCT    label.py --min-left-pct per-account quota floor (default 15, Forest 2026-11-03)
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -61,6 +65,9 @@ hhmm "$DEADLINE" || { SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_DEADLINE=$DEA
 # minutes_left would read as "not enough time" every night (deferring the candidate forever)
 if [ -n "${CORTADOS_S1_NOW:-}" ] && ! hhmm "$CORTADOS_S1_NOW"; then
   SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_NOW=$CORTADOS_S1_NOW is not HHMM; using the clock. "; unset CORTADOS_S1_NOW
+elif [ -n "${CORTADOS_S1_NOW:-}" ]; then
+  # a valid override silently replacing the clock is a test hook; a leftover value in train-config.env must show in every log
+  SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_NOW=$CORTADOS_S1_NOW replaces the clock for the deadline check (test hook). "
 fi
 # ceiling: evaluation starts after labeling (~75 min into the window that opens at 01:30), so a value within 30 min of the whole
 # 01:30-to-deadline window (330 min to 07:00: >= 300) can never fit: every candidate would wait forever. That is a config error,
@@ -68,6 +75,11 @@ fi
 local window; window=$(minutes_left 0130)   # minutes in the 01:30-to-deadline window
 if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
   SETTING_NOTES="${SETTING_NOTES:-}EVAL_MINUTES=$EVAL_MINUTES can never fit the 01:30-$DEADLINE window (>= $((window - 30))); using 110. "; EVAL_MINUTES=110
+fi
+# the 110 fallback is re-checked: a window too short even for it (e.g. DEADLINE=0300: 90 min) would defer every candidate
+# forever, so the deadline check is disabled (0) with a logged reason; overnight.py's TERM at the deadline still applies
+if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
+  SETTING_NOTES="${SETTING_NOTES:-}the 01:30-$DEADLINE window is too short even for EVAL_MINUTES=$EVAL_MINUTES; deadline check disabled (0). "; EVAL_MINUTES=0
 fi
 }
 hhmm() { [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]; }   # 0000-2359
@@ -88,7 +100,11 @@ PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop
 if [ "${1:-}" = "--stop" ]; then                       # the one supported way to stop a run: the loop AND its trainer, then the services come back
   touch "$STOPFLAG"
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    p=$(cat "$PIDFILE"); pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null
+    # SIGCONT first: overnight.py --continuous may have SIGSTOPped the tree (latency guard); a stopped process does not act on
+    # TERM, so without CONT it would sit out the grace period and then be SIGKILLed with no cleanup.
+    # The group CONT reaches stopped grandchildren too (the trainer under a python wrapper), which -P (direct children) misses.
+    p=$(cat "$PIDFILE"); kill -CONT -- -"$p" 2>/dev/null; pkill -CONT -P "$p" 2>/dev/null; kill -CONT "$p" 2>/dev/null
+    pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null
     for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
     kill -0 "$p" 2>/dev/null && { pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; }
     echo "stopped nightly $p and its children"
@@ -101,7 +117,12 @@ if [ "${CORTADOS_NIGHTLY_SUPERVISED:-}" != "1" ]; then
   exec python3 overnight.py -- /bin/bash "$PWD/nightly.sh" "$@"
 fi
 [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && { echo "nightly already running (pid $(cat "$PIDFILE"))"; exit 0; }
-echo $$ > "$PIDFILE"; rm -f "$STOPFLAG"
+# Window mode: a new night clears yesterday's stop. Continuous mode: the stop flag outlives the cycle (overnight.py checks it
+# between cycles), so a cycle never clears it and refuses to start while it is there (exit 130 = stop requested).
+if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ]; then
+  [ -f "$STOPFLAG" ] && { echo "stop flag $STOPFLAG present: not starting a cycle (remove it to resume)"; exit 130; }
+else rm -f "$STOPFLAG"; fi
+echo $$ > "$PIDFILE"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 # set -a: every assignment in the config is exported, so label.py / evaluate.py see CORTADOS_PROVIDER_URL and friends
 # (sourced without it they stayed shell-local and label.py exited 2, config error).
@@ -126,9 +147,15 @@ setting DB_MAX_AGE_MIN 60
 setting STALL_NIGHTS 2 1; setting EARLY_STOP_NIGHTS 2 1; setting EVAL_FAIL_NIGHTS 2 1; setting HOLDOUT_BLOCKED_NIGHTS 2 1   # 0 would alert on every night
 GPU_SETTLE="${CORTADOS_S1_GPU_SETTLE:-3}"; EVAL_SETTLE="${CORTADOS_S1_EVAL_SETTLE:-20}"
 setting GPU_SETTLE 3; setting EVAL_SETTLE 20
+# label.py --min-left-pct: a percentage, so 0-100; an invalid or out-of-range value falls back to the 15% floor (Forest 2026-11-03)
+MIN_LEFT_PCT="${CORTADOS_S1_MIN_LEFT_PCT:-15}"
+setting MIN_LEFT_PCT 15
+[ "$MIN_LEFT_PCT" -gt 100 ] && { SETTING_NOTES="${SETTING_NOTES:-}MIN_LEFT_PCT=$MIN_LEFT_PCT is above 100; using 15. "; MIN_LEFT_PCT=15; }
 deadline_settings
 eval_time_ok() {   # eval_time_ok <run> <reason>: true when an evaluation can finish before the deadline; else logs why, raises
   # the eval_deferred streak (a candidate deferred night after night is a stall someone must see) and is false
+  # Forest 2026-11-03: continuous mode (overnight.py --continuous sets CORTADOS_S1_CONTINUOUS=1) has no deadline, so evaluation is never skipped.
+  [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && return 0
   local left; left=$(minutes_left)
   [ "$EVAL_MINUTES" -eq 0 ] || [ "$left" -ge "$EVAL_MINUTES" ] && return 0
   echo "not evaluating $1: $left min to the $DEADLINE deadline, evaluation needs ~$EVAL_MINUTES (CORTADOS_S1_EVAL_MINUTES); it stays pending ($2) and is evaluated first next night"
@@ -229,14 +256,34 @@ rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapter
   return 0
 }
 rotate_logs
-gpu_alone() {   # Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
+gpu_alone() {   # called only right before training starts, so it marks the cycle worked. Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
+  # Forest 2026-11-03: in continuous mode the live scorer has priority and STAYS UP; overnight.py pauses this tree instead when
+  # scorer latency rises more than CORTADOS_S1_LATENCY_BUDGET_S above baseline.
+  worked_cycle
+  [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && { echo "continuous mode: scorer stays up during training (overnight.py latency guard)"; return 0; }
   launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "$GPU_SETTLE"; echo "scorer stopped for training; ollama + memory gateway stay up"
 }
+# worked_cycle: tell overnight.py --continuous this cycle did real work (labels added, training ran, an evaluation/promotion was
+# attempted). Absence means idle: every no-op exit sleeps CORTADOS_S1_CYCLE_IDLE_S instead of restarting at once (a missed call
+# only costs one idle sleep; a missed "idle" mark used to hot-loop the provider and quota).
+# quota_cycle: the labeler stopped at the Claude headroom floor; overnight.py then waits CORTADOS_S1_QUOTA_COOLDOWN_S. It wins over
+# "worked" (labels added before the stop, training after it): once written, worked_cycle no longer overwrites it.
+CYCLE_QUOTA=0
+cycle_mark() {
+  [ -n "${CORTADOS_S1_CYCLE_RESULT:-}" ] || return 0
+  echo "$1" > "$CORTADOS_S1_CYCLE_RESULT" || echo "WARNING: could not write cycle result $1 to CORTADOS_S1_CYCLE_RESULT"
+  return 0
+}
+worked_cycle() { [ "$CYCLE_QUOTA" = 1 ] || cycle_mark worked; return 0; }
+quota_cycle() { CYCLE_QUOTA=1; cycle_mark quota; }
 gpu_share() {
+  # continuous mode never unloads the scorer (gpu_alone), so there is nothing to load back and no "scorer back" to log each cycle
+  [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && return 0
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
 state() { python3 -B ./nightly_state.py "$@"; }
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
+  worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
     $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
 }
@@ -285,12 +332,37 @@ eval_fingerprint() {   # effective holdout labels + inference settings (evaluate
 report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['promote'] else 1)" "$1/report.json"; }
 cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
-trap 'echo "stop requested"; touch "$STOPFLAG"; exit 130' TERM INT
+# Continuous mode: the stop flag means "the operator ran nightly.sh --stop" (only --stop creates it) and overnight.py will not
+# relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
+# shutdown): flagging that would leave continuous training stopped for good after a reboot, so the trap does not touch it.
+# Window mode keeps the old behaviour (a TERM is a stop for tonight; the next night clears the flag).
+trap 'echo "stop requested"; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
 # unitcost / refresh-tiers live in the router checkout; a missing one is logged, never fatal (labelling and training do not need them)
 if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
 else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
 # every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case.
-if [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then "$REPO_ROOT/bin/refresh-tiers.sh" || echo "refresh-tiers.sh failed (rc $?)"
+# Continuous mode runs a cycle every few minutes, and refresh-tiers.sh fetches public leaderboards (lmarena, swebench, epoch,
+# aider, ...): refreshing every cycle would hammer those sites for scores that change daily at most. So in continuous mode the
+# refresh runs at most once per CORTADOS_S1_BENCH_REFRESH_S (default 86400 = 24 h), timed from data/last-bench-refresh, which
+# is stamped only after a successful refresh (a failed one is retried next cycle). Window mode refreshes every night as before.
+bench_due=1
+if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ]; then
+  BENCH_REFRESH_S="${CORTADOS_S1_BENCH_REFRESH_S:-86400}"
+  whole "$BENCH_REFRESH_S" || { echo "CORTADOS_S1_BENCH_REFRESH_S=$BENCH_REFRESH_S is not a whole number up to 9 digits; using 86400"; BENCH_REFRESH_S=86400; }
+  BENCH_REFRESH_S=$(dec "$BENCH_REFRESH_S")
+  last_bench=$(cat data/last-bench-refresh 2>/dev/null)
+  # a future-dated stamp (clock change, bad write) gives a negative age: treat it as due, not as fresh for ever
+  if [[ "$last_bench" =~ ^[0-9]{1,12}$ ]] && [ $(( $(date +%s) - last_bench )) -ge 0 ] \
+     && [ $(( $(date +%s) - last_bench )) -lt "$BENCH_REFRESH_S" ]; then
+    echo "benchmark/tiers refresh skipped: last refresh $(( $(date +%s) - last_bench )) s ago, under CORTADOS_S1_BENCH_REFRESH_S=$BENCH_REFRESH_S (continuous mode)"
+    bench_due=0
+  fi
+fi
+if [ "$bench_due" = 0 ]; then :
+elif [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then
+  if "$REPO_ROOT/bin/refresh-tiers.sh"; then
+    date +%s > data/last-bench-refresh || echo "WARNING: could not write data/last-bench-refresh: the next cycle refreshes again"
+  else echo "refresh-tiers.sh failed (rc $?)"; fi
 else echo "refresh-tiers.sh not found under $REPO_ROOT: skipped"; fi
 # The Air's router.db is rsynced here every 15 min by another machine; a stale copy means its recent usage is missing tonight.
 # Stale data is still valid data, so the night goes on, but the gap is logged and put in the status file for the dashboard.
@@ -315,12 +387,15 @@ purl=unset; [ -n "${CORTADOS_PROVIDER_URL:-}" ] && purl=set
 ptok="default (~/.config/cortados/provider-token)"; [ -n "${CORTADOS_PROVIDER_TOKEN_FILE:-}" ] && ptok=set
 echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file $ptok)"
 # shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
-"$LABEL_PY" -B label.py $TEACHER_ARGS
+# Forest 2026-11-03: two Claude accounts are under-utilized, so labeling may run in the daytime down to a 15% per-account floor.
+labels_before=$(state labels data/labels.jsonl 2>/dev/null) && whole "$labels_before" || labels_before=""
+"$LABEL_PY" -B label.py --min-left-pct "$MIN_LEFT_PCT" $TEACHER_ARGS
 rc=$?
 # Count labels and update the stall tracker BEFORE branching on rc: a labeler that fails every night is exactly the stall to alert on.
 if ! labelled=$(state labels data/labels.jsonl) || ! whole "$labelled"; then
   echo "LABEL COUNT FAILED (data/labels.jsonl unreadable): training skipped"; state event "$STATUS" label_count_failure "labels.jsonl unreadable"; exit 1
 fi
+[ -n "$labels_before" ] && [ "$labelled" -gt "$labels_before" ] && worked_cycle
 if alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT"); then
   [ -n "$alert" ] && echo "$alert"
 else
@@ -331,6 +406,7 @@ if [ "$rc" -eq 3 ]; then
   # partial labels are real labels: go on, and let the no-new-labels check below decide whether there is anything to train on
   stop_reason=$(head -1 data/label-stop-reason 2>/dev/null | tr -cd 'a-z_'); stop_reason=${stop_reason:-unknown}
   echo "LABELING STOPPED EARLY (label.py rc 3, reason $stop_reason): continuing with the labels written so far"
+  case "$stop_reason" in low_headroom|unknown_headroom) quota_cycle ;; esac   # the headroom floor: overnight.py cools down
   state event "$STATUS" labeling_stopped_early "label.py rc 3: $stop_reason"
   # one batch then a stop still "grows" labels, so the growth stall never fires: alert on the same stop reason night after night
   streak label_early_stop hit "$EARLY_STOP_NIGHTS" "$stop_reason"

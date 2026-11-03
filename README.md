@@ -96,7 +96,7 @@ Local hardware can be metered as a resource pool: copy `tables/resources.example
 
 S1 is a LoRA adapter on `Qwen3-4B-Instruct-2507` (MLX, 4-bit). Its completion is twelve `question=digit` lines, one single-digit token each, so the router reads a probability per allowed answer and type errors are impossible by construction. When a difficulty feature's top probability is below 0.75 the router takes the higher of its two likeliest levels; the `outward` question is called at a stricter 0.25.
 
-The pipeline is in `s1/`, run nightly by `s1/nightly.sh`:
+The pipeline is in `s1/`, run nightly by `s1/nightly.sh` (or back to back by `s1/overnight.py --continuous`; see `docs/ROUTER-DESIGN.md` §4d.1):
 
 | step | file | what it does |
 |---|---|---|

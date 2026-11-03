@@ -332,6 +332,49 @@ The scorer never sees a model name: it scores the TASK. Models, tiers and scarci
 Cadence (Claude's call, Forest 2026-09-21): label every night 01:30 (`com.cortados.router-nightly`); train when there is no promoted model, on Sunday nights,
 or when ≥150 newly labelled requests have accumulated. Serving the promoted model in place of the 14B engine is the next build.
 
+### 4d.1 Continuous mode (Forest 2026-11-03: no night window)
+`python3 s1/overnight.py --continuous -- /bin/bash s1/nightly.sh` runs `s1/nightly.sh` cycles back to back instead of the 01:30 job, with
+`CORTADOS_NIGHTLY_SUPERVISED=1 CORTADOS_S1_CONTINUOUS=1 CORTADOS_S1_CYCLE_RESULT=<file> TZ=America/Toronto`. In continuous mode the
+live scorer stays loaded during training; the supervisor pauses (SIGSTOP) the cycle's tree when probed scorer latency rises more than
+the budget above baseline, and evaluation is never skipped for a deadline. A cycle writes `worked` (labels added, training ran, an
+evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude headroom floor, `low_headroom`/`unknown_headroom`;
+`quota` wins over `worked`) to the result file, or nothing (idle). Exit codes: 0 normal, 130 stop requested, anything else a failure.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CORTADOS_S1_LATENCY_BUDGET_S` | 1.0 | scorer latency allowed above baseline before training is paused |
+| `CORTADOS_S1_MIN_FREE_GB` | 8 | free memory below which training is paused |
+| `CORTADOS_S1_PROBE_S` | 30 | seconds between scorer latency probes |
+| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it the tree is resumed and `guard_forced_resume` alerts |
+| `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume, no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
+| `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle (min 60) |
+| `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle (min 60) |
+| `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
+| `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |
+
+Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S` or the scorer stayed unreadable; the detail counts forced
+releases in a row, reset by a normal resume), `scorer_probe_config` (the probe settings are unusable; alerts and logs name the setting
+that chose the URL, `CORTADOS_S1_URL` / `CORTADOS_S1_ENDPOINT` / default, never the URL itself), `scorer_probe_crashed`
+(the probe raised an unexpected exception, by type name: a code fault, not a setting), `cycle_result_stuck` (the result marker
+cannot be removed; once per supervisor). A stale result marker that cannot be
+removed makes the cycle count as idle. The failure backoff exponent and the persisted failure count are clamped.
+Stop: `s1/data/nightly.stop` means "the operator ran `nightly.sh --stop`", and only `--stop` creates it in continuous mode: a TERM from
+the supervisor (launchctl unload / `kickstart -k`, logout, shutdown) ends the cycle with exit 130 but leaves no flag, so the job comes
+back after a reboot. `s1/nightly.sh --stop` touches the flag, continues the paused process group (SIGCONT) and then TERMs it; the
+supervisor exits 0 and a cycle refuses to start (exit 130) while the flag exists. Resume: remove `s1/data/nightly.stop`, then
+`launchctl kickstart gui/$(id -u)/com.cortados.s1-continuous`. Run it under launchd with `KeepAlive` = `SuccessfulExit` false, so a
+crash is relaunched and a stop-flag exit 0 is not:
+
+```xml
+<key>Label</key><string>com.cortados.s1-continuous</string>
+<key>ProgramArguments</key>
+<array><string>/usr/bin/python3</string><string>/path/to/CortadOS-Router/s1/overnight.py</string><string>--continuous</string>
+       <string>--</string><string>/bin/bash</string><string>/path/to/CortadOS-Router/s1/nightly.sh</string></array>
+<key>WorkingDirectory</key><string>/path/to/CortadOS-Router/s1</string>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>EnvironmentVariables</key><dict><key>CORTADOS_S1_LATENCY_BUDGET_S</key><string>1.0</string></dict>
+```
+
 ## 5. Hard rules before any scoring (deterministic, cannot be out-voted)
 1. Fable only by escalation evidence (G112 / INV-RES-003).
 2. Outward effect (Q7 true or outward verb) → blast_radius 3 → at least R3, and the Door still requires Forest's yes.

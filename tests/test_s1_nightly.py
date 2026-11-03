@@ -9,9 +9,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import date, timedelta
@@ -25,6 +28,7 @@ STUBS = {
     "label.py": (
         "import json, os, sys\n"
         "open('data/label-args', 'w').write(' '.join(sys.argv[1:]))\n"
+        "if os.environ.get('STUB_LABEL_SLEEP'): __import__('time').sleep(float(os.environ['STUB_LABEL_SLEEP']))   # a long cycle\n"
         "open('data/label-env', 'w').write(os.environ.get('CORTADOS_PROVIDER_URL', '<unset>'))\n"
         "p = 'data/labels.jsonl'\n"
         "have = sum(1 for _ in open(p)) if os.path.exists(p) else 0\n"
@@ -222,7 +226,218 @@ class NightlyEndToEnd(unittest.TestCase):
     def test_teacher_args_reach_label_py(self):
         self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_TEACHER_ARGS="--workers 1 --teacher provider",
                        CORTADOS_PROVIDER_URL="http://example.invalid", CORTADOS_PROVIDER_TOKEN_FILE="/nonexistent")
-        self.assertEqual((self.s1 / "data/label-args").read_text(), "--workers 1 --teacher provider")
+        self.assertEqual((self.s1 / "data/label-args").read_text(), "--min-left-pct 15 --workers 1 --teacher provider")
+
+    # Continuous mode (overnight.py --continuous): "worked" in CORTADOS_S1_CYCLE_RESULT only for real work; absence = idle.
+    def _cycle(self, **env):
+        rf = self.tmp / "cycle-result"
+        rf.unlink(missing_ok=True)
+        rc, log, run = self.run_night(CORTADOS_S1_CONTINUOUS=1, CORTADOS_S1_CYCLE_RESULT=rf, **env)
+        return rc, log, run, (rf.read_text().strip() if rf.exists() else None)
+
+    def test_cycle_result_worked_on_training_and_absent_when_idle(self):
+        rc, log, _, res = self._cycle(STUB_NEW_LABELS=5)
+        self.assertEqual((rc, res), (0, "worked"), log)
+        rc, log, _, res = self._cycle(STUB_NEW_LABELS=0)
+        self.assertIn("skipped: no new labels", log)
+        self.assertEqual((rc, res), (0, None), log)
+
+    def test_cycle_result_absent_on_label_failure(self):
+        rc, log, _, res = self._cycle(STUB_LABEL_RC=1)
+        self.assertNotEqual(rc, 0, log)
+        self.assertIsNone(res, log)
+
+    def test_continuous_gpu_alone_keeps_the_scorer_loaded(self):
+        rc, log, run, _ = self._cycle(STUB_NEW_LABELS=5)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("continuous mode: scorer stays up during training", log)
+        self.assertTrue((run / "adapter").exists(), log)
+        calls = self.tmp / "home/launchctl.log"
+        self.assertNotIn("unload", calls.read_text() if calls.exists() else "")
+
+    def test_cycle_result_quota_wins_over_worked(self):
+        for reason in ("low_headroom", "unknown_headroom"):
+            rc, log, run, res = self._cycle(STUB_LABEL_RC=3, STUB_STOP_REASON=reason, STUB_NEW_LABELS=3)
+            self.assertEqual((rc, res), (0, "quota"), log)   # labels were added and training ran, but the floor was hit
+            self.assertTrue((run / "adapter").exists(), log)
+        rc, log, _, res = self._cycle(STUB_LABEL_RC=3, STUB_STOP_REASON="retries", STUB_NEW_LABELS=3)
+        self.assertEqual((rc, res), (0, "worked"), "a non-headroom early stop is ordinary work")
+
+    def _bare(self, *args, **env):
+        return subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), *args], cwd=self.tmp,
+                              env={**self.env, **{k: str(v) for k, v in env.items()}}, capture_output=True, text=True, timeout=60)
+
+    def test_continuous_stop_flag_is_kept_and_refuses_the_cycle(self):
+        flag = self.s1 / "data/nightly.stop"; flag.touch()
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, CORTADOS_S1_RUN="runs/2026-01-01", CORTADOS_S1_NIGHT_DATE="2026-01-02")
+        self.assertEqual(out.returncode, 130, out.stdout + out.stderr)
+        self.assertTrue(flag.exists(), "continuous mode never clears the stop flag")
+        self.assertFalse((self.s1 / "data/ran-dataset").exists())
+        self.assertFalse((self.s1 / "data/nightly.pid").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)   # window mode: a new night clears yesterday's stop
+        self.assertEqual(rc, 0, log)
+        self.assertFalse(flag.exists())
+
+    def test_stop_continues_a_sigstopped_run_so_it_gets_its_grace_period(self):
+        mark = self.tmp / "termed"
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import signal, sys, time\n"
+                                  f"signal.signal(signal.SIGTERM, lambda *a: (open({str(mark)!r}, 'w').write('x'), sys.exit(0)))\n"
+                                  "time.sleep(120)\n"])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        time.sleep(0.5)
+        (self.s1 / "data/nightly.pid").write_text(f"{child.pid}\n")
+        os.kill(child.pid, signal.SIGSTOP)
+        out = self._bare("--stop")
+        self.assertIn("stopped nightly", out.stdout)
+        child.wait(timeout=10)
+        self.assertTrue(mark.exists(), "the stopped run handled TERM (it was continued), not SIGKILLed")
+        self.assertTrue((self.s1 / "data/nightly.stop").exists())
+
+    def test_stop_continues_a_stopped_grandchild_through_the_group(self):
+        # The supervisor's layout: the run (nightly.sh) leads its own group (start_new_session), a wrapper is its child, and
+        # the SIGSTOPped trainer is the wrapper's child. `pkill -P <run>` reaches only the wrapper; only the group CONT
+        # reaches the trainer. The trainer marks "early" if it resumed while the run was still handling TERM (--stop
+        # continued it) and "late" if it resumed only after the run exited (the kernel CONTs an orphaned stopped group).
+        mark, ready, exiting = self.tmp / "trainer-resumed", self.tmp / "trainer-ready", self.tmp / "run-exiting"
+        trainer = ("import os, signal\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                   f"open({str(ready)!r}, 'w').write(str(os.getpid()))\n"
+                   "os.kill(os.getpid(), signal.SIGSTOP)\n"
+                   f"open({str(mark)!r}, 'w').write('late' if os.path.exists({str(exiting)!r}) else 'early')\n")
+        wrapper = ("import signal, subprocess, sys\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                   f"subprocess.Popen([sys.executable, '-c', {trainer!r}]).wait()\n")
+        run = ("import os, signal, subprocess, sys, time\n"
+               f"subprocess.Popen([sys.executable, '-c', {wrapper!r}])\n"
+               "def term(*a):\n"
+               "    t = time.monotonic() + 5\n"   # give the trainer time to act, as nightly.sh's trap waits for its children
+               f"    while not os.path.exists({str(mark)!r}) and time.monotonic() < t: time.sleep(0.05)\n"
+               f"    open({str(exiting)!r}, 'w').close(); sys.exit(0)\n"
+               "signal.signal(signal.SIGTERM, term)\n"
+               "time.sleep(120)\n")
+        child = subprocess.Popen([sys.executable, "-c", run], start_new_session=True)
+        threading.Thread(target=child.wait, daemon=True).start()   # reap at once: a zombie run would hold --stop's 20 s wait
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", "--", f"-{child.pid}"], capture_output=True))
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(ready.exists(), "trainer started")
+        tpid = ready.read_text().strip()
+        st = ""
+        deadline = time.monotonic() + 5
+        while not st.startswith("T") and time.monotonic() < deadline:
+            st = subprocess.run(["ps", "-o", "stat=", "-p", tpid], capture_output=True, text=True).stdout.strip()
+            time.sleep(0.05)
+        self.assertTrue(st.startswith("T"), f"trainer is stopped: {st!r}")
+        (self.s1 / "data/nightly.pid").write_text(f"{child.pid}\n")
+        out = self._bare("--stop")
+        self.assertIn("stopped nightly", out.stdout)
+        deadline = time.monotonic() + 5
+        while not mark.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(mark.read_text() if mark.exists() else "never", "early",
+                         "--stop's group CONT resumed the stopped grandchild while the run was still alive")
+
+    def _supervisor(self, scorer_port, **env):
+        """overnight.py --continuous over the real nightly.sh in the temp s1; its probe hits the test's stub scorer, never :8431."""
+        shutil.copy(S1 / "overnight.py", self.s1 / "overnight.py")
+        out = open(self.tmp / f"sup-{time.monotonic_ns()}.log", "w+")
+        self.addCleanup(out.close)
+        e = {k: v for k, v in self.env.items() if k != "CORTADOS_NIGHTLY_SUPERVISED"}
+        e.update({"CORTADOS_S1_URL": f"http://127.0.0.1:{scorer_port}", "CORTADOS_S1_MIN_FREE_GB": "0",
+                  "CORTADOS_S1_CYCLE_IDLE_S": "60", **{k: str(v) for k, v in env.items()}})
+        p = subprocess.Popen([sys.executable, "-B", str(self.s1 / "overnight.py"), "--continuous", "--", "/bin/bash",
+                              str(self.s1 / "nightly.sh")], cwd=self.tmp, env=e, stdout=out, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: p.poll() is None and (p.kill(), p.wait()))
+        return p, out
+
+    def _wait_for(self, what, cond, timeout=30):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(f"timed out waiting for {what}")
+
+    def test_supervisor_term_leaves_no_stop_flag_and_stop_still_prevents_relaunch(self):
+        import http.server, threading
+        class Scorer(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Scorer)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        port, flag, args = srv.server_port, self.s1 / "data/nightly.stop", self.s1 / "data/label-args"
+        text = lambda f: (f.flush(), f.seek(0), f.read())[2]
+        # 1. TERM the supervisor mid-cycle (launchctl unload / kickstart -k / logout / shutdown): no stop flag is left behind
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        self._wait_for("the first cycle to start labelling", args.exists)
+        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        self.assertFalse(flag.exists(), "a supervisor TERM must not look like nightly.sh --stop: " + text(out))
+        self.assertFalse((self.s1 / "data/nightly.pid").exists(), text(out))
+        # 2. restarted (launchd KeepAlive / the next boot), it runs a cycle
+        args.unlink()
+        sup, out = self._supervisor(port, STUB_NEW_LABELS=0)
+        self._wait_for("a cycle after the restart", lambda: "cycle 1 ended rc 0" in text(out))
+        self.assertTrue(args.exists(), text(out))
+        sup.send_signal(signal.SIGTERM); sup.wait(timeout=40)
+        self.assertFalse(flag.exists(), text(out))
+        # 3. nightly.sh --stop during a cycle still flags the stop, and a restarted supervisor does not relaunch
+        args.unlink()
+        sup, out = self._supervisor(port, STUB_LABEL_SLEEP=60)
+        self._wait_for("the cycle to start labelling", args.exists)
+        stop = self._bare("--stop")
+        self.assertIn("stopped nightly", stop.stdout, stop.stdout + stop.stderr)
+        self.assertEqual(sup.wait(timeout=40), 130, text(out))
+        self.assertTrue(flag.exists())
+        args.unlink()
+        sup, out = self._supervisor(port)
+        self.assertEqual(sup.wait(timeout=40), 0, text(out))
+        self.assertIn("stop flag", text(out))
+        self.assertFalse(args.exists(), "no cycle runs while the stop flag is there")
+
+    def test_continuous_cleanup_does_not_reload_the_scorer(self):
+        rc, log, _, _ = self._cycle(STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("scorer back", log)
+        calls = self.tmp / "home/launchctl.log"
+        self.assertNotIn("load", calls.read_text() if calls.exists() else "")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)   # window mode still restores the scorer on exit
+        self.assertIn("launchctl load", calls.read_text())
+
+    def test_min_left_pct_is_validated(self):
+        for value, want, note in (("40", "40", None), ("101", "15", "above 100"), ("abc", "15", "not a whole number"),
+                                  ("007", "7", None)):
+            rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_MIN_LEFT_PCT=value)
+            self.assertEqual(rc, 0, log)
+            self.assertTrue((self.s1 / "data/label-args").read_text().startswith(f"--min-left-pct {want} "), value)
+            if note:
+                self.assertIn("MIN_LEFT_PCT", log); self.assertIn(note, log)
+
+    def test_future_dated_bench_stamp_is_due_and_a_failed_stamp_is_logged(self):
+        repo = self.tmp / "router"; (repo / "bin").mkdir(parents=True)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\necho run >> \"$HOME/refresh.log\"\n")
+        calls = Path(self.env["HOME"]) / "refresh.log"
+        cont = {"CORTADOS_ROUTER_REPO": str(repo), "CORTADOS_S1_CONTINUOUS": "1"}
+        (self.s1 / "data/last-bench-refresh").write_text(f"{int(time.time()) + 10**6}\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, log)
+        (self.s1 / "data/last-bench-refresh").unlink()
+        (self.s1 / "data/last-bench-refresh").mkdir()   # the stamp cannot be written
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("WARNING: could not write data/last-bench-refresh", log)
+
+    def test_continuous_eval_time_ok_always_evaluates(self):
+        rc, log, run, _ = self._cycle(STUB_NEW_LABELS=3, CORTADOS_S1_EVAL_MINUTES=1440)   # window mode: never enough time
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("not evaluating", log)
+        self.assertTrue((run / "report.json").exists(), log)
 
     def test_no_new_labels_skips_training(self):
         rc, log, run = self.run_night(STUB_NEW_LABELS=5)
@@ -456,6 +671,47 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertEqual(out.stdout, "630\n", out.stdout + out.stderr)     # 400 fits a 01:30-12:00 window: no note
         out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="1200", CORTADOS_S1_EVAL_MINUTES="600")
         self.assertIn("EVAL_MINUTES=600 can never fit the 01:30-1200 window (>= 600); using 110", out.stdout)
+
+    def test_window_too_short_for_the_fallback_disables_the_deadline_check(self):
+        # DEADLINE=0300: the 01:30-03:00 window is 90 min, too short for the configured value AND the 110 fallback
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0300", CORTADOS_S1_EVAL_MINUTES="200")
+        self.assertTrue(out.stdout.startswith("90\n"), out.stdout + out.stderr)
+        self.assertIn("using 110", out.stdout)
+        self.assertIn("too short even for EVAL_MINUTES=110; deadline check disabled (0)", out.stdout)
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0300", CORTADOS_S1_EVAL_MINUTES="110")
+        self.assertIn("deadline check disabled (0)", out.stdout)
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0700", CORTADOS_S1_EVAL_MINUTES="110")
+        self.assertEqual(out.stdout, "330\n", out.stdout)                    # a window that fits 110: no note
+
+    def test_valid_now_override_is_always_logged(self):
+        out = self.minutes_left(CORTADOS_S1_NOW="0619")
+        self.assertTrue(out.stdout.startswith("41\n"), out.stdout)
+        self.assertIn("CORTADOS_S1_NOW=0619 replaces the clock for the deadline check (test hook)", out.stdout)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_NOW="0619")
+        self.assertIn("CORTADOS_S1_NOW=0619 replaces the clock", log)
+        out = self.minutes_left("0130")
+        self.assertNotIn("CORTADOS_S1_NOW", out.stdout)
+
+    def test_continuous_mode_refreshes_benchmarks_at_most_once_per_interval(self):
+        repo = self.tmp / "router"; (repo / "bin").mkdir(parents=True)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\necho run >> \"$HOME/refresh.log\"\n")
+        calls = Path(self.env["HOME"]) / "refresh.log"
+        cont = {"CORTADOS_ROUTER_REPO": str(repo), "CORTADOS_S1_CONTINUOUS": "1"}
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, log)
+        self.assertTrue((self.s1 / "data/last-bench-refresh").read_text().strip().isdigit())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, "a fresh refresh is not repeated")
+        self.assertIn("benchmark/tiers refresh skipped", log)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_BENCH_REFRESH_S="0", **cont)
+        self.assertEqual(calls.read_text().count("run"), 2, "an expired interval refreshes again")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_ROUTER_REPO=str(repo))   # window mode: every night
+        self.assertEqual(calls.read_text().count("run"), 3, log)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\nexit 4\n")
+        (self.s1 / "data/last-bench-refresh").write_text("5\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertIn("refresh-tiers.sh failed", log)
+        self.assertEqual((self.s1 / "data/last-bench-refresh").read_text(), "5\n", "a failed refresh is not stamped")
 
     def test_invalid_now_is_refused_or_falls_back_to_the_clock(self):
         for bad in ("730", "2500", "7", "abc"):

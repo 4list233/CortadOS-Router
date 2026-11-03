@@ -193,7 +193,7 @@ class ProviderTeacherTests(unittest.TestCase):
         got, log = self._work()
         self.assertEqual(got, 3)
         self.assertTrue(label._stop.is_set())
-        self.assertIn("12% left < --min-left-pct 30", log)
+        self.assertIn(f"12% left < --min-left-pct {label.MIN_LEFT_PCT_DEFAULT:g}", log)
 
     def test_low_headroom_stops_the_pass_even_when_the_answer_is_skipped(self):
         low = "claude-sonnet-5 · 12% left"
@@ -210,7 +210,7 @@ class ProviderTeacherTests(unittest.TestCase):
                 self.fake.close()
                 self.assertEqual(got, 0)
                 self.assertIn("batch dropped", log)
-                self.assertIn("12% left < --min-left-pct 30", log)
+                self.assertIn(f"12% left < --min-left-pct {label.MIN_LEFT_PCT_DEFAULT:g}", log)
                 self.assertTrue(label._stop.is_set(), f"{name}: a skipped answer must not hide low headroom")
 
     def test_ample_headroom_continues(self):
