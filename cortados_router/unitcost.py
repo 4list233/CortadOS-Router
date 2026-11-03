@@ -81,7 +81,9 @@ WINDOW_POOL = {("claude", "week (all models)"): "claude:all", ("claude", "week (
 def learn(days: int = 14) -> dict:
     since = time.time() - days * 86400
     series: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    for line in (STATE / "scarcity-history.jsonl").read_text().splitlines():
+    hist = STATE / "scarcity-history.jsonl"
+    # A fresh home has no history until the first sample's append, which runs after this learn: no data, not an error.
+    for line in (hist.read_text().splitlines() if hist.exists() else []):
         try:
             r = json.loads(line)
         except Exception:
@@ -93,14 +95,18 @@ def learn(days: int = 14) -> dict:
                 p = window_pool(lane, w[0])
                 if p:
                     series[p].append((r["ts"], float(w[1])))
-    c = sqlite3.connect(STATE / "usage.db")
-    try:
-        has_lane = "lane" in {r[1] for r in c.execute("PRAGMA table_info(usage)")}
-        lane_col = "lane" if has_lane else "NULL"
-        rows = c.execute(f"SELECT ts, runtime, model, input_tokens+output_tokens+cache_read_tokens+cache_write_tokens, {lane_col} FROM usage WHERE ts > ?",
-                         (since,)).fetchall()
-    finally:
-        c.close()
+    rows: list = []
+    db = STATE / "usage.db"
+    if db.exists():          # no ledger yet (a machine whose provider never ran a turn) is no data, not an error
+        c = sqlite3.connect(str(db))
+        try:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(usage)")}
+            if cols:         # an empty table_info means no `usage` table yet: also no data
+                lane_col = "lane" if "lane" in cols else "NULL"
+                rows = c.execute(f"SELECT ts, runtime, model, input_tokens+output_tokens+cache_read_tokens+cache_write_tokens, {lane_col} FROM usage WHERE ts > ?",
+                                 (since,)).fetchall()
+        finally:
+            c.close()
     tokens: dict[str, list[tuple[float, int]]] = defaultdict(list)
     for ts, rt, model, tok, lane in rows:
         p = pool_of(rt, model, lane)
