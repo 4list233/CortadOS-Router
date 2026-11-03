@@ -94,7 +94,7 @@ resource in the pool next to subscription "% left".
 - Derived `headroom`: free_mem_gb, cpu_idle_pct, gpu_idle_pct; `null` when the input was unavailable.
 - Other OSes: host, load and CPU count are reported; the rest is `{"available": false, "reason": ...}`. Never crashes.
 - Every command has a 4 s timeout, the Ollama fetch 0.5 s; each failure is an entry in `errors`.
-- `sample --out` writes `$CORTADOS_HOME/hardware/<host>.json` atomically (0600 file, 0700 directory).
+- `sample --out` writes `<state dir>/hardware/<host>.json` atomically (state dir per `paths.state_dir()`; 0600 file; only directories it creates are tightened to 0700). `--out PATH` never changes the mode of an existing directory. GPU is read from `ioreg -a` (plist), never the width-clipped text form.
 - Next: the `/resources` snapshot and dashboard show these files per host; later, routing can use `headroom` and
   the resident models to decide whether a local lane is worth trying (a loaded model costs no load time). This
   ticket does not wire it into routing or admission.

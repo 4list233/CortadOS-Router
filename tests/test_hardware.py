@@ -1,32 +1,77 @@
+import contextlib
+import http.client
+import io
 import json
 import os
+import plistlib
 import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from cortados_router import hardware
 
+# Real capture (M5 Max, 2026-11-03), trimmed of the tag-storage tail; includes the quoted key.
 VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                               10000.
-Pages active:                            500000.
-Pages inactive:                           20000.
-Pages speculative:                         2000.
+Pages free:                                    10000.
+Pages active:                                1203204.
+Pages inactive:                                20000.
+Pages speculative:                              2000.
+Pages throttled:                                   0.
+Pages wired down:                             285683.
+Pages purgeable:                               75106.
+"Translation faults":                     1349400432.
+Pages copy-on-write:                       123363742.
+Pages zero filled:                        1098692836.
+Pages reactivated:                          13612137.
+Pages purged:                                4914075.
+File-backed pages:                            875735.
+Anonymous pages:                             1532644.
+Pages stored in compressor:                   687935.
+Pages occupied by compressor:                 341083.
+Decompressions:                              8297807.
+Compressions:                               12560345.
+Pageins:                                    31864759.
+Pageouts:                                      40532.
+Swapins:                                      171787.
+Swapouts:                                     494031.
 """
 TOP = """Processes: 600 total
 CPU usage: 3.0% user, 2.0% sys, 95.0% idle
 Processes: 600 total
 CPU usage: 20.5% user, 9.5% sys, 70.0% idle
 """
-IOREG = '+-o AGXAcceleratorG16X  <class AGXAccelerator>\n  "PerformanceStatistics" = {"Device Utilization %"=37,"Renderer Utilization %"=30}\n'
+
+
+def ioreg_plist(*utilizations):
+    """`ioreg -a -r -c IOAccelerator -d 1` shape: the real M5 Max key set (2026-11-03), one entry per accelerator."""
+    devices = []
+    for pct in utilizations:
+        devices.append({
+            "IOClass": "AGXAcceleratorG16X", "IOObjectClass": "AGXAcceleratorG16X",
+            "IORegistryEntryName": "AGXAcceleratorG16X", "IORegistryEntryID": 4294968371,
+            "CFBundleIdentifier": "com.apple.AGXG16X", "MetalPluginName": "AGXMetalG16X",
+            "IOReportLegend": [{"IOReportGroupName": "GPU Stats", "IOReportChannels": [[1, 2, "x" * 400]]}],
+            "AGCInfo": {"fLastSubmissionPID": 512, "fSubmissionsSinceLastCheck": 0},
+            "PerformanceStatistics": {
+                "Alloc system memory": 6213484544, "Allocated PB Size": 274726912,
+                "Device Utilization %": pct, "In use system memory": 1379794944,
+                "In use system memory (driver)": 0, "Renderer Utilization %": pct, "SplitSceneCount": 0,
+                "TiledSceneBytes": 557056, "Tiler Utilization %": pct, "lastRecoveryTime": 0, "recoveryCount": 0},
+        })
+    return plistlib.dumps(devices).decode()
+
+
+IOREG = ioreg_plist(37)
 OLLAMA = json.dumps({"models": [{"name": "qwen3:8b", "model": "qwen3:8b", "size": 6000000000, "size_vram": 6000000000}]})
 
 OUTPUTS = {
-    ("sysctl", "-n", "machdep.cpu.brand_string"): "Apple M5 Max\n",
-    ("sysctl", "-n", "hw.memsize"): str(64 * hardware.GIB) + "\n",
-    ("vm_stat",): VM_STAT,
-    ("top", "-l", "2", "-n", "0", "-s", "1"): TOP,
-    ("ioreg", "-r", "-d", "1", "-c", "IOAccelerator"): IOREG,
+    (hardware.SYSCTL, "-n", "machdep.cpu.brand_string"): "Apple M5 Max\n",
+    (hardware.SYSCTL, "-n", "hw.memsize"): str(64 * hardware.GIB) + "\n",
+    (hardware.VM_STAT,): VM_STAT,
+    (hardware.TOP, "-l", "2", "-n", "0", "-s", "1"): TOP,
+    hardware.IOREG_ARGV: IOREG,
 }
 
 
@@ -66,6 +111,23 @@ class SampleTest(unittest.TestCase):
                                          "cpu_idle_pct": 70.0, "gpu_idle_pct": 63.0})
         self.assertEqual(s["errors"], [])
         self.assertEqual(s["host"], "box")
+        self.assertEqual(s["sampled_at"], 1.0)
+
+    def test_http_protocol_error_is_a_reading_failure(self):
+        def junk(url, timeout=None):
+            raise http.client.BadStatusLine("junk")
+        s = self.take(fetch=junk)
+        self.assertFalse(s["ollama_models"]["available"])
+        self.assertIn("BadStatusLine", s["ollama_models"]["reason"])
+
+    def test_ollama_entry_without_name_fails_reading(self):
+        s = self.take(fetch=lambda url, timeout=None: json.dumps({"models": [{"size": 1}, "junk"]}))
+        self.assertFalse(s["ollama_models"]["available"])
+        self.assertIn("no name", s["ollama_models"]["reason"])
+
+    def test_reason_is_capped(self):
+        s = self.take(fetch=lambda url, timeout=None: (_ for _ in ()).throw(ValueError("x" * 1000)))
+        self.assertEqual(len(s["ollama_models"]["reason"]), hardware.REASON_CHARS)
 
     def test_ollama_down_is_unavailable_not_empty(self):
         s = self.take(fetch=down_fetch)
@@ -74,8 +136,8 @@ class SampleTest(unittest.TestCase):
         self.assertEqual([e["field"] for e in s["errors"]], ["ollama_models"])
 
     def test_timeout_and_missing_gpu(self):
-        run = fake_run({("top", "-l", "2", "-n", "0", "-s", "1"): subprocess.TimeoutExpired("top", 4),
-                        ("ioreg", "-r", "-d", "1", "-c", "IOAccelerator"): "+-o nothing\n"})
+        run = fake_run({(hardware.TOP, "-l", "2", "-n", "0", "-s", "1"): subprocess.TimeoutExpired("top", 4),
+                        hardware.IOREG_ARGV: plistlib.dumps([{"IOClass": "x"}]).decode()})
         s = self.take(run=run)
         self.assertFalse(s["cpu_busy_pct"]["available"])
         self.assertIn("TimeoutExpired", s["cpu_busy_pct"]["reason"])
@@ -85,8 +147,8 @@ class SampleTest(unittest.TestCase):
         self.assertEqual({e["field"] for e in s["errors"]}, {"cpu_busy_pct", "gpu_busy_pct"})
 
     def test_missing_binary_and_bad_vm_stat(self):
-        run = fake_run({("sysctl", "-n", "hw.memsize"): FileNotFoundError("sysctl"),
-                        ("vm_stat",): "garbage\n"})
+        run = fake_run({(hardware.SYSCTL, "-n", "hw.memsize"): FileNotFoundError("sysctl"),
+                        (hardware.VM_STAT,): "garbage\n"})
         s = self.take(run=run)
         self.assertFalse(s["mem_total_bytes"]["available"])
         self.assertFalse(s["mem_available_bytes"]["available"])
@@ -101,6 +163,7 @@ class SampleTest(unittest.TestCase):
         self.assertFalse(s["mem_total_bytes"]["available"])
         self.assertIn("Linux", s["gpu_busy_pct"]["reason"])
         self.assertIn("platform", [e["field"] for e in s["errors"]])
+        self.assertFalse(s["chip"]["available"])  # never the host's own processor string
         json.dumps(s)
 
 
@@ -110,7 +173,61 @@ class ParserTest(unittest.TestCase):
             hardware.parse_vm_stat("Pages free: 1.\n")
 
     def test_ioreg_busiest_accelerator(self):
-        self.assertEqual(hardware.parse_ioreg_gpu('"Device Utilization %"=5 "Device Utilization %"=80'), 80)
+        self.assertEqual(hardware.parse_ioreg_gpu(ioreg_plist(5, 80)), 80)
+
+    def test_ioreg_long_plist_parses(self):
+        self.assertGreater(len(IOREG), 1000)  # wider than any terminal: width never matters for -a
+        self.assertEqual(hardware.parse_ioreg_gpu(IOREG), 37)
+
+    def test_ioreg_text_form_is_rejected(self):
+        with self.assertRaises(ValueError):
+            hardware.parse_ioreg_gpu('+-o AGX\n  "PerformanceStatistics" = {"Device Utilization %"=37}\n')
+
+
+class RunnerTest(unittest.TestCase):
+    def test_default_run_passes_timeout_and_check(self):
+        with mock.patch.object(hardware.subprocess, "run") as run:
+            run.return_value.stdout = "ok"
+            self.assertEqual(hardware.default_run(["x"]), "ok")
+        self.assertEqual(run.call_args.kwargs["timeout"], hardware.CMD_TIMEOUT)
+        self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_default_run_times_out(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            hardware.default_run(["/bin/sh", "-c", "sleep 5"], timeout=0.2)
+
+    def test_default_fetch_timeout_and_size_cap(self):
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=Resp(b"{}")) as op:
+            self.assertEqual(hardware.default_fetch("http://x"), "{}")
+        self.assertEqual(op.call_args.kwargs["timeout"], hardware.OLLAMA_TIMEOUT)
+        big = Resp(b"a" * (hardware.MAX_OLLAMA_BYTES + 10))
+        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=big):
+            with self.assertRaises(ValueError):
+                hardware.default_fetch("http://x")
+
+
+@contextlib.contextmanager
+def env(**values):
+    old = {k: os.environ.get(k) for k in values}
+    try:
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 class WriteTest(unittest.TestCase):
@@ -118,23 +235,76 @@ class WriteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "hardware", "box.json")
             hardware.write_atomic(path, {"a": 1})
-            self.assertEqual(json.load(open(path)), {"a": 1})
+            with open(path) as handle:
+                self.assertEqual(json.load(handle), {"a": 1})
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
             self.assertEqual(os.listdir(os.path.dirname(path)), ["box.json"])
 
-    def test_default_path_uses_cortados_home(self):
+    def test_existing_parent_keeps_its_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old = os.environ.get("CORTADOS_HOME")
-            os.environ["CORTADOS_HOME"] = tmp
-            try:
-                self.assertEqual(str(hardware.default_out_path("box")), os.path.join(tmp, "hardware", "box.json"))
-            finally:
-                if old is None:
-                    del os.environ["CORTADOS_HOME"]
-                else:
-                    os.environ["CORTADOS_HOME"] = old
+            shared = os.path.join(tmp, "shared")
+            os.mkdir(shared)
+            os.chmod(shared, 0o755)
+            hardware.write_atomic(os.path.join(shared, "hw.json"), {"a": 1})
+            self.assertEqual(stat.S_IMODE(os.stat(shared).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(shared, "hw.json")).st_mode), 0o600)
 
+    def test_every_created_level_is_0700(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "fresh-home")
+            hardware.write_atomic(os.path.join(home, "hardware", "box.json"), {"a": 1})
+            self.assertEqual(stat.S_IMODE(os.stat(home).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(tmp).st_mode) & 0o777, stat.S_IMODE(os.stat(tmp).st_mode))
+
+    def test_owned_check_refuses_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real")
+            os.mkdir(real)
+            os.symlink(real, os.path.join(tmp, "link"))
+            with self.assertRaises(PermissionError):
+                hardware.write_atomic(os.path.join(tmp, "link", "box.json"), {}, require_owned=True)
+
+    def test_default_path_uses_cortados_home(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):
+            self.assertEqual(str(hardware.default_out_path("box")), os.path.join(tmp, "hardware", "box.json"))
+
+    def test_default_path_hermes_home_only(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=None, CORTADOS_HERMES_HOME=tmp,
+                                                       WANGCAI_HOME=None, WANGCAI_HERMES_HOME=None):
+            self.assertEqual(str(hardware.default_out_path("box")), os.path.join(tmp, "hardware", "box.json"))
+
+
+class MainTest(unittest.TestCase):
+    def run_main(self, argv):
+        real = hardware.sample
+        fake = lambda: real(run=fake_run(), fetch=ok_fetch, system="Darwin", now=1.0, hostname="box")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(hardware, "sample", fake), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = hardware.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_out_without_path_writes_default(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp):
+            code, out, _ = self.run_main(["sample", "--out"])
+            path = os.path.join(tmp, "hardware", "box.json")
+            self.assertEqual(code, 0)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            with open(path) as handle:
+                self.assertEqual(json.load(handle), json.loads(out))
+
+    def test_write_failure_still_prints_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "file")
+            open(blocker, "w").close()
+            code, out, err = self.run_main(["sample", "--out", os.path.join(blocker, "x.json")])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["host"], "box")
+            self.assertIn("could not write", err)
+
+    def test_empty_out_is_an_error(self):
+        with self.assertRaises(SystemExit):
+            self.run_main(["sample", "--out", ""])
 
 if __name__ == "__main__":
     unittest.main()
