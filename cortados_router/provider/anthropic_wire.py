@@ -15,6 +15,31 @@ from typing import Any, Iterator
 MODEL_ID = "cortados"
 
 
+# Anthropic server tools: the Messages API itself executes them (web search, web fetch, code execution) and answers with
+# server_tool_use / *_tool_result blocks. This endpoint's backends are a headless CLI or Codex serving only the client's
+# own tools, so nothing here can execute one. Before this list existed, a `web_search_20250305` tool (it has a `name`)
+# became a fake bridge tool with an empty schema, and Claude Code's WebSearch got an empty success with no links
+# (incident 2026-11-03). Matched by type prefix because the API versions them with a date suffix. Client-executed
+# Anthropic-defined tools (bash_*, text_editor_*, computer_*) are not listed: the client runs those.
+SERVER_TOOL_PREFIXES = ("web_search_", "web_fetch_", "code_execution_")
+SERVER_TOOL_UNAVAILABLE = ("cortados: {names} is unavailable on this CortadOS lane: the routed backend cannot run "
+                           "Anthropic's server-side tools, so no search was performed and there are no results. Use "
+                           "WebFetch on a known URL, or report what you have without searching.")
+
+
+def is_server_tool(tool: Any) -> bool:
+    return isinstance(tool, dict) and str(tool.get("type") or "").startswith(SERVER_TOOL_PREFIXES)
+
+
+def server_tool_names(body: dict[str, Any]) -> list[str]:
+    """Names of the server tools the request declares (empty if none, or if `tools` is malformed: parse_request
+    reports that)."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list):
+        return []
+    return [str(t.get("name") or t.get("type")) for t in tools if is_server_tool(t)]
+
+
 class WireError(ValueError):
     """The request is not a Messages request this endpoint can serve; the server answers 400 with the message."""
 
@@ -259,7 +284,8 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     choice = (body.get("tool_choice") or {"type": "auto"}).get("type")
     if choice != "auto":
         raise WireError(f"tool_choice {choice!r} is not supported by the cortados model; only 'auto'")
-    return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools if t.get("name")],
+    return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools
+                                                                     if t.get("name") and not is_server_tool(t)],
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),
