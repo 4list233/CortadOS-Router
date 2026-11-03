@@ -172,7 +172,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or None, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
-                           a.get("connectors"))
+                           a.get("connectors"), client=cfg.get("client"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -194,7 +194,7 @@ def _err(text: str) -> dict:
 
 
 def route_task(provider_url: str, token: str, task: str, context: str = "", max_tokens: int = DEFAULT_MAX_TOKENS,
-               urlopen=urllib.request.urlopen, model=None) -> dict:
+               urlopen=urllib.request.urlopen, model=None, client=None) -> dict:
     """Post the subtask to the provider's /v1/messages and return the routed model's text as an MCP tool result."""
     provider_url, token = (provider_url or "").strip(), (token or "").strip()   # strip stray whitespace/newlines that break header validation
     # Never let the token reach model-visible text: every error below is scrubbed. A token too short to be a provider
@@ -239,7 +239,9 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                                  # reveal: the provider answers with the backend model (and the lane's % left)
                                  # instead of `cortados`, so the trailer below can name what really ran
                                  headers={"content-type": "application/json", "x-api-key": token,
-                                          "x-cortados-reveal": "1"})
+                                          "x-cortados-reveal": "1",
+                                          # attribution: which front door asked (e.g. the bot gateway's "grokbot")
+                                          **({"x-cortados-client": str(client)} if client else {})})
     try:
         with urlopen(req, timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read())

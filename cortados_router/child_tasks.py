@@ -520,8 +520,9 @@ def select_connectors(names) -> dict | None:
 
 
 def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False, red=None, connectors=None) -> dict:
-    """`red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
+          provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None) -> dict:
+    """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
+    can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
@@ -564,8 +565,11 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
                                   chrome, max_s, exe, selected, login)
+        if client:
+            meta["client"] = str(client)[:64]
         if mode_note:
             meta["permission_mode_note"] = mode_note
+        if client or mode_note:
             _write_json(os.path.join(d, "meta.json"), meta)
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
@@ -724,6 +728,8 @@ def _add_child_directive(cmd: list) -> None:
 
 def _event_fields(meta: dict) -> dict:
     out = {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    if meta.get("client"):
+        out["client"] = meta["client"]
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
     return out
