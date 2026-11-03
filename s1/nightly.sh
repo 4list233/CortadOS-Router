@@ -339,14 +339,15 @@ if [ -f data/pending-candidate ]; then
     hc_out=$(mktemp "${TMPDIR:-/tmp}/holdout-count.XXXXXX"); hc_err=$(mktemp "${TMPDIR:-/tmp}/holdout-count-err.XXXXXX")
     hc=""
     if holdout_count >"$hc_out" 2>"$hc_err"; then
-      hc=$(cat "$hc_out"; printf x); hc=${hc%x}
-      # exactly "<rows> <floor>", one line, at most one terminal newline, each 1-9 digits (no extra lines, no huge values)
-      if [[ "$hc" =~ ^([0-9]{1,9})\ ([0-9]{1,9})$'\n'?$ ]]; then
-        h_rows=$(dec "${BASH_REMATCH[1]}"); h_floor=$(dec "${BASH_REMATCH[2]}"); hc_ok=1
+      # validated as BYTES (bash strings drop NULs): exactly "<rows> <floor>", one line, at most one terminal newline,
+      # ASCII digits 1-9 long; prints the normalised integers
+      if hc=$(python3 -c 'import re,sys
+m = re.fullmatch(rb"(\d{1,9}) (\d{1,9})\n?", open(sys.argv[1], "rb").read())
+sys.exit(1) if not m else print(int(m[1]), int(m[2]))' "$hc_out"); then
+        read -r h_rows h_floor <<< "$hc"; hc_ok=1
       fi
-    else
-      hc=$(cat "$hc_out")
     fi
+    hc=$(head -c 400 "$hc_out" | tr -d '\000')
     if [ "$hc_ok" -ne 1 ]; then
       echo "HOLDOUT COUNT FAILED (evaluate.py --holdout-count: $( { printf '%s\n' "$hc"; cat "$hc_err"; } | grep -v '^$' | tail -1 | cut -c1-160)); pending $p_run kept, not retraining"
       rm -f "$hc_out" "$hc_err"
@@ -406,17 +407,18 @@ n=$(wc -l < data/sft/train.jsonl | tr -d ' '); [[ "$n" =~ ^[0-9]{1,9}$ ]] || { e
 gpu_alone
 BATCH="${CORTADOS_S1_BATCH:-2}"                                   # 2: the 8B stays resident beside training now, so keep the trainer's footprint small
 LR="${CORTADOS_S1_LR:-1e-4}"; EPOCHS="${CORTADOS_S1_EPOCHS:-2}"
-MAX_ITERS="${CORTADOS_S1_MAX_ITERS:-3600}"                          # a night is ~6 h; at ~6 s/step that is ~3,600 steps (2026-09-28: 7,499 steps ran into the day)
+MAX_ITERS="${CORTADOS_S1_MAX_ITERS:-3600}"; MAX_DEFAULT=3600                          # a night is ~6 h; at ~6 s/step that is ~3,600 steps (2026-09-28: 7,499 steps ran into the day)
 # Forest 2026-10-13: a tested candidate every night. A new run (nothing to resume) warm-starts from the promoted adapter and is
 # sized to finish AND be evaluated before the 07:00 stop. 1,500 steps: ~3.2 h at the measured 0.13 step/s from ~02:00, leaving
 # ~1 h for evaluation; too many and the run is cut off unevaluated (the 10-03..10-13 failure), too few and a night adds little.
 # Warm LR 5e-5: half the from-scratch rate, so one night's continued training refines the adapter rather than overwriting it.
 if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f "${SERVE_POINTER:-current.json}" ]; then
   CORTADOS_S1_INIT=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'] + '/adapters.safetensors')" "${SERVE_POINTER:-current.json}")
-  MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
+  MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; MAX_DEFAULT=1500; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
 fi
 if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then mkdir -p "$RUN/adapter"; cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/" 2>/dev/null; echo "warm start from $CORTADOS_S1_INIT"; fi
-setting MAX_ITERS 3600 1; setting BATCH 2 1; setting EPOCHS 2 1   # MAX_ITERS bounds the segment below: never let a bad value pass
+setting MAX_ITERS "$MAX_DEFAULT" 1;   # the selected cap falls back to ITS default (warm night 1500, fresh run 3600)
+ setting BATCH 2 1; setting EPOCHS 2 1   # MAX_ITERS bounds the segment below: never let a bad value pass
 [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 iters=$(( n * EPOCHS / BATCH ))
 echo "training on $n examples, $iters iterations at batch $BATCH"
@@ -425,7 +427,10 @@ while :; do
   resume=""
   last=$(ls -t "$RUN"/adapter/0*_adapters.safetensors 2>/dev/null | head -1)          # newest by time: counters restart at 1 after each resume
   # mlx_lm counts iterations from 1 again on resume: keep a cumulative count in the run dir and hand it only the remaining ones
-  ckpt=$(basename "${last:-0000000_x}" | sed -E 's/^0*([0-9]+)_.*/\1/'); [[ "$ckpt" =~ ^[0-9]{1,9}$ ]] || ckpt=0; ckpt=$((10#$ckpt))
+  ckpt=$(basename "${last:-0000000_x}" | sed -E 's/^0*([0-9]+)_.*/\1/')
+  # a checkpoint whose step count cannot be read cannot be resumed correctly (the cumulative count would be wrong): stop
+  [[ "$ckpt" =~ ^[0-9]{1,9}$ ]] || { echo "ERROR: checkpoint $last has no readable step count; not resuming (move it aside to start the segment over)"; exit 1; }
+  ckpt=$((10#$ckpt))
   # cumulative steps = steps credited BEFORE this checkpoint's segment + the checkpoint's own count. The segment base is recorded when a
   # segment starts (iters-base), never re-added on the next resume (the 2026-09-26 double count).
   base_done=$(cat "$RUN/iters-base" 2>/dev/null || echo 0)
@@ -439,7 +444,14 @@ while :; do
   fi
   if [ -f "$RUN/segment-target" ]; then
     target=$(cat "$RUN/segment-target")
-    [[ "$target" =~ ^[0-9]{1,9}$ ]] && target=$((10#$target)) || { echo "segment-target unreadable ($target); recomputing"; rm -f "$RUN/segment-target"; continue; }
+    if [[ "$target" =~ ^[0-9]{1,9}$ ]]; then
+      target=$((10#$target))
+    else
+      echo "segment-target unreadable ($target); recomputing"
+      # if it cannot be removed, recomputing would loop forever with the scorer stopped: fail (the EXIT trap brings it back)
+      rm -f "$RUN/segment-target" && [ ! -e "$RUN/segment-target" ] || { echo "ERROR: cannot remove $RUN/segment-target; stopping"; exit 1; }
+      continue
+    fi
   else
     target=$iters
     [ "$((target - done_iters))" -gt "$MAX_ITERS" ] && target=$((done_iters + MAX_ITERS))

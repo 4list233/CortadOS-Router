@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -52,6 +53,8 @@ STUBS = {
         "if a.holdout_count and os.environ.get('STUB_COUNT_RC'): print('Traceback: KeyError answers'); raise SystemExit(1)\n"
         "if a.holdout_count and os.environ.get('STUB_COUNT_GARBAGE'): print('fifty', floor); raise SystemExit(0)\n"        "if a.holdout_count and os.environ.get('STUB_COUNT_MULTILINE'): print(300, floor); print('garbage'); raise SystemExit(0)\n"
         "if a.holdout_count: print('labels: kept N Claude-teacher rows', file=__import__('sys').stderr)   # like read_labels\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_NUL'):\n"
+        "    __import__('sys').stdout.buffer.write({'1': b'300 200\\x00\\n', '2': b'30\\x000 200\\n'}[os.environ['STUB_COUNT_NUL']]); raise SystemExit(0)\n"
         "if a.holdout_count and os.environ.get('STUB_COUNT_TRAILING'): print(300, floor); print(); raise SystemExit(0)\n"
         "short = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0'   # the holdout is short only in the blocked scenarios\n"
         "if a.holdout_count: print(50 if short else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
@@ -523,6 +526,45 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertIn("WARNING: synced router db", log, "a huge age limit must not make a stale db look fresh")
         self.assertIn("CORTADOS_S1_LOG_KEEP=" + "9" * 30 + " is not a whole number; keeping 14", log)
         self.assertIn("MAX_ITERS=x is not a whole number up to 9 digits; using 3600", log)
+
+    def test_nul_bytes_in_holdout_count_keep_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_NUL="1")
+
+    def test_embedded_nul_in_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_NUL="2")
+
+    def test_invalid_warm_start_cap_uses_its_own_default(self):
+        self.run_night(STUB_NEW_LABELS=3)                                          # promotes: a serving pointer exists
+        self.assertTrue(self.pointer.exists())
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_NIGHT_ITERS="bogus")
+        self.assertIn("warm start from", log)
+        self.assertIn("MAX_ITERS=bogus is not a whole number up to 9 digits; using 1500", log)
+
+    def _pending_run(self, segment_target, checkpoint="0000100_adapters.safetensors"):
+        run = self.s1 / "runs/2026-01-01"
+        (run / "adapter").mkdir(parents=True)
+        (run / "adapter" / checkpoint).write_text("w")
+        (run / "segment-target").write_text(segment_target)
+        (run / "nightly.log").write_text("")
+        return run
+
+    def test_unremovable_bad_segment_target_fails_promptly(self):
+        run = self._pending_run("garbage")
+        run.chmod(0o555); self.addCleanup(run.chmod, 0o755)                         # segment-target cannot be removed
+        t0 = time.time()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertLess(time.time() - t0, 30, "must not spin")
+        self.assertNotEqual(rc, 0, log)
+        self.assertIn("ERROR: cannot remove runs/2026-01-01/segment-target; stopping", log)
+        calls = (self.tmp / "home/launchctl.log").read_text().split("\n")
+        self.assertTrue(calls[-2].startswith("launchctl load"), f"the scorer is restarted on the error exit: {calls}")
+
+    def test_unreadable_checkpoint_count_stops_the_resume(self):
+        self._pending_run("100", checkpoint="0abc_adapters.safetensors")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertNotEqual(rc, 0, log)
+        self.assertIn("ERROR: checkpoint runs/2026-01-01/adapter/0abc_adapters.safetensors has no readable step count; not resuming", log)
+        self.assertNotIn("resuming from", log)
 
     def test_trailing_blank_line_in_holdout_count_keeps_the_candidate(self):
         self._count_failure_keeps_candidate(STUB_COUNT_TRAILING=1)
