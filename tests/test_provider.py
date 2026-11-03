@@ -394,6 +394,61 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(self.post({"tools": [READ_TOOL], "messages": summary})["stop_reason"], "end_turn")
         self.assertEqual(len(self.reg.sessions), 2)
 
+    def test_a_retry_of_the_answered_turn_replays_the_stored_response_without_the_backend(self):
+        # A lost/timed-out response: the session already holds turn 2's reply, the client re-sends turn 2.
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"],
+                                                  "content": "hello"}]}]
+        body = {"tools": [READ_TOOL], "messages": history}
+        r2 = self.post(body)
+        (session,) = self.reg.sessions.values()
+        before = list(session.history)
+        with mock.patch.object(session, "run_turn", side_effect=AssertionError("backend called")), \
+                mock.patch.object(session, "deliver", side_effect=AssertionError("backend called")), \
+                self.assertLogs("cortados.provider", "INFO") as logs:
+            again = self.post(body)
+        self.assertEqual(again, r2)
+        self.assertEqual(session.history, before)
+        self.assertTrue(any("replaying its last response" in l for l in logs.output))
+        # The conversation still continues from the replayed reply.
+        r3 = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r2["content"]},
+                                                                     {"role": "user", "content": "thanks"}]})
+        self.assertEqual(r3["stop_reason"], "end_turn")
+
+    def test_a_retry_with_a_different_user_turn_still_409s_and_says_why(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        history += [{"role": "assistant", "content": r1["content"]}]
+        use = r1["content"][-1]["id"]
+        self.post({"tools": [READ_TOOL], "messages": history + [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "hello"}]}]})
+        other = {"tools": [READ_TOOL], "messages": history + [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "something else"}]}]}
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            self.assertEqual(self.status_of(other), 409)
+        self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
+
+    def _409_class(self, body):
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            self.assertEqual(self.status_of(body), 409)
+        line = next(l for l in logs.output if "409 lost conversation" in l)
+        return line.split("class=")[1].split()[0]
+
+    def test_the_409_log_classifies_client_ahead_diverged_no_candidate_and_reaped(self):
+        history = self._two_tool_turns()
+        tail = [{"role": "user", "content": "thanks"}]
+        ahead = history + tail + [{"role": "assistant", "content": [{"type": "text", "text": "never written"}]}]
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": ahead + tail}), "client_ahead")
+        edited = list(history)
+        edited[3] = {"role": "assistant", "content": [{"type": "text", "text": "an answer this endpoint never wrote"}]}
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": edited + tail}), "diverged_at=1")
+        stranger = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": stranger + tail}), "no_candidate")
+        self.reg.reap(-1)                               # every idle session is past a negative idle limit
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": history + tail}), "reaped_recently")
+
     def test_an_ambiguous_history_is_refused_not_guessed(self):
         opening = [{"role": "user", "content": "hi"}]
         a = self.post({"tools": [READ_TOOL], "messages": opening})
@@ -954,9 +1009,8 @@ class FailedSessionTombstoneTests(EndpointHarness):
         self.assertEqual(sum("no conversation identity" in line for line in lines), 1, lines)
         self.assertEqual(len(self.reg.tombstones), 0)                  # no identity: nothing published
         self.assertEqual(self.error_of(body, none)[0], 409)            # A's own retry: the ordinary 409 too
-        code, err, _ = self.error_of(self.lose_a_reply(none), none)
-        self.assertEqual(code, 409)
-        self.assertNotIn("failed at", err["error"]["message"])
+        # B's retry of its answered turn is now replayed from B's live session (Replay): never A's failure.
+        self.assertIn("content", self.post(self.lose_a_reply(none), headers=none))
 
     def test_the_missing_identity_is_logged_once_per_process(self):
         none = {"X-Claude-Code-Session-Id": ""}
@@ -978,9 +1032,8 @@ class FailedSessionTombstoneTests(EndpointHarness):
     def test_distinct_identities_never_share_a_tombstone(self):
         self.failed_conversation(headers={"X-Claude-Code-Session-Id": "session-a"})
         b = {"X-Claude-Code-Session-Id": "session-b"}
-        code, err, _ = self.error_of(self.lose_a_reply(b), b)
-        self.assertEqual(code, 409)
-        self.assertNotIn("failed at", err["error"]["message"])
+        # B's retry of its answered turn is now replayed from B's live session (Replay): never A's failure.
+        self.assertIn("content", self.post(self.lose_a_reply(b), headers=b))
 
     def test_a_sibling_sharing_the_session_id_retrying_a_lost_reply_gets_the_409_not_the_failure(self):
         # Round-4 reproduction: Claude Code's main loop and subagents share one session id. Sibling A fails after
@@ -988,9 +1041,8 @@ class FailedSessionTombstoneTests(EndpointHarness):
         # previous history. B's live session strictly extends it: B gets the ordinary 409, never A's terminal error.
         body = self.failed_conversation()
         self.assertEqual(len(self.reg.tombstones), 1)
-        code, err, _ = self.error_of(self.lose_a_reply(self.HEADERS))
-        self.assertEqual(code, 409)
-        self.assertNotIn("failed at", err["error"]["message"])
+        # B's retry of its answered turn is now replayed from B's live session (Replay): never A's failure.
+        self.assertIn("content", self.post(self.lose_a_reply(self.HEADERS), headers=self.HEADERS))
         self.assertEqual(len(self.reg.sessions), 1)                    # B is untouched and still live
         self.assertEqual(self.error_of(body)[0], 409)                  # A's retry is indistinguishable from B's
 

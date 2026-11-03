@@ -112,9 +112,19 @@ Not yet in P1, each needing a decision or another phase:
   history that keeps some but not all earlier assistant messages is a 409. (c) A removed or edited assistant message,
   or a different tool_use id, is a 409: never continued, because the CLI session would answer from a history the
   client no longer has. Rebuilding (b)/(c) from the transcript is still open. The live 409 bursts of 2026-11-03
-  (several conversations within two minutes) are therefore NOT explained by (a); remaining suspects are the idle reaper
-  (`CORTADOS_PROVIDER_IDLE_S`, 1800 s, closes every idle session in one sweep), a rewritten assistant text, or
-  partial compaction: the provider log needs the reason a find missed before a fix is chosen.
+  (12:32-12:42, ~40 across several long `claude -p` sessions; no restart, no sleep, reaper last ran 12:07) are NOT
+  explained by (a) or the reaper. Leading hypothesis: a lost/timed-out response retried by the client. The session
+  already holds turn N's reply, the retry's history is one reply shorter, and that 409 poisons every later request.
+  Now handled: (d) a request whose history is a live session's minus its last reply AND whose new user turn (content
+  + tool results, `anthropic_wire.turn_fingerprint`) is the one that reply answered gets the stored last response
+  again (same id, content, stop reason, usage), without the backend; logged as "replaying its last response". One
+  response per session, at most `REPLAY_MAX_BYTES` (1 MiB; larger replies are not kept and their retry stays a 409).
+  A different user turn on that history is still a 409. (e) Every lost-conversation 409 logs
+  `409 lost conversation: class=<c> candidates=<n> common_prefix=<i> request_len=<n> candidate_len=<n>` (counts and
+  lengths only, no content or fingerprints), with `class` one of `retry_of_answered_turn` (a retry that could not be
+  replayed), `client_ahead`, `diverged_at=<i>`, `no_candidate`, or `reaped_recently` (the endpoint closed a
+  conversation with the same first reply within the last hour: `Registry.closed`, 128 entries). The next burst's log
+  lines say which case it was.
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.

@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -64,6 +64,13 @@ IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
 # goes first.
 TOMBSTONE_TTL_S = 900.0
 TOMBSTONE_MAX = 256
+# Recently closed conversations kept for the 409 diagnostic (Registry.closed): enough to cover the live conversations
+# of a busy endpoint, and an hour, past which a reap no longer explains a 409.
+CLOSED_RECORD_MAX = 128
+CLOSED_RECORD_TTL_S = 3600.0
+# Largest last response a session keeps for a retry replay (_remember_reply): 1 MiB covers ordinary replies (text plus
+# tool calls) while bounding what each idle session can hold.
+REPLAY_MAX_BYTES = 1 << 20
 # The answer to a request on a failed conversation must be terminal: an api_error (5xx, or an SSE `api_error`) is
 # what Claude Code and the Anthropic SDK retry, so a retryable shape would make the client re-send the same doomed
 # request until its retry budget runs out. 400 invalid_request_error is not retried (the SDK retries 408, 409, 429
@@ -480,6 +487,12 @@ class Registry:
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
+        # Recently closed conversations, for the 409 diagnostic only (find -> _lost_diagnostic): (closed_at, reason,
+        # first reply fingerprint, history length). A 409 whose first fingerprint is here was a conversation this
+        # endpoint closed itself (reaped, dropped, failed), which tells a reap from a lost response or an edited
+        # history. Fingerprints are digests of reply text, never logged; bounded by count and age so a long-running
+        # endpoint keeps only what can still explain a 409 burst.
+        self.closed: "deque[tuple[float, str, str, int]]" = deque(maxlen=CLOSED_RECORD_MAX)
 
     def claude_config_dir(self, account: str | None) -> str | None:
         """The CLAUDE_CONFIG_DIR for a routed Claude account id, from tables/accounts.json; None (the default login)
@@ -545,19 +558,83 @@ class Registry:
     def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
-        tombstone under `failure_key` makes it a FailedSession instead."""
+        tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
+        (see Replay) raises Replay with the stored response."""
         if not turn.history:
             return None
         with self._lock:
             matches = [s for s in self.sessions.values() if s.history == turn.history]
+            replays = [] if matches else self._replays(turn)
         if len(matches) > 1:
             raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
         if not matches:
+            if len(replays) == 1:
+                s, last = replays[0]
+                logger.info("conversation %s: replaying its last response to a retry of the answered turn "
+                            "(history %d replies); the backend is not called", s.id[:8], len(turn.history))
+                raise Replay(s, last)
             dead = self.failure(failure_key, turn.history, scope)
             if dead:
                 raise dead
+            logger.warning("409 lost conversation: %s", self._lost_diagnostic(turn))
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
+
+    def _replays(self, turn: anthropic_wire.ClientTurn) -> list:
+        """(session, last_reply) for each live session this request is an exact retry of: its history is the session's
+        minus the last reply, and its new user turn (turn_fingerprint) is the one that reply answered. Caller holds
+        self._lock. last_reply[0] is the history length the reply belongs to, so a reply recorded for an older turn
+        (or a session mid-way through appending) never matches."""
+        n, fp, out = len(turn.history), None, []
+        for s in self.sessions.values():
+            last = getattr(s, "last_reply", None)
+            if last and last[0] == len(s.history) == n + 1 and s.history[:n] == turn.history:
+                fp = fp or anthropic_wire.turn_fingerprint(turn)
+                if last[1] == fp:
+                    out.append((s, last))
+        return out
+
+    def _lost_diagnostic(self, turn: anthropic_wire.ClientTurn) -> str:
+        """Why a continuation matched no live session, for the 409 log line: counts, lengths and a classification only
+        (no fingerprints, no content). `retry_of_answered_turn`: the request is the best candidate's history minus its
+        last reply (a lost response, retried, with a different user turn or no stored reply to replay);
+        `client_ahead`: the candidate's history is a strict prefix of the request's; `diverged_at=<i>`: the first
+        index where they differ; `reaped_recently`: no live candidate, but this endpoint closed a conversation with
+        the same first reply within CLOSED_RECORD_TTL_S; `no_candidate`: nothing shares the first reply."""
+        h, now = turn.history, time.time()
+        with self._lock:
+            hists = [list(s.history) for s in self.sessions.values()]
+            closed = [c for c in self.closed if now - c[0] <= CLOSED_RECORD_TTL_S and c[2] == h[0]]
+
+        def lcp(a: list) -> int:
+            i = 0
+            while i < min(len(a), len(h)) and a[i] == h[i]:
+                i += 1
+            return i
+        cands = [c for c in hists if c and c[0] == h[0]]
+        if not cands:
+            if closed:
+                at, reason, _, length = closed[-1]
+                return (f"class=reaped_recently candidates=0 request_len={len(h)} closed_len={length} "
+                        f"closed_reason={reason} closed_ago_s={int(now - at)}")
+            return f"class=no_candidate candidates=0 request_len={len(h)} live_sessions={len(hists)}"
+        best = max(cands, key=lambda c: (lcp(c), -abs(len(c) - len(h))))
+        common = lcp(best)
+        if len(best) == len(h) + 1 and common == len(h):
+            cls = "retry_of_answered_turn"
+        elif common == len(best) < len(h):
+            cls = "client_ahead"
+        else:
+            cls = f"diverged_at={common}"
+        return (f"class={cls} candidates={len(cands)} common_prefix={common} request_len={len(h)} "
+                f"candidate_len={len(best)}")
+
+    def note_closed(self, s, reason: str) -> None:
+        """Remember a closed conversation for _lost_diagnostic (see self.closed)."""
+        hist = getattr(s, "history", None)
+        if hist:
+            with self._lock:
+                self.closed.append((time.time(), reason, hist[0], len(hist)))
 
     def failure(self, key: str | None, history: list | None = None,
                 scope: str | None = None) -> "FailedSession | None":
@@ -606,6 +683,7 @@ class Registry:
             _unkeyed_logged = True
             logger.info("failed conversation left no tombstone (%s); its retries get the ordinary 409. "
                         "Logged once per process.", unkeyed_reason)
+        self.note_closed(s, "failed")
         with self._lock:
             self.sessions.pop(s.id, None)
             if key:
@@ -619,7 +697,8 @@ class Registry:
         with self._lock:
             return self.sessions.get(session_id)
 
-    def drop(self, s) -> None:
+    def drop(self, s, reason: str = "dropped") -> None:
+        self.note_closed(s, reason)
         with self._lock:
             self.sessions.pop(s.id, None)
         s.close()
@@ -629,7 +708,21 @@ class Registry:
             stale = [s for s in self.sessions.values() if time.time() - s.last_used > idle_s and not s.lock.locked()]
         for s in stale:
             logger.info("closing idle conversation %s", s.id[:8])
-            self.drop(s)
+            self.drop(s, "reaped")
+
+
+def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
+    """Keep the session's last response for one replay (Replay), replacing the previous one: only the last answered
+    turn can be retried by a client that lost its response, so one per session is all that is needed. Not kept when
+    its serialized size passes REPLAY_MAX_BYTES (a replay is then a 409, as before), so idle sessions cannot pin
+    large replies in memory. Called before the reply's fingerprint is appended, under the session lock."""
+    blocks, stop, usage = result
+    try:
+        size = len(json.dumps([blocks, usage], default=str))
+    except (TypeError, ValueError):
+        size = REPLAY_MAX_BYTES + 1
+    session.last_reply = None if size > REPLAY_MAX_BYTES else (
+        len(session.history) + 1, anthropic_wire.turn_fingerprint(turn), msg_id, model, blocks, stop, usage)
 
 
 _unkeyed_logged = False                    # Registry.fail has logged a continuation it could not tombstone
@@ -637,6 +730,18 @@ _unkeyed_logged = False                    # Registry.fail has logged a continua
 
 class LostSession(LookupError):
     pass
+
+
+class Replay(Exception):
+    """A request that retries a live session's last answered turn (Registry._replays): the client never received that
+    response (a lost or timed-out reply), so the session's history is one reply ahead of the request's and every
+    later request would 409. The stored response is sent again; the backend is not called and the session is
+    unchanged. `last` is the session's last_reply: (history length, turn fingerprint, msg_id, model, blocks, stop,
+    usage)."""
+
+    def __init__(self, session, last):
+        super().__init__("replay")
+        self.session, self.last = session, last
 
 
 class FailedSession(LostSession):
@@ -1059,6 +1164,25 @@ class Handler(BaseHTTPRequestHandler):
             # Terminal, not retryable: see TERMINAL_ERROR.
             return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(exc)),
                               headers={"x-should-retry": "false"})
+        except Replay as rp:
+            _, _, msg_id, model, blocks, stop, usage = rp.last
+            if turn.stream:
+                try:
+                    self.send_response(200)
+                    self._route_header(rp.session)
+                    self.send_header("content-type", "text/event-stream")
+                    self.send_header("cache-control", "no-cache")
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    self.wfile.write(wire.stream_start(msg_id, model))
+                    for chunk in wire.stream_body(msg_id, model, blocks, stop, usage):
+                        self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError as gone:
+                    logger.info("client gone while the replayed reply was written (%s)", gone)
+                return
+            return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         changed = self._model_change(session, body) if session is not None else None
@@ -1170,6 +1294,7 @@ class Handler(BaseHTTPRequestHandler):
                 _turn_t0 = time.time()
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
+                _remember_reply(session, turn, msg_id, model, outcome["turn"])
                 session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
                 if session.route and not session.route_logged and reg.executed:
                     try:

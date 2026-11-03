@@ -79,6 +79,12 @@ def mcp_content(blocks: Any) -> list[dict[str, Any]]:
     return out
 
 
+def turn_fingerprint(turn: "ClientTurn") -> str:
+    """Digest of a request's new user turn (its user content and tool results), so a retry of an answered turn can be
+    told from a different message on the same history (server.Replay). Never logged."""
+    return hashlib.sha256(json.dumps([turn.content, turn.tool_results], sort_keys=True, default=str).encode()).hexdigest()
+
+
 def reply_fingerprint(blocks: Any) -> str:
     """One assistant message as the endpoint wrote it: its text (whitespace-trimmed, blocks joined) and its tool_use
     ids. Every assistant message in a conversation was written by this endpoint, so the sequence of fingerprints
