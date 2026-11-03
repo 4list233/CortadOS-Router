@@ -339,7 +339,14 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   placeholder and counted in `redact_unparsed_lines`, never text-redacted. The raw pass (each credential at up to
   eight JSON-escaping depths) then runs over everything as a second layer. If the structural pass itself fails, the
   task fails with `redact_error` (logs withheld) and the raw pass still runs. A `manual` child is reported by Claude
-  Code as mode `default`, which is not treated as leaving the requested mode.
+  Code as mode `default`, which is not treated as leaving the requested mode. A string that looks like JSON (an
+  object, array or string literal) is decoded recursively, so a chain of quoted strings is unwound; one that does not
+  decode is withheld, not text-redacted. Keys get the same treatment, and an object whose key cannot be redacted
+  safely, or whose redacted keys collide, is withheld whole.
+- Threat model: redaction protects against ACCIDENTAL credential exposure in logs and tool results, at any realistic
+  encoding depth, and fails closed on anything it cannot parse. Encodings a child builds on purpose to smuggle out its
+  own token are out of scope: the child already holds that token in its environment, and the same OS user can read
+  the token file. The real fix for that is per-task scoped tokens, which the provider does not offer yet.
 - Relay scratch dir: the provider's headless backend (Claude CLI or Codex) runs in an empty scratch dir, and its CLI
   tells the model so in its own environment block, next to the client's real one. A model that trusted it aimed a
   child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody

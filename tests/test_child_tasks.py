@@ -1008,6 +1008,65 @@ class ChildTaskTests(unittest.TestCase):
             inner = json.loads(inner["wrapped"])
         self.assertEqual(inner, {"token": "***"})            # still the same structure, decodable
 
+    def test_malformed_json_past_the_raw_escape_depth_is_withheld(self):
+        tok = 'ab"QQZZ\\ef-123456'
+        red = ct.Redactor([tok])
+        value = '{"token": ' + json.dumps(tok) + ', broken'    # looks like JSON, does not decode
+        for _ in range(ct.redact.ESCAPE_DEPTH + 2):
+            value = json.dumps({"wrapped": value})
+        line = json.dumps({"outer": value})
+        self.assertIn("QQZZ", red.text(line))                 # the raw pass alone leaks it at this depth
+        clean, withheld = red.deep_count(json.loads(line))
+        self.assertNotIn("QQZZ", json.dumps(clean))
+        self.assertEqual(withheld, 1)
+        inner = clean["outer"]
+        for _ in range(ct.redact.ESCAPE_DEPTH + 2):
+            inner = json.loads(inner)["wrapped"]
+        self.assertEqual(inner, ct.redact.WITHHELD)             # withheld wholesale, not text-redacted
+        self.assertEqual(red.deep_count({"x": "[INFO] " + tok}), ({"x": ct.redact.WITHHELD}, 1))
+
+    def test_a_chain_of_quoted_strings_is_unwound(self):
+        tok = 'ab"QQZZ\\ef-123456'
+        red = ct.Redactor([tok])
+        levels = ct.redact.ESCAPE_DEPTH + 2
+        value = "token=" + tok
+        for _ in range(levels):                                 # a JSON string literal inside a string, again and again
+            value = json.dumps(value)
+        self.assertIn("QQZZ", red.text(value))
+        clean, withheld = red.deep_count({"v": value})
+        self.assertEqual(withheld, 0)
+        self.assertNotIn("QQZZ", json.dumps(clean))
+        inner = clean["v"]
+        for _ in range(levels):
+            inner = json.loads(inner)
+        self.assertEqual(inner, "token=***")
+        bad = json.dumps(json.dumps(tok))[:-2]                   # a quoted string cut short: does not decode
+        self.assertEqual(red.deep_count([bad]), ([ct.redact.WITHHELD], 1))
+        deep = "[" * 1500 + json.dumps(tok) + "]" * 1500         # too deep to decode
+        self.assertEqual(red.deep_count([json.dumps(deep)]), ([json.dumps(ct.redact.WITHHELD)], 1))
+
+    def test_keys_are_redacted_structurally_and_unsafe_keys_withhold_the_object(self):
+        tok = 'ab"QQZZ\\ef-123456'
+        red = ct.Redactor([tok])
+        key = {"k": tok}
+        for _ in range(ct.redact.ESCAPE_DEPTH + 2):              # an encoded key, deeper than the raw pass matches
+            key = {"w": json.dumps(key)}
+        enc = json.dumps(key)
+        self.assertIn("QQZZ", red.text(enc))
+        clean, withheld = red.deep_count({"outer": {enc: 1, "other": 2}})
+        self.assertEqual(withheld, 0)
+        self.assertNotIn("QQZZ", json.dumps(clean))
+        self.assertEqual(clean["outer"]["other"], 2)
+        (k,) = [k for k in clean["outer"] if k != "other"]
+        inner = json.loads(k)
+        for _ in range(ct.redact.ESCAPE_DEPTH + 2):
+            inner = json.loads(inner["w"])
+        self.assertEqual(inner, {"k": "***"})
+        # a key that redacts to the name of another key: the whole object goes, not one silent value
+        self.assertEqual(red.deep_count({"keep": {"a": 0, tok: 1, "***": 2}}), ({"keep": ct.redact.WITHHELD}, 1))
+        # a key that cannot be processed safely (malformed JSON): the whole object goes, counted once
+        self.assertEqual(red.deep_count([{"{" + tok: 1, "b": "{bad"}]), ([ct.redact.WITHHELD], 1))
+
     def test_redact_stream_file_counts_lines_it_could_not_parse(self):
         tok = "stream-token-000001"
         path = os.path.join(self.tmp, "s.log")

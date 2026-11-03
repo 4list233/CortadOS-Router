@@ -1,5 +1,11 @@
 """Credential redaction for the child-task runner (child_tasks.Redactor builds on this class).
 
+Threat model: this protects against ACCIDENTAL credential exposure in logs and tool results (a token echoed by a
+tool, quoted in an error, nested in JSON a tool printed) at any realistic encoding depth, and fails closed on anything
+it cannot parse (WITHHELD). Encodings a child builds on purpose to smuggle out its own token (base64, splitting,
+arithmetic) are out of scope: the child already holds that token in its environment, and the same OS user can read
+the token file. The real fix for that is per-task scoped tokens, which the provider does not offer yet.
+
 One implementation: every credential and its JSON-escaped spelling (JSON output escapes quotes and backslashes in
 it), matched in a single alternation, longest first, so a shorter credential that is a prefix of a longer one never
 splits it. Redact BEFORE serializing or truncating: truncating first can cut a credential to a prefix that no longer
@@ -73,23 +79,35 @@ class Redactor:
 
     def _deep(self, obj, counter):
         if isinstance(obj, str):
-            if obj.lstrip()[:1] in ("{", "["):
-                try:
-                    inner = json.loads(obj)
-                except ValueError:              # not JSON after all: plain text
-                    return self.text(obj)
-                except RecursionError:
-                    counter[0] += 1
-                    return WITHHELD
-                if isinstance(inner, (dict, list)):
-                    try:
-                        return json.dumps(self._deep(inner, counter))
-                    except RecursionError:
-                        counter[0] += 1
-                        return WITHHELD
-            return self.text(obj)
+            return self._deep_str(obj, counter)
         if isinstance(obj, list):
             return [self._deep(x, counter) for x in obj]
         if isinstance(obj, dict):
-            return {self.text(str(k)): self._deep(v, counter) for k, v in obj.items()}
+            out = {}
+            for k, v in obj.items():
+                before = counter[0]
+                key = self._deep_str(str(k), counter)
+                if counter[0] != before or key in out:
+                    # A key that could not be redacted safely, or two keys that redact to the same name (one would
+                    # silently replace the other): the whole object is withheld, counted once.
+                    counter[0] = before + 1
+                    return WITHHELD
+                out[key] = self._deep(v, counter)
+            return out
         return obj
+
+    def _deep_str(self, s: str, counter) -> str:
+        """A string, structurally: JSON text (an object, array or string literal, after leading whitespace) is decoded,
+        redacted the same way (recursively, so a chain of quoted strings is unwound) and re-encoded; plain text gets
+        text(). Anything that looks like JSON but does not decode, or is too deep to decode or walk, is WITHHELD and
+        counted: never left to text(), which matches only ESCAPE_DEPTH escaping layers."""
+        if s.lstrip()[:1] not in ("{", "[", '"'):
+            return self.text(s)
+        try:
+            inner = json.loads(s)
+            if not isinstance(inner, (dict, list, str)):
+                raise ValueError("not an object, array or string")
+            return json.dumps(self._deep(inner, counter))
+        except (ValueError, RecursionError):
+            counter[0] += 1
+            return WITHHELD
