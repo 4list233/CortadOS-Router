@@ -141,8 +141,18 @@ _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
 
 
+# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, or loading
+# anything but its own inline code and same-origin fetches.
+DASHBOARD_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
 def _dashboard_html() -> bytes:
-    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /resources)."""
+    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage)."""
     if "b" not in _dashboard_cache:
         _dashboard_cache["b"] = _DASHBOARD_PATH.read_bytes()
     return _dashboard_cache["b"]
@@ -900,12 +910,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
             try:
-                html = _dashboard_html()                # static page; the data it shows (/resources) still needs the token
+                html = _dashboard_html()                # static page; the data it shows (/v1/cortados/usage) still needs the token
             except OSError:
                 return self._error(500, "api_error", "dashboard page unavailable")
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(html)))
+            for k, v in DASHBOARD_HEADERS.items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(html)
             return

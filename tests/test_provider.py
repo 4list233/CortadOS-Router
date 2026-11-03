@@ -704,7 +704,7 @@ class EndpointTests(EndpointHarness):
             self.assertIn("text/html", r.headers.get("content-type", ""))
             body = r.read().decode()
         self.assertIn("CortadOS Router", body)               # the page title/heading
-        self.assertIn("/resources", body)                    # it fetches the resources endpoint for its data
+        self.assertIn("/v1/cortados/usage", body)            # it fetches the usage endpoint for its data
 
 
 class RoutedHarness(EndpointHarness):
