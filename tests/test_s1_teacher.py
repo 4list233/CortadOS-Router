@@ -358,10 +358,22 @@ class MainExitCodeTests(unittest.TestCase):
         self.assertEqual(len(common.read_jsonl(label.LABELS)), 8)          # 4 requests x k=2
 
     def test_quota_refusal_exits_3_and_keeps_partial_labels(self):
-        code, out = self._main([(200, {}, answers_for), (503, {}, err("no claude subscription account can take this request"))])
+        code, out = self._main([(200, {}, answers_for), (503, {}, err(SPENT_503))] + [(200, {}, answers_for)] * 2)
         self.assertEqual(code, label.EXIT_STOPPED)
+        self.assertEqual(len(self.fake.seen), 2, "a spent-quota refusal stops at once: no retry, no further batch")
         self.assertEqual(len(common.read_jsonl(label.LABELS)), 2)          # the first batch's labels survive
-        self.assertIn("stopped early", out)
+        self.assertIn("stopped early: quota", out)
+        self.assertEqual((label.DATA / label.STOP_REASON_FILE).read_text().strip(), "quota")
+
+    def test_teacher_stop_reasons(self):
+        self.assertEqual(label.stop_reason_for(503, SPENT_503), "quota")
+        self.assertEqual(label.stop_reason_for(401, "bad token"), "auth")
+        self.assertEqual(label.stop_reason_for(404, "unserved pin"), "rejected")
+        self.assertEqual(self._main([(401, {}, err("bad token", "authentication_error"))])[0], 3)
+        self.assertEqual((label.DATA / label.STOP_REASON_FILE).read_text().strip(), "auth")
+        self.fake.close(); reset_pass_state()
+        self.assertEqual(self._main([(500, {}, err("x", "api_error"))] * 3)[0], 3)
+        self.assertEqual((label.DATA / label.STOP_REASON_FILE).read_text().strip(), "unreachable")
 
     def test_auth_error_exits_3(self):
         self.assertEqual(self._main([(401, {}, err("bad token", "authentication_error"))])[0], 3)

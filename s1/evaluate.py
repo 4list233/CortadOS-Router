@@ -238,7 +238,15 @@ def main() -> int:
     ap.add_argument("--holdout-key", action="store_true",
                     help="print the evaluation fingerprint of the current holdout (effective teacher labels + settings) and exit; "
                          "nightly.sh uses it to re-evaluate a waiting candidate only when its holdout changed")
+    ap.add_argument("--holdout-count", action="store_true",
+                    help="print '<Claude holdout rows> <promotion floor>' and exit; nightly.sh holds retraining while a blocked candidate "
+                         "waits below the floor")
     a = ap.parse_args()
+    if a.holdout_count:
+        reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
+        holdout, _ = build_eval_sets(reqs, read_labels())
+        print(f"{len(holdout)} {MIN_TEACHER_HOLDOUT}")
+        return 0
     if a.holdout_key:
         reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
         holdout, _ = build_eval_sets(reqs, read_labels())

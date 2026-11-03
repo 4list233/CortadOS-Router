@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,10 +46,19 @@ STUBS = {
     "evaluate.py": (
         "import argparse, json, os\n"
         "ap = argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--adapter'); ap.add_argument('--out')\n"
-        "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); a = ap.parse_args()\n"
+        "ap.add_argument('--baseline', action='store_true'); ap.add_argument('--holdout-key', action='store_true'); ap.add_argument('--holdout-count', action='store_true'); a = ap.parse_args()\n"
         "hk = open('data/stub-holdout').read() if os.path.exists('data/stub-holdout') else 'h0'\n"
         "floor = int(os.environ.get('CORTADOS_S1_MIN_HOLDOUT', '200'))\n"
         "if a.holdout_key: print(f'{hk}-min{floor}'); raise SystemExit(0)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_RC'): print('Traceback: KeyError answers'); raise SystemExit(1)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_GARBAGE'): print('fifty', floor); raise SystemExit(0)\n"        "if a.holdout_count and os.environ.get('STUB_COUNT_MULTILINE'): print(300, floor); print('garbage'); raise SystemExit(0)\n"
+        "if a.holdout_count: print('labels: kept N Claude-teacher rows', file=__import__('sys').stderr)   # like read_labels\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_NUL'):\n"
+        "    __import__('sys').stdout.buffer.write({'1': b'300 200\\x00\\n', '2': b'30\\x000 200\\n'}[os.environ['STUB_COUNT_NUL']]); raise SystemExit(0)\n"
+        "if a.holdout_count and os.environ.get('STUB_COUNT_TRAILING'): print(300, floor); print(); raise SystemExit(0)\n"
+        "short = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0'   # the holdout is short only in the blocked scenarios\n"
+        "if a.holdout_count: print(50 if short else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
+        "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
         "if os.environ.get('STUB_EVAL_RC'): raise SystemExit(int(os.environ['STUB_EVAL_RC']))\n"
         "unavailable = os.environ.get('STUB_EVAL_UNAVAILABLE') == '1'\n"
@@ -457,6 +467,175 @@ class NightlyEndToEnd(unittest.TestCase):
         self.run_night(STUB_NEW_LABELS=0)                                           # evaluates again: cleared
         self.assertNotIn("evaluation_failed", self.status().get("alerts", {}))
 
+    def test_holdout_blocked_holds_retraining_below_the_floor_and_alerts(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)      # new TRAIN labels, holdout still short
+        self.assertEqual(rc, 0, log)
+        self.assertIn("holdout still 50/200; not retraining", log)
+        self.assertFalse((run2 / "adapter").exists(), "no GPU loop while the bar cannot judge any candidate")
+        self.assertIn("holdout_blocked runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertIn("ALERT: holdout_blocked", log)
+        self.assertIn("holdout_blocked", self.status()["alerts"])
+        # the holdout backfill reaches the floor while train labels also changed: retrain normally, alert cleared on promotion
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=1, STUB_HOLDOUT_BLOCKED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("superseded by new training data", log)
+        self.assertTrue((run3 / "report.json").exists(), log)
+        self.assertIn("PROMOTED →", log)
+        self.assertNotIn("holdout_blocked", self.status().get("alerts", {}))
+
+    def _count_failure_keeps_candidate(self, **env):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        for night in (1, 2):
+            rc, log, run = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1, **env)
+            self.assertEqual(rc, 1, log)
+            self.assertIn("HOLDOUT COUNT FAILED", log)
+            self.assertNotIn("superseded", log)
+            self.assertFalse((run / "adapter").exists(), "no training on a failed holdout count")
+            self.assertIn("holdout_blocked runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertIn("ALERT: holdout_count_failed", log)
+        self.assertIn("holdout_count_failed", self.status()["alerts"])
+        (self.s1 / "data/force-train").write_text("")                              # an explicit override still trains
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")                 # ... and its candidate promotes
+        rc, log, run = self.run_night(STUB_NEW_LABELS=1, STUB_HOLDOUT_BLOCKED=1, **env)
+        self.assertTrue((run / "adapter").exists(), log)
+        self.assertIn("PROMOTED →", log)
+        st = self.status()
+        self.assertNotIn("holdout_count_failed", st.get("alerts", {}), "resolving the candidate clears its failed-count alert")
+        self.assertNotIn("holdout_count_failed", st.get("streaks", {}))
+
+    def test_failed_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_RC=1)
+
+    def test_malformed_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_GARBAGE=1)
+
+    def test_multiline_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_MULTILINE=1)
+
+    def test_huge_holdout_floor_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(CORTADOS_S1_MIN_HOLDOUT="9" * 25)
+
+    def test_bad_numeric_settings_fall_back_to_defaults(self):
+        db = self.tmp / "router-air.db"; db.write_text(""); os.utime(db, (1_700_000_000, 1_700_000_000))
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_ROUTER_DB_EXTRA=db, CORTADOS_S1_DB_MAX_AGE_MIN="9" * 30,
+                                   CORTADOS_S1_LOG_KEEP="9" * 30, CORTADOS_S1_MAX_ITERS="x")
+        self.assertNotIn("integer expression expected", log)
+        self.assertIn("DB_MAX_AGE_MIN=" + "9" * 30 + " is not a whole number up to 9 digits; using 60", log)
+        self.assertIn("WARNING: synced router db", log, "a huge age limit must not make a stale db look fresh")
+        self.assertIn("CORTADOS_S1_LOG_KEEP=" + "9" * 30 + " is not a whole number; keeping 14", log)
+        self.assertIn("MAX_ITERS=x is not a whole number up to 9 digits; using 3600", log)
+
+    def test_nul_bytes_in_holdout_count_keep_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_NUL="1")
+
+    def test_embedded_nul_in_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_NUL="2")
+
+    def test_invalid_warm_start_cap_uses_its_own_default(self):
+        self.run_night(STUB_NEW_LABELS=3)                                          # promotes: a serving pointer exists
+        self.assertTrue(self.pointer.exists())
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_NIGHT_ITERS="bogus")
+        self.assertIn("warm start from", log)
+        self.assertIn("MAX_ITERS=bogus is not a whole number up to 9 digits; using 1500", log)
+
+    def _pending_run(self, segment_target, checkpoint="0000100_adapters.safetensors"):
+        run = self.s1 / "runs/2026-01-01"
+        (run / "adapter").mkdir(parents=True)
+        (run / "adapter" / checkpoint).write_text("w")
+        (run / "segment-target").write_text(segment_target)
+        (run / "nightly.log").write_text("")
+        return run
+
+    def test_unremovable_bad_segment_target_fails_promptly(self):
+        run = self._pending_run("garbage")
+        run.chmod(0o555); self.addCleanup(run.chmod, 0o755)                         # segment-target cannot be removed
+        t0 = time.time()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertLess(time.time() - t0, 30, "must not spin")
+        self.assertNotEqual(rc, 0, log)
+        self.assertIn("ERROR: cannot remove runs/2026-01-01/segment-target; stopping", log)
+        calls = (self.tmp / "home/launchctl.log").read_text().split("\n")
+        self.assertTrue(calls[-2].startswith("launchctl load"), f"the scorer is restarted on the error exit: {calls}")
+
+    def test_unreadable_checkpoint_count_stops_the_resume(self):
+        self._pending_run("100", checkpoint="0abc_adapters.safetensors")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=1)
+        self.assertNotEqual(rc, 0, log)
+        self.assertIn("ERROR: checkpoint runs/2026-01-01/adapter/0abc_adapters.safetensors has no readable step count; not resuming", log)
+        self.assertNotIn("resuming from", log)
+
+    def test_trailing_blank_line_in_holdout_count_keeps_the_candidate(self):
+        self._count_failure_keeps_candidate(STUB_COUNT_TRAILING=1)
+
+    def test_evaluation_failed_candidate_below_the_floor_is_not_superseded(self):
+        # the holdout is short AND the bar is unavailable: the candidate's last reason is evaluation_failed, not holdout_blocked
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1, STUB_EVAL_UNAVAILABLE=1)
+        self.assertIn("EVALUATION UNAVAILABLE for runs/2026-01-01", log)
+        for _ in range(2):
+            rc, log, run = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)      # new train labels every night
+            self.assertEqual(rc, 0, log)
+            self.assertIn("holdout still 50/200; not retraining (pending runs/2026-01-01 (evaluation_failed) waits", log)
+            self.assertNotIn("superseded", log)
+            self.assertFalse((run / "adapter").exists(), "no retraining while the holdout is below the floor")
+            self.assertIn("evaluation_failed runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        self.assertTrue((run1 / "adapter").is_dir())
+        self.assertIn("holdout_blocked", self.status()["alerts"])
+
+    def test_leading_zero_settings_are_decimal(self):
+        rc, log, run = self.run_night(STUB_NEW_LABELS=30, CORTADOS_S1_MAX_ITERS="010", CORTADOS_S1_LOG_KEEP="08",
+                                      CORTADOS_S1_STALL_NIGHTS="09", CORTADOS_S1_DB_MAX_AGE_MIN="08")
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("value too great for base", log)
+        self.assertNotIn("integer expression expected", log)
+        self.assertEqual((run / "segment-target").read_text().strip(), "10", "010 is ten, not octal eight")
+        rc, log, run = self.run_night(STUB_NEW_LABELS=30, CORTADOS_S1_MAX_ITERS="08")
+        self.assertNotIn("value too great for base", log)
+        self.assertIn("segment target", log)
+
+    def test_bad_thresholds_and_batch_fall_back_with_a_log(self):
+        for bad in ("lots", "9" * 30, "0"):
+            _, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_STALL_NIGHTS=bad, CORTADOS_S1_EVAL_FAIL_NIGHTS=bad,
+                                       CORTADOS_S1_EARLY_STOP_NIGHTS=bad, CORTADOS_S1_HOLDOUT_BLOCKED_NIGHTS=bad,
+                                       CORTADOS_S1_BATCH="0" if bad == "0" else bad)
+            for name in ("STALL_NIGHTS", "EVAL_FAIL_NIGHTS", "EARLY_STOP_NIGHTS", "HOLDOUT_BLOCKED_NIGHTS", "BATCH"):
+                self.assertRegex(log, rf"{name}={bad} is (not a whole number up to 9 digits|below 1); using 2", (name, bad))
+            self.assertNotIn("integer expression expected", log)
+            self.assertNotIn("Traceback", log)
+
+    def test_failing_streak_record_is_logged(self):
+        blocker = self.tmp / "not-a-dir"; blocker.write_text("")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_LABEL_RC=3, STUB_STOP_REASON="quota",
+                                   CORTADOS_S1_STATUS=blocker / "status.json")
+        self.assertIn("WARNING: recording the label_early_stop streak failed", log)
+        self.assertIn("WARNING: recording label growth failed", log)
+
+    def test_holdout_blocked_force_train_retrains_below_the_floor(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        (self.s1 / "data/force-train").write_text("")
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)
+        self.assertNotIn("not retraining", log)
+        self.assertTrue((run2 / "adapter").exists(), log)
+
+    def test_holdout_blocked_alert_clears_on_not_promoted(self):
+        self.run_night(STUB_NEW_LABELS=3, STUB_HOLDOUT_BLOCKED=1)
+        self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("holdout_blocked", self.status()["alerts"])
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")
+        _, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_PROMOTE=0)               # re-evaluated: a genuine rejection
+        self.assertIn("no longer promotes", log)
+        self.assertNotIn("holdout_blocked", self.status().get("alerts", {}))
+
+    def test_malformed_report_takes_the_evaluation_failed_branch(self):
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_GARBAGE=1)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("EVALUATION UNAVAILABLE for runs/2026-01-01: report.json unreadable or malformed", log)
+        self.assertIn("evaluation_failed", (self.s1 / "data/pending-candidate").read_text())
+        self.assertFalse((self.s1 / "data/last-train-labels").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+
     def test_not_promoted_leaves_pointer(self):
         self.pointer.write_text('{"adapter": "/old"}')
         rc, log, _ = self.run_night(STUB_NEW_LABELS=4, STUB_PROMOTE=0)
@@ -494,7 +673,8 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
 
     def setUp(self):
         super().setUp()
-        from tests.test_s1_teacher import FakeProvider, answers_for, err
+        from tests.test_s1_teacher import SPENT_503, FakeProvider, answers_for, err
+        self.SPENT_503 = SPENT_503
         self.FakeProvider, self.answers_for, self.err = FakeProvider, answers_for, err
         shutil.copy(S1 / "label.py", self.s1 / "label.py")
         reqs = [{"id": f"r{i}", "split": "train", "unit_kind": "interactive", "request": f"task {i}"} for i in range(4)]
@@ -506,11 +686,12 @@ class NightlyWithRealLabeler(NightlyEndToEnd):
         self.addCleanup(lambda: self.fake and self.fake.close())
 
     def test_quota_refusal_takes_the_stopped_early_path(self):
-        self.fake = self.FakeProvider([(200, {}, self.answers_for),
-                                       (503, {}, self.err("no claude subscription account can take this request"))])
+        self.fake = self.FakeProvider([(200, {}, self.answers_for), (503, {}, self.err(self.SPENT_503))]
+                                      + [(200, {}, self.answers_for)] * 2)
         rc, log, run = self.run_night(CORTADOS_PROVIDER_URL=self.fake.url)
         self.assertEqual(rc, 0, log)
-        self.assertIn("LABELING STOPPED EARLY (label.py rc 3, reason provider_stop)", log)
+        self.assertEqual(len(self.fake.seen), 2, "spent quota stops the pass at once")
+        self.assertIn("LABELING STOPPED EARLY (label.py rc 3, reason quota)", log)
         self.assertIn("training tonight", log)                    # the first batch's labels are new data
         self.assertIn("last_labeling_stopped_early", self.status())
         self.assertEqual(self.status()["last_label_count"], 2)

@@ -8,7 +8,8 @@
 # This file is the ONE canonical nightly (2026-11-02: replaces the Studio's forked ~/cortados/train/nightly.sh). Run it from the
 # checkout the scorer serves from, so a promotion lands where s1/serve.py reads. Every machine-specific value is an env var
 # (set them in the launchd plist or data/train-config.env); none of them names a host:
-#   CORTADOS_S1_SERVE_POINTER   file the scorer reads; promotion writes it atomically + keeps <file>.prev   (default: s1/current.json)
+#   CORTADOS_S1_SERVE_POINTER   file the scorer reads; promotion writes it atomically + keeps <file>.prev   (default: s1/current.json).
+#                               It must name <scorer checkout>/s1/current.json: serve.py reads only the current.json beside itself.
 #   CORTADOS_S1_SCORER_PLIST    scorer LaunchAgent unloaded during training      (default ~/Library/LaunchAgents/com.cortados.s1-scorer.plist)
 #   CORTADOS_S1_PY              training python with mlx_lm                      (default <repo>/.venv-mlx/bin/python)
 #   CORTADOS_S1_LABEL_PY        python that runs s1/label.py                      (default python3; label.py runs from this repo)
@@ -58,11 +59,34 @@ export CORTADOS_S1_SERVE_POINTER="$SERVE_POINTER"   # evaluate.py grades against
 SCORER_PLIST="${CORTADOS_S1_SCORER_PLIST:-$HOME/Library/LaunchAgents/com.cortados.s1-scorer.plist}"
 STATUS="${CORTADOS_S1_STATUS:-data/status.json}"
 NIGHT="${CORTADOS_S1_NIGHT_DATE:-$(date +%F)}"   # the stall tracker counts nights by this date (override for tests / backfilled runs)
+# one quiet night is normal (weekend); two in a row means the labeler is stuck
 STALL_NIGHTS="${CORTADOS_S1_STALL_NIGHTS:-2}"
 EARLY_STOP_NIGHTS="${CORTADOS_S1_EARLY_STOP_NIGHTS:-2}"   # same label.py stop reason this many nights running → ALERT
-EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailable/crashed this many nights running → ALERT   # one quiet night is normal (weekend); two in a row means the labeler is stuck
+EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailable/crashed this many nights running → ALERT
+HOLDOUT_BLOCKED_NIGHTS="${CORTADOS_S1_HOLDOUT_BLOCKED_NIGHTS:-2}"   # a candidate blocked by the holdout floor this many nights → ALERT
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
+# `[ a -lt b ]` on a non-number or an out-of-range number prints "integer expression expected" and is simply false, so a
+# bad setting would silently take the permissive branch. Every configurable number a comparison reads is validated here:
+# 1-9 digits (well inside bash's 64-bit arithmetic), else the documented default, with a logged reason.
+# A validated value is then normalised to decimal: bash arithmetic reads 08 / 010 as octal (08 is an error, 010 is 8).
+whole() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
+dec() { echo "$((10#$1))"; }   # only ever called on a value whole() accepted
+setting() {   # setting <var name> <default> [<min>]: replace an invalid or too-small value with the default (logged once the log is open)
+  local v="${!1}" min="${3:-0}"
+  if ! whole "$v"; then
+    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is not a whole number up to 9 digits; using $2. "; printf -v "$1" '%s' "$2"; return
+  fi
+  v=$(dec "$v")
+  if [ "$v" -lt "$min" ]; then
+    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is below $min; using $2. "; v="$2"
+  fi
+  printf -v "$1" '%s' "$v"
+}
+setting DB_MAX_AGE_MIN 60
+setting STALL_NIGHTS 2 1; setting EARLY_STOP_NIGHTS 2 1; setting EVAL_FAIL_NIGHTS 2 1; setting HOLDOUT_BLOCKED_NIGHTS 2 1   # 0 would alert on every night
+GPU_SETTLE="${CORTADOS_S1_GPU_SETTLE:-3}"; EVAL_SETTLE="${CORTADOS_S1_EVAL_SETTLE:-20}"
+setting GPU_SETTLE 3; setting EVAL_SETTLE 20
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 export CORTADOS_S1_BASE="$BASE"
 # Forest 2026-10-26: fold the Air's synced routed usage into training (another machine rsyncs its router.db here);
@@ -99,12 +123,14 @@ fi
 mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
+[ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 prune_unresumable_runs
 # names only: values can be an internal provider URL or a secret's path
 [ -f data/train-config.env ] && echo "train-config sets: $(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' data/train-config.env | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | tr '\n' ' ')"
 rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapters, reports) are untouched
   local old
-  case "$LOG_KEEP" in ''|*[!0-9]*) echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14 ;; esac
+  whole "$LOG_KEEP" || { echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP is not a whole number; keeping 14"; LOG_KEEP=14; }
+  LOG_KEEP=$(dec "$LOG_KEEP")
   # 0 would delete tonight's own log (tail -n +1 lists every file): keep at least the current one
   [ "$LOG_KEEP" -lt 1 ] && { echo "log rotation: CORTADOS_S1_LOG_KEEP=$LOG_KEEP would delete tonight's log; keeping 1"; LOG_KEEP=1; }
   old=$(ls -t runs/*/nightly.log 2>/dev/null | tail -n +"$((LOG_KEEP + 1))")
@@ -113,7 +139,7 @@ rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapter
 }
 rotate_logs
 gpu_alone() {   # Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
-  launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "${CORTADOS_S1_GPU_SETTLE:-3}"; echo "scorer stopped for training; ollama + memory gateway stay up"
+  launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "$GPU_SETTLE"; echo "scorer stopped for training; ollama + memory gateway stay up"
 }
 gpu_share() {
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
@@ -126,10 +152,38 @@ evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdo
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
 mark_trained() { echo "$sft_hash" > data/last-train-labels.tmp && mv data/last-train-labels.tmp data/last-train-labels; }
-alert_line() { [ -n "$1" ] && echo "$1"; return 0; }
-eval_failed() { alert_line "$(state streak "$STATUS" evaluation_failed hit "$NIGHT" "$EVAL_FAIL_NIGHTS" "evaluation unavailable or crashed")"; }
-eval_ok() { state streak "$STATUS" evaluation_failed clear "$NIGHT" "$EVAL_FAIL_NIGHTS"; }
-report_unavailable() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('evaluation_status') == 'unavailable' else 1)" "$1/report.json"; }
+# streak <name> hit|clear <threshold> [<detail>]: record a consecutive-night condition; print its ALERT; a failing
+# nightly_state call is logged (an alert that silently failed to record is an alert nobody sees)
+streak() {
+  local out rc
+  out=$(state streak "$STATUS" "$1" "$2" "$NIGHT" "$3" "${4:-}"); rc=$?
+  if [ "$rc" -ne 0 ]; then echo "WARNING: recording the $1 streak failed (nightly_state rc $rc): its alert state is unknown"; return 0; fi
+  [ -n "$out" ] && echo "$out"; return 0
+}
+eval_failed() { streak evaluation_failed hit "$EVAL_FAIL_NIGHTS" "evaluation unavailable or crashed"; }
+eval_ok() { streak evaluation_failed clear "$EVAL_FAIL_NIGHTS"; }
+# report.json readers exit 2 when the file is unreadable or malformed (no boolean "promote"); report_unavailable treats that
+# like an unavailable evaluation, so a broken report goes to the evaluation_failed branch, never to a verdict.
+report_check() { python3 - "$1/report.json" <<'PY'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+    assert isinstance(r, dict) and isinstance(r.get("promote"), bool)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if r.get("evaluation_status") == "unavailable" else 1)
+PY
+}
+report_unavailable() { report_check "$1"; [ $? -ne 1 ]; }
+report_why() { python3 -c "import json,sys
+try: print(json.load(open(sys.argv[1])).get('evaluation_unavailable') or 'report.json unreadable or malformed')
+except Exception: print('report.json unreadable or malformed')" "$1/report.json"; }
+holdout_count() { CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" $PY evaluate.py --holdout-count; }
+holdout_hit() { streak holdout_blocked hit "$HOLDOUT_BLOCKED_NIGHTS" "candidate waits for the Claude holdout backfill"; }
+holdout_clear() {   # the holdout-blocked candidate is resolved: its blocked streak and any failed-count streak end with it
+  streak holdout_blocked clear "$HOLDOUT_BLOCKED_NIGHTS"
+  streak holdout_count_failed clear "$HOLDOUT_BLOCKED_NIGHTS"
+}
 report_blocked() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get('promote_blocked') else 1)" "$1/report.json"; }
 eval_fingerprint() {   # effective holdout labels + inference settings (evaluate.py --holdout-key) + the serving incumbent
   local hk inc
@@ -154,7 +208,7 @@ for db in "${extra_dbs[@]+"${extra_dbs[@]}"}"; do
   [ -n "$db" ] || continue
   if [ ! -f "$db" ]; then echo "WARNING: synced router db $db is missing"; state event "$STATUS" stale_router_db "$db missing"; continue; fi
   mtime=$(stat -f %m "$db" 2>/dev/null || stat -c %Y "$db" 2>/dev/null)
-  if [ -z "$mtime" ]; then
+  if ! [[ "$mtime" =~ ^[0-9]{1,12}$ ]]; then
     echo "WARNING: synced router db $db: age unknown (stat failed)"; state event "$STATUS" stale_router_db "$db age unknown"; continue
   fi
   age_min=$(( ($(date +%s) - mtime) / 60 ))
@@ -173,11 +227,14 @@ echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file 
 "$LABEL_PY" -B label.py $TEACHER_ARGS
 rc=$?
 # Count labels and update the stall tracker BEFORE branching on rc: a labeler that fails every night is exactly the stall to alert on.
-if ! labelled=$(state labels data/labels.jsonl); then
+if ! labelled=$(state labels data/labels.jsonl) || ! whole "$labelled"; then
   echo "LABEL COUNT FAILED (data/labels.jsonl unreadable): training skipped"; state event "$STATUS" label_count_failure "labels.jsonl unreadable"; exit 1
 fi
-alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT")
-[ -n "$alert" ] && echo "$alert"
+if alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT"); then
+  [ -n "$alert" ] && echo "$alert"
+else
+  echo "WARNING: recording label growth failed (nightly_state rc $?): the stall alert state is unknown"
+fi
 # label.py exit codes: 0 completed, 2 config error, 3 stopped early (quota/auth/retries; the labels it wrote are kept).
 if [ "$rc" -eq 3 ]; then
   # partial labels are real labels: go on, and let the no-new-labels check below decide whether there is anything to train on
@@ -185,9 +242,9 @@ if [ "$rc" -eq 3 ]; then
   echo "LABELING STOPPED EARLY (label.py rc 3, reason $stop_reason): continuing with the labels written so far"
   state event "$STATUS" labeling_stopped_early "label.py rc 3: $stop_reason"
   # one batch then a stop still "grows" labels, so the growth stall never fires: alert on the same stop reason night after night
-  alert_line "$(state streak "$STATUS" label_early_stop hit "$NIGHT" "$EARLY_STOP_NIGHTS" "$stop_reason")"
+  streak label_early_stop hit "$EARLY_STOP_NIGHTS" "$stop_reason"
 elif [ "$rc" -eq 0 ]; then
-  state streak "$STATUS" label_early_stop clear "$NIGHT" "$EARLY_STOP_NIGHTS"
+  streak label_early_stop clear "$EARLY_STOP_NIGHTS"
 else
   # 2026-11-02: a failed labeler used to be ignored and the night retrained on yesterday's data.
   echo "LABELING FAILED (label.py rc $rc): training skipped"
@@ -205,7 +262,7 @@ fi
 if ! sft_hash=$(state fingerprint data/sft/train.jsonl data/sft/valid.jsonl); then
   echo "SFT FINGERPRINT FAILED (data/sft missing after build_sft.py): training skipped"; state event "$STATUS" sft_fingerprint_failure "data/sft"; exit 1
 fi
-last=$(cat data/last-train-count 2>/dev/null || echo 0)
+last=$(cat data/last-train-count 2>/dev/null || echo 0); whole "$last" || { echo "data/last-train-count unreadable ($last); counting from 0"; last=0; }; last=$(dec "$last")
 new=$((labelled - last))
 pending=0
 if [ ! -f "$RUN/report.json" ] && { [ -f "$RUN/segment-target" ] || compgen -G "$RUN/adapter/0*_adapters.safetensors" >/dev/null; }; then
@@ -225,6 +282,7 @@ if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
   # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one
   read -r _ _ p_reason p_run < data/pending-candidate
   echo "forced training: pending candidate $p_run ($p_reason) superseded"; rm -f data/pending-candidate
+  holdout_clear   # the waiting candidate (and any failed count about it) is resolved
 fi
 if [ -f data/pending-candidate ]; then
   read -r p_sft p_eval p_reason p_run < data/pending-candidate
@@ -237,7 +295,7 @@ if [ -f data/pending-candidate ]; then
     fi
     if [ "$p_reason" = holdout_blocked ] && [ "$now_eval" = "$p_eval" ]; then
       echo "skipped: no new labels; pending $p_run waits for the holdout backfill (holdout and incumbent unchanged)"
-      state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"
+      state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
     echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
@@ -246,7 +304,7 @@ if [ -f data/pending-candidate ]; then
     fi
     if report_unavailable "$p_run"; then
       echo "$sft_hash $now_eval evaluation_failed $p_run" > data/pending-candidate
-      echo "EVALUATION UNAVAILABLE again for $p_run: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$p_run/report.json"); retried next night"
+      echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
       state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
     fi
     eval_ok
@@ -254,21 +312,56 @@ if [ -f data/pending-candidate ]; then
       if report_blocked "$p_run"; then
         echo "$sft_hash $now_eval holdout_blocked $p_run" > data/pending-candidate
         echo "pending $p_run still blocked: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['promote_blocked'])" "$p_run/report.json")"
-        state event "$STATUS" skip "pending $p_run still holdout-blocked"
+        state event "$STATUS" skip "pending $p_run still holdout-blocked"; holdout_hit
       else
-        rm -f data/pending-candidate; mark_trained
+        rm -f data/pending-candidate; mark_trained; holdout_clear
         state event "$STATUS" skip "pending $p_run no longer promotes"
         echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
       fi
       echo "=== $(date) nightly end"; exit 0
     fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
-      rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; mark_trained
+      rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; mark_trained; holdout_clear
       echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
     fi
     echo "$sft_hash $now_eval promotion_failed $p_run" > data/pending-candidate
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
   else
+    # New train labels. While the Claude holdout is below the floor the bar cannot judge ANY candidate: retraining would only
+    # produce another blocked run every night (a GPU loop) and would discard this one. So the holdout readiness is checked
+    # before superseding a pending candidate whatever its last reason (holdout_blocked, evaluation_failed, promotion_failed);
+    # --train / data/force-train override (handled above).
+    # The count must be trustworthy: a failed or garbled count (e.g. malformed holdout answers crash build_eval_sets) must not
+    # fall through to discarding the candidate and training.
+    h_rows=""; h_floor=""; hc_ok=0
+    # stdout only (evaluate.py's label loader reports its Claude-only filter on stderr), captured byte-exact in a file:
+    # $(...) would strip every trailing newline and let "300 200\n\n" pass
+    hc_out=$(mktemp "${TMPDIR:-/tmp}/holdout-count.XXXXXX"); hc_err=$(mktemp "${TMPDIR:-/tmp}/holdout-count-err.XXXXXX")
+    hc=""
+    if holdout_count >"$hc_out" 2>"$hc_err"; then
+      # validated as BYTES (bash strings drop NULs): exactly "<rows> <floor>", one line, at most one terminal newline,
+      # ASCII digits 1-9 long; prints the normalised integers
+      if hc=$(python3 -c 'import re,sys
+m = re.fullmatch(rb"(\d{1,9}) (\d{1,9})\n?", open(sys.argv[1], "rb").read())
+sys.exit(1) if not m else print(int(m[1]), int(m[2]))' "$hc_out"); then
+        read -r h_rows h_floor <<< "$hc"; hc_ok=1
+      fi
+    fi
+    hc=$(head -c 400 "$hc_out" | tr -d '\000')
+    if [ "$hc_ok" -ne 1 ]; then
+      echo "HOLDOUT COUNT FAILED (evaluate.py --holdout-count: $( { printf '%s\n' "$hc"; cat "$hc_err"; } | grep -v '^$' | tail -1 | cut -c1-160)); pending $p_run kept, not retraining"
+      rm -f "$hc_out" "$hc_err"
+      state event "$STATUS" pending_failure "$p_run holdout count failed"
+      streak holdout_count_failed hit "$HOLDOUT_BLOCKED_NIGHTS" "evaluate.py --holdout-count failed"
+      exit 1
+    fi
+    rm -f "$hc_out" "$hc_err"
+    streak holdout_count_failed clear "$HOLDOUT_BLOCKED_NIGHTS"
+    if [ "$h_rows" -lt "$h_floor" ]; then
+      echo "holdout still $h_rows/$h_floor; not retraining (pending $p_run ($p_reason) waits; --train or data/force-train overrides)"
+      state event "$STATUS" skip "holdout still $h_rows/$h_floor; $p_run waits"; holdout_hit
+      echo "=== $(date) nightly end"; exit 0
+    fi
     echo "pending candidate $p_run superseded by new training data"; rm -f data/pending-candidate
   fi
 fi
@@ -290,7 +383,8 @@ if [ -f data/laya-tonight ]; then
   LRUN="laya/runs/$(date +%Y-%m-%d)"; [ -f "$LRUN/train-meta.json" ] && LRUN="$LRUN-$(date +%H%M)"
   gpu_alone
   echo "=== $(date) laya night: training into $LRUN (cap ${LAYA_MAX_STEPS:-2000} steps, stop file at ${LAYA_STOP_AT:-0645})"
-  ( while [ "$(date +%H%M)" -lt "${LAYA_STOP_AT:-0645}" ] || [ "$(date +%H%M)" -gt 1200 ]; do sleep 60; [ -f "$LRUN/train-meta.json" ] && exit 0; done; touch "$LRUN/stop"; echo "laya: deadline reached, stop file set" ) &
+  LAYA_STOP_AT="${LAYA_STOP_AT:-0645}"; [[ "$LAYA_STOP_AT" =~ ^[0-9]{4}$ ]] || { echo "LAYA_STOP_AT=$LAYA_STOP_AT is not HHMM; using 0645"; LAYA_STOP_AT=0645; }
+  ( while [ "$((10#$(date +%H%M)))" -lt "$((10#$LAYA_STOP_AT))" ] || [ "$(date +%H%M)" -gt 1200 ]; do sleep 60; [ -f "$LRUN/train-meta.json" ] && exit 0; done; touch "$LRUN/stop"; echo "laya: deadline reached, stop file set" ) &
   deadline=$!
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
@@ -309,20 +403,23 @@ fi
 if ! HF_HUB_OFFLINE=1 $PY -c "from mlx_lm import load; load('$BASE')" >/dev/null 2>&1; then
   echo "base model $BASE is not on disk: training skipped (download needs Forest's OK)"; exit 2
 fi
-n=$(wc -l < data/sft/train.jsonl)
+n=$(wc -l < data/sft/train.jsonl | tr -d ' '); [[ "$n" =~ ^[0-9]{1,9}$ ]] || { echo "data/sft/train.jsonl line count unreadable: training skipped"; exit 1; }
 gpu_alone
 BATCH="${CORTADOS_S1_BATCH:-2}"                                   # 2: the 8B stays resident beside training now, so keep the trainer's footprint small
 LR="${CORTADOS_S1_LR:-1e-4}"; EPOCHS="${CORTADOS_S1_EPOCHS:-2}"
-MAX_ITERS="${CORTADOS_S1_MAX_ITERS:-3600}"                          # a night is ~6 h; at ~6 s/step that is ~3,600 steps (2026-09-28: 7,499 steps ran into the day)
+MAX_ITERS="${CORTADOS_S1_MAX_ITERS:-3600}"; MAX_DEFAULT=3600                          # a night is ~6 h; at ~6 s/step that is ~3,600 steps (2026-09-28: 7,499 steps ran into the day)
 # Forest 2026-10-13: a tested candidate every night. A new run (nothing to resume) warm-starts from the promoted adapter and is
 # sized to finish AND be evaluated before the 07:00 stop. 1,500 steps: ~3.2 h at the measured 0.13 step/s from ~02:00, leaving
 # ~1 h for evaluation; too many and the run is cut off unevaluated (the 10-03..10-13 failure), too few and a night adds little.
 # Warm LR 5e-5: half the from-scratch rate, so one night's continued training refines the adapter rather than overwriting it.
 if [ -z "${CORTADOS_S1_INIT:-}" ] && [ "$pending" -eq 0 ] && [ -f "${SERVE_POINTER:-current.json}" ]; then
   CORTADOS_S1_INIT=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'] + '/adapters.safetensors')" "${SERVE_POINTER:-current.json}")
-  MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
+  MAX_ITERS="${CORTADOS_S1_NIGHT_ITERS:-1500}"; MAX_DEFAULT=1500; LR="${CORTADOS_S1_WARM_LR:-5e-5}"
 fi
 if [ -n "${CORTADOS_S1_INIT:-}" ] && [ -f "$CORTADOS_S1_INIT" ]; then mkdir -p "$RUN/adapter"; cp "$CORTADOS_S1_INIT" "$RUN/adapter/0000000_adapters.safetensors"; cp "$(dirname "$CORTADOS_S1_INIT")/adapter_config.json" "$RUN/adapter/" 2>/dev/null; echo "warm start from $CORTADOS_S1_INIT"; fi
+setting MAX_ITERS "$MAX_DEFAULT" 1;   # the selected cap falls back to ITS default (warm night 1500, fresh run 3600)
+ setting BATCH 2 1; setting EPOCHS 2 1   # MAX_ITERS bounds the segment below: never let a bad value pass
+[ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 iters=$(( n * EPOCHS / BATCH ))
 echo "training on $n examples, $iters iterations at batch $BATCH"
 attempt=0
@@ -330,16 +427,31 @@ while :; do
   resume=""
   last=$(ls -t "$RUN"/adapter/0*_adapters.safetensors 2>/dev/null | head -1)          # newest by time: counters restart at 1 after each resume
   # mlx_lm counts iterations from 1 again on resume: keep a cumulative count in the run dir and hand it only the remaining ones
-  ckpt=$(basename "${last:-0000000_x}" | sed -E 's/^0*([0-9]+)_.*/\1/'); ckpt=${ckpt:-0}
+  ckpt=$(basename "${last:-0000000_x}" | sed -E 's/^0*([0-9]+)_.*/\1/')
+  # a checkpoint whose step count cannot be read cannot be resumed correctly (the cumulative count would be wrong): stop
+  [[ "$ckpt" =~ ^[0-9]{1,9}$ ]] || { echo "ERROR: checkpoint $last has no readable step count; not resuming (move it aside to start the segment over)"; exit 1; }
+  ckpt=$((10#$ckpt))
   # cumulative steps = steps credited BEFORE this checkpoint's segment + the checkpoint's own count. The segment base is recorded when a
   # segment starts (iters-base), never re-added on the next resume (the 2026-09-26 double count).
-  base_done=$(cat "$RUN/iters-base" 2>/dev/null || echo 0); done_iters=$(( base_done + ckpt ))
+  base_done=$(cat "$RUN/iters-base" 2>/dev/null || echo 0)
+  [[ "$base_done" =~ ^[0-9]{1,9}$ ]] || { echo "iters-base unreadable ($base_done); counting from 0"; base_done=0; }
+  done_iters=$(( 10#$base_done + ckpt ))
   if [ -z "$last" ]; then
     last=$(ls -t "$RUN"/adapter/resume_*_adapters.safetensors 2>/dev/null | head -1)
     [ -n "$last" ] && done_iters=$(basename "$last" | sed -E 's/^resume_([0-9]+)_adapters.safetensors$/\1/')
+    [[ "$done_iters" =~ ^[0-9]{1,9}$ ]] || { echo "resume checkpoint name unreadable ($last); counting from 0"; done_iters=0; }
+    done_iters=$((10#$done_iters))
   fi
   if [ -f "$RUN/segment-target" ]; then
     target=$(cat "$RUN/segment-target")
+    if [[ "$target" =~ ^[0-9]{1,9}$ ]]; then
+      target=$((10#$target))
+    else
+      echo "segment-target unreadable ($target); recomputing"
+      # if it cannot be removed, recomputing would loop forever with the scorer stopped: fail (the EXIT trap brings it back)
+      rm -f "$RUN/segment-target" && [ ! -e "$RUN/segment-target" ] || { echo "ERROR: cannot remove $RUN/segment-target; stopping"; exit 1; }
+      continue
+    fi
   else
     target=$iters
     [ "$((target - done_iters))" -gt "$MAX_ITERS" ] && target=$((done_iters + MAX_ITERS))
@@ -365,7 +477,7 @@ while :; do
   sleep 60
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
 done
-gpu_share; sleep "${CORTADOS_S1_EVAL_SETTLE:-20}"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
+gpu_share; sleep "$EVAL_SETTLE"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
 if ! evaluate_run "$RUN"; then
   # a crashed evaluation is not a verdict: keep the run pending and re-evaluate it next night, data unchanged or not
   echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
@@ -377,7 +489,7 @@ state event "$STATUS" train "$RUN ($labelled labels)"
 if report_unavailable "$RUN"; then
   echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
   state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"; eval_failed
-  echo "EVALUATION UNAVAILABLE for $RUN: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['evaluation_unavailable'])" "$RUN/report.json"); not a rejection: re-evaluated next night"
+  echo "EVALUATION UNAVAILABLE for $RUN: $(report_why "$RUN"); not a rejection: re-evaluated next night"
   exit 1
 fi
 eval_ok
@@ -386,7 +498,7 @@ if report_promotes "$RUN"; then
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
   if state promote "$RUN/report.json" "$PWD/$RUN/adapter" "$SERVE_POINTER"; then
     state event "$STATUS" promotion "$RUN"
-    mark_trained
+    mark_trained; holdout_clear
     echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
   else
     echo "$sft_hash $(eval_fingerprint || echo unknown) promotion_failed $RUN" > data/pending-candidate   # retried next night
@@ -396,10 +508,10 @@ if report_promotes "$RUN"; then
 elif report_blocked "$RUN"; then
   # not final: the holdout is too small to judge. Keep the run waiting for the backfill instead of marking the data trained.
   echo "$sft_hash $(eval_fingerprint || echo unknown) holdout_blocked $RUN" > data/pending-candidate
-  state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"
+  state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"; holdout_hit
   echo "not promoted: holdout too small (see $RUN/report.json); $RUN waits and is re-evaluated when the holdout grows"
 else
-  mark_trained
+  mark_trained; holdout_clear
   echo "not promoted (see $RUN/report.json); incumbent stays"
 fi
 echo "=== $(date) nightly end"
