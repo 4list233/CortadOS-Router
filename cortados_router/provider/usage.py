@@ -50,7 +50,6 @@ _HW_KEYS = ("schema", "sampled_at", "host", "os", "load_avg", "ncpu", "chip", "m
             "cpu_busy_pct", "gpu_busy_pct")
 _HW_HEADROOM_KEYS = ("free_mem_gb", "cpu_idle_pct", "gpu_idle_pct")
 _HW_MODEL_KEYS = ("name", "size", "size_vram")      # hardware.parse_ollama_ps's entries
-_HW_ERR_KEYS = ("field", "error")                   # hardware.sample's errors entries; `error` reduced to its kind
 # An unavailable field's reason is reduced to its kind (the part before the first colon), published only when it
 # looks like an exception type name (<= 40 chars); anything else (a message, a path, a command line) becomes "error".
 _KIND_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
@@ -246,11 +245,16 @@ def _hw_kind(reason: Any) -> str:
     return kind if _KIND_RE.fullmatch(kind) else "error"
 
 
-def _hw_value(x: Any) -> Any:
+def _hw_value(x: Any, *, key: str = "") -> Any:
     if isinstance(x, dict):   # the sampler's unavailable(reason) shape is the only dict a scalar field can hold
         return {"available": False, "reason": _hw_kind(x.get("reason"))}
-    if isinstance(x, list):   # no list field besides load_avg (bounded below): kept, every nested non-finite nulled
-        return _finite(x)
+    if isinstance(x, list):
+        # hardware.sample() writes exactly one list field, load_avg (three numbers): capped to 3, each a finite number
+        # or null. Any other list (nested lists/dicts can carry an SSH target, a tailnet address, a path, or be
+        # unbounded) is never published verbatim.
+        if key == "load_avg":
+            return [v if _num(v) else None for v in x[:3]]
+        return {"available": False, "reason": "unexpected_type"}
     if isinstance(x, float) and not math.isfinite(x):
         return None
     return x[:WINDOW_NAME_MAX] if isinstance(x, str) else x
@@ -267,9 +271,7 @@ def _hw_sample(raw: Any, truncated: list[str] | None = None) -> dict[str, Any]:
     truncated = [] if truncated is None else truncated
     if not isinstance(raw, dict):
         raise ValueError("not an object")
-    out = {k: _hw_value(raw[k]) for k in _HW_KEYS if k in raw}
-    if isinstance(out.get("load_avg"), list):
-        out["load_avg"] = [_hw_value(x) for x in out["load_avg"][:3] if _num(x)]
+    out = {k: _hw_value(raw[k], key=k) for k in _HW_KEYS if k in raw}
     if isinstance(raw.get("headroom"), dict):
         out["headroom"] = {k: _hw_value(raw["headroom"].get(k)) for k in _HW_HEADROOM_KEYS}
     models = raw.get("ollama_models")

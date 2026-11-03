@@ -321,10 +321,24 @@ class CollectTest(unittest.TestCase):
             ' "headroom": {"free_mem_gb": Infinity}, "ollama_models": [{"name": "m", "size": NaN}]}')
         out = self.collect(home)
         hw = out["hardware"][0]["data"]
-        self.assertEqual(hw["os"], [None, [None], {"a": None}])
-        self.assertEqual(hw["load_avg"], [1.0])
+        self.assertEqual(hw["os"], {"available": False, "reason": "unexpected_type"})
+        self.assertEqual(hw["load_avg"], [1.0, None])
         self.assertIsNone(hw["headroom"]["free_mem_gb"]); self.assertIsNone(hw["ollama_models"][0]["size"])
         json.dumps(out, allow_nan=False)
+
+    def test_unexpected_hw_lists_not_published(self):
+        home = fixture_home()
+        (home / "hardware" / "studio.json").write_text(json.dumps({
+            "schema": 1, "os": [{"ssh_target": "user@100.64.0.9", "note": "x" * 5000}], "chip": [["/Users/x/secret"]],
+            "ncpu": [1] * 4000, "load_avg": [1.0, 2.0, 3.0, 4.0, 5.0]}))
+        out = self.collect(home)
+        hw = out["hardware"][0]["data"]
+        body = json.dumps(out)
+        for leak in ("ssh_target", "100.64", "/Users/", "xxxxxxxx"):
+            self.assertNotIn(leak, body)
+        for k in ("os", "chip", "ncpu"):
+            self.assertEqual(hw[k], {"available": False, "reason": "unexpected_type"})
+        self.assertEqual(hw["load_avg"], [1.0, 2.0, 3.0])
 
     def test_null_lane_model_band_labelled(self):
         home = fixture_home()
