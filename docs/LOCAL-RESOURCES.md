@@ -81,6 +81,24 @@ each Mac with Xcode Command Line Tools, compile it with:
 xcrun swiftc -framework Metal metal-budget.swift -o metal-budget
 ```
 
+## Per-machine hardware sample (`cortados_router/hardware.py`)
+
+A single-machine snapshot, separate from the fleet collector above, that treats local hardware as a measured
+resource in the pool next to subscription "% left".
+
+- Measured (macOS Apple Silicon): chip (`sysctl machdep.cpu.brand_string`), total memory (`hw.memsize`), available
+  memory (`vm_stat` free + inactive + speculative pages x page size; inactive is reclaimable, not guaranteed free),
+  CPU busy % from the second `top -l 2 -n 0 -s 1` sample (the first is since boot; `ps` %cpu is a decaying lifetime
+  average and lags), 1/5/15 min load, GPU busy % (`ioreg -c IOAccelerator` "Device Utilization %", busiest
+  accelerator), and resident Ollama models (`GET 127.0.0.1:11434/api/ps`: name, size, size_vram).
+- Derived `headroom`: free_mem_gb, cpu_idle_pct, gpu_idle_pct; `null` when the input was unavailable.
+- Other OSes: host, load and CPU count are reported; the rest is `{"available": false, "reason": ...}`. Never crashes.
+- Every command has a 4 s timeout, the Ollama fetch 0.5 s; each failure is an entry in `errors`.
+- `sample --out` writes `$CORTADOS_HOME/hardware/<host>.json` atomically (0600 file, 0700 directory).
+- Next: the `/resources` snapshot and dashboard show these files per host; later, routing can use `headroom` and
+  the resident models to decide whether a local lane is worth trying (a loaded model costs no load time). This
+  ticket does not wire it into routing or admission.
+
 ## Per-model admission
 
 The router admits a local candidate only when its exact model ID has a verified
