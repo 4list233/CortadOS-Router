@@ -65,6 +65,17 @@ FAKE = textwrap.dedent('''\
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "api_error_status": 413,
                           "result": "Request too large (max 32MB). Accumulated images..."}}))
         sys.exit(1)
+    if mode == "stream-json-in-tool":
+        # a tool result whose text is JSON (one escaping layer more than the event), and JSON inside that JSON
+        tok = os.environ["ANTHROPIC_AUTH_TOKEN"]
+        inner = json.dumps({{"config": {{"token": tok}}}})
+        print(json.dumps({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_1",
+            "name": "Bash", "input": {{"command": "cat cfg.json"}}}}]}}}}))
+        print(json.dumps({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
+            "content": [{{"type": "text", "text": inner}}, {{"type": "text", "text": json.dumps({{"wrapped": inner}})}}]}}]}}}}))
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "read " + inner}}))
+        print("a non-JSON line with " + tok)
+        sys.exit(0)
     if mode in ("stream-denied", "stream-outside"):
         # claude -p --output-format stream-json --verbose: one event per line, the result record last
         def ev(e):
@@ -80,11 +91,19 @@ FAKE = textwrap.dedent('''\
                 "num_turns": 2, "permission_denials": [{{"tool_name": "Write", "tool_use_id": "toolu_1",
                                                          "tool_input": {{"file_path": "a.txt"}}}}]}})
         else:
+            # confirmed writes (outside and inside cwd), a failed one and one that never got a result
             ev({{"type": "assistant", "message": {{"content": [
                 {{"type": "tool_use", "id": "toolu_1", "name": "Write",
                   "input": {{"file_path": os.environ["FAKE_OUTSIDE"], "content": "child-ok"}}}},
                 {{"type": "tool_use", "id": "toolu_2", "name": "Edit", "input": {{"file_path": "inside.txt"}}}},
-                {{"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": {{"command": "true"}}}}]}}}})
+                {{"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": {{"command": "true"}}}},
+                {{"type": "tool_use", "id": "toolu_4", "name": "Write", "input": {{"file_path": "failed.txt"}}}},
+                {{"type": "tool_use", "id": "toolu_5", "name": "Write", "input": {{"file_path": "/tmp/unresolved.txt"}}}}]}}}})
+            ev({{"type": "user", "message": {{"content": [
+                {{"type": "tool_result", "tool_use_id": "toolu_1", "content": "File created successfully"}},
+                {{"type": "tool_result", "tool_use_id": "toolu_2", "content": "edited"}},
+                {{"type": "tool_result", "tool_use_id": "toolu_3", "content": ""}},
+                {{"type": "tool_result", "tool_use_id": "toolu_4", "is_error": True, "content": "denied"}}]}}}})
             ev({{"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 2,
                 "permission_denials": []}})
         sys.exit(0)
@@ -324,6 +343,9 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(w["tool_uses"], {"Write": 1})
         self.assertEqual(w["tool_errors"], 1)
         self.assertEqual(w["effective_permission_mode"], "default")
+        self.assertNotIn("files_written", w)                      # the denied Write is not reported as written
+        self.assertEqual(w["write_attempts_unconfirmed"], [{"path": os.path.join(self.work, "a.txt"),
+                                                            "outcome": "failed"}])
         joined = " ".join(w["warnings"])
         self.assertIn("1 tool call(s) were denied (Write)", joined)
         self.assertIn("ran in permission mode 'default', not the requested 'auto'", joined)
@@ -334,10 +356,16 @@ class ChildTaskTests(unittest.TestCase):
         os.environ["FAKE_OUTSIDE"] = outside
         _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
         self.assertEqual(w["state"], "succeeded")
-        self.assertEqual(w["tool_uses"], {"Write": 1, "Edit": 1, "Bash": 1})
+        self.assertEqual(w["tool_uses"], {"Write": 3, "Edit": 1, "Bash": 1})
+        # only writes whose tool_result came back without an error count as written
         self.assertEqual(w["files_written"], [outside, os.path.join(self.work, "inside.txt")])
         self.assertEqual(w["writes_outside_cwd"], [outside])
-        self.assertIn("wrote 1 file(s) outside its cwd", " ".join(w["warnings"]))
+        self.assertEqual(w["write_attempts_unconfirmed"], [
+            {"path": os.path.join(self.work, "failed.txt"), "outcome": "failed"},
+            {"path": os.path.realpath("/tmp/unresolved.txt"), "outcome": "unresolved"}])
+        joined = " ".join(w["warnings"])
+        self.assertIn("wrote 1 file(s) outside its cwd", joined)
+        self.assertIn("2 file write(s) were attempted but not confirmed (1 failed, 1 without a result)", joined)
         self.assertNotIn("permission_denials", w)
 
     def test_a_stream_without_a_result_record_is_an_output_error(self):
@@ -889,6 +917,32 @@ class ChildTaskTests(unittest.TestCase):
             self.assertNotIn(tok, data, name)
             self.assertNotIn(json.dumps(tok)[1:-1], data, name)
         self.assertNotIn(json.dumps(tok)[1:-1], r["content"][0]["text"])
+
+    def test_token_in_json_inside_a_tool_result_survives_no_rotation(self):
+        # stream-json: a tool result holding JSON text escapes the token twice (and JSON inside that, three times); a
+        # raw pass with one escaped spelling missed it. The token has a quote and a backslash, and is rotated at once.
+        tok = 'tok"quo\\te-0005'
+        with open(self.cfg["token_file"], "w") as f:
+            f.write(tok)
+        self.cfg["token"] = "env-token-unrelated-02"
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-json-in-tool"
+        tid = self.start()
+        with open(self.cfg["token_file"], "w") as f:            # rotated right after launch
+            f.write("a-rotated-token-0006")
+        r, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["redact_unparsed_lines"], 1)            # the non-JSON line got the raw pass, and is marked
+        d = ct.task_path(tid)
+        for name in ("stdout.log", "stderr.log", "result.json"):
+            with open(os.path.join(d, name)) as f:
+                data = f.read()
+            self.assertNotIn("quo", data, name)                    # no spelling of the token at any escaping depth
+            self.assertNotIn("te-0005", data, name)
+        self.assertNotIn("quo", r["content"][0]["text"])
+        with open(os.path.join(d, "stdout.log")) as f:             # still one JSON event per line, and decodable
+            events = [json.loads(line) for line in f if line.startswith("{")]
+        text = events[1]["message"]["content"][0]["content"][0]["text"]
+        self.assertEqual(json.loads(text), {"config": {"token": "***"}})
 
     def test_redaction_failure_fails_the_task_and_withholds_logs(self):
         for mode in ("ok", "fail"):

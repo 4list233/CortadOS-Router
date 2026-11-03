@@ -327,9 +327,14 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   such a model gets `acceptEdits` (start_task and task_status say so in `permission_mode_note`), and an explicit
   `auto` on it is refused at `start_task`.
 - What the child really did: the child prints `--output-format stream-json`, and `task_status` reports `tool_uses`
-  (counts by tool), `tool_errors`, `files_written`, `effective_permission_mode` (the mode Claude Code actually ran in)
-  and `permission_denials`, plus `warnings` when a "succeeded" child's result is not backed by its actions: denied
-  tool calls, a mode Claude Code left, or files written outside `cwd`.
+  (counts by tool), `tool_errors`, `files_written` (writes whose tool_result came back without an error, matched by
+  tool_use id), `write_attempts_unconfirmed` (failed or never answered, with the outcome), `effective_permission_mode`
+  (the mode Claude Code actually ran in) and `permission_denials`, plus `warnings` when a "succeeded" child's result is
+  not backed by its actions: denied tool calls, a mode Claude Code left, confirmed writes outside `cwd`, or write
+  attempts that were not confirmed.
+- Log redaction: stdout is redacted structurally first (each event parsed, its strings redacted, JSON held inside a
+  string decoded and redacted too, then re-serialized), then by the raw pass, which matches each credential at up to
+  four JSON-escaping depths. A line that is not JSON gets the raw pass only and is counted in `redact_unparsed_lines`.
 - Relay scratch dir: the provider's headless backend (Claude CLI or Codex) runs in an empty scratch dir, and its CLI
   tells the model so in its own environment block, next to the client's real one. A model that trusted it aimed a
   child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody

@@ -11,13 +11,21 @@ import json
 import re
 
 MASK = "***"
+# Escaping layers matched per credential: JSON inside a JSON string escapes it again at each level (a tool result
+# holding JSON text, inside claude's stream-json event, is two levels). Four covers every nesting seen in claude's
+# output with room to spare; the structural pass (deep) decodes embedded JSON so its depth is relative anyway.
+ESCAPE_DEPTH = 4
 
 
 class Redactor:
     def __init__(self, tokens=()):
         toks = {t for t in tokens if t}
         self.raw = sorted(toks)
-        toks |= {json.dumps(t)[1:-1] for t in toks}
+        for t in list(toks):
+            spelled = t
+            for _ in range(ESCAPE_DEPTH):
+                spelled = json.dumps(spelled)[1:-1]
+                toks.add(spelled)
         self.tokens = sorted(toks, key=len, reverse=True)
         self._re = re.compile("|".join(re.escape(t) for t in self.tokens)) if self.tokens else None
 
@@ -41,3 +49,20 @@ class Redactor:
             return {self.text(str(k)): self.tree(v) for k, v in obj.items()}
         return obj
 
+    def deep(self, obj):
+        """Like tree, and a string that is itself JSON (an object or array, e.g. a tool result holding JSON text) is
+        decoded, redacted the same way and re-encoded, so a credential at any nesting depth is found decoded."""
+        if isinstance(obj, str):
+            if obj.lstrip()[:1] in ("{", "["):
+                try:
+                    inner = json.loads(obj)
+                except ValueError:
+                    inner = None
+                if isinstance(inner, (dict, list)):
+                    return self.text(json.dumps(self.deep(inner), ensure_ascii=False))
+            return self.text(obj)
+        if isinstance(obj, list):
+            return [self.deep(x) for x in obj]
+        if isinstance(obj, dict):
+            return {self.text(str(k)): self.deep(v) for k, v in obj.items()}
+        return obj

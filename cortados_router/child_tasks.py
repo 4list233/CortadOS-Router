@@ -663,6 +663,7 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     if not launch or not launch <= set(credential_fingerprints(red.raw)):
         return False
     try:
+        redact_stream_file(os.path.join(d, "stdout.log"), red)
         for name in ("stdout.log", "stderr.log"):
             redact_file(os.path.join(d, name), red)
     except OSError:
@@ -708,6 +709,9 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             out["output_error"] = res["output_error"]     # reported even when a (malformed) record was parsed
         if res.get("redact_error"):
             out["redact_error"] = res["redact_error"]
+        if res.get("redact_unparsed_lines"):
+            # stdout lines that were not JSON got the raw pass only (no structural redaction): say so
+            out["redact_unparsed_lines"] = res["redact_unparsed_lines"]
         if res.get("error"):
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
@@ -763,7 +767,14 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
         if act.get("writes_outside_cwd"):
             out["writes_outside_cwd"] = act["writes_outside_cwd"]
             warnings.append(f"the child wrote {len(act['writes_outside_cwd'])} file(s) outside its cwd "
-                            f"{meta.get('cwd')}: check writes_outside_cwd before trusting the result")
+                            f"{meta.get('cwd')} (confirmed by their tool results): check writes_outside_cwd before "
+                            "trusting the result")
+        attempts = act.get("write_attempts_unconfirmed") or []
+        if attempts:
+            out["write_attempts_unconfirmed"] = attempts
+            failed = sum(1 for a in attempts if a.get("outcome") == "failed")
+            warnings.append(f"{len(attempts)} file write(s) were attempted but not confirmed ({failed} failed, "
+                            f"{len(attempts) - failed} without a result): those files may not exist")
     if meta.get("permission_mode_note"):
         out["permission_mode_note"] = meta["permission_mode_note"]
     return warnings
@@ -955,6 +966,41 @@ def credential_fingerprints(tokens) -> list:
     return sorted({hashlib.sha256(t.encode("utf-8")).hexdigest() for t in tokens if t})
 
 
+def redact_stream_file(path: str, red: "Redactor") -> int:
+    """Structural redaction of claude's stream-json stdout: each line is parsed and its strings redacted (red.deep,
+    which also decodes JSON held inside strings), then re-serialized. A raw pass misses a credential escaped more often
+    than it matches (a tool result with JSON text inside an event). A line that does not parse is redacted raw and
+    counted; the count is returned (result.json records it). redact_file runs after this as the second layer."""
+    if not red.tokens or not os.path.exists(path):
+        return 0
+    unparsed = 0
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as src, \
+                os.fdopen(fd, "w", encoding="utf-8", newline="") as dst:
+            for line in src:
+                body = line.rstrip("\r\n")
+                end = line[len(body):]
+                ev, parsed = None, False
+                if body.strip():
+                    try:
+                        ev, parsed = json.loads(body), True
+                    except ValueError:
+                        unparsed += 1
+                if not parsed:
+                    dst.write(red.text(body) + end)
+                else:
+                    dst.write(json.dumps(red.deep(ev), ensure_ascii=False) + end)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return unparsed
+
+
 def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:
     """Rewrite `path` with every token replaced, streaming (a carried overlap keeps a token split across chunks whole),
     via a unique temp file and an atomic rename."""
@@ -1031,13 +1077,15 @@ MAX_ACTIVITY_PATHS = 50     # paths kept per list: enough to see what happened, 
 
 def summarize_stream(path: str, cwd: str) -> dict:
     """What the child really did, from its stream-json events: tool_use counts by tool, how many tool results were
-    errors, the permission mode it actually ran in (the last one a system event named), and the files its file tools
-    wrote, with those outside cwd listed apart. A `result` saying "done" proves nothing on its own; this does."""
+    errors, the permission mode it actually ran in (the last one a system event named), and its file writes. A write
+    counts as done only when its tool_result (matched by tool_use id) came back without an error: `files_written` and
+    `writes_outside_cwd` hold those; a write whose result was an error, or that never got one, is in
+    `write_attempts_unconfirmed` with its outcome. A `result` saying "done" proves nothing on its own; this does."""
     tool_uses: dict = {}
     errors = 0
     mode = None
-    written: list = []
-    outside: list = []
+    attempts: dict = {}                     # tool_use id -> resolved path, in call order (dicts keep insertion order)
+    outcome: dict = {}                      # tool_use id -> "ok" | "failed"
     root = os.path.realpath(cwd)
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -1059,16 +1107,21 @@ def summarize_stream(path: str, cwd: str) -> dict:
                     tool_uses[name] = tool_uses.get(name, 0) + 1
                     key = WRITE_TOOLS.get(name)
                     target = (b.get("input") or {}).get(key) if key and isinstance(b.get("input"), dict) else None
-                    if isinstance(target, str) and target:
-                        full = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
-                        if len(written) < MAX_ACTIVITY_PATHS:
-                            written.append(full)
-                        if os.path.commonpath([root, full]) != root and len(outside) < MAX_ACTIVITY_PATHS:
-                            outside.append(full)
-                elif kind == "user" and b.get("type") == "tool_result" and b.get("is_error"):
-                    errors += 1
+                    if isinstance(target, str) and target and isinstance(b.get("id"), str):
+                        attempts[b["id"]] = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
+                elif kind == "user" and b.get("type") == "tool_result":
+                    if b.get("is_error"):
+                        errors += 1
+                    tid = b.get("tool_use_id")
+                    if tid in attempts and tid not in outcome:
+                        outcome[tid] = "failed" if b.get("is_error") else "ok"
+    written = [p for i, p in attempts.items() if outcome.get(i) == "ok"]
+    unconfirmed = [{"path": p, "outcome": outcome.get(i, "unresolved")} for i, p in attempts.items()
+                   if outcome.get(i) != "ok"]
+    outside = [p for p in written if os.path.commonpath([root, p]) != root]
     return {"tool_uses": tool_uses, "tool_errors": errors, "effective_permission_mode": mode,
-            "files_written": written, "writes_outside_cwd": outside}
+            "files_written": written[:MAX_ACTIVITY_PATHS], "writes_outside_cwd": outside[:MAX_ACTIVITY_PATHS],
+            "write_attempts_unconfirmed": unconfirmed[:MAX_ACTIVITY_PATHS]}
 
 
 class _CancelledBeforeSpawn(Exception):
@@ -1136,6 +1189,12 @@ def _run(d: str, lock_fd=None) -> int:
     # Redact the child's stored output with the exact launch credentials while the runner still has them: a later
     # status call only knows the token file as it is THEN (it may have been replaced or removed).
     red = Redactor([t for t in _launch_tokens() if len(t) >= MIN_TOKEN_LEN])
+    try:
+        unparsed = redact_stream_file(os.path.join(d, "stdout.log"), red)   # structural first, then the raw pass
+        if unparsed:
+            result["redact_unparsed_lines"] = unparsed
+    except OSError as exc:
+        result["redact_error"] = f"could not redact stdout.log: {type(exc).__name__}"
     for name in ("stdout.log", "stderr.log"):
         try:
             redact_file(os.path.join(d, name), red)
@@ -1149,11 +1208,11 @@ def _run(d: str, lock_fd=None) -> int:
         pass
     out, err = parse_output(raw)
     if out is not None:
-        result["output"] = red.tree(out)
+        result["output"] = red.deep(out)
     if err:
         result["output_error"] = err
     try:
-        result["activity"] = red.tree(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
+        result["activity"] = red.deep(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
     except OSError as exc:                       # no stdout at all (the child never started): nothing to summarize
         result["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     result["ended_at"] = time.time()
