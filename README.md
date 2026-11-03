@@ -481,3 +481,7 @@ Copyright (C) 2026 Linjiu Li.
 CortadOS Router is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License version 3 (GPL-3.0-only) as published by the Free Software Foundation. It is distributed WITHOUT ANY WARRANTY; see `LICENSE` for the full text.
 
 Benchmark scores in `tables/benchmarks/scores*.csv` are derived from public sources listed in `tables/benchmarks/sources.json`; the raw downloads are not redistributed (run `fetch_benchmarks.py` to re-fetch).
+
+### Usage endpoint
+
+`GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.

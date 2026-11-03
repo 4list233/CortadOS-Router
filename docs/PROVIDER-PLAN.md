@@ -512,3 +512,7 @@ probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does 
 ## Open
 
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
+
+## Usage endpoint (GET /v1/cortados/usage)
+
+`GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.

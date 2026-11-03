@@ -344,6 +344,21 @@ class RunRecords:
             while len(self._runs) > self.MAX_RUNS:
                 self._runs.popitem(last=False)
 
+    def all_refusals(self) -> list[dict[str, Any]]:
+        """Every recorded refusal (for GET /v1/cortados/usage's 24-hour counts)."""
+        with self._lock:
+            return [dict(e) for es in self._refusals.values() for e in es]
+
+    def model_counts(self) -> dict[str, int]:
+        """Routed entries per provider/model since start (in memory, bounded; for GET /v1/cortados/usage)."""
+        with self._lock:
+            out: dict[str, int] = {}
+            for es in self._runs.values():
+                for e in es:
+                    k = f"{e['provider']}/{e['model']}"
+                    out[k] = out.get(k, 0) + 1
+            return out
+
     def summary(self, run_id: str) -> dict[str, Any] | None:
         """The run's answer: the primary entry (the first that had tools, the agent's own loop, else the first), the
         distinct models in order (`models`, every entry, tool-less side calls included) and the distinct models of the
@@ -925,6 +940,10 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == "/v1/cortados/usage":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            return self._json(200, self.server.usage_view(self.server.registry))
         if self.path.split("?")[0].startswith(RUNS_PATH):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1600,6 +1619,20 @@ class ProviderServer(ThreadingHTTPServer):
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
         self.registry = registry
+
+    def usage_view(self, registry: Registry) -> dict[str, Any]:
+        """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
+        from cortados_router import paths, scarcity
+        from cortados_router.provider import usage
+        try:
+            from cortados_router.s1_endpoint import resolve_url
+            s1_url = resolve_url()
+        except Exception as exc:                        # reported by the s1 section as unavailable, with the reason
+            logger.warning("usage: cannot resolve the S1 URL: %s", exc)
+            s1_url = None
+        return usage.collect(state_dir=paths.state_dir(), scarcity_reader=lambda: scarcity.current(refresh=False),
+                             refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
+                             s1_url=s1_url, freshness=scarcity.reading_freshness)
 
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
