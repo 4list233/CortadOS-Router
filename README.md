@@ -321,7 +321,40 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
 - `permission_mode`: `auto` (default: a safety classifier approves or denies each action, so a child can run Bash and
   tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
   anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
-  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead.
+  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. Not every model has auto mode: Claude Code 2.1.316
+  drops a session on a haiku model other than `claude-haiku-5-5` to `default` at startup ("does not support auto
+  mode"), and a child then gets every approval-needing call denied ("no approval surface"). So with the mode unset
+  such a model gets `acceptEdits` (start_task and task_status say so in `permission_mode_note`), and an explicit
+  `auto` on it is refused at `start_task`.
+- What the child really did: the child prints `--output-format stream-json`, and `task_status` reports `tool_uses`
+  (counts by tool), `tool_errors`, `files_written` (writes whose tool_result came back without an error, matched by
+  tool_use id), `write_attempts_unconfirmed` (failed or never answered, with the outcome), `effective_permission_mode`
+  (the mode Claude Code actually ran in) and `permission_denials`, plus `warnings` when a "succeeded" child's result is
+  not backed by its actions: denied tool calls, a mode Claude Code left, confirmed writes outside `cwd`, or write
+  attempts that were not confirmed.
+- Log redaction: stdout is redacted structurally first: a legacy single JSON record is parsed whole, otherwise each
+  stream record (split on "\n" only) is parsed, its strings redacted (JSON held inside a string decoded and redacted
+  too) and re-serialized ASCII-only. This fails closed: a record that does not parse, or a string or record too deep
+  to decode or walk (~1000 levels), is replaced wholesale by a `[withheld: content could not be safely redacted]`
+  placeholder and counted in `redact_unparsed_lines`, never text-redacted. The raw pass (each credential at up to
+  eight JSON-escaping depths) then runs over everything as a second layer. If the structural pass itself fails, the
+  task fails with `redact_error` (logs withheld) and the raw pass still runs. A `manual` child is reported by Claude
+  Code as mode `default`, which is not treated as leaving the requested mode. A string that looks like JSON (an
+  object, array or string literal) is decoded recursively, so a chain of quoted strings is unwound; one that does not
+  decode is withheld, not text-redacted. Keys get the same treatment, and an object whose key cannot be redacted
+  safely, or whose redacted keys collide, is withheld whole. The one exception is the child's free-form final
+  `result` text (what `task_status` / `wait_task` return): prose may start with `[`, `{` or `"`, so it gets text
+  redaction (every credential at all eight escaping depths) when stdout is rewritten, in `result.json` and in the
+  status, and is never reparsed after truncation; it is withheld only if that redaction cannot run.
+- Threat model: redaction protects against ACCIDENTAL credential exposure in logs and tool results, at any realistic
+  encoding depth, and fails closed on anything it cannot parse. Encodings a child builds on purpose to smuggle out its
+  own token are out of scope: the child already holds that token in its environment, and the same OS user can read
+  the token file. The real fix for that is per-task scoped tokens, which the provider does not offer yet.
+- Relay scratch dir: the provider's headless backend (Claude CLI or Codex) runs in an empty scratch dir, and its CLI
+  tells the model so in its own environment block, next to the client's real one. A model that trusted it aimed a
+  child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody
+  looks at). The backend's system prompt now says which block to trust, and a bridged tool call whose input names the
+  scratch dir is never forwarded: the model gets a tool error and retries with the user's path.
 - Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
   `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive

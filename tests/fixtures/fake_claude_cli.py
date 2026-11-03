@@ -3,6 +3,7 @@
 Starts the `bridge` MCP server from --mcp-config like the real CLI, then for each user line on stdin:
   - "use two tools": one assistant message with two tool_use blocks for the first tool, called serially;
   - "use tool": one tool_use (input {"file_path": "f0.md"}), called through MCP with _meta.claudecode/toolUseId;
+    with "scratch path" in the text the first call's file_path is <this process's cwd>/c.txt instead;
     either way it then answers "tool said: <result texts>";
   - "garbled" first emits a tool_use of a tool that does not exist and answers it with the CLI's own tool error,
     then carries on as above; "misnamed" does the same with a wrong tool under the bridge's prefix
@@ -90,6 +91,8 @@ for line in sys.stdin:
     if n and tools:
         uses = [{"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:12], "name": "mcp__bridge__" + tools[0],
                  "input": {"file_path": f"f{i}.md"}} for i in range(n)]
+        if "scratch path" in text:      # the model trusts the backend's own environment block (its cwd)
+            uses[0]["input"] = {"file_path": os.path.join(os.getcwd(), "c.txt")}
         assistant([{"type": "text", "text": "Let me look."}] + uses)
         said = []
         for u in uses:

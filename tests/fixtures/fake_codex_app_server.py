@@ -6,7 +6,8 @@ integers from 0, replies echo the client's string ids. Triggers on the text of t
                    "tool said: <reply texts joined by ' | ', failed replies prefixed 'ERR '>";
                    with "slowly" in the text the second call follows the first after SLOW_SIBLING_S (a long
                    function_call payload still streaming);
-  "use tool"       one such call ({"file_path": "f0.md"}) and the same answer;
+  "use tool"       one such call ({"file_path": "f0.md"}) and the same answer; with "scratch path" in the text the
+                   first call's file_path is <the thread's cwd>/c.txt instead;
   "complete around call"  one call, then after 0.5 s a turn/completed with status completed while the call is still
                    outstanding (the client's result is read and dropped afterwards): a turn that ends around a call,
                    as when code mode yields and the model ends the turn;
@@ -110,7 +111,7 @@ stdin = os.fdopen(0, "rb", buffering=0)     # unbuffered, so select() sees exact
 server_ids = itertools.count()
 state = {"experimental": False, "tools": [], "thread": None, "total": {"inputTokens": 0, "outputTokens": 0,
                                                                         "cachedInputTokens": 0, "totalTokens": 0},
-         "ignored": set(), "deferred": []}
+         "ignored": set(), "deferred": [], "cwd": None}
 
 
 def out(msg):
@@ -314,6 +315,8 @@ def run_turn(mid, params):
             if i and "slowly" in text:
                 time.sleep(SLOW_SIBLING_S)
             call_id, rid, args = "exec-" + str(uuid.uuid4()), next(server_ids), {"file_path": f"f{i}.md"}
+            if i == 0 and "scratch path" in text:   # the model trusts the thread's cwd (the backend's scratch dir)
+                args = {"file_path": os.path.join(state["cwd"] or os.getcwd(), "c.txt")}
             item(turn_id, "item/started", {"type": "dynamicToolCall", "id": call_id, "namespace": None, "tool": state["tools"][0],
                                            "arguments": args, "status": "inProgress", "contentItems": None, "success": None})
             out({"method": "item/tool/call", "id": rid, "params": {"threadId": state["thread"], "turnId": turn_id,
@@ -396,6 +399,7 @@ def main():
                 continue
             state["tools"] = [t["name"] for t in params.get("dynamicTools") or []]
             state["thread"] = str(uuid.uuid4())
+            state["cwd"] = params.get("cwd")
             if os.environ.get("FAKE_CODEX_LEAK_MCP"):
                 notify("mcpServer/startupStatus/updated", {"name": "leaky-server", "status": {"type": "starting"}})
             model = os.environ.get("FAKE_CODEX_MODEL") or params.get("model")

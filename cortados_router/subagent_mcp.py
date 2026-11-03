@@ -70,8 +70,9 @@ CHILD_TOOLS = [
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
                           "model such as fable, opus, sonnet, gpt-6.1-sol: that pins the child's MAIN model; the "
                           "child's subagents are still routed by S1."},
-         "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default): a safety classifier "
-                             "approves or denies each action; acceptEdits: edits in cwd allowed, other approval-needing "
+         "permission_mode": {"type": "string", "enum": _MODES, "description": "auto (default where the model "
+                             "supports it): a safety classifier approves or denies each action (haiku models other "
+                             "than claude-haiku-5-5 have no auto mode: unset, they get acceptEdits; 'auto' is refused); acceptEdits: edits in cwd allowed, other approval-needing "
                              "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
@@ -136,7 +137,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
     try:
         if name == "start_task":
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
-                           a.get("permission_mode") or ct.DEFAULT_PERMISSION_MODE, a.get("allowed_tools"),
+                           a.get("permission_mode") or None, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
                            a.get("connectors"))
         elif name == "task_status":
