@@ -90,6 +90,13 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         events = [{"type": "message_start", "message": {**msg, "content": [], "stop_reason": None}}]
+        if FakeOllama.mode == "stall-stream":           # starts the answer, then goes quiet past the read timeout
+            ev = events[0]
+            self.wfile.write(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(2)
+            self.close_connection = True
+            return
         for i, b in enumerate(content):
             if b["type"] == "text":                       # text streams as deltas, as Ollama sends it
                 events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}]
@@ -284,7 +291,19 @@ class LocalPinTests(LocalHarness):
         self.assertIn("resolved to the excluded model", r["error"])
 
     def test_truncated_or_stalled_error_body_is_a_bounded_502_and_cleans_up(self):
+        # The failed opener is dropped after the 502 is written, so the client can see the answer before the drop has
+        # run: the test waits for the drop itself (an Event set once reg.drop returns), never for a fixed time.
+        dropped = threading.Event()
+        real_drop = self.reg.drop
+
+        def drop(session):
+            try:
+                return real_drop(session)
+            finally:
+                dropped.set()
+        self.reg.drop = drop
         for mode in ("truncated", "stalled"):
+            dropped.clear()
             FakeOllama.mode = mode
             if mode == "stalled":
                 cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
@@ -298,7 +317,27 @@ class LocalPinTests(LocalHarness):
             self.assertEqual(code, 502, mode)
             self.assertIn("truncated or stalled", msg, mode)
             self.assertLess(len(msg), 1000)
+            self.assertTrue(dropped.wait(10), mode)
             self.assertEqual(self.reg.sessions, {}, mode)              # the failed opener was cleaned up
+
+    def test_a_local_timeout_is_recorded_under_the_run_id(self):
+        cfg = json.loads(Path(os.environ[local_lane.CONFIG_ENV]).read_text())
+        cfg["nodes"][0]["ollama"]["read_timeout_s"] = 0.5
+        Path(os.environ[local_lane.CONFIG_ENV]).write_text(json.dumps(cfg))
+        FakeOllama.mode = "stall-stream"
+        try:
+            raw = self.post({**self.BODY, "stream": True}, headers={"x-cortados-run-id": "run-local-stall"})
+        finally:
+            FakeOllama.mode = "ok"
+        self.assertIn("event: error", raw)                              # said in the stream, not a silent truncation
+        req = urllib.request.Request(self.url + "/v1/cortados/runs/run-local-stall",
+                                     headers={"authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            got = json.loads(r.read())
+        last = got["refusals"][-1]
+        self.assertEqual((last["status"], last["type"]), (502, "api_error"))
+        self.assertEqual(last["reason"], "the local node stopped mid-answer (stalled or dropped)")
+        self.assertIn("read timeout 0.5s", last["detail"])
 
     def test_a_relay_crash_still_answers_and_cleans_up(self):
         real = local_lane.serve

@@ -341,8 +341,11 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   gets no client-side tool search). The full set measured ~1.1 MB, about 290k estimated tokens across 495 MCP tools
   (Vercel alone 241), on 2026-11-02. That is over a 200k model's input ceiling, so the provider refused every such
   child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
-- Refusals: the provider logs every refusal (any 4xx/5xx it answers) with its reason, and records a refused request
-  under its `x-cortados-run-id`. `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
+- Refusals: the provider logs every refusal it answers (JSON errors, SSE error events, the local relay's errors) and,
+  for an authenticated request, records it under its `x-cortados-run-id`; an unauthenticated one is logged apart and
+  never recorded. Only a sanitized diagnostic is kept: status, error type, a fixed reason, and at most 200 characters
+  of backend text redacted (provider token, configured credentials, their JSON-escaped forms) before it is cut.
+  `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.
   If the runner itself dies, the next status call stops claude's leftover process group (SIGTERM, then SIGKILL after

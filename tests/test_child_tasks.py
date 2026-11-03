@@ -1083,12 +1083,15 @@ class ChildTaskTests(unittest.TestCase):
         tid = self.start()
         self.runs[tid] = {"run_id": tid, "model": None, "label": None, "provider": None, "models": [],
                           "builder_models": [], "refusals": [{"status": 413, "type": "request_too_large",
-                                                              "message": "cortados: sub/x: the request (≈293k tokens) does not fit"}]}
+                                                              "reason": "the request is larger than every eligible "
+                                                                        "model's context",
+                                                              "detail": "sub/x: the request (≈293k tokens) does not fit"}]}
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertEqual(w["state"], "failed")
         self.assertEqual(w["api_error_status"], 413)
         self.assertIn("HTTP 413 request_too_large", w["provider_refusal"])
         self.assertIn("≈293k tokens", w["provider_refusal"])
+        self.assertIn("larger than every eligible model's context", w["provider_refusal"])
         self.assertIn("connectors", w["hint"])
 
     def test_failure_exit(self):

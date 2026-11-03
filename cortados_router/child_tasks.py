@@ -42,7 +42,7 @@ if __name__ == "__main__" and not __package__:
     # environment (it would shadow `tests`, `s1`, `cortados_router` in unrelated repos); put the root on sys.path here.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cortados_router import paths, session  # noqa: E402
+from cortados_router import paths, redact, session  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TASKS_DIR = "~/.config/cortados/tasks"
@@ -153,9 +153,10 @@ def _write_json(path: str, obj) -> None:
         raise
 
 
-class Redactor:
-    """Removes provider credentials from model-visible output. Every token must be at least MIN_TOKEN_LEN long (a
-    shorter one is refused, not silently left in). Redact strings BEFORE serializing or truncating."""
+class Redactor(redact.Redactor):
+    """Removes provider credentials from model-visible output (the shared cortados_router.redact implementation).
+    Every token must be at least MIN_TOKEN_LEN long (a shorter one is refused, not silently left in). Redact strings
+    BEFORE serializing or truncating."""
 
     def __init__(self, tokens=()):
         toks = {t for t in tokens if t}
@@ -163,33 +164,7 @@ class Redactor:
             raise TaskError(f"a configured provider token is shorter than {MIN_TOKEN_LEN} characters; it is not a "
                             "provider token and could not be redacted safely (check CORTADOS_PROVIDER_TOKEN and the "
                             "token file)")
-        self.raw = sorted(toks)
-        # Each credential's JSON-escaped spelling too: claude's JSON output escapes quotes and backslashes in it.
-        toks |= {json.dumps(t)[1:-1] for t in toks}
-        self.tokens = sorted(toks, key=len, reverse=True)
-        # One alternation, longest first: at any position the longest credential wins (a shorter one that is a prefix
-        # of a longer one never splits it).
-        self._re = re.compile("|".join(re.escape(t) for t in self.tokens)) if self.tokens else None
-
-    def text(self, s: str) -> str:
-        return self._re.sub("***", s) if self._re else s
-
-    def leading_fragment(self, s: str) -> str:
-        """Mask a token suffix at the very start of `s` (text read from mid-file may begin mid-token)."""
-        for t in self.tokens:
-            for k in range(len(t) - 1, 0, -1):
-                if s.startswith(t[-k:]):
-                    return "***" + s[k:]
-        return s
-
-    def tree(self, obj):
-        if isinstance(obj, str):
-            return self.text(obj)
-        if isinstance(obj, list):
-            return [self.tree(x) for x in obj]
-        if isinstance(obj, dict):
-            return {self.text(str(k)): self.tree(v) for k, v in obj.items()}
-        return obj
+        super().__init__(toks)
 
 
 def pin_model(name) -> str:
@@ -692,7 +667,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
         if refusals:
             last = refusals[-1]
-            out["provider_refusal"] = f"HTTP {last.get('status')} {last.get('type')}: {last.get('message')}"
+            detail = f" ({last['detail']})" if last.get("detail") else ""
+            out["provider_refusal"] = f"HTTP {last.get('status')} {last.get('type')}: {last.get('reason')}{detail}"
         api_status = o.get("api_error_status") if isinstance(o, dict) else None
         if api_status is not None:
             out["api_error_status"] = api_status
