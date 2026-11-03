@@ -222,11 +222,12 @@ class RunnerTest(unittest.TestCase):
 
             def __exit__(self, *a):
                 return False
-        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=Resp(b"{}")) as op:
+        with opener_returning(Resp(b"{}")) as build:
             self.assertEqual(hardware.default_fetch("http://x"), "{}")
-        self.assertEqual(op.call_args.kwargs["timeout"], hardware.OLLAMA_TIMEOUT)
+        self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], hardware.OLLAMA_TIMEOUT)
+        self.assertIs(build.call_args.args[0], hardware._NoRedirect)
         big = Resp(b"a" * (hardware.MAX_OLLAMA_BYTES + 10))
-        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=big):
+        with opener_returning(big):
             with self.assertRaises(ValueError):
                 hardware.default_fetch("http://x")
 
@@ -241,10 +242,35 @@ class RunnerTest(unittest.TestCase):
             def read(self, n):
                 return b"a"  # one byte per read, forever: only the deadline stops it
         clock = iter(range(0, 1000))
-        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=Drip()), \
+        with opener_returning(Drip()), \
                 mock.patch.object(hardware.time, "monotonic", side_effect=lambda: float(next(clock))):
             with self.assertRaises(TimeoutError):
                 hardware.default_fetch("http://x")
+
+    def test_redirect_is_refused(self):
+        handler = hardware._NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "http://elsewhere/"))
+
+    def test_default_fetch_checks_budget_after_a_blocking_read(self):
+        class Slow:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return b"a"  # the clock below jumps past the budget during this one read
+        clock = iter([0.0, 0.0, hardware.FETCH_BUDGET + 1])
+        with opener_returning(Slow()), mock.patch.object(hardware.time, "monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaises(TimeoutError):
+                hardware.default_fetch("http://x")
+
+
+def opener_returning(response):
+    opener = mock.Mock()
+    opener.open.return_value = response
+    return mock.patch.object(hardware.urllib.request, "build_opener", return_value=opener)
 
 
 @contextlib.contextmanager
@@ -335,6 +361,41 @@ class WriteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=os.path.join(tmp, "home"), CORTADOS_HERMES_HOME=None):
             with self.assertRaises(PermissionError):
                 hardware.write_atomic(os.path.join(tmp, "other", "box.json"), {}, require_owned=True)
+
+    def test_owned_check_refuses_dotdot_escape(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=os.path.join(tmp, "home"), CORTADOS_HERMES_HOME=None):
+            target = os.path.join(tmp, "home", "hardware", "..", "..", "escaped.json")
+            with self.assertRaises(PermissionError):
+                hardware.write_atomic(target, {}, require_owned=True)
+            self.assertFalse(os.path.lexists(os.path.join(tmp, "escaped.json")))
+            self.assertFalse(os.path.lexists(os.path.join(tmp, "home")))
+
+    def test_owned_check_refuses_group_writable_level(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):
+            os.chmod(tmp, 0o770)
+            with self.assertRaises(PermissionError):
+                hardware.write_atomic(os.path.join(tmp, "hardware", "box.json"), {}, require_owned=True)
+            self.assertFalse(os.path.lexists(os.path.join(tmp, "hardware")))
+
+    def test_hostile_host_stays_in_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):
+            for host in ("../../../../tmp/x", "..", ".hidden", "a/b", "", None):
+                path = hardware.default_out_path(host)
+                self.assertEqual(str(path.parent), os.path.join(tmp, "hardware"), host)
+                self.assertRegex(path.name, r"^[A-Za-z0-9_-]+\.json$")
+            path = hardware.default_out_path("../../x")
+            hardware.write_atomic(path, {}, require_owned=True)
+            self.assertTrue(path.exists())
+
+    def test_hostname_fqdn_is_trimmed(self):
+        with mock.patch.object(hardware.socket, "gethostname", return_value="box.tail1234.ts.net"):
+            out = hardware.sample(run=fake_run(), fetch=ok_fetch, system="Darwin", now=1.0)
+        self.assertEqual(out["host"], "box")
+
+    def test_missing_getloadavg_is_unavailable(self):
+        with mock.patch.object(hardware.os, "getloadavg", side_effect=AttributeError("no getloadavg")):
+            out = hardware.sample(run=fake_run(), fetch=ok_fetch, system="Windows", now=1.0, hostname="box")
+        self.assertFalse(out["load_avg"]["available"])
 
     def test_default_path_uses_cortados_home(self):
         with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):

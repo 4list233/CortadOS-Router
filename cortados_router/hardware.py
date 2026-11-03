@@ -6,7 +6,8 @@ router reads it yet. Stdlib only. Every subprocess and the HTTP fetch is injecta
 `fetch`) so tests never depend on the host; every failure lands in `errors` and the field it
 would have filled is marked unavailable with the reason. Missing readings are unknown, never 0.
 
-Worst case one sample takes 5 x CMD_TIMEOUT + FETCH_BUDGET (about 22 s, every command hanging);
+Worst case one sample takes 5 x CMD_TIMEOUT + FETCH_BUDGET + OLLAMA_TIMEOUT (about 22.5 s, every command
+hanging; the last body read may block one more OLLAMA_TIMEOUT);
 normally about 2 s (top's two 1 s samples). A timer that fires more often than the worst case can overlap.
 
 CLI: python3 -m cortados_router.hardware sample [--out [PATH]]
@@ -52,18 +53,28 @@ def default_run(argv, timeout=CMD_TIMEOUT):
     return result.stdout
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # refuse: urllib then raises HTTPError for the 3xx
+
+
 def default_fetch(url, timeout=OLLAMA_TIMEOUT):
     """GET url. timeout is per socket operation; FETCH_BUDGET bounds the whole body read (a peer
     dripping one byte per timeout would otherwise stall for hours); the size cap stops a huge body."""
     deadline = time.monotonic() + FETCH_BUDGET
     chunks, size = [], 0
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+    # No redirects: whatever holds the port could otherwise point the GET at any URL and have that
+    # body land in the sample. A 3xx becomes an HTTPError (an OSError), so attempt() records it.
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(url, timeout=timeout) as response:
         while size <= MAX_OLLAMA_BYTES:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"body not complete within {FETCH_BUDGET}s")  # an OSError: attempt() records it
             chunk = response.read(min(8192, MAX_OLLAMA_BYTES + 1 - size))
             if not chunk:
                 break
+            if time.monotonic() > deadline:  # a read may block one more OLLAMA_TIMEOUT past the budget
+                raise TimeoutError(f"body not complete within {FETCH_BUDGET}s")
             chunks.append(chunk)
             size += len(chunk)
     body = b"".join(chunks)
@@ -157,7 +168,7 @@ def sample(run=default_run, fetch=default_fetch, system=None, now=None, hostname
     try:
         load = os.getloadavg()
         out["load_avg"] = [round(x, 2) for x in load]
-    except OSError as exc:
+    except (OSError, AttributeError) as exc:  # AttributeError: os.getloadavg does not exist on Windows
         errors.append({"field": "load_avg", "error": str(exc)})
         out["load_avg"] = unavailable(str(exc))
     ncpu = os.cpu_count()
@@ -200,8 +211,20 @@ def _raise(message):
     raise ValueError(message)
 
 
+_HOST_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def safe_host(host):
+    """host as a single safe file-name component: anything outside [A-Za-z0-9_-] becomes '_'.
+
+    The host name is not validated by the OS for our purpose; '/' or '..' in it must not move the
+    default write out of the state dir."""
+    cleaned = _HOST_UNSAFE.sub("_", str(host or ""))
+    return cleaned or "unknown"
+
+
 def default_out_path(host):
-    return state_dir() / "hardware" / f"{host}.json"
+    return state_dir() / "hardware" / f"{safe_host(host)}.json"
 
 
 def write_atomic(path, data, require_owned=False):
@@ -240,8 +263,11 @@ def write_atomic(path, data, require_owned=False):
 
 def _state_levels(directory):
     """The state dir and every level under it down to directory (require_owned is for our own tree only)."""
-    root = Path(state_dir())
-    directory = Path(directory)
+    if ".." in Path(directory).parts:  # relative_to is lexical: '..' would pass it and escape the tree
+        raise PermissionError(f"{directory} leaves the state dir via '..'")
+    # normpath, not resolve(): resolving would follow the symlinks _check_owned exists to refuse
+    root = Path(os.path.normpath(state_dir()))
+    directory = Path(os.path.normpath(directory))
     try:
         rel = directory.relative_to(root)
     except ValueError:
@@ -253,13 +279,16 @@ def _state_levels(directory):
 
 
 def _check_owned(levels, existing_only):
-    """lstat each level: a symlink, a non-directory or another user's directory anywhere in the tree is refused."""
+    """lstat each level: a symlink, a non-directory, another user's directory, or one group/other can
+    write (someone else could swap entries in it) anywhere in the tree is refused."""
     for level in levels:
         if existing_only and not os.path.lexists(level):
             continue
         info = os.lstat(level)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise PermissionError(f"{level} is not a directory owned by this user")
+        if info.st_mode & 0o022:
+            raise PermissionError(f"{level} is writable by group or others")
 
 
 def main(argv=None):
