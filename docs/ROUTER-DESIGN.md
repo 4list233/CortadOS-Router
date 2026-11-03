@@ -345,15 +345,21 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 | `CORTADOS_S1_LATENCY_BUDGET_S` | 1.0 | scorer latency allowed above baseline before training is paused |
 | `CORTADOS_S1_MIN_FREE_GB` | 8 | free memory below which training is paused |
 | `CORTADOS_S1_PROBE_S` | 30 | seconds between scorer latency probes |
-| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause; past it the tree is resumed and `guard_forced_resume` alerts |
+| `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it the tree is resumed and `guard_forced_resume` alerts |
+| `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume, no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
 | `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle |
-| `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle |
+| `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle (min 60) |
 | `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
 | `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |
 
-Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S`), `scorer_probe_config` (the probe settings are unusable).
-Stop: `s1/nightly.sh --stop` touches `s1/data/nightly.stop`, continues a paused tree (SIGCONT) and then TERMs it; the supervisor exits 0
-and a cycle refuses to start (exit 130) while the flag exists. Resume: remove `s1/data/nightly.stop`, then
+Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S` or the scorer stayed unreadable; the detail counts forced
+releases in a row, reset by a normal resume), `scorer_probe_config` (the probe settings are unusable; alerts and logs name the setting
+that chose the URL, `CORTADOS_S1_URL` / `CORTADOS_S1_ENDPOINT` / default, never the URL itself). A stale result marker that cannot be
+removed makes the cycle count as idle. The failure backoff exponent and the persisted failure count are clamped.
+Stop: `s1/data/nightly.stop` means "the operator ran `nightly.sh --stop`", and only `--stop` creates it in continuous mode: a TERM from
+the supervisor (launchctl unload / `kickstart -k`, logout, shutdown) ends the cycle with exit 130 but leaves no flag, so the job comes
+back after a reboot. `s1/nightly.sh --stop` touches the flag, continues the paused process group (SIGCONT) and then TERMs it; the
+supervisor exits 0 and a cycle refuses to start (exit 130) while the flag exists. Resume: remove `s1/data/nightly.stop`, then
 `launchctl kickstart gui/$(id -u)/com.cortados.s1-continuous`. Run it under launchd with `KeepAlive` = `SuccessfulExit` false, so a
 crash is relaunched and a stop-flag exit 0 is not:
 

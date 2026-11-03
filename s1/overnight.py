@@ -145,6 +145,23 @@ class ScorerConfigError(Exception):
     """401/403/404 (or an unresolvable URL): the probe is misconfigured. Not back-pressure; logged once per cycle and alerted."""
 
 
+def scorer_url_source() -> str:
+    """Which setting chose the scorer URL, for alerts and logs. The URL itself is never written there: it names a host on the
+    tailnet (e.g. the Studio's 100.x address), and status.json alerts are shown on the dashboard and copied into handbacks."""
+    if os.environ.get("CORTADOS_S1_URL"):
+        return "CORTADOS_S1_URL"
+    if os.environ.get("CORTADOS_S1_ENDPOINT"):
+        return "CORTADOS_S1_ENDPOINT"
+    return "the default endpoint (s1-endpoints.json default, else loopback)"
+
+
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"]*")
+
+
+def _redact_urls(text: str) -> str:
+    return _URL_RE.sub("<url>", text)
+
+
 def scorer_url() -> str:
     """The /score URL through the router's resolver (CORTADOS_S1_URL -> endpoint name -> endpoints default -> loopback)."""
     if str(REPO) not in sys.path:
@@ -152,8 +169,8 @@ def scorer_url() -> str:
     from cortados_router import s1_endpoint
     try:
         return s1_endpoint.resolve_url().rstrip("/") + "/score"
-    except ValueError as e:
-        raise ScorerConfigError(f"scorer URL does not resolve ({e})") from e
+    except ValueError as e:   # the resolver's message can quote the URL: redact it and name the setting instead
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} does not resolve ({_redact_urls(str(e))})") from e
 
 
 def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float | None:
@@ -173,9 +190,10 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
     except urllib.error.HTTPError as e:   # before OSError: HTTPError is an OSError subclass
         if e.code >= 500:
             raise ScorerRefused(f"scorer refused (HTTP {e.code})") from None
-        raise ScorerConfigError(f"scorer probe got HTTP {e.code} from {url}: check CORTADOS_S1_URL/ENDPOINT/TOKEN") from None
+        raise ScorerConfigError(f"scorer probe got HTTP {e.code} from the URL set by {scorer_url_source()}: "
+                                "check CORTADOS_S1_URL/ENDPOINT/TOKEN") from None
     except OSError as e:
-        print(f"overnight: scorer probe failed ({e}); latency unknown this probe", flush=True)
+        print(f"overnight: scorer probe failed ({_redact_urls(str(e))}); latency unknown this probe", flush=True)
         return None
     return _time.monotonic() - t0
 
@@ -215,7 +233,8 @@ class Guard:
 
     def __init__(self, *, latency=probe_scorer_latency, memory=free_memory_gb, clock=_time.monotonic, signaller=None,
                  budget_s: float | None = None, min_free_gb: float | None = None, interval_s: float | None = None,
-                 max_pause_s: float | None = None, log=lambda m: print(m, flush=True), alerter=None):
+                 max_pause_s: float | None = None, release_hold_s: float | None = None, log=lambda m: print(m, flush=True),
+                 alerter=None):
         self.latency, self.memory, self.clock, self.log = latency, memory, clock, log
         self.signaller = signaller or signal_group
         self.alerter = alerter or (lambda name, detail: alert(name, detail, log=self.log))
@@ -223,8 +242,17 @@ class Guard:
         self.min_free = _env_float("CORTADOS_S1_MIN_FREE_GB", 8.0, minimum=0) if min_free_gb is None else min_free_gb
         self.interval = _env_float("CORTADOS_S1_PROBE_S", 30.0, above=0) if interval_s is None else interval_s
         # A trainer stopped longer than this is a stalled cycle, not back-pressure: release it, log loudly and alert.
+        # minimum=60: two probes at the default 30 s interval; a shorter cap releases before the guard can see whether the
+        # contention cleared, so the pause would be noise (and 0 would disable pausing entirely).
         self.max_pause = (_env_float("CORTADOS_S1_MAX_PAUSE_S", 1800.0, minimum=60) if max_pause_s is None
                           else max_pause_s)
+        # After a forced release, no re-pause for this long (default = max_pause: training runs at least as long as it was
+        # held). Without it a persistent 503 or low memory re-paused on the very next probe and the tree ran ~1% of the time
+        # (2 h simulation, review 2026-11-03). minimum=60 for the same two-probe reason as MAX_PAUSE_S.
+        default_hold = max(self.max_pause, 60.0)
+        self.release_hold = (_env_float("CORTADOS_S1_RELEASE_HOLD_S", default_hold, minimum=60) if release_hold_s is None
+                             else release_hold_s)
+        self.forced_releases = 0   # consecutive forced releases (supervisor lifetime); a normal resume resets it
         self.baseline_samples: list[float] = []
         self.last = None
         self.new_cycle()
@@ -237,6 +265,7 @@ class Guard:
         self.unreadable = 0
         self.config_logged = False
         self.blind = False   # set after a forced release: an unreadable scorer must not re-pause the tree at once
+        self.hold_until = None   # clock time before which a forced release is not re-paused (release_hold)
 
     @property
     def baseline(self) -> float | None:
@@ -281,8 +310,12 @@ class Guard:
         self.paused_at = None
         self.unreadable = 0
         self.blind = True
-        self.log(f"overnight: !!! FORCED RESUME of work tree: {why}")
-        self.alerter("guard_forced_resume", why)
+        self.hold_until = self.clock() + self.release_hold
+        self.forced_releases += 1
+        detail = (f"{why}; forced release #{self.forced_releases} in a row; no re-pause for "
+                  f"CORTADOS_S1_RELEASE_HOLD_S {self.release_hold:g}s")
+        self.log(f"overnight: !!! FORCED RESUME of work tree: {detail}")
+        self.alerter("guard_forced_resume", detail)
 
     def tick(self, pgid: int) -> None:
         """One guard step for the running work group (rate-limited to one probe per interval)."""
@@ -301,6 +334,10 @@ class Guard:
                 return self._release(pgid, f"paused {held:.0f}s >= CORTADOS_S1_MAX_PAUSE_S {self.max_pause:g}s")
             if self.unreadable >= self.MAX_UNREADABLE:
                 return self._release(pgid, f"{self.unreadable} consecutive unreadable scorer probes while paused")
+        elif self.hold_until is not None:
+            if self.clock() < self.hold_until:
+                return   # release hold-off: the tree runs at least as long as it was held, whatever the probes say
+            self.hold_until = None
         reasons = [refused] if refused else []
         base = self.baseline
         if lat is not None and base is not None and lat > base + self.budget:
@@ -326,6 +363,7 @@ class Guard:
                 self.paused = False
                 self.paused_at = None
                 self.good = 0
+                self.forced_releases = 0
                 self.log(f"overnight: RESUME work tree: latency {lat:.2f}s within budget for {self.RESUME_AFTER} probes"
                          + (f", free memory {mem:.1f} GB" if mem is not None else ""))
 
@@ -364,12 +402,15 @@ def _read_result(result_file: Path) -> str:
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
               sleep=_time.sleep, pidfile: Path | None = None) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'."""
+    stale = False
     try:
         result_file.unlink()
     except FileNotFoundError:
         pass
-    except OSError as e:   # a stale marker we cannot remove would be misread as this cycle's: say so, and ignore it below
-        print(f"overnight: cannot remove stale cycle result {result_file} ({e}); this cycle's result is unreliable", flush=True)
+    except OSError as e:   # a stale marker we cannot remove would be misread as this cycle's: the cycle is read as idle
+        stale = True
+        print(f"overnight: WARNING: cannot remove stale cycle result {result_file} ({e}); this cycle will be treated as idle",
+              flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file))
     guard.new_cycle()
@@ -393,6 +434,10 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 pass
             except OSError as e:
                 print(f"overnight: cannot clear pidfile {pidfile} ({e})", flush=True)
+    if stale:
+        print(f"overnight: WARNING: cycle result {result_file} may be the previous cycle's; treating this cycle as idle",
+              flush=True)
+        return child.returncode, "idle"
     return child.returncode, _read_result(result_file)
 
 
@@ -447,6 +492,10 @@ BACKOFF_CAP_S = 4 * 3600.0
 # 'quota' cooldown default: the accounts' 5 h usage window. A cycle that stopped on the labeler's headroom floor (15%) must not
 # relaunch at once, or the next cycle labels again on the same window and the floor is defeated.
 QUOTA_COOLDOWN_S = 5 * 3600.0
+# Backoff exponent and persisted failure count are clamped: 2**20 * 60 s already exceeds BACKOFF_CAP_S by far, and an unclamped
+# count (a long outage, a corrupt .failures file) makes idle_s * 2**n overflow a float and crash the supervisor.
+MAX_BACKOFF_EXP = 20
+MAX_FAILURES = 1000
 
 
 def next_delay(rc: int, worked, idle_s: float, failures: int, quota_s: float = QUOTA_COOLDOWN_S) -> tuple[float, int]:
@@ -454,8 +503,8 @@ def next_delay(rc: int, worked, idle_s: float, failures: int, quota_s: float = Q
     `worked` is the cycle result: 'worked', 'quota' or 'idle' (True/False are accepted as worked/idle)."""
     result = "worked" if worked is True else ("idle" if worked is False else worked)
     if rc != 0:
-        failures += 1
-        delay = min(idle_s * 2 ** (failures - 1), BACKOFF_CAP_S)
+        failures = min(failures + 1, MAX_FAILURES)
+        delay = min(idle_s * 2 ** min(failures - 1, MAX_BACKOFF_EXP), BACKOFF_CAP_S)
         return (max(delay, quota_s) if result == "quota" else delay), failures
     if result == "quota":
         return quota_s, 0
@@ -470,7 +519,7 @@ def _load_failures(result_file: Path) -> int:
     """Consecutive-failure count persisted next to the result marker, so a supervisor restart keeps the backoff."""
     path = _failures_file(result_file)
     try:
-        return max(0, int(path.read_text().strip()))
+        return min(max(0, int(path.read_text().strip())), MAX_FAILURES)
     except FileNotFoundError:
         return 0
     except (OSError, ValueError) as e:
@@ -494,6 +543,7 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
     guard = guard or Guard()
     # >= 60 s: a 0 s idle interval is a hot relaunch loop against the scorer and the accounts.
     idle_s = _env_float("CORTADOS_S1_CYCLE_IDLE_S", 900.0, minimum=60) if idle_s is None else idle_s
+    # >= 60 s: a 0 s cooldown relaunches straight into the same exhausted usage window, defeating the labeler's headroom floor.
     quota_s = _env_float("CORTADOS_S1_QUOTA_COOLDOWN_S", QUOTA_COOLDOWN_S, minimum=60) if quota_s is None else quota_s
     n = 0
     failures = _load_failures(result_file)

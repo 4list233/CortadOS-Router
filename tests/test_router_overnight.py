@@ -336,3 +336,91 @@ class ReviewFixes(unittest.TestCase):
         for _ in range(3):
             t2[0] += 30; g2.tick(1)
         self.assertEqual(sig2, []); self.assertEqual([a[0] for a in alerts2], ['scorer_probe_config'])   # once per cycle
+
+
+class ReviewFixesRound2(unittest.TestCase):
+    """Release hold-off, stale-marker idle, backoff clamp, no scorer URL in alerts/logs."""
+
+    def test_persistent_503_still_runs_at_least_40_percent(self):
+        def refused():
+            raise night.ScorerRefused('scorer refused (HTTP 503)')
+        sig, alerts, t = [], [], [0.0]
+        g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, clock=lambda: t[0], signaller=lambda p, s: sig.append(s),
+                        budget_s=1.0, min_free_gb=8, interval_s=30, max_pause_s=1800, log=lambda m: None,
+                        alerter=lambda n, d: alerts.append(d))
+        g.idle_probe(); g.latency = refused
+        running = 0.0
+        while t[0] < 7200:
+            g.tick(1)
+            if not g.paused:
+                running += 1
+            t[0] += 1
+        self.assertGreaterEqual(running / 7200, 0.40, sig)
+        self.assertGreaterEqual(len(alerts), 2)
+        self.assertIn('forced release #1 in a row', alerts[0]); self.assertIn('forced release #2 in a row', alerts[1])
+        self.assertIn('CORTADOS_S1_RELEASE_HOLD_S', alerts[0])
+
+    def test_release_hold_env_default_and_minimum(self):
+        mk = lambda: night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, max_pause_s=900, log=lambda m: None,
+                                 alerter=lambda n, d: None)
+        os.environ.pop('CORTADOS_S1_RELEASE_HOLD_S', None)
+        self.assertEqual(mk().release_hold, 900)
+        with patch.dict(os.environ, {'CORTADOS_S1_RELEASE_HOLD_S': '30'}), patch('builtins.print'):
+            self.assertEqual(mk().release_hold, 900)   # below the 60 s minimum: the default
+        with patch.dict(os.environ, {'CORTADOS_S1_RELEASE_HOLD_S': '120'}):
+            self.assertEqual(mk().release_hold, 120)
+
+    def test_unremovable_stale_marker_reads_as_idle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rf = Path(tmp) / 'r'; rf.write_text('worked\n')
+            g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, max_pause_s=1800,
+                            log=lambda m: None, alerter=lambda n, d: None)
+            real_unlink = Path.unlink
+            def unlink(self, *a, **k):
+                if self == rf:
+                    raise PermissionError(13, 'Permission denied')
+                return real_unlink(self, *a, **k)
+            with patch.object(Path, 'unlink', unlink), patch('builtins.print') as pr:
+                self.assertEqual(night.run_cycle([sys.executable, '-c', 'pass'], g, result_file=rf, poll_s=0,
+                                                 sleep=lambda s: None), (0, 'idle'))
+            self.assertTrue(any('treated as idle' in str(c.args[0]) for c in pr.call_args_list))
+
+    def test_huge_failure_count_does_not_overflow(self):
+        delay, failures = night.next_delay(1, 'idle', 900, 2000)
+        self.assertEqual(delay, night.BACKOFF_CAP_S); self.assertLessEqual(failures, night.MAX_FAILURES)
+        with tempfile.TemporaryDirectory() as tmp:
+            rf = Path(tmp) / 'r'; Path(tmp, 'r.failures').write_text('99999999999999999999\n')
+            self.assertEqual(night._load_failures(rf), night.MAX_FAILURES)
+
+    def test_scorer_url_never_in_alert_or_log(self):
+        secret = 'http://100.64.0.9:8431'
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                self.send_response(403); self.end_headers()
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            logs, alerts = [], []
+            local = f'http://127.0.0.1:{srv.server_port}'
+            with patch.dict(os.environ, {'CORTADOS_S1_URL': local}):
+                g = night.Guard(latency=lambda: night.probe_scorer_latency(timeout=5), memory=lambda: 100.0, budget_s=1,
+                                min_free_gb=8, interval_s=0, max_pause_s=1800, log=logs.append,
+                                alerter=lambda n, d: alerts.append(d))
+                g.idle_probe()
+            text = '\n'.join(logs + alerts)
+            self.assertNotIn(local, text); self.assertNotIn('127.0.0.1', text); self.assertIn('CORTADOS_S1_URL', text)
+            # an unresolvable URL: the resolver quotes it, the error must not
+            with patch.dict(os.environ, {'CORTADOS_S1_URL': secret.replace('http', 'ftp')}):
+                with self.assertRaises(night.ScorerConfigError) as cm:
+                    night.scorer_url()
+            self.assertNotIn('100.64.0.9', str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
+            # unreachable: the OSError text is redacted too
+            with patch.dict(os.environ, {'CORTADOS_S1_URL': secret}), patch('builtins.print') as pr, \
+                    patch.object(night.urllib.request, 'urlopen', side_effect=OSError(f'cannot reach {secret}/score')):
+                self.assertIsNone(night.probe_scorer_latency(timeout=1))
+            self.assertNotIn('100.64.0.9', pr.call_args[0][0])
+        finally:
+            srv.shutdown(); srv.server_close()
