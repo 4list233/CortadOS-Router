@@ -65,6 +65,20 @@ FAKE = textwrap.dedent('''\
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "api_error_status": 413,
                           "result": "Request too large (max 32MB). Accumulated images..."}}))
         sys.exit(1)
+    if mode == "stream-deep":
+        # 1500-deep JSON: inside a tool result string (the decode in deep overflows) and as a raw line of its own
+        # (json.loads overflows), each with the token in it
+        tok = os.environ["ANTHROPIC_AUTH_TOKEN"]
+        nested = "[" * 1500 + json.dumps(tok) + "]" * 1500
+        print(json.dumps({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "t1",
+            "content": nested}}]}}}}))
+        print(nested)
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}))
+        sys.exit(0)
+    if mode == "stream-manual":
+        print(json.dumps({{"type": "system", "subtype": "init", "permissionMode": "default"}}))   # 2.1.316 for manual
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}))
+        sys.exit(0)
     if mode == "stream-json-in-tool":
         # a tool result whose text is JSON (one escaping layer more than the event), and JSON inside that JSON
         tok = os.environ["ANTHROPIC_AUTH_TOKEN"]
@@ -943,6 +957,102 @@ class ChildTaskTests(unittest.TestCase):
             events = [json.loads(line) for line in f if line.startswith("{")]
         text = events[1]["message"]["content"][0]["content"][0]["text"]
         self.assertEqual(json.loads(text), {"config": {"token": "***"}})
+
+    def test_a_1500_deep_line_neither_kills_the_runner_nor_keeps_the_token(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-deep"
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertIn(w["state"], ("succeeded", "failed"), w)
+        self.assertTrue(w.get("redact_unparsed_lines") == 1 or "redact_error" in w, w)
+        self.assertEqual(w.get("redact_unparsed_lines"), 1)       # this build: the deep raw line, raw-redacted
+        d = ct.task_path(tid)
+        for name in ("stdout.log", "stderr.log", "result.json"):
+            with open(os.path.join(d, name)) as f:
+                data = f.read()
+            self.assertNotIn(self.cfg["token"], data, name)
+        _, again = self.call("task_status", task_id=tid)            # status keeps answering
+        self.assertEqual(again["state"], w["state"])
+
+    def test_deep_cleans_what_text_leaks_at_six_levels(self):
+        tok = 'ab"QQZZ\\ef-123456'                          # a quote and a backslash
+        red = ct.Redactor([tok])
+        value = {"token": tok}
+        for _ in range(6):                                  # JSON text inside a string, six levels down
+            value = {"wrapped": json.dumps(value)}
+        line = json.dumps(value)
+        self.assertIn("QQZZ", red.text(line))                # the raw pass alone leaks it at this depth
+        clean = json.dumps(red.deep(json.loads(line)))
+        self.assertNotIn("QQZZ", clean)
+        inner = json.loads(clean)
+        for _ in range(6):
+            inner = json.loads(inner["wrapped"])
+        self.assertEqual(inner, {"token": "***"})            # still the same structure, decodable
+
+    def test_redact_stream_file_counts_lines_it_could_not_parse(self):
+        tok = "stream-token-000001"
+        path = os.path.join(self.tmp, "s.log")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "a", "t": tok}) + "\n" + "plain " + tok + "\n" + "\n"
+                    + "[" * 1500 + "]" * 1500 + "\n" + json.dumps({"type": "b"}) + "\n")
+        self.assertEqual(ct.redact_stream_file(path, ct.Redactor([tok])), 2)   # the plain line and the deep one
+        with open(path) as f:
+            data = f.read()
+        self.assertNotIn(tok, data)
+        self.assertEqual(json.loads(data.splitlines()[0]), {"type": "a", "t": "***"})
+
+    def test_a_manual_child_is_not_warned_about_its_reported_default_mode(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-manual"
+        _, w = self.call("wait_task", task_id=self.start(permission_mode="manual"), timeout_s=30)
+        self.assertEqual(w["effective_permission_mode"], "default")
+        self.assertNotIn("warnings", w)
+
+    def _recovered(self, lines):
+        d = os.path.join(self.tmp, "recovered")
+        os.makedirs(d, exist_ok=True)
+        tok = "recover-token-00001"
+        with open(os.path.join(d, "stdout.log"), "w") as f:
+            f.write("\n".join(lines(tok)) + "\n")
+        open(os.path.join(d, "stderr.log"), "w").close()
+        meta = {"cwd": self.work, "cred_fingerprints": ct.credential_fingerprints([tok])}
+        res = {"logs_unredacted": True}
+        return d, tok, meta, res
+
+    def test_recovered_logs_record_unparsed_lines_and_activity(self):
+        d, tok, meta, res = self._recovered(lambda tok: [
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": "x.txt"}}]}}),
+            json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "w1",
+                                                                 "content": tok}]}}),
+            "not json " + tok])
+        self.assertTrue(ct._release_recovered_logs(d, meta, res, ct.Redactor([tok])))
+        self.assertEqual(res["redact_unparsed_lines"], 1)
+        self.assertEqual(res["activity"]["files_written"], [os.path.join(self.work, "x.txt")])
+        with open(os.path.join(d, "stdout.log")) as f:
+            self.assertNotIn(tok, f.read())
+
+    def test_a_structural_failure_in_recovery_withholds_logs_but_still_redacts_raw(self):
+        d, tok, meta, res = self._recovered(lambda tok: [json.dumps({"type": "a", "t": tok})])
+        with mock.patch.object(ct, "redact_stream_file", side_effect=RuntimeError("boom")):
+            self.assertFalse(ct._release_recovered_logs(d, meta, res, ct.Redactor([tok])))
+        self.assertIn("structurally", res["redact_error"])
+        self.assertTrue(res["logs_unredacted"])                   # still withheld
+        with open(os.path.join(d, "stdout.log")) as f:
+            self.assertNotIn(tok, f.read())                        # the raw pass ran anyway
+
+    def test_a_structural_failure_in_the_runner_fails_the_task_and_still_redacts_raw(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "echo-auth"
+        tid, d = self._manual_task("echo-auth")
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        with mock.patch.object(ct, "redact_stream_file", side_effect=RecursionError("deep")):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "runner-token-000001"}):
+                ct._run(d)
+        res = _load(os.path.join(d, "result.json"))
+        self.assertIn("structurally", res["redact_error"])
+        self.assertEqual(ct.classify(res), "failed")
+        for name in ("stdout.log", "stderr.log"):
+            with open(os.path.join(d, name)) as f:
+                self.assertNotIn("runner-token-000001", f.read(), name)
 
     def test_redaction_failure_fails_the_task_and_withholds_logs(self):
         for mode in ("ok", "fail"):

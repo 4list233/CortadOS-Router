@@ -52,9 +52,9 @@ def names_scratch(args: Any, scratch: Path) -> bool:
     """Whether a tool call's input names the backend's scratch dir. Its basename (cortados-bridge-<random>) is unique,
     so it matches every spelling of the path (/var vs /private/var, relative forms) and nothing else."""
     try:
-        return scratch.name in json.dumps(args)
-    except (TypeError, ValueError):
-        return False
+        return scratch.name in json.dumps(args, default=str)
+    except (ValueError, RecursionError):        # a circular or absurdly deep input: treat as naming it (fail closed)
+        return True
 
 
 def claude_env(config_dir: str | None) -> dict[str, str]:

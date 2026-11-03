@@ -70,6 +70,9 @@ DEFAULT_PERMISSION_MODE = "auto"
 # claude-haiku-4-5-20251001; supported: cortados, sub/claude-haiku-5-5, sonnet-4-6/5/5-5, opus-4-6/5-5, fable-5,
 # gpt-5.6-luna, gpt-6.1-sol, qwen-27b. The CLI's rule is "a name containing haiku, except claude-haiku-5-5".
 AUTO_MODE_EXCEPTIONS = ("claude-haiku-5-5",)
+# How a requested mode appears in the stream's system events (2.1.316, checked 2026-11-02): `manual` is reported as
+# `default` (the others as themselves), so a manual child is not warned about a mode it never left.
+MODE_REPORTED_AS = {"manual": "default"}
 # The mode a defaulted task gets on a model without auto mode: file edits in cwd still go through unattended.
 NO_AUTO_FALLBACK = "acceptEdits"
 # claude.ai connectors are disabled in token-auth sessions (the child authenticates to the provider with a token), so
@@ -662,12 +665,27 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     launch = set(meta.get("cred_fingerprints") or [])
     if not launch or not launch <= set(credential_fingerprints(red.raw)):
         return False
+    stdout = os.path.join(d, "stdout.log")
+    structural_error = None
     try:
-        redact_stream_file(os.path.join(d, "stdout.log"), red)
+        unparsed = redact_stream_file(stdout, red)
+    except Exception as exc:                    # as in _run: recorded, and the raw pass below still runs
+        unparsed, structural_error = 0, f"could not redact stdout.log structurally: {type(exc).__name__}"
+    try:
         for name in ("stdout.log", "stderr.log"):
             redact_file(os.path.join(d, name), red)
     except OSError:
         return False
+    if structural_error:
+        res["redact_error"] = structural_error   # the task fails and its logs stay withheld
+        _write_json(os.path.join(d, "result.json"), res)
+        return False
+    if unparsed:
+        res["redact_unparsed_lines"] = unparsed
+    try:
+        res["activity"] = red.deep(summarize_stream(stdout, meta.get("cwd") or d))
+    except OSError as exc:
+        res["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     res["logs_unredacted"] = False
     _write_json(os.path.join(d, "result.json"), res)
     return True
@@ -751,7 +769,7 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     if isinstance(denials, list) and denials:
         names = [str((x or {}).get("tool_name") or "?") for x in denials if isinstance(x, dict)]
         out["permission_denials"] = names
-        warnings.append(f"{len(denials)} tool call(s) were denied ({', '.join(dict.fromkeys(names))}): nobody can "
+        warnings.append(f"{len(names)} tool call(s) were denied ({', '.join(dict.fromkeys(names))}): nobody can "
                         "approve a prompt in a child, so the work they were for was NOT done, whatever the result says")
     if isinstance(act, dict):
         out["tool_uses"] = act.get("tool_uses") or {}
@@ -761,7 +779,8 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
         mode = act.get("effective_permission_mode")
         if mode:
             out["effective_permission_mode"] = mode
-            if mode != meta.get("permission_mode"):
+            requested = meta.get("permission_mode")
+            if mode != MODE_REPORTED_AS.get(requested, requested):
                 warnings.append(f"the child ran in permission mode {mode!r}, not the requested "
                                 f"{meta.get('permission_mode')!r} (Claude Code left it)")
         if act.get("writes_outside_cwd"):
@@ -981,16 +1000,15 @@ def redact_stream_file(path: str, red: "Redactor") -> int:
             for line in src:
                 body = line.rstrip("\r\n")
                 end = line[len(body):]
-                ev, parsed = None, False
+                cleaned = None
                 if body.strip():
+                    # RecursionError as well as ValueError: a line nested ~1000 deep (a file the child cat'ed)
+                    # overflows json.loads, red.deep or json.dumps; that line gets the raw pass only.
                     try:
-                        ev, parsed = json.loads(body), True
-                    except ValueError:
+                        cleaned = json.dumps(red.deep(json.loads(body)), ensure_ascii=False)
+                    except (ValueError, RecursionError):
                         unparsed += 1
-                if not parsed:
-                    dst.write(red.text(body) + end)
-                else:
-                    dst.write(json.dumps(red.deep(ev), ensure_ascii=False) + end)
+                dst.write((red.text(body) if cleaned is None else cleaned) + end)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -1052,7 +1070,7 @@ def parse_output(raw: str):
         for line in reversed(lines):
             try:
                 ev = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):  # not the result record (a deep line overflows json.loads)
                 continue
             if isinstance(ev, dict) and ev.get("type") == "result":
                 raw = line
@@ -1061,7 +1079,7 @@ def parse_output(raw: str):
             return None, "stdout has no result record (the event stream ended without one); see stdout_log"
     try:
         out = json.loads(raw) if raw.startswith("{") else json.loads(raw.splitlines()[-1])
-    except ValueError:
+    except (ValueError, RecursionError):
         return None, "stdout is not the JSON result claude -p --output-format json prints; see stdout_log"
     if not isinstance(out, dict):
         return None, f"stdout is JSON but not a result record ({type(out).__name__})"
@@ -1091,7 +1109,7 @@ def summarize_stream(path: str, cwd: str) -> dict:
         for line in f:
             try:
                 ev = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):  # not an event, or nested too deep to be one: skipped
                 continue
             if not isinstance(ev, dict):
                 continue
@@ -1193,8 +1211,10 @@ def _run(d: str, lock_fd=None) -> int:
         unparsed = redact_stream_file(os.path.join(d, "stdout.log"), red)   # structural first, then the raw pass
         if unparsed:
             result["redact_unparsed_lines"] = unparsed
-    except OSError as exc:
-        result["redact_error"] = f"could not redact stdout.log: {type(exc).__name__}"
+    except Exception as exc:
+        # Any failure of the structural pass fails the task and withholds its logs (redact_error), and the raw pass
+        # below still runs: a runner that died here would leave the raw token in stdout.log.
+        result["redact_error"] = f"could not redact stdout.log structurally: {type(exc).__name__}"
     for name in ("stdout.log", "stderr.log"):
         try:
             redact_file(os.path.join(d, name), red)
@@ -1208,7 +1228,10 @@ def _run(d: str, lock_fd=None) -> int:
         pass
     out, err = parse_output(raw)
     if out is not None:
-        result["output"] = red.deep(out)
+        try:
+            result["output"] = red.deep(out)
+        except RecursionError:                   # parsed, but too deep to walk: not kept, and the task fails
+            err = err or "the result record is nested too deeply to redact; see stdout_log"
     if err:
         result["output_error"] = err
     try:

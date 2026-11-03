@@ -334,7 +334,10 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   attempts that were not confirmed.
 - Log redaction: stdout is redacted structurally first (each event parsed, its strings redacted, JSON held inside a
   string decoded and redacted too, then re-serialized), then by the raw pass, which matches each credential at up to
-  four JSON-escaping depths. A line that is not JSON gets the raw pass only and is counted in `redact_unparsed_lines`.
+  four JSON-escaping depths. A line that is not JSON, or is nested too deep to parse (~1000 levels), gets the raw
+  pass only and is counted in `redact_unparsed_lines`; if the structural pass itself fails, the task fails with
+  `redact_error` (logs withheld) and the raw pass still runs. A `manual` child is reported by Claude Code as mode
+  `default`, which is not treated as leaving the requested mode.
 - Relay scratch dir: the provider's headless backend (Claude CLI or Codex) runs in an empty scratch dir, and its CLI
   tells the model so in its own environment block, next to the client's real one. A model that trusted it aimed a
   child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody

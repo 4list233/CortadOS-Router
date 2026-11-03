@@ -734,8 +734,8 @@ class CodexSession:
                 if call_id in self.emitted:
                     raise BridgeError(f"codex app-server reused tool call id {call_id}")
                 name = params.get("tool") or ""
-                scratch = getattr(self, "dir", None)    # set in __init__; unit tests build sessions without one
-                if scratch is not None and names_scratch(args, scratch):
+                scratch = self.dir
+                if names_scratch(args, scratch):
                     # Never forwarded (bridge.SCRATCH_NOTE): answered here with the refusal, and the turn goes on.
                     logger.warning("codex conversation %s: item/tool/call %s (tool %s) names the backend's scratch "
                                    "dir; answered with an error, not forwarded", self.id[:8], call_id, name)

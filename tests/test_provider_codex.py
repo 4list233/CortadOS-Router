@@ -492,6 +492,7 @@ class CodexEndpointTests(unittest.TestCase):
 
     def test_a_refusal_naming_no_declared_tool_blames_none(self):
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         s._aliases = {}
         # "toolname" is inside "zzz_toolname" but not a whole token of it: no declared tool is named by this message.
         declared = [{"name": "toolname"}, {"name": "zzz"}, {"name": "Read"}]
@@ -506,6 +507,7 @@ class CodexEndpointTests(unittest.TestCase):
 
     def test_a_tool_named_like_a_refusal_word_is_not_blamed_over_the_refused_one(self):
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         s._aliases = {}
         # "reserved" is a whole word of the message and longer than "foo"; only the name Codex spelled out counts.
         declared = [{"name": "reserved"}, {"name": "foo"}]
@@ -516,6 +518,7 @@ class CodexEndpointTests(unittest.TestCase):
 
     def test_an_undeclared_refused_name_blames_no_tool_even_a_boilerplate_one(self):
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         s._aliases = {}
         for msg in ("codex app-server refused thread/start: dynamic tool name is reserved: other (code -32600)",
                     "codex app-server refused thread/start: dynamic tool namespace is reserved: tool (code -32600)",
@@ -858,6 +861,7 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_leaked_items_include_the_sleep_and_image_generation_tools(self):
         s = object.__new__(codex_bridge.CodexSession)                    # _note_notification needs no process
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         s.id, s._usage_total, s._fatal = "unit", {}, None
         for itype in ("sleep", "imageGeneration", "commandExecution"):
             with self.assertRaisesRegex(BridgeError, itype):
@@ -1116,6 +1120,7 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_a_tool_call_or_message_naming_a_turn_never_started_is_a_bridge_error(self):
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
@@ -1238,6 +1243,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         # A server that streams notifications without end re-arms the settle window on every one; the absolute
         # deadline must still end the turn: with calls collected they are returned, with none it is a failure.
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark = "unit", None, {}, {}
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
@@ -1268,6 +1274,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         """A process-less session whose reader queue is pre-filled and kept non-empty by a producer thread; every event
         carries a sequence number so loss or reordering shows. Replies are recorded, never written."""
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id = "unit", None, {}, {}, "t1"
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}
@@ -1455,6 +1462,7 @@ class CodexSessionUnitTests(unittest.TestCase):
     def test_abandoning_a_turn_keeps_its_deadline_while_events_keep_arriving(self):
         # The drain after turn/interrupt must end at its deadline even when the queue never runs dry.
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id = "unit", None, {}, {}, "t1", "turn-1"
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {"exec-1": 0}, {"exec-1"}, {}, {}
@@ -1497,6 +1505,7 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.thread_id, s._turn_id, s.proc = "unit", None, {}, {}, "t1", "turn-1", Proc()
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {f"exec-{i}": i for i in range(4)}, set(), {}, {}
@@ -1519,6 +1528,7 @@ class CodexSessionUnitTests(unittest.TestCase):
 
     def test_usage_is_reported_in_the_messages_shape_with_the_cached_part_taken_out_of_codex_input(self):
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s._delivered, s._usage_mark = {}, {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 5}
         s._usage_total = {"totalTokens": 12419, "inputTokens": 12309, "cachedInputTokens": 3968, "cacheWriteInputTokens": 10,
@@ -1542,6 +1552,7 @@ class CodexSessionUnitTests(unittest.TestCase):
             def kill(self):
                 self.killed = True
         s = object.__new__(codex_bridge.CodexSession)
+        s.dir = Path(tempfile.gettempdir()) / "cortados-codex-unit"   # the scratch dir names_scratch checks
         late_state(s)
         s.id, s._fatal, s._usage_total, s._usage_mark, s.proc, s.dir = "unit", None, {}, {}, Proc(), Path(self.scratch)
         s._events, s._pending, s.emitted, s._delivered, s._aliases = queue.Queue(), {}, set(), {}, {}

@@ -54,12 +54,14 @@ class Redactor:
         decoded, redacted the same way and re-encoded, so a credential at any nesting depth is found decoded."""
         if isinstance(obj, str):
             if obj.lstrip()[:1] in ("{", "["):
+                # RecursionError too: json.loads (and this walk) recurse per nesting level, so a string like
+                # "[[[[…" a thousand deep raises it instead of ValueError. Such a string is treated as plain text.
                 try:
                     inner = json.loads(obj)
-                except ValueError:
-                    inner = None
-                if isinstance(inner, (dict, list)):
-                    return self.text(json.dumps(self.deep(inner), ensure_ascii=False))
+                    if isinstance(inner, (dict, list)):
+                        return self.text(json.dumps(self.deep(inner), ensure_ascii=False))
+                except (ValueError, RecursionError):
+                    pass
             return self.text(obj)
         if isinstance(obj, list):
             return [self.deep(x) for x in obj]
