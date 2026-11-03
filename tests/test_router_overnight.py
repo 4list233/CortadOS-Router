@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 import subprocess
 import tempfile
+import time as _time
 
 spec = importlib.util.spec_from_file_location('overnight_test', Path(__file__).resolve().parents[1]/'s1/overnight.py')
 night = importlib.util.module_from_spec(spec); spec.loader.exec_module(night)
@@ -138,8 +139,8 @@ class ReviewFixesRound3(unittest.TestCase):
             self.assertEqual((rc, sleeps), (0, [900])); self.assertIn('external TERM', out)
             flag.touch()
             rc, sleeps, out = loop([(130, 'idle'), (0, 'worked')])
-            # the flag is checked before the first cycle too, so set it mid-run: simulate --stop during cycle 1
-            self.assertEqual(rc, 0)
+            # a flag present before the first cycle: the pre-cycle check returns 0 without running any cycle
+            self.assertEqual((rc, sleeps), (0, [])); self.assertIn('stop flag', out); self.assertIn('not relaunching', out)
             flag.unlink()
             calls = iter([(130, 'idle'), (0, 'worked')])
             def cycle(*a, **k):
@@ -150,8 +151,6 @@ class ReviewFixesRound3(unittest.TestCase):
                                           cycles=2, stopflag=flag)
             self.assertEqual(rc, 130)
 
-
-if __name__ == '__main__':unittest.main()
 
 
 class Continuous(unittest.TestCase):
@@ -500,3 +499,138 @@ class ReviewFixesRound2(unittest.TestCase):
             self.assertNotIn('100.64.0.9', pr.call_args[0][0])
         finally:
             srv.shutdown(); srv.server_close()
+
+
+
+class ReviewFixesRound4(unittest.TestCase):
+    """Malformed URL / unexpected probe errors never kill the supervisor; resets are outages; no host text leaks."""
+
+    def _guard(self, latency, logs, alerts):
+        return night.Guard(latency=latency, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, max_pause_s=1800,
+                           log=logs.append, alerter=lambda n, d: alerts.append((n, d)))
+
+    def _survives(self, latency, host):
+        logs, alerts = [], []
+        with patch('builtins.print') as pr:
+            g = self._guard(latency, logs, alerts)
+            g.idle_probe(); g.idle_probe()   # must not raise; second probe in the same cycle does not re-alert
+        printed = '\n'.join(str(c.args[0]) for c in pr.call_args_list if c.args)
+        text = '\n'.join(logs + [d for _, d in alerts]) + printed
+        self.assertEqual([n for n, _ in alerts], ['scorer_probe_config'])
+        self.assertNotIn(host, text)
+        return text
+
+    def test_malformed_urls_are_config_errors_without_the_host(self):
+        for value, host in (('http://[fd7a:115c:a1e0::9:8431', 'fd7a'), ('http://studio-host:abc', 'studio-host')):
+            with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}):
+                with self.assertRaises(night.ScorerConfigError) as cm:
+                    night.probe_scorer_latency(timeout=1)
+                self.assertNotIn(host, str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
+                self.assertIsNone(cm.exception.__cause__); self.assertTrue(cm.exception.__suppress_context__)
+                self._survives(lambda: night.probe_scorer_latency(timeout=1), host)
+
+    def test_unexpected_probe_exception_is_a_config_error_by_type_name(self):
+        def boom():
+            raise RuntimeError('cannot talk to http://secret-host:8431/score')
+        text = self._survives(boom, 'secret-host')
+        self.assertIn('RuntimeError', text)
+
+    def test_unexpected_probe_exception_does_not_kill_a_running_cycle(self):
+        logs, alerts = [], []
+        def boom():
+            raise RuntimeError('secret-host')
+        g = self._guard(boom, logs, alerts)
+        with tempfile.TemporaryDirectory() as tmp, patch('builtins.print'):
+            rc, _ = night.run_cycle([sys.executable, '-c', 'import time; time.sleep(0.2)'], g,
+                                    result_file=Path(tmp) / 'r', poll_s=0.05)
+        # (no baseline: the existing pause-to-measure / unreadable-release path may also alert; only the config alert is ours)
+        self.assertEqual(rc, 0); self.assertEqual([n for n, _ in alerts].count('scorer_probe_config'), 1, alerts)
+        self.assertNotIn('secret-host', repr(alerts) + '\n'.join(logs))
+
+    def test_dropped_connection_is_an_outage_not_a_config_alert(self):
+        import socket, threading
+        srv = socket.socket(); srv.bind(('127.0.0.1', 0)); srv.listen(5)
+        port = srv.getsockname()[1]
+        def serve():
+            for _ in range(2):
+                try:
+                    c, _ = srv.accept(); c.recv(65536); c.close()
+                except OSError:
+                    return
+        th = threading.Thread(target=serve, daemon=True); th.start()
+        try:
+            logs, alerts = [], []
+            url = f'http://127.0.0.1:{port}/score'
+            with patch('builtins.print') as pr:
+                self.assertIsNone(night.probe_scorer_latency(url=url, timeout=5))
+                g = self._guard(lambda: night.probe_scorer_latency(url=url, timeout=5), logs, alerts)
+                g.idle_probe()
+            self.assertEqual(alerts, []); self.assertFalse(any('CONFIG' in m for m in logs))
+            self.assertIn('latency unknown', pr.call_args_list[0][0][0])
+        finally:
+            srv.close(); th.join(2)
+
+    def test_bare_host_in_os_error_is_not_printed(self):
+        import ssl
+        err = ssl.SSLCertVerificationError(1, "hostname 'studio.example.ts.net' doesn't match")
+        for exc in (err, night.urllib.error.URLError(err), OSError(111, 'refused studio.example.ts.net:8431')):
+            with self.subTest(exc=type(exc).__name__), patch('builtins.print') as pr, \
+                    patch.object(night.urllib.request, 'urlopen', side_effect=exc):
+                self.assertIsNone(night.probe_scorer_latency(url='http://127.0.0.1:9/score', timeout=1))
+            self.assertNotIn('studio.example', pr.call_args[0][0])
+
+    def test_resolver_errors_keep_a_value_free_class_and_a_working_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ep = Path(tmp) / 'ep.json'; ep.write_text('{"endpoints": {"studio": "http://100.64.0.9:8431"}}')
+            cases = (({'CORTADOS_S1_URL': '100.64.0.9:8431'}, 'not an http(s) URL'),
+                     ({'CORTADOS_S1_ENDPOINTS': str(Path(tmp) / 'missing.json')}, 'does not exist'),
+                     ({'CORTADOS_S1_ENDPOINTS': str(ep), 'CORTADOS_S1_ENDPOINT': 'stuido'}, 'not in the endpoints file'))
+            for env, cls in cases:
+                clean = {k: v for k, v in os.environ.items() if not k.startswith('CORTADOS_S1_')}
+                with self.subTest(cls=cls), patch.dict(os.environ, {**clean, **env}, clear=True):
+                    with self.assertRaises(night.ScorerConfigError) as cm:
+                        night.scorer_url()
+                    msg = str(cm.exception)
+                    self.assertIn(cls, msg); self.assertNotIn('100.64.0.9', msg); self.assertNotIn('stuido', msg)
+                    self.assertIn('s1_endpoint.resolve_url()', msg)
+        # the hint is a command that works from the repo root
+        out = subprocess.run([sys.executable, '-c', 'from cortados_router import s1_endpoint; print(s1_endpoint.resolve_url())'],
+                             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                             env={k: v for k, v in os.environ.items() if not k.startswith('CORTADOS_S1_')})
+        self.assertEqual(out.returncode, 0, out.stderr); self.assertTrue(out.stdout.startswith('http'))
+
+    def test_unremovable_marker_alerts_once_per_supervisor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rf = Path(tmp) / 'r'; rf.write_text('worked\n')
+            logs, alerts = [], []
+            g = self._guard(lambda: 1.0, logs, alerts)
+            real_unlink = Path.unlink
+            def unlink(self, *a, **k):
+                if self == rf:
+                    raise PermissionError(13, 'Permission denied')
+                return real_unlink(self, *a, **k)
+            with patch.object(Path, 'unlink', unlink), patch('builtins.print') as pr:
+                for _ in range(2):
+                    self.assertEqual(night.run_cycle([sys.executable, '-c', 'pass'], g, result_file=rf, poll_s=0,
+                                                     sleep=lambda s: None), (0, 'idle'))
+            self.assertEqual([n for n, _ in alerts], ['cycle_result_stuck'])
+            self.assertIn("'quota' result is still honoured", '\n'.join(str(c.args[0]) for c in pr.call_args_list))
+
+    def test_stop_flag_removed_during_grace_is_still_a_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = Path(tmp) / 'nightly.stop'
+            # the child creates the flag (as --stop would), then removes it (operator resumes) and exits 130
+            code = (f'import pathlib,time; p=pathlib.Path({str(flag)!r}); p.touch(); time.sleep(0.3); p.unlink(); '
+                    'raise SystemExit(130)')
+            g = self._guard(lambda: 1.0, [], [])
+            sleeps = []
+            with patch('builtins.print'):
+                rc = night.run_continuous([sys.executable, '-c', code], g, result_file=Path(tmp) / 'r', idle_s=900,
+                                          sleep=lambda s: (sleeps.append(s) if s >= 60 else _time.sleep(s)), cycles=2,
+                                          stopflag=flag, poll_s=0.05)
+            self.assertEqual((rc, sleeps), (130, []))
+            self.assertFalse((Path(tmp) / 'r.failures').exists() and (Path(tmp) / 'r.failures').read_text().strip() != '0')
+
+
+if __name__ == '__main__':
+    unittest.main()

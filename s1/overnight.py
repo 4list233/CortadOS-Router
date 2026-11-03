@@ -156,11 +156,27 @@ def scorer_url_source() -> str:
     return "the default endpoint (s1-endpoints.json default, else loopback)"
 
 
-_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"]*")
+# A command that prints the resolver's full message (value included) on the operator's own terminal. Alerts and logs carry
+# only a value-free classification, because the value names a tailnet host and alerts reach the dashboard and handbacks.
+RESOLVE_HINT = ('run `python3 -c "from cortados_router import s1_endpoint; print(s1_endpoint.resolve_url())"` '
+                "from the repo root for the detail")
+
+# Value-free classes of the resolver's ValueError messages (cortados_router/s1_endpoint.py), matched on its fixed wording.
+_RESOLVE_CLASSES = (
+    ("is not an http(s) URL", "the value is not an http(s) URL"),
+    ("does not exist", "the endpoints file named by CORTADOS_S1_ENDPOINTS does not exist"),
+    ("is not readable JSON", "the endpoints file is not readable JSON"),
+    ("must be an object", "the endpoints file does not hold an 'endpoints' object"),
+    ("non-string 'default'", "the endpoints file has a non-string 'default'"),
+    ("is not in", "the endpoint name is not in the endpoints file"),
+)
 
 
-def _redact_urls(text: str) -> str:
-    return _URL_RE.sub("<url>", text)
+def _resolve_class(message: str) -> str:
+    for needle, label in _RESOLVE_CLASSES:
+        if needle in message:
+            return label
+    return "the resolver rejected it"
 
 
 def scorer_url() -> str:
@@ -170,9 +186,18 @@ def scorer_url() -> str:
     from cortados_router import s1_endpoint
     try:
         return s1_endpoint.resolve_url().rstrip("/") + "/score"
-    except ValueError:   # the resolver's message repr's the value, scheme-less hosts included: forward none of it
-        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} does not resolve "
-                                "(run cortados_router/s1_endpoint.py locally for the detail)") from None
+    except ValueError as e:   # the resolver's message repr's the value, scheme-less hosts included: forward only its class
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} does not resolve ({_resolve_class(str(e))}); "
+                                f"{RESOLVE_HINT}") from None
+
+
+def _probe_failure(e: BaseException) -> str:
+    """Type name (and errno) of a probe failure. Never the message: OSError/SSL texts can carry a bare host
+    ("hostname 'studio.<tailnet>.ts.net' doesn't match"), which no URL pattern catches."""
+    inner = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    base = inner if isinstance(inner, BaseException) else e
+    errno = getattr(base, "errno", None)
+    return type(base).__name__ + (f" errno {errno}" if errno is not None else "")
 
 
 def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float | None:
@@ -184,9 +209,10 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
     token = os.environ.get("CORTADOS_S1_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=body, headers=headers)
     t0 = _time.monotonic()
     try:
+        # Built inside the try: Request() raises ValueError for what urlsplit rejects (e.g. 'http://[fd7a::9:8431').
+        req = urllib.request.Request(url, data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             r.read()
     except urllib.error.HTTPError as e:   # before OSError: HTTPError is an OSError subclass
@@ -194,12 +220,17 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
             raise ScorerRefused(f"scorer refused (HTTP {e.code})") from None
         raise ScorerConfigError(f"scorer probe got HTTP {e.code} from the URL set by {scorer_url_source()}: "
                                 "check CORTADOS_S1_URL/ENDPOINT/TOKEN") from None
-    except http.client.HTTPException:   # e.g. InvalidURL for 'http://host:abc': a setting problem, not an outage
-        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} is malformed "
-                                "(run cortados_router/s1_endpoint.py locally for the detail)") from None
-    except OSError as e:
-        print(f"overnight: scorer probe failed ({_redact_urls(str(e))}); latency unknown this probe", flush=True)
+    except http.client.InvalidURL as e:   # 'http://host:abc': a setting, not an outage (before HTTPException, its base)
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} is malformed ({type(e).__name__}); "
+                                f"{RESOLVE_HINT}") from None
+    # Before ValueError: ssl.SSLCertVerificationError is both an OSError and a ValueError, and a bad certificate is a
+    # transient/remote problem, not a malformed setting.
+    except (OSError, http.client.HTTPException) as e:   # reset, RemoteDisconnected, IncompleteRead: an outage, not a setting
+        print(f"overnight: scorer probe failed ({_probe_failure(e)}); latency unknown this probe", flush=True)
         return None
+    except ValueError as e:   # Request()/urlsplit rejected it, e.g. a missing IPv6 bracket; the message can quote the value
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} is malformed ({type(e).__name__}); "
+                                f"{RESOLVE_HINT}") from None
     return _time.monotonic() - t0
 
 
@@ -258,6 +289,7 @@ class Guard:
         self.release_hold = (_env_float("CORTADOS_S1_RELEASE_HOLD_S", default_hold, minimum=60) if release_hold_s is None
                              else release_hold_s)
         self.forced_releases = 0   # consecutive forced releases (supervisor lifetime); a normal resume resets it
+        self.stuck_alerted = False   # 'cycle result marker cannot be removed' alerted once per supervisor lifetime
         self.baseline_samples: list[float] = []
         self.last = None
         self.new_cycle()
@@ -286,11 +318,18 @@ class Guard:
         except ScorerRefused as e:
             return None, str(e)
         except ScorerConfigError as e:
-            if not self.config_logged:
-                self.config_logged = True
-                self.log(f"overnight: CONFIG ERROR: {e}; the latency guard has no reading (not treated as back-pressure)")
-                self.alerter("scorer_probe_config", str(e))
+            self._config_error(str(e))
             return None, None
+        except Exception as e:   # any other probe failure must not kill the supervisor (launchd would crash-loop it)
+            # Type name only: an unexpected exception's message can quote the scorer URL.
+            self._config_error(f"scorer probe raised {type(e).__name__} (URL from {scorer_url_source()})")
+            return None, None
+
+    def _config_error(self, detail: str) -> None:
+        if not self.config_logged:
+            self.config_logged = True
+            self.log(f"overnight: CONFIG ERROR: {detail}; the latency guard has no reading (not treated as back-pressure)")
+            self.alerter("scorer_probe_config", detail)
 
     def idle_probe(self) -> None:
         """No work tree running: every probe is a clean baseline sample."""
@@ -405,8 +444,14 @@ def _read_result(result_file: Path) -> str:
 
 
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
-              sleep=_time.sleep, pidfile: Path | None = None) -> tuple[int, str]:
-    """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'."""
+              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
+              stop_seen: list | None = None) -> tuple[int, str]:
+    """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
+    When stopflag and stop_seen are given, True is appended to stop_seen if the flag existed at any poll of this cycle, so an
+    operator who removes it during the TERM grace (to resume) is still read as a stop, not as a failure."""
+    def watch_stop():
+        if stopflag is not None and stop_seen is not None and not stop_seen and stopflag.exists():
+            stop_seen.append(True)
     stale = False
     try:
         result_file.unlink()
@@ -415,15 +460,23 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
     except OSError as e:   # a stale marker we cannot remove would be misread as this cycle's: 'worked' is read as idle
         stale = True
         print(f"overnight: WARNING: cannot remove stale cycle result {result_file} ({e}); a 'worked' result will be treated "
-              "as idle", flush=True)
+              "as idle, a 'quota' result is still honoured", flush=True)
+        if not guard.stuck_alerted:
+            # Silent otherwise: back-to-back cycling degrades to one cycle per idle interval (or a stale quota pins the
+            # 5 h cooldown) every cycle until someone fixes the permissions.
+            guard.stuck_alerted = True
+            guard.alerter("cycle_result_stuck", f"cannot remove {result_file} ({type(e).__name__}); cycle results may be a "
+                          "cycle old: 'worked' is read as idle, 'quota' still cools down")
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file))
     guard.new_cycle()
     child = subprocess.Popen(command, env=env, start_new_session=True)
     try:
         while child.poll() is None:
+            watch_stop()
             guard.tick(child.pid)
             sleep(poll_s)
+        watch_stop()
     except BaseException:
         stop_tree(child, grace=grace)
         raise
@@ -562,8 +615,10 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             return 0
         n += 1
         guard.idle_probe()
-        rc, result = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep, pidfile=pidfile)
-        if rc == 130 and (stopflag is None or stopflag.exists()):
+        seen: list = []
+        rc, result = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep, pidfile=pidfile,
+                               stopflag=stopflag, stop_seen=seen)
+        if rc == 130 and (stopflag is None or seen or stopflag.exists()):
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
         if rc == 130:   # TERM from someone other than --stop (e.g. pkill -f nightly.sh): a hand-run supervisor must survive it
