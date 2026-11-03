@@ -26,7 +26,6 @@ CHILD_TAIL = 5000             # recent child-task events parsed (the log only gr
 CHILD_TAIL_BYTES = 2 << 20    # ... and bytes read from its end: the read itself is bounded, not only the parse
 HW_MAX_BYTES = 64 << 10       # one node sample is ~1-2 KB; a larger file is not a sample and is never read into memory
 HW_MAX_FILES = 32             # one file per node; the fleet is a handful of machines, so more means a stray directory
-WINDOW_NAME_MAX = 60          # window names are captured vendor screen text, bounded only by the sampler's regex
 COLLECT_CACHE_S = 2.0         # one 1 Hz dashboard re-scans router.db / the child log at most every 2 s; a memo miss is
                               # single-flighted per state dir, so N concurrent GETs run one collect (each scan holds a
                               # SHARED lock on router.db that delays core.log_route's commit)
@@ -46,13 +45,12 @@ _WIN_KEYS = ("window", "pool", "used_pct", "headroom_pct", "resets_at", "reset_e
 _HW_KEYS = ("schema", "sampled_at", "host", "os", "load_avg", "ncpu", "chip", "mem_total_bytes", "mem_available_bytes",
             "cpu_busy_pct", "gpu_busy_pct")
 _HW_HEADROOM_KEYS = ("free_mem_gb", "cpu_idle_pct", "gpu_idle_pct")
-_HW_MODEL_KEYS = ("name", "size", "size_vram")      # hardware.parse_ollama_ps's entries
 # The field names hardware.sample() records errors under: errors[].field is published only as one of these.
 _HW_ERROR_FIELDS = frozenset(_HW_KEYS + _HW_HEADROOM_KEYS + ("platform", "ollama_models"))
 # An unavailable field's reason is reduced to its kind (the part before the first colon), published only when it
 # looks like an exception type name (<= 40 chars); anything else (a message, a path, a command line) becomes "error".
 _KIND_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
-# A hardware file name is published only when it is a plain bounded name; anything else is "<unnamed:i>".
+# A hardware file name is published only when it is a plain bounded name holding no address; else "<unnamed:i>".
 _FNAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _UNNAMED_RE = re.compile(r"<unnamed:[0-9]{1,4}>")
 # Lanes without general (pool "all") windows are headlined by this pool: the same fallback scarcity.finish uses.
@@ -71,11 +69,20 @@ SHARED_MAX = 4         # products sharing a pool: one today (Grok Bot)
 LOAD_AVG_LEN = 3       # os.getloadavg(): 1, 5 and 15 minutes
 TEXT_MAX = 60          # window names, model ids, ISO times, kinds: all well under 60 in real readings
 REASON_MAX = 120       # refusal reasons are the endpoint's own fixed sentences (server._REFUSAL_REASONS, ~70 chars)
+NOTES_MAX = 8          # one note per in-memory source (two today: run records, refusals)
+MODEL_SEGMENTS_MAX = 4  # an Ollama name is [registry/][namespace/]model[:tag] (hf.co/<user>/<repo>:Q4): 3 parts at most
 # The one string rule: plain text only. No '/', '\\', '@', '<', '{', quotes (a path, an SSH target, markup or a
 # serialised object cannot pass); '#' for lane keys (claude#b), "'" for the endpoint's own sentences, '\u2026' for the
-# ellipsis Cursor's screen prints. A string outside it, or holding an IPv4-looking address, publishes as "error".
+# ellipsis Cursor's screen prints. A string outside it, or holding an address (IPv4, IPv6 or MAC-looking), is "error".
 _TEXT_RE = re.compile(r"[A-Za-z0-9 ._:()+%,#'\u2026-]*")
 _IPV4_RE = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
+# IPv6 / MAC: '::' (every compressed IPv6, e.g. a tailnet fd7a:115c:a1e0::1) or 3+ colon-separated hex groups (a full
+# IPv6 has 7 colons, a MAC 5). Legit values hold at most two colons ('04:00:00', 'qwen2.5:7b'), so none is refused.
+_IPV6_RE = re.compile(r"::|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){3,}")
+
+
+def _has_address(x: str) -> bool:
+    return bool(_IPV4_RE.search(x) or _IPV6_RE.search(x))
 _SOURCES = ("scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware", "usage")
 _NOTE_RUNS = ("routed.provider_since_start comes from the provider's in-memory run records: since process "
               "start, bounded LRU, no timestamps")
@@ -254,14 +261,16 @@ def _s1(url: str | None) -> dict[str, Any]:
 
 def _kind(reason: Any) -> str:
     """'<Type>: <message>' -> '<Type>' when that part is identifier-like (an exception type name); otherwise 'error'."""
-    kind = reason.split(":", 1)[0].strip() if isinstance(reason, str) else ""
+    if not isinstance(reason, str) or _IPV6_RE.match(reason):   # 'fd7a:115c::1' would publish its first group as a kind
+        return "error"
+    kind = reason.split(":", 1)[0].strip()
     return kind if _KIND_RE.fullmatch(kind) else "error"
 
 
 def _hw_name(name: str, i: int) -> str:
     """A hardware file name as published: plain and bounded, or '<unnamed:i>' (a name is attacker-chosen text; `i`,
     the freshest-first position, keeps two odd names apart in errors[] and hardware[])."""
-    return name if _FNAME_RE.fullmatch(name) else f"<unnamed:{i}>"
+    return name if _FNAME_RE.fullmatch(name) and not _has_address(name) else f"<unnamed:{i}>"
 
 
 def _hw_sample(raw: Any) -> dict[str, Any]:
@@ -339,8 +348,19 @@ class _List:
 
 
 class _Map:
-    def __init__(self, key: Callable[[Any], Any], value: Any, cap: int, cut: str):
-        self.key, self.value, self.cap, self.cut = key, value, cap, cut
+    """merge: how two source keys that publish alike combine (counters add, pool headroom keeps the minimum); the
+    merge is also named in errors[] as 'keys_merged'. Without one the later key is dropped, also named."""
+    def __init__(self, key: Callable[[Any], Any], value: Any, cap: int, cut: str,
+                 merge: Callable[[Any, Any], Any] | None = None):
+        self.key, self.value, self.cap, self.cut, self.merge = key, value, cap, cut, merge
+
+
+def _add(a: Any, b: Any) -> Any:
+    return a + b if _num(a) and _num(b) else (a if _num(a) else b)
+
+
+def _min(a: Any, b: Any) -> Any:
+    return min(a, b) if _num(a) and _num(b) else (a if _num(a) else b)
 
 
 class _Hw:
@@ -353,7 +373,7 @@ class _Hw:
 def _text(x: Any, max_len: int = TEXT_MAX) -> str | None:
     if not isinstance(x, str):
         return None
-    if not _TEXT_RE.fullmatch(x) or _IPV4_RE.search(x):
+    if not _TEXT_RE.fullmatch(x) or _has_address(x):
         return "error"
     return x[:max_len]
 
@@ -381,11 +401,27 @@ def _enum(*allowed: str) -> Callable[[Any], Any]:
 def _file(x: Any) -> str | None:
     if not isinstance(x, str):
         return None
-    return x if _FNAME_RE.fullmatch(x) or _UNNAMED_RE.fullmatch(x) else "error"
+    return x if (_FNAME_RE.fullmatch(x) and not _has_address(x)) or _UNNAMED_RE.fullmatch(x) else "error"
 
 
-def _hw_field(x: Any) -> str | None:
+def _model_name(x: Any) -> str | None:
+    """An Ollama model name: '[registry/][namespace/]model[:tag]', each '/'-segment by the text rule; a segment that
+    fails it (or is empty, '.' or '..', or too many segments) makes the whole name "error", never a partial path."""
+    if not isinstance(x, str):
+        return None
+    parts = x.split("/")
+    if len(parts) > MODEL_SEGMENTS_MAX or any(p in ("", ".", "..") for p in parts):
+        return "error"
+    texts = [_text(p, len(p)) for p in parts]
+    return "error" if "error" in texts else "/".join(texts)[:TEXT_MAX]
+
+
+def _hw_field(x: Any) -> str:
+    """errors[].field: one of the sampler's field names, else "unknown" (a container or null too: one shape)."""
     return x if isinstance(x, str) and x in _HW_ERROR_FIELDS else "unknown"
+
+
+_hw_field.total = True   # type: ignore[attr-defined]  # _pub hands it null and containers too, so it has one "unknown"
 
 
 def _source(x: Any) -> str | None:
@@ -406,23 +442,22 @@ def _run_key(x: Any) -> str | None:
     return f"{_text(a)}/{_text(b)}" if sep and isinstance(b, str) else _text(x)
 
 
-_UNAVAILABLE = {"available": _bool, "reason": _kind}
 _WINDOW = _Obj({"window": _text, "pool": _text, "used_pct": _number, "headroom_pct": _number, "left_pct": _number,
                 "resets_at": _text, "reset_epoch": _number, "resets_in_h": _number, "scarcity": _number,
                 "expiring_pct": _number, "stale": _bool})
 _LANE = _Obj({"lane": _label, "label": _label, "account": _label, "left_pct": _number,
               "windows": _List(_WINDOW, WINDOWS_MAX, "windows_truncated"),
-              "pools": _Map(_text, _number, POOLS_MAX, "pools_truncated"),
+              "pools": _Map(_text, _number, POOLS_MAX, "pools_truncated", merge=_min),
               "sample_age_s": _number, "stale": _bool, "error": _label,
               "shared_with": _List(_label, SHARED_MAX, "shared_with_truncated")}, source=("scarcity", "lane"))
 _HW_CARD = _Obj({**{k: _Hw(_text if k in ("host", "os", "chip") else _number) for k in _HW_KEYS},
                  "load_avg": _Hw(_List(_number, LOAD_AVG_LEN, "load_avg_truncated")),
                  "headroom": _Obj({k: _Hw(_number) for k in _HW_HEADROOM_KEYS}),
-                 "ollama_models": _Hw(_List(_Obj({"name": _text, "size": _number, "size_vram": _number}),
+                 "ollama_models": _Hw(_List(_Obj({"name": _model_name, "size": _number, "size_vram": _number}),
                                             HW_MODELS_MAX, "models_truncated")),
                  "errors": _List(_Obj({"field": _hw_field, "error": _kind}), HW_ERRORS_MAX, "errors_truncated")})
 _ROUTE = _Obj({"lane": _label, "model": _text, "calls": _number})
-_COUNTS = lambda cut: _Map(_text, _number, MAP_MAX, cut)   # noqa: E731
+_COUNTS = lambda cut: _Map(_text, _number, MAP_MAX, cut, merge=_add)   # noqa: E731
 _VIEW = _Obj({
     "generated_at": _number,
     "lanes": _List(_LANE, LANES_MAX, "lanes_truncated"),
@@ -430,8 +465,8 @@ _VIEW = _Obj({
                     "last_7d": _List(_ROUTE, ROUTED_TOP, "last_7d_truncated"),
                     "top_bands_7d": _List(_Obj({"band": _text, "calls": _number}), BAND_TOP, "bands_truncated"),
                     "today_truncated": _bool, "last_7d_truncated": _bool, "bands_truncated": _bool,
-                    "provider_since_start": _Map(_run_key, _number, RUNS_MAX, "provider_since_start_truncated")}),
-    "refusals": _Obj({"window": _enum("24h"), "by_reason": _Map(_reason, _number, MAP_MAX, "refusals_truncated"),
+                    "provider_since_start": _Map(_run_key, _number, RUNS_MAX, "provider_since_start_truncated", merge=_add)}),
+    "refusals": _Obj({"window": _enum("24h"), "by_reason": _Map(_reason, _number, MAP_MAX, "refusals_truncated", merge=_add),
                       "total": _number}),
     "child_tasks": _Obj({"window": _enum("7d"), "by_event": _COUNTS("by_event_truncated"),
                          "by_status": _COUNTS("by_status_truncated"), "unparsable_lines": _number,
@@ -439,7 +474,7 @@ _VIEW = _Obj({
     "s1": _Obj({"available": _bool, "status": _number, "latency_ms": _number, "reason": _label}),
     "hardware": _List(_Obj({"file": _file, "age_s": _number, "data": _HW_CARD}, source=("hardware", "file")),
                       HW_MAX_FILES, "too_many_files"),
-    "notes": _List(_enum(_NOTE_RUNS, _NOTE_REFUSALS), 8, "notes_truncated"),
+    "notes": _List(_enum(_NOTE_RUNS, _NOTE_REFUSALS), NOTES_MAX, "notes_truncated"),
 })
 _ERROR = _Obj({"source": _source, "error": _label})
 # the section a top-level cut is reported under (a lane or hardware card names itself through its _Obj source)
@@ -448,6 +483,8 @@ _SECTION_SOURCE = {"lanes": "scarcity", "routed": "router.db", "child_tasks": "c
 
 
 def _pub(spec: Any, x: Any, src: str, cuts: list[tuple[str, str]]) -> Any:
+    if getattr(spec, "total", False):        # a leaf defined on every input (null and containers included)
+        return spec(x)
     if x is None:
         return None
     if isinstance(spec, _Hw):
@@ -475,7 +512,12 @@ def _pub(spec: Any, x: Any, src: str, cuts: list[tuple[str, str]]) -> Any:
         out: dict[str, Any] = {}
         for k, v in x.items():
             pk = "(none)" if k is None else spec.key(k)
-            if pk is None or pk in out:      # an unpublishable key, or two that publish alike: the first kept
+            if pk is None:                   # an unpublishable key (the value type is not a string)
+                continue
+            if pk in out:                    # two keys that publish alike: combined (or dropped) and said so
+                if spec.merge is not None:
+                    out[pk] = spec.merge(out[pk], _pub(spec.value, v, src, cuts))
+                cuts.append((src, "keys_merged"))
                 continue
             if len(out) >= spec.cap:
                 cuts.append((src, spec.cut))

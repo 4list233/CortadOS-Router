@@ -171,7 +171,7 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(len(lane["windows"]), usage.WINDOWS_MAX)
         self.assertNotIn("_pools_truncated", lane)
         self.assertIsNone(lane["sample_age_s"]); self.assertTrue(lane["stale"])
-        self.assertEqual(len(lane["windows"][0]["pool"]), usage.WINDOW_NAME_MAX)
+        self.assertEqual(len(lane["windows"][0]["pool"]), usage.TEXT_MAX)
         self.assertEqual(len(lane["pools"]), usage.POOLS_MAX)
         json.dumps(lane, allow_nan=False)
 
@@ -190,7 +190,7 @@ class CollectTest(unittest.TestCase):
     def test_window_name_capped(self):
         long = {"lanes": {"claude": {"fetched_at": NOW, "windows": [{**_wv("week (" + "x" * 500 + ")", 1.0, NOW + 9, 9, now=NOW)}]}}}
         w = self.collect(fixture_home(), scarcity_reader=lambda: long)["lanes"][0]["windows"][0]["window"]
-        self.assertEqual(len(w), usage.WINDOW_NAME_MAX)
+        self.assertEqual(len(w), usage.TEXT_MAX)
 
     def test_bad_ts_counted_not_section_erased(self):
         home = fixture_home()
@@ -452,6 +452,7 @@ class CollectTest(unittest.TestCase):
             calls.append(1)
             return SCARCITY
         hot_args = dict(state_dir=hot, scarcity_reader=reader, refusals=[], s1_probe=lambda url: {"available": True})
+        saved, usage.COLLECT_CACHE_S = usage.COLLECT_CACHE_S, 3600.0   # 49 real collects on a loaded box can pass 2 s
         try:
             usage.collect(**hot_args)
             for _ in range(12):
@@ -464,14 +465,16 @@ class CollectTest(unittest.TestCase):
             body = usage.collect(**hot_args, encoded=True)
             self.assertIs(body, usage._COLLECT_CACHE[str(hot)][1])   # the memo holds the bytes: a hit serialises nothing
         finally:
+            usage.COLLECT_CACHE_S = saved
             usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
 
 
 # a 100 KB string publishes at most its first REASON_MAX (refusal reasons) or TEXT_MAX chars
-LEAKS = ("ssh_target", "100.64", "/Users/", "R" * (usage.REASON_MAX + 1))
+LEAKS = ("ssh_target", "100.64", "/Users/", "R" * (usage.REASON_MAX + 1), "fd7a", "aa:bb")
 PAYLOADS = [{"ssh_target": "forest@100.64.0.9"}, "/Users/someone/.ssh/id", "R" * 100000,
             [{"ssh_target": "x"}, ["/Users/a"]], {"available": False, "reason": "forest@100.64.0.9: /Users/x"},
-            "forest@100.64.0.9", "10.0.100.64", "ok\\Users"]
+            "forest@100.64.0.9", "10.0.100.64", "ok\\Users", "fd7a:115c:a1e0::1", "aa:bb:cc:dd:ee:ff",
+            "fd7a:115c:a1e0:ab12:4843:cd96:6263:1234"]
 
 
 class PublishTest(unittest.TestCase):
@@ -528,7 +531,7 @@ class PublishTest(unittest.TestCase):
         hw = self.view(hw={**HW_SAMPLE, "errors": [{"field": "/Users/a", "error": "E: x"},
                                                    {"field": {"ssh_target": 1}, "error": "E"},
                                                    {"field": "platform", "error": "OSError: y"}]})["hardware"][0]["data"]
-        self.assertEqual([e["field"] for e in hw["errors"]], ["unknown", None, "platform"])   # a container where the leaf is expected: null
+        self.assertEqual([e["field"] for e in hw["errors"]], ["unknown", "unknown", "platform"])   # one "unknown" shape
 
     def test_text_rule(self):
         for bad in ("/Users/x", "a\\b", "u@h", "10.1.2.3", "x <b>", '{"a": 1}'):
@@ -567,6 +570,50 @@ class PublishTest(unittest.TestCase):
         self.assertLessEqual(len(out["errors"]), usage.ERRORS_MAX)
         self.assertEqual(out["errors"][-1], {"source": "usage", "error": "errors_truncated"})
         self.assertLess(len(body), 200_000)
+
+    def test_ipv4_hardware_file_name_unnamed(self):
+        (self.home / "hardware" / "100.64.0.9.json").write_text(json.dumps({**HW_SAMPLE, "load_avg": [1.0] * 4}))
+        t = time.time() + 100; os.utime(self.home / "hardware" / "100.64.0.9.json", (t, t))   # freshest: position 0
+        out = self.view()
+        self.assertEqual(out["hardware"][0]["file"], "<unnamed:0>")
+        self.assertIn({"source": "hardware/<unnamed:0>", "error": "load_avg_truncated"}, out["errors"])
+        self.assertNotIn("100.64", json.dumps(out))
+        self.assertEqual(usage._file("100.64.0.9.json"), "error")
+        self.assertEqual(usage._hw_name("10.0.0.1.json", 3), "<unnamed:3>")
+        self.assertEqual(usage._hw_name("studio.json", 3), "studio.json")
+
+    def test_ipv6_and_mac_refused(self):
+        for bad in ("fd7a:115c:a1e0::1", "::1", "fd7a:115c:a1e0:ab12:4843:cd96:6263:1234", "aa:bb:cc:dd:ee:ff",
+                    "host fe80::1 up"):
+            self.assertEqual(usage._text(bad), "error", bad)
+            self.assertEqual(usage._kind(bad), "error", bad)
+        self.assertEqual(usage._kind("TimeoutError: fd7a::1"), "TimeoutError")
+        for good in ("04:00:00", "qwen2.5:7b", "2027-01-15 04:00:00", "month (other models: Claude, GPT)"):
+            self.assertEqual(usage._text(good), good)
+        hw = self.view(hw={**HW_SAMPLE, "host": "fd7a:115c:a1e0:ab12:4843:cd96:6263:1234", "chip": "fd7a:115c:a1e0::1",
+                           "os": "aa:bb:cc:dd:ee:ff"})
+        self.clean(hw)
+
+    def test_merged_keys_keep_counts(self):
+        long = "R" * usage.REASON_MAX
+        out = self.view(refusals=[{"reason": long + "a", "at": NOW}, {"reason": long + "b", "at": NOW},
+                                  {"reason": long + "b", "at": NOW}])
+        self.assertEqual(sum(out["refusals"]["by_reason"].values()), out["refusals"]["total"])
+        self.assertEqual(out["refusals"]["by_reason"], {long: 3})
+        self.assertIn({"source": "usage", "error": "keys_merged"}, out["errors"])
+        out = self.view({"lanes": {"x": {"fetched_at": NOW, "windows": [
+            {"window": "w", "pool": "/a", "headroom_pct": 30.0}, {"window": "v", "pool": "/b", "headroom_pct": 5.0}]}}})
+        self.assertEqual(out["lanes"][0]["pools"], {"error": 5.0})            # pool headroom keeps the minimum
+        self.assertIn({"source": "scarcity/x", "error": "keys_merged"}, out["errors"])
+
+    def test_ollama_registry_names(self):
+        for good in ("hf.co/bartowski/Llama-3.2-3B:Q4", "library/llama3", "qwen2.5:7b"):
+            self.assertEqual(usage._model_name(good), good)
+        for bad in ("/Users/x", "a//b", "../x", "u@h/x", "100.64.0.9/x", "a/b/c/d/e", "fd7a::1/m"):
+            self.assertEqual(usage._model_name(bad), "error", bad)
+        self.assertLessEqual(len(usage._model_name("a/" + "R" * 100000)), usage.TEXT_MAX)
+        out = self.view(hw={**HW_SAMPLE, "ollama_models": [{"name": "hf.co/bartowski/Llama-3.2-3B:Q4", "size": 1}]})
+        self.assertEqual(out["hardware"][0]["data"]["ollama_models"][0]["name"], "hf.co/bartowski/Llama-3.2-3B:Q4")
 
     def test_load_avg_cut_flagged(self):
         out = self.view(hw={**HW_SAMPLE, "load_avg": [1.0, 2.0, 3.0, 4.0]})
