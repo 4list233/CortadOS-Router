@@ -106,3 +106,25 @@ the invariant is "gated" (built-ins visible, attempted, refused by cursor-agent'
 not `permissionDenied`/`error` as a hard fail — note glob would trip this today, so either deny it explicitly (try
 `Glob(**)`/`Grep(**)` rules in C1) or accept empty-result successes; (b) expect wasted turns as the model probes built-ins;
 (c) prompt it that only the client's tools exist. Not tested: write/edit, grep, web fetch, `--mode`, sandbox-disabled baseline.
+
+## C1 result (2026-11-03, cursor-agent 2026.10.22-27dcf5f, "Composer 2.5", 1 real turn) — LANE STAYS OFF
+`cortados_router/provider/cursor_isolation.py` (+ `tests/test_cursor_isolation.py`, 14 tests OK): per-turn 0700 mktemp
+workspace with only `.cursor/cli.json` (allow `Mcp(cortados:*)`; deny `Shell/Read/Write/Glob/Grep/Edit/Delete` on `*` and `**`,
+`WebFetch(*)`, `WebSearch(*)`) and `.cursor/mcp.json` (shim); argv `-p --output-format stream-json --trust --sandbox enabled
+--approve-mcps --model <id> --workspace <ws>` (no documented switch skips user rules / `~/.cursor/mcp.json`: left to C2's
+preflight). `check_event` hard-fails any `*ToolCall` whose completed result is not `permissionDenied` or an
+`error` saying "Permission denied", any MCP call off the shim, and any tool-like event of unknown shape.
+`getMcpToolsToolCall` is allowed only for the shim server (schema lookup, no host effect; needed before every MCP call).
+
+Real event shape: `tool_call.{<kind>ToolCall: {args, result}, hookAdditionalContexts, toolCallId, startedAtMs}`.
+Real turn (prompt: echo, `ls`, read canary, glob `*.txt`, grep CANARY), every event through `check_event`:
+- `mcpToolCall cortados-echo_marker` → `MARKER:c1` (shim log: initialize, tools/list, tools/call): allowed.
+- `shellToolCall` ×2 → `permissionDenied`; `readToolCall` ×2 → error "Permission denied": allowed.
+- `globToolCall` ×2 → **success** (`files: []`) and `grepToolCall` ×2 (patterns `CANARY`, `.`) → **success** (empty):
+  **HARD-FAIL**. The `Glob(**)`/`Grep(**)` deny rules have no effect; glob and grep execute on the host and only their
+  output is filtered by the Read deny. Canary absent from the stream.
+
+Go/no-go for C2: **NO-GO.** Under Forest's terms (any built-in call not denied aborts the turn), glob and grep cannot be
+denied, so every turn in which the model probes the filesystem would abort, and the tools do run on the provider host.
+Revisit only if a cursor-agent release adds a working Glob/Grep permission (or a tool-removal flag); `check_event` and
+its tests are ready to re-run that check.
