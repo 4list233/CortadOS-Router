@@ -1277,14 +1277,27 @@ class Handler(BaseHTTPRequestHandler):
         reg = self.server.registry
         try:
             cfg = search_lane.config_dir_for(reg)
+            allowed, blocked = search_lane.domain_filters(body)
             result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
-                                     search_lane.extract_query(body), cfg)
+                                     search_lane.extract_query(body), cfg, allowed=allowed, blocked=blocked)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
             reason = "search busy" if exc.kind == "busy" else f"the search lane failed: {exc.kind}"
             return self._server_tools_unavailable(turn, names, wire, reason=reason)
+        except Exception:
+            # Anything else is a bug in the lane: the client still gets a complete reply (never a dropped
+            # connection), and the traceback goes to the log.
+            logger.exception("web search lane failed unexpectedly")
+            return self._server_tools_unavailable(turn, names, wire, reason="the search lane failed: internal")
         logger.info("web search answered on the search lane (%s, %d chars)", search_lane.SEARCH_MODEL,
                     len(result.text))
+        try:
+            lane = search_lane.ledger_lane()
+            if lane:                                    # the search spent quota on this Claude account's pool
+                from cortados_router import usage_ledger
+                usage_ledger.record_async(lane, search_lane.SEARCH_MODEL, result.usage)
+        except Exception as exc:
+            _log_ledger_hook_failure(exc)               # the ledger never breaks a reply (as _ledger_turn's caller)
         return self._reply_text(turn, result.text, result.usage, wire)
 
     def _server_tools_unavailable(self, turn, names: list[str], wire: Wire, reason: str = "") -> None:

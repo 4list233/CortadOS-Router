@@ -518,9 +518,15 @@ config, no setting sources, `dontAsk`, empty scratch cwd, ANTHROPIC_* stripped a
 owner-approved exception to the bridge rule that the headless CLI never runs a tool itself. Model: `SEARCH_MODEL`
 (the routing table's W-fast Claude route, Haiku 4.5). Login: the default Claude login, or the account named by
 `CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json; unresolvable fails, never falls back).
+Hooks are off (`--settings '{"disableAllHooks": true}'`) and every `ANTHROPIC_*` variable is stripped by prefix
+(`bridge.claude_env`), so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches api.anthropic.com. The query is capped at 2000
+characters (`query_too_long`) and rides in argv, like the bridge's system prompt. The web_search tool's
+`allowed_domains` / `blocked_domains` are carried into the prompt ("only use results from ...; never use results
+from ...") as an instruction to the search model, not an enforced filter.
 Timeout 120 s, at most 4 concurrent searches. The CLI's result text is the reply (JSON or SSE, end_turn, with usage);
-any failure (timeout, nonzero exit, bad output, busy, no login) answers with the explicit "unavailable" text naming the
-failure class. Searches are not routed by S1 and are not recorded in the usage ledger yet.
+any failure (timeout, nonzero exit, bad output, busy, no login, an unexpected error: `internal`) answers with the
+explicit "unavailable" text naming the failure class. Searches are not routed by S1. A successful search is recorded in
+the usage ledger against the Claude lane it ran on (`claude`, or the named account's lane such as `claude#b`).
 
 ## Open
 

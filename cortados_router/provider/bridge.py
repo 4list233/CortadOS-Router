@@ -29,6 +29,10 @@ SHIM = Path(__file__).with_name("mcp_shim.py")
 # Dropped from the child's environment. BASE_URL and AUTH_TOKEN would send the child back into this endpoint;
 # API_KEY would bill an API key instead of the CLI's subscription login.
 STRIPPED_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+# Every ANTHROPIC_* is stripped by prefix, not only the three above: the provider's own process can carry e.g.
+# ANTHROPIC_CUSTOM_HEADERS (x-cortados-run-id, x-cortados-reveal) from the client that launched it, and the headless
+# CLI would send those to api.anthropic.com. STRIPPED_ENV stays as the named minimum (tests and docs cite it).
+STRIPPED_ENV_PREFIX = "ANTHROPIC_"
 # After the first unanswered tool call, the CLI's stdout may still be delivering other tool_use blocks of the same
 # assistant message (the shim's HTTP call and the CLI's stdout race). Wait this long for stdout to go quiet.
 SETTLE_S = 0.3
@@ -64,9 +68,10 @@ def names_scratch(args: Any, scratch: Path) -> bool:
 
 
 def claude_env(config_dir: str | None) -> dict[str, str]:
-    """The env a headless Claude CLI runs with: this process's, minus STRIPPED_ENV, on the routed account's login when
-    one is named. One builder, so the login a session runs on can be stated (server reveal) without starting one."""
-    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+    """The env a headless Claude CLI runs with: this process's, minus every ANTHROPIC_* (STRIPPED_ENV_PREFIX), on the
+    routed account's login when one is named. One builder, so the login a session runs on can be stated (server
+    reveal) without starting one."""
+    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV and not k.startswith(STRIPPED_ENV_PREFIX)}
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir       # run this turn on the routed account's login, not the default
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)    # an inherited ambient token would override the account's stored login: drop it so config_dir wins

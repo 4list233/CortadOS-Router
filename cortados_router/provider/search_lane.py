@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -33,11 +34,19 @@ SEARCH_TIMEOUT_S = 120.0
 MAX_CONCURRENT = 4
 # Optional: run searches on a named Claude account of tables/accounts.json (its config_dir), not the default login.
 ACCOUNT_ENV = "CORTADOS_PROVIDER_SEARCH_ACCOUNT"
+# A search query is a sentence; anything longer is a pasted document, and it would ride in argv (below) and spend
+# quota on a prompt no search engine takes. Refused rather than truncated, so the model learns why.
+MAX_QUERY_CHARS = 2000
 QUERY_PREFIX = "perform a web search for the query:"
 PROMPT = ("Search the web for: {query}\n\n"
           "Use the WebSearch tool. Reply with the results as a list, one per line: title, URL, and a one-line summary. "
           "Then give a short answer to the query from those results. Only list URLs that the search actually "
           "returned; never invent or guess a URL. If the search returns nothing, say so.")
+# The client's web_search tool may restrict domains (allowed_domains / blocked_domains). The CLI's WebSearch takes no
+# such flag here, so the restriction is carried in the prompt: a best-effort instruction to the search model, not an
+# enforced filter.
+ALLOWED_NOTE = "\n\nOnly use results from these domains: {domains}."
+BLOCKED_NOTE = "\n\nNever use results from these domains: {domains}."
 
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 
@@ -74,28 +83,70 @@ def extract_query(body: dict[str, Any]) -> str:
     return ""
 
 
-def argv(claude_bin: str | list[str], query: str) -> list[str]:
+def _domains(v: Any) -> list[str]:
+    return [d.strip() for d in v if isinstance(d, str) and d.strip()] if isinstance(v, list) else []
+
+
+def domain_filters(body: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(allowed_domains, blocked_domains) of the request's web_search_* server tool; empty lists when it sets none."""
+    for t in (body.get("tools") if isinstance(body, dict) and isinstance(body.get("tools"), list) else []):
+        if isinstance(t, dict) and str(t.get("type", "")).startswith("web_search"):
+            return _domains(t.get("allowed_domains")), _domains(t.get("blocked_domains"))
+    return [], []
+
+
+def prompt(query: str, allowed: list[str] | None = None, blocked: list[str] | None = None) -> str:
+    text = PROMPT.format(query=query)
+    if allowed:
+        text += ALLOWED_NOTE.format(domains=", ".join(allowed))
+    if blocked:
+        text += BLOCKED_NOTE.format(domains=", ".join(blocked))
+    return text
+
+
+def argv(claude_bin: str | list[str], query: str, allowed: list[str] | None = None,
+         blocked: list[str] | None = None) -> list[str]:
     prefix = [claude_bin] if isinstance(claude_bin, str) else list(claude_bin)
-    return prefix + ["-p", PROMPT.format(query=query), "--model", SEARCH_MODEL,
+    # The query rides in argv, so it is visible to `ps` on the provider host: the same exposure bridge.py accepts for
+    # the client's system prompt. Kept deliberately; the provider host is the owner's own machine.
+    return prefix + ["-p", prompt(query, allowed, blocked), "--model", SEARCH_MODEL,
                      "--tools", "WebSearch", "--allowedTools", "WebSearch",
                      "--output-format", "json", "--setting-sources", "",
+                     # no hooks either (as bridge.py): a user hook must not run inside the one lane that runs a tool
+                     "--settings", json.dumps({"disableAllHooks": True}),
                      "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}}),
                      "--permission-mode", "dontAsk"]
 
 
+def _usage_int(v: Any) -> int | None:
+    """A usage count from the CLI's JSON; None for non-numbers and for NaN/Infinity (json.loads accepts both)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return max(0, int(v))
+
+
 def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
-        timeout: float | None = None) -> SearchResult:
-    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, timeout, exit_<n>, bad_output, empty,
-    start_failed); never returns an empty success."""
+        timeout: float | None = None, allowed: list[str] | None = None,
+        blocked: list[str] | None = None) -> SearchResult:
+    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, exit_<n>,
+    bad_output, cli_error, empty, start_failed); never returns an empty success."""
     timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
     if not query:
         raise SearchFailed("no_query", "the request carries no user text to search for")
+    if len(query) > MAX_QUERY_CHARS:
+        raise SearchFailed("query_too_long", f"{len(query)} chars, the limit is {MAX_QUERY_CHARS}")
+    try:
+        work = tempfile.mkdtemp(prefix="cortados-search-")
+    except OSError as exc:
+        raise SearchFailed("start_failed", f"no scratch dir: {exc}") from None
+    # The slot is taken only after the scratch dir exists, and released in the same finally that removes it, so no
+    # path between acquire and release can leave a slot taken forever.
     if not _slots.acquire(blocking=False):
+        shutil.rmtree(work, ignore_errors=True)
         raise SearchFailed("busy", f"{MAX_CONCURRENT} searches already running")
-    work = tempfile.mkdtemp(prefix="cortados-search-")
     try:
         try:
-            p = subprocess.run(argv(claude_bin, query), cwd=work, env=bridge.claude_env(config_dir),
+            p = subprocess.run(argv(claude_bin, query, allowed, blocked), cwd=work, env=bridge.claude_env(config_dir),
                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise SearchFailed("timeout", f"no answer in {timeout:.0f}s") from None
@@ -113,7 +164,8 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         if not isinstance(text, str) or not text.strip():
             raise SearchFailed("empty", "the CLI returned no text")
         u = out.get("usage") if isinstance(out.get("usage"), dict) else {}
-        usage = {k: int(u[k]) for k in ("input_tokens", "output_tokens") if isinstance(u.get(k), (int, float))}
+        usage = {k: n for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                                 "cache_creation_input_tokens") if (n := _usage_int(u.get(k))) is not None}
         return SearchResult(text.strip(), usage)
     finally:
         _slots.release()
@@ -132,3 +184,20 @@ def config_dir_for(registry) -> str | None:
     if not cfg:
         raise SearchFailed("no_claude_lane", f"account {account!r} has no resolvable login")
     return cfg
+
+
+def ledger_lane() -> str | None:
+    """The scarcity lane a search draws on, for the usage ledger: the named account's lane from tables/accounts.json
+    (claude#b), else the bare `claude` lane (the default login, the one the bare claude lane runs on). None when the
+    named account is not configured (the search itself already failed then) or the accounts file is unreadable."""
+    account = os.environ.get(ACCOUNT_ENV, "").strip()
+    if not account:
+        return "claude"
+    try:
+        from cortados_router import core
+        for a in core._vendor_accounts("claude", "claude", "claude-cli"):
+            if a.get("account") == account:
+                return a.get("lane")
+    except Exception:
+        logger.warning("search lane: accounts lookup for the ledger failed; this search is not recorded")
+    return None
