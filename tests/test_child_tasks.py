@@ -1600,6 +1600,34 @@ class ChildTaskTests(unittest.TestCase):
         r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=9999)
         self.assertTrue(r.get("isError"))
 
+    def test_wait_cap_is_50s_for_the_desktop_app(self):
+        # The Claude desktop app times MCP requests out at 60 s (observed 2026-11-03).
+        os.environ.pop("CORTADOS_WAIT_MAX_S", None)
+        self.assertEqual(ct.wait_max_s(), 50)
+        r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=60)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("between 0 and 50", r["content"][0]["text"])
+
+    def test_wait_cap_env_override(self):
+        self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": "300"}), 300)
+        for bad in ("", "abc", "0", "-5", "99999", "nan"):
+            self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": bad}), 50)
+        with self.assertRaises(ct.TaskError):
+            ct.wait("t20261102000000-0000000a", 120, max_s=50)
+
+    def test_wait_still_running_says_call_again(self):
+        orig = ct.status
+        ct.status = lambda *a, **k: {"task_id": a[0], "state": "running"}
+        orig_state, orig_path = ct._state, ct.task_path
+        ct._state = lambda d: ("running", {}, {})
+        ct.task_path = lambda tid: "/nonexistent"
+        try:
+            out = ct.wait("t20261102000000-0000000a", 0.05, poll_s=0.01)
+        finally:
+            ct.status, ct._state, ct.task_path = orig, orig_state, orig_path
+        self.assertEqual(out["state"], "running")
+        self.assertIn("call wait_task again", out["wait_ended"])
+
     def test_unconfigured_url(self):
         self.cfg["url"] = ""
         r, _ = self.call("start_task", task="x", cwd=self.work)

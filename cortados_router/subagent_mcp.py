@@ -89,10 +89,12 @@ CHILD_TOOLS = [
                     "result text when done (bounded; the full log path is included).",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
     {"name": "wait_task",
-     "description": "Block until a child task ends or timeout_s passes (max 540 s, under MCP client tool timeouts), then "
-                    "return what task_status returns. Call again to keep waiting.",
+     "description": "Block until a child task ends or timeout_s passes (default and max 50 s: the Claude desktop app "
+                    "times MCP requests out at 60 s; CORTADOS_WAIT_MAX_S raises the cap for other clients), then "
+                    "return what task_status returns. If the result says state 'running', the task is not done: "
+                    "call wait_task again to keep waiting.",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"},
-                                                      "timeout_s": {"type": "number", "description": "0-540, default 540"}},
+                                                      "timeout_s": {"type": "number", "description": "0-50 (or CORTADOS_WAIT_MAX_S), default the max"}},
                      "required": ["task_id"]}},
     {"name": "list_tasks",
      "description": "Most recent child tasks, newest first, with state and a short preview.",
@@ -143,8 +145,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
-            out = ct.wait(a.get("task_id"), a.get("timeout_s", ct.WAIT_MAX_S), red, provider_url=cfg.get("url", ""),
-                          token=token)
+            out = ct.wait(a.get("task_id"), a.get("timeout_s"), red, provider_url=cfg.get("url", ""),
+                          token=token, max_s=ct.wait_max_s())
         elif name == "list_tasks":
             out = {"tasks": ct.list_recent(a.get("limit", 20))}
         else:

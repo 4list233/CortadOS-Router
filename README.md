@@ -314,7 +314,7 @@ on the machine that runs the server (`claude -p` launched through `cortados_rout
 server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
 
 Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
-`task_status(task_id)`, `wait_task(task_id, timeout_s≤540)`, `list_tasks(limit?)`, `cancel_task(task_id)`.
+`task_status(task_id)`, `wait_task(task_id, timeout_s≤50)` (50 s cap: the Claude desktop app times MCP requests out at 60 s; `CORTADOS_WAIT_MAX_S` raises it for clients with a longer timeout; a result with state `running` means call again), `list_tasks(limit?)`, `cancel_task(task_id)`.
 
 - `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
   ...), which pins the child's MAIN model; the child's subagents are still routed by S1.

@@ -101,7 +101,21 @@ LOGS_WITHHELD_NOTE = ("logs withheld: the runner died before redaction, and the 
                       "this task was launched with. The raw stdout/stderr logs in the task dir contain the launch "
                       "credential and must not be read or shared.")
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
-WAIT_MAX_S = 540                    # MCP clients time a tool call out (~10 min); stay under it
+# The Claude desktop app's Code session times every MCP request out at 60 s (observed 2026-11-03: "Request timed out"
+# at ~61 s on wait_task calls), so a wait defaults to and is capped at 50 s. Clients with a longer request timeout can
+# raise the cap with CORTADOS_WAIT_MAX_S (read by subagent_mcp.py via wait_max_s()).
+WAIT_MAX_S = 50
+WAIT_MAX_S_CEILING = 3600
+
+
+def wait_max_s(env=None) -> float:
+    """The wait cap: CORTADOS_WAIT_MAX_S when it is a number in (0, 3600], else WAIT_MAX_S."""
+    raw = (os.environ if env is None else env).get("CORTADOS_WAIT_MAX_S", "")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return WAIT_MAX_S
+    return v if 0 < v <= WAIT_MAX_S_CEILING else WAIT_MAX_S
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
 # Claude Code refuses to start inside another Claude Code session when it sees this; the child is a fresh session.
 STRIP_ENV = ("CLAUDECODE",)
@@ -816,19 +830,26 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     return warnings
 
 
-def wait(task_id, timeout_s=WAIT_MAX_S, red=None, poll_s=0.5, provider_url="", token="") -> dict:
+def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="", max_s=None) -> dict:
+    cap = WAIT_MAX_S if max_s is None else max_s
+    if timeout_s is None:
+        timeout_s = cap
     try:
         t = float(timeout_s)
     except (TypeError, ValueError):
         raise TaskError("timeout_s must be a number of seconds") from None
-    if t < 0 or t > WAIT_MAX_S:
-        raise TaskError(f"timeout_s must be between 0 and {WAIT_MAX_S} (MCP clients time out longer tool calls); "
+    if t != t or t < 0 or t > cap:
+        raise TaskError(f"timeout_s must be between 0 and {cap:g} (MCP clients time out longer tool calls); "
                         "call wait_task again to keep waiting")
     d = task_path(task_id)
     end = time.monotonic() + t
     while _state(d)[0] == "running" and time.monotonic() < end:
         time.sleep(poll_s)
-    return status(task_id, red, provider_url, token)
+    out = status(task_id, red, provider_url, token)
+    if out.get("state") == "running":
+        out["wait_ended"] = (f"waited {t:g} s; the task is still running: call wait_task again to keep waiting "
+                             "(or task_status to poll)")
+    return out
 
 
 def list_recent(n=20) -> list:
