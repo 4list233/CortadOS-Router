@@ -353,6 +353,10 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(ct.tasks_dir()).st_mode), 0o700)
         _, lst = self.call("list_tasks")
         self.assertEqual(lst["tasks"][0]["task_id"], tid)
+        _, only = self.call("list_tasks", ids=[tid, "t00000000000000-00000000"])   # bot gateway: owned ids only
+        self.assertEqual([t["task_id"] for t in only["tasks"]], [tid])
+        _, none = self.call("list_tasks", ids=[])
+        self.assertEqual(none["tasks"], [])
 
     # ---- permission modes the child's model really supports (2026-11-02 E2E: haiku + auto denied every write)
     def test_auto_mode_support_follows_the_clis_rule(self):
@@ -537,6 +541,15 @@ class ChildTaskTests(unittest.TestCase):
             raw = f.read()
         self.assertNotIn("secret-ish", raw)
         self.assertNotIn("tok-test", raw)
+
+    def test_client_attribution_on_both_lifecycle_events(self):
+        # Review r2 P3-8 (bot gateway): the finished event is written from cmd.json, so it must carry the client too.
+        self.cfg = {**self.cfg, "client": "grokbot"}
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual([(e["event"], e.get("client")) for e in ev], [("started", "grokbot"), ("finished", "grokbot")])
 
     def test_run_record_fetch_failure_is_a_field(self):
         tid = self.start()

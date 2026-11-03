@@ -70,7 +70,9 @@ def default_fetch(url, timeout=OLLAMA_TIMEOUT):
         while size <= MAX_OLLAMA_BYTES:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"body not complete within {FETCH_BUDGET}s")  # an OSError: attempt() records it
-            chunk = response.read(min(8192, MAX_OLLAMA_BYTES + 1 - size))
+            # read1, not read: read(n) loops over socket reads until n bytes arrive, so a dripping peer could hold it
+            # far past the budget; read1 does at most one socket read (bounded by timeout) per check.
+            chunk = response.read1(min(8192, MAX_OLLAMA_BYTES + 1 - size))
             if not chunk:
                 break
             if time.monotonic() > deadline:  # a read may block one more OLLAMA_TIMEOUT past the budget

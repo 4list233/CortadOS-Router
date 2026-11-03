@@ -520,8 +520,9 @@ def select_connectors(names) -> dict | None:
 
 
 def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False, red=None, connectors=None) -> dict:
-    """`red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
+          provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None) -> dict:
+    """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
+    can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
     None picks auto where the model supports it (resolve_permission_mode)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
@@ -564,8 +565,18 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
                                   chrome, max_s, exe, selected, login)
+        if client:
+            meta["client"] = str(client)[:64]
+            # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
+            # finished event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
+            cmd_path = os.path.join(d, "cmd.json")
+            with open(cmd_path, encoding="utf-8") as f:
+                spec = json.load(f)
+            spec["event"] = _event_fields(meta)
+            _write_json(cmd_path, spec)
         if mode_note:
             meta["permission_mode_note"] = mode_note
+        if client or mode_note:
             _write_json(os.path.join(d, "meta.json"), meta)
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
@@ -724,6 +735,8 @@ def _add_child_directive(cmd: list) -> None:
 
 def _event_fields(meta: dict) -> dict:
     out = {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    if meta.get("client"):
+        out["client"] = meta["client"]
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
     return out
@@ -1051,13 +1064,19 @@ def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="
     return out
 
 
-def list_recent(n=20) -> list:
+def list_recent(n=20, ids=None) -> list:
+    """`ids` (optional): list only these task ids (the bot gateway passes the ids it started, so a client's tasks
+    stay listed however many newer tasks the owner has)."""
     try:
         n = max(1, min(int(n), 200))            # bounded: the listing goes into a tool result
     except (TypeError, ValueError):
         raise TaskError("limit must be an integer") from None
     root = _private_root()
-    ids = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:n]
+    names = (x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x))
+    if ids is not None:
+        wanted = {x for x in ids if isinstance(x, str)}
+        names = (x for x in names if x in wanted)
+    ids = sorted(names, reverse=True)[:n]
     rows = []
     for tid in ids:
         state, meta, res = _state(os.path.join(root, tid))
