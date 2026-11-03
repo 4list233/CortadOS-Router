@@ -77,7 +77,8 @@ other host, no https, no password, no path or bypass), and the pinned binary is 
 install command); there is no boundary-less config. It writes two files, both 0600 (inside the 0700 task dir), and
 the child gets `--mcp-config <task_dir>/browser-mcp.json`:
 ```json
-{"mcpServers": {"browser": {"command": "<repo>/integrations/browser/run-mcp.sh", "args": ["<task_dir>", "<prefix>"]}}}
+{"mcpServers": {"browser": {"command": "python3", "args": ["-I", "<repo>/integrations/browser/mcp_filter.py",
+  "--task", "<task_dir>", "--", "<repo>/integrations/browser/run-mcp.sh", "<task_dir>", "<prefix>"]}}}
 ```
 `<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag, plus the proxy):
 ```json
@@ -95,8 +96,8 @@ username and have no `bypass`; then it runs `cd <task>/browser && exec env -i PA
 HOME=<task>/browser/home TMPDIR=<task>/browser/tmp PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers
 <prefix>/node_modules/.bin/playwright-mcp --config <task>/browser/config.json --headless --isolated --sandbox
 --no-webmcp --ignore-roots --browser chromium --blocked-origins <list> --output-dir <task>/browser/out
---block-service-workers --timeout-navigation 30000 --timeout-action 10000`. With B1b the command becomes the stdio
-filter, which execs the wrapper. B6 confirms on the real build that the config-file proxy is what Chromium uses (a
+--block-service-workers --timeout-navigation 30000 --timeout-action 10000`. With B1b (built) the command is the stdio
+filter, which starts the wrapper as its child over pipes. B6 confirms on the real build that the config-file proxy is what Chromium uses (a
 page fetch shows up in the proxy log; with the proxy stopped, navigation fails).
 - `--ignore-roots`: the workspace (the server's file boundary) is the cwd `<task>/browser`, never the client's roots
   (item 7d). B1b's `<task>/browser/in` path check for upload/drop is then defence in depth, not the only line.

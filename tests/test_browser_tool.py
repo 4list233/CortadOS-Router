@@ -109,7 +109,8 @@ class BrowserScriptsTests(unittest.TestCase):
                 "args": ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]},
             "contextOptions": {"proxy": px}}})
         self.assertEqual(json.loads(mcp.read_text()), {"mcpServers": {"browser": {
-            "command": str(RUN), "args": [str(self.task), str(self.prefix)]}}})
+            "command": "python3", "args": ["-I", str(BROWSER / "mcp_filter.py"), "--task", str(self.task), "--",
+                                           str(RUN), str(self.task), str(self.prefix)]}}})
         for f in (cfg, mcp):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)
         self.assertNotIn(TOKEN, mcp.read_text())

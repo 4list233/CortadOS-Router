@@ -44,9 +44,12 @@ def write(path, obj):
         f.write(json.dumps(obj, indent=2) + "\n")
     os.chmod(path, 0o600)
 write(f"{task}/browser/config.json", pw)
-# The MCP server is always started through run-mcp.sh (scrubbed env, fixed flags); no "env" block here, because
-# whatever Claude Code passes would be dropped by env -i anyway.
-write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": wrapper, "args": [task, prefix]}}})
+# Claude Code talks only to the stdio allowlist filter (B1b, mcp_filter.py, run with python3 -I so no PYTHON* variable
+# reaches it), which starts the server through run-mcp.sh (scrubbed env, fixed flags) as its child over pipes. No
+# "env" block here, because whatever Claude Code passes would be dropped by env -i anyway.
+filt = os.path.join(os.path.dirname(wrapper), "mcp_filter.py")
+write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": "python3",
+    "args": ["-I", filt, "--task", task, "--", wrapper, task, prefix]}}})
 print(f"{task}/browser-mcp.json")
 PY
 )"
