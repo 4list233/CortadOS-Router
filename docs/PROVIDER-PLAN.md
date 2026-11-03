@@ -120,12 +120,15 @@ Not yet in P1, each needing a decision or another phase:
   again (same id, content, stop reason, usage), without the backend; logged as "replaying its last response". One
   response per session, at most `REPLAY_MAX_BYTES` (1 MiB; larger replies are not kept and their retry stays a 409).
   A different user turn on that history is still a 409, and so is a retry that also changes the `sub/` pin (the
-  "model is fixed per conversation" refusal). Only sessions in the request's conversation scope (client + identity)
-  are replayed, more than one candidate is a 409, and a replay refreshes the conversation's idle clock so the reaper
+  "model is fixed per conversation" refusal). Replay needs a conversation identity header (one of
+  `CONVERSATION_ID_HEADERS`): a request without one is never replayed and gets the ordinary 409, since identity-less
+  sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
+  conversation scope (client + identity) opened on the same wire (`/v1/messages` or `/v1/responses`) are replayed, more than one candidate is a 409, and a replay refreshes the conversation's idle clock so the reaper
   does not close it mid-retry. (e) Every lost-conversation 409 logs one `409 lost conversation: class=<c> ...` line
   (counts and lengths only, no content or fingerprints). From `Registry.find`: `class=<c> candidates=<n>
   common_prefix=<i> request_len=<n> candidate_len=<n>` with `class` one of `retry_of_answered_turn` (one reply behind,
-  but not replayable: a different user turn, no stored reply, another scope, or several candidates),
+  but not replayable: a different user turn, no stored reply, no identity, another scope or wire, or several
+  candidates),
   `client_behind=<k>` (a strict prefix k >= 2 replies short: only the last turn is replayed), `client_ahead`,
   `diverged_at=<i>`, `no_candidate`, or `reaped_recently` (the endpoint closed a conversation with the same first
   reply within the last hour: `Registry.closed`, 128 entries); `class=ambiguous candidates=<n> request_len=<n>` when

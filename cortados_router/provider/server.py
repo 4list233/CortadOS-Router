@@ -510,7 +510,7 @@ class Registry:
         return None
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
-            scope: str | None = None):
+            scope: str | None = None, wire_path: str | None = None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
@@ -528,6 +528,7 @@ class Registry:
         s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
+        s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         if keep:
             with self._lock:
@@ -556,7 +557,8 @@ class Registry:
         can tell a sibling's live conversation (same identity, see CONVERSATION_ID_HEADERS) from a stranger's."""
         return anthropic_wire.history_digest(wire_path, client, identity) if identity else None
 
-    def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None):
+    def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None,
+             wire_path: str | None = None):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
         tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
@@ -566,7 +568,7 @@ class Registry:
             return None
         with self._lock:
             matches = [s for s in self.sessions.values() if s.history == turn.history]
-            replays = [] if matches else self._replays(turn, scope)
+            replays = [] if matches else self._replays(turn, scope, wire_path)
             if len(replays) == 1:
                 # A client in a retry loop touches nothing else, so the replay itself must count as use: otherwise the
                 # idle reaper closes the conversation the client is still trying to recover.
@@ -588,17 +590,25 @@ class Registry:
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
 
-    def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None) -> list:
+    def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None,
+                 wire_path: str | None = None) -> list:
         """(session, last_reply) for each live session this request is an exact retry of: its history is the session's
         minus the last reply, and its new user turn (turn_fingerprint) is the one that reply answered. Caller holds
         self._lock. last_reply[0] is the history length the reply belongs to, so a reply recorded for an older turn
         (or a session mid-way through appending) never matches. Only sessions in the request's `scope` (the same
         client and conversation identity, see conversation_scope) qualify, as in failure(): a stored reply is never
-        handed to another client's conversation that happens to share the history."""
+        handed to another client's conversation that happens to share the history. A request without a conversation
+        identity (scope None, see CONVERSATION_ID_HEADERS) is never replayed: two identity-less sessions share the None
+        scope, so None == None would hand one client's reply to a stranger (another User-Agent, even another wire); it
+        gets the ordinary 409. The session must also have been opened on the request's wire (`wire_path`), so a
+        /v1/messages reply is never replayed on /v1/responses."""
+        if scope is None or wire_path is None:
+            return []
         n, fp, out = len(turn.history), None, []
         for s in self.sessions.values():
             last = getattr(s, "last_reply", None)
-            if (last and getattr(s, "scope", None) == scope and last[0] == len(s.history) == n + 1
+            if (last and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
+                    and last[0] == len(s.history) == n + 1
                     and s.history[:n] == turn.history):
                 fp = fp or anthropic_wire.turn_fingerprint(turn)
                 if last[1] == fp:
@@ -1142,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
             unkeyed = (None if identity or not turn.history else
                        "the client sent no conversation identity: none of " + ", ".join(CONVERSATION_ID_HEADERS))
             scope = reg.conversation_scope(wire_path=self.path.split("?")[0], client=self._client(), identity=identity)
-            session = None if one_shot else reg.find(turn, fail_key, scope)
+            session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0])
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
                 # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
@@ -1245,7 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
-                session = reg.new(turn, keep=not one_shot, route=route, scope=scope)
+                session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
+                                  wire_path=self.path.split("?")[0])
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
