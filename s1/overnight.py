@@ -25,6 +25,7 @@ import sys
 import time as _time
 import http.client
 import urllib.error
+import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
@@ -213,7 +214,9 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
     try:
         # Built inside the try: Request() raises ValueError for what urlsplit rejects (e.g. 'http://[2001:db8::9:8431').
         req = urllib.request.Request(url, data=body, headers=headers)
-        if not req.host:   # 'http://' or 'http:///score' pass _normalize's scheme check; urlopen would call it an outage
+        # hostname, not req.host: for 'http://:8431/score' req.host is ':8431' (truthy), yet there is no host to reach.
+        # 'http://', 'http:///score' and 'http://:8431' pass _normalize's scheme check; urlopen would call them an outage.
+        if not urllib.parse.urlsplit(url).hostname:
             raise ScorerConfigError(f"scorer URL from {scorer_url_source()} has no host; {RESOLVE_HINT}") from None
         with urllib.request.urlopen(req, timeout=timeout) as r:
             r.read()

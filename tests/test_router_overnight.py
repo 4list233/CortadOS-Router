@@ -524,8 +524,9 @@ class ReviewFixesRound4(unittest.TestCase):
 
     def test_malformed_urls_are_config_errors_without_the_host(self):
         for value, host in (('http://[2001:db8::9:8431', '2001:db8'), ('http://studio-host:abc', 'studio-host'),
-                            ('http://', None), ('http:///score', None)):
-            with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}):
+                            ('http://', None), ('http:///score', None), ('http://:8431/score', None)):
+            with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}), \
+                    patch.object(night.urllib.request, 'urlopen', wraps=night.urllib.request.urlopen) as urlopen:
                 with self.assertRaises(night.ScorerConfigError) as cm:
                     night.probe_scorer_latency(timeout=1)
                 if host:
@@ -533,6 +534,8 @@ class ReviewFixesRound4(unittest.TestCase):
                 self.assertIn('CORTADOS_S1_URL', str(cm.exception))
                 self.assertIsNone(cm.exception.__cause__); self.assertTrue(cm.exception.__suppress_context__)
                 self._survives(lambda: night.probe_scorer_latency(timeout=1), host)
+                if host is None:   # a hostless URL is refused before any connection attempt
+                    urlopen.assert_not_called()
 
     def test_unexpected_probe_exception_is_a_config_error_by_type_name(self):
         def boom():
