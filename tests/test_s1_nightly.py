@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -250,6 +252,77 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertTrue((run / "adapter").exists(), log)
         calls = self.tmp / "home/launchctl.log"
         self.assertNotIn("unload", calls.read_text() if calls.exists() else "")
+
+    def test_cycle_result_quota_wins_over_worked(self):
+        for reason in ("low_headroom", "unknown_headroom"):
+            rc, log, run, res = self._cycle(STUB_LABEL_RC=3, STUB_STOP_REASON=reason, STUB_NEW_LABELS=3)
+            self.assertEqual((rc, res), (0, "quota"), log)   # labels were added and training ran, but the floor was hit
+            self.assertTrue((run / "adapter").exists(), log)
+        rc, log, _, res = self._cycle(STUB_LABEL_RC=3, STUB_STOP_REASON="retries", STUB_NEW_LABELS=3)
+        self.assertEqual((rc, res), (0, "worked"), "a non-headroom early stop is ordinary work")
+
+    def _bare(self, *args, **env):
+        return subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), *args], cwd=self.tmp,
+                              env={**self.env, **{k: str(v) for k, v in env.items()}}, capture_output=True, text=True, timeout=60)
+
+    def test_continuous_stop_flag_is_kept_and_refuses_the_cycle(self):
+        flag = self.s1 / "data/nightly.stop"; flag.touch()
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, CORTADOS_S1_RUN="runs/2026-01-01", CORTADOS_S1_NIGHT_DATE="2026-01-02")
+        self.assertEqual(out.returncode, 130, out.stdout + out.stderr)
+        self.assertTrue(flag.exists(), "continuous mode never clears the stop flag")
+        self.assertFalse((self.s1 / "data/ran-dataset").exists())
+        self.assertFalse((self.s1 / "data/nightly.pid").exists())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)   # window mode: a new night clears yesterday's stop
+        self.assertEqual(rc, 0, log)
+        self.assertFalse(flag.exists())
+
+    def test_stop_continues_a_sigstopped_run_so_it_gets_its_grace_period(self):
+        mark = self.tmp / "termed"
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import signal, sys, time\n"
+                                  f"signal.signal(signal.SIGTERM, lambda *a: (open({str(mark)!r}, 'w').write('x'), sys.exit(0)))\n"
+                                  "time.sleep(120)\n"])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        time.sleep(0.5)
+        (self.s1 / "data/nightly.pid").write_text(f"{child.pid}\n")
+        os.kill(child.pid, signal.SIGSTOP)
+        out = self._bare("--stop")
+        self.assertIn("stopped nightly", out.stdout)
+        child.wait(timeout=10)
+        self.assertTrue(mark.exists(), "the stopped run handled TERM (it was continued), not SIGKILLed")
+        self.assertTrue((self.s1 / "data/nightly.stop").exists())
+
+    def test_continuous_cleanup_does_not_reload_the_scorer(self):
+        rc, log, _, _ = self._cycle(STUB_NEW_LABELS=0)
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("scorer back", log)
+        calls = self.tmp / "home/launchctl.log"
+        self.assertNotIn("load", calls.read_text() if calls.exists() else "")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)   # window mode still restores the scorer on exit
+        self.assertIn("launchctl load", calls.read_text())
+
+    def test_min_left_pct_is_validated(self):
+        for value, want, note in (("40", "40", None), ("101", "15", "above 100"), ("abc", "15", "not a whole number"),
+                                  ("007", "7", None)):
+            rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_MIN_LEFT_PCT=value)
+            self.assertEqual(rc, 0, log)
+            self.assertTrue((self.s1 / "data/label-args").read_text().startswith(f"--min-left-pct {want} "), value)
+            if note:
+                self.assertIn("MIN_LEFT_PCT", log); self.assertIn(note, log)
+
+    def test_future_dated_bench_stamp_is_due_and_a_failed_stamp_is_logged(self):
+        repo = self.tmp / "router"; (repo / "bin").mkdir(parents=True)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\necho run >> \"$HOME/refresh.log\"\n")
+        calls = Path(self.env["HOME"]) / "refresh.log"
+        cont = {"CORTADOS_ROUTER_REPO": str(repo), "CORTADOS_S1_CONTINUOUS": "1"}
+        (self.s1 / "data/last-bench-refresh").write_text(f"{int(time.time()) + 10**6}\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, log)
+        (self.s1 / "data/last-bench-refresh").unlink()
+        (self.s1 / "data/last-bench-refresh").mkdir()   # the stamp cannot be written
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("WARNING: could not write data/last-bench-refresh", log)
 
     def test_continuous_eval_time_ok_always_evaluates(self):
         rc, log, run, _ = self._cycle(STUB_NEW_LABELS=3, CORTADOS_S1_EVAL_MINUTES=1440)   # window mode: never enough time
