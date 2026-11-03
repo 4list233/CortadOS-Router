@@ -542,6 +542,15 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn("secret-ish", raw)
         self.assertNotIn("tok-test", raw)
 
+    def test_client_attribution_on_both_lifecycle_events(self):
+        # Review r2 P3-8 (bot gateway): the finished event is written from cmd.json, so it must carry the client too.
+        self.cfg = {**self.cfg, "client": "grokbot"}
+        tid = self.start()
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual([(e["event"], e.get("client")) for e in ev], [("started", "grokbot"), ("finished", "grokbot")])
+
     def test_run_record_fetch_failure_is_a_field(self):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)

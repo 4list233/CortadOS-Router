@@ -50,8 +50,9 @@ class GatewayTest(unittest.TestCase):
         def route(url, token, task, context="", max_tokens=0, model=None, client=None):
             self.routes.append({"task": task, "client": client})
             return {"content": [{"type": "text", "text": "answer"}]}
+        # The start_task path is tested with it switched on (--enable-start-task); PhaseOneTest covers the default.
         self.gw = bg.Gateway(TOKEN, self.root, {"url": "http://fake", "token": "prov-token-xyz123"},
-                             child=self.child, route=route)
+                             child=self.child, route=route, enable_start_task=True)
 
     def tearDown(self):
         self.env.stop()
@@ -173,7 +174,7 @@ class GatewayTest(unittest.TestCase):
         self.assertIn("result", self.start(orchestrator="cortados"))
         self.assertNotIn("orchestrator", self.child.calls[-1][1])
         self.assertIn("result", self.tcall("route_task", task="q", model="cortados"))
-        tools = {t["name"]: t for t in bg.tool_list()}
+        tools = {t["name"]: t for t in bg.tool_list(bg.EXPOSED)}
         self.assertNotIn("orchestrator", tools["start_task"]["inputSchema"]["properties"])
         self.assertNotIn("model", tools["route_task"]["inputSchema"]["properties"])
         self.assertIn("model", subagent_mcp.TOOL["inputSchema"]["properties"])
@@ -188,7 +189,7 @@ class GatewayTest(unittest.TestCase):
         a = self.child.calls[-1][1]
         self.assertEqual(a.get("permission_mode"), "plan")
         self.assertNotIn("allowed_tools", a)
-        props = {t["name"]: t for t in bg.tool_list()}["start_task"]["inputSchema"]["properties"]
+        props = {t["name"]: t for t in bg.tool_list(bg.EXPOSED)}["start_task"]["inputSchema"]["properties"]
         self.assertFalse({"permission_mode", "allowed_tools"} & set(props))
 
     def test_parallel_starts_respect_cap(self):
@@ -266,6 +267,75 @@ class GatewayTest(unittest.TestCase):
         self.gw.child = lambda n, a, c: gone
         self.gw._refresh_running()
         self.assertEqual(self.gw.running, set())
+
+    # -- review round 2 --------------------------------------------------------------------------------------------
+    def test_permission_mode_always_plan_through_real_resolution(self):
+        # P1-1: omitted / null / empty must not reach child_tasks as "unset" (which resolves to auto).
+        for kw in ({}, {"permission_mode": None}, {"permission_mode": ""}, {"permission_mode": "plan"}):
+            self.assertIn("result", self.start(**kw), kw)
+            fwd = self.child.calls[-1][1]
+            mode, _ = ct.resolve_permission_mode(fwd.get("permission_mode"), "cortados")
+            self.assertEqual(mode, "plan", kw)
+            for t in self.child.states:        # finish it, freeing the concurrency slot for the next start
+                self.child.states[t] = "succeeded"
+
+    def test_cwd_resolved_once(self):
+        # P2-3: the value checked is the value forwarded; a second realpath after the check would see a swapped link.
+        real = os.path.join(self.root, "real")
+        os.mkdir(real)
+        calls = []
+        orig = os.path.realpath
+
+        def counting(p, *a, **k):
+            calls.append(p)
+            return orig(p, *a, **k)
+        with mock.patch.object(bg.os.path, "realpath", counting):
+            self.start(cwd=real)
+        self.assertEqual(calls.count(real), 1)
+        self.assertEqual(self.child.calls[-1][1]["cwd"], orig(real))
+
+    def test_reservation_persisted_before_spawn(self):
+        # P2-5: if the gateway dies after spawning but before recording the task id, a restarted gateway still holds
+        # the slot (the reservation was on disk before the child launched).
+        seen = {}
+
+        def crashing(name, a, cfg):
+            if name == "start_task":
+                seen["restart"] = bg.Gateway(TOKEN, self.root, {}, child=FakeChild(), enable_start_task=True)
+                raise SystemExit("gateway killed mid-start")
+            return self.child(name, a, cfg)
+        self.gw.child = crashing
+        with self.assertRaises(SystemExit):
+            self.start()
+        again = seen["restart"]
+        self.assertEqual(len(again.reserved), 1)
+        self.assertTrue(all(s.startswith(bg._PENDING) for s in again.running))
+        with mock.patch.dict(again.limits, {"max_concurrent": 1}):
+            self.assertIn("concurrency cap", again.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "start_task", "arguments": {"task": "t", "cwd": self.root}}})["error"]["message"])
+        # Past the child's max runtime the reservation is provably dead and expires.
+        again.reservation_ttl = 0
+        again._refresh_running()
+        self.assertEqual((again.reserved, again.running), ({}, set()))
+
+    def test_errors_are_fixed_text(self):
+        # P3-6: a failed start (or any child error) never shows the bot the raw text; stderr gets the detail.
+        leak = {"content": [{"type": "text", "text": "cannot read /Users/o/.cortados/provider-token"}], "isError": True}
+        self.gw.child = lambda n, a, c: leak
+        err = io.StringIO()
+        with redirect_stderr(err):
+            r = self.start()
+        txt = json.dumps(r)
+        self.assertNotIn("/Users/o", txt)
+        self.assertIn("gateway log", txt)
+        self.assertIn("/Users/o/.cortados/provider-token", err.getvalue())
+
+    def test_success_fields_allowlisted(self):
+        self.start()
+        self.gw.child = lambda n, a, c: {"content": [{"type": "text", "text": json.dumps(
+            {"task_id": "task-0001-abcdef", "state": "running", "new_owner_field": "/Users/o/secret"})}]}
+        st = json.loads(self.tcall("task_status", task_id="task-0001-abcdef")["result"]["content"][0]["text"])
+        self.assertEqual(set(st), {"task_id", "state"})
 
     def test_start_forwards_realpath(self):
         real = os.path.join(self.root, "real")
@@ -375,6 +445,41 @@ class RouteTaskHeaderTest(unittest.TestCase):
         self.assertNotIn("client", ct._event_fields({"task_id": "t"}))
 
 
+class PhaseOneTest(unittest.TestCase):
+    """Default (no --enable-start-task): route_task only (owner decision 2026-11-03, review r2 P1-2)."""
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_HOME": tempfile.mkdtemp()})
+        self.env.start()
+        self.child = FakeChild()
+        self.gw = bg.Gateway(TOKEN, tempfile.mkdtemp(), {}, child=self.child,
+                             route=lambda *a, **k: {"content": [{"type": "text", "text": "answer"}]})
+
+    def tearDown(self):
+        self.env.stop()
+
+    def call(self, name, **a):
+        return self.gw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": name, "arguments": a}})
+
+    def test_only_route_task_offered(self):
+        r = self.gw.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual([t["name"] for t in r["result"]["tools"]], ["route_task"])
+
+    def test_start_and_task_tools_refused(self):
+        r = self.call("start_task", task="x", cwd=self.gw.root)
+        self.assertEqual(r["error"]["message"], "refused by bot gateway policy: " + bg.START_DISABLED)
+        for name in ("wait_task", "task_status", "cancel_task", "list_tasks"):
+            self.assertIn("phase 2, B5", self.call(name, task_id="t")["error"]["message"], name)
+        self.assertEqual(self.child.calls, [])
+        self.assertEqual(self.call("route_task", task="q")["result"]["content"][0]["text"], "answer")
+
+    def test_enable_flag_needs_children_run_as_me(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(bg.main(["--enable-start-task", "--token-file", "x", "--workspace-root", "/"]), 2)
+        self.assertIn("--children-run-as-me", err.getvalue())
+
+
 class TokenFileTest(unittest.TestCase):
     def test_perms(self):
         d = tempfile.mkdtemp()
@@ -442,7 +547,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.post(msg, "wrong-token-0000000000")[0], 401)
         code, body = self.post(msg)
         self.assertEqual(code, 200)
-        self.assertEqual(len(json.loads(body)["result"]["tools"]), 6)
+        self.assertEqual(len(json.loads(body)["result"]["tools"]), 1)    # phase 1: route_task only
         self.assertEqual(self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         self.assertNotIn(TOKEN, self.err.getvalue())
         self.assertIn("POST /mcp", self.err.getvalue())
@@ -463,9 +568,35 @@ class HttpTest(unittest.TestCase):
         try:
             self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
             self.assertEqual(self.post({"jsonrpc": "2.0", "id": 1, "method": "ping"})[0], 503)
+            # P2-4: refused at accept, before any header is parsed: a client that sends nothing still gets the 503.
+            import socket
+            with socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=5) as s:
+                self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 503"))
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_header_deadline_closes_trickler(self):
+        # P2-4: a client that never finishes its headers is shut at HEADER_DEADLINE_S, freeing its slot.
+        import socket
+        import time
+        with mock.patch.object(bg, "HEADER_DEADLINE_S", 0.3):
+            with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+                s.sendall(b"POST /mcp HTTP/1.1\r\nhost: x\r\n")
+                t0 = time.monotonic()
+                self.assertEqual(s.recv(100), b"")
+                self.assertLess(time.monotonic() - t0, 3)
+
+    def test_body_deadline_closes_trickler(self):
+        import socket
+        import time
+        with mock.patch.object(bg, "BODY_DEADLINE_S", 0.3):
+            with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+                s.sendall(b"POST /mcp HTTP/1.1\r\nhost: x\r\nauthorization: Bearer " + TOKEN.encode() +
+                          b"\r\ncontent-length: 100\r\n\r\n{")
+                t0 = time.monotonic()
+                self.assertEqual(s.recv(100), b"")
+                self.assertLess(time.monotonic() - t0, 3)
 
 
 if __name__ == "__main__":

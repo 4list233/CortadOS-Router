@@ -567,6 +567,13 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
                                   chrome, max_s, exe, selected, login)
         if client:
             meta["client"] = str(client)[:64]
+            # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
+            # finished event from them, so rewrite them or that event loses its attribution (review r2 P3-8).
+            cmd_path = os.path.join(d, "cmd.json")
+            with open(cmd_path, encoding="utf-8") as f:
+                spec = json.load(f)
+            spec["event"] = _event_fields(meta)
+            _write_json(cmd_path, spec)
         if mode_note:
             meta["permission_mode_note"] = mode_note
         if client or mode_note:

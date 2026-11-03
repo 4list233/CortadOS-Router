@@ -8,6 +8,13 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
 - **One shared token for all Grok Bots.** No per-bot tokens, principals or scopes: every bot is the single client
   `grokbot`. Sections 3.3 and ticket B2's per-client tokens are superseded. Usage by bots is still tracked and shown.
 - **Chrome is never allowed through the gateway** (refused, and removed from the advertised `start_task` schema).
+- **Phase 1 offers `route_task` only** (owner decision 2026-11-03: Grok Bots must not act on their own yet).
+  `start_task` arrives with phase 2: plan mode is not an isolation boundary (a child runs as the owner, reads the
+  owner's files and inherits the owner's MCP servers), so it waits for per-bot filesystem/account isolation (B5).
+  `start_task` is not listed in `tools/list` and is refused if called, with the reason "start_task is disabled until
+  per-bot filesystem/account isolation (phase 2, B5) exists; use route_task"; the task tools are refused likewise.
+  The code path stays behind `--enable-start-task` (accepted only together with `--children-run-as-me`), and even
+  then every child is sent `permission_mode: "plan"` explicitly (an omitted mode would resolve to `auto`).
 - The gateway will run on the Air on port 8434; phase 1 only builds and tests it.
 - The system prompt to paste into Grok Bot is [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md) (ticket B10).
 
@@ -17,8 +24,15 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
 - Auth: `Authorization: Bearer <token>`, compared with `hmac.compare_digest` against `--token-file` /
   `CORTADOS_BOT_TOKEN_FILE` (regular file, owned by the gateway user, mode 0600, else it refuses to start). 401
   otherwise. The access log prints method and path only, never headers.
-- Exactly six tools, reusing `subagent_mcp`: `start_task`, `wait_task`, `task_status`, `list_tasks`, `cancel_task`,
-  `route_task`.
+- Tools, reusing `subagent_mcp`: phase 1 lists `route_task` only. With `--enable-start-task` (not for phase 1) six:
+  `start_task`, `wait_task`, `task_status`, `list_tasks`, `cancel_task`, `route_task`.
+- HTTP admission: capacity (16 connections) is taken at accept, before a worker thread exists or a header is parsed
+  (a full server answers 503 at once); the request line and headers must arrive within 10 s and the body within 30 s
+  (absolute deadlines, as in `local_gate`), one request per connection.
+- Errors from a child or the provider reach the bot as a fixed text; the detail goes to the gateway's stderr.
+  Successful task results are allowlisted field by field (no owner paths). A `start_task` launch reservation is
+  written to `bot-counters.json` before the spawn, so a gateway crash mid-start keeps the slot held after restart
+  (until the child's max runtime has passed).
 - Policy before any tool runs (refusals are JSON-RPC error `-32001`, counted and logged): `chrome` refused; `cwd` must
   resolve inside `--workspace-root` (no root = refuse to start); status/wait/cancel only on tasks the gateway started
   (`list_tasks` filtered likewise); caps: 2 concurrent tasks, 30 tasks/day, 200 `route_task`/day (UTC days, rebuilt

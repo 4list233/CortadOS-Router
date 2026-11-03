@@ -239,13 +239,49 @@ class RunnerTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self, n):
+            def read1(self, n):
                 return b"a"  # one byte per read, forever: only the deadline stops it
         clock = iter(range(0, 1000))
         with opener_returning(Drip()), \
                 mock.patch.object(hardware.time, "monotonic", side_effect=lambda: float(next(clock))):
             with self.assertRaises(TimeoutError):
                 hardware.default_fetch("http://x")
+
+    def test_default_fetch_budget_against_a_real_dripping_server(self):
+        # A real socket peer that sends its headers, then one body byte every 50 ms (review r2 P3-7): read(8192) would
+        # have blocked until all 200 bytes arrived (~10 s); the budget must stop it near FETCH_BUDGET + one read.
+        import socket as _socket
+        import threading as _threading
+        import time as _time
+        srv = _socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        stop = _threading.Event()
+
+        def serve():
+            conn, _ = srv.accept()
+            with conn:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-length: 200\r\n\r\n")
+                for _ in range(200):
+                    if stop.is_set():
+                        return
+                    try:
+                        conn.sendall(b"a")
+                    except OSError:
+                        return
+                    _time.sleep(0.05)
+        t = _threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            with mock.patch.object(hardware, "FETCH_BUDGET", 0.3):
+                t0 = _time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    hardware.default_fetch(f"http://127.0.0.1:{srv.getsockname()[1]}/", timeout=1.0)
+                self.assertLess(_time.monotonic() - t0, 2.0)
+        finally:
+            stop.set()
+            srv.close()
 
     def test_redirect_is_refused(self):
         handler = hardware._NoRedirect()
@@ -259,7 +295,7 @@ class RunnerTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self, n):
+            def read1(self, n):
                 return b"a"  # the clock below jumps past the budget during this one read
         clock = iter([0.0, 0.0, hardware.FETCH_BUDGET + 1])
         with opener_returning(Slow()), mock.patch.object(hardware.time, "monotonic", side_effect=lambda: next(clock)):

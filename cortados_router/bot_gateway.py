@@ -3,9 +3,12 @@
 Owner decisions (docs/GROKBOT-BRIDGE.md): ONE shared bearer token for every Grok Bot; all of them are attributed as the
 single client "grokbot"; usage is tracked in $CORTADOS_HOME/bot-usage.jsonl; Chrome (login mode) is never allowed.
 
-It reuses the cortados-route tool implementations (subagent_mcp.call_child_tool / route_task) and exposes only six
-tools. Policy is enforced here BEFORE a tool runs: chrome refused, cwd confined to --workspace-root, a client only sees
-the tasks it started, and caps (concurrency, tasks/day, route_task/day). Stdlib only.
+It reuses the cortados-route tool implementations (subagent_mcp.call_child_tool / route_task). Phase 1 offers ONLY
+route_task (owner decision 2026-11-03: bots must not act on their own yet): start_task, and with it wait_task /
+task_status / list_tasks / cancel_task, is disabled until per-bot filesystem/account isolation (phase 2, B5) exists.
+The start_task path stays behind --enable-start-task (only together with --children-run-as-me), and even then every
+child is forced to plan mode. Policy is enforced here BEFORE a tool runs: chrome refused, cwd confined to
+--workspace-root, a client only sees the tasks it started, and caps (concurrency, tasks/day, route_task/day).
 
 Run: python3 -B -m cortados_router.bot_gateway --token-file F --workspace-root DIR [--port 8434] [--host 127.0.0.1]
 """
@@ -15,6 +18,7 @@ import argparse
 import hmac
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -22,10 +26,25 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from cortados_router import paths, subagent_mcp
+from cortados_router import child_tasks, paths, subagent_mcp
 
 CLIENT = "grokbot"                       # fixed: one shared token means one attributable client (owner decision)
 EXPOSED = ("start_task", "wait_task", "task_status", "list_tasks", "cancel_task", "route_task")
+# Phase 1 surface. Reason: children run as the owner's user with the owner's files and MCP servers, and plan mode is
+# not an isolation boundary (review r2 P1-2), so until phase 2 B5 a bot only gets text answers.
+PHASE1 = ("route_task",)
+START_DISABLED = ("start_task is disabled until per-bot filesystem/account isolation (phase 2, B5) exists; "
+                  "use route_task")
+# Reason: the only mode a bot child may ever get. Omitted/empty would let child_tasks pick its default (auto), which
+# runs the owner's shell unattended (review r2 P1-1), so the gateway always sends it explicitly.
+FORCED_PERMISSION_MODE = "plan"
+# Successful results are allowlisted, not blocklisted: a field child_tasks adds later (a path, a note) must not reach a
+# remote bot until someone decides it should. cwd is rewritten relative to the workspace root.
+RESULT_FIELDS = ("task_id", "state", "elapsed_s", "exit_code", "timed_out", "result", "result_truncated", "models",
+                 "cwd", "permission_mode", "cancelled", "ok", "waited_s")
+# Fixed external error text: a child or provider error can carry owner paths (token file, task dir); the detail goes
+# to the operator's stderr only, bounded to this many characters.
+ERROR_DETAIL_CHARS = 500
 USAGE_LOG = "bot-usage.jsonl"
 # Reason: the usage log rotates (below), so two rotations in one day can drop today's records; the caps and ownership
 # live in this small file instead (rewritten atomically on every change), and the usage log stays the audit trail.
@@ -37,7 +56,7 @@ MAX_OWNED = 10000
 # unattended call spend more subscription quota than any interactive one.
 MAX_ROUTE_TOKENS = subagent_mcp.DEFAULT_MAX_TOKENS
 # Reason: absolute paths in the owner's home (task dir, log files) tell a remote bot nothing it can use and leak the
-# machine's layout; they are stripped from every child result, and cwd is shown relative to the workspace root.
+# machine's layout. RESULT_FIELDS (an allowlist) keeps them out; this list names them for the tests that assert it.
 PATH_FIELDS = ("dir", "stdout_log", "stderr_log")
 REASON_CHARS = 200                        # a refusal reason is one sentence; longer text is not worth logging per call
 NAME_CHARS = 64                           # tool names are short identifiers; a longer one is junk echoed into the log
@@ -56,8 +75,12 @@ ROUTED = (None, "", "cortados")           # GROKBOT-BRIDGE.md 3.3: bots are rout
 ALLOWED_PERMISSION_MODES = (None, "", "plan")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 MAX_BATCH = 20                            # MCP batches are a handful of calls; a longer list is not a real client
-MAX_INFLIGHT = 16                         # bounds handler threads doing work at once; past it the server answers 503
+MAX_INFLIGHT = 16                         # bounds connection threads at once (taken at accept); past it: 503
 REQUEST_TIMEOUT_S = 30                    # a bot sends its JSON-RPC at once or is gone; a slow sender holds a thread
+# The idle timeout only measures silence, so a client trickling a byte at a time would never trip it: the request line
+# and headers, then the body, each get an absolute deadline (as local_gate does), after which the socket is shut.
+HEADER_DEADLINE_S = 10.0                  # a bot sends its headers in one write; 10 s is generous for a slow link
+BODY_DEADLINE_S = 30.0                    # MAX_BODY (1 MiB) in 30 s is ~280 kbit/s, slower than any real bot link
 _PENDING = "__pending__"                  # placeholder prefix reserving a concurrency slot while a child starts
 
 
@@ -98,7 +121,7 @@ class Gateway:
     """Policy + accounting. One instance per server; thread-safe."""
 
     def __init__(self, token: str, workspace_root: str, cfg: dict, limits: dict | None = None,
-                 child=None, route=None):
+                 child=None, route=None, enable_start_task: bool = False):
         if not workspace_root:
             raise GatewayError("no workspace root: pass --workspace-root (the gateway refuses to run tasks anywhere)")
         root = os.path.realpath(workspace_root)
@@ -113,9 +136,20 @@ class Gateway:
         self.running: set = set()         # task ids not yet seen in a final state (+ pending start placeholders)
         self.routes_inflight = 0          # route_task calls currently waiting on the provider
         self.counts: dict = {}            # (day, kind) -> n  kind: tasks | routes | refused
+        self.offered = EXPOSED if enable_start_task else PHASE1
+        # Launch reservations (slot -> wall time), persisted BEFORE a child is spawned: if the gateway dies between the
+        # spawn and recording the task id, the reservation survives the restart and keeps the concurrency slot held.
+        self.reserved: dict = {}
+        try:
+            # Reason: a reservation whose launch never reported back can only have produced a child that its runner
+            # kills at max_s (+ the kill grace); after that the slot is provably free again.
+            self.reservation_ttl = child_tasks._max_s() + child_tasks.KILL_GRACE_S + 60
+        except child_tasks.TaskError as exc:
+            raise GatewayError(str(exc)) from None
         self._load_owned()
         # After a restart, every owned task may still be running; _refresh_running prunes the finished ones.
         self.running.update(t for t, c in self.tasks.items() if c == CLIENT)
+        self.running.update(self.reserved)
 
     # -- auth ------------------------------------------------------------------------------------------------------
     def authorized(self, header) -> bool:
@@ -188,6 +222,10 @@ class Gateway:
         saved = self._read_counters()
         for t in saved.get("owned", []):
             self.tasks.setdefault(t, CLIENT)
+        now = time.time()
+        for slot, ts in saved.get("reserved", {}).items():
+            if now - ts < self.reservation_ttl:
+                self.reserved[slot] = ts
         file_counts = saved.get("counts", {}) if saved.get("day") == today else {}
         for kind in ("tasks", "routes", "refused"):
             n = max(log_counts.get(kind, 0), file_counts.get(kind, 0))
@@ -210,7 +248,10 @@ class Gateway:
             return {}
         counts = d.get("counts") if isinstance(d.get("counts"), dict) else {}
         owned = d.get("owned") if isinstance(d.get("owned"), list) else []
+        reserved = d.get("reserved") if isinstance(d.get("reserved"), dict) else {}
         return {"day": d.get("day"),
+                "reserved": {k: v for k, v in reserved.items() if isinstance(k, str) and k.startswith(_PENDING)
+                             and isinstance(v, (int, float)) and not isinstance(v, bool)},
                 "counts": {k: v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool)},
                 "owned": [t for t in owned if isinstance(t, str) and t]}
 
@@ -218,7 +259,8 @@ class Gateway:
         """Called with self.lock held. Temp file + atomic rename, so a crash never leaves half a file."""
         today = _day()
         owned = sorted(t for t, c in self.tasks.items() if c == CLIENT)[-MAX_OWNED:]
-        obj = {"day": today, "counts": {k: n for (d, k), n in self.counts.items() if d == today}, "owned": owned}
+        obj = {"day": today, "counts": {k: n for (d, k), n in self.counts.items() if d == today}, "owned": owned,
+               "reserved": dict(self.reserved)}
         p = self.counters_path()
         try:
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -250,16 +292,26 @@ class Gateway:
         self.record(tool, "refused", task_id, reason)
         raise PolicyRefusal(reason)
 
-    def _inside_root(self, cwd) -> bool:
+    def _confined(self, cwd):
+        """The cwd resolved ONCE, or None when it is not inside the root. The caller forwards exactly this value, so a
+        symlink swapped after the check cannot redirect the child (review r2 P2-3)."""
         if not isinstance(cwd, str) or not os.path.isabs(cwd):
-            return False
+            return None
         real = os.path.realpath(cwd)
-        return real == self.root or real.startswith(self.root + os.sep)
+        return real if real == self.root or real.startswith(self.root + os.sep) else None
 
     def _refresh_running(self) -> None:
         """Drop finished tasks from self.running. Called WITHOUT self.lock held: task_status may take seconds."""
         with self.lock:
             ids = [t for t in self.running if not t.startswith(_PENDING)]
+            # A reservation left by a launch that never reported back (the gateway died mid-start) expires here.
+            now = time.time()
+            stale = [s for s, ts in self.reserved.items() if now - ts >= self.reservation_ttl]
+            for s in stale:
+                self.reserved.pop(s, None)
+                self.running.discard(s)
+            if stale:
+                self._save_counters()
         done = []
         for tid in ids:
             res = self.child("task_status", {"task_id": tid}, self.cfg)
@@ -281,6 +333,9 @@ class Gateway:
     def call(self, name: str, a: dict) -> dict:
         if name not in EXPOSED:
             self._refuse(str(name)[:NAME_CHARS], f"tool {str(name)[:NAME_CHARS]!r} is not offered by the bot gateway")
+        if name not in self.offered:
+            self._refuse(name, START_DISABLED if name == "start_task" else
+                         f"{name} has nothing to act on: {START_DISABLED}")
         if name == "start_task":
             return self._start(a)
         if name == "route_task":
@@ -310,7 +365,7 @@ class Gateway:
                 with self.lock:
                     self.routes_inflight -= 1
             self.record(name, "error" if res.get("isError") else "ok")
-            return res
+            return _external(name, res) if res.get("isError") else res
         if name == "list_tasks":
             with self.lock:
                 mine = {t for t, c in self.tasks.items() if c == CLIENT}
@@ -327,7 +382,7 @@ class Gateway:
                 except (ValueError, TypeError, AttributeError, RecursionError):
                     res = subagent_mcp._err("list_tasks: unexpected result from the task store")
             self.record(name, "error" if res.get("isError") else "ok")
-            return res
+            return _external(name, res) if res.get("isError") else res
         # task_status / wait_task / cancel_task: only on tasks this client started
         tid = a.get("task_id")
         with self.lock:
@@ -335,12 +390,12 @@ class Gateway:
         if owner != CLIENT:
             self._refuse(name, "unknown task_id, or a task this client did not start", tid if isinstance(tid, str)
                          else None)
-        res = self._scrub_result(self.child(name, a, self.cfg))
+        res = self.child(name, a, self.cfg)
         self.record(name, "error" if res.get("isError") else "ok", tid)
-        return res
+        return _external(name, res) if res.get("isError") else self._scrub_result(res)
 
     def _scrub(self, d: dict) -> dict:
-        d = {k: v for k, v in d.items() if k not in PATH_FIELDS}
+        d = {k: v for k, v in d.items() if k in RESULT_FIELDS}
         if isinstance(d.get("cwd"), str):
             real = os.path.realpath(d["cwd"])
             d["cwd"] = (os.path.relpath(real, self.root) if real == self.root or real.startswith(self.root + os.sep)
@@ -348,13 +403,14 @@ class Gateway:
         return d
 
     def _scrub_result(self, res: dict) -> dict:
-        """Strip owner paths from a JSON tool result; a non-JSON (error) text is passed through unchanged."""
+        """Allowlist the fields of a successful JSON tool result. Anything else (not JSON, not an object) is not passed
+        through: its text is unscrubbed, so the bot gets a fixed message and the operator the detail."""
         try:
             obj = json.loads(_text(res))
         except (ValueError, RecursionError):
-            return res
+            obj = None
         if not isinstance(obj, dict):
-            return res
+            return _external("result", subagent_mcp._err(_text(res)))
         out = dict(res)
         out["content"] = [{"type": "text", "text": json.dumps(self._scrub(obj), indent=2)}]
         return out
@@ -369,10 +425,12 @@ class Gateway:
         if a.get("permission_mode") not in ALLOWED_PERMISSION_MODES or a.get("allowed_tools") not in (None, [], ""):
             self._refuse("start_task", "permission_mode other than 'plan' and allowed_tools are refused until the "
                                        "per-user boundary (phase 2 B5) ships: children run as the owner's user")
-        if not self._inside_root(a.get("cwd")):
+        cwd = self._confined(a.get("cwd"))
+        if cwd is None:
             self._refuse("start_task", "cwd must be an absolute path inside the gateway's workspace root")
         self._refresh_running()
-        slot = f"{_PENDING}{threading.get_ident()}-{time.monotonic_ns()}"
+        # pid + thread + clock: unique across restarts too, since reservations are persisted.
+        slot = f"{_PENDING}{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
         with self.lock:
             if len(self.running) >= self.limits["max_concurrent"]:
                 reason = (f"concurrency cap reached ({self.limits['max_concurrent']} running): it bounds unattended "
@@ -381,13 +439,12 @@ class Gateway:
                 reason = f"daily task cap reached ({self.limits['max_tasks_per_day']}/day)"
             else:
                 reason = None
-                self._bump("tasks")
                 self.running.add(slot)    # reserve the slot now, so parallel starts cannot all pass the cap
+                self.reserved[slot] = time.time()
+                self._bump("tasks")       # also persists the reservation (bot-counters.json) before the spawn
         if reason:
             self._refuse("start_task", reason)
-        args = {k: a[k] for k in ("task", "permission_mode") if a.get(k)}
-        args["cwd"] = os.path.realpath(a["cwd"])   # forward the checked path: a symlink swapped after the check is moot
-        args["chrome"] = False
+        args = {"task": a.get("task"), "cwd": cwd, "chrome": False, "permission_mode": FORCED_PERMISSION_MODE}
         tid = None
         try:
             res = self.child("start_task", args, {**self.cfg, "client": CLIENT})
@@ -399,12 +456,13 @@ class Gateway:
         finally:
             with self.lock:
                 self.running.discard(slot)
+                self.reserved.pop(slot, None)
                 if tid:
                     self.tasks[tid] = CLIENT
                     self.running.add(tid)
-                    self._save_counters()
+                self._save_counters()
         self.record("start_task", "ok" if tid else "error", tid)
-        return self._scrub_result(res) if tid else res
+        return self._scrub_result(res) if tid else _external("start_task", res)
 
     # -- JSON-RPC --------------------------------------------------------------------------------------------------
     def handle(self, msg) -> dict | None:
@@ -436,7 +494,7 @@ class Gateway:
         if method == "ping":
             return {**base, "result": {}}
         if method == "tools/list":
-            return {**base, "result": {"tools": tool_list()}}
+            return {**base, "result": {"tools": tool_list(self.offered)}}
         if method == "tools/call":
             a = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             try:
@@ -458,12 +516,19 @@ def _text(res) -> str:
     return t if isinstance(t, str) else ""
 
 
-def tool_list() -> list:
-    """The six tools, with the refused arguments (chrome, connectors, pins, permission/tool grants) removed."""
+def _external(tool: str, res: dict) -> dict:
+    """A fixed error for the bot; the unscrubbed detail (it may name owner paths) goes to the operator's stderr."""
+    detail = _text(res).replace("\n", " ")[:ERROR_DETAIL_CHARS]
+    sys.stderr.write(f"bot-gateway: {tool} error: {detail}\n")
+    return subagent_mcp._err(f"{tool} failed inside the gateway; the operator's gateway log has the details")
+
+
+def tool_list(offered=PHASE1) -> list:
+    """The offered tools, with the refused arguments (chrome, connectors, pins, permission/tool grants) removed."""
     tools = [subagent_mcp.TOOL] + subagent_mcp._child_tools()
     out = []
     for t in tools:
-        if t["name"] not in EXPOSED:
+        if t["name"] not in offered:
             continue
         if t["name"] == "start_task":
             t = json.loads(json.dumps(t))
@@ -479,12 +544,82 @@ def tool_list() -> list:
     return out
 
 
-def make_handler(gw: Gateway):
-    inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
+class GatewayServer(ThreadingHTTPServer):
+    """Capacity is taken at accept, BEFORE a worker thread exists or a header is parsed (local_gate's pattern): the
+    old in-handler semaphore let unauthenticated, half-sent headers each hold a thread (review r2 P2-4)."""
+    daemon_threads = True
 
+    def __init__(self, addr, handler, max_connections: int):
+        self.slots = threading.BoundedSemaphore(max_connections) if max_connections > 0 else None
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        if self.slots is None or not self.slots.acquire(blocking=False):
+            body = b'{"error": "busy: too many requests in flight"}'
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n"
+                                b"content-length: " + str(len(body)).encode() + b"\r\nconnection: close\r\n\r\n" + body)
+            except OSError as exc:            # the client already left; nothing to tell it
+                sys.stderr.write(f"bot-gateway: 503 not delivered ({type(exc).__name__})\n")
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def make_handler(gw: Gateway):
     class H(BaseHTTPRequestHandler):
         server_version = "cortados-bot-gateway"
         timeout = REQUEST_TIMEOUT_S
+
+        def setup(self):
+            super().setup()
+            # http.server reads the request line and headers itself, so a timer shuts the socket if they are not all
+            # in by HEADER_DEADLINE_S; do_POST/do_GET cancel it. The flag stops a request parsed from partial headers.
+            self._expired = False
+            self._header_timer = threading.Timer(HEADER_DEADLINE_S, self._expire)
+            self._header_timer.daemon = True
+            self._header_timer.start()
+
+        def _expire(self):
+            self._expired = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError as exc:            # already closed by the client: the deadline's goal is met
+                sys.stderr.write(f"bot-gateway: header deadline shutdown ({type(exc).__name__})\n")
+
+        def finish(self):
+            self._header_timer.cancel()
+            super().finish()
+
+        def _read_body(self, n: int):
+            """n bytes within BODY_DEADLINE_S, or None. Each wait is bounded by the time left, so a trickle cannot
+            extend the deadline."""
+            end = time.monotonic() + BODY_DEADLINE_S
+            parts, left = [], n
+            try:
+                while left > 0:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self.connection.settimeout(min(REQUEST_TIMEOUT_S, remaining))
+                    chunk = self.rfile.read1(min(left, 65536))
+                    if not chunk:
+                        return None
+                    parts.append(chunk)
+                    left -= len(chunk)
+            except OSError:
+                return None                   # the client stalled or left; the caller closes the connection
+            return b"".join(parts)
 
         def log_message(self, fmt, *args):          # path + status only; headers (the token) are never logged
             sys.stderr.write("bot-gateway: %s %s\n" % (self.command, self.path.split("?")[0][:100]))
@@ -498,15 +633,21 @@ def make_handler(gw: Gateway):
             self.wfile.write(body)
 
         def do_GET(self):
+            self._header_timer.cancel()
+            self.close_connection = True
+            if self._expired:
+                return
             self._send(405, {"error": "use POST /mcp"})   # no SSE stream offered
 
         def do_POST(self):
-            if not inflight.acquire(blocking=False):
-                return self._send(503, {"error": "busy: too many requests in flight"})
+            self._header_timer.cancel()
+            self.close_connection = True          # one request per connection: no keep-alive slot holding
+            if self._expired:                     # the header deadline fired: these headers may be partial
+                return
             try:
                 self._post()
-            finally:
-                inflight.release()
+            except OSError:                       # the client left, reset or stalled; nothing to tell it
+                self.close_connection = True
 
         def _post(self):
             if self.path.split("?")[0] != "/mcp":
@@ -519,8 +660,11 @@ def make_handler(gw: Gateway):
                 n = -1
             if n < 0 or n > MAX_BODY:
                 return self._send(413, {"error": "request body too large or invalid length"})
+            raw = self._read_body(n)
+            if raw is None:
+                return                            # body deadline passed or the client left: close, no reply
             try:
-                msg = json.loads(self.rfile.read(n) or b"null")
+                msg = json.loads(raw or b"null")
             except (ValueError, RecursionError):          # RecursionError: deeply nested JSON
                 return self._send(400, {"jsonrpc": "2.0", "id": None,
                                         "error": {"code": -32700, "message": "parse error"}})
@@ -541,7 +685,7 @@ def make_handler(gw: Gateway):
 
 
 def build_server(gw: Gateway, host: str = "127.0.0.1", port: int = 8434) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(gw))
+    return GatewayServer((host, port), make_handler(gw), MAX_INFLIGHT)
 
 
 def main(argv=None) -> int:
@@ -553,6 +697,9 @@ def main(argv=None) -> int:
     ap.add_argument("--children-run-as-me", action="store_true",
                     help="allow a non-loopback --host although children run as the owner's user (no per-user "
                          "boundary until phase 2 B5)")
+    ap.add_argument("--enable-start-task", action="store_true",
+                    help="offer start_task (and the task tools) again; only with --children-run-as-me, and every "
+                         "child is still forced to plan mode. Off in phase 1 (owner decision 2026-11-03)")
     ap.add_argument("--max-concurrent", type=int, default=DEFAULTS["max_concurrent"])
     ap.add_argument("--max-tasks-per-day", type=int, default=DEFAULTS["max_tasks_per_day"])
     ap.add_argument("--max-routes-per-day", type=int, default=DEFAULTS["max_routes_per_day"])
@@ -561,13 +708,18 @@ def main(argv=None) -> int:
         sys.stderr.write(f"bot-gateway: refusing to listen on {o.host!r}: children run as the owner's user and the "
                          "per-user boundary (phase 2 B5) is not built yet; pass --children-run-as-me to accept that\n")
         return 2
+    if o.enable_start_task and not o.children_run_as_me:
+        sys.stderr.write("bot-gateway: --enable-start-task needs --children-run-as-me: a child runs as the owner's "
+                         "user with the owner's files until phase 2 B5\n")
+        return 2
     try:
         token = read_token_file(o.token_file)
         cfg = {"url": subagent_mcp._resolve_url(), "token": subagent_mcp._resolve_token(),
                "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}
         gw = Gateway(token, o.workspace_root, cfg, {"max_concurrent": o.max_concurrent,
                                                      "max_tasks_per_day": o.max_tasks_per_day,
-                                                     "max_routes_per_day": o.max_routes_per_day})
+                                                     "max_routes_per_day": o.max_routes_per_day},
+                     enable_start_task=o.enable_start_task)
     except GatewayError as exc:
         sys.stderr.write(f"bot-gateway: refusing to start: {exc}\n")
         return 2
