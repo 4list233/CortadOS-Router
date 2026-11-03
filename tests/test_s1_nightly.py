@@ -60,6 +60,7 @@ STUBS = {
         "if a.holdout_count: print(50 if short else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
         "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
+        "if os.environ.get('STUB_EVAL_TERM'): import signal, time; os.kill(int(open('data/nightly.pid').read()), signal.SIGTERM); time.sleep(1); raise SystemExit(143)\n"
         "if os.environ.get('STUB_EVAL_RC'): raise SystemExit(int(os.environ['STUB_EVAL_RC']))\n"
         "unavailable = os.environ.get('STUB_EVAL_UNAVAILABLE') == '1'\n"
         "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0' and floor > 50   # the stub holdout has 50 rows\n"
@@ -109,7 +110,8 @@ class NightlyEndToEnd(unittest.TestCase):
         keep = {k: v for k, v in os.environ.items() if not k.startswith(("CORTADOS_", "STUB_"))}
         self.env = {**keep, "HOME": str(home), "CORTADOS_NIGHTLY_SUPERVISED": "1", "CORTADOS_S1_PY": str(self.tmp / "fake-py"),
                     "CORTADOS_S1_GPU_SETTLE": "0", "CORTADOS_S1_EVAL_SETTLE": "0", "CORTADOS_ROUTER_REPO": str(self.tmp / "no-repo"),
-                    "CORTADOS_HOME": str(self.tmp / "cortados-home")}
+                    "CORTADOS_HOME": str(self.tmp / "cortados-home"),
+                    "CORTADOS_S1_EVAL_MINUTES": "0"}   # no wall-clock dependence; the deadline tests set it
         self.night = 0
 
     def run_night(self, **env):
@@ -382,6 +384,53 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertFalse((run2 / "adapter").exists(), "recovered without retraining")
         _, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertIn("skipped: no new labels", log)
+
+    def test_term_during_evaluation_keeps_the_run_pending_and_next_night_evaluates_it(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)    # 07:00 TERM mid-evaluation
+        self.assertEqual(rc, 130, log)
+        self.assertIn("stop requested", log)
+        self.assertFalse((run1 / "report.json").exists())
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)                      # new labels do NOT supersede it
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertNotIn("superseded", log)
+        self.assertIn("pending candidate runs/2026-01-01 (evaluation_pending): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertFalse((run2 / "adapter").exists(), "evaluated, not retrained")
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "the newer labels were never trained on")
+        _, log, run3 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("training tonight", log)
+
+    def test_marker_is_written_before_evaluation_starts(self):
+        evaluate = self.s1 / "evaluate.py"
+        evaluate.write_text("import os, sys\nif '--holdout-key' not in sys.argv and '--holdout-count' not in sys.argv:\n"
+                            "    open('data/marker-at-eval', 'w').write(open('data/pending-candidate').read())\n" + evaluate.read_text())
+        self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/marker-at-eval").read_text())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists(), "a final verdict clears the marker")
+
+    def test_not_enough_time_skips_evaluation_and_leaves_it_pending(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, CORTADOS_S1_EVAL_MINUTES=1440)   # never enough time
+        self.assertEqual(rc, 0, log)
+        self.assertIn("not evaluating runs/2026-01-01", log)
+        self.assertFalse((self.s1 / "data/eval-count").exists(), "evaluation not started")
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_EVAL_MINUTES=1440)
+        self.assertIn("not evaluating runs/2026-01-01", log)
+        self.assertFalse((run2 / "adapter").exists(), "no new training while the candidate waits")
+        self.assertTrue((run1 / "adapter").is_dir())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+
+    def test_trained_unevaluated_run_without_marker_is_recovered(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)
+        (self.s1 / "data/pending-candidate").unlink()                          # the 2026-11-03 state: no marker
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)
+        self.assertIn("recovered runs/2026-01-01", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertFalse((run2 / "adapter").exists())
 
     def test_crashed_evaluation_stays_pending_and_recovers(self):
         rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
