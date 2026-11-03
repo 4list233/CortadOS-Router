@@ -65,10 +65,11 @@ const FALLBACK: Cfg = {
   // Background routed work is separate.
   subagentTimeoutMs: 600_000,
   // `claude -p --max-turns N`: the child stops after N agentic turns instead of looping until the timeout kills it
-  // and every result is lost (incident 2026-11-03: a research child made 70 tool calls against a broken WebSearch,
-  // ran 600 s, cost $1.57 and returned nothing). 40 turns is ample for a focused subtask; a stopped run still hands
-  // back its partial text (see partialFromTranscript). 0 or a non-number turns the flag off.
-  maxTurns: 40,
+  // (incident 2026-11-03: a research child made 70 tool calls against a broken WebSearch, ran 600 s, cost $1.57 and
+  // returned nothing). OPT-IN (0 = off): there is no evidence yet that any blanket budget is safe for builders, whose
+  // legitimate runs can need many turns, and a stopped builder has acted but not finished. The partial-result
+  // handback (see partialFromTranscript) and the stop-on-dead-tool prompt line cover the incident without it.
+  maxTurns: 0,
   // A review subagent is kept off the MAIN SESSION's own model AND the models routed (non-review) subagents ran on
   // since the last review (x-cortados-exclude-model, a comma-separated list; see workerModels).
   excludeBuilderOnReview: true,
@@ -162,12 +163,17 @@ export function newSessionId(): string {
   return `${h(8)}-${h(4)}-4${h(3)}-${'89ab'[Math.floor(Math.random() * 4)]}${h(3)}-${h(12)}`
 }
 
-/** Claude Code's project folder name for a cwd: every non-alphanumeric character becomes '-'
- * (/Users/a/Ai/CortadOS-Router -> -Users-a-Ai-CortadOS-Router). Very long paths are hashed by the CLI and won't match;
- * then the transcript is simply not found. */
-export function projectSlug(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
+/** A lowercase v4 UUID exactly as newSessionId makes it. The session id goes into a shell command (as a positional
+ * argument, never spliced into the script), and this strict check is the second guard: nothing else can reach it. */
+export function isSessionUuid(s: unknown): s is string {
+  return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(s)
 }
+
+/** The fixed shell script that finds a session transcript by its UUID under the CLI's projects dir. Located by name,
+ * not by deriving the project folder from the cwd: Claude Code hashes long project-folder names, so a slug of the cwd
+ * misses them. $1 is the (validated) UUID; depth 2 is projects/<folder>/<uuid>.jsonl. */
+export const FIND_TRANSCRIPT_SH =
+  'find "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" -maxdepth 2 -type f -name "$1.jsonl" 2>/dev/null | head -n 1'
 
 /** Milliseconds as whole seconds for a message ("600 s"), so a 600000 ms timeout never reads as "60000s". */
 export function fmtSecs(ms: number): string {
@@ -177,31 +183,40 @@ export function fmtSecs(ms: number): string {
 export type PartialRun = { lastText: string | null; toolUses: number; assistantTurns: number }
 
 /** The last assistant text and how far the child got (tool calls, assistant turns), from a session transcript jsonl.
- * Malformed lines are skipped (the file may be cut mid-line by the kill). */
+ * The CLI writes one record per content block, so records sharing a message.id are ONE assistant turn (a record
+ * without an id counts on its own); every tool_use block is still counted, and the text blocks of the last turn are
+ * joined. Malformed lines are skipped (the file may be cut mid-line by the kill). */
 export function partialFromTranscript(jsonl: string): PartialRun {
   let lastText: string | null = null
+  let lastTextId: string | null = null
   let toolUses = 0
-  let assistantTurns = 0
+  let anonymousTurns = 0
+  const ids = new Set<string>()
   for (const line of jsonl.split('\n')) {
     const t = line.trim()
     if (!t.startsWith('{')) continue
     let d: any
     try { d = JSON.parse(t) } catch { continue }
     if (!d || d.type !== 'assistant' || !d.message) continue
-    assistantTurns += 1
+    const id = typeof d.message.id === 'string' && d.message.id ? d.message.id : null
+    if (id) ids.add(id)
+    else anonymousTurns += 1
     const content = Array.isArray(d.message.content) ? d.message.content : []
     const texts: string[] = []
     for (const b of content) {
       if (b && b.type === 'tool_use') toolUses += 1
       else if (b && b.type === 'text' && typeof b.text === 'string' && b.text.trim()) texts.push(b.text)
     }
-    if (texts.length) lastText = texts.join('\n')
+    if (texts.length) {
+      // Another block of the same turn extends its text; a new turn replaces it.
+      lastText = id && id === lastTextId && lastText ? `${lastText}\n${texts.join('\n')}` : texts.join('\n')
+      lastTextId = id
+    }
   }
-  return { lastText, toolUses, assistantTurns }
+  return { lastText, toolUses, assistantTurns: ids.size + anonymousTurns }
 }
 
-/** The last brace-delimited line of `claude -p --output-format json|stream-json` output (with stream-json that is
- * the final `{"type":"result",...}` event, which carries the same fields as the json format) (warnings may precede it). */
+/** The last brace-delimited line of `claude -p --output-format json` output (warnings may precede it). */
 export function lastJsonLine(stdout: string): string | null {
   const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean)
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -554,10 +569,10 @@ export const register: Register = (on, options) => {
       '--setting-sources', '',
       '--strict-mcp-config',
       '--mcp-config', JSON.stringify({ mcpServers: {} }),
-      // stream-json (+ --verbose, which the CLI requires for it) writes every message as it happens and ends with the
-      // same result object as `json`; parseResult reads that last line either way.
-      '--output-format', 'stream-json',
-      '--verbose',
+      // json = the result object only. NOT stream-json: that puts every intermediate message on stdout, so a
+      // tool-heavy child that succeeded can overrun the host's stdout cap, come back truncated and be refused. How far
+      // a failed child got is read from its transcript instead (partialNote).
+      '--output-format', 'json',
     ]
     const maxTurns = resolveMaxTurns(cfg.maxTurns)
     if (maxTurns !== null) args.push('--max-turns', String(maxTurns))
@@ -623,21 +638,23 @@ export const register: Register = (on, options) => {
       } catch { /* never fail the subagent over bookkeeping */ }
       return record
     }
-    /** What the child left behind: its last assistant text and progress, read from its transcript under the CLI's
-     * config dir (CLAUDE_CONFIG_DIR or ~/.claude, the child inherits the same env and cwd). A one-line summary for the
-     * refusal, scrubbed and capped; never throws. */
+    /** What the child left behind: its last assistant text and progress, read from its transcript, found by its
+     * session UUID under the CLI's config dir (CLAUDE_CONFIG_DIR or ~/.claude; the child inherits the same env). A
+     * summary for the refusal, capped; the caller scrubs the whole refusal. Never throws. */
     const partialNote = async (): Promise<string> => {
       const elapsed = `elapsed ${fmtSecs(Date.now() - startedAt)}`
       if (!sessionId) return `[${elapsed}]`
       let where = `session ${sessionId}`
       try {
-        const loc = await $.process.run(['sh', '-c', 'printf "%s\\n%s" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$PWD"'])
-        const [dir, cwd] = String(loc.stdout).split('\n')
-        const file = `${dir}/projects/${projectSlug(cwd ?? '')}/${sessionId}.jsonl`
+        if (!isSessionUuid(sessionId)) throw new Error('session id is not a UUID; transcript not searched')
+        const loc = await $.process.run(['sh', '-c', FIND_TRANSCRIPT_SH, 'sh', sessionId])
+        const file = String(loc.stdout).split('\n')[0].trim()
+        if (!file || !file.endsWith(`/${sessionId}.jsonl`)) throw new Error('transcript not found under the projects dir')
         where += `, transcript ${file}`
         const pt = partialFromTranscript(String(await $.fs.read(file)))
         const head = `[${elapsed}; ${where}; ${pt.assistantTurns} assistant turns, ${pt.toolUses} tool calls]`
         if (!pt.lastText) return `${head}\n(no assistant text yet)`
+        // Scrubbed before the cut too, so the 4000-char window never starts inside a token the final scrub would miss.
         return `${head}\nLast assistant text (partial result):\n${scrubToken(pt.lastText, token).slice(-4000)}`
       } catch (err) {
         return `[${elapsed}; ${where}; transcript unreadable: ${scrubToken(String(err), token).slice(0, 200)}]`
@@ -672,7 +689,8 @@ export const register: Register = (on, options) => {
         // stderr are NOT surfaced: the CLI truncates them at a byte boundary that could split a token past the
         // exact-match scrubber. They remain in the child's on-disk logs for debugging.
         const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
-        return { deny: `${note}routed subagent did not complete cleanly (${why}): ${detail}\n${await partialNote()}` }
+        // The WHOLE refusal is scrubbed: the transcript path, session id and partial note are model-visible too.
+        return { deny: scrubToken(`${note}routed subagent did not complete cleanly (${why}): ${detail}\n${await partialNote()}`, token) }
       }
       // A completed review has checked the work of the models it was kept off: forget exactly those entries (as of
       // dispatch), keeping workers that finished while it ran — even on the same model. A failed review keeps the

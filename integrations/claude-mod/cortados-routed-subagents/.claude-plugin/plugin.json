@@ -83,8 +83,8 @@
     "maxTurns": {
       "type": "number",
       "title": "Routed subagent max turns",
-      "default": 40,
-      "description": "Passed as claude -p --max-turns: a routed subagent stops after this many agentic turns instead of looping until the timeout kills it (incident 2026-11-03). A stopped or timed-out subagent still hands back its last assistant text, session id and elapsed time. 0 turns the limit off."
+      "default": 0,
+      "description": "Opt-in, off (0) by default. When positive, passed as claude -p --max-turns: a routed subagent stops after this many agentic turns instead of looping until the timeout kills it (incident 2026-11-03). Off by default because there is no evidence yet that a blanket budget is safe for builders, which can legitimately need many turns. A stopped or timed-out subagent still hands back its last assistant text, session id and elapsed time."
     },
     "excludeBuilderOnReview": {
       "type": "boolean",
