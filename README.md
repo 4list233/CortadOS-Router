@@ -453,6 +453,16 @@ claude mcp add -s user cortados-route \
 
 A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (reachable from any device on the tailnet; it asks for the token and never embeds it), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.
 
+## This machine's hardware as a resource
+
+`python3 -m cortados_router.hardware sample [--out [PATH]]` measures this machine like a subscription's "% left": host,
+chip, total and available memory (`vm_stat` free + inactive + speculative), CPU busy % (second sample of `top -l 2`),
+load averages, GPU busy % (Apple IOAccelerator "Device Utilization %"), the Ollama models resident now (`/api/ps`,
+0.5 s timeout), and a `headroom` block (free_mem_gb, cpu_idle_pct, gpu_idle_pct). It takes about 2 s (worst case about 22.5 s: every command hanging to its 4 s timeout plus the 2 s Ollama fetch budget and one last 0.5 s read). Anything that
+cannot be read is marked unavailable with the reason and listed in `errors`; nothing is guessed. `--out` writes the
+JSON atomically to the state dir (`$CORTADOS_HOME`, else `$CORTADOS_HERMES_HOME`, else `~/.cortados`) as `hardware/<host>.json` (0600; directories it creates are 0700, existing ones keep their mode). Each sample carries `sampled_at` (epoch s). It feeds the dashboard next and
+routing later; nothing in routing reads it yet. Details: `docs/LOCAL-RESOURCES.md`.
+
 ## Status
 
 - Live per-turn routing, with mandatory routing for agent, cron, delegation and auxiliary calls when enabled.
