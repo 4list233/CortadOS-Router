@@ -92,17 +92,43 @@ setting STALL_NIGHTS 2 1; setting EARLY_STOP_NIGHTS 2 1; setting EVAL_FAIL_NIGHT
 GPU_SETTLE="${CORTADOS_S1_GPU_SETTLE:-3}"; EVAL_SETTLE="${CORTADOS_S1_EVAL_SETTLE:-20}"
 setting GPU_SETTLE 3; setting EVAL_SETTLE 20
 EVAL_MINUTES="${CORTADOS_S1_EVAL_MINUTES:-110}"; setting EVAL_MINUTES 110
+# ceiling: the nightly window is 01:30-07:00 (330 min) and evaluation starts after labeling (~02:45, ~255 min left), so a value
+# >= 300 can never fit: every candidate would wait forever. That is a config error, not a policy: fall back to the default.
+if [ "$EVAL_MINUTES" -ge 300 ]; then
+  SETTING_NOTES="${SETTING_NOTES:-}EVAL_MINUTES=$EVAL_MINUTES can never fit the 01:30-07:00 window (>= 300); using 110. "; EVAL_MINUTES=110
+fi
 DEADLINE="${CORTADOS_S1_DEADLINE:-0700}"
 [[ "$DEADLINE" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]] || { SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_DEADLINE=$DEADLINE is not HHMM; using 0700. "; DEADLINE=0700; }
-minutes_left() {   # minutes from now to the next $DEADLINE (wraps past midnight: a 01:30 start has 330 min to 07:00)
-  local now dl; now=$(date +%H%M); now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
+minutes_left() {   # minutes_left [HHMM]: minutes from now (or HHMM) to the next $DEADLINE (wraps: a 01:30 start has 330 min to 07:00)
+  # CORTADOS_S1_NOW (HHMM) overrides the clock so tests can pin the time of night
+  local now dl; now=${1:-${CORTADOS_S1_NOW:-$(date +%H%M)}}; now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
   echo $(( (dl - now + 1440) % 1440 ))
 }
-eval_time_ok() {   # eval_time_ok <run>: true when an evaluation can finish before the deadline; else logs why and is false
+eval_time_ok() {   # eval_time_ok <run> <reason>: true when an evaluation can finish before the deadline; else logs why, raises
+  # the eval_deferred streak (a candidate deferred night after night is a stall someone must see) and is false
   local left; left=$(minutes_left)
   [ "$EVAL_MINUTES" -eq 0 ] || [ "$left" -ge "$EVAL_MINUTES" ] && return 0
-  echo "not evaluating $1: $left min to the $DEADLINE deadline, evaluation needs ~$EVAL_MINUTES (CORTADOS_S1_EVAL_MINUTES); it stays pending (evaluation_pending) and is evaluated first next night"
+  echo "not evaluating $1: $left min to the $DEADLINE deadline, evaluation needs ~$EVAL_MINUTES (CORTADOS_S1_EVAL_MINUTES); it stays pending ($2) and is evaluated first next night"
+  streak eval_deferred hit "$EVAL_FAIL_NIGHTS" "evaluation deferred: not enough time before the deadline"
   return 1
+}
+# diagnostic / test hook: print the minutes to the deadline for HHMM (or now) and the settings notes, then exit
+if [ "${1:-}" = "--minutes-left" ]; then minutes_left "${2:-}"; [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES"; exit 0; fi
+# write_pending <sft> <eval> <reason> <run>: atomic (tmp + mv, like mark_trained) and checked; a marker that cannot be written
+# is fatal: evaluating without it would let a TERM leave the trained run unmarked and the next retention pass delete it
+write_pending() {
+  if ! { echo "$1 $2 $3 $4" > data/pending-candidate.tmp && mv data/pending-candidate.tmp data/pending-candidate; }; then
+    echo "ERROR: could not write data/pending-candidate ($3 $4); stopping without evaluating"; exit 1
+  fi
+}
+# read_pending: sets p_sft p_eval p_reason p_run from a VALID marker (exactly four non-empty fields) and returns 0; else 1.
+# An invalid marker is treated as absent: recovery then re-adopts the trained run, so a garbled marker never hides it from prune.
+read_pending() {
+  local extra=""
+  p_sft=""; p_eval=""; p_reason=""; p_run=""
+  [ -s data/pending-candidate ] || return 1
+  read -r p_sft p_eval p_reason p_run extra < data/pending-candidate || [ -n "$p_run" ] || return 1
+  [ -n "$p_sft" ] && [ -n "$p_eval" ] && [ -n "$p_reason" ] && [ -n "$p_run" ] && [ -z "$extra" ]
 }
 BASE="${CORTADOS_S1_BASE:-mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 export CORTADOS_S1_BASE="$BASE"
@@ -132,7 +158,7 @@ prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfi
   local d promoted pending_run=""
   promoted=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['adapter'])" "${SERVE_POINTER:-current.json}" 2>/dev/null)
   # a pending candidate (e.g. its evaluation crashed, so it has no report.json) is kept: it is re-evaluated, not retrained
-  [ -f data/pending-candidate ] && read -r _ _ _ pending_run < data/pending-candidate
+  read_pending && pending_run=$p_run
   for d in runs/20*/; do
     d=${d%/}
     [ "$d" = "$RUN" ] || [ -f "$d/report.json" ] || [ ! -d "$d/adapter" ] && continue
@@ -155,11 +181,17 @@ echo "=== $(date) nightly start (base $BASE, run $RUN)"
 # it and retrained from step 0, forever). A trained, unevaluated run with no pending marker is adopted as evaluation_pending BEFORE
 # the retention pass. Placeholder fingerprints are fine: evaluation_pending is re-evaluated whatever the fingerprints say.
 # Only the newest is adopted (the marker holds one run); older ones are logged and left to the retention pass.
-if [ ! -f data/pending-candidate ]; then
-  adopt=$(trained_unevaluated_runs | head -1)
-  if [ -n "$adopt" ] && [ "$adopt" != "$RUN" ]; then
-    echo "unknown unknown evaluation_pending $adopt" > data/pending-candidate
+if ! read_pending; then
+  [ -e data/pending-candidate ] && echo "data/pending-candidate is invalid ($(head -c 200 data/pending-candidate | tr -d '\000\n')); treated as absent"
+  adopt=$(trained_unevaluated_runs | grep -vxF "$RUN" | head -1)
+  if [ -n "$adopt" ]; then
+    write_pending unknown unknown evaluation_pending "$adopt"
     echo "recovered $adopt: training completed but it has no report.json; pending (evaluation_pending), evaluated before any new training"
+    for d in $(trained_unevaluated_runs | grep -vxF "$RUN" | grep -vxF "$adopt"); do
+      echo "recovery: $d is also trained but unevaluated; only the newest is kept pending, so the retention pass removes its checkpoints"
+    done
+  else
+    rm -f data/pending-candidate
   fi
 fi
 prune_unresumable_runs
@@ -322,19 +354,19 @@ fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
   # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one
-  read -r _ _ p_reason p_run < data/pending-candidate
+  read_pending
   echo "forced training: pending candidate $p_run ($p_reason) superseded"; rm -f data/pending-candidate
   holdout_clear   # the waiting candidate (and any failed count about it) is resolved
 fi
-if [ -f data/pending-candidate ]; then
-  read -r p_sft p_eval p_reason p_run < data/pending-candidate
+if read_pending; then
   if [ ! -d "$p_run/adapter" ]; then
     echo "pending candidate $p_run adapter missing; dropped"; state event "$STATUS" pending_failure "$p_run adapter missing"
     rm -f data/pending-candidate
   elif [ "$p_sft" = "$sft_hash" ] || [ "$p_reason" = evaluation_pending ]; then
     # Convergence: a night with an evaluation_pending candidate spends itself on that evaluation (it starts right after labeling,
-    # ~02:45, so 110 min fits) and ends; the next night trains on the newer data. Training itself already resumes across nights
-    # (segment-target / iters-base), so every night either finishes an evaluation or advances training: nothing is redone.
+    # ~02:45, so 110 min fits) and ends; the next night trains on the newer data. Only a run whose training COMPLETED is protected
+    # this way: mid-training progress on a non-completed run resumes only within its own run folder (segment-target / iters-base),
+    # not across date folders, so a training run cut off before completion is redone by a later night's run.
     # Only when the data is unchanged does a verdict mark it trained (mark_trained): newer labels were never trained on.
     same_data=0; [ "$p_sft" = "$sft_hash" ] && same_data=1
     trained_mark() { [ "$same_data" -eq 1 ] && mark_trained; return 0; }
@@ -346,7 +378,7 @@ if [ -f data/pending-candidate ]; then
       state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
-    if ! eval_time_ok "$p_run"; then
+    if ! eval_time_ok "$p_run" "$p_reason"; then
       state event "$STATUS" skip "pending $p_run: not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
     fi
     echo "pending candidate $p_run ($p_reason): re-evaluating against the current holdout and incumbent"
@@ -354,28 +386,29 @@ if [ -f data/pending-candidate ]; then
       echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
     fi
     if report_unavailable "$p_run"; then
-      echo "$sft_hash $now_eval evaluation_failed $p_run" > data/pending-candidate
+      write_pending "$sft_hash" "$now_eval" evaluation_failed "$p_run"
       echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
       state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
     fi
-    eval_ok
+    eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
+    if [ "$same_data" -eq 1 ]; then next_msg="no new data, nothing to train"; else next_msg="the newer labels are trained next night"; fi
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
-        echo "$sft_hash $now_eval holdout_blocked $p_run" > data/pending-candidate
+        write_pending "$sft_hash" "$now_eval" holdout_blocked "$p_run"
         echo "pending $p_run still blocked: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['promote_blocked'])" "$p_run/report.json")"
         state event "$STATUS" skip "pending $p_run still holdout-blocked"; holdout_hit
       else
         rm -f data/pending-candidate; trained_mark; holdout_clear
         state event "$STATUS" skip "pending $p_run no longer promotes"
-        echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; no new data, nothing to train"
+        echo "pending $p_run no longer promotes (see $p_run/report.json); incumbent stays; $next_msg"
       fi
       echo "=== $(date) nightly end"; exit 0
     fi
     if state promote "$p_run/report.json" "$PWD/$p_run/adapter" "$SERVE_POINTER"; then
       rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; trained_mark; holdout_clear
-      echo "PROMOTED (retry) $p_run → $SERVE_POINTER; no new data, nothing to train"; echo "=== $(date) nightly end"; exit 0
+      echo "PROMOTED (retry) $p_run → $SERVE_POINTER; $next_msg"; echo "=== $(date) nightly end"; exit 0
     fi
-    echo "$sft_hash $now_eval promotion_failed $p_run" > data/pending-candidate
+    write_pending "$sft_hash" "$now_eval" promotion_failed "$p_run"
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
   else
     # New train labels. While the Claude holdout is below the floor the bar cannot judge ANY candidate: retraining would only
@@ -530,26 +563,31 @@ while :; do
 done
 # written BEFORE evaluation: a TERM (07:00 deadline, --stop) during evaluate_run must leave the trained run pending, or the next
 # night's retention pass deletes its adapter and retrains from step 0 (2026-11-03). Every verdict below overwrites or removes it.
-echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_pending $RUN" > data/pending-candidate
-if ! eval_time_ok "$RUN"; then
+# "+N since last training" counts from the last COMPLETED training, so it is recorded here, when training finishes, not after
+# evaluation: a run TERMed mid-evaluation (and re-evaluated by a pending night) was still trained on these labels.
+echo "$labelled" > data/last-train-count
+# The eval fingerprint is a subprocess that can hang or fail; evaluation_pending ignores it, so the marker goes down first with
+# "unknown" and is refreshed after.
+write_pending "$sft_hash" unknown evaluation_pending "$RUN"
+if run_eval_fp=$(eval_fingerprint); then write_pending "$sft_hash" "$run_eval_fp" evaluation_pending "$RUN"; fi
+if ! eval_time_ok "$RUN" evaluation_pending; then
   state event "$STATUS" skip "$RUN trained; not enough time to evaluate"; echo "=== $(date) nightly end"; exit 0
 fi
 gpu_share; sleep "$EVAL_SETTLE"                                            # the grader's incumbent baseline needs ollama back; the 14B rows are cached anyway
 if ! evaluate_run "$RUN"; then
   # a crashed evaluation is not a verdict: keep the run pending and re-evaluate it next night, data unchanged or not
-  echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
+  write_pending "$sft_hash" "$(eval_fingerprint || echo unknown)" evaluation_failed "$RUN"
   state event "$STATUS" evaluation_failure "$RUN (evaluate.py failed)"; eval_failed
   echo "EVALUATION FAILED for $RUN; it stays pending and is re-evaluated next night"; exit 1
 fi
-echo "$labelled" > data/last-train-count
 state event "$STATUS" train "$RUN ($labelled labels)"
 if report_unavailable "$RUN"; then
-  echo "$sft_hash $(eval_fingerprint || echo unknown) evaluation_failed $RUN" > data/pending-candidate
+  write_pending "$sft_hash" "$(eval_fingerprint || echo unknown)" evaluation_failed "$RUN"
   state event "$STATUS" evaluation_failure "$RUN (bar unavailable)"; eval_failed
   echo "EVALUATION UNAVAILABLE for $RUN: $(report_why "$RUN"); not a rejection: re-evaluated next night"
   exit 1
 fi
-eval_ok
+eval_ok; streak eval_deferred clear "$EVAL_FAIL_NIGHTS"
 if report_promotes "$RUN"; then
   # 2026-11-02: write the file the scorer reads (it used to be a copy the scorer never saw). serve.py reloads when its mtime changes;
   # the previous pointer is kept as <pointer>.prev — rollback: mv <pointer>.prev <pointer>.
@@ -558,13 +596,13 @@ if report_promotes "$RUN"; then
     rm -f data/pending-candidate; mark_trained; holdout_clear
     echo "PROMOTED → $SERVE_POINTER (previous kept as $SERVE_POINTER.prev)"
   else
-    echo "$sft_hash $(eval_fingerprint || echo unknown) promotion_failed $RUN" > data/pending-candidate   # retried next night
+    write_pending "$sft_hash" "$(eval_fingerprint || echo unknown)" promotion_failed "$RUN"   # retried next night
     state event "$STATUS" promotion_failure "$RUN → $SERVE_POINTER"
     echo "PROMOTION FAILED writing $SERVE_POINTER; incumbent stays; publication retried next night"; exit 1
   fi
 elif report_blocked "$RUN"; then
   # not final: the holdout is too small to judge. Keep the run waiting for the backfill instead of marking the data trained.
-  echo "$sft_hash $(eval_fingerprint || echo unknown) holdout_blocked $RUN" > data/pending-candidate
+  write_pending "$sft_hash" "$(eval_fingerprint || echo unknown)" holdout_blocked "$RUN"
   state event "$STATUS" skip "$RUN holdout-blocked; waits for the holdout backfill"; holdout_hit
   echo "not promoted: holdout too small (see $RUN/report.json); $RUN waits and is re-evaluated when the holdout grows"
 else

@@ -411,17 +411,51 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertFalse((self.s1 / "data/pending-candidate").exists(), "a final verdict clears the marker")
 
     def test_not_enough_time_skips_evaluation_and_leaves_it_pending(self):
-        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, CORTADOS_S1_EVAL_MINUTES=1440)   # never enough time
+        late = {"CORTADOS_S1_EVAL_MINUTES": 110, "CORTADOS_S1_NOW": "0659"}   # 1 min to 07:00: never enough time
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, **late)
         self.assertEqual(rc, 0, log)
-        self.assertIn("not evaluating runs/2026-01-01", log)
+        self.assertIn("not evaluating runs/2026-01-01: 1 min to the 0700 deadline", log)
+        self.assertIn("it stays pending (evaluation_pending)", log)
+        self.assertNotIn("ALERT", log)
         self.assertFalse((self.s1 / "data/eval-count").exists(), "evaluation not started")
         self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
-        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_EVAL_MINUTES=1440)
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1, **late)
         self.assertIn("not evaluating runs/2026-01-01", log)
+        self.assertIn("ALERT", log)
+        self.assertIn("evaluation deferred: not enough time before the deadline", log)
         self.assertFalse((run2 / "adapter").exists(), "no new training while the candidate waits")
         self.assertTrue((run1 / "adapter").is_dir())
         rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertNotIn("ALERT", log)
+
+    def test_minutes_left_table(self):
+        cases = {("0130", "0700"): 330, ("0245", "0700"): 255, ("0619", "0700"): 41, ("0659", "0700"): 1,
+                 ("2200", "0700"): 540, ("0000", "0700"): 420, ("0830", "0700"): 1350, ("0959", "0700"): 1261,
+                 ("0130", "0030"): 1380, ("0245", "0030"): 1305, ("0619", "0030"): 1091, ("0659", "0030"): 1051,
+                 ("2200", "0030"): 150, ("0000", "0030"): 30, ("0830", "0030"): 960, ("0959", "0030"): 871}
+        for (now, dl), want in cases.items():
+            out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", now], cwd=self.tmp,
+                                 env={**self.env, "CORTADOS_S1_DEADLINE": dl}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.stdout.split("\n")[0], str(want), (now, dl, out.stdout, out.stderr))
+        for bad in ("2400", "9z9z"):
+            out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", "0130"], cwd=self.tmp,
+                                 env={**self.env, "CORTADOS_S1_DEADLINE": bad}, capture_output=True, text=True, timeout=30)
+            self.assertIn(f"CORTADOS_S1_DEADLINE={bad} is not HHMM; using 0700", out.stdout)
+            self.assertTrue(out.stdout.startswith("330\n"), out.stdout)
+        out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", "0130"], cwd=self.tmp,
+                             env={**self.env, "CORTADOS_S1_EVAL_MINUTES": "300"}, capture_output=True, text=True, timeout=30)
+        self.assertIn("EVAL_MINUTES=300 can never fit", out.stdout)
+
+    def test_invalid_marker_falls_through_to_recovery_and_never_lets_prune_delete(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)
+        (self.s1 / "data/pending-candidate").write_text("garbage\n")          # truncated / garbled marker
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)
+        self.assertIn("data/pending-candidate is invalid", log)
+        self.assertIn("recovered runs/2026-01-01", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertIn("the newer labels are trained next night", log)
 
     def test_trained_unevaluated_run_without_marker_is_recovered(self):
         rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)
