@@ -1,0 +1,8 @@
+{
+  "name": "cortados-browser-tool",
+  "private": true,
+  "description": "Pinned @playwright/mcp for CortadOS browser child tasks. Install with npm ci --ignore-scripts (integrations/browser/install.sh).",
+  "dependencies": {
+    "@playwright/mcp": "0.0.84"
+  }
+}
