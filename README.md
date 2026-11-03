@@ -331,7 +331,8 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   tool_use id), `write_attempts_unconfirmed` (failed or never answered, with the outcome), `effective_permission_mode`
   (the mode Claude Code actually ran in) and `permission_denials`, plus `warnings` when a "succeeded" child's result is
   not backed by its actions: denied tool calls, a mode Claude Code left, confirmed writes outside `cwd`, or write
-  attempts that were not confirmed.
+  attempts that were not confirmed, or no tool call at all (a heuristic: the result's claims are then the model's
+  word alone).
 - Log redaction: stdout is redacted structurally first: a legacy single JSON record is parsed whole, otherwise each
   stream record (split on "\n" only) is parsed, its strings redacted (JSON held inside a string decoded and redacted
   too) and re-serialized ASCII-only. This fails closed: a record that does not parse, or a string or record too deep
@@ -355,6 +356,12 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody
   looks at). The backend's system prompt now says which block to trust, and a bridged tool call whose input names the
   scratch dir is never forwarded: the model gets a tool error and retries with the user's path.
+- Relay sandbox: the Codex backend's thread is read-only, and Codex used to say so in a `<permissions instructions>`
+  block ("The sandbox only permits reading files"). A gpt-6.1-sol child took that as its own limit and "succeeded"
+  with "this session's filesystem is read-only", without calling a tool (2026-11-02). The backend now starts with
+  `include_permissions_instructions=false` (checked in the effective config like the other overrides; the sandbox
+  itself stays read-only), and the relay note says the tools are the user's, on the user's machine, and that a
+  backend sandbox or approval policy does not apply to them.
 - Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
   `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive

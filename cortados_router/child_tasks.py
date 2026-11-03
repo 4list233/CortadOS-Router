@@ -785,6 +785,12 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     if isinstance(act, dict):
         out["tool_uses"] = act.get("tool_uses") or {}
         out["tool_errors"] = act.get("tool_errors") or 0
+        if not out["tool_uses"]:
+            # A heuristic (found live, 2026-11-02): a routed Codex child "succeeded" saying its filesystem was
+            # read-only, with no tool call and no denial; it had believed the relay backend's own sandbox text. Any
+            # claim in the result that something was done, or could not be, is then the model's word alone.
+            warnings.append("no tool calls were made: whatever the result says was done (or was blocked) was not "
+                            "attempted through a tool; check before trusting it")
         if act.get("files_written"):
             out["files_written"] = act["files_written"]
         mode = act.get("effective_permission_mode")

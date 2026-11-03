@@ -80,7 +80,7 @@ def effective_config(argv):
     cfg = {"model_provider": None, "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
            "openai_base_url": None, "model_catalog_json": None,
            "mcp_servers": {}, "notify": None, "web_search": None, "include_environment_context": True,
-           "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
+           "include_permissions_instructions": True, "project_doc_max_bytes": 32768, "features": {f: True for f in FEATURES}}
     for i, a in enumerate(argv):
         if a == "-c" and i + 1 < len(argv) and argv[i + 1].split("=", 1)[0].split(".")[0] in IGNORED_TABLES:
             state["ignored"].add(argv[i + 1].split(".")[0])
