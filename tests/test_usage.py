@@ -253,6 +253,150 @@ class CollectTest(unittest.TestCase):
     def test_s1_without_url(self):
         self.assertEqual(usage._s1(None)["available"], False)
 
+    def _hw_collect(self, home, timeout=10):
+        """collect() in a thread with a deadline, so a regression that blocks (a FIFO open) fails instead of hanging."""
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault("out", self.collect(home)), daemon=True)
+        t.start(); t.join(timeout)
+        self.assertFalse(t.is_alive(), "collect blocked on a hardware file")
+        return box["out"]
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_hardware_fifo_and_symlink_refused(self):
+        home = fixture_home()
+        os.mkfifo(home / "hardware" / "x.json")
+        outside = home / "elsewhere.json"
+        outside.write_text(json.dumps(HW_SAMPLE))
+        os.symlink(outside, home / "hardware" / "link.json")
+        out = self._hw_collect(home)
+        self.assertIn({"source": "hardware/x.json", "error": "not_a_regular_file"}, out["errors"])
+        self.assertIn({"source": "hardware/link.json", "error": "not_a_regular_file"}, out["errors"])
+        self.assertEqual([h["file"] for h in out["hardware"]], ["studio.json"])
+
+    def test_no_known_fields_only_when_none_survive(self):
+        home = fixture_home()
+        (home / "hardware" / "z.json").write_text(json.dumps({"ssh_target": "x"}))
+        no_schema = {k: v for k, v in HW_SAMPLE.items() if k != "schema"}
+        (home / "hardware" / "y.json").write_text(json.dumps(no_schema))
+        out = self.collect(home)
+        self.assertIn({"source": "hardware/z.json", "error": "no_known_fields"}, out["errors"])
+        self.assertNotIn({"source": "hardware/y.json", "error": "no_known_fields"}, out["errors"])
+        self.assertEqual({h["file"]: h["data"].get("host") for h in out["hardware"]}["y.json"], "studio")
+
+    def test_hardware_name_sanitised(self):
+        home = fixture_home()
+        (home / "hardware" / "bad name ü.json").write_text(json.dumps(HW_SAMPLE))
+        out = self.collect(home)
+        self.assertIn("<unnamed>", [h["file"] for h in out["hardware"]])
+        self.assertNotIn("bad name", json.dumps(out))
+
+    def test_hardware_error_text_and_kinds_sanitised(self):
+        home = fixture_home()
+        s = {**HW_SAMPLE, "chip": {"available": False, "reason": "/usr/sbin/sysctl failed"},
+             "ncpu": {"available": False, "reason": "bad kind with spaces: detail"},
+             "errors": [{"field": "chip", "error": "/Users/someone/bin/ioreg: exit 1"},
+                        {"field": "ncpu", "error": "ValueError: /Users/someone/x"}]}
+        (home / "hardware" / "studio.json").write_text(json.dumps(s))
+        hw = self.collect(home)["hardware"][0]["data"]
+        self.assertEqual(hw["errors"], [{"field": "chip", "error": "error"}, {"field": "ncpu", "error": "ValueError"}])
+        self.assertEqual(hw["chip"], {"available": False, "reason": "error"})
+        self.assertEqual(hw["ncpu"], {"available": False, "reason": "error"})
+
+    def test_hardware_lists_capped_and_said(self):
+        home = fixture_home()
+        s = {**HW_SAMPLE, "ollama_models": [{"name": f"m{i}"} for i in range(usage.HW_MODELS_MAX + 3)],
+             "errors": [{"field": "f", "error": "OSError: x"}] * (usage.HW_ERRORS_MAX + 3)}
+        (home / "hardware" / "studio.json").write_text(json.dumps(s))
+        out = self.collect(home)
+        hw = out["hardware"][0]["data"]
+        self.assertEqual(len(hw["ollama_models"]), usage.HW_MODELS_MAX)
+        self.assertEqual(len(hw["errors"]), usage.HW_ERRORS_MAX)
+        self.assertIn({"source": "hardware/studio.json", "error": "models_truncated"}, out["errors"])
+        self.assertIn({"source": "hardware/studio.json", "error": "errors_truncated"}, out["errors"])
+
+    def test_nested_non_finite_nulled(self):
+        home = fixture_home()
+        (home / "hardware" / "studio.json").write_text(
+            '{"schema": 1, "host": "h", "os": [Infinity, [NaN], {"a": -Infinity}], "load_avg": [1.0, Infinity],'
+            ' "headroom": {"free_mem_gb": Infinity}, "ollama_models": [{"name": "m", "size": NaN}]}')
+        out = self.collect(home)
+        hw = out["hardware"][0]["data"]
+        self.assertEqual(hw["os"], [None, [None], {"a": None}])
+        self.assertEqual(hw["load_avg"], [1.0])
+        self.assertIsNone(hw["headroom"]["free_mem_gb"]); self.assertIsNone(hw["ollama_models"][0]["size"])
+        json.dumps(out, allow_nan=False)
+
+    def test_null_lane_model_band_labelled(self):
+        home = fixture_home()
+        c = sqlite3.connect(home / "router.db")
+        c.execute("INSERT INTO routes VALUES ('n', ?, NULL, NULL, NULL)", (NOW - 5,))
+        c.commit(); c.close()
+        r = self.collect(home)["routed"]
+        self.assertIn({"lane": "(none)", "model": "(none)", "calls": 1}, r["today"])
+        self.assertIn({"band": "(none)", "calls": 1}, r["top_bands_7d"])
+
+    def test_routed_and_bands_truncated(self):
+        home = fixture_home()
+        keep = (usage.ROUTED_TOP, usage.BAND_TOP)
+        usage.ROUTED_TOP, usage.BAND_TOP = 1, 1
+        try:
+            r = self.collect(home)["routed"]
+        finally:
+            usage.ROUTED_TOP, usage.BAND_TOP = keep
+        self.assertEqual(r["last_7d"], [{"lane": "claude", "model": "sonnet", "calls": 2}])
+        self.assertEqual(r["top_bands_7d"], [{"band": "B", "calls": 2}])
+
+    def test_window_nan_used_pct_has_no_left(self):
+        sc = {"lanes": {"x": {"fetched_at": NOW, "windows": [{"window": "w", "pool": "all", "used_pct": float("nan")}]}}}
+        lane = self.collect(fixture_home(), scarcity_reader=lambda: sc)["lanes"][0]
+        self.assertIsNone(lane["windows"][0].get("left_pct")); self.assertIsNone(lane["left_pct"])
+        json.dumps(lane, allow_nan=False)
+
+    def test_unclassified_error_and_label_caps(self):
+        long = "claude#" + "a" * 200
+        sc = {"lanes": {"codex": {"fetched_at": NOW, "error": "RuntimeError: raw screen text", "windows": []},
+                        long: {"fetched_at": NOW, "windows": []}}}
+        lanes = {l["lane"]: l for l in self.collect(fixture_home(), scarcity_reader=lambda: sc)["lanes"]}
+        self.assertEqual(lanes["codex"]["error"], "unclassified")
+        self.assertNotIn("raw screen", json.dumps(lanes))
+        capped = [l for k, l in lanes.items() if k != "codex"][0]
+        for k in ("lane", "label", "account"):
+            self.assertLessEqual(len(capped[k]), usage.LABEL_MAX)
+
+    def test_other_login_nulls_sample_age(self):
+        swapped = [("claude", "/Users/someone/.claude-acctB"), ("claude#b", "/Users/someone/.claude-acctA")]
+        lanes = {l["lane"]: l for l in self.collect(fixture_home(), claude_lanes=swapped)["lanes"]}
+        self.assertIsNone(lanes["claude"]["sample_age_s"])
+
+    def test_pool_min_without_sentinel(self):
+        sc = {"lanes": {"x": {"fetched_at": NOW, "windows": [
+            {"window": "a", "pool": "p", "headroom_pct": 150.0}, {"window": "b", "pool": "p", "headroom_pct": 120.0}]}}}
+        lane = self.collect(fixture_home(), scarcity_reader=lambda: sc)["lanes"][0]
+        self.assertEqual(lane["pools"], {"p": 120.0})                # no 101 sentinel capping the minimum
+
+    def test_concurrent_misses_single_flight(self):
+        home = fixture_home()
+        calls = []
+        def slow_reader():
+            calls.append(1)
+            time.sleep(0.3)
+            return SCARCITY
+        usage._COLLECT_CACHE.clear()
+        args = dict(state_dir=home, scarcity_reader=slow_reader, refusals=[],
+                    s1_probe=lambda url: {"available": True})
+        outs = []
+        ts = [threading.Thread(target=lambda: outs.append(usage.collect(**args))) for _ in range(3)]
+        try:
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(10)
+        finally:
+            usage._COLLECT_CACHE.clear()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(outs), 3)
+        self.assertEqual(outs[0]["lanes"], outs[2]["lanes"])
+
 
 class EndpointTest(unittest.TestCase):
     def setUp(self):
@@ -278,6 +422,26 @@ class EndpointTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 self.get(tok)
             self.assertEqual(cm.exception.code, 401)
+
+    def test_view_failure_is_a_clean_500(self):
+        def boom(reg):
+            raise RuntimeError("secret /Users/someone/path")
+        self.httpd.usage_view = boom
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get(TOKEN)
+        self.assertEqual(cm.exception.code, 500)
+        body = cm.exception.read().decode()
+        self.assertIn("usage view unavailable", body); self.assertNotIn("/Users/", body)
+        self.assertTrue(any("usage: view failed: RuntimeError" in m for m in logs.output))
+        self.assertFalse(any("/Users/" in m for m in logs.output))
+
+    def test_non_finite_view_is_a_500_not_invalid_json(self):
+        self.httpd.usage_view = lambda reg: {"x": [float("inf")]}
+        with self.assertLogs("cortados.provider", "WARNING"):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get(TOKEN)
+        self.assertEqual(cm.exception.code, 500)
 
     def test_authorized(self):
         self.reg.runs.record("r1", provider="claude-cli", model="sonnet", label="x", tools=True)

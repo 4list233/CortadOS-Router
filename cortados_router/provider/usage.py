@@ -9,7 +9,9 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
+import stat
 import threading
 import time
 import urllib.request
@@ -25,11 +27,14 @@ CHILD_TAIL_BYTES = 2 << 20    # ... and bytes read from its end: the read itself
 HW_MAX_BYTES = 64 << 10       # one node sample is ~1-2 KB; a larger file is not a sample and is never read into memory
 HW_MAX_FILES = 32             # one file per node; the fleet is a handful of machines, so more means a stray directory
 WINDOW_NAME_MAX = 60          # window names are captured vendor screen text, bounded only by the sampler's regex
-COLLECT_CACHE_S = 2.0         # one 1 Hz dashboard re-scans router.db / the child log at most every 2 s (a memo miss is
-                              # not single-flighted: concurrent GETs each scan; the endpoint assumes one dashboard client)
+COLLECT_CACHE_S = 2.0         # one 1 Hz dashboard re-scans router.db / the child log at most every 2 s; a memo miss is
+                              # single-flighted per state dir, so N concurrent GETs run one collect (each scan holds a
+                              # SHARED lock on router.db that delays core.log_route's commit)
 POOLS_MAX = 16                # pool names are slugged from captured vendor screen text: a bounded set, like window names
 ROUTED_TOP = 50               # lane x model pairs per period; the fleet has a few dozen, more is noise at dashboard size
-HW_REASON_MAX = 40            # an unavailable field's reason is reduced to its kind (the exception type): never a path
+HW_MODELS_MAX = 32            # models Ollama holds loaded on one node at once: a handful; more is not a real ps reply
+HW_ERRORS_MAX = 16            # hardware.sample() records at most one error per field (~11 fields); more is not a sample
+LABEL_MAX = 60                # lane keys / account labels come from scarcity.json keys: bounded like window names
 DB_TIMEOUT_S = 0.5            # a dashboard GET must not wait on a router.db writer holding the lock
 BAND_TOP = 5                  # the dashboard shows the five busiest bands; the rest are noise at this size
 S1_BODY_MAX = 4096            # /health is a tiny JSON; only its status is used, the body is drained, bounded
@@ -46,6 +51,11 @@ _HW_KEYS = ("schema", "sampled_at", "host", "os", "load_avg", "ncpu", "chip", "m
 _HW_HEADROOM_KEYS = ("free_mem_gb", "cpu_idle_pct", "gpu_idle_pct")
 _HW_MODEL_KEYS = ("name", "size", "size_vram")      # hardware.parse_ollama_ps's entries
 _HW_ERR_KEYS = ("field", "error")                   # hardware.sample's errors entries; `error` reduced to its kind
+# An unavailable field's reason is reduced to its kind (the part before the first colon), published only when it
+# looks like an exception type name (<= 40 chars); anything else (a message, a path, a command line) becomes "error".
+_KIND_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
+# A hardware file name is published only when it is a plain bounded name; anything else is "<unnamed>".
+_FNAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Lanes without general (pool "all") windows are headlined by this pool: the same fallback scarcity.finish uses.
 _FALLBACK_POOL = {"cursor": "cursor-models", "antigravity": "gemini"}
 # Pools a lane shares with another product (Forest 2026-11-03, docs.x.ai/grok-bot: Cursor and Grok Bot draw on one
@@ -59,7 +69,23 @@ logger = logging.getLogger("cortados.provider.usage")
 def _lane_label(lane: str) -> str:
     base = lane.split("#", 1)[0]
     shared = SHARED_WITH.get(base)
-    return f"{lane} (shared with {', '.join(shared)})" if shared else lane
+    return (f"{lane} (shared with {', '.join(shared)})" if shared else lane)[:LABEL_MAX]
+
+
+def _account(lane: str) -> str | None:
+    # the account label comes from the lane key (claude#b); config_dir is a filesystem path and never leaves
+    return lane.split("#", 1)[1][:LABEL_MAX] if "#" in lane else None
+
+
+def _finite(x: Any) -> Any:
+    """Nulls every non-finite float at any depth: json.dumps would emit NaN/Infinity, which strict parsers reject."""
+    if isinstance(x, float) and not math.isfinite(x):
+        return None
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_finite(v) for v in x]
+    return x
 
 
 def _num(x: Any) -> bool:
@@ -98,21 +124,26 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
     for w in usable:
         p = w.get("pool", "all")
         if p not in ("all", "info") and isinstance(w.get("left_pct"), (int, float)) and (p in pools or len(pools) < POOLS_MAX):
-            pools[p] = min(pools.get(p, 101.0), w["left_pct"])
-    entry = {"lane": lane, "label": _lane_label(lane),
-             # the account label comes from the lane key (claude#b); config_dir is a filesystem path and never leaves
-             "account": lane.split("#", 1)[1] if "#" in lane else None,
+            left = w["left_pct"]
+            pools[p] = left if p not in pools else min(pools[p], left)
+    if v.get("error_kind"):
+        err = str(v["error_kind"])[:LABEL_MAX]
+    elif v.get("error"):     # an error scarcity did not classify: flagged, its raw text (vendor screen) never published
+        err = "unclassified"
+    else:
+        err = None
+    entry = {"lane": lane[:LABEL_MAX], "label": _lane_label(lane), "account": _account(lane),
              "left_pct": min(lefts) if lefts else None, "windows": wins, "pools": pools,
              "sample_age_s": round(now - fetched, 1) if fetched else None,
              "stale": not fresh or failed,
              # error_kind is scarcity's sanitised classification; the raw error can carry vendor screen text
-             "error": v.get("error_kind") if v.get("error") or v.get("error_kind") else None}
+             "error": err}
     # A positional Claude lane key (claude#<i>) can point at a different login after accounts.json is reordered: core's one
     # identity rule (_reading_for_other_login) decides, and such a reading publishes no number, as headroom_pct_for does.
     if configured is not None and lane.split("#", 1)[0] == "claude":
         from cortados_router import core
         if core._reading_for_other_login(v, {"config_dir": configured.get(lane)}):
-            entry.update(left_pct=None, windows=[], pools={}, stale=True, error="reading_for_other_login")
+            entry.update(left_pct=None, windows=[], pools={}, sample_age_s=None, stale=True, error="reading_for_other_login")
     shared = SHARED_WITH.get(lane.split("#", 1)[0])
     if shared:
         entry["shared_with"] = shared
@@ -127,7 +158,7 @@ def _lanes(scarcity: dict[str, Any], now: float, freshness: Callable | None,
             out.append(_one_lane(lane, v, now, freshness, configured))
         except Exception as exc:
             # same shape as a good entry, flagged stale with no reading, so a dashboard never renders it healthy
-            out.append({"lane": lane, "label": _lane_label(lane), "account": lane.split("#", 1)[1] if "#" in lane else None,
+            out.append({"lane": str(lane)[:LABEL_MAX], "label": _lane_label(str(lane)), "account": _account(str(lane)),
                         "left_pct": None, "windows": [], "pools": {}, "sample_age_s": None, "stale": True,
                         "error": type(exc).__name__})
     return out
@@ -143,7 +174,7 @@ def _routed(db_path: Path, now: float) -> dict[str, Any]:
             rows = c.execute("SELECT COALESCE(lane, '(none)'), COALESCE(model, '(none)'), COUNT(*) FROM routes "
                              "WHERE ts >= ? GROUP BY 1, 2 ORDER BY 3 DESC LIMIT ?", (since, ROUTED_TOP)).fetchall()
             return [{"lane": l, "model": m, "calls": n} for l, m, n in rows]
-        bands = c.execute("SELECT band, COUNT(*) FROM routes WHERE ts >= ? GROUP BY band ORDER BY 2 DESC LIMIT ?",
+        bands = c.execute("SELECT COALESCE(band, '(none)'), COUNT(*) FROM routes WHERE ts >= ? GROUP BY 1 ORDER BY 2 DESC LIMIT ?",
                           (now - 7 * 86400, BAND_TOP)).fetchall()
         return {"source": "router.db", "today": by(day0), "last_7d": by(now - 7 * 86400),
                 "top_bands_7d": [{"band": b, "calls": n} for b, n in bands]}
@@ -210,21 +241,30 @@ def _s1(url: str | None) -> dict[str, Any]:
 
 
 def _hw_kind(reason: Any) -> str:
-    """'<Type>: <message>' -> '<Type>' (bounded); a reason that is not that shape and holds a path becomes 'error'."""
-    kind = str(reason).split(":", 1)[0].strip()[:HW_REASON_MAX]
-    return "error" if "/" in kind or "\\" in kind or not kind else kind
+    """'<Type>: <message>' -> '<Type>' when that part is identifier-like (an exception type name); otherwise 'error'."""
+    kind = str(reason).split(":", 1)[0].strip()
+    return kind if _KIND_RE.fullmatch(kind) else "error"
 
 
 def _hw_value(x: Any) -> Any:
     if isinstance(x, dict):   # the sampler's unavailable(reason) shape is the only dict a scalar field can hold
         return {"available": False, "reason": _hw_kind(x.get("reason"))}
+    if isinstance(x, list):   # no list field besides load_avg (bounded below): kept, every nested non-finite nulled
+        return _finite(x)
     if isinstance(x, float) and not math.isfinite(x):
         return None
     return x[:WINDOW_NAME_MAX] if isinstance(x, str) else x
 
 
-def _hw_sample(raw: Any) -> dict[str, Any]:
-    """Only hardware.sample()'s fields; headroom, ollama_models and errors reduced to their known sub-fields."""
+def _hw_name(name: str) -> str:
+    """A hardware file name as published: plain and bounded, or '<unnamed>' (a name is attacker-chosen text)."""
+    return name if _FNAME_RE.fullmatch(name) else "<unnamed>"
+
+
+def _hw_sample(raw: Any, truncated: list[str] | None = None) -> dict[str, Any]:
+    """Only hardware.sample()'s fields; headroom, ollama_models and errors reduced to their known sub-fields.
+    A list cut to its cap appends '<list>_truncated' to `truncated`, so a clipped card is said to be clipped."""
+    truncated = [] if truncated is None else truncated
     if not isinstance(raw, dict):
         raise ValueError("not an object")
     out = {k: _hw_value(raw[k]) for k in _HW_KEYS if k in raw}
@@ -235,13 +275,17 @@ def _hw_sample(raw: Any) -> dict[str, Any]:
     models = raw.get("ollama_models")
     if isinstance(models, list):
         out["ollama_models"] = [{k: _hw_value(m[k]) for k in _HW_MODEL_KEYS if k in m}
-                                for m in models[:HW_MAX_FILES] if isinstance(m, dict)]
+                                for m in models[:HW_MODELS_MAX] if isinstance(m, dict)]
+        if len(models) > HW_MODELS_MAX:
+            truncated.append("models_truncated")
     elif isinstance(models, dict):
         out["ollama_models"] = _hw_value(models)
     if isinstance(raw.get("errors"), list):   # the error text can carry a host, path or command line: its kind only
         out["errors"] = [{"field": str(e.get("field"))[:WINDOW_NAME_MAX], "error": _hw_kind(e.get("error"))}
-                         for e in raw["errors"][:HW_MAX_FILES] if isinstance(e, dict)]
-    return out
+                         for e in raw["errors"][:HW_ERRORS_MAX] if isinstance(e, dict)]
+        if len(raw["errors"]) > HW_ERRORS_MAX:
+            truncated.append("errors_truncated")
+    return _finite(out)
 
 
 def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
@@ -253,7 +297,7 @@ def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
         return []
     def mtime(p: Path) -> float:
         try:
-            return p.stat().st_mtime
+            return os.lstat(p).st_mtime   # lstat: never follows a link, never opens (a FIFO is only stat'ed)
         except OSError:          # vanished or unreadable: sorted last, reported by the read below
             return float("-inf")
     files.sort(key=lambda p: (-mtime(p), p.name))   # freshest first, so the cap drops the oldest, not by alphabet
@@ -262,28 +306,43 @@ def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
         files = files[:HW_MAX_FILES]
     out = []
     for f in files:
+        name = _hw_name(f.name)
+        src = f"hardware/{name}"
         try:
-            st = f.stat()
-            if st.st_size > HW_MAX_BYTES:
-                errors.append({"source": f"hardware/{f.name}", "error": "oversize"})
+            # lstat, never stat: a FIFO (or a link to one) would block the open forever and leak a request thread per
+            # poll; a symlink could point anywhere. hardware.py writes regular files only.
+            st = os.lstat(f)
+            if not stat.S_ISREG(st.st_mode):
+                errors.append({"source": src, "error": "not_a_regular_file"})
                 continue
-            with f.open("rb") as fh:
+            if st.st_size > HW_MAX_BYTES:
+                errors.append({"source": src, "error": "oversize"})
+                continue
+            # O_NONBLOCK: a file swapped for a FIFO between lstat and open still cannot block; O_NOFOLLOW: nor a link
+            fd = os.open(f, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    errors.append({"source": src, "error": "not_a_regular_file"})
+                    continue
                 raw = fh.read(HW_MAX_BYTES + 1)
             if len(raw) > HW_MAX_BYTES:   # grew between stat and read
-                errors.append({"source": f"hardware/{f.name}", "error": "oversize"})
+                errors.append({"source": src, "error": "oversize"})
                 continue
-            data = _hw_sample(json.loads(raw))
-            if "schema" not in data:   # not a hardware.sample() file: said so, never an empty card that reads as fine
-                errors.append({"source": f"hardware/{f.name}", "error": "no_known_fields"})
-            out.append({"file": f.name, "age_s": round(now - st.st_mtime, 1), "data": data})
+            truncated: list[str] = []
+            data = _hw_sample(json.loads(raw), truncated)
+            if not data:   # none of hardware.sample()'s fields: said so, never an empty card that reads as fine
+                errors.append({"source": src, "error": "no_known_fields"})
+            errors.extend({"source": src, "error": t} for t in truncated)
+            out.append({"file": name, "age_s": round(now - st.st_mtime, 1), "data": data})
         except Exception as exc:
-            logger.warning("usage: hardware/%s failed: %s", f.name, exc)
-            errors.append({"source": f"hardware/{f.name}", "error": type(exc).__name__})   # OSError text carries the path
+            logger.warning("usage: %s failed: %s", src, type(exc).__name__)
+            errors.append({"source": src, "error": type(exc).__name__})   # OSError text carries the path
     return out
 
 
 _COLLECT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_COLLECT_LOCK = threading.Lock()
+_COLLECT_LOCK = threading.Lock()                       # guards the two dicts; never held across a collect
+_COLLECT_FLIGHT: dict[str, threading.Lock] = {}        # one per state dir: held across a miss (single flight)
 
 
 def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], refusals: list[dict[str, Any]],
@@ -292,15 +351,22 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
             claude_lanes: list[tuple[str, str | None]] | None = None, now: float | None = None) -> dict[str, Any]:
     if now is None:   # live calls (no injected clock) are memoised COLLECT_CACHE_S; tests pass now and never hit it
         key = str(state_dir)
-        with _COLLECT_LOCK:
-            hit = _COLLECT_CACHE.get(key)
-            if hit and time.monotonic() - hit[0] < COLLECT_CACHE_S:
-                return json.loads(json.dumps(hit[1]))
-        res = collect(state_dir=state_dir, scarcity_reader=scarcity_reader, refusals=refusals,
-                      runs_since_start=runs_since_start, s1_url=s1_url, s1_probe=s1_probe, freshness=freshness,
-                      claude_lanes=claude_lanes, now=time.time())
-        with _COLLECT_LOCK:
-            _COLLECT_CACHE[key] = (time.monotonic(), res)
+        def fresh() -> dict[str, Any] | None:
+            with _COLLECT_LOCK:
+                hit = _COLLECT_CACHE.get(key)
+                return hit[1] if hit and time.monotonic() - hit[0] < COLLECT_CACHE_S else None
+        res = fresh()
+        if res is None:
+            with _COLLECT_LOCK:
+                flight = _COLLECT_FLIGHT.setdefault(key, threading.Lock())
+            with flight:      # concurrent misses wait here; the first collects, the rest read its result
+                res = fresh()
+                if res is None:
+                    res = collect(state_dir=state_dir, scarcity_reader=scarcity_reader, refusals=refusals,
+                                  runs_since_start=runs_since_start, s1_url=s1_url, s1_probe=s1_probe,
+                                  freshness=freshness, claude_lanes=claude_lanes, now=time.time())
+                    with _COLLECT_LOCK:
+                        _COLLECT_CACHE[key] = (time.monotonic(), res)
         return json.loads(json.dumps(res))
     errors: list[dict[str, str]] = []
     notes: list[str] = []

@@ -931,7 +931,10 @@ DDL = """CREATE TABLE IF NOT EXISTS routes (
   engine TEXT, engine_ms INTEGER, degraded INTEGER, engine_error TEXT, answers TEXT, features TEXT, D INTEGER,
   band TEXT, orchestrator TEXT, lane TEXT, provider TEXT, model TEXT, runner_up TEXT, skipped TEXT,
   subagents INTEGER, verifier INTEGER, hard_rules TEXT, table_version INTEGER, table_error TEXT,
-  response_chars INTEGER, turn_ms INTEGER, forest_correction TEXT);"""
+  response_chars INTEGER, turn_ms INTEGER, forest_correction TEXT);
+-- GET /v1/cortados/usage counts rows by ts window on every collect: without this index each count is a full scan
+-- holding a SHARED lock that delays log_route's commit. IF NOT EXISTS: existing databases gain it on the next open.
+CREATE INDEX IF NOT EXISTS routes_ts ON routes(ts);"""
 
 
 def _db() -> sqlite3.Connection:
