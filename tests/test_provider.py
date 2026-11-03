@@ -415,15 +415,16 @@ class EndpointTests(EndpointHarness):
 
     def test_a_retry_with_a_different_user_turn_still_409s_and_says_why(self):
         history = [{"role": "user", "content": "please use tool"}]
-        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=self.REPLAY_ID)
         history += [{"role": "assistant", "content": r1["content"]}]
         use = r1["content"][-1]["id"]
         self.post({"tools": [READ_TOOL], "messages": history + [
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "hello"}]}]})
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "hello"}]}]},
+                  headers=self.REPLAY_ID)
         other = {"tools": [READ_TOOL], "messages": history + [
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "something else"}]}]}
         with self.assertLogs("cortados.provider", "WARNING") as logs:
-            self.assertEqual(self.status_of(other), 409)
+            self.assertEqual(self.status_of(other, headers=self.REPLAY_ID), 409)
         self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
 
     REPLAY_ID = {"x-claude-code-session-id": "conversation-replay"}   # replay needs a conversation identity
@@ -534,7 +535,7 @@ class EndpointTests(EndpointHarness):
         self.assertIsNone(session.last_reply)
         self.assertTrue(any("not kept for a retry replay" in l and "over REPLAY_MAX_BYTES" in l
                             for l in logs.output), logs.output)
-        self.assertEqual(self._409_class(body), "retry_of_answered_turn")
+        self.assertEqual(self._409_class(body, headers=self.REPLAY_ID), "retry_of_answered_turn")
 
     def test_an_unserialisable_reply_is_not_kept_and_says_why(self):
         session = type("S", (), {"id": "abcdef0123", "history": ["x"], "last_reply": ("old",)})()
@@ -564,8 +565,8 @@ class EndpointTests(EndpointHarness):
 
     def test_two_sessions_the_same_retry_could_replay_are_refused_not_guessed(self):
         opening = [{"role": "user", "content": "hi"}]
-        a = self.post({"tools": [READ_TOOL], "messages": opening})
-        self.post({"tools": [READ_TOOL], "messages": opening})          # same opening, same text reply
+        a = self.post({"tools": [READ_TOOL], "messages": opening}, headers=self.REPLAY_ID)
+        self.post({"tools": [READ_TOOL], "messages": opening}, headers=self.REPLAY_ID)   # same opening, same reply
         follow = {"tools": [READ_TOOL], "messages": opening + [{"role": "assistant", "content": a["content"]},
                                                                {"role": "user", "content": "more"}]}
         sa, sb = list(self.reg.sessions.values())
@@ -574,7 +575,7 @@ class EndpointTests(EndpointHarness):
             with self.reg._lock:
                 self.reg.sessions.pop(aside.id)
             try:
-                replies.append(self.post(follow))
+                replies.append(self.post(follow, headers=self.REPLAY_ID))
             finally:
                 with self.reg._lock:
                     self.reg.sessions[aside.id] = aside
@@ -582,7 +583,7 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(sa.history, sb.history)
         with self.assertLogs("cortados.provider", "WARNING") as logs:
             try:
-                self.post(follow)
+                self.post(follow, headers=self.REPLAY_ID)
                 self.fail("an ambiguous retry was replayed")
             except urllib.error.HTTPError as exc:
                 self.assertEqual(exc.code, 409)
