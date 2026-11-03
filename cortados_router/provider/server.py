@@ -1133,6 +1133,29 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             session.lock.release()
 
+    def _server_tools_unavailable(self, turn, names: list[str], wire: Wire) -> None:
+        """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
+        not a 4xx: the client hands the text to the model as the tool's output, so the model reads why and stops
+        retrying, where an HTTP error may be retried or surface only as a generic API error."""
+        text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(sorted(set(names))))
+        logger.warning("request with server tool(s) %s answered as unavailable", sorted(set(names)))
+        msg_id, blocks, usage = wire.new_message_id(), [{"type": "text", "text": text}], {}
+        if not turn.stream:
+            return self._json(200, wire.message_json(msg_id, turn.model, blocks, "end_turn", usage))
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.wfile.write(wire.stream_start(msg_id, turn.model))
+            for chunk in wire.stream_body(msg_id, turn.model, blocks, "end_turn", usage):
+                self.wfile.write(chunk)
+            self.wfile.flush()
+        except OSError as gone:
+            logger.info("client gone while the server-tool refusal was written (%s)", gone)
+
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
         reg = self.server.registry
@@ -1165,6 +1188,16 @@ class Handler(BaseHTTPRequestHandler):
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
             turn = wire.parse_request(body)
+            server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
+            if server_tools and not turn.tools:
+                # A request whose only tools are server tools (Claude Code's WebSearch makes exactly such a call) asks
+                # for work no backend here can do. Answer it at once with text saying so, never spend a backend on it:
+                # a routed model would answer without searching, and the client would show that as an empty success.
+                return self._server_tools_unavailable(turn, server_tools, wire)
+            if server_tools:
+                # Mixed with client tools: parse_request dropped the server tools, the client tools are served.
+                logger.warning("request declares server tool(s) %s that this endpoint cannot run; served without them",
+                               sorted(set(server_tools)))
             # A tool-less request (a client's title or summary call) never joins a live session: it would hold that
             # session's lock while the session waits for a tool result. It gets its own throwaway CLI instead.
             one_shot = not turn.tools

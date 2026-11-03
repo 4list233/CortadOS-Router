@@ -15,6 +15,44 @@ from typing import Any, Iterator
 MODEL_ID = "cortados"
 
 
+# Anthropic server tools: the Messages API itself executes them (web search, web fetch, code execution) and answers with
+# server_tool_use / *_tool_result blocks. This endpoint's backends are a headless CLI or Codex serving only the client's
+# own tools, so nothing here can execute one. Before this list existed, a `web_search_20250305` tool (it has a `name`)
+# became a fake bridge tool with an empty schema, and Claude Code's WebSearch got an empty success with no links
+# (incident 2026-11-03). Matched by type prefix because the API versions them with a date suffix. Client-executed
+# Anthropic-defined tools (bash_*, text_editor_*, computer_*) are not listed: the client runs those.
+SERVER_TOOL_PREFIXES = ("web_search_", "web_fetch_", "code_execution_")
+SERVER_TOOL_UNAVAILABLE = ("cortados: {names} is unavailable on this CortadOS lane: the routed backend cannot run "
+                           "Anthropic's server-side tools, so no search was performed and there are no results. Use "
+                           "WebFetch on a known URL, or report what you have without searching.")
+
+
+def is_server_tool(tool: Any) -> bool:
+    return isinstance(tool, dict) and str(tool.get("type") or "").startswith(SERVER_TOOL_PREFIXES)
+
+
+def server_tool_names(body: dict[str, Any]) -> list[str]:
+    """Names of the server tools the request declares (empty if none, or if `tools` is malformed: parse_request
+    reports that)."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list):
+        return []
+    return [str(t.get("name") or t.get("type")) for t in tools if is_server_tool(t)]
+
+
+def _forced_server_tool_choice(tools: list[Any], choice: dict[str, Any]) -> bool:
+    """True when a non-auto tool_choice forces only server tools, so the request can reach the server's unavailable
+    reply. Claude Code's WebSearch (2.1.317) sends tools=[web_search_*] with tool_choice {"type": "tool", "name":
+    "web_search"}; refusing that with the bridge's auto-only 400 meant the refusal text never reached the model.
+    Allowed only when every tool is a server tool (no backend is started for such a request, so nothing has to honour
+    the forcing) and the choice is `any` or names one of them. Forcing a client tool still fails: the bridge cannot."""
+    if not tools or not all(is_server_tool(t) for t in tools):
+        return False
+    if choice.get("type") == "any":
+        return True
+    return choice.get("type") == "tool" and choice.get("name") in {t.get("name") for t in tools}
+
+
 class WireError(ValueError):
     """The request is not a Messages request this endpoint can serve; the server answers 400 with the message."""
 
@@ -256,10 +294,15 @@ def _parse_request(body: dict[str, Any]) -> ClientTurn:
     # The CLI session's tool set is fixed when it starts and the CLI decides itself whether to call one, so only
     # `auto` can be honoured. Anything else is refused, never silently ignored. (max_tokens is not enforced either:
     # the CLI has no output cap flag; docs/PROVIDER-PLAN.md lists it as a known limit.)
-    choice = (body.get("tool_choice") or {"type": "auto"}).get("type")
-    if choice != "auto":
+    raw_choice = body.get("tool_choice") or {"type": "auto"}
+    if not isinstance(raw_choice, dict):
+        raise WireError("tool_choice must be an object")
+    choice = raw_choice.get("type")
+    # One exception, for server-tool-only requests: see _forced_server_tool_choice.
+    if choice != "auto" and not _forced_server_tool_choice(tools, raw_choice):
         raise WireError(f"tool_choice {choice!r} is not supported by the cortados model; only 'auto'")
-    return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools if t.get("name")],
+    return ClientTurn(system=_system_text(body.get("system")), tools=[without_cache_control(t) for t in tools
+                                                                     if t.get("name") and not is_server_tool(t)],
                       content=content, tool_results=results,
                       history=[reply_fingerprint(m.get("content")) for m in messages if m.get("role") == "assistant"],
                       stream=bool(body.get("stream")), model=str(body.get("model") or MODEL_ID),

@@ -1897,6 +1897,83 @@ class RevealModelTests(unittest.TestCase):
             self.assertIsNone(server.reveal_model(route))
 
 
+class ServerToolTests(EndpointHarness):
+    """Anthropic server tools (web_search_*) cannot run on any backend here: incident 2026-11-03, where Claude Code's
+    WebSearch got an empty success with no links. The model must read that the search did not happen."""
+    WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+    SEARCH = {"model": "cortados", "tools": [WEB_SEARCH],
+              "messages": [{"role": "user", "content": "Perform a web search for the query: cortados"}]}
+
+    def test_server_tools_never_become_bridged_client_tools(self):
+        turn = wire.parse_request({"tools": [self.WEB_SEARCH, READ_TOOL, {"type": "web_fetch_20250910", "name": "web_fetch"}],
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual([t["name"] for t in turn.tools], ["Read"])
+        self.assertEqual(wire.server_tool_names({"tools": [self.WEB_SEARCH, READ_TOOL]}), ["web_search"])
+        self.assertEqual(wire.server_tool_names({"tools": "bad"}), [])
+        # Client-executed Anthropic-defined tools are the client's to run, so they stay.
+        self.assertFalse(wire.is_server_tool({"type": "bash_20250124", "name": "bash"}))
+
+    def test_a_web_search_only_request_gets_an_explicit_unavailable_reply_and_no_backend(self):
+        r = self.post(self.SEARCH)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        text = r["content"][0]["text"]
+        self.assertIn("web_search is unavailable on this CortadOS lane", text)
+        self.assertIn("WebFetch", text)
+        self.assertFalse(os.path.exists(self.argv_file), "no CLI may be started for an unservable search")
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_the_streamed_reply_says_the_same(self):
+        raw = self.post(dict(self.SEARCH, stream=True))
+        self.assertIn("event: message_start", raw)
+        self.assertIn("unavailable on this CortadOS lane", raw)
+        self.assertIn('"stop_reason": "end_turn"', raw)
+        self.assertFalse(os.path.exists(self.argv_file))
+
+    # The real Claude Code 2.1.317 WebSearch shape: the tool is forced, which the bridge's auto-only check refused
+    # with 400 before the unavailable reply could be reached (review P1).
+    REAL = {"model": "claude-sonnet-4-6", "max_tokens": 32000, "tools": [WEB_SEARCH],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "messages": [{"role": "user", "content": "Perform a web search for the query: cortados router"}]}
+
+    def test_the_real_forced_web_search_request_gets_the_unavailable_reply(self):
+        r = self.post(self.REAL)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertIn("web_search is unavailable on this CortadOS lane", r["content"][0]["text"])
+        self.assertFalse(os.path.exists(self.argv_file), "no CLI may be started for an unservable search")
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_the_real_forced_web_search_request_streamed(self):
+        raw = self.post(dict(self.REAL, stream=True))
+        self.assertIn("event: message_start", raw)
+        self.assertIn("unavailable on this CortadOS lane", raw)
+        self.assertIn('"stop_reason": "end_turn"', raw)
+        self.assertFalse(os.path.exists(self.argv_file))
+
+    def test_any_choice_over_server_tools_only_also_gets_the_reply(self):
+        r = self.post(dict(self.REAL, tool_choice={"type": "any"}))
+        self.assertIn("unavailable on this CortadOS lane", r["content"][0]["text"])
+
+    def test_forcing_a_client_tool_is_still_refused(self):
+        msgs = [{"role": "user", "content": "x"}]
+        for tools, choice in (([READ_TOOL], {"type": "tool", "name": "Read"}),
+                              ([self.WEB_SEARCH, READ_TOOL], {"type": "tool", "name": "Read"}),
+                              ([self.WEB_SEARCH, READ_TOOL], {"type": "tool", "name": "web_search"}),
+                              ([self.WEB_SEARCH, READ_TOOL], {"type": "any"}),
+                              ([self.WEB_SEARCH], {"type": "tool", "name": "Read"}),
+                              ([self.WEB_SEARCH], {"type": "none"}),
+                              ([], {"type": "any"})):
+            with self.subTest(tools=tools, choice=choice), self.assertRaises(wire.WireError):
+                wire.parse_request({"tools": tools, "tool_choice": choice, "messages": msgs})
+        self.assertEqual(self.status_of(dict(self.REAL, tools=[self.WEB_SEARCH, READ_TOOL])), 400)
+        self.assertFalse(os.path.exists(self.argv_file))
+
+    def test_mixed_with_client_tools_the_client_tools_are_still_served(self):
+        r = self.post({"model": "cortados", "tools": [self.WEB_SEARCH, READ_TOOL],
+                       "messages": [{"role": "user", "content": "please use tool"}]})
+        self.assertEqual(r["stop_reason"], "tool_use")
+        self.assertEqual(r["content"][-1]["name"], "Read")
+
+
 if __name__ == "__main__":
     unittest.main()
 
