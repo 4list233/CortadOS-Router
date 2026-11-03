@@ -222,7 +222,40 @@ class NightlyEndToEnd(unittest.TestCase):
     def test_teacher_args_reach_label_py(self):
         self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_TEACHER_ARGS="--workers 1 --teacher provider",
                        CORTADOS_PROVIDER_URL="http://example.invalid", CORTADOS_PROVIDER_TOKEN_FILE="/nonexistent")
-        self.assertEqual((self.s1 / "data/label-args").read_text(), "--workers 1 --teacher provider")
+        self.assertEqual((self.s1 / "data/label-args").read_text(), "--min-left-pct 15 --workers 1 --teacher provider")
+
+    # Continuous mode (overnight.py --continuous): "worked" in CORTADOS_S1_CYCLE_RESULT only for real work; absence = idle.
+    def _cycle(self, **env):
+        rf = self.tmp / "cycle-result"
+        rf.unlink(missing_ok=True)
+        rc, log, run = self.run_night(CORTADOS_S1_CONTINUOUS=1, CORTADOS_S1_CYCLE_RESULT=rf, **env)
+        return rc, log, run, (rf.read_text().strip() if rf.exists() else None)
+
+    def test_cycle_result_worked_on_training_and_absent_when_idle(self):
+        rc, log, _, res = self._cycle(STUB_NEW_LABELS=5)
+        self.assertEqual((rc, res), (0, "worked"), log)
+        rc, log, _, res = self._cycle(STUB_NEW_LABELS=0)
+        self.assertIn("skipped: no new labels", log)
+        self.assertEqual((rc, res), (0, None), log)
+
+    def test_cycle_result_absent_on_label_failure(self):
+        rc, log, _, res = self._cycle(STUB_LABEL_RC=1)
+        self.assertNotEqual(rc, 0, log)
+        self.assertIsNone(res, log)
+
+    def test_continuous_gpu_alone_keeps_the_scorer_loaded(self):
+        rc, log, run, _ = self._cycle(STUB_NEW_LABELS=5)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("continuous mode: scorer stays up during training", log)
+        self.assertTrue((run / "adapter").exists(), log)
+        calls = self.tmp / "home/launchctl.log"
+        self.assertNotIn("unload", calls.read_text() if calls.exists() else "")
+
+    def test_continuous_eval_time_ok_always_evaluates(self):
+        rc, log, run, _ = self._cycle(STUB_NEW_LABELS=3, CORTADOS_S1_EVAL_MINUTES=1440)   # window mode: never enough time
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("not evaluating", log)
+        self.assertTrue((run / "report.json").exists(), log)
 
     def test_no_new_labels_skips_training(self):
         rc, log, run = self.run_night(STUB_NEW_LABELS=5)

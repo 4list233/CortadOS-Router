@@ -1,8 +1,9 @@
 """Bound the existing nightly process tree to 01:30–07:00 America/Toronto (default, window mode), or run it continuously.
 
 Continuous mode (Forest 2026-11-03): `overnight.py --continuous -- /bin/bash <repo>/s1/nightly.sh` from a launchd KeepAlive job.
-No window, no deadline: one cycle = one nightly.sh run; after an idle cycle (nightly.sh wrote "idle" to $CORTADOS_S1_CYCLE_RESULT)
-sleep CORTADOS_S1_CYCLE_IDLE_S (default 900), else start the next cycle at once. The live scorer stays up (nightly.sh skips
+No window, no deadline: one cycle = one nightly.sh run. Only a cycle that exits 0 AND wrote "worked" to $CORTADOS_S1_CYCLE_RESULT
+(labels added, training ran, an evaluation/promotion attempted) starts the next cycle at once; any other rc-0 exit is idle and sleeps
+CORTADOS_S1_CYCLE_IDLE_S (default 900); a failure (rc 1/2/3/...) backs off exponentially from that interval, capped at 4 h; rc 130 ends. The live scorer stays up (nightly.sh skips
 gpu_alone under CORTADOS_S1_CONTINUOUS=1); a guard SIGSTOPs the work process group while
   - scorer latency > baseline + CORTADOS_S1_LATENCY_BUDGET_S (default 1.0 s, Forest 2026-11-03), or
   - free memory (vm_stat free+inactive+speculative) < CORTADOS_S1_MIN_FREE_GB (default 8),
@@ -212,7 +213,7 @@ def stop_tree(child, *, grace: float = 20) -> None:
 
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
               sleep=_time.sleep) -> tuple[int, bool]:
-    """Run one nightly.sh cycle under the guard. Returns (rc, idle)."""
+    """Run one nightly.sh cycle under the guard. Returns (rc, worked)."""
     try:
         result_file.unlink()
     except FileNotFoundError:
@@ -229,25 +230,47 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         raise
     guard.paused = False
     guard.good = 0
-    idle = result_file.exists() and result_file.read_text().strip() == "idle"
-    return child.returncode, idle
+    worked = result_file.exists() and result_file.read_text().strip() == "worked"
+    return child.returncode, worked
+
+
+# Failure backoff cap. Exit 3 (Claude quota headroom low/unknown) recovers on the accounts' ~5 h usage window, and other failures
+# (provider down, base model missing, eval crash) need a human or a slow external recovery: retrying faster than every 4 h only
+# burns quota and fills logs, while 4 h still gives several attempts per day once the cause clears.
+BACKOFF_CAP_S = 4 * 3600.0
+
+
+def next_delay(rc: int, worked: bool, idle_s: float, failures: int) -> tuple[float, int]:
+    """(seconds to sleep before the next cycle, updated consecutive-failure count) for a finished cycle."""
+    if rc != 0:
+        failures += 1
+        return min(idle_s * 2 ** (failures - 1), BACKOFF_CAP_S), failures
+    return (0.0 if worked else idle_s), 0
 
 
 def run_continuous(command: list[str], guard: Guard | None = None, *, result_file: Path, idle_s: float | None = None,
                    sleep=_time.sleep, cycles: int | None = None, poll_s: float = 1.0) -> int:
     guard = guard or Guard()
     idle_s = _env_float("CORTADOS_S1_CYCLE_IDLE_S", 900.0) if idle_s is None else idle_s
-    n = 0
+    n = failures = 0
     while cycles is None or n < cycles:
         n += 1
         guard.idle_probe()
-        rc, idle = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep)
-        print(f"overnight: cycle {n} ended rc {rc}" + (f"; idle, sleeping {idle_s:g}s" if idle else "; next cycle now"), flush=True)
+        rc, worked = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep)
         if rc == 130:
+            print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
-        if idle:
-            sleep(idle_s)
+        delay, failures = next_delay(rc, worked, idle_s, failures)
+        what = f"failure #{failures}, backing off" if rc else ("worked" if worked else "idle")
+        print(f"overnight: cycle {n} ended rc {rc} ({what}); next cycle in {delay:g}s", flush=True)
+        if delay:
+            sleep(delay)
     return 0
+
+
+def scorer_plist() -> Path:
+    raw = os.environ.get("CORTADOS_S1_SCORER_PLIST")
+    return Path(raw) if raw else Path.home() / "Library/LaunchAgents/com.cortados.s1-scorer.plist"
 
 
 def main(argv: list[str]) -> int:
@@ -275,8 +298,10 @@ def main(argv: list[str]) -> int:
     try:
         return run_bounded(command, budget, pidfile=Path(__file__).parent / 'data/nightly.pid')
     finally:
-        # The nightly shell normally restores the scorer in its EXIT trap; cover a forced kill.
-        plist = Path.home() / "Library/LaunchAgents/com.cortados.s1-scorer.plist"
+        # The nightly shell normally restores the scorer in its EXIT trap; cover a forced kill. Same path nightly.sh unloads
+        # (SCORER_PLIST from CORTADOS_S1_SCORER_PLIST). Window mode only: continuous mode returns above and never runs this,
+        # since nightly.sh never unloads the scorer under CORTADOS_S1_CONTINUOUS=1 (gpu_alone keeps it up).
+        plist = scorer_plist()
         if plist.exists():
             subprocess.run(["launchctl", "load", str(plist)], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=20, check=False)

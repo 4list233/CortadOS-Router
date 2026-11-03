@@ -131,8 +131,8 @@ QUOTA_RE = re.compile(r"no capacity left|usage limit|quota|% used, resets", re.I
 MAX_TOKENS = 8192
 # Headroom the labeler leaves in the account it was routed to (% left, from the provider's x-cortados-reveal answer). The provider's pin
 # path only refuses at SPENT; interactive sessions, reviews and routed subagents share these Claude accounts, so a nightly pass must stop
-# while they still have room. 30% ~ the old --max-scarcity 0.7 gate. Override with --min-left-pct.
-# Forest 2026-11-03: default lowered 30 -> 15 (two Claude accounts, under-utilized; labeling now runs in the daytime too).
+# while they still have room. Default 15% (Forest 2026-11-03: was 30, ~ the old --max-scarcity 0.7 gate; lowered because the
+# two Claude accounts are under-utilized and labeling now runs in the daytime too). Override with --min-left-pct.
 MIN_LEFT_PCT_DEFAULT = 15.0
 MIN_LEFT_PCT = MIN_LEFT_PCT_DEFAULT
 # Unknown headroom (the provider sent no "% left": its usage reading is stale, failed, or of another login) stops the pass by

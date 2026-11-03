@@ -106,17 +106,44 @@ class Continuous(unittest.TestCase):
         g.idle_probe(); t[0] += 30; g.tick(1)
         self.assertEqual(sig, [signal.SIGSTOP])
 
-    def test_idle_vs_immediate_next_cycle(self):
+    def _loop(self, outcomes, idle_s=900):
+        """Drive run_continuous with scripted (rc, worked) cycles; returns the sleeps between cycles (poll sleeps excluded)."""
+        it = iter(outcomes); sleeps = []
+        g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, log=lambda m: None)
+        with patch.object(night, 'run_cycle', side_effect=lambda *a, **k: next(it)):
+            rc = night.run_continuous(['x'], g, result_file=Path('/nonexistent'), idle_s=idle_s, sleep=sleeps.append,
+                                      cycles=len(outcomes))
+        return rc, sleeps
+
+    def test_worked_cycle_restarts_at_once(self):
+        self.assertEqual(self._loop([(0, True), (0, True)])[1], [])
+
+    def test_idle_cycle_sleeps_idle_interval(self):
+        self.assertEqual(self._loop([(0, False), (0, False)])[1], [900, 900])
+
+    def test_failures_and_quota_stop_back_off_exponentially_capped_and_reset(self):
+        _, sleeps = self._loop([(1, False), (3, True), (2, False)] + [(3, False)] * 6 + [(0, True), (1, False)])
+        self.assertEqual(sleeps, [900, 1800, 3600, 7200, 14400, 14400, 14400, 14400, 14400, 900])
+
+    def test_stop_request_ends_the_loop(self):
+        rc, sleeps = self._loop([(0, True), (130, False), (0, True)])
+        self.assertEqual((rc, sleeps), (130, []))
+
+    def test_run_cycle_reads_worked_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             rf = Path(tmp) / 'r'
             g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, log=lambda m: None)
-            sleeps = []
-            idle = [sys.executable, '-c', 'import os;open(os.environ["CORTADOS_S1_CYCLE_RESULT"],"w").write("idle")']
-            night.run_continuous(idle, g, result_file=rf, idle_s=900, sleep=sleeps.append, cycles=2, poll_s=0)
-            self.assertEqual(sleeps.count(900), 2)
-            sleeps.clear()
-            night.run_continuous([sys.executable, '-c', 'pass'], g, result_file=rf, idle_s=900, sleep=sleeps.append, cycles=2, poll_s=0)
-            self.assertNotIn(900, sleeps)
+            w = [sys.executable, '-c', 'import os;open(os.environ["CORTADOS_S1_CYCLE_RESULT"],"w").write("worked")']
+            self.assertEqual(night.run_cycle(w, g, result_file=rf, poll_s=0, sleep=lambda s: None), (0, True))
+            self.assertEqual(night.run_cycle([sys.executable, '-c', 'pass'], g, result_file=rf, poll_s=0,
+                                             sleep=lambda s: None), (0, False))   # stale marker removed; absence = idle
+
+    def test_scorer_plist_follows_env(self):
+        with patch.dict(os.environ, {'CORTADOS_S1_SCORER_PLIST': '/tmp/x.plist'}):
+            self.assertEqual(night.scorer_plist(), Path('/tmp/x.plist'))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('CORTADOS_S1_SCORER_PLIST', None)
+            self.assertTrue(str(night.scorer_plist()).endswith('com.cortados.s1-scorer.plist'))
 
     def test_term_while_paused_conts_first(self):
         proc = Mock(pid=7); proc.wait.return_value = 0

@@ -235,19 +235,23 @@ rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapter
   return 0
 }
 rotate_logs
-gpu_alone() {   # Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
+gpu_alone() {   # called only right before training starts, so it marks the cycle worked. Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
   # Forest 2026-11-03: in continuous mode the live scorer has priority and STAYS UP; overnight.py pauses this tree instead when
   # scorer latency rises more than CORTADOS_S1_LATENCY_BUDGET_S above baseline.
+  worked_cycle
   [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && { echo "continuous mode: scorer stays up during training (overnight.py latency guard)"; return 0; }
   launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "$GPU_SETTLE"; echo "scorer stopped for training; ollama + memory gateway stay up"
 }
-# idle_cycle: tell overnight.py --continuous this cycle did nothing (no new data, nothing pending) so it sleeps CORTADOS_S1_CYCLE_IDLE_S
-idle_cycle() { [ -n "${CORTADOS_S1_CYCLE_RESULT:-}" ] && echo idle > "$CORTADOS_S1_CYCLE_RESULT"; return 0; }
+# worked_cycle: tell overnight.py --continuous this cycle did real work (labels added, training ran, an evaluation/promotion was
+# attempted). Absence means idle: every no-op exit sleeps CORTADOS_S1_CYCLE_IDLE_S instead of restarting at once (a missed call
+# only costs one idle sleep; a missed "idle" mark used to hot-loop the provider and quota).
+worked_cycle() { [ -n "${CORTADOS_S1_CYCLE_RESULT:-}" ] && echo worked > "$CORTADOS_S1_CYCLE_RESULT"; return 0; }
 gpu_share() {
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
 state() { python3 -B ./nightly_state.py "$@"; }
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
+  worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
     $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
 }
@@ -327,12 +331,14 @@ ptok="default (~/.config/cortados/provider-token)"; [ -n "${CORTADOS_PROVIDER_TO
 echo "teacher: $LABEL_PY label.py $TEACHER_ARGS (provider url $purl, token file $ptok)"
 # shellcheck disable=SC2086   # TEACHER_ARGS is a word list on purpose
 # Forest 2026-11-03: two Claude accounts are under-utilized, so labeling may run in the daytime down to a 15% per-account floor.
+labels_before=$(state labels data/labels.jsonl 2>/dev/null) && whole "$labels_before" || labels_before=""
 "$LABEL_PY" -B label.py --min-left-pct "${CORTADOS_S1_MIN_LEFT_PCT:-15}" $TEACHER_ARGS
 rc=$?
 # Count labels and update the stall tracker BEFORE branching on rc: a labeler that fails every night is exactly the stall to alert on.
 if ! labelled=$(state labels data/labels.jsonl) || ! whole "$labelled"; then
   echo "LABEL COUNT FAILED (data/labels.jsonl unreadable): training skipped"; state event "$STATUS" label_count_failure "labels.jsonl unreadable"; exit 1
 fi
+[ -n "$labels_before" ] && [ "$labelled" -gt "$labels_before" ] && worked_cycle
 if alert=$(state growth "$STATUS" "$labelled" "$STALL_NIGHTS" "$NIGHT"); then
   [ -n "$alert" ] && echo "$alert"
 else
@@ -410,7 +416,6 @@ if read_pending; then
     fi
     if [ "$p_reason" = holdout_blocked ] && [ "$now_eval" = "$p_eval" ]; then
       echo "skipped: no new labels; pending $p_run waits for the holdout backfill (holdout and incumbent unchanged)"
-      idle_cycle
       state event "$STATUS" skip "pending $p_run waits for holdout ($p_reason)"; holdout_hit
       echo "=== $(date) nightly end"; exit 0
     fi
@@ -491,7 +496,6 @@ fi
 if [ "$force" != "--train" ] && [ "$pending" -eq 0 ] && [ "$(cat data/last-train-labels 2>/dev/null)" = "$sft_hash" ]; then
   echo "skipped: no new labels ($labelled labels; training data identical to the last training run)"
   state event "$STATUS" skip "no new labels ($labelled)"
-  idle_cycle
   echo "=== $(date) nightly end"; exit 0
 fi
 echo "labelled $labelled (+$new since last training); training tonight (pending run: $pending)"
