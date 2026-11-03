@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, projectSlug, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -657,4 +657,113 @@ test('re-tracking a model moves it to the end; the cap still applies', async () 
   trackWorkerModels(['d'])
   expect(trackedWorkerModels()).toEqual(['c', 'a', 'd'])
   resetWorkerModels()
+})
+
+test('resolveMaxTurns: positive integers on, 0/negative/junk off', async () => {
+  expect(resolveMaxTurns(40)).toBe(40)
+  expect(resolveMaxTurns('25')).toBe(25)
+  expect(resolveMaxTurns(12.9)).toBe(12)
+  for (const off of [0, -1, NaN, null, undefined, 'x', {}]) expect(resolveMaxTurns(off)).toBe(null)
+})
+
+test('fmtSecs words a 600000 ms timeout as 600 s, not 60000s', async () => {
+  expect(fmtSecs(600_000)).toBe('600 s')
+  expect(fmtSecs(1_499)).toBe('1 s')
+})
+
+test('projectSlug matches the CLI project folder naming; newSessionId is a v4 UUID', async () => {
+  expect(projectSlug('/Users/a/Ai/CortadOS-Router')).toBe('-Users-a-Ai-CortadOS-Router')
+  expect(projectSlug('/x/my_repo.v2')).toBe('-x-my-repo-v2')
+  expect(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(newSessionId())).toBe(true)
+})
+
+test('partialFromTranscript keeps the last assistant text and counts progress, skipping junk and a cut last line', async () => {
+  const lines = [
+    JSON.stringify({ type: 'user', message: { content: 'go' } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'first finding' }, { type: 'tool_use', name: 'WebSearch' }] } }),
+    'not json',
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch' }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'second finding' }] } }),
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"cut',
+  ].join('\n')
+  expect(partialFromTranscript(lines)).toEqual({ lastText: 'second finding', toolUses: 2, assistantTurns: 3 })
+  expect(partialFromTranscript('')).toEqual({ lastText: null, toolUses: 0, assistantTurns: 0 })
+})
+
+/** Register the mod and return its Agent handler. */
+function agentHandlerFor(opts: any): any {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, ...opts })
+  return agentHandler
+}
+
+test('the child runs stream-json --verbose with --max-turns, a chosen --session-id and the stop-on-dead-tool line', async () => {
+  let argv: string[] = []
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => { argv = a; return { exitCode: 0, stdout: '{"type":"system"}\n' + JSON.stringify({ type: 'result', result: 'pong', session_id: 's' }), stderr: '', isStdoutTruncated: false } } },
+    fs: { read: async () => '' }, ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(out.result.content[0].text.endsWith('pong')).toBe(true)
+  expect(out.result.prompt).toBe('say pong')                      // the parent sees its own prompt, not the suffix
+  expect(argv[argv.indexOf('-p') + 1]).toBe('say pong\n\n' + STOP_ON_DEAD_TOOL)
+  expect(argv[argv.indexOf('--output-format') + 1]).toBe('stream-json')
+  expect(argv.includes('--verbose')).toBe(true)
+  expect(argv[argv.indexOf('--max-turns') + 1]).toBe('40')
+  expect(/^[0-9a-f-]{36}$/.test(argv[argv.indexOf('--session-id') + 1])).toBe(true)
+  // maxTurns 0 turns the flag off
+  const h0 = agentHandlerFor({ maxTurns: 0 })
+  await h0($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(argv.includes('--max-turns')).toBe(false)
+})
+
+test('a timed-out child hands back its transcript text, session id, elapsed time and the timeout in seconds', async () => {
+  let sid = ''
+  let readPath = ''
+  const h = agentHandlerFor({ subagentTimeoutMs: 1 })
+  const $ = {
+    process: {
+      run: async (a: string[]) => {
+        if (a[0] === 'sh') return { exitCode: 0, stdout: '/home/u/.claude\n/work/my repo', stderr: '', isStdoutTruncated: false }
+        sid = a[a.indexOf('--session-id') + 1]
+        await new Promise((r) => setTimeout(r, 5))
+        throw new Error('HooksError: claude aborted: still running after 60000s')
+      },
+    },
+    fs: {
+      read: async (p: string) => {
+        readPath = p
+        return JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'found A and B; WebSearch empty tok' }, { type: 'tool_use' }] } })
+      },
+    },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'research', description: 'd' }, async () => 'native')
+  expect(readPath).toBe(`/home/u/.claude/projects/-work-my-repo/${sid}.jsonl`)
+  expect(out.deny).toContain('(timeout 0 s)')
+  expect(out.deny).toContain(`session ${sid}`)
+  expect(out.deny).toContain('elapsed ')
+  expect(out.deny).toContain('1 assistant turns, 1 tool calls')
+  expect(out.deny).toContain('found A and B; WebSearch empty ***') // partial text, token scrubbed
+})
+
+test('an unreadable transcript still reports the session id and never throws', async () => {
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => {
+      if (a[0] === 'sh') return { exitCode: 0, stdout: '/h/.claude\n/w', stderr: '', isStdoutTruncated: false }
+      return { exitCode: 1, stdout: JSON.stringify({ type: 'result', is_error: true, subtype: 'error_max_turns' }), stderr: '', isStdoutTruncated: false }
+    } },
+    fs: { read: async () => { throw new Error('ENOENT') } },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'x', description: 'd' }, async () => 'native')
+  expect(out.deny).toContain('did not complete cleanly (exit 1, error)')
+  expect(out.deny).toContain('transcript unreadable')
+  expect(/session [0-9a-f-]{36}/.test(out.deny)).toBe(true)
 })

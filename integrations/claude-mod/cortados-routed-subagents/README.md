@@ -43,6 +43,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under the `subagentTimeoutMs` ceiling). |
 | `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
+| `maxTurns` | `40` | Passed as `claude -p --max-turns N`: the child stops after N agentic turns instead of looping until the timeout kills it. `0` (or any non-positive/invalid value) leaves the flag off. A stopped child is reported like any other failure, with its partial result (see **When a routed subagent fails**). |
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
@@ -138,6 +139,17 @@ These pass through to a normal in-process subagent on your direct model:
 Once a routed subagent has been launched it has already acted, so if it does not finish cleanly (nonzero exit, a
 terminal error, truncated output, or a result the Agent schema would reject) the mod returns a **refusal** with the
 reason — it never silently re-runs the task as a native subagent, which would duplicate any non-idempotent work.
+
+## When a routed subagent fails
+
+Each child runs with `--output-format stream-json --verbose` (the final result line is the same object as `json`)
+and a `--session-id` the mod chooses, so its transcript is at
+`${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd with non-alphanumerics as ->/<session-id>.jsonl`. On a timeout,
+a `--max-turns` stop or any other unclean finish, the refusal names the elapsed time, the timeout in seconds, the
+session id and transcript path, how many assistant turns and tool calls the child made, and its **last assistant
+text** (scrubbed, last 4000 characters), so the parent can see how far it got instead of losing all the work. The
+child's prompt also ends with: "If a tool returns nothing useful twice in a row, stop and report what you have and
+what failed."
 
 ## Notes
 
