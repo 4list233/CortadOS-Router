@@ -23,7 +23,7 @@ Forest's decision: CortadOS gets its own browser tool. Playwright is allowed, wi
 | 6 | `@playwright/mcp` | `browser_file_upload` can read any local file the process can read and post it to a page. | by design | Off by default; when granted, roots limited to the task dir. |
 | 7 | `@playwright/mcp` | `browser_install` downloads and installs browsers at agent request. | by design | Off (tool disallowed); browsers are installed once by our install script. |
 | 8 | `playwright` (npm and Python) | CVE-2025-59288 / GHSA-7mvr-c777-76hp: browser install scripts used `curl -k` (no TLS verification) -> MITM of the installer. | 1.55.1 | Pin playwright >= 1.55.1 (current 1.64.1); install only from our script. |
-| 9 | Chromium | Default persistent profile (`--user-data-dir` under the user's cache) keeps cookies across sessions; `--extension` / CDP endpoint modes attach to a real browser. | by design | `--isolated` (in-memory profile) + per-task `--user-data-dir` never shared; never pass `--extension`, `--cdp-endpoint`, `--remote-debugging-port`. |
+| 9 | Chromium | Default persistent profile (`--user-data-dir` under the user's cache) keeps cookies across sessions; `--extension` / CDP endpoint modes attach to a real browser. | by design | `--isolated` (in-memory profile, gone when the task ends); never pass `--extension`, `--cdp-endpoint`, `--remote-debugging-port`. |
 | 10 | Chromium | Downloads land wherever the browser chooses. | by design | `--output-dir <task>/browser/` and download path inside the task dir. |
 
 Latest published versions on 2026-11-03: `@playwright/mcp` 0.0.84, `playwright` 1.64.1.
@@ -62,10 +62,9 @@ passed today:
 ```json
 {"mcpServers": {"browser": {"command": "<prefix>/node_modules/.bin/playwright-mcp",
   "args": ["--headless", "--isolated", "--browser", "chromium",
-           "--user-data-dir", "<task_dir>/browser/profile",
            "--output-dir", "<task_dir>/browser/out",
            "--proxy-server", "http://127.0.0.1:<egress_port>",
-           "--blocked-origins", "<private-net hosts>", "--save-trace",
+           "--blocked-origins", "<private-net hosts>", "--block-service-workers",
            "--timeout-navigation", "30000", "--timeout-action", "10000"],
   "env": {"PLAYWRIGHT_BROWSERS_PATH": "<prefix>/browsers", "HOME": "<task_dir>/browser/home"}}}}
 ```
@@ -121,6 +120,19 @@ Refusals are logged, never silently downgraded.
 Per task, from `child-tasks.jsonl`: `browser: true`, pinned versions (`@playwright/mcp`, chromium build), grants used,
 pages visited (count + origins), refused hosts, downloads (name, size), artifact paths, browser wall time, exit reason
 (done / cap_pages / cap_time / killed). No page content or cookies are recorded.
+
+## Spike findings (2026-11-03, temp CORTADOS_HOME, no browsers downloaded)
+- `npm install --ignore-scripts @playwright/mcp@0.0.84` = 3 packages, under 1 s; it pulls a `playwright-core`
+  1.65 alpha (>= 1.55.1, so CVE-2025-59288 is fixed).
+- 0.0.84 `--help` has: `--headless --isolated --browser --output-dir --output-max-size --proxy-server --proxy-bypass
+  --blocked-origins --allowed-origins --block-service-workers --timeout-action --timeout-navigation --idle-timeout
+  --caps --file-paths --allow-unrestricted-file-access --save-session`, and the ones we must never pass: `--port --host
+  --allowed-hosts --endpoint --extension --cdp-endpoint --cdp-header --executable-path --shared-browser-context
+  --storage-state --no-sandbox --ignore-https-errors --init-script`.
+- There is no `--save-trace` in 0.0.84. Trace/screenshot artifacts come from `--output-dir` (screenshots, `--save-session`
+  to be evaluated in B1). `--isolated` keeps the profile in memory, so no `--user-data-dir` is passed.
+- Browser download still to do: `CORTADOS_HOME=<home> integrations/browser/install.sh install --browsers`
+  (`playwright install --only-shell chromium` into `<prefix>/browsers`, about 100 MB).
 
 ## Build tickets
 - B1 Pin + install: `integrations/browser/install.sh` + committed `package.json`/`package-lock.json`; record the pinned
