@@ -60,6 +60,7 @@ STUBS = {
         "if a.holdout_count: print(50 if short else 300, floor); raise SystemExit(0)   # 50 rows until the backfill\n"
         "if os.environ.get('STUB_EVAL_GARBAGE'): open(os.path.join(a.out, 'report.json'), 'w').write('{trunc'); raise SystemExit(0)\n"
         "open('data/eval-count', 'a').write('x')\n"
+        "if os.environ.get('STUB_EVAL_TERM'): import signal, time; os.kill(int(open('data/nightly.pid').read()), signal.SIGTERM); time.sleep(1); raise SystemExit(143)\n"
         "if os.environ.get('STUB_EVAL_RC'): raise SystemExit(int(os.environ['STUB_EVAL_RC']))\n"
         "unavailable = os.environ.get('STUB_EVAL_UNAVAILABLE') == '1'\n"
         "blocked = os.environ.get('STUB_HOLDOUT_BLOCKED') == '1' and hk == 'h0' and floor > 50   # the stub holdout has 50 rows\n"
@@ -109,7 +110,8 @@ class NightlyEndToEnd(unittest.TestCase):
         keep = {k: v for k, v in os.environ.items() if not k.startswith(("CORTADOS_", "STUB_"))}
         self.env = {**keep, "HOME": str(home), "CORTADOS_NIGHTLY_SUPERVISED": "1", "CORTADOS_S1_PY": str(self.tmp / "fake-py"),
                     "CORTADOS_S1_GPU_SETTLE": "0", "CORTADOS_S1_EVAL_SETTLE": "0", "CORTADOS_ROUTER_REPO": str(self.tmp / "no-repo"),
-                    "CORTADOS_HOME": str(self.tmp / "cortados-home")}
+                    "CORTADOS_HOME": str(self.tmp / "cortados-home"),
+                    "CORTADOS_S1_EVAL_MINUTES": "0"}   # no wall-clock dependence; the deadline tests set it
         self.night = 0
 
     def run_night(self, **env):
@@ -382,6 +384,140 @@ class NightlyEndToEnd(unittest.TestCase):
         self.assertFalse((run2 / "adapter").exists(), "recovered without retraining")
         _, log, _ = self.run_night(STUB_NEW_LABELS=0)
         self.assertIn("skipped: no new labels", log)
+
+    def test_term_during_evaluation_keeps_the_run_pending_and_next_night_evaluates_it(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)    # 07:00 TERM mid-evaluation
+        self.assertEqual(rc, 130, log)
+        self.assertIn("stop requested", log)
+        self.assertFalse((run1 / "report.json").exists())
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)                      # new labels do NOT supersede it
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertNotIn("superseded", log)
+        self.assertIn("pending candidate runs/2026-01-01 (evaluation_pending): re-evaluating", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertFalse((run2 / "adapter").exists(), "evaluated, not retrained")
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "the newer labels were never trained on")
+        _, log, run3 = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("training tonight", log)
+
+    def test_marker_is_written_before_evaluation_starts(self):
+        evaluate = self.s1 / "evaluate.py"
+        evaluate.write_text("import os, sys\nif '--holdout-key' not in sys.argv and '--holdout-count' not in sys.argv:\n"
+                            "    open('data/marker-at-eval', 'w').write(open('data/pending-candidate').read())\n" + evaluate.read_text())
+        self.run_night(STUB_NEW_LABELS=3)
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/marker-at-eval").read_text())
+        self.assertFalse((self.s1 / "data/pending-candidate").exists(), "a final verdict clears the marker")
+
+    def test_not_enough_time_skips_evaluation_and_leaves_it_pending(self):
+        late = {"CORTADOS_S1_EVAL_MINUTES": 110, "CORTADOS_S1_NOW": "0659"}   # 1 min to 07:00: never enough time
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, **late)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("not evaluating runs/2026-01-01: 1 min to the 0700 deadline", log)
+        self.assertIn("it stays pending (evaluation_pending)", log)
+        self.assertNotIn("ALERT", log)
+        self.assertFalse((self.s1 / "data/eval-count").exists(), "evaluation not started")
+        self.assertIn("evaluation_pending runs/2026-01-01", (self.s1 / "data/pending-candidate").read_text())
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=1, **late)
+        self.assertIn("not evaluating runs/2026-01-01", log)
+        self.assertIn("ALERT", log)
+        self.assertIn("evaluation deferred: not enough time before the deadline", log)
+        self.assertFalse((run2 / "adapter").exists(), "no new training while the candidate waits")
+        self.assertTrue((run1 / "adapter").is_dir())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertNotIn("ALERT", log)
+
+    def test_minutes_left_table(self):
+        cases = {("0130", "0700"): 330, ("0245", "0700"): 255, ("0619", "0700"): 41, ("0659", "0700"): 1,
+                 ("2200", "0700"): 540, ("0000", "0700"): 420, ("0830", "0700"): 1350, ("0959", "0700"): 1261,
+                 ("0130", "0030"): 1380, ("0245", "0030"): 1305, ("0619", "0030"): 1091, ("0659", "0030"): 1051,
+                 ("2200", "0030"): 150, ("0000", "0030"): 30, ("0830", "0030"): 960, ("0959", "0030"): 871}
+        for (now, dl), want in cases.items():
+            out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", now], cwd=self.tmp,
+                                 env={**self.env, "CORTADOS_S1_DEADLINE": dl}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.stdout.split("\n")[0], str(want), (now, dl, out.stdout, out.stderr))
+        for bad in ("2400", "9z9z"):
+            out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", "0130"], cwd=self.tmp,
+                                 env={**self.env, "CORTADOS_S1_DEADLINE": bad}, capture_output=True, text=True, timeout=30)
+            self.assertIn(f"CORTADOS_S1_DEADLINE={bad} is not HHMM; using 0700", out.stdout)
+            self.assertTrue(out.stdout.startswith("330\n"), out.stdout)
+        out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", "0130"], cwd=self.tmp,
+                             env={**self.env, "CORTADOS_S1_EVAL_MINUTES": "300"}, capture_output=True, text=True, timeout=30)
+        self.assertIn("EVAL_MINUTES=300 can never fit", out.stdout)
+
+    def minutes_left(self, *args, **env):
+        return subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", *args], cwd=self.tmp,
+                              env={**self.env, **{k: str(v) for k, v in env.items()}}, capture_output=True, text=True, timeout=30)
+
+    def test_eval_minutes_ceiling_follows_the_deadline(self):
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="1200", CORTADOS_S1_EVAL_MINUTES="400")
+        self.assertEqual(out.stdout, "630\n", out.stdout + out.stderr)     # 400 fits a 01:30-12:00 window: no note
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="1200", CORTADOS_S1_EVAL_MINUTES="600")
+        self.assertIn("EVAL_MINUTES=600 can never fit the 01:30-1200 window (>= 600); using 110", out.stdout)
+
+    def test_invalid_now_is_refused_or_falls_back_to_the_clock(self):
+        for bad in ("730", "2500", "7", "abc"):
+            out = self.minutes_left(bad)
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn(f"--minutes-left {bad} is not HHMM", out.stdout)
+            self.assertEqual(out.stderr, "", bad)
+            out = self.minutes_left(CORTADOS_S1_NOW=bad)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            first = out.stdout.split("\n")[0]
+            self.assertTrue(first.isdigit() and int(first) < 1440, (bad, out.stdout))
+            self.assertIn(f"CORTADOS_S1_NOW={bad} is not HHMM; using the clock", out.stdout)
+            self.assertEqual(out.stderr, "", bad)
+
+    def test_minutes_left_has_no_side_effects(self):
+        stop, pid = self.s1 / "data/nightly.stop", self.s1 / "data/nightly.pid"
+        stop.write_text("keep"); pid.write_text("999999\n")
+        env = {k: v for k, v in self.env.items() if k != "CORTADOS_NIGHTLY_SUPERVISED"}   # would re-exec under overnight.py
+        out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), "--minutes-left", "0130"], cwd=self.tmp,
+                             env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout, "330\n", out.stdout + out.stderr)
+        self.assertEqual(stop.read_text(), "keep")
+        self.assertEqual(pid.read_text(), "999999\n")
+
+    def test_reevaluation_keeps_the_candidates_own_training_fingerprint(self):
+        # night 1: TERM mid-evaluation; night 2: +2 labels, re-evaluated and holdout-blocked; night 3: quiet, holdout backfilled.
+        # The candidate never saw night 2's labels: they must never be marked trained without a training run. (Before the fix the
+        # marker took night 2's hash, night 3 said "PROMOTED (retry) ...; no new data" and wrote it, and night 4 skipped them.)
+        # With the candidate's own fingerprint, night 3 sees data newer than the candidate and trains it (a ready holdout supersedes).
+        self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1, STUB_HOLDOUT_BLOCKED=1)
+        h1 = (self.s1 / "data/pending-candidate").read_text().split()[0]
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=2, STUB_HOLDOUT_BLOCKED=1)
+        self.assertIn("pending runs/2026-01-01 still blocked", log)
+        self.assertFalse((self.s1 / "data/last-train-labels").exists(), "night 2's labels were never trained on")
+        marker = (self.s1 / "data/pending-candidate").read_text().split()
+        self.assertEqual((marker[0], marker[2]), (h1, "holdout_blocked"), "the candidate keeps its own training fingerprint")
+        (self.s1 / "data/stub-holdout").write_text("h-backfilled")
+        rc, log, run3 = self.run_night(STUB_NEW_LABELS=0, STUB_HOLDOUT_BLOCKED=1)
+        self.assertNotIn("no new data", log)
+        self.assertNotIn("PROMOTED (retry)", log)
+        self.assertIn("superseded by new training data", log)
+        self.assertIn("training tonight", log)
+        self.assertTrue((run3 / "report.json").exists(), "night 2's labels are trained, not skipped")
+
+    def test_invalid_marker_falls_through_to_recovery_and_never_lets_prune_delete(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)
+        (self.s1 / "data/pending-candidate").write_text("garbage\n")          # truncated / garbled marker
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)
+        self.assertIn("data/pending-candidate is invalid", log)
+        self.assertIn("recovered runs/2026-01-01", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertIn("the newer labels are trained next night", log)
+
+    def test_trained_unevaluated_run_without_marker_is_recovered(self):
+        rc, log, run1 = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)
+        (self.s1 / "data/pending-candidate").unlink()                          # the 2026-11-03 state: no marker
+        rc, log, run2 = self.run_night(STUB_NEW_LABELS=2)
+        self.assertIn("recovered runs/2026-01-01", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2026-01-01", log)
+        self.assertIn("PROMOTED (retry) runs/2026-01-01", log)
+        self.assertFalse((run2 / "adapter").exists())
 
     def test_crashed_evaluation_stays_pending_and_recovers(self):
         rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_RC=1)
