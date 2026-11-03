@@ -77,7 +77,12 @@ CLAUDE_SHARED_MODELS = ("haiku", "sonnet", "opus")
 # Claude's are the rolling session and the weekly all-models window; both must be in hand before any Claude call, even
 # before either has been observed on a fresh home (Codex review 2026-10-25: a partial capture with only the session
 # window otherwise admitted a shared model against an unseen, possibly exhausted weekly limit).
-REQUIRED_GENERAL = {"claude": ("5-hour", "week")}
+REQUIRED_GENERAL = {"claude": ("week",)}
+# General windows the vendor has DROPPED from its usage screen (Forest 2026-11-03: Claude accounts now show only the weekly
+# windows, "week (all models)" / "week (Fable)", no 5-hour session panel). Absent, such a window is treated as gone — not
+# as an incomplete capture — so long as every REQUIRED_GENERAL window is in hand; present, it is checked like any other.
+# Without this every Claude call was held forever ("required general window(s) ['5-hour'] ... incomplete capture").
+DROPPABLE_GENERAL = {"claude": ("5-hour",)}
 
 
 def _panel_unavailable(raw: dict) -> bool:
@@ -145,7 +150,9 @@ def _windows(sc, lane: str, model: str | None):
     required = [r for r in REQUIRED_GENERAL.get(lane, ()) if not any(r in (w or "").lower() for w in general_now)]
     if required:
         return None, f"{lane} required general window(s) {required} not in the current reading (incomplete capture)"
-    missing = sorted(set(known_general) - general_now)
+    droppable = DROPPABLE_GENERAL.get(lane, ())
+    missing = sorted(w for w in set(known_general) - general_now
+                     if not any(d in (w or "").lower() for d in droppable))
     if missing:
         return None, f"{lane} general window(s) {missing} missing from the current reading"
     if model:
@@ -164,7 +171,12 @@ def _windows(sc, lane: str, model: str | None):
                 carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
                 return None, (f"{lane} pool {owner} for {model} is "
                               + ("a carried-forward reading" if carried else "missing from the current reading"))
-        if owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model):
+        # Forest 2026-11-03: a model of unknown ownership while the per-model panel is down no longer holds forever (the
+        # panel has been unavailable for days and the loop sat idle). It falls back to the general weekly window(s), which
+        # are its cap if it has no pool of its own, with the 95 % / last-hour stop rule intact. Set
+        # CORTADOS_OUTCOME_STRICT_PANEL=1 to restore the old refusal.
+        if (owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model)
+                and os.environ.get("CORTADOS_OUTCOME_STRICT_PANEL") == "1"):
             return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
                           "unknown and it may have an unobserved cap")
     pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None

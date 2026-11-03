@@ -2,6 +2,15 @@
 
 Run from s1/: `python3 -B -m outcome.loop`. The repository root goes on sys.path so the provider's shared rules
 (injected-text stripping, served routes) are imported from their one owner, not copied.
+
+Backends (2026-11-03): with CORTADOS_PROVIDER_URL set (token from CORTADOS_PROVIDER_TOKEN or
+CORTADOS_PROVIDER_TOKEN_FILE, default ~/.config/cortados/provider-token), judge (sub/claude-fable-5-1) and generate
+(sub/<CORTADOS_OUTCOME_GENERATOR>) run through the cortados provider, which picks the account (claude, claude#b, codex)
+by scarcity; their quota door is the provider-revealed "% left" of the serving lane (outcome/provider.py), held below
+5 %. CORTADOS_OUTCOME_BACKEND=local restores the local CLI path and the local usage reading (quota.py). Ladder runs
+(agents.run_task) still use the local subscription CLIs and quota.py; quota.py now treats Claude's dropped 5-hour
+panel as absent (weekly window required) and lets an unknown-ownership model ride the weekly window while the
+per-model panel is down (CORTADOS_OUTCOME_STRICT_PANEL=1 restores the old refusal).
 """
 import sys
 from pathlib import Path

@@ -37,7 +37,9 @@ def _spec(**over):
 class OutcomeCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home})
+        # The local backend unless a test opts into the provider: a developer shell's CORTADOS_PROVIDER_URL must not
+        # send a test's judge/generate call to a real provider.
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local"})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -438,13 +440,14 @@ class QuotaTests(OutcomeCase):
         self.assertIsInstance(w["reset_epoch"], float)
         self.assertTrue(quota.admit(self._core(FakeScarcity([self._sess(), w])), "claude", "m")[0])
 
-    def test_claude_admission_requires_both_the_session_and_weekly_windows(self):
+    def test_claude_admission_requires_the_weekly_window_and_tolerates_the_dropped_session_window(self):
         week, sess = self._w(used=10, hours=100), self._sess()
         self.assertTrue(quota.admit(self._core(FakeScarcity([sess, week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
         ok_wk, why_wk = quota.admit(self._core(FakeScarcity([sess], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
         self.assertFalse(ok_wk); self.assertIn("week", why_wk)          # partial capture: only the session window
+        # Forest 2026-11-03: the vendor dropped the 5-hour panel; a weekly-only reading admits (was: "incomplete capture")
         ok_se, why_se = quota.admit(self._core(FakeScarcity([week], fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
-        self.assertFalse(ok_se); self.assertIn("5-hour", why_se)        # partial capture: only the weekly window
+        self.assertTrue(ok_se, why_se)
 
     def test_quota_rule_on_real_windows(self):
         import time as _t
@@ -598,14 +601,19 @@ class QuotaTests(OutcomeCase):
         results = [quota.verdict([fable], reserved={"k": i}, now=now)[0] for i in range(8)]
         self.assertEqual(results, [True] * 7 + [False])
 
-    def test_an_unknown_model_is_refused_when_the_panel_is_unavailable(self):
-        # Neither Fable (pooled) nor a confirmed shared model: with the panel down its ownership is unknown, so it is
-        # refused rather than spent blind on the shared windows (Codex review 2026-10-25).
-        sc = FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now(),
-                          per_model="not shown this read (vendor rate limit on the per-model panel)")
+    def test_an_unknown_model_falls_back_to_the_weekly_window_when_the_panel_is_unavailable(self):
+        # Forest 2026-11-03: was refused forever ("per-model panel unavailable"); now it rides the general weekly window
+        # with the stop rule intact. CORTADOS_OUTCOME_STRICT_PANEL=1 restores the refusal.
+        panel = "not shown this read (vendor rate limit on the per-model panel)"
+        sc = FakeScarcity([self._w(used=10, hours=100)], fetched_at=self._fresh_now(), per_model=panel)
         ok, why = quota.admit(self._core(sc), "claude", "claude-newmodel-9")
-        self.assertFalse(ok)
-        self.assertIn("ownership is unknown", why)
+        self.assertTrue(ok, why)
+        full = FakeScarcity([self._w(used=96, hours=100)], fetched_at=self._fresh_now(), per_model=panel)
+        ok_f, why_f = quota.admit(self._core(full), "claude", "claude-newmodel-9")
+        self.assertFalse(ok_f); self.assertIn("95", why_f)               # the stop rule still applies on the fallback
+        with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_STRICT_PANEL": "1"}):
+            ok_s, why_s = quota.admit(self._core(sc), "claude", "claude-newmodel-9")
+        self.assertFalse(ok_s); self.assertIn("ownership is unknown", why_s)
         # when the panel IS available, the same unknown model admits against the shared windows normally
         ok2, _ = quota.admit(self._core(FakeScarcity([self._sess(), self._w(used=10, hours=100)], fetched_at=self._fresh_now())), "claude", "claude-newmodel-9")
         self.assertTrue(ok2)
@@ -617,6 +625,81 @@ class QuotaTests(OutcomeCase):
         ok, why = quota.admit(self._core(FakeScarcity(only_5h, fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
         self.assertFalse(ok)
         self.assertIn("week", why)
+
+
+    def test_a_once_seen_5_hour_window_missing_now_does_not_hold(self):
+        # known_windows.json remembers "5-hour" from before the vendor dropped it: its absence alone must not hold work.
+        self.assertTrue(quota.admit(self._core(FakeScarcity([self._sess(), self._w(used=10, hours=100)],
+                                                            fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")[0])
+        ok, why = quota.admit(self._core(FakeScarcity([self._w(used=10, hours=100)],
+                                                      fetched_at=self._fresh_now())), "claude", "claude-sonnet-5-5")
+        self.assertTrue(ok, why)
+
+    def test_fable_on_a_weekly_only_reading_with_the_panel_down_uses_the_derived_pool(self):
+        panel = "unavailable (rate limited)"
+        sc = FakeScarcity([self._w(used=10, hours=100, window="week (all models)")], fetched_at=self._fresh_now(), per_model=panel)
+        ok, why = quota.admit(self._core(sc), "claude", "claude-fable-5-1")
+        self.assertTrue(ok, why); self.assertIn("fable", why)
+
+
+class ProviderBackendTests(OutcomeCase):
+    """Judge/generate through the cortados provider (fake urlopen; no network)."""
+
+    def setUp(self):
+        super().setUp()
+        from outcome import provider
+        self.p = provider
+        env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_BACKEND": "provider", "CORTADOS_PROVIDER_URL": "http://fake:1",
+                                           "CORTADOS_PROVIDER_TOKEN": "tok"})
+        env.start(); self.addCleanup(env.stop)
+
+    def _urlopen(self, served, text="ok", seen=None):
+        import io, json as _j
+        class R(io.BytesIO):
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+        def op(req, timeout):
+            if seen is not None:
+                seen.append((req.full_url, _j.loads(req.data), dict(req.header_items())))
+            return R(_j.dumps({"model": served, "content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}).encode())
+        return op
+
+    def test_enabled_only_with_a_url_and_not_forced_local(self):
+        self.assertTrue(self.p.enabled())
+        with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_BACKEND": "local"}):
+            self.assertFalse(self.p.enabled())
+
+    def test_a_call_is_a_sub_pin_with_reveal_and_records_the_serving_lanes_headroom(self):
+        seen = []
+        out = self.p.ask("claude", "claude-fable-5-1", "sys", "u", urlopen=self._urlopen("claude-fable-5-1 · 61% left", "hi", seen))
+        self.assertEqual(out, "hi")
+        url, body, headers = seen[0]
+        self.assertTrue(url.endswith("/v1/messages")); self.assertEqual(body["model"], "sub/claude-fable-5-1")
+        self.assertEqual(headers.get("X-cortados-reveal"), "1")
+        ok, why = self.p.admit("claude"); self.assertTrue(ok); self.assertIn("61%", why)
+        self.p.ask("codex", "gpt-6-astra", "", "u", urlopen=self._urlopen("gpt-6-astra · 3% left"))
+        ok, why = self.p.admit("codex"); self.assertFalse(ok); self.assertIn("3%", why)   # the 95 % stop rule, as % left
+        self.assertTrue(self.p.admit("claude")[0])                                         # per lane
+
+    def test_unrevealed_headroom_holds_unless_allowed(self):
+        self.p.ask("claude", "claude-fable-5-1", "", "u", urlopen=self._urlopen("claude-fable-5-1"))
+        self.assertFalse(self.p.admit("claude")[0])
+        with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_ALLOW_UNREVEALED": "1"}):
+            self.assertTrue(self.p.admit("claude")[0])
+
+    def test_no_reading_yet_admits_and_the_codex_hold_no_longer_needs_a_local_reading(self):
+        ok, why = self.p.admit("codex")
+        self.assertTrue(ok, why)
+        self.assertNotIn("missing or stale", why)
+
+    def test_judge_and_generate_default_to_the_provider(self):
+        from outcome import generate as gen
+        with mock.patch.object(self.p, "ask") as ask:
+            ask.return_value = "[]"
+            gen.generate(limit=1)       # no seeds: nothing called, but the default wiring must not touch the local reading
+            judge.judge(limit=1)
+        with mock.patch.object(quota, "admit", side_effect=AssertionError("local reading used")):
+            judge.judge(limit=1); gen.generate(limit=1)
 
 
 class StoreTests(OutcomeCase):

@@ -12,7 +12,7 @@ import json
 import os
 
 import common
-from outcome import agents, quota, store, tasks
+from outcome import agents, provider, quota, store, tasks
 
 GENERATOR = os.environ.get("CORTADOS_OUTCOME_GENERATOR", "gpt-6-astra")
 # Eight seeds keep one reply well under the CLI's message size with full fixtures. Fewer: more calls for the same
@@ -54,8 +54,11 @@ def _pending_seeds() -> list[dict]:
     return [s for s in store.read("seeds") if s["id"] not in used]
 
 
-def generate(limit: int = 0, ask=agents.ask_codex, admit=None) -> dict:
-    admit = admit or (lambda lane, model: quota.admit(common.core, lane, model))
+def generate(limit: int = 0, ask=None, admit=None) -> dict:
+    # Provider backend (default when CORTADOS_PROVIDER_URL is set): generation runs on the router's pool, pinned sub/<GENERATOR>.
+    via = provider.enabled()
+    ask = ask or (provider.ask_codex if via else agents.ask_codex)
+    admit = admit or (provider.admit if via else (lambda lane, model: quota.admit(common.core, lane, model)))
     seeds = _pending_seeds()[: limit or None]
     counts = {"tasks": 0, "refused": 0, "batches": 0, "failed_batches": 0, "held": 0}
     for k in range(0, len(seeds), BATCH):
