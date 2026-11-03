@@ -1,0 +1,426 @@
+--- a/integrations/mcp/remote_dispatch.py
++++ b/integrations/mcp/remote_dispatch.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Compose owned remote operations with existing routing/job/quota owners.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R014–027,036,041–042.
++# CONTRACT: RT-COWORK-MCP-008 v5 R014–027,036,041–042.
+ # DEPENDS: CoreRuntime, task_store, existing route_task and JobStore.
+ # CEILING: No alternative routing algorithm, paid retry, listener or caller-selected cwd.
+ import asyncio
+@@ -59,13 +59,12 @@
+         try:
+             if principal != runtime.config.principal or not runtime.enabled:
+                 raise s.RemoteError('permission_refused')
+-            if not runtime.ready or runtime.admission_failed or runtime.broker.store.admission_closed:
+-                raise s.RemoteError('storage_error')
++            runtime.authorize(principal, tool)
+             args = s.validate_remote(tool, args, runtime.config)
+             async with runtime.broker.admission_lock:
+                 lock = runtime.task_locks.setdefault(args.get('task_id', ''), asyncio.Lock())
+                 async with lock:
+-                    runtime.authorize(principal)
++                    runtime.authorize(principal, tool)
+                     return await self._dispatch(principal, tool, args)
+         except WorkerError as exc:
+             error = s.from_worker_error(exc)
+@@ -74,6 +73,8 @@
+         except Exception:
+             error = s.RemoteError('storage_error')
+         try:
++            if error.code in ('storage_error', 'policy_unavailable', 'artifact_corrupt'):
++                runtime.fatal()
+             if runtime.broker.store.admission_closed:
+                 runtime.admission_failed = True
+                 runtime.fatal()
+@@ -126,16 +127,17 @@
+                     task = store.transition(tx, owner_id, task.task_id, task.version, 'quarantined')
+                     task = store.save(tx, 'remote_tasks', store.changed(task, cleanup_error=s.RemoteError('storage_error').payload()['error']))
+             return self.task_result(task)
+-        task = store.get_owned(db, owner_id, args['task_id'])
+-        if tool == 'task_get':
+-            return self.task_result(task)
+         if tool.startswith('job_'):
+-            self.job_result(owner_id, task.task_id, args['job_id'])
++            # Unknown/foreign task and job pairs have the same public job refusal.
++            self.job_result(owner_id, args['task_id'], args['job_id'])
+             if tool == 'job_cancel':
+                 await broker.stop(args['job_id'], 'cancel_requested')
+             if tool == 'job_feedback':
+                 return broker.store.feedback({key: value for key, value in args.items() if key != 'task_id'})
+-            return self.job_result(owner_id, task.task_id, args['job_id'], include_result=tool == 'job_result')
++            return self.job_result(owner_id, args['task_id'], args['job_id'], include_result=tool == 'job_result')
++        task = store.get_owned(db, owner_id, args['task_id'])
++        if tool == 'task_get':
++            return self.task_result(task)
+         if task.state == 'quarantined':
+             raise s.RemoteError('task_quarantined')
+         if task.state == 'deleted':
+@@ -189,7 +191,7 @@
+         packet = build_handoff(local, tuple(entries), runtime.base['limits']['max_handoff_bytes'])
+         if tool == 'route':
+             route = await asyncio.to_thread(route_task, local, runtime.base, broker.metadata, handoff_packet=packet.text)
+-            runtime.authorize(principal)
++            runtime.authorize(principal, tool)
+             load_manifest(runtime.manifest_raw, runtime.base, runtime.config.execution_policy)
+             return s.project_remote_result(dict(kind='route', route=route))
+         with broker.store.transaction() as tx:
+@@ -207,7 +209,7 @@
+                 task_group_id=task.group_id, request_id=args['request_id'], argument_hash=argument_hash,
+                 expected_task_version=task.version, input_manifest=entries, execution_policy=runtime.config.execution_policy,
+                 native_manifest=runtime.manifest, handoff=packet, policy_snapshot=runtime.snapshot)
+-            runtime.authorize(principal)
++            runtime.authorize(principal, tool)
+             record, created = broker.store.accept(local, route, cli_version=broker.metadata.version, acceptance_seed=seed)
+         except Exception:
+             if broker.store.admission_closed:
+--- a/integrations/mcp/remote_http.py
++++ b/integrations/mcp/remote_http.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Compose listener-free synthetic MCP HTTP and exact raw transfer routes.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R052,055,075–076,086–087.
++# CONTRACT: RT-COWORK-MCP-008 v5 R052,055,075–076,086–087.
+ # DEPENDS: Existing MCP SDK session manager and already-bound CoreClient.
+ # CEILING: No OAuth, listener, stdio startup, identity headers or task lifetime ownership.
+ from contextlib import asynccontextmanager
+@@ -129,6 +129,7 @@
+             await self.transfer(scope, receive, send, match[1])
+ 
+         async def transfer(self, scope, receive, send, ticket_id):
++            entered = time.monotonic()
+             headers = {}
+             duplicate = False
+             for key, value in scope['headers']:
+@@ -136,13 +137,30 @@
+                 duplicate = duplicate or key in headers
+                 headers[key] = value.decode('latin-1')
+             lease_id = None
+-            started = False
++            state = 'not_attempted'
+             complete = False
+-            total = time.monotonic() + config.limits.transfer_total_ms / 1000
+-            idle = time.monotonic() + config.limits.transfer_idle_ms / 1000
++            total = entered + config.limits.transfer_total_ms / 1000
++            idle = entered + config.limits.transfer_idle_ms / 1000
+             async def bounded(call, *args):
+-                async with asyncio.timeout_at(min(total, idle)):
+-                    return await call(*args)
++                deadline = min(total, idle)
++                if time.monotonic() >= deadline:
++                    raise TimeoutError()
++                async with asyncio.timeout_at(deadline):
++                    result = await call(*args)
++                if time.monotonic() >= deadline:
++                    raise TimeoutError()
++                return result
++            async def emit(message):
++                nonlocal state
++                if message['type'] == 'http.response.start':
++                    if state != 'not_attempted':
++                        raise s.RemoteError('storage_error')
++                    state = 'headers_attempted'
++                await bounded(send, message)
++                if message['type'] == 'http.response.start':
++                    state = 'headers_complete'
++                elif not message.get('more_body', False):
++                    state = 'finished'
+             def progress():
+                 nonlocal idle
+                 idle = time.monotonic() + config.limits.transfer_idle_ms / 1000
+@@ -182,19 +200,18 @@
+                     if not result['ok']:
+                         raise s.RemoteError(**result['error'])
+                     complete = True
+-                    await bounded(_json, send, 201, result)
++                    await bounded(_json, emit, 201, result)
+                 else:
+                     if b'range' in headers:
+                         complete = True
+-                        await _json(send, 416, s.RemoteError('invalid_request').payload())
++                        await bounded(_json, emit, 416, s.RemoteError('invalid_request').payload())
+                         return
+                     artifact = opened['artifact']
+                     disposition = 'attachment; filename="artifact-' + artifact['artifact_id'] + '"; filename*=UTF-8\'\'' + quote(artifact['filename'], safe='')
+-                    await bounded(send, {'type': 'http.response.start', 'status': 200, 'headers': [
++                    await emit({'type': 'http.response.start', 'status': 200, 'headers': [
+                         (b'content-type', b'application/octet-stream'), (b'content-length', str(artifact['bytes']).encode()),
+                         (b'etag', ('"' + artifact['sha256'] + '"').encode()), (b'x-content-type-options', b'nosniff'),
+                         (b'cache-control', b'no-store'), (b'content-disposition', disposition.encode('ascii'))]})
+-                    started = True
+                     offset = 0
+                     while True:
+                         frame = await bounded(core_client.stream, 'read_chunk', {'lease_id': lease_id, 'offset': offset, 'max_bytes': config.limits.chunk_bytes})
+@@ -202,25 +219,24 @@
+                         if not result['ok']:
+                             raise s.RemoteError(**result['error'])
+                         offset = result['offset']
+-                        await bounded(send, {'type': 'http.response.body', 'body': frame['body'], 'more_body': not result['eof']})
++                        await emit({'type': 'http.response.body', 'body': frame['body'], 'more_body': not result['eof']})
+                         if frame['body']:
+                             progress()
+                         if result['eof']:
+                             complete = True
+                             break
+-            except TimeoutError as exc:
+-                if started:
++            except (TimeoutError, s.RemoteError) as exc:
++                if state != 'not_attempted' or time.monotonic() >= min(total, idle):
+                     raise s.RemoteError('timeout') from exc
+-                async with asyncio.timeout(config.limits.transfer_idle_ms / 1000):
+-                    await _json(send, 408, s.RemoteError('timeout').payload())
+-            except s.RemoteError as exc:
+-                if started:
+-                    raise
+-                async with asyncio.timeout(config.limits.transfer_idle_ms / 1000):
+-                    await _json(send, STATUS.get(exc.code, 503), exc.payload())
++                error = s.RemoteError('timeout') if isinstance(exc, TimeoutError) else exc
++                await bounded(_json, emit, STATUS.get(error.code, 503), error.payload())
+             finally:
++                if time.monotonic() >= min(total, idle):
++                    await core_client.close()
+                 if lease_id is not None and not core_client.closed:
+                     try:
++                        if time.monotonic() >= min(total, idle):
++                            raise TimeoutError()
+                         await bounded(core_client.stream, 'close',
+                                       {'lease_id': lease_id, 'reason': 'complete' if complete else 'abort'})
+                     except TimeoutError:
+--- a/integrations/mcp/file_transfer.py
++++ b/integrations/mcp/file_transfer.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Own open broker descriptors and exact bounded lease byte operations.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R045,047,051–057.
++# CONTRACT: RT-COWORK-MCP-008 v5 R045,047,051–057.
+ # DEPENDS: artifact_store, transfer_tickets and JobStore transactions.
+ # CEILING: No framing, listener, text conversion or descriptor transfer to frontend.
+ import os
+@@ -74,9 +74,11 @@
+     runtime = _runtime()
+     if lease.lease_id not in runtime.leases:
+         raise s.RemoteError('ticket_invalid')
+-    if not runtime.enabled or not runtime.ready or runtime.admission_failed:
+-        close(lease, 'abort')
+-        raise s.RemoteError('permission_refused' if not runtime.enabled else 'storage_error')
++    try:
++        runtime.authorize(runtime.config.principal, 'put_chunk' if lease.direction == 'put' else 'read_chunk')
++    except s.RemoteError:
++        close(lease, 'abort')
++        raise
+     lease = runtime.leases[lease.lease_id]
+     now = int(time.monotonic() * 1000)
+     if now >= min(lease.deadline_ms, lease.idle_deadline_ms):
+--- a/integrations/mcp/remote_runtime.py
++++ b/integrations/mcp/remote_runtime.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Own the complete local-core lock, recovery, sessions and worker lifetime.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R010–018,068–070,074.
++# CONTRACT: RT-COWORK-MCP-008 v5 R010–018,068–070,074.
+ # DEPENDS: Existing Broker/JobStore, remote owners and descriptor-relative roots.
+ # CEILING: No listener, installation, credential discovery, OAuth or automatic relaunch.
+ import asyncio
+@@ -36,19 +36,24 @@
+         self.ready = False
+         self.enabled = False
+         self.admission_failed = False
++        self.capacity_failed = False
++        self.fatal_failed = False
+         self.fatal_signalled = False
+         self.fatal_signal_failed = False
+         self.token = None
+         self.task_locks = {}
+ 
+-    def authorize(self, principal):
++    def authorize(self, principal, operation=None):
+         if principal != self.config.principal or not self.enabled:
+             raise s.RemoteError('permission_refused')
+-        if not self.ready or self.admission_failed or self.broker.store.admission_closed:
++        if not self.ready or self.fatal_failed or self.broker.store.admission_closed:
+             raise s.RemoteError('storage_error')
++        if self.capacity_failed and operation not in ('attach', 'bind', 'task_get', 'job_status', 'job_result', 'job_cancel', 'close'):
++            raise s.RemoteError('capacity_exhausted')
+ 
+     def fatal(self):
+         self.admission_failed = True
++        self.fatal_failed = True
+         if self.broker:
+             self.broker.store.admission_closed = True
+         for timer in self.lease_timers.values():
+@@ -178,6 +183,7 @@
+     async def attach(self, server_socket, principal):
+         if not self.ready or principal != self.config.principal or not self.enabled:
+             raise s.RemoteError('permission_refused')
++        self.authorize(principal, 'attach')
+         if server_socket.family != socket.AF_UNIX or server_socket.type != socket.SOCK_STREAM:
+             raise s.RemoteError('permission_refused')
+         from .remote_ipc import serve_endpoint
+--- a/integrations/mcp/remote_ipc.py
++++ b/integrations/mcp/remote_ipc.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Own the sole bounded socketpair frame codec and private client protocol.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R013,043–047 and section 4 operation table.
++# CONTRACT: RT-COWORK-MCP-008 v5 R013,043–047 and section 4 operation table.
+ # DEPENDS: Trusted CoreBroker, raw sockets, remote records and transfer descriptor owner.
+ # CEILING: No listener, socket paths, frontend database, resend or implicit job cancellation.
+ import asyncio
+@@ -40,11 +40,18 @@
+     return header, await _exact(sock, header['body_bytes'])
+ 
+ 
+-async def _write(sock, header, body, limits):
++def _encode(header, body, limits):
+     data = s.json_bytes(header)
+     if not 0 < len(data) <= limits.control_bytes or len(body) > limits.chunk_bytes:
+         raise s.RemoteError('output_limit', 'Control response exceeds configured bound')
+-    await asyncio.get_running_loop().sock_sendall(sock, struct.pack('!I', len(data)) + data + body)
++    return struct.pack('!I', len(data)) + data + body
++
++
++async def _write(sock, header, body, limits, *, deadline=None, encoded=None):
++    frame = _encode(header, body, limits) if encoded is None else encoded
++    if deadline is not None and time.monotonic() >= deadline:
++        raise TimeoutError()
++    await asyncio.get_running_loop().sock_sendall(sock, frame)
+ 
+ 
+ class CoreClient:
+@@ -115,7 +122,6 @@
+ 
+ 
+ async def _stream(runtime, connection_id, op, args, body):
+-    runtime.authorize(runtime.config.principal)
+     if not isinstance(args, dict) or set(args) != set(STREAM_FIELDS[op]):
+         raise s.RemoteError('invalid_request')
+     for key in ('ticket_id', 'lease_id'):
+@@ -125,6 +131,14 @@
+         raise s.RemoteError('invalid_request')
+     if 'capability' in args and not isinstance(args['capability'], str):
+         raise s.RemoteError('invalid_request')
++    if op != 'close':
++        try:
++            runtime.authorize(runtime.config.principal, op)
++        except s.RemoteError:
++            lease = runtime.leases.get(args.get('lease_id'))
++            if lease is not None and lease.connection_id == connection_id:
++                transfer.close(lease, 'abort')
++            raise
+     if op in ('open_put', 'open_get'):
+         if type(args.get('content_length', 0)) is not int or args.get('content_length', 0) < 0:
+             raise s.RemoteError('invalid_request')
+@@ -147,7 +161,11 @@
+         result = {'ok': True, 'lease_id': lease.lease_id}
+         result.update(offset=0) if direction == 'put' else result.update(artifact=s.artifact_projection(artifact))
+         return result, b''
++    if op == 'close' and args['reason'] not in ('complete', 'disconnect', 'timeout', 'abort'):
++        raise s.RemoteError('invalid_request')
+     lease = runtime.leases.get(args['lease_id'])
++    if lease is None and op == 'close':
++        return {'ok': True}, b''
+     if lease is None or lease.connection_id != connection_id:
+         raise s.RemoteError('ticket_invalid')
+     if op == 'put_chunk':
+@@ -157,8 +175,6 @@
+     if op == 'read_chunk':
+         result = transfer.read_chunk(lease, args['offset'], args['max_bytes'])
+         return {'ok': True, 'offset': result.offset, 'eof': result.eof}, result.body
+-    if args['reason'] not in ('complete', 'disconnect', 'timeout', 'abort'):
+-        raise s.RemoteError('invalid_request')
+     transfer.close(lease, args['reason'])
+     return {'ok': True}, b''
+ 
+@@ -177,6 +193,8 @@
+             close_after = False
+             result_body = b''
+             op = header.get('op')
++            request_args = header.get('args', {})
++            prior_lease = runtime.leases.get(request_args.get('lease_id')) if isinstance(request_args, dict) and isinstance(request_args.get('lease_id'), str) else None
+             try:
+                 if (set(header) != {'v', 'seq', 'op', 'body_bytes', 'args'} or type(header['v']) is not int
+                         or header['v'] != 1 or type(header['seq']) is not int or header['seq'] != seq
+@@ -191,6 +209,7 @@
+                         raise s.RemoteError('invalid_request')
+                     if s.Principal(**args['principal']) != principal or args['config_digest'] != runtime.snapshot.config_digest:
+                         raise s.RemoteError('permission_refused')
++                    runtime.authorize(principal, 'bind')
+                     bound, close_after = True, False
+                     result = {'ok': True, 'connection_id': connection_id}
+                 elif op == 'bind':
+@@ -214,22 +233,32 @@
+                     runtime.fatal()
+                     close_after = True
+                 result = s.RemoteError('storage_error').payload()
++            deadline = time.monotonic() + limits.ipc_idle_ms / 1000
++            args = header.get('args', {})
++            lease = runtime.leases.get(args.get('lease_id')) if isinstance(args, dict) else None
++            if lease is None and isinstance(result, dict):
++                lease = runtime.leases.get(result.get('lease_id'))
++            if lease is None:
++                lease = prior_lease
++            if lease is not None and lease.connection_id == connection_id:
++                deadline = min(deadline, lease.deadline_ms / 1000, lease.idle_deadline_ms / 1000)
+             response = dict(v=1, seq=seq, op=op, body_bytes=len(result_body), result=result)
++            # Validate before the only write; uncertain sends cannot select a fallback.
+             try:
+-                timeout_ms = limits.ipc_idle_ms
+-                args = header.get('args', {})
+-                lease = runtime.leases.get(args.get('lease_id')) if isinstance(args, dict) else None
+-                if lease is not None and lease.connection_id == connection_id:
+-                    timeout_ms = min(timeout_ms, lease.deadline_ms - int(time.monotonic() * 1000),
+-                                     lease.idle_deadline_ms - int(time.monotonic() * 1000))
+-                async with asyncio.timeout(max(0, timeout_ms) / 1000):
+-                    await _write(socket, response, result_body, limits)
++                encoded = _encode(response, result_body, limits)
+             except s.RemoteError:
+                 lease_id = result.get('lease_id')
+                 if lease_id in runtime.leases:
+                     transfer.close(runtime.leases[lease_id], 'abort')
+                 response.update(body_bytes=0, result=s.RemoteError('output_limit', 'Control response exceeds configured bound').payload())
+-                await _write(socket, response, b'', limits)
++                result_body = b''
++                if time.monotonic() >= deadline:
++                    raise TimeoutError()
++                encoded = _encode(response, result_body, limits)
++            if time.monotonic() >= deadline:
++                raise TimeoutError()
++            async with asyncio.timeout_at(deadline):
++                await _write(socket, response, result_body, limits, deadline=deadline, encoded=encoded)
+             seq += 1
+             if close_after:
+                 break
+--- a/integrations/mcp/remote_capacity.py
++++ b/integrations/mcp/remote_capacity.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Measure logical payload extents and own reservation arithmetic/monitoring.
+-# CONTRACT: RT-COWORK-MCP-008 v4 R064–067; monitoring is not a hard filesystem quota.
++# CONTRACT: RT-COWORK-MCP-008 v5 R064–067; monitoring is not a hard filesystem quota.
+ # DEPENDS: Runtime root descriptors, task_store SQL and existing Broker.stop.
+ # CEILING: No retention cleanup, quota policy replacement or optimistic write credit.
+ import asyncio
+@@ -115,11 +115,17 @@
+                 limits = self.runtime.config.limits
+                 installation_bad = (self.unknown or usage.installation_measured_bytes + usage.installation_promised_bytes > limits.installation_bytes
+                                     or usage.free_bytes < usage.installation_promised_bytes + limits.disk_headroom_bytes)
++                if installation_bad:
++                    self.runtime.capacity_failed = True
++                    self.runtime.admission_failed = True
+                 for item in usage.tasks:
+                     task = store.get_owned(self.runtime.broker.store.db, item.owner_id, item.task_id)
+                     bad = (installation_bad or task.task_id in self.invalid_tasks
+                            or item.measured_bytes + item.promised_bytes > task.policy.limits.task_bytes
+                            or item.artifact_slots > task.policy.limits.artifacts_per_task)
++                    if bad:
++                        self.runtime.capacity_failed = True
++                        self.runtime.admission_failed = True
+                     if bad and task.active_job_id:
+                         await self.runtime.broker.stop(task.active_job_id, 'capacity_exhausted')
+                     if task.task_id in self.invalid_tasks and task.state not in ('deleted', 'quarantined', 'busy'):
+@@ -127,7 +133,10 @@
+                             store.transition(tx, task.owner_id, task.task_id, task.version, 'quarantined')
+                 if time.monotonic() - start > interval:
+                     raise s.RemoteError('capacity_exhausted')
+-            except (OSError, s.RemoteError):
++            except (OSError, s.RemoteError) as exc:
++                if isinstance(exc, s.RemoteError) and exc.code != 'capacity_exhausted':
++                    self.runtime.fatal()
++                self.runtime.capacity_failed = True
+                 self.runtime.admission_failed = True
+                 for record in self.runtime.broker.store.active():
+                     if record.get('execution_kind') == 'cowork_remote_v1':

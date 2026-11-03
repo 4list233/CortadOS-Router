@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/.cowork-core-evidence/attempt-2/diagnostic.py", line 18, in <module>
+    with patch('integrations.mcp.broker.host_boot_id', return_value='private-diagnostic-boot'):
+         ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1510, in __enter__
+    original, local = self.get_original()
+                      ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1480, in get_original
+    raise AttributeError(
+        "%s does not have the attribute %r" % (target, name)
+    )
+AttributeError: <module 'integrations.mcp.broker' from '/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py'> does not have the attribute 'host_boot_id'

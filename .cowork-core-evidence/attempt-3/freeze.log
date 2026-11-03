@@ -1,0 +1,22 @@
+{
+  "protected_identity": {
+    "contracts_sha256": {
+      "checked": 3,
+      "mismatches": []
+    },
+    "protected_prior_sha256": {
+      "checked": 641,
+      "mismatches": []
+    },
+    "fixture_files_sha256": {
+      "checked": 18,
+      "mismatches": []
+    }
+  },
+  "manifest_sha256": "585527a2aaca7780d0ca9509b92e466e7d891147d9866d13be01809643fc8967",
+  "head": "62fcd07b2e6a416dc4d1aee921f57e93a1966fc5",
+  "correction_patch_sha256": "8042de88889a8f35e91f69687a08895ee02f253938f683036f38d62bdc14983f",
+  "candidate_patch_sha256": "4176f43a551f067834242aeb5361ed2f708e2304059cae07497f7530f744be2c",
+  "compile": "18/18; no pycache",
+  "prior_reconstruction": "all18 match attempt-2 terminal source hashes"
+}

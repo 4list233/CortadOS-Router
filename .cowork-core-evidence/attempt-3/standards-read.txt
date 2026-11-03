@@ -1,0 +1,475 @@
+<!-- PURPOSE: Operating rules for the single orchestrating agent that owns a contract suite.
+     It dispatches builders and verifies their handbacks. It never writes production code.
+     CONTRACT: §1 is absolute. An orchestrator that also builds cannot run Rubric B honestly on its
+     own work, and Rubric B is the only thing between a plausible handback and a wrong one.
+     DEPENDS: CONVENTIONS.md, RUBRIC.md, and the project's contract index.
+     CEILING: Runs the suite. Approves no contract and resolves no ESCALATE — both are the owner's. -->
+
+# Orchestration
+
+**Audience:** the orchestrating agent, and nobody else. Builder agents read their own execution
+subcontract plus `CONVENTIONS.md`, `RUBRIC.md` and the engineering standard; they do not read this file.
+
+---
+
+## 1 · The one hard rule
+
+> **The orchestrator never writes production code.**
+
+Not a fix, not a one-liner, not "while I was in there". It reads, gates, dispatches, verifies,
+records and escalates. Every line of production code is written by a builder agent against an
+`approved` execution subcontract.
+
+**Why this is absolute rather than a preference.** An orchestrator that also builds cannot run
+Rubric B honestly on its own work. The moment it holds both roles, `B1` ("re-run by the
+orchestrator") becomes self-certification — which `D2.2` already names as the defining defect of a
+weak acceptance criterion.
+
+The orchestrator MAY write: contract files, fixtures it is dispatching with, the attempt ledger,
+design-error packets, and its own notes. It MUST NOT write anything under the project's production
+source paths `[PROJECT: list them]`.
+
+## 2 · What the orchestrator owns
+
+| Owns | Does not own |
+|---|---|
+| Dispatching **contract-author** sub-agents, and gating what they return | Approving a contract — the owner holds design authority |
+| Deciding dispatch order from the dependency graph | Changing a system contract to unblock a builder |
+| Assembling and handing each builder its package | Implementing anything a builder failed to |
+| Re-running Rubric B on every handback | Waiving a failed acceptance criterion |
+| Maintaining the attempt ledger | Authorising a third attempt |
+| Detecting D-REPEAT and D-CLUSTER | Resolving an `[ESCALATE]` |
+| Producing the design-error packet | Deciding the redesign |
+
+Anything in the right-hand column is the owner's, and reaching it means the orchestrator stops and
+returns the question.
+
+## 3 · The builder package
+
+Two kinds of sub-agent exist.
+
+A **contract author** writes contract files and no production code. It receives the plan section it
+covers, the exemplar contract, and all four standards.
+
+A **builder** writes production code inside its `scope_paths` and receives exactly this, and
+nothing else:
+
+1. its **execution subcontract**, complete and self-contained;
+2. the **parent system contract** it implements, at the pinned version;
+3. `CONVENTIONS.md`, `RUBRIC.md` and `standards/00-ENGINEERING-STANDARD.md` (ENG-01–13 bind the
+   builder; the QA gates in `01-QA-GATES.md` are run by the orchestrator and need not be read);
+4. the **committed acceptance tests and fixtures** in its `acceptance_paths`, read-only;
+5. its `scope_paths` and `excluded_paths`.
+
+It does **not** receive the conversation that produced the contract, the product plan, or the other
+contracts.
+
+**If the contract cannot be executed from that package alone, the contract is defective.** That is
+`DESIGN-GUIDELINE.md` §1, and the fix is to revise the contract — never to send more context. Every
+time you send more context you convert a permanent, findable defect into a private one that will
+recur on the next dispatch.
+
+The orchestrator itself may read the plan when it gates contracts or audits coverage. The ban is on
+using that knowledge to fill a gap in a builder's package. Two hats, one agent: *governance* reads
+the plan; *dispatch* does not. (Ratified 2026-10-07 from `INTEGRATION-REVIEW.md` §2.)
+
+## 4 · The dispatch gate
+
+An execution subcontract MAY be dispatched only when **all seven** hold:
+
+1. every system contract it depends on is `approved`;
+2. its copied acceptance criteria match the parent **byte-for-byte**;
+3. its `acceptance_paths` exist and are committed;
+4. its `scope_paths` overlap no currently-dispatched contract;
+5. its Rubric D total is zero;
+6. its Rubric A total is zero;
+7. its attempt ledger is empty, or holds exactly one valid failed attempt.
+
+Any `[ESCALATE]` in the contract, or in anything it depends on, fails gates 1 and 6. **Do not
+dispatch and do not pick a default.**
+
+```mermaid
+flowchart TD
+  A["Contract reaches the orchestrator"] --> B{"Rubric D == 0?"}
+  B -->|no| R1["Return to owner: ambiguous.<br>Rubric A is not run."]
+  B -->|yes| C{"Rubric A == 0?"}
+  C -->|no| R2["Return to owner: not buildable."]
+  C -->|yes| D{"Any ESCALATE here<br>or upstream?"}
+  D -->|yes| R3["Stop. Return the question.<br>Never default."]
+  D -->|no| E{"scope_paths free?"}
+  E -->|no| Q["Queue behind the holder.<br>Never dispatch overlapping writers."]
+  E -->|yes| F{"Fixtures committed?"}
+  F -->|no| R4["Build fixtures first.<br>Not during the build."]
+  F -->|yes| G["DISPATCH builder with the §3 package"]
+  G --> H["Builder returns handback"]
+  H --> I{"Rubric B == 0?"}
+  I -->|yes| V["verified · release scope_paths · unblock dependents"]
+  I -->|no| J{"Attempt ledger?"}
+  J -->|"0 failures"| K["Record attempt 1.<br>Authorise attempt 2, same design."]
+  J -->|"1 failure"| L["design_error.<br>Stop downstream. Packet to owner."]
+```
+
+## 5 · Parallelism
+
+Builders run in parallel **only** when their `scope_paths` are disjoint. Two builders writing the
+same file is not a merge problem, it is an ownership defect — `A1.6` exists to catch it at authoring
+time, and the orchestrator enforces it again at dispatch.
+
+The dependency graph in the contract index is the ordering authority. The orchestrator MAY dispatch
+any set of contracts whose dependencies are all `verified` and whose paths are disjoint.
+
+**Do not widen a builder's scope to avoid queueing.** A contract that needs a path another contract
+owns is a dependency, not a scope extension.
+
+## 6 · Handback verification
+
+On every handback the orchestrator runs Rubric B **itself**, from a clean checkout:
+
+- re-runs each AC by its named command — a builder's report that a test passed is not evidence;
+- diffs the branch and confirms every changed file is inside `scope_paths` and none is in `acceptance_paths`;
+- confirms no contract file was modified by the builder;
+- runs the existing regression suites for `B5`;
+- records which `[BOUNDED]` option was chosen and the stated reason.
+
+`B2` is the one to be strict about. **Narration is not evidence.** A row from the database, a file
+on disk, a returned ID, a process state — those are evidence. *"I implemented the claim table and it
+works"* is a claim of success and scores a defect.
+
+## 7 · Escalation
+
+The orchestrator stops and returns to the owner when any of these is true:
+
+| Trigger | What goes back |
+|---|---|
+| An `[ESCALATE]` blocks a contract | The question, what it blocks, and what is still dispatchable without it |
+| Attempt 2 fails | The full design-error packet (`RUBRIC.md`) |
+| D-CLUSTER trips | The three-plus defects, and the candidate missing entity |
+| A builder requests a system-contract change | The requested change and why the builder believes it necessary |
+| A contract's assumption is contradicted by the code | The `file:line` that contradicts it, per `D5.3` |
+
+**Everything not blocked keeps moving.** An escalation blocks the contracts named on it and nothing
+else. The orchestrator reports what is blocked *and what it is proceeding with* — an escalation that
+silently halts the whole fleet is a scheduling failure dressed up as diligence.
+
+## 8 · What the orchestrator records
+
+A running ledger, one row per dispatch:
+
+```text
+contract_id · version · builder · dispatched_at · scope_paths
+handback_at · rubric_b_total · failing_ac_ids · bounded_choices
+outcome ∈ verified | attempt_1_failed | attempt_2_failed | design_error | blocked
+```
+
+`blocked` is distinct from `attempt_N_failed` and does **not** increment the ledger.
+
+## 9 · What good orchestration looks like
+
+- **Contracts are gated before builders are spawned**, never after. A builder dispatched against an
+  ungated contract wastes its whole run.
+- **Fixtures exist before dispatch** (`A5.5`). A builder asked to produce its own fixtures grades
+  itself.
+- **The dependency graph is respected even when a builder is idle.** Idle capacity is cheaper than a
+  contract built against an unverified parent.
+- **Every handback is re-run, including the ones that look obviously fine.** The obvious ones are
+  where self-certification hides.
+- **Escalations are frequent early and rare later.** An orchestrator that never escalates is
+  guessing.
+<!-- PURPOSE: The method itself. Eleven phases, in order, with what each produces and what it
+     prevents. This is the document to read before starting a project.
+     CONTRACT: Phases 1-4 are not reorderable. Each one's output is the next one's input, and
+     skipping one produces a contract suite that looks complete and is not.
+     DEPENDS: CONVENTIONS.md, DESIGN-GUIDELINE.md, RUBRIC.md, ORCHESTRATION.md — the artifacts
+     phases 5-7 produce and consume.
+     CEILING: Describes how to get to a dispatchable contract suite. Says nothing about how the
+     resulting code is released; that is a per-project delivery plan. -->
+
+# The Playbook
+
+How to go from *"we need to rebuild this"* to a contract suite an agent fleet can build from
+without asking a question.
+
+Eleven phases. Phases 1–4 are **not reorderable** — each output is the next input. Phases 5–8 have
+some latitude. Phases 9–11 are the checks, and they are where the method earns its cost.
+
+```mermaid
+flowchart TD
+  P0["0 · DECIDE<br>is this project worth contracting at all"]
+  P1["1 · TOPOLOGY<br>read the existing system<br>output: restraint, not a document"]
+  P2["2 · NARRATION<br>the human walks the day, screen by screen<br>output: raw requirements"]
+  P3["3 · DECISION TREES<br>every branch drawn in Mermaid<br>output: ratified decisions"]
+  P4["4 · ARTIFACTS<br>open the real files<br>output: the facts that break assumptions"]
+  P5["5 · PLAN<br>one product authority<br>output: PLAN.md"]
+  P6["6 · STANDARDS<br>conventions, guideline, rubric, orchestration<br>output: the four docs"]
+  P7["7 · EXEMPLAR<br>one contract, hand-written<br>output: the shape everything copies"]
+  P8["8 · INDEX<br>built from find, never from memory<br>output: README.md with verified scope_paths"]
+  P9["9 · AUTHOR<br>parallel sub-agents, one contract each<br>output: the suite"]
+  P10["10 · AUDIT<br>coverage audit, then cold-read walkthrough<br>output: the contradictions"]
+  P11["11 · GATE<br>Rubric D then A, per contract<br>output: dispatchable, or escalations"]
+
+  P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9 --> P10 --> P11
+  P10 -->|"contradictions found"| P5
+  P11 -->|"any defect"| P9
+```
+
+---
+
+## Phase 0 · Decide whether to do this at all
+
+Before anything: this method costs roughly **half a line of contract per line of code**. On the
+reference project, ~11,000 lines of contract preceded the build.
+
+Run it only if all three hold:
+
+1. **Agents build in parallel, without a human reading each diff.** The contract replaces the code
+   review that would otherwise happen after the fact.
+2. **A wrong build is expensive to detect.** If your failures are loud and immediate, write tests
+   instead.
+3. **The system outlives the conversation.** Contracts are how a decision survives into a session
+   with no memory of why it was made.
+
+For anything smaller, take the five ideas from `README.md` §6 and skip the apparatus.
+
+## Phase 1 · Topology — read before you design
+
+Read the existing system. Not to plan; to stop yourself proposing a rebuild of code that works.
+
+Use an offline AST tool over the repository rather than reading files one by one — you want the
+shape (what calls what, what is dead, what is load-bearing) before you have opinions.
+
+**This phase produces no document.** It produces restraint, and restraint is the thing that stops
+Phase 9 from quietly re-deriving 16,000 lines of working service code.
+
+> **What it prevents:** the single most expensive agent failure, which is a competent rebuild of
+> something that already existed and worked.
+
+## Phase 2 · Narration — the human walks the day
+
+Sit with the person who does the work and have them narrate it, **screen by screen, in order**.
+Not a requirements interview. A walkthrough of a real day.
+
+Ask about the exceptions as they arise — *what happens when the truck breaks down, when the crew
+finds the tree dead, when it rains* — but let them drive the sequence.
+
+**Everything in the eventual contract suite should be traceable to this phase.** If a requirement
+originates from you imagining what such a system needs, mark it and check it. That is where
+invented requirements enter.
+
+> **What it prevents:** a system that is internally coherent and describes a job nobody does.
+
+## Phase 3 · Decision trees — make the branches visible
+
+Convert the narration into Mermaid decision trees. Every scenario, every branch, every terminal
+state. Then hand them back to the human.
+
+The whole purpose is to make it **cheap to say "no, not that branch."** Prose hides branches — a
+reader nods along and the disagreement surfaces three weeks into the build. A tree cannot hide one:
+every fork is drawn, and an unratified fork is visibly unratified.
+
+This is the conversion step. Narration in, **ratified decisions** out.
+
+> **What it prevents:** the disagreement that surfaces after the code is written, when changing it
+> is a redesign rather than an edit.
+
+## Phase 4 · Artifacts — open the real files
+
+Get the actual spreadsheets, the actual API responses, the actual database rows. Open them. Not the
+documentation of them, not a description, not a remembered shape.
+
+**This is the phase that pays for the method.** On the reference project it produced three facts
+that no amount of careful thinking would have found:
+
+- Two files carried **different coordinate systems under identical column headers**, one with its
+  axes reversed relative to its own header names.
+- 594 of 4,756 asset numbers carried **leading zeros that were part of their identity** — so the
+  key is a string, forever, and any integer parse silently corrupts 12% of the data.
+- Seven status strings had to be reproduced **byte-exact**, including a trailing space in one of
+  them, because a downstream system matched on them literally.
+
+None of the three is inferable. All three are build-breaking. All three took one afternoon of
+opening files.
+
+**Rule:** if you cannot record a real sample of a payload the contract consumes, the contract is
+not ready to be written. Go dump it first.
+
+> **What it prevents:** a contract authored against a remembered shape, whose failure presents as a
+> data-quality outlier rather than as the specification error it is.
+
+## Phase 5 · The plan — one product authority
+
+Write one document that holds every ratified decision from Phase 3 and every fact from Phase 4.
+Call it `PLAN.md`. Number the sections so contracts can cite them.
+
+Its job is to be **the place a decision lives**, so a contract can cite it rather than re-argue it,
+and so two contracts cannot quietly ratify different versions of the same thing.
+
+It also holds the **open items** — the decisions nobody has made yet. Those become `[ESCALATE]`
+tags downstream, and they are the honest output of this phase. A plan with no open items after a
+real Phase 2 is a plan that guessed.
+
+> **What it prevents:** two contracts, both internally consistent, that disagree.
+
+## Phase 6 · Standards — write the rules before the contracts
+
+Copy the four documents from this repository and fill in their project slots:
+
+| Document | Project slots to fill |
+|---|---|
+| `CONVENTIONS.md` | global conventions table, area codes, entity vocabulary, hard constraints |
+| `DESIGN-GUIDELINE.md` | the anti-pattern table — replace the examples with defects from *your* codebase |
+| `RUBRIC.md` | usually unchanged; add checks when an audit finds a gap the rubric missed |
+| `ORCHESTRATION.md` | the paths the orchestrator must not write to |
+
+`templates/PROJECT-CONVENTIONS.md` is the fill-in sheet.
+
+**Do this before writing any contract.** Sixteen authors working against rules written afterwards
+produce sixteen documents that then have to be reconciled.
+
+> **What it prevents:** a reconciliation pass that costs more than the contracts did.
+
+## Phase 7 · The exemplar — hand-write exactly one
+
+Write one complete system contract yourself. By hand. All of it.
+
+Pick the one that owns the schema, or whatever the most structurally central component is —
+everything else will reference it, so getting its vocabulary right propagates.
+
+**Sixteen authors copying one artifact produce a suite. Sixteen authors reading a style guide
+produce sixteen documents.** This is the highest-leverage hour in the whole method, and there is no
+way to delegate it: the exemplar *is* the specification of what a contract looks like here, and it
+only works if it is genuinely good.
+
+> **What it prevents:** a suite where every contract is individually acceptable and no two are
+> shaped alike, which is unreadable in aggregate and impossible to gate consistently.
+
+## Phase 8 · The index — built from `find`, never from memory
+
+Build the contract index: every contract ID, its area, its owner, and its `scope_paths` — the exact
+files it may write.
+
+**Every path in that index must come from a shell command you actually ran.** `find`, `ls`, `git
+ls-files`. Not from prose, not from memory, not from the plan.
+
+This phase is numbered 8 because on the reference project it was originally done from prose, and
+four claimed paths did not exist while 2,351 lines across 27 handlers ended up owned by nobody. The
+rubric caught neither, because it checked that no path appeared in *two* contracts and never checked
+that every required path appeared in *one*. A path in two contracts was a defect; a path in zero was
+invisible. That asymmetry produced an unwinnable review before a single line of code was written.
+
+The fix was two new rubric checks (`A1.8` path exists, `A1.9` every required path is owned) and this
+phase.
+
+> **What it prevents:** work that no contract owns, discovered when a builder needs to write a file
+> and has no authority to.
+
+## Phase 9 · Author in parallel
+
+Dispatch one sub-agent per system contract. Each one gets, and only gets:
+
+1. `AUTHORING-BRIEF.md` with the project slots filled;
+2. the exemplar from Phase 7;
+3. the four standards from Phase 6;
+4. the plan from Phase 5;
+5. its own row from the index in Phase 8.
+
+Each writes **exactly one file** and no production code. Each finishes with a self-grade against
+Rubric D and Rubric A, naming any defect it could not close and why.
+
+The self-grade is not ceremony. An author that names its own unclosed defect has converted a hidden
+soft spot into a tracked one, which is the entire objective.
+
+> **What it prevents:** the serialisation that makes a large suite take weeks — and, via the shared
+> brief and exemplar, the divergence that usually makes parallel authoring not worth it.
+
+## Phase 10 · Audit — two different readers, two different blind spots
+
+Two audits, and they are not interchangeable.
+
+**10a · Coverage audit.** Does every requirement in the plan have a home in exactly one contract?
+Run it against the plan and the index. On the reference project this found four orphaned
+requirements — stories had been deleted and their requirements went with them.
+
+**10b · The cold-read walkthrough.** This is the important one, and it is the check most people
+skip.
+
+Dispatch a fresh agent — a strong one — that reads **only the contracts**. No plan. No repository.
+No access to the conversation. Ask it for one thing:
+
+> *Write the manual. How does this finished system behave and feel, based on the contracts alone?*
+
+Then read what comes back and look for two things: what it got **wrong**, and what it **could not
+determine**. Both are specification defects, and this reader is the only one who can find them,
+because it is the only reader who cannot unconsciously patch a gap from memory. You cannot do this
+yourself. Neither can anyone who was in the room.
+
+On the reference project this found **seven contradictions** that the coverage audit, the rubric
+self-grades and two human passes had all missed — including two contracts declaring different
+column sets for the same table, and two contracts giving coordinates for the same physical location
+4 km apart.
+
+It also found the more valuable thing, which was an **unspecified behaviour rather than a
+contradiction**: nothing in the suite caused a carried-forward route to reach the crew. Every
+individual contract was correct. The sequence they implied did not close. Only a reader
+reconstructing the whole day end to end would notice.
+
+> **What it prevents:** the class of defect where every contract is right and the system is wrong.
+
+## Phase 11 · Gate — three rubrics, in order
+
+Per contract, in this order, from `RUBRIC.md`:
+
+1. **Rubric D — is it unambiguous?** Run first. There is no point assessing completeness on a
+   document that can be read two ways.
+2. **Rubric A — is it buildable?** Run before any builder is dispatched.
+3. **Rubric B — did the build satisfy it?** Run on handback, by the orchestrator, never by the
+   builder that produced the work.
+
+Zero defects is the only pass. Any `[ESCALATE]` — in the contract or in anything it depends on —
+blocks dispatch. **Do not resolve it by picking a default;** that is the exact failure the whole
+method exists to prevent, and doing it at the gate is worse than doing it while authoring, because
+by the gate everyone has stopped looking.
+
+Then the two detectors run continuously through the build:
+
+- **D-REPEAT** — the same contract fails twice → stop, it is a design error, not a build error. No
+  third attempt on the same design, ever.
+- **D-CLUSTER** — three or more defects at once across different components → do not open three
+  fixes. Ask what single thing was left undesigned. It is usually an unowned lifecycle falling
+  between contracts.
+
+> **What it prevents:** grinding a fundamentally wrong design through attempt after attempt, each
+> one looking like it is nearly there.
+
+---
+
+## What actually goes wrong, in order of cost
+
+Ranked from the reference project. Every one of these happened.
+
+| # | Failure | Phase that catches it | Cost if missed |
+|---|---|---|---|
+| 1 | Contract authored against a remembered payload shape | 4 | Silent data corruption, presents as a data-quality issue |
+| 2 | Work owned by no contract | 8 | Unwinnable review; builder blocked with no authority to proceed |
+| 3 | Every contract correct, the implied sequence broken | 10b | A promised behaviour that never happens, discovered in production |
+| 4 | Two contracts ratifying different versions of one decision | 5, 10b | Two builders build to different specs, both pass their own gate |
+| 5 | A rule stated without its reason | 6 (D7) | Deleted by the next competent reader, who was not careless |
+| 6 | An invariant enforced by convention rather than structure | 6 (D6) | Holds until the first agent that did not read the contract |
+| 7 | Rebuild of working code | 1, 7 (disposition) | Weeks, and a worse version of what existed |
+| 8 | Silently invented default for an undecided question | 6 (latitude bands) | Divergent builds, none of them wrong per the contract |
+
+## The three habits underneath all of it
+
+**Write for the weakest reader, not the smartest.** A senior engineer fills gaps from context you
+did not write down, and the result looks like success. The gaps stay load-bearing and invisible
+until a fresh session hits them. Designing for the reader who cannot infer is what makes a contract
+auditable — a requirement a weak reader cannot execute is a requirement you have not specified.
+
+**Record the mistake in the artifact.** Every phase above that carries a story got that story
+because something failed. The reference project's rubric has a note explaining why `A1.9` exists.
+Contracts that record their own near-misses do not get those defects re-introduced by the next
+author, and they are the only durable form of institutional memory in a workflow where no
+participant has a memory.
+
+**Default to escalation.** A suite with twelve honest `[ESCALATE]` tags is fixable in an afternoon.
+A suite with twelve silently-invented defaults is indistinguishable from a correct one, right up
+until it is built.

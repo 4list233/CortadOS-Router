@@ -1,0 +1,23 @@
+{
+  "protected_identity": {
+    "contracts_sha256": {
+      "checked": 3,
+      "mismatches": []
+    },
+    "protected_prior_sha256": {
+      "checked": 641,
+      "mismatches": []
+    },
+    "fixture_files_sha256": {
+      "checked": 18,
+      "mismatches": []
+    }
+  },
+  "manifest_sha256": "03589f6ad5394e4c5d3c29f37979f349f7fb4b1c7cd8b6671b0c55f94da49959",
+  "head": "647fea73341beed45624732efc7fb992730f5873",
+  "correction_patch_sha256": "fbecf8c02286f2d54d424af112e811797c79e32ea601123614f5a3ad4be70a2f",
+  "candidate_patch_sha256": "4726a8fc2d1769b0c48d052a7e3d60743a814a5a163695e18726a54cb0351700",
+  "attempt_1_reconstruction": "All18 reconstructed from preserved patch and verified against independent B source hashes",
+  "compile": "18/18 passed; no pycache written",
+  "verification_script_setup_error": "Initial fixture paths mistakenly treated as repo relative; corrected prefix only"
+}

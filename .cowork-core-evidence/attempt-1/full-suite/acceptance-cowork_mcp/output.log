@@ -1,0 +1,2097 @@
+test_app_rejects_double_adoption_and_wrong_principal (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_app_rejects_double_adoption_and_wrong_principal) ... ERROR
+test_exact_routes_methods_queries_no_redirect_or_listener (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_exact_routes_methods_queries_no_redirect_or_listener) ... ERROR
+test_frontend_disconnect_preserves_accepted_job_and_reconnect (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_frontend_disconnect_preserves_accepted_job_and_reconnect) ... ERROR
+test_handoff_override_reaches_existing_s1_fit_and_default_is_unchanged (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_handoff_override_reaches_existing_s1_fit_and_default_is_unchanged) ... ok
+test_http_raw_binary_and_unicode_disposition (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_http_raw_binary_and_unicode_disposition) ... ERROR
+test_live_training_prefix_exam_rows_and_protected_model_inputs (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_live_training_prefix_exam_rows_and_protected_model_inputs) ... Executing <Task finished name='Task-32' coro=<CompatibilityExam.test_live_training_prefix_exam_rows_and_protected_model_inputs() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py:105> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.122 seconds
+ok
+test_mcp_initialization_tools_and_failure_preserve_structured_json (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_mcp_initialization_tools_and_failure_preserve_structured_json) ... ERROR
+test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_ordinary_bootstrap_has_identical_envelope_and_no_remote_discriminator) ... {"schema":"cortados.mcp-worker.event.v1","at_ms":1792292080053,"event":"state_transition","client_id":"unit-client","request_id":"d04351df-faf3-4d8d-918e-4b7e19f60d77","route_id":"95adc736-271e-4048-8a4b-8e376759d74e","job_id":"2792e251-f1f4-4fd0-b93d-9a637f5fa3b4","from_state":null,"state":"queued","reason":null}
+ok
+test_ordinary_native_argv_and_environment_are_unchanged (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_ordinary_native_argv_and_environment_are_unchanged) ... ok
+test_oversized_mcp_body_never_calls_core (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_oversized_mcp_body_never_calls_core) ... ERROR
+test_binary_generation_change_refuses_before_native_exec (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_binary_generation_change_refuses_before_native_exec) ... ERROR
+test_failed_native_retains_only_explicit_partial_output (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_failed_native_retains_only_explicit_partial_output) ... ERROR
+test_full_handoff_byte_limit_is_enforced_before_acceptance (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_full_handoff_byte_limit_is_enforced_before_acceptance) ... ERROR
+test_native_argv_uses_complete_remote_template_and_full_input_packet (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_native_argv_uses_complete_remote_template_and_full_input_packet) ... ERROR
+test_nonregular_output_fails_entire_publication_preserving_native_success (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_nonregular_output_fails_entire_publication_preserving_native_success) ... ERROR
+test_output_snapshot_is_immutable_and_sorted_utf8 (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_output_snapshot_is_immutable_and_sorted_utf8) ... ERROR
+test_route_only_does_not_prepare_workspace (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_route_only_does_not_prepare_workspace) ... ERROR
+test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_worker_cli_bootstrap_binding_discriminator_cannot_downgrade) ... ok
+test_file_exact_bound_allowed_one_over_refused_without_intent (acceptance.cowork_mcp.test_performance.CapacityExam.test_file_exact_bound_allowed_one_over_refused_without_intent) ... ERROR
+test_filesystem_available_boundary_includes_existing_promises (acceptance.cowork_mcp.test_performance.CapacityExam.test_filesystem_available_boundary_includes_existing_promises) ... ERROR
+test_pending_upload_reservation_counts_and_rename_does_not_double_count (acceptance.cowork_mcp.test_performance.CapacityExam.test_pending_upload_reservation_counts_and_rename_does_not_double_count) ... ERROR
+test_selected_input_copy_reserves_destination_before_native_start (acceptance.cowork_mcp.test_performance.CapacityExam.test_selected_input_copy_reserves_destination_before_native_start) ... ERROR
+test_unknown_payload_root_entry_blocks_new_reservations (acceptance.cowork_mcp.test_performance.CapacityExam.test_unknown_payload_root_entry_blocks_new_reservations) ... ERROR
+test_workspace_file_overrun_stops_actual_fake_worker (acceptance.cowork_mcp.test_performance.CapacityExam.test_workspace_file_overrun_stops_actual_fake_worker) ... ERROR
+test_zero_byte_reserved_intents_consume_artifact_slots (acceptance.cowork_mcp.test_performance.CapacityExam.test_zero_byte_reserved_intents_consume_artifact_slots) ... ERROR
+test_accept_binding_failure_rolls_back_all_accepted_rows (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_accept_binding_failure_rolls_back_all_accepted_rows) ... ERROR
+test_corrupt_remote_schema_refuses_without_migration_repair (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_corrupt_remote_schema_refuses_without_migration_repair) ... ERROR
+test_crash_after_mkdir_before_inode_record_quarantines_never_infers (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_crash_after_mkdir_before_inode_record_quarantines_never_infers) ... Process SpawnProcess-1:
+FAIL
+test_crash_before_mkdir_retires_intent_and_allows_explicit_retry (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_crash_before_mkdir_retires_intent_and_allows_explicit_retry) ... Process SpawnProcess-2:
+FAIL
+Traceback (most recent call last):
+test_invalid_core_refuses_before_db_and_native_preflight (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_invalid_core_refuses_before_db_and_native_preflight) ... ok
+test_missing_sealed_blob_quarantines_instead_of_serving_stale_success (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_missing_sealed_blob_quarantines_instead_of_serving_stale_success) ... ERROR
+test_restart_revokes_ticket_without_erasing_blob_or_operation (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_restart_revokes_ticket_without_erasing_blob_or_operation) ... ERROR
+test_sealed_blob_symlink_swap_never_reads_outside_bytes (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_sealed_blob_symlink_swap_never_reads_outside_bytes) ... ERROR
+test_second_runtime_refuses_before_second_jobstore (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_second_runtime_refuses_before_second_jobstore) ... ERROR
+test_cross_field_dimensions_and_retention_refuse (acceptance.cowork_mcp.test_schemas.SchemaExam.test_cross_field_dimensions_and_retention_refuse) ... ok
+test_duplicate_nonfinite_surrogate_json_rejected (acceptance.cowork_mcp.test_schemas.SchemaExam.test_duplicate_nonfinite_surrogate_json_rejected) ... ok
+test_every_config_key_required_and_unknown_refuses (acceptance.cowork_mcp.test_schemas.SchemaExam.test_every_config_key_required_and_unknown_refuses) ... ok
+test_every_new_owner_module_has_a_real_importable_boundary (acceptance.cowork_mcp.test_schemas.SchemaExam.test_every_new_owner_module_has_a_real_importable_boundary) ... ok
+test_integer_limits_reject_boolean_zero_missing_and_unknown (acceptance.cowork_mcp.test_schemas.SchemaExam.test_integer_limits_reject_boolean_zero_missing_and_unknown) ... ok
+test_nested_inputs_are_copied_and_immutable_without_implementation_requirement (acceptance.cowork_mcp.test_schemas.SchemaExam.test_nested_inputs_are_copied_and_immutable_without_implementation_requirement) ... ok
+test_principal_is_synthetic_and_installation_matches (acceptance.cowork_mcp.test_schemas.SchemaExam.test_principal_is_synthetic_and_installation_matches) ... ok
+test_private_record_constructors_freeze_and_reject_unknown_fields (acceptance.cowork_mcp.test_schemas.SchemaExam.test_private_record_constructors_freeze_and_reject_unknown_fields) ... ok
+test_projected_variants_and_unknown_cross_fields (acceptance.cowork_mcp.test_schemas.SchemaExam.test_projected_variants_and_unknown_cross_fields) ... ok
+test_remote_errors_are_closed_and_do_not_leak_worker_messages (acceptance.cowork_mcp.test_schemas.SchemaExam.test_remote_errors_are_closed_and_do_not_leak_worker_messages) ... ok
+test_request_unknown_identity_paths_and_filename_boundaries (acceptance.cowork_mcp.test_schemas.SchemaExam.test_request_unknown_identity_paths_and_filename_boundaries) ... ok
+test_root_geometry_and_base_state_identity_refuse (acceptance.cowork_mcp.test_schemas.SchemaExam.test_root_geometry_and_base_state_identity_refuse) ... ok
+test_wire_success_examples_and_errors_match_frozen_schema (acceptance.cowork_mcp.test_schemas.SchemaExam.test_wire_success_examples_and_errors_match_frozen_schema) ... ok
+test_busy_task_blocks_delete_and_second_delegate (acceptance.cowork_mcp.test_tasks.TaskExam.test_busy_task_blocks_delete_and_second_delegate) ... ERROR
+test_create_replay_keeps_identity_and_current_projection (acceptance.cowork_mcp.test_tasks.TaskExam.test_create_replay_keeps_identity_and_current_projection) ... ERROR
+test_declined_quota_retires_preparation_and_same_request_can_retry (acceptance.cowork_mcp.test_tasks.TaskExam.test_declined_quota_retires_preparation_and_same_request_can_retry) ... ERROR
+test_delegate_replay_does_not_score_or_start_twice (acceptance.cowork_mcp.test_tasks.TaskExam.test_delegate_replay_does_not_score_or_start_twice) ... ERROR
+test_delete_tombstone_replay_preserves_history (acceptance.cowork_mcp.test_tasks.TaskExam.test_delete_tombstone_replay_preserves_history) ... ERROR
+test_disable_latches_without_cancelling_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_disable_latches_without_cancelling_job) ... ERROR
+test_foreign_trusted_principal_refuses_attach (acceptance.cowork_mcp.test_tasks.TaskExam.test_foreign_trusted_principal_refuses_attach) ... ERROR
+test_group_and_context_refusals_do_not_accept_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_group_and_context_refusals_do_not_accept_job) ... ERROR
+test_second_task_cannot_read_cancel_or_feedback_first_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_second_task_cannot_read_cancel_or_feedback_first_job) ... ERROR
+test_transition_audit_has_one_creation_event_and_no_payload_secrets (acceptance.cowork_mcp.test_tasks.TaskExam.test_transition_audit_has_one_creation_event_and_no_payload_secrets) ... ERROR
+test_unknown_task_and_foreign_job_are_identical_refusals (acceptance.cowork_mcp.test_tasks.TaskExam.test_unknown_task_and_foreign_job_are_identical_refusals) ... ERROR
+test_bad_sequence_frame_closes_without_tool_effect (acceptance.cowork_mcp.test_transfer.TransferExam.test_bad_sequence_frame_closes_without_tool_effect) ... ERROR
+test_declared_header_over_limit_closes_before_allocating_body (acceptance.cowork_mcp.test_transfer.TransferExam.test_declared_header_over_limit_closes_before_allocating_body) ... ERROR
+test_delete_revokes_existing_get_before_next_chunk (acceptance.cowork_mcp.test_transfer.TransferExam.test_delete_revokes_existing_get_before_next_chunk) ... ERROR
+test_disable_aborts_open_transfer_before_next_chunk (acceptance.cowork_mcp.test_transfer.TransferExam.test_disable_aborts_open_transfer_before_next_chunk) ... ERROR
+test_expiry_blocks_new_open_but_open_get_completes (acceptance.cowork_mcp.test_transfer.TransferExam.test_expiry_blocks_new_open_but_open_get_completes) ... ERROR
+test_foreign_connection_cannot_write_existing_lease (acceptance.cowork_mcp.test_transfer.TransferExam.test_foreign_connection_cannot_write_existing_lease) ... ERROR
+test_hmac_matches_independent_encoding_and_full_get_retries (acceptance.cowork_mcp.test_transfer.TransferExam.test_hmac_matches_independent_encoding_and_full_get_retries) ... ERROR
+test_key_rotation_restart_invalidates_prior_capability (acceptance.cowork_mcp.test_transfer.TransferExam.test_key_rotation_restart_invalidates_prior_capability) ... ERROR
+test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put (acceptance.cowork_mcp.test_transfer.TransferExam.test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put) ... ERROR
+test_put_consumed_and_wrong_hash_are_not_success (acceptance.cowork_mcp.test_transfer.TransferExam.test_put_consumed_and_wrong_hash_are_not_success) ... ERROR
+test_separate_process_runtime_owns_bytes_and_survives_frontend_loss (acceptance.cowork_mcp.test_transfer.TransferExam.test_separate_process_runtime_owns_bytes_and_survives_frontend_loss) ... Process SpawnProcess-3:
+FAIL
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/process.py", line 320, in _bootstrap
+    self.run()
+    ~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 219, in runtime_child
+    else:asyncio.run(run())
+         ~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 205, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 204, in run
+    async with mod('remote_runtime').CoreRuntime(base_raw=base,core_raw=config,manifest_raw=manifest) as runtime:
+               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+test_separate_process_runtime_owns_bytes_and_survives_frontend_loss (acceptance.cowork_mcp.test_transfer.TransferExam.test_separate_process_runtime_owns_bytes_and_survives_frontend_loss) ... ERROR
+test_unsealed_renewal_requires_stopped_writer_and_exact_metadata (acceptance.cowork_mcp.test_transfer.TransferExam.test_unsealed_renewal_requires_stopped_writer_and_exact_metadata) ... ERROR
+test_wrong_offset_revokes_own_lease (acceptance.cowork_mcp.test_transfer.TransferExam.test_wrong_offset_revokes_own_lease) ... ERROR
+test_zero_and_non_utf8_bytes_roundtrip_hash_exact (acceptance.cowork_mcp.test_transfer.TransferExam.test_zero_and_non_utf8_bytes_roundtrip_hash_exact) ... ERROR
+
+======================================================================
+ERROR: test_app_rejects_double_adoption_and_wrong_principal (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_app_rejects_double_adoption_and_wrong_principal)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 79, in test_app_rejects_double_adoption_and_wrong_principal
+    await self.start();self.app()
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_exact_routes_methods_queries_no_redirect_or_listener (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_exact_routes_methods_queries_no_redirect_or_listener)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 35, in test_exact_routes_methods_queries_no_redirect_or_listener
+    await self.start()
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_frontend_disconnect_preserves_accepted_job_and_reconnect (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_frontend_disconnect_preserves_accepted_job_and_reconnect)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 82, in test_frontend_disconnect_preserves_accepted_job_and_reconnect
+    self.fixture.control(hang=True);await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']
+                                    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_http_raw_binary_and_unicode_disposition (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_http_raw_binary_and_unicode_disposition)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 61, in test_http_raw_binary_and_unicode_disposition
+    await self.start();task=await self.task();data=b'\x00\xffbinary\x00';ticket=await self.ticket(task['task_id'],data,'résumé "Q1".bin')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_mcp_initialization_tools_and_failure_preserve_structured_json (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_mcp_initialization_tools_and_failure_preserve_structured_json)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 47, in test_mcp_initialization_tools_and_failure_preserve_structured_json
+    await self.start();client=await self.http(self.app());headers={'Accept':'application/json, text/event-stream'}
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_oversized_mcp_body_never_calls_core (acceptance.cowork_mcp.test_compatibility.CompatibilityExam.test_oversized_mcp_body_never_calls_core)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_compatibility.py", line 74, in test_oversized_mcp_body_never_calls_core
+    await self.start();client=await self.http(self.app())
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_binary_generation_change_refuses_before_native_exec (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_binary_generation_change_refuses_before_native_exec)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 34, in test_binary_generation_change_refuses_before_native_exec
+    await self.start();task=await self.task();self.fixture.binary.write_text(self.fixture.binary.read_text()+'\n# changed generation\n')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_failed_native_retains_only_explicit_partial_output (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_failed_native_retains_only_explicit_partial_output)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 55, in test_failed_native_retains_only_explicit_partial_output
+    await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_full_handoff_byte_limit_is_enforced_before_acceptance (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_full_handoff_byte_limit_is_enforced_before_acceptance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 61, in test_full_handoff_byte_limit_is_enforced_before_acceptance
+    await self.start();task=await self.task();args=self.args(task,context='x'*1024)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_native_argv_uses_complete_remote_template_and_full_input_packet (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_native_argv_uses_complete_remote_template_and_full_input_packet)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 14, in test_native_argv_uses_complete_remote_template_and_full_input_packet
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'input\xff','résumé.bin')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_nonregular_output_fails_entire_publication_preserving_native_success (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_nonregular_output_fails_entire_publication_preserving_native_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 49, in test_nonregular_output_fails_entire_publication_preserving_native_success
+    await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_output_snapshot_is_immutable_and_sorted_utf8 (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_output_snapshot_is_immutable_and_sorted_utf8)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 39, in test_output_snapshot_is_immutable_and_sorted_utf8
+    await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_route_only_does_not_prepare_workspace (acceptance.cowork_mcp.test_native_policy.NativePolicyExam.test_route_only_does_not_prepare_workspace)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 65, in test_route_only_does_not_prepare_workspace
+    await self.start();task=await self.task();args=self.args(task)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_file_exact_bound_allowed_one_over_refused_without_intent (acceptance.cowork_mcp.test_performance.CapacityExam.test_file_exact_bound_allowed_one_over_refused_without_intent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 11, in test_file_exact_bound_allowed_one_over_refused_without_intent
+    await self.start();task=await self.task();await self.upload(task['task_id'],b'x'*4096)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_filesystem_available_boundary_includes_existing_promises (acceptance.cowork_mcp.test_performance.CapacityExam.test_filesystem_available_boundary_includes_existing_promises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 50, in test_filesystem_available_boundary_includes_existing_promises
+    await self.start();first=await self.task();second=await self.task()
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_pending_upload_reservation_counts_and_rename_does_not_double_count (acceptance.cowork_mcp.test_performance.CapacityExam.test_pending_upload_reservation_counts_and_rename_does_not_double_count)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 24, in test_pending_upload_reservation_counts_and_rename_does_not_double_count
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'x'*4096)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_selected_input_copy_reserves_destination_before_native_start (acceptance.cowork_mcp.test_performance.CapacityExam.test_selected_input_copy_reserves_destination_before_native_start)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 33, in test_selected_input_copy_reserves_destination_before_native_start
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'x'*4096)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_unknown_payload_root_entry_blocks_new_reservations (acceptance.cowork_mcp.test_performance.CapacityExam.test_unknown_payload_root_entry_blocks_new_reservations)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 43, in test_unknown_payload_root_entry_blocks_new_reservations
+    await self.start();task=await self.task();(self.fixture.path/'blobs/unknown-object').write_bytes(b'x')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_workspace_file_overrun_stops_actual_fake_worker (acceptance.cowork_mcp.test_performance.CapacityExam.test_workspace_file_overrun_stops_actual_fake_worker)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 39, in test_workspace_file_overrun_stops_actual_fake_worker
+    await self.start();task=await self.task();job=self.ok(await self.call('delegate',self.args(task)))['job']
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_zero_byte_reserved_intents_consume_artifact_slots (acceptance.cowork_mcp.test_performance.CapacityExam.test_zero_byte_reserved_intents_consume_artifact_slots)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_performance.py", line 18, in test_zero_byte_reserved_intents_consume_artifact_slots
+    await self.start();task=await self.task();await self.ticket(task['task_id'],b'');await self.ticket(task['task_id'],b'')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_accept_binding_failure_rolls_back_all_accepted_rows (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_accept_binding_failure_rolls_back_all_accepted_rows)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 26, in test_accept_binding_failure_rolls_back_all_accepted_rows
+    await self.start();task=await self.task();module=mod('task_store');original=module.accept_binding
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_corrupt_remote_schema_refuses_without_migration_repair (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_corrupt_remote_schema_refuses_without_migration_repair)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 45, in test_corrupt_remote_schema_refuses_without_migration_repair
+    await self.start();await self.stack.aclose();db=sqlite3.connect(self.fixture.path/'state/jobs.db')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_missing_sealed_blob_quarantines_instead_of_serving_stale_success (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_missing_sealed_blob_quarantines_instead_of_serving_stale_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 50, in test_missing_sealed_blob_quarantines_instead_of_serving_stale_success
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'original')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_restart_revokes_ticket_without_erasing_blob_or_operation (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_restart_revokes_ticket_without_erasing_blob_or_operation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 37, in test_restart_revokes_ticket_without_erasing_blob_or_operation
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'preserve')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_sealed_blob_symlink_swap_never_reads_outside_bytes (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_sealed_blob_symlink_swap_never_reads_outside_bytes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 89, in test_sealed_blob_symlink_swap_never_reads_outside_bytes
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'original')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_second_runtime_refuses_before_second_jobstore (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_second_runtime_refuses_before_second_jobstore)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 14, in test_second_runtime_refuses_before_second_jobstore
+    await self.start();f=self.fixture
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_busy_task_blocks_delete_and_second_delegate (acceptance.cowork_mcp.test_tasks.TaskExam.test_busy_task_blocks_delete_and_second_delegate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 67, in test_busy_task_blocks_delete_and_second_delegate
+    self.fixture.control(hang=True);await self.start();task=await self.task();args=self.args(task)
+                                    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_create_replay_keeps_identity_and_current_projection (acceptance.cowork_mcp.test_tasks.TaskExam.test_create_replay_keeps_identity_and_current_projection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 11, in test_create_replay_keeps_identity_and_current_projection
+    await self.start();args={'request_id':uid(),'task_group_id':uid(),'title':'Same λ'}
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_declined_quota_retires_preparation_and_same_request_can_retry (acceptance.cowork_mcp.test_tasks.TaskExam.test_declined_quota_retires_preparation_and_same_request_can_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 43, in test_declined_quota_retires_preparation_and_same_request_can_retry
+    self.fixture.control(quota='spent');await self.start();task=await self.task();args=self.args(task)
+                                        ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_delegate_replay_does_not_score_or_start_twice (acceptance.cowork_mcp.test_tasks.TaskExam.test_delegate_replay_does_not_score_or_start_twice)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 52, in test_delegate_replay_does_not_score_or_start_twice
+    await self.start();task=await self.task();args=self.args(task)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_delete_tombstone_replay_preserves_history (acceptance.cowork_mcp.test_tasks.TaskExam.test_delete_tombstone_replay_preserves_history)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 21, in test_delete_tombstone_replay_preserves_history
+    await self.start();task=await self.task();args={'task_id':task['task_id'],'request_id':uid()}
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_disable_latches_without_cancelling_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_disable_latches_without_cancelling_job)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 74, in test_disable_latches_without_cancelling_job
+    self.fixture.control(hang=True);await self.start();task=await self.task()
+                                    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_foreign_trusted_principal_refuses_attach (acceptance.cowork_mcp.test_tasks.TaskExam.test_foreign_trusted_principal_refuses_attach)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 90, in test_foreign_trusted_principal_refuses_attach
+    await self.start();principal=dict(self.fixture.principal,subject='synthetic:other')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_group_and_context_refusals_do_not_accept_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_group_and_context_refusals_do_not_accept_job)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 37, in test_group_and_context_refusals_do_not_accept_job
+    await self.start();task=await self.task();args=self.args(task)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_second_task_cannot_read_cancel_or_feedback_first_job (acceptance.cowork_mcp.test_tasks.TaskExam.test_second_task_cannot_read_cancel_or_feedback_first_job)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 61, in test_second_task_cannot_read_cancel_or_feedback_first_job
+    await self.start();first=await self.task();second=await self.task()
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_transition_audit_has_one_creation_event_and_no_payload_secrets (acceptance.cowork_mcp.test_tasks.TaskExam.test_transition_audit_has_one_creation_event_and_no_payload_secrets)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 81, in test_transition_audit_has_one_creation_event_and_no_payload_secrets
+    await self.start();args={'request_id':uid(),'task_group_id':uid(),'title':'SENTINEL-TITLE-PRIVATE'}
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_unknown_task_and_foreign_job_are_identical_refusals (acceptance.cowork_mcp.test_tasks.TaskExam.test_unknown_task_and_foreign_job_are_identical_refusals)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_tasks.py", line 32, in test_unknown_task_and_foreign_job_are_identical_refusals
+    await self.start();task=await self.task()
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_bad_sequence_frame_closes_without_tool_effect (acceptance.cowork_mcp.test_transfer.TransferExam.test_bad_sequence_frame_closes_without_tool_effect)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 70, in test_bad_sequence_frame_closes_without_tool_effect
+    await self.start();f=self.fixture;left,right=socket.socketpair();left.setblocking(False);right.setblocking(False)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_declared_header_over_limit_closes_before_allocating_body (acceptance.cowork_mcp.test_transfer.TransferExam.test_declared_header_over_limit_closes_before_allocating_body)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 80, in test_declared_header_over_limit_closes_before_allocating_body
+    await self.start();f=self.fixture;left,right=socket.socketpair();left.setblocking(False);right.setblocking(False)
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_delete_revokes_existing_get_before_next_chunk (acceptance.cowork_mcp.test_transfer.TransferExam.test_delete_revokes_existing_get_before_next_chunk)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 127, in test_delete_revokes_existing_get_before_next_chunk
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'abc')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_disable_aborts_open_transfer_before_next_chunk (acceptance.cowork_mcp.test_transfer.TransferExam.test_disable_aborts_open_transfer_before_next_chunk)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 64, in test_disable_aborts_open_transfer_before_next_chunk
+    await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'ab')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_expiry_blocks_new_open_but_open_get_completes (acceptance.cowork_mcp.test_transfer.TransferExam.test_expiry_blocks_new_open_but_open_get_completes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 56, in test_expiry_blocks_new_open_but_open_get_completes
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'abc')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_foreign_connection_cannot_write_existing_lease (acceptance.cowork_mcp.test_transfer.TransferExam.test_foreign_connection_cannot_write_existing_lease)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 48, in test_foreign_connection_cannot_write_existing_lease
+    await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'ab')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_hmac_matches_independent_encoding_and_full_get_retries (acceptance.cowork_mcp.test_transfer.TransferExam.test_hmac_matches_independent_encoding_and_full_get_retries)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 22, in test_hmac_matches_independent_encoding_and_full_get_retries
+    await self.start();task=await self.task();data=b'\x00\xfftest'
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_key_rotation_restart_invalidates_prior_capability (acceptance.cowork_mcp.test_transfer.TransferExam.test_key_rotation_restart_invalidates_prior_capability)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 121, in test_key_rotation_restart_invalidates_prior_capability
+    await self.start();task=await self.task();artifact,_=await self.upload(task['task_id'],b'persist')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put (acceptance.cowork_mcp.test_transfer.TransferExam.test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 114, in test_lost_finish_ack_is_resolved_by_task_inspection_not_second_put
+    await self.start();task=await self.task();artifact,ticket=await self.upload(task['task_id'],b'committed')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_put_consumed_and_wrong_hash_are_not_success (acceptance.cowork_mcp.test_transfer.TransferExam.test_put_consumed_and_wrong_hash_are_not_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 36, in test_put_consumed_and_wrong_hash_are_not_success
+    await self.start();task=await self.task();_,ticket=await self.upload(task['task_id'],b'x')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_separate_process_runtime_owns_bytes_and_survives_frontend_loss (acceptance.cowork_mcp.test_transfer.TransferExam.test_separate_process_runtime_owns_bytes_and_survives_frontend_loss)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 91, in cleanup
+    if process.is_alive():parent.send('close')
+                          ~~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/connection.py", line 216, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/connection.py", line 448, in _send_bytes
+    self._send(header + buf)
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/connection.py", line 404, in _send
+    n = write(self._handle, buf)
+BrokenPipeError: [Errno 32] Broken pipe
+
+======================================================================
+ERROR: test_unsealed_renewal_requires_stopped_writer_and_exact_metadata (acceptance.cowork_mcp.test_transfer.TransferExam.test_unsealed_renewal_requires_stopped_writer_and_exact_metadata)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 104, in test_unsealed_renewal_requires_stopped_writer_and_exact_metadata
+    await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'ab')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_wrong_offset_revokes_own_lease (acceptance.cowork_mcp.test_transfer.TransferExam.test_wrong_offset_revokes_own_lease)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 43, in test_wrong_offset_revokes_own_lease
+    await self.start();task=await self.task();ticket=await self.ticket(task['task_id'],b'ab')
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+ERROR: test_zero_and_non_utf8_bytes_roundtrip_hash_exact (acceptance.cowork_mcp.test_transfer.TransferExam.test_zero_and_non_utf8_bytes_roundtrip_hash_exact)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 62, in __aenter__
+    self.broker = Broker(self.base, hashlib.sha256(self.base_raw).hexdigest(), core_runtime=self)
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/broker.py", line 104, in __init__
+    self.store = JobStore(config, host_boot_id())
+                                  ~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/native_process.py", line 40, in host_boot_id
+    raise OSError(ctypes.get_errno(), "Cannot read host boot identity")
+PermissionError: [Errno 1] Cannot read host boot identity
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 16, in test_zero_and_non_utf8_bytes_roundtrip_hash_exact
+    await self.start();task=await self.task()
+    ^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/support.py", line 121, in start
+    self.runtime=await self.stack.enter_async_context(mod('remote_runtime').CoreRuntime(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        base_raw=canon(f.base),core_raw=canon(f.core),manifest_raw=canon(f.manifest)))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/contextlib.py", line 668, in enter_async_context
+    result = await _enter(cm)
+             ^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/integrations/mcp/remote_runtime.py", line 82, in __aenter__
+    raise s.RemoteError('storage_error') from exc
+integrations.mcp.remote_schemas.RemoteError: Remote operation refused: storage_error
+
+======================================================================
+FAIL: test_crash_after_mkdir_before_inode_record_quarantines_never_infers (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_crash_after_mkdir_before_inode_record_quarantines_never_infers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 83, in test_crash_after_mkdir_before_inode_record_quarantines_never_infers
+    task,args=await self.crash_preparation('after_prepare')
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 67, in crash_preparation
+    self.assertTrue(ready.get('ready'),ready)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: None is not true : {'error': 'RemoteError', 'message': 'Remote operation refused: storage_error'}
+
+======================================================================
+FAIL: test_crash_before_mkdir_retires_intent_and_allows_explicit_retry (acceptance.cowork_mcp.test_recovery.RecoveryExam.test_crash_before_mkdir_retires_intent_and_allows_explicit_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 78, in test_crash_before_mkdir_retires_intent_and_allows_explicit_retry
+    task,args=await self.crash_preparation('before_prepare')
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py", line 67, in crash_preparation
+    self.assertTrue(ready.get('ready'),ready)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: None is not true : {'error': 'RemoteError', 'message': 'Remote operation refused: storage_error'}
+
+======================================================================
+FAIL: test_separate_process_runtime_owns_bytes_and_survives_frontend_loss (acceptance.cowork_mcp.test_transfer.TransferExam.test_separate_process_runtime_owns_bytes_and_survives_frontend_loss)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_transfer.py", line 96, in test_separate_process_runtime_owns_bytes_and_survives_frontend_loss
+    self.assertTrue(ready.get('ready'),ready);self.assertNotEqual(ready['pid'],__import__('os').getpid())
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: None is not true : {'error': 'RemoteError', 'message': 'Remote operation refused: storage_error'}
+
+----------------------------------------------------------------------
+Ran 72 tests in 3.336s
+
+FAILED (failures=3, errors=51)
+Exception ignored while finalizing file <_io.BytesIO object at 0x108d9d710>:
+BufferError: Existing exports of data: object cannot be re-sized

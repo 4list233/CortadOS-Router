@@ -1,0 +1,507 @@
+diff --git a/cortados_router/route_task.py b/cortados_router/route_task.py
+index 76823f8..74aa38f 100644
+--- a/cortados_router/route_task.py
++++ b/cortados_router/route_task.py
+@@ -64,12 +64,12 @@ def _log(route_id, arguments, decision, resolved, config):
+         raise WorkerError("storage_error", "The isolated Router observation could not be recorded") from exc
+ 
+ 
+-def route_task(arguments, config, metadata):
++def route_task(arguments, config, metadata, *, handoff_packet: str | None = None):
+     tool = "delegate" if any(key in arguments for key in ("cwd", "request_id", "timeout_s")) else "route"
+     arguments = validate(tool, arguments, config)
+     if "task_evidence" in arguments and missing_fields(arguments):
+         raise WorkerError("needs_clarification", "Task evidence is incomplete; call context_requirements and answer its questions before resubmitting")
+-    packet = handoff(arguments)
++    packet = handoff(arguments) if handoff_packet is None else handoff_packet
+     worker_bytes = len(packet.encode("utf-8"))
+     if worker_bytes > config["limits"]["max_handoff_bytes"]:
+         raise WorkerError("worker_context_too_large", "Worker handoff exceeds the configured UTF-8 byte bound")
+diff --git a/integrations/mcp/broker.py b/integrations/mcp/broker.py
+index 828c5d1..5fce4f4 100644
+--- a/integrations/mcp/broker.py
++++ b/integrations/mcp/broker.py
+@@ -94,10 +94,13 @@ def ensure_broker(config, config_path, digest):
+ 
+ 
+ class Broker:
+-    def __init__(self, config, digest):
++    def __init__(self, config, digest, *, core_runtime=None):
+         from .native_metadata import NativeMetadata
+         from .native_process import host_boot_id
+         self.config, self.digest = config, digest
++        self.core_runtime = core_runtime
++        if core_runtime is not None and core_runtime.lock_fd is None:
++            raise WorkerError('storage_error', 'Core runtime does not own the broker lock')
+         self.store = JobStore(config, host_boot_id())
+         self.metadata = NativeMetadata(config)
+         try:
+@@ -106,11 +109,13 @@ class Broker:
+             # An unsupported executable remains a typed tool refusal. Managed
+             # policy failures still refuse frontend startup before tool access.
+             if exc.code != 'native_version_mismatch':
++                self.store.close()
+                 raise
+         self.workers, self.tasks = {}, set()
+         self.admission_lock = asyncio.Lock()
+         self.stopping = False
+-        self.recover()
++        if core_runtime is None:
++            self.recover()
+ 
+     def receipt(self, record):
+         from .native_process import validate_receipt
+@@ -197,10 +202,20 @@ class Broker:
+             return False
+ 
+     async def stop(self, job_id, reason):
+-        record = self.store.get(job_id)
+-        if record['state'] in TERMINAL or record['stop_intent']:
+-            return record
+-        record = self.store.transition(job_id, 'cancelling', reason=reason)
++        try:
++            record = self.store.get(job_id)
++            if record['state'] in TERMINAL or record['stop_intent']:
++                return record
++            record = self.store.transition(job_id, 'cancelling', reason=reason)
++        except Exception:
++            if self.core_runtime is not None:
++                try:
++                    self.core_runtime.fatal()
++                finally:
++                    process = self.workers.get(job_id)
++                    if process:
++                        await self.send(process, {'command': 'STOP', 'reason': reason})
++            raise
+         process = self.workers.get(job_id)
+         if process:
+             await self.send(process, {'command': 'STOP', 'reason': reason})
+@@ -223,7 +238,26 @@ class Broker:
+         job_id, process, launch_error = accepted['job_id'], None, None
+         timer = asyncio.create_task(self.deadline(job_id))
+         job_dir = Path(self.config['state_dir']) / 'jobs' / job_id
++        remote = accepted.get('execution_kind') == 'cowork_remote_v1'
++        remote_errors = ()
++        if self.core_runtime is not None:
++            from .remote_schemas import RemoteError
++            remote_errors = (RemoteError,)
+         try:
++            if self.core_runtime is not None:
++                remote = self.core_runtime.classify(self.store.get(job_id))
++            remote_bootstrap = {}
++            remote_cli = []
++            if remote:
++                from .remote_native import worker_binding
++                from .task_workspace import prepare
++                binding = self.core_runtime.binding(accepted)
++                task = self.core_runtime.task(binding.seed.task_id)
++                prepare(task, binding)
++                self.core_runtime.materialize_inputs(binding)
++                remote_bootstrap = {'execution_kind': 'cowork_remote_v1', 'remote_binding':
++                                    self.core_runtime.record_dict(worker_binding(binding))}
++                remote_cli = ['--execution-kind', 'cowork_remote_v1']
+             job_dir.mkdir(mode=0o700, parents=True)
+             # JSON string escapes may expand observed output sixfold. This IPC
+             # frame limit preserves the operator's output bound without clipping
+@@ -231,6 +265,7 @@ class Broker:
+             with (job_dir / 'watchdog-stderr.txt').open('wb') as errors:
+                 process = await asyncio.create_subprocess_exec(sys.executable, '-B', '-m',
+                     'integrations.mcp.worker', '--state-dir', self.config['state_dir'],
++                    *remote_cli,
+                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                     stderr=errors, start_new_session=True,
+                     limit=(self.config['limits']['max_output_bytes'] +
+@@ -238,7 +273,7 @@ class Broker:
+             self.workers[job_id] = process
+             await self.send(process, {'config': self.config, 'arguments': accepted['arguments'],
+                 'route': accepted['route'], 'job_id': job_id, 'launch_nonce': accepted['launch_nonce'],
+-                'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted)})
++                'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted), **remote_bootstrap})
+             while line := await process.stdout.readline():
+                 message = json.loads(line)
+                 record = self.store.get(job_id)
+@@ -247,7 +282,7 @@ class Broker:
+                     if not record['stop_intent']:
+                         try:
+                             await self.admit_launch(record)
+-                        except WorkerError as exc:
++                        except (WorkerError, *remote_errors) as exc:
+                             launch_error = exc
+                     record = self.store.get(job_id)
+                     if record['stop_intent'] or launch_error:
+@@ -269,20 +304,43 @@ class Broker:
+                         'result': failure_result(record, 'native_failed', 'Watchdog ended without completion')}, launch_error)
+                 else:
+                     self.store.containment_failed(job_id)
+-        except (WorkerError, OSError, ValueError, KeyError, TypeError) as exc:
++        except (WorkerError, *remote_errors, OSError, ValueError, KeyError, TypeError) as exc:
+             record = self.store.get(job_id)
+             if process is None:
+-                result = failure_result(record, 'native_failed', 'Watchdog could not start')
++                code = exc.code if remote and isinstance(exc, remote_errors) else 'native_failed'
++                result = failure_result(record, code, 'Watchdog could not start')
+                 state = self.stop_state(record) if record['stop_intent'] else 'failed'
+-                self.store.transition(job_id, state, reason=record['stop_intent'] or 'native_failed', result=result)
++                self.store.transition(job_id, state, reason=record['stop_intent'] or code, result=result)
+             else:
+-                await self.send(process, {'command': 'STOP', 'reason': 'native_protocol_error'})
+-                self.store.containment_failed(job_id)
++                reason = exc.code if remote and isinstance(exc, remote_errors) else 'native_protocol_error'
++                await self.send(process, {'command': 'STOP', 'reason': reason})
++                if remote:
++                    # Keep ownership until the existing watchdog closes and its
++                    # termination receipt proves the native tree is contained.
++                    done = None
++                    while line := await process.stdout.readline():
++                        try:
++                            message = json.loads(line)
++                        except (ValueError, UnicodeError):
++                            continue
++                        if message.get('event') == 'done':
++                            done = message
++                    await process.wait()
++                    if self.receipt(self.store.get(job_id)):
++                        self.finish(job_id, done or {'state': 'failed', 'reason': reason,
++                            'result': failure_result(record, reason, 'Remote launch refused')}, exc)
++                    else:
++                        self.store.containment_failed(job_id)
++                else:
++                    self.store.containment_failed(job_id)
+         finally:
+             timer.cancel()
+-            self.workers.pop(job_id, None)
++            if not remote or process is None or self.receipt(self.store.get(job_id)):
++                self.workers.pop(job_id, None)
+             if process and process.stdin:
+                 process.stdin.close()
++            if remote:
++                await self.core_runtime.publish(job_id)
+ 
+     @staticmethod
+     def stop_state(record):
+@@ -305,8 +363,39 @@ class Broker:
+             state, reason, result = message['state'], message.get('reason'), message['result']
+         self.store.transition(job_id, state, reason=reason, result=result)
+ 
++    async def contain_remote(self, reason):
++        jobs = set(self.workers)
++        try:
++            jobs.update(record['job_id'] for record in self.store.active()
++                        if record.get('execution_kind') == 'cowork_remote_v1')
++        except Exception:
++            self.signal_remote_failure()
++        for job_id in jobs:
++            try:
++                await self.stop(job_id, reason)
++            except Exception:
++                self.signal_remote_failure()
++
++    def signal_remote_failure(self):
++        try:
++            self.core_runtime.fatal()
++        except Exception:
++            # Runtime retains the failed sink for teardown.
++            self.core_runtime.fatal_signal_failed = True
++
+     async def shutdown(self):
+         self.stopping = True
++        if self.core_runtime is not None:
++            await self.contain_remote('cancel_requested')
++            if self.tasks:
++                results = await asyncio.gather(*list(self.tasks), return_exceptions=True)
++                if any(isinstance(result, BaseException) for result in results):
++                    self.signal_remote_failure()
++            for job_id in tuple(self.workers):
++                if not self.receipt(self.store.get(job_id)):
++                    raise WorkerError('containment_failed', 'Worker termination is unproven')
++                self.workers.pop(job_id, None)
++            return
+         for job_id in list(self.workers):
+             await self.stop(job_id, 'cancel_requested')
+         if self.tasks:
+diff --git a/integrations/mcp/codex.py b/integrations/mcp/codex.py
+index a7d804f..6a6e59d 100644
+--- a/integrations/mcp/codex.py
++++ b/integrations/mcp/codex.py
+@@ -39,7 +39,7 @@ def toml_value(value):
+     raise TypeError("Unsupported native TOML value")
+ 
+ 
+-def native_arguments(config, arguments, route, final_path, proxy_socket=None):
++def native_arguments(config, arguments, route, final_path, proxy_socket=None, *, remote_binding=None):
+     servers = {}
+     for grant in arguments["permissions"]["mcp_servers"]:
+         if proxy_socket is None:
+@@ -64,7 +64,11 @@ def native_arguments(config, arguments, route, final_path, proxy_socket=None):
+         argv.extend(["-c", key + "=" + toml_value(value)])
+     for feature in DISABLED_FEATURES:
+         argv.extend(["--disable", feature])
+-    return argv + ["--json", "--color", "never", "-o", str(final_path), "-"]
++    argv += ["--json", "--color", "never", "-o", str(final_path), "-"]
++    if remote_binding is not None:
++        from .remote_native import native_arguments as remote_arguments
++        return list(remote_arguments(remote_binding, tuple(argv)))
++    return argv
+ 
+ 
+ class EventReader:
+diff --git a/integrations/mcp/job_store.py b/integrations/mcp/job_store.py
+index b15d323..9ac634b 100644
+--- a/integrations/mcp/job_store.py
++++ b/integrations/mcp/job_store.py
+@@ -10,6 +10,7 @@ from pathlib import Path
+ import sqlite3
+ import time
+ import uuid
++from contextlib import contextmanager
+ 
+ from .schemas import WorkerError, canonical, emit_event
+ from .native_profile import captured_version, record_version
+@@ -48,6 +49,7 @@ class JobStore:
+         path = Path(config['state_dir']) / 'jobs.db'
+         existed = path.exists()
+         self.db = None
++        self.admission_closed = False
+         try:
+             self.db = sqlite3.connect(path, isolation_level=None)
+             if self.db.execute('PRAGMA integrity_check').fetchone() != ('ok',):
+@@ -112,7 +114,29 @@ class JobStore:
+         except (sqlite3.Error, ValueError, TypeError) as exc:
+             raise WorkerError('storage_error', 'Cannot read active reservations') from exc
+ 
+-    def accept(self, arguments, route, *, cli_version):
++    @contextmanager
++    def transaction(self):
++        if self.db.in_transaction:
++            raise WorkerError('storage_error', 'Nested job store transaction refused')
++        committing = False
++        try:
++            self.db.execute('BEGIN IMMEDIATE')
++            yield self.db
++            committing = True
++            self.db.execute('COMMIT')
++        except Exception as exc:
++            if committing or isinstance(exc, sqlite3.Error):
++                self.admission_closed = True
++            if self.db.in_transaction:
++                self.db.execute('ROLLBACK')
++            if isinstance(exc, sqlite3.Error):
++                raise WorkerError('storage_error', 'Job store transaction did not commit') from exc
++            raise
++
++    def accept(self, arguments, route, *, cli_version, acceptance_seed=None):
++        if acceptance_seed is not None and self.admission_closed:
++            from .remote_schemas import RemoteError
++            raise RemoteError('storage_error')
+         encoded = canonical(arguments)
+         record = {'job_id': str(uuid.uuid4()), 'route_id': route['route_id'], 'state': 'queued',
+                   'cwd': arguments['cwd'], 'created_at_ms': utc_ms(), 'started_at_ms': None,
+@@ -123,6 +147,15 @@ class JobStore:
+                   'launch_nonce': str(uuid.uuid4()), 'host_boot_id': self.boot_id,
+                   'watchdog': None, 'native': None, 'accepted_monotonic': time.monotonic(),
+                   'stop_intent': None, 'result': None, 'state_dir': self.config['state_dir']}
++        if acceptance_seed is not None:
++            from .remote_native import build_handoff
++            from .remote_schemas import RemoteError
++            if (build_handoff(arguments, acceptance_seed.input_manifest,
++                              self.config['limits']['max_handoff_bytes']) != acceptance_seed.handoff
++                    or route['context']['worker_bytes'] != acceptance_seed.handoff.worker_bytes):
++                raise RemoteError('policy_unavailable')
++            record['execution_kind'] = 'cowork_remote_v1'
++        committing = False
+         try:
+             self.db.execute('BEGIN IMMEDIATE')
+             previous = self.replay(arguments)
+@@ -139,14 +172,22 @@ class JobStore:
+             self.db.execute('INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?)',
+                 (record['job_id'], self.config['client_id'], arguments['request_id'],
+                  record['argument_hash'], encoded, record['cwd'], 1, json.dumps(record)))
++            if acceptance_seed is not None:
++                from .task_store import accept_binding, event
++                accept_binding(self.db, record['job_id'], acceptance_seed)
++                event(self.db, 'job', record['job_id'], state='queued', request_id=arguments['request_id'])
++            committing = True
+             self.db.execute('COMMIT')
+         except Exception as exc:
++            if acceptance_seed is not None and (committing or isinstance(exc, sqlite3.Error)):
++                self.admission_closed = True
+             if self.db.in_transaction:
+                 self.db.execute('ROLLBACK')
+             if isinstance(exc, sqlite3.Error):
+                 raise WorkerError('storage_error', 'Job reservation did not commit') from exc
+             raise
+-        self._event(record, None)
++        if acceptance_seed is None:
++            self._event(record, None)
+         return record, True
+ 
+     def feedback(self, arguments):
+@@ -186,18 +227,28 @@ class JobStore:
+         return {'ok': True, 'feedback': {'job_id': arguments['job_id'], 'feedback_id': arguments['feedback_id'],
+             'seq': seq, 'created_at_ms': created, 'verdict': arguments['verdict'], 'verification_status': 'planner_asserted'}}
+ 
+-    def _save(self, record):
++    def _save(self, record, *, old_state=None):
+         try:
+             self.db.execute('BEGIN IMMEDIATE')
+             self.db.execute('UPDATE jobs SET active=?,record=? WHERE job_id=?',
+                             (int(record['state'] not in TERMINAL), json.dumps(record), record['job_id']))
++            if record.get('execution_kind') == 'cowork_remote_v1' and old_state is not None:
++                from .task_store import event
++                event(self.db, 'job', record['job_id'], old_state, record['state'],
++                      reason=record['reason'], request_id=record['arguments']['request_id'])
+             self.db.execute('COMMIT')
+-        except sqlite3.Error as exc:
++        except Exception as exc:
+             if self.db.in_transaction:
+                 self.db.execute('ROLLBACK')
++            if record.get('execution_kind') == 'cowork_remote_v1':
++                self.admission_closed = True
++                from .remote_runtime import current
++                current().fatal()
+             raise WorkerError('storage_error', 'Job transition did not commit') from exc
+ 
+     def _event(self, record, old_state):
++        if record.get('execution_kind') == 'cowork_remote_v1':
++            return
+         emit_event(self.config, 'state_transition', request_id=record['arguments']['request_id'],
+                    route_id=record['route_id'], job_id=record['job_id'], from_state=old_state,
+                    state=record['state'], reason=record['reason'])
+@@ -230,7 +281,7 @@ class JobStore:
+         if state in TERMINAL:
+             record['finished_at_ms'] = utc_ms()
+             record['result'] = result
+-        self._save(record)
++        self._save(record, old_state=old)
+         self._event(record, old)
+         return record
+ 
+@@ -239,10 +290,13 @@ class JobStore:
+         if record['state'] not in TERMINAL and record['reason'] != 'containment_failed':
+             record['reason'] = 'containment_failed'
+             record['progress'] = 'Worker termination could not be proven'
+-            self._save(record)
+-            emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
+-                       route_id=record['route_id'], job_id=record['job_id'],
+-                       from_state=record['state'], state=record['state'], reason='containment_failed')
++            if record.get('execution_kind') == 'cowork_remote_v1':
++                self._save(record, old_state=record['state'])
++            else:
++                self._save(record)
++                emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
++                           route_id=record['route_id'], job_id=record['job_id'],
++                           from_state=record['state'], state=record['state'], reason='containment_failed')
+         return record
+ 
+     @staticmethod
+diff --git a/integrations/mcp/worker.py b/integrations/mcp/worker.py
+index c91e7e5..6156b29 100644
+--- a/integrations/mcp/worker.py
++++ b/integrations/mcp/worker.py
+@@ -28,10 +28,25 @@ def send(event):
+ 
+ 
+ class Watchdog:
+-    def __init__(self, bootstrap):
++    def __init__(self, bootstrap, *, execution_kind=None):
+         self.bootstrap = bootstrap
+         self.config, self.arguments, self.route = (bootstrap[name] for name in ("config", "arguments", "route"))
+         self.job_id = bootstrap["job_id"]
++        self.remote_binding = None
++        self.remote_errors = ()
++        if execution_kind is not None or 'execution_kind' in bootstrap or 'remote_binding' in bootstrap:
++            from .remote_schemas import RemoteError, WorkerBinding
++            from .remote_native import verify_binding, build_handoff, load_manifest
++            if execution_kind != 'cowork_remote_v1' or bootstrap.get('execution_kind') != execution_kind or not bootstrap.get('remote_binding'):
++                raise RemoteError('policy_unavailable')
++            binding = WorkerBinding(**bootstrap['remote_binding'])
++            if binding.job_id != self.job_id:
++                raise RemoteError('policy_unavailable')
++            verify_binding(binding, binding.native_manifest)
++            if build_handoff(self.arguments, binding.input_manifest, self.config['limits']['max_handoff_bytes']) != binding.handoff:
++                raise RemoteError('policy_unavailable')
++            self.remote_binding = binding
++            self.remote_errors = (RemoteError,)
+         self.cli_version = record_version(bootstrap)
+         self.directory = Path(self.config["state_dir"]) / "jobs" / self.job_id
+         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+@@ -59,7 +74,11 @@ class Watchdog:
+ 
+     def stop(self, reason):
+         if self.error is None:
+-            self.error = WorkerError(reason, "Worker stopped: " + reason)
++            if self.remote_binding is not None:
++                from .remote_schemas import RemoteError
++                self.error = RemoteError(reason)
++            else:
++                self.error = WorkerError(reason, "Worker stopped: " + reason)
+         if self.stop_at is None:
+             self.stop_at = time.monotonic()
+             if self.tracker:
+@@ -97,10 +116,22 @@ class Watchdog:
+         self.streams = {name: (self.directory / (name + ".tmp")).open("wb")
+                         for name in ("events.jsonl", "native.stderr")}
+         argv = native_arguments(self.config, self.arguments, self.route,
+-                                self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None)
++                                self.directory / "final.txt.tmp", self.proxy.path if self.proxy else None,
++                                **({'remote_binding': self.remote_binding} if self.remote_binding is not None else {}))
+         environment = native_environment(self.config)
+         check_version(self.config, time.monotonic() + self.config["limits"]["startup_timeout_s"],
+                       expected=self.cli_version)
++        if self.remote_binding is not None:
++            from .remote_native import load_manifest, build_handoff, verify_inputs
++            from .remote_schemas import json_bytes, RemoteError
++            load_manifest(json_bytes(self.remote_binding.native_manifest), self.config, self.remote_binding.execution_policy)
++            identity = os.stat(self.arguments['cwd'], follow_symlinks=False)
++            expected = self.remote_binding.workspace_identity
++            if ((identity.st_dev, identity.st_ino) != (expected.device, expected.inode)
++                    or build_handoff(self.arguments, self.remote_binding.input_manifest,
++                                     self.config['limits']['max_handoff_bytes']) != self.remote_binding.handoff):
++                raise RemoteError('policy_unavailable')
++            verify_inputs(self.remote_binding, self.arguments['cwd'])
+         self.native = subprocess.Popen(argv, cwd=self.arguments["cwd"], env=environment, stdin=subprocess.PIPE,
+             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, shell=False)
+         identity = process_identity(self.native.pid)
+@@ -109,7 +140,8 @@ class Watchdog:
+             raise WorkerError("containment_failed", "Native launch identity could not be observed")
+         self.tracker = ProcessTracker(identity)
+         self.tracker.sample()
+-        self.handoff = memoryview(handoff(self.arguments).encode("utf-8"))
++        packet = self.remote_binding.handoff.text if self.remote_binding is not None else handoff(self.arguments)
++        self.handoff = memoryview(packet.encode("utf-8"))
+         for stream, label, event in ((self.native.stdout, "events.jsonl", selectors.EVENT_READ),
+                                      (self.native.stderr, "native.stderr", selectors.EVENT_READ),
+                                      (self.native.stdin, "handoff", selectors.EVENT_WRITE)):
+@@ -133,7 +165,7 @@ class Watchdog:
+         if key.data == "events.jsonl" and self.error is None:
+             try:
+                 self.reader.feed(chunk)
+-            except WorkerError as exc:
++            except (WorkerError, *self.remote_errors) as exc:
+                 self.stop(exc.code)
+ 
+     def _write_handoff(self, key):
+@@ -187,7 +219,7 @@ class Watchdog:
+                         self._output(key)
+                 if self._tick():
+                     break
+-            except WorkerError as exc:
++            except (WorkerError, *self.remote_errors) as exc:
+                 self.stop(exc.code)
+             except (OSError, ValueError) as exc:
+                 self.stop("storage_error" if isinstance(exc, OSError) else "native_protocol_error")
+@@ -247,12 +279,13 @@ class Watchdog:
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--state-dir", required=True)
++    parser.add_argument("--execution-kind")
+     args = parser.parse_args()
+     # Bootstrap is trusted broker control, read once before any model/proxy starts.
+     bootstrap = json.loads(sys.stdin.buffer.raw.readline())
+     if bootstrap["config"]["state_dir"] != args.state_dir:
+         raise ValueError("Watchdog state directory does not match bootstrap")
+-    watchdog = Watchdog(bootstrap)
++    watchdog = Watchdog(bootstrap, execution_kind=args.execution_kind)
+     signal.signal(signal.SIGTERM, lambda *_: watchdog.stop("broker_interrupted"))
+     signal.signal(signal.SIGINT, lambda *_: watchdog.stop("broker_interrupted"))
+     return watchdog.run()

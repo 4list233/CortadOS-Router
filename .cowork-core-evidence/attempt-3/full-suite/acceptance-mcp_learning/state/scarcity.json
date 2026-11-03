@@ -1,0 +1,36 @@
+{
+ "fetched_at": 1792345800.8755789,
+ "lanes": {
+  "cursor": {
+   "tried_at": 1792345801.018228,
+   "error": "ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/__init__.py)",
+   "plan": "Cursor Pro"
+  },
+  "codex": {
+   "tried_at": 1792345801.091362,
+   "error": "RuntimeError: Quota source metadata is unavailable",
+   "plan": "ChatGPT 20x"
+  },
+  "antigravity": {
+   "tried_at": 1792345801.16174,
+   "error": "RuntimeError: no quota groups on the /usage screen: ",
+   "plan": "Google AI Pro"
+  },
+  "local": {
+   "tried_at": 1792345805.8855512,
+   "error": "TimeoutExpired: Command '['vm_stat']' timed out after 5 seconds",
+   "plan": "free"
+  },
+  "claude": {
+   "tried_at": 1792345807.4983559,
+   "error": "RuntimeError: Probe process ownership is unavailable",
+   "plan": "Claude Max 20x"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 0,
+  "killed": 0,
+  "removed": 0
+ }
+}

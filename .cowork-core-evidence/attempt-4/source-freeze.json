@@ -1,0 +1,74 @@
+{
+  "cortados_router/route_task.py": {
+    "sha256": "0926d833733ab05155aec08ce3343da288785d1d5d31fbd05862cc7c435212b9",
+    "lines": 117
+  },
+  "integrations/mcp/broker.py": {
+    "sha256": "1c20988bdbfe36391e61b29523b1bcc3420decb119a0f91e52d2b2af9c6e9eca",
+    "lines": 414
+  },
+  "integrations/mcp/job_store.py": {
+    "sha256": "e8ffc82b3a24a78ae8524f958beebc8d6e48175ff22a9da361b6b79c58c52119",
+    "lines": 319
+  },
+  "integrations/mcp/codex.py": {
+    "sha256": "f86de48a4f99df93849e386530348e8c3897fb1ec031a47cc545bbda82d62872",
+    "lines": 147
+  },
+  "integrations/mcp/worker.py": {
+    "sha256": "d450beb3c6351a42de5d3ff200b21657f100190dd3de6c595f6737d728515bc5",
+    "lines": 295
+  },
+  "integrations/mcp/remote_config.py": {
+    "sha256": "199132ec2792e74852337ffa7811e62ed3101801b017680927e7ed21ee383014",
+    "lines": 66
+  },
+  "integrations/mcp/remote_schemas.py": {
+    "sha256": "717973e2bce4ad34af217ec91226ca915bff2b9d825e8b2dd7f8f6507969ed07",
+    "lines": 390
+  },
+  "integrations/mcp/remote_dispatch.py": {
+    "sha256": "084a2ca286b58a8e21c4ecdb72e7e856cfb6db33668ca37c2748ee894e593ae9",
+    "lines": 261
+  },
+  "integrations/mcp/remote_http.py": {
+    "sha256": "415a29d1338c157d58a482b050dc92cc279936146687473326ca3da1405cbb87",
+    "lines": 245
+  },
+  "integrations/mcp/task_store.py": {
+    "sha256": "6a28a57cf549aa639fd653d342bf4986f2f942a93202307d1bc3bc73e59a88eb",
+    "lines": 325
+  },
+  "integrations/mcp/task_workspace.py": {
+    "sha256": "e28115bb190cb2fddf99df75793b017ac0a7507753c01e9305d379e3c80f83c6",
+    "lines": 201
+  },
+  "integrations/mcp/artifact_store.py": {
+    "sha256": "399fd3599a5a0496bb4d4cd3aeca0e0136a6038c97c5c254daf19442503179d6",
+    "lines": 180
+  },
+  "integrations/mcp/file_transfer.py": {
+    "sha256": "b1894e0e42547e18059b12fc5b8f77bc5588de25334a3ea7b7aafa675fc71a95",
+    "lines": 219
+  },
+  "integrations/mcp/transfer_tickets.py": {
+    "sha256": "ef8be49d138948182f3a1acc309d95e1f05e6179609b8f655e47aec60eccb1ad",
+    "lines": 166
+  },
+  "integrations/mcp/remote_native.py": {
+    "sha256": "b76af4ed2c1074991e6b5ec153824c02b631e2a6642858e58f1c540f61f2d62f",
+    "lines": 111
+  },
+  "integrations/mcp/remote_runtime.py": {
+    "sha256": "611f45788d0c91f161a90d9b4fcda649d0b8d69e2cdadd18bdcc85eda0332dd2",
+    "lines": 402
+  },
+  "integrations/mcp/remote_ipc.py": {
+    "sha256": "53719f850a30d6d447c499b7e4f5f56ebdb92653c1c5dfe5d62c4aa537db1bd5",
+    "lines": 280
+  },
+  "integrations/mcp/remote_capacity.py": {
+    "sha256": "07ef6a89b5855dab5b78fc47f3d35af1f4c41a66f4ceb04e7ca5cac9bd6c32c9",
+    "lines": 146
+  }
+}

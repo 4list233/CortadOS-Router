@@ -1,0 +1,42 @@
+{
+ "fetched_at": 1792346117.628281,
+ "lanes": {
+  "local": {
+   "source": "vm_stat + ollama ps",
+   "windows": [],
+   "free_gb": 11.7,
+   "resident": [],
+   "scarcity": 1.0,
+   "fetched_at": 1792346117.6572502,
+   "tried_at": 1792346117.6572502,
+   "error": null,
+   "plan": "free"
+  },
+  "codex": {
+   "tried_at": 1792346117.857933,
+   "error": "RuntimeError: Quota source metadata is unavailable",
+   "plan": "ChatGPT 20x"
+  },
+  "cursor": {
+   "tried_at": 1792346118.50739,
+   "error": "WorkerError: Quota source metadata is unavailable",
+   "plan": "Cursor Pro"
+  },
+  "claude": {
+   "tried_at": 1792346119.27135,
+   "error": "RuntimeError: no '% used' lines on the /usage screen: ",
+   "plan": "Claude Max 20x"
+  },
+  "antigravity": {
+   "tried_at": 1792346119.272228,
+   "error": "RuntimeError: no quota groups on the /usage screen: ",
+   "plan": "Google AI Pro"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 0,
+  "killed": 0,
+  "removed": 0
+ }
+}

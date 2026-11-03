@@ -1,0 +1,115 @@
+{
+  "sources": {
+    "cortados_router/route_task.py": {
+      "sha256": "0926d833733ab05155aec08ce3343da288785d1d5d31fbd05862cc7c435212b9",
+      "lines": 117,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/broker.py": {
+      "sha256": "1c20988bdbfe36391e61b29523b1bcc3420decb119a0f91e52d2b2af9c6e9eca",
+      "lines": 414,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/job_store.py": {
+      "sha256": "e8ffc82b3a24a78ae8524f958beebc8d6e48175ff22a9da361b6b79c58c52119",
+      "lines": 319,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/codex.py": {
+      "sha256": "f86de48a4f99df93849e386530348e8c3897fb1ec031a47cc545bbda82d62872",
+      "lines": 147,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/worker.py": {
+      "sha256": "d450beb3c6351a42de5d3ff200b21657f100190dd3de6c595f6737d728515bc5",
+      "lines": 295,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/remote_config.py": {
+      "sha256": "199132ec2792e74852337ffa7811e62ed3101801b017680927e7ed21ee383014",
+      "lines": 66,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/remote_schemas.py": {
+      "sha256": "717973e2bce4ad34af217ec91226ca915bff2b9d825e8b2dd7f8f6507969ed07",
+      "lines": 390,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/remote_dispatch.py": {
+      "sha256": "54f46c93ec8fdfda66bc2fb57f38f5fedb00cfe6a960388134756cd2e9b073e8",
+      "lines": 239,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/remote_http.py": {
+      "sha256": "ffffe86c00e47bdb00238705de853eed573255aabd06ba6bf0efbfd2e5150d66",
+      "lines": 229,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/task_store.py": {
+      "sha256": "be7e3c43efa1e33ff38898c5adf7f5527933660a89f4fe3b05761c537c218481",
+      "lines": 323,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/task_workspace.py": {
+      "sha256": "e28115bb190cb2fddf99df75793b017ac0a7507753c01e9305d379e3c80f83c6",
+      "lines": 201,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/artifact_store.py": {
+      "sha256": "399fd3599a5a0496bb4d4cd3aeca0e0136a6038c97c5c254daf19442503179d6",
+      "lines": 180,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/file_transfer.py": {
+      "sha256": "d027cb889f5bf61cd447fa18ee10772e15e3f07cab5e3ac23cddb1de87f8cda3",
+      "lines": 217,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/transfer_tickets.py": {
+      "sha256": "5b21c43860d5e217cf30e7398ca56d39d673457b36b04211efc614100415ba36",
+      "lines": 155,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/remote_native.py": {
+      "sha256": "b76af4ed2c1074991e6b5ec153824c02b631e2a6642858e58f1c540f61f2d62f",
+      "lines": 111,
+      "changed_from_attempt_1": false
+    },
+    "integrations/mcp/remote_runtime.py": {
+      "sha256": "cf34ed42e06a3803a32e906356f3b042a09a7b91beb95a3ef9540c8b280b9d16",
+      "lines": 371,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/remote_ipc.py": {
+      "sha256": "8e7785993e0a719f446184880f96aa5df4803e83a5ca1247f8c0d23ca3a486c8",
+      "lines": 251,
+      "changed_from_attempt_1": true
+    },
+    "integrations/mcp/remote_capacity.py": {
+      "sha256": "ae7ae42bd6428de088596c462a5c360b7a1ee155b5662d96cd43b4949826467e",
+      "lines": 140,
+      "changed_from_attempt_1": true
+    }
+  },
+  "protected_identity": {
+    "contracts_sha256": {
+      "checked": 3,
+      "mismatches": []
+    },
+    "protected_prior_sha256": {
+      "checked": 641,
+      "mismatches": []
+    },
+    "fixture_files_sha256": {
+      "checked": 18,
+      "mismatches": []
+    }
+  },
+  "manifest_sha256": "03589f6ad5394e4c5d3c29f37979f349f7fb4b1c7cd8b6671b0c55f94da49959",
+  "head": "647fea73341beed45624732efc7fb992730f5873",
+  "correction_patch_sha256": "fbecf8c02286f2d54d424af112e811797c79e32ea601123614f5a3ad4be70a2f",
+  "candidate_patch_sha256": "4726a8fc2d1769b0c48d052a7e3d60743a814a5a163695e18726a54cb0351700",
+  "attempt_1_reconstruction": "All18 reconstructed from preserved patch and verified against independent B source hashes",
+  "compile": "18/18 passed; no pycache written",
+  "verification_script_setup_error": "Initial fixture paths mistakenly treated as repo relative; corrected prefix only"
+}

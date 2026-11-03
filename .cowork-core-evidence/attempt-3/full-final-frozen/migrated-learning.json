@@ -1,0 +1,26 @@
+{
+  "tests": 3,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "protected_before": {
+    "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_activation.py": "9e34dfd88be7e99aa8c188860c3a1eb54d146f9fd017164c3888d0e64d2399c8",
+    "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/pipeline_support.py": "5dfc2be5b8137a50964c2f51d6d985ab2af9204131970750fe69dad2178034e9"
+  },
+  "protected_after": {
+    "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/test_activation.py": "9e34dfd88be7e99aa8c188860c3a1eb54d146f9fd017164c3888d0e64d2399c8",
+    "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_learning/pipeline_support.py": "5dfc2be5b8137a50964c2f51d6d985ab2af9204131970750fe69dad2178034e9"
+  },
+  "installed_origins": [
+    "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/quota_admission.py",
+    "/Users/velox/.local/share/cortados-workers/releases/quota-sources-v1-20261017/venv/lib/python3.14/site-packages/integrations/mcp/config.py"
+  ],
+  "fixture_substitutions": [
+    "fresh stage REPO",
+    "inert PATH/HOME",
+    "inert private source preparation",
+    "known actual quota check",
+    "normalized config fixture",
+    "isolated package namespaces"
+  ]
+}

@@ -1,0 +1,42 @@
+{
+ "fetched_at": 1792292715.455295,
+ "lanes": {
+  "cursor": {
+   "tried_at": 1792292715.6211772,
+   "error": "WorkerError: Quota source metadata is unavailable",
+   "plan": "Cursor Pro"
+  },
+  "antigravity": {
+   "tried_at": 1792292715.63095,
+   "error": "RuntimeError: Probe process ownership is unavailable",
+   "plan": "Google AI Pro"
+  },
+  "claude": {
+   "tried_at": 1792292715.663319,
+   "error": "RuntimeError: Probe process ownership is unavailable",
+   "plan": "Claude Max 20x"
+  },
+  "local": {
+   "source": "vm_stat + ollama ps",
+   "windows": [],
+   "free_gb": 7.3,
+   "resident": [],
+   "scarcity": 1.0,
+   "fetched_at": 1792292715.67963,
+   "tried_at": 1792292715.67963,
+   "error": null,
+   "plan": "free"
+  },
+  "codex": {
+   "tried_at": 1792292715.682465,
+   "error": "RuntimeError: Quota source metadata is unavailable",
+   "plan": "ChatGPT 20x"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 0,
+  "killed": 0,
+  "removed": 0
+ }
+}

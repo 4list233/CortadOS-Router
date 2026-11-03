@@ -1,0 +1,216 @@
+--- candidate4/integrations/mcp/broker.py
++++ attempt5/integrations/mcp/broker.py
+@@ -202,17 +202,19 @@
+             return False
+ 
+     async def stop(self, job_id, reason):
+-        record = self.store.get(job_id)
+-        if record['state'] in TERMINAL or record['stop_intent']:
+-            return record
+-        try:
++        try:
++            record = self.store.get(job_id)
++            if record['state'] in TERMINAL or record['stop_intent']:
++                return record
+             record = self.store.transition(job_id, 'cancelling', reason=reason)
+         except Exception:
+-            if self.core_runtime is not None and self.store.admission_closed:
+-                self.core_runtime.fatal()
+-                process = self.workers.get(job_id)
+-                if process:
+-                    await self.send(process, {'command': 'STOP', 'reason': reason})
++            if self.core_runtime is not None:
++                try:
++                    self.core_runtime.fatal()
++                finally:
++                    process = self.workers.get(job_id)
++                    if process:
++                        await self.send(process, {'command': 'STOP', 'reason': reason})
+             raise
+         process = self.workers.get(job_id)
+         if process:
+@@ -333,7 +335,8 @@
+                     self.store.containment_failed(job_id)
+         finally:
+             timer.cancel()
+-            self.workers.pop(job_id, None)
++            if not remote or process is None or self.receipt(self.store.get(job_id)):
++                self.workers.pop(job_id, None)
+             if process and process.stdin:
+                 process.stdin.close()
+             if remote:
+@@ -360,24 +363,38 @@
+             state, reason, result = message['state'], message.get('reason'), message['result']
+         self.store.transition(job_id, state, reason=reason, result=result)
+ 
++    async def contain_remote(self, reason):
++        jobs = set(self.workers)
++        try:
++            jobs.update(record['job_id'] for record in self.store.active()
++                        if record.get('execution_kind') == 'cowork_remote_v1')
++        except Exception:
++            self.signal_remote_failure()
++        for job_id in jobs:
++            try:
++                await self.stop(job_id, reason)
++            except Exception:
++                self.signal_remote_failure()
++
++    def signal_remote_failure(self):
++        try:
++            self.core_runtime.fatal()
++        except Exception:
++            # Runtime retains the failed sink for teardown.
++            self.core_runtime.fatal_signal_failed = True
++
+     async def shutdown(self):
+         self.stopping = True
+         if self.core_runtime is not None:
+-            jobs = set(self.workers)
+-            try:
+-                jobs.update(record['job_id'] for record in self.store.active()
+-                            if record.get('execution_kind') == 'cowork_remote_v1')
+-            except Exception:
+-                self.core_runtime.fatal()
+-            for job_id in jobs:
+-                try:
+-                    await self.stop(job_id, 'cancel_requested')
+-                except Exception:
+-                    self.core_runtime.fatal()
++            await self.contain_remote('cancel_requested')
+             if self.tasks:
+                 results = await asyncio.gather(*list(self.tasks), return_exceptions=True)
+                 if any(isinstance(result, BaseException) for result in results):
+-                    self.core_runtime.fatal()
++                    self.signal_remote_failure()
++            for job_id in tuple(self.workers):
++                if not self.receipt(self.store.get(job_id)):
++                    raise WorkerError('containment_failed', 'Worker termination is unproven')
++                self.workers.pop(job_id, None)
+             return
+         for job_id in list(self.workers):
+             await self.stop(job_id, 'cancel_requested')
+--- candidate4/integrations/mcp/task_store.py
++++ attempt5/integrations/mcp/task_store.py
+@@ -160,8 +160,14 @@
+                      for (name, field), item in zip(fields.items(), raw)}
+             for name, field in fields.items():
+                 if field.get('type') == 'boolean':
++                    if type(value[name]) is not int or value[name] not in (0, 1):
++                        raise s.RemoteError('storage_error')
+                     value[name] = bool(value[name])
++            record = getattr(s, TABLES[table][0])(**value)
++            value = s.plain(record)
+             if table == 'remote_job_bindings':
++                if type(raw[-1]) is not int or raw[-1] not in (0, 1):
++                    raise s.RemoteError('storage_error')
+                 if tuple(raw[len(columns):2 + len(columns)]) != (value['seed']['owner_id'], value['seed']['task_id']):
+                     raise s.RemoteError('policy_unavailable')
+             if table == 'remote_operations' and raw[-1] != value['object_ids']['task_id']:
+@@ -176,9 +182,9 @@
+                     raise s.RemoteError('policy_unavailable')
+             if table == 'remote_tasks' and value['owner_id'] != s.owner(s.Principal(**value['policy']['principal'])):
+                 raise s.RemoteError('policy_unavailable')
+-            result.append(getattr(s, TABLES[table][0])(**value))
++            result.append(record)
+         return result
+-    except (ValueError, TypeError, sqlite3.Error, s.RemoteError) as exc:
++    except Exception as exc:
+         from .remote_runtime import current
+         current().fatal()
+         if isinstance(exc, s.RemoteError) and exc.code == 'policy_unavailable':
+--- candidate4/integrations/mcp/remote_runtime.py
++++ attempt5/integrations/mcp/remote_runtime.py
+@@ -1,5 +1,5 @@
+ # PURPOSE: Own the complete local-core lock, recovery, sessions and worker lifetime.
+-# CONTRACT: RT-COWORK-MCP-008 v5 R010–018,068–070,074.
++# CONTRACT: RT-COWORK-MCP-008 v6 R010–018,068–070,074,093–102.
+ # DEPENDS: Existing Broker/JobStore, remote owners and descriptor-relative roots.
+ # CEILING: No listener, installation, credential discovery, OAuth or automatic relaunch.
+ import asyncio
+@@ -28,6 +28,8 @@
+         self.root_fds = {}
+         self.broker = None
+         self.monitor_task = None
++        self.monitor_stop_owned = False
++        self.containment_task = None
+         self.sessions = {}
+         self.leases = {}
+         self.descriptors = {}
+@@ -44,12 +46,29 @@
+         self.task_locks = {}
+ 
+     def authorize(self, principal, operation=None):
++        self.observe_monitor(self.monitor_task)
+         if principal != self.config.principal or not self.enabled:
+             raise s.RemoteError('permission_refused')
+         if not self.ready or self.fatal_failed or self.broker.store.admission_closed:
+             raise s.RemoteError('storage_error')
+         if self.capacity_failed and operation not in ('attach', 'bind', 'task_get', 'job_status', 'job_result', 'job_cancel', 'close'):
+             raise s.RemoteError('capacity_exhausted')
++
++    def observe_monitor(self, task):
++        if task is None or not task.done():
++            return
++        if not task.cancelled():
++            task.exception()  # Consume even after another detector has latched.
++        if self.monitor_stop_owned:
++            return
++        if self.containment_task is None:
++            self.containment_task = asyncio.create_task(
++                self.broker.contain_remote('capacity_exhausted'))
++        try:
++            self.fatal()
++        except Exception:
++            # Sink failure remains latched for safe teardown reporting.
++            self.fatal_signal_failed = True
+ 
+     def fail_capacity(self):
+         if self.capacity_failed:
+@@ -91,7 +110,7 @@
+                     object_id=None, request_id=None, from_state=None, state=None, reason='storage_error'))
+             except Exception:
+                 self.fatal_signal_failed = True
+-                raise
++                raise s.RemoteError('storage_error') from None
+         if self.fatal_signal_failed:
+             raise s.RemoteError('storage_error')
+ 
+@@ -137,6 +156,7 @@
+                 store.event(tx, 'runtime', None, state='ready')
+             self.ready = True
+             self.monitor_task = asyncio.create_task(self.capacity.run())
++            self.monitor_task.add_done_callback(self.observe_monitor)
+             return self
+         except Exception as exc:
+             await self.__aexit__(type(exc), exc, exc.__traceback__)
+@@ -151,7 +171,9 @@
+                 self.fatal()
+             except Exception as error:
+                 failures.append(error)
++        self.observe_monitor(self.monitor_task)
+         self.ready = False
++        self.monitor_stop_owned = True
+         for session in tuple(self.sessions.values()):
+             session.socket.close()
+             session.task.cancel()
+@@ -169,6 +191,8 @@
+             await self.capacity.close()
+             self.monitor_task.cancel()
+             await asyncio.gather(self.monitor_task, return_exceptions=True)
++        if self.containment_task:
++            await asyncio.gather(self.containment_task, return_exceptions=True)
+         if self.broker:
+             try:
+                 await self.broker.shutdown()
+@@ -193,8 +217,8 @@
+         if self.token is not None:
+             CURRENT.reset(self.token)
+             self.token = None
+-        if failures:
+-            raise s.RemoteError('storage_error') from failures[0]
++        if failures or self.fatal_signal_failed:
++            raise s.RemoteError('storage_error') from None
+ 
+     async def attach(self, server_socket, principal):
+         if not self.ready or principal != self.config.principal or not self.enabled:

@@ -1,0 +1,42 @@
+{
+ "fetched_at": 1792346121.152799,
+ "lanes": {
+  "local": {
+   "source": "vm_stat + ollama ps",
+   "windows": [],
+   "free_gb": 11.7,
+   "resident": [],
+   "scarcity": 1.0,
+   "fetched_at": 1792346121.1849139,
+   "tried_at": 1792346121.1849139,
+   "error": null,
+   "plan": "free"
+  },
+  "antigravity": {
+   "tried_at": 1792346121.287793,
+   "error": "RuntimeError: no quota groups on the /usage screen: ",
+   "plan": "Google AI Pro"
+  },
+  "codex": {
+   "tried_at": 1792346121.395781,
+   "error": "RuntimeError: Quota source metadata is unavailable",
+   "plan": "ChatGPT 20x"
+  },
+  "claude": {
+   "tried_at": 1792346121.399604,
+   "error": "RuntimeError: Probe process ownership is unavailable",
+   "plan": "Claude Max 20x"
+  },
+  "cursor": {
+   "tried_at": 1792346121.418144,
+   "error": "WorkerError: Quota source metadata is unavailable",
+   "plan": "Cursor Pro"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 0,
+  "killed": 0,
+  "removed": 0
+ }
+}

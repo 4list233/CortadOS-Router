@@ -1,0 +1,13 @@
+{
+  "scope": "Actual local core with prior protected fake native; no real providers",
+  "baseline": "baseline-ordinary.json: direct existing owners, not an equivalent prior remote service",
+  "memory_acceptance": "Independent B review required: file-size-independent growth with chunk\u00d7active streams. No fixed RSS or latency SLO.",
+  "selector_budget": "One indexed SELECT per unique selector; one indexed prefix artifact listing<=100 rows; bounded temporary sort allowed.",
+  "cases": [],
+  "correctness_pass": false,
+  "efficiency_review": "pending",
+  "failure": {
+    "type": "RemoteError",
+    "message": "Remote operation refused: storage_error"
+  }
+}

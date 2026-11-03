@@ -1,0 +1,39 @@
+--- a/integrations/mcp/broker.py
++++ b/integrations/mcp/broker.py
+@@ -234,6 +234,14 @@
+             if record['route']['chosen']['model'] not in admission['models']:
+                 raise WorkerError('model_unavailable', 'Selected model is no longer admitted')
+ 
++    async def guard_remote_launch(self, job_id):
++        runtime = self.core_runtime
++        runtime.observe_monitor(runtime.monitor_task)
++        if runtime.fatal_failed or runtime.capacity_failed or runtime.broker.store.admission_closed:
++            # A pending spawn may have missed the containment enumeration. Use
++            # this launch's identity and the existing STOP/receipt owner instead.
++            await self.stop(job_id, 'capacity_exhausted')
++
+     async def run_worker(self, accepted):
+         job_id, process, launch_error = accepted['job_id'], None, None
+         timer = asyncio.create_task(self.deadline(job_id))
+@@ -274,8 +282,12 @@
+             await self.send(process, {'config': self.config, 'arguments': accepted['arguments'],
+                 'route': accepted['route'], 'job_id': job_id, 'launch_nonce': accepted['launch_nonce'],
+                 'host_boot_id': accepted['host_boot_id'], 'cli_version': record_version(accepted), **remote_bootstrap})
++            if remote:
++                await self.guard_remote_launch(job_id)
+             while line := await process.stdout.readline():
+                 message = json.loads(line)
++                if remote and message.get('event') == 'ready':
++                    await self.guard_remote_launch(job_id)
+                 record = self.store.get(job_id)
+                 if message.get('event') == 'ready':
+                     record = self.store.identify(job_id, watchdog=message['watchdog'])
+@@ -284,6 +296,8 @@
+                             await self.admit_launch(record)
+                         except (WorkerError, *remote_errors) as exc:
+                             launch_error = exc
++                    if remote:
++                        await self.guard_remote_launch(job_id)
+                     record = self.store.get(job_id)
+                     if record['stop_intent'] or launch_error:
+                         reason = record['stop_intent'] or launch_error.code

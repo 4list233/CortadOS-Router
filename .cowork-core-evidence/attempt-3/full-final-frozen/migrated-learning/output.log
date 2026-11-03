@@ -1,0 +1,186 @@
+test_l12_disabled_modified_eval_preserves_legacy_inputs_and_outputs (acceptance.mcp_learning.test_activation.Activation.test_l12_disabled_modified_eval_preserves_legacy_inputs_and_outputs) ... ok
+test_l12_enabled_collection_teacher_sft_and_eval_use_installed_learning_owner (acceptance.mcp_learning.test_activation.Activation.test_l12_enabled_collection_teacher_sft_and_eval_use_installed_learning_owner) ... ok
+test_l12_only_five_adapters_change_and_next_run_exports_precede_reexec (acceptance.mcp_learning.test_activation.Activation.test_l12_only_five_adapters_change_and_next_run_exports_precede_reexec) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.224s
+
+OK
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}
+labelled train-split requests 1 · teacher-majority bands {'R0': 1} · sft train 2 examples · valid 0
+{
+ "holdout_rows": 1,
+ "teacher_band_mix": {
+  "R0": 1
+ },
+ "candidate": {
+  "n": 1,
+  "no_answer": 0,
+  "band_accuracy": 0.0,
+  "under_routed": 0.0,
+  "over_routed": 1.0,
+  "outward_recall": 0.0,
+  "outward_positives": 0,
+  "question_accuracy": {
+   "steps": 0.0,
+   "ambiguity": 0.0,
+   "blast_radius": 0.0,
+   "context_size": 0.0,
+   "novelty": 0.0,
+   "parallelizability": 0.0,
+   "outward": 0.0,
+   "work_kind": 1.0,
+   "urgency": 1.0,
+   "needs_clarification": 1.0,
+   "parts": 1.0,
+   "diversity": 1.0
+  },
+  "ece": {
+   "steps": 0.25,
+   "ambiguity": 0.25,
+   "blast_radius": 0.25,
+   "context_size": 0.25,
+   "novelty": 0.25,
+   "parallelizability": 0.25,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "brier": {
+   "steps": 0.75,
+   "ambiguity": 0.75,
+   "blast_radius": 0.75,
+   "context_size": 0.75,
+   "novelty": 0.75,
+   "parallelizability": 0.75,
+   "outward": 0.5,
+   "work_kind": 0.857,
+   "urgency": 0.667,
+   "needs_clarification": 0.5,
+   "parts": 0.8,
+   "diversity": 0.5
+  },
+  "latency_ms_median": 1
+ },
+ "promote": false
+}

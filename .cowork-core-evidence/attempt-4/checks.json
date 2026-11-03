@@ -1,0 +1,53 @@
+{
+  "changed_sources": [
+    "integrations/mcp/remote_dispatch.py",
+    "integrations/mcp/task_store.py",
+    "integrations/mcp/transfer_tickets.py",
+    "integrations/mcp/remote_runtime.py",
+    "integrations/mcp/remote_capacity.py"
+  ],
+  "protected_checked": 664,
+  "protected_mismatches": [],
+  "all18_ast_and_line_cap": "passed",
+  "test_runs": {
+    "core.log": {
+      "methods": 114,
+      "passed": 20,
+      "errors": 92,
+      "failures": 3,
+      "skips": 0,
+      "exit_code": 1,
+      "error_blocks_with_boot_identity_denial": 91,
+      "failed_child_startup_blocks": 3,
+      "distinct_unsuccessful_methods": 94,
+      "classification": "environment blocked; raw failure/error events retained",
+      "cleanup_broken_pipe_events": 1
+    },
+    "core-final.log": {
+      "methods": 114,
+      "passed": 20,
+      "errors": 92,
+      "failures": 3,
+      "skips": 0,
+      "exit_code": 1,
+      "error_blocks_with_boot_identity_denial": 91,
+      "failed_child_startup_blocks": 3,
+      "distinct_unsuccessful_methods": 94,
+      "classification": "environment blocked; raw failure/error events retained",
+      "cleanup_broken_pipe_events": 1
+    },
+    "ordinary.log": {
+      "methods": 52,
+      "passed": 49,
+      "errors": 3,
+      "failures": 0,
+      "skips": 0,
+      "exit_code": 1,
+      "error_blocks_with_boot_identity_denial": 3,
+      "failed_child_startup_blocks": 0,
+      "distinct_unsuccessful_methods": 3,
+      "classification": "environment blocked; raw failure/error events retained"
+    }
+  },
+  "host_full28_and_performance": "pending root after freeze"
+}

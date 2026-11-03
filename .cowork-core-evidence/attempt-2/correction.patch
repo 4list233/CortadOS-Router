@@ -1,0 +1,797 @@
+--- a/integrations/mcp/broker.py
++++ b/integrations/mcp/broker.py
+@@ -205,7 +205,15 @@
+         record = self.store.get(job_id)
+         if record['state'] in TERMINAL or record['stop_intent']:
+             return record
+-        record = self.store.transition(job_id, 'cancelling', reason=reason)
++        try:
++            record = self.store.transition(job_id, 'cancelling', reason=reason)
++        except Exception:
++            if self.core_runtime is not None and self.store.admission_closed:
++                self.core_runtime.fatal()
++                process = self.workers.get(job_id)
++                if process:
++                    await self.send(process, {'command': 'STOP', 'reason': reason})
++            raise
+         process = self.workers.get(job_id)
+         if process:
+             await self.send(process, {'command': 'STOP', 'reason': reason})
+@@ -355,9 +363,22 @@
+     async def shutdown(self):
+         self.stopping = True
+         if self.core_runtime is not None:
+-            for record in self.store.active():
+-                if record.get('execution_kind') == 'cowork_remote_v1':
+-                    await self.stop(record['job_id'], 'cancel_requested')
++            jobs = set(self.workers)
++            try:
++                jobs.update(record['job_id'] for record in self.store.active()
++                            if record.get('execution_kind') == 'cowork_remote_v1')
++            except Exception:
++                self.core_runtime.fatal()
++            for job_id in jobs:
++                try:
++                    await self.stop(job_id, 'cancel_requested')
++                except Exception:
++                    self.core_runtime.fatal()
++            if self.tasks:
++                results = await asyncio.gather(*list(self.tasks), return_exceptions=True)
++                if any(isinstance(result, BaseException) for result in results):
++                    self.core_runtime.fatal()
++            return
+         for job_id in list(self.workers):
+             await self.stop(job_id, 'cancel_requested')
+         if self.tasks:
+--- a/integrations/mcp/job_store.py
++++ b/integrations/mcp/job_store.py
+@@ -237,9 +237,13 @@
+                 event(self.db, 'job', record['job_id'], old_state, record['state'],
+                       reason=record['reason'], request_id=record['arguments']['request_id'])
+             self.db.execute('COMMIT')
+-        except sqlite3.Error as exc:
++        except Exception as exc:
+             if self.db.in_transaction:
+                 self.db.execute('ROLLBACK')
++            if record.get('execution_kind') == 'cowork_remote_v1':
++                self.admission_closed = True
++                from .remote_runtime import current
++                current().fatal()
+             raise WorkerError('storage_error', 'Job transition did not commit') from exc
+ 
+     def _event(self, record, old_state):
+@@ -286,10 +290,13 @@
+         if record['state'] not in TERMINAL and record['reason'] != 'containment_failed':
+             record['reason'] = 'containment_failed'
+             record['progress'] = 'Worker termination could not be proven'
+-            self._save(record)
+-            emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
+-                       route_id=record['route_id'], job_id=record['job_id'],
+-                       from_state=record['state'], state=record['state'], reason='containment_failed')
++            if record.get('execution_kind') == 'cowork_remote_v1':
++                self._save(record, old_state=record['state'])
++            else:
++                self._save(record)
++                emit_event(self.config, 'refusal', request_id=record['arguments']['request_id'],
++                           route_id=record['route_id'], job_id=record['job_id'],
++                           from_state=record['state'], state=record['state'], reason='containment_failed')
+         return record
+ 
+     @staticmethod
+--- a/integrations/mcp/remote_schemas.py
++++ b/integrations/mcp/remote_schemas.py
+@@ -90,22 +90,22 @@
+ 'FrontendConfig': _shape('config_digest=Hash;limits=CoreLimits;transfer_origin=HTTPSOrigin'),
+ 'PolicySnapshot': _shape('schema={"const":"cortados.cowork-snapshot.v1"};installation_id=ID;principal=Principal;roots=Roots;limits=CoreLimits;retention=Retention;execution_policy=Policy;transfer_origin=HTTPSOrigin;ticket_key_version=Nonblank;ticket_key_sha256=Hash;config_digest=Hash'),
+ 'CaptureRef': _shape('name=Nonblank;sha256=Hash;kind={"enum":["synthetic","captured"]}'),
+-'NativeTemplate': _shape('id={"const":"cowork-task-v1"};default_permissions={"const":"cowork-task"};extends={"const":":workspace"};filesystem={"type":"object","properties":{"root":{"const":"deny"},"minimal":{"const":"read"},"tmpdir":{"const":"deny"},"slash_tmp":{"const":"deny"}},"required":["root","minimal","tmpdir","slash_tmp"],"additionalProperties":false};network={"const":false};strict_config={"const":true};ignore_user_config={"const":true};ignore_rules={"const":true};ephemeral={"const":true};skip_git_repo_check={"const":true};mcp_servers={"type":"array"}'),
+-'NativeManifest': _shape('schema={"const":"cortados.cowork-native.v1"};native_version={"const":"0.163.0"};binary_sha256=Hash;template=NativeTemplate;disabled_features={"type":"array","items":{"$ref":"#/$defs/Nonblank"}};environment_names={"type":"array","items":{"$ref":"#/$defs/Nonblank"}};environment_policy={"const":"ordinary-native-environment-v1"};captures={"type":"array","items":{"$ref":"#/$defs/CaptureRef"}}'),
++'NativeTemplate': _shape('id={"const":"cowork-task-v1"};default_permissions={"const":"cowork-task"};extends={"const":":workspace"};filesystem={"type":"object","properties":{"root":{"const":"deny"},"minimal":{"const":"read"},"tmpdir":{"const":"deny"},"slash_tmp":{"const":"deny"}},"required":["root","minimal","tmpdir","slash_tmp"],"additionalProperties":false};network={"const":false};strict_config={"const":true};ignore_user_config={"const":true};ignore_rules={"const":true};ephemeral={"const":true};skip_git_repo_check={"const":true};mcp_servers={"type":"array","maxItems":0}'),
++'NativeManifest': _shape('schema={"const":"cortados.cowork-native.v1"};native_version={"const":"0.163.0"};binary_sha256=Hash;template=NativeTemplate;disabled_features={"type":"array","items":{"$ref":"#/$defs/Nonblank"},"maxItems":100};environment_names={"type":"array","items":{"$ref":"#/$defs/Nonblank"},"maxItems":100};environment_policy={"const":"ordinary-native-environment-v1"};captures={"type":"array","items":{"$ref":"#/$defs/CaptureRef"},"maxItems":100}'),
+ 'WorkspaceIdentity': _shape('device=N;inode=P;relative_name=Nonblank'),
+ 'BlobIdentity': _shape('device=N;inode=P;relative_name=Nonblank;bytes=N;sha256=Hash'),
+ 'InputEntry': _shape('artifact=Artifact;blob=BlobIdentity'),
+ 'OutputEntry': _shape('artifact=Artifact;blob=BlobIdentity;phase={"enum":["staged","renamed","sealed"]}'),
+ 'Handoff': _shape('text=Text;worker_bytes=N;sha256=Hash'),
+-'AcceptanceSeed': _shape('owner_id=Owner;task_id=ID;task_group_id=ID;request_id=ID;argument_hash=Hash;expected_task_version=N;input_manifest={"type":"array","items":{"$ref":"#/$defs/InputEntry"}};execution_policy=Policy;native_manifest=NativeManifest;handoff=Handoff;policy_snapshot=PolicySnapshot;preparation_id=ID'),
++'AcceptanceSeed': _shape('owner_id=Owner;task_id=ID;task_group_id=ID;request_id=ID;argument_hash=Hash;expected_task_version=N;input_manifest={"type":"array","items":{"$ref":"#/$defs/InputEntry"},"maxItems":100};execution_policy=Policy;native_manifest=NativeManifest;handoff=Handoff;policy_snapshot=PolicySnapshot;preparation_id=ID'),
+ 'RemoteBinding': _shape('job_id=ID;execution_kind={"const":"cowork_remote_v1"};seed=AcceptanceSeed;workspace_identity=WorkspaceIdentity?'),
+-'WorkerBinding': _shape('job_id=ID;execution_kind={"const":"cowork_remote_v1"};owner_id=Owner;task_id=ID;task_group_id=ID;input_manifest={"type":"array","items":{"$ref":"#/$defs/InputEntry"}};execution_policy=Policy;native_manifest=NativeManifest;workspace_identity=WorkspaceIdentity;config_digest=Hash;limits=CoreLimits;handoff=Handoff'),
++'WorkerBinding': _shape('job_id=ID;execution_kind={"const":"cowork_remote_v1"};owner_id=Owner;task_id=ID;task_group_id=ID;input_manifest={"type":"array","items":{"$ref":"#/$defs/InputEntry"},"maxItems":100};execution_policy=Policy;native_manifest=NativeManifest;workspace_identity=WorkspaceIdentity;config_digest=Hash;limits=CoreLimits;handoff=Handoff'),
+ 'TaskRow': _shape('owner_id=Owner;task_id=ID;group_id=ID;title=Text;state={"enum":["creating","ready","busy","quarantined","deleting","deleted"]};policy=PolicySnapshot;created_at_ms=N;updated_at_ms=N;version=N;active_job_id=ID?;root_identity=WorkspaceIdentity?;cleanup_error=Error?'),
+-'ObjectIDs': _shape('task_id=ID;artifact_ids={"type":"array","items":{"$ref":"#/$defs/ID"}};job_id=ID?;ticket_id=ID?'),
++'ObjectIDs': _shape('task_id=ID;artifact_ids={"type":"array","items":{"$ref":"#/$defs/ID"},"maxItems":100};job_id=ID?;ticket_id=ID?'),
+ 'OperationRow': _shape('owner_id=Owner;operation={"enum":["task_create","task_delete","delegate","file_upload_ticket","file_download_ticket"]};request_id=ID;argument_hash=Hash;phase={"enum":["intent","committed","failed"]};object_ids=ObjectIDs;error=Error?;created_at_ms=N'),
+ 'ArtifactRow': _shape('owner_id=Owner;task_id=ID;artifact_id=ID;filename=Name;media_type=Media;declared_bytes=N;declared_hash=Hash;observed_bytes=N?;observed_hash=Hash?;origin={"enum":["input","output"]};job_id=ID?;state={"enum":["reserved","uploading","sealed","quarantined"]};blob=BlobIdentity?;partial={"type":"boolean"};created_at_ms=N'),
+ 'TicketRow': _shape('ticket_id=ID;owner_id=Owner;task_id=ID;artifact_id=ID;operation={"enum":["file_upload_ticket","file_download_ticket"]};request_id=ID;capability_hash=Hash;key_version=Nonblank;direction={"enum":["put","get"]};bytes=N;sha256=Hash;expires_at_ms=N;state={"enum":["issued","claimed","consumed","revoked"]};lease_id=ID?;connection_id=ID?'),
+-'PublicationRow': _shape('job_id=ID;owner_id=Owner;task_id=ID;manifest={"type":"array","items":{"$ref":"#/$defs/OutputEntry"}};state={"enum":["pending","complete","failed","blocked"]};error=Error?'),
++'PublicationRow': _shape('job_id=ID;owner_id=Owner;task_id=ID;manifest={"type":"array","items":{"$ref":"#/$defs/OutputEntry"},"maxItems":100};state={"enum":["pending","complete","failed","blocked"]};error=Error?'),
+ 'ReservationRow': _shape('reservation_id=ID;owner_id=Owner;task_id=ID;operation={"enum":["task_create","task_delete","delegate","file_upload_ticket","file_download_ticket"]};request_id=ID;kind={"enum":["upload","workspace_copy","output_snapshot"]};bytes=N;materialized_bytes=N;state={"enum":["held","materialized","released"]}'),
+ 'Lease': _shape('lease_id=ID;connection_id=ID;owner_id=Owner;task_id=ID;artifact_id=ID;ticket_id=ID;direction={"enum":["put","get"]};offset=N;deadline_ms=N;idle_deadline_ms=N;state={"enum":["open","closing","closed"]}'),
+ 'ReadResult': _shape('body={"type":"string","pattern":"^[0-9a-f]*$","description":"Diagnostic hexadecimal bytes, never a transfer wire field"};offset=N;eof={"type":"boolean"}'),
+@@ -113,7 +113,7 @@
+ 'RecoveryResult': _shape('state={"enum":["ready","quarantined","deleting","deleted"]};error=Error?'),
+ 'TaskUsage': _shape('owner_id=Owner;task_id=ID;measured_bytes=N;promised_bytes=N;artifact_slots=N'),
+ 'RemoteEvent': _shape('schema={"const":"cortados.cowork-event.v1"};event_id=ID;at_ms=N;event={"enum":["refusal","transition"]};entity={"enum":["runtime","task","artifact","ticket","publication","job","lease"]};object_id=ID?;request_id=ID?;from_state=Text?;state=Text?;reason={"enum":["invalid_request","idempotency_conflict","model_unavailable","account_unavailable","subscription_required","quota_unknown","quota_spent","scorer_unavailable","scoring_context_too_large","worker_context_too_large","needs_clarification","permission_refused","connector_unavailable","workspace_busy","capacity_exhausted","job_not_found","storage_error","native_version_mismatch","native_protocol_error","native_failed","output_limit","timeout","cancel_requested","broker_interrupted","containment_failed","job_not_terminal","task_not_found","artifact_not_found","task_deleted","task_quarantined","upload_incomplete","transfer_busy","ticket_invalid","ticket_expired","ticket_consumed","length_mismatch","hash_mismatch","artifact_corrupt","policy_unavailable","publication_failed"]}?'),
+-'CapacityUsage': _shape('tasks={"type":"array","items":{"$ref":"#/$defs/TaskUsage"}};installation_measured_bytes=N;installation_promised_bytes=N;free_bytes=N;sampled_at_ms=N'),
++'CapacityUsage': _shape('tasks={"type":"array","items":{"$ref":"#/$defs/TaskUsage"},"maxItems":100};installation_measured_bytes=N;installation_promised_bytes=N;free_bytes=N;sampled_at_ms=N'),
+ 'PreparationRow': _shape('preparation_id=ID;owner_id=Owner;task_id=ID;request_id=ID;argument_hash=Hash;expected_task_version=N;relative_name={"type":"string","minLength":1};workspace_identity=WorkspaceIdentity?;phase={"enum":["intent","prepared","adopted","retired","quarantined"]};job_id=ID?'),
+ })
+ 
+@@ -383,7 +383,7 @@
+                 error = native.get('error')
+                 result['result'].update(changed_paths=None,
+                     error=RemoteError(error['code']).payload()['error'] if error else None,
+-                    artifacts=[artifact_projection(a) for a in value['artifacts']] if publication.state == 'complete' else [])
++                    artifacts=[plain(entry.artifact) for entry in publication.manifest] if publication.state == 'complete' else [])
+     schema = {'task': 'TaskSuccess', 'job': 'JobSuccess', 'result': 'ResultSuccess', 'ticket': 'TicketSuccess',
+               'receipt': 'Receipt', 'route': 'RouteSuccess', 'context': 'ContextSuccess', 'feedback': 'FeedbackSuccess'}[kind]
+     _validate(schema, result, WIRE)
+--- a/integrations/mcp/remote_dispatch.py
++++ b/integrations/mcp/remote_dispatch.py
+@@ -19,8 +19,19 @@
+ 
+     def task_result(self, task):
+         artifacts = store.rows(self.runtime.broker.store.db, 'remote_artifacts', 'owner_id=? AND task_id=?', (task.owner_id, task.task_id))
+-        published = {row.job_id for row in store.rows(self.runtime.broker.store.db, 'remote_publications', "owner_id=? AND task_id=? AND state='complete'", (task.owner_id, task.task_id))}
+-        artifacts = [row for row in artifacts if row.origin == 'input' or row.job_id in published]
++        visible = []
++        for row in artifacts:
++            if row.origin == 'input':
++                visible.append(row)
++            else:
++                try:
++                    tickets.require_publication(self.runtime.broker.store.db, row)
++                except s.RemoteError as exc:
++                    if exc.code == 'publication_failed':
++                        continue
++                    raise
++                visible.append(row)
++        artifacts = visible
+         return s.project_remote_result(dict(kind='task', task=task, artifacts=artifacts))
+ 
+     def job_result(self, owner_id, task_id, job_id, *, include_result=False):
+@@ -29,12 +40,18 @@
+         if not bindings:
+             raise s.RemoteError('job_not_found')
+         record = runtime.broker.store.get(job_id)
++        runtime.binding(record)
+         if record.get('execution_kind') != 'cowork_remote_v1':
+             raise s.RemoteError('policy_unavailable')
+         publication = store.rows(runtime.broker.store.db, 'remote_publications', 'job_id=? AND owner_id=? AND task_id=?', (job_id, owner_id, task_id))[0]
+         value = dict(kind='result' if include_result else 'job', job=record, binding=bindings[0], publication=publication)
+         if include_result:
+-            value['artifacts'] = store.rows(runtime.broker.store.db, 'remote_artifacts', 'owner_id=? AND task_id=? AND job_id=?', (owner_id, task_id, job_id))
++            value['artifacts'] = []
++            if publication.state == 'complete':
++                for entry in publication.manifest:
++                    row = tickets.artifact(runtime.broker.store.db, owner_id, task_id, entry.artifact.artifact_id)
++                    tickets.require_publication(runtime.broker.store.db, row)
++                    value['artifacts'].append(row)
+         return s.project_remote_result(value)
+ 
+     async def dispatch_remote(self, principal, tool, args):
+@@ -48,6 +65,7 @@
+             async with runtime.broker.admission_lock:
+                 lock = runtime.task_locks.setdefault(args.get('task_id', ''), asyncio.Lock())
+                 async with lock:
++                    runtime.authorize(principal)
+                     return await self._dispatch(principal, tool, args)
+         except WorkerError as exc:
+             error = s.from_worker_error(exc)
+@@ -58,14 +76,14 @@
+         try:
+             if runtime.broker.store.admission_closed:
+                 runtime.admission_failed = True
+-                store.event(None, 'runtime', None, reason='storage_error')
++                runtime.fatal()
+                 return s.RemoteError('storage_error').payload()
+             with runtime.broker.store.transaction() as tx:
+                 store.event(tx, 'runtime', None, reason=error.code)
+         except Exception:
+             runtime.admission_failed = True
+             error = s.RemoteError('storage_error')
+-            store.event(None, 'runtime', None, reason=error.code)
++            runtime.fatal()
+         return error.payload()
+ 
+     async def _dispatch(self, principal, tool, args):
+@@ -171,6 +189,7 @@
+         packet = build_handoff(local, tuple(entries), runtime.base['limits']['max_handoff_bytes'])
+         if tool == 'route':
+             route = await asyncio.to_thread(route_task, local, runtime.base, broker.metadata, handoff_packet=packet.text)
++            runtime.authorize(principal)
+             load_manifest(runtime.manifest_raw, runtime.base, runtime.config.execution_policy)
+             return s.project_remote_result(dict(kind='route', route=route))
+         with broker.store.transaction() as tx:
+@@ -188,6 +207,7 @@
+                 task_group_id=task.group_id, request_id=args['request_id'], argument_hash=argument_hash,
+                 expected_task_version=task.version, input_manifest=entries, execution_policy=runtime.config.execution_policy,
+                 native_manifest=runtime.manifest, handoff=packet, policy_snapshot=runtime.snapshot)
++            runtime.authorize(principal)
+             record, created = broker.store.accept(local, route, cli_version=broker.metadata.version, acceptance_seed=seed)
+         except Exception:
+             if broker.store.admission_closed:
+@@ -213,5 +233,7 @@
+ 
+     def ticket_result(self, ticket):
+         row = tickets.artifact(self.runtime.broker.store.db, ticket.owner_id, ticket.task_id, ticket.artifact_id)
++        if ticket.direction == 'get':
++            tickets.require_publication(self.runtime.broker.store.db, row)
+         return s.project_remote_result(dict(kind='ticket', ticket=ticket, authorization='Bearer ' + tickets.capability(ticket),
+             transfer_origin=self.runtime.config.transfer_origin, media_type=row.media_type))
+--- a/integrations/mcp/remote_http.py
++++ b/integrations/mcp/remote_http.py
+@@ -3,6 +3,8 @@
+ # DEPENDS: Existing MCP SDK session manager and already-bound CoreClient.
+ # CEILING: No OAuth, listener, stdio startup, identity headers or task lifetime ownership.
+ from contextlib import asynccontextmanager
++import asyncio
++import time
+ import json
+ import re
+ from urllib.parse import quote
+@@ -136,6 +138,14 @@
+             lease_id = None
+             started = False
+             complete = False
++            total = time.monotonic() + config.limits.transfer_total_ms / 1000
++            idle = time.monotonic() + config.limits.transfer_idle_ms / 1000
++            async def bounded(call, *args):
++                async with asyncio.timeout_at(min(total, idle)):
++                    return await call(*args)
++            def progress():
++                nonlocal idle
++                idle = time.monotonic() + config.limits.transfer_idle_ms / 1000
+             try:
+                 authorization = headers.get(b'authorization', '')
+                 if not authorization.startswith('Bearer '):
+@@ -149,29 +159,30 @@
+                             or any(key in headers for key in (b'transfer-encoding', b'content-encoding', b'range'))):
+                         raise s.RemoteError('invalid_request')
+                     args['content_length'] = int(length)
+-                opened = (await core_client.stream('open_put' if put else 'open_get', args))['result']
++                opened = (await bounded(core_client.stream, 'open_put' if put else 'open_get', args))['result']
+                 if not opened['ok']:
+                     raise s.RemoteError(**opened['error'])
+                 lease_id = opened['lease_id']
+                 if put:
+                     offset = 0
+                     while True:
+-                        message = await receive()
++                        message = await bounded(receive)
+                         if message['type'] == 'http.disconnect':
+                             return
+                         body = memoryview(message.get('body', b''))
+                         for index in range(0, len(body), config.limits.chunk_bytes):
+-                            result = (await core_client.stream('put_chunk', {'lease_id': lease_id, 'offset': offset}, bytes(body[index:index + config.limits.chunk_bytes])))['result']
++                            result = (await bounded(core_client.stream, 'put_chunk', {'lease_id': lease_id, 'offset': offset}, bytes(body[index:index + config.limits.chunk_bytes])))['result']
+                             if not result['ok']:
+                                 raise s.RemoteError(**result['error'])
+                             offset = result['offset']
++                            progress()
+                         if not message.get('more_body'):
+                             break
+-                    result = (await core_client.stream('finish_put', {'lease_id': lease_id}))['result']
++                    result = (await bounded(core_client.stream, 'finish_put', {'lease_id': lease_id}))['result']
+                     if not result['ok']:
+                         raise s.RemoteError(**result['error'])
+                     complete = True
+-                    await _json(send, 201, result)
++                    await bounded(_json, send, 201, result)
+                 else:
+                     if b'range' in headers:
+                         complete = True
+@@ -179,28 +190,40 @@
+                         return
+                     artifact = opened['artifact']
+                     disposition = 'attachment; filename="artifact-' + artifact['artifact_id'] + '"; filename*=UTF-8\'\'' + quote(artifact['filename'], safe='')
+-                    await send({'type': 'http.response.start', 'status': 200, 'headers': [
++                    await bounded(send, {'type': 'http.response.start', 'status': 200, 'headers': [
+                         (b'content-type', b'application/octet-stream'), (b'content-length', str(artifact['bytes']).encode()),
+                         (b'etag', ('"' + artifact['sha256'] + '"').encode()), (b'x-content-type-options', b'nosniff'),
+                         (b'cache-control', b'no-store'), (b'content-disposition', disposition.encode('ascii'))]})
+                     started = True
+                     offset = 0
+                     while True:
+-                        frame = await core_client.stream('read_chunk', {'lease_id': lease_id, 'offset': offset, 'max_bytes': config.limits.chunk_bytes})
++                        frame = await bounded(core_client.stream, 'read_chunk', {'lease_id': lease_id, 'offset': offset, 'max_bytes': config.limits.chunk_bytes})
+                         result = frame['result']
+                         if not result['ok']:
+                             raise s.RemoteError(**result['error'])
+                         offset = result['offset']
+-                        await send({'type': 'http.response.body', 'body': frame['body'], 'more_body': not result['eof']})
++                        await bounded(send, {'type': 'http.response.body', 'body': frame['body'], 'more_body': not result['eof']})
++                        if frame['body']:
++                            progress()
+                         if result['eof']:
+                             complete = True
+                             break
++            except TimeoutError as exc:
++                if started:
++                    raise s.RemoteError('timeout') from exc
++                async with asyncio.timeout(config.limits.transfer_idle_ms / 1000):
++                    await _json(send, 408, s.RemoteError('timeout').payload())
+             except s.RemoteError as exc:
+                 if started:
+                     raise
+-                await _json(send, STATUS.get(exc.code, 503), exc.payload())
++                async with asyncio.timeout(config.limits.transfer_idle_ms / 1000):
++                    await _json(send, STATUS.get(exc.code, 503), exc.payload())
+             finally:
+                 if lease_id is not None and not core_client.closed:
+-                    await core_client.stream('close', {'lease_id': lease_id, 'reason': 'complete' if complete else 'abort'})
++                    try:
++                        await bounded(core_client.stream, 'close',
++                                      {'lease_id': lease_id, 'reason': 'complete' if complete else 'abort'})
++                    except TimeoutError:
++                        await core_client.close()
+ 
+     return App()
+--- a/integrations/mcp/task_store.py
++++ b/integrations/mcp/task_store.py
+@@ -147,7 +147,8 @@
+ def rows(tx, table, where='', parameters=(), order=''):
+     fields = _fields(table)
+     columns = [_column(name, field) for name, field in fields.items()]
+-    sql = 'SELECT ' + ','.join(columns) + ' FROM ' + table
++    extras = ['owner_id', 'task_id', 'active'] if table == 'remote_job_bindings' else ['task_id'] if table == 'remote_operations' else []
++    sql = 'SELECT ' + ','.join(columns + extras) + ' FROM ' + table
+     if where:
+         sql += ' WHERE ' + where
+     if order:
+@@ -160,9 +161,26 @@
+             for name, field in fields.items():
+                 if field.get('type') == 'boolean':
+                     value[name] = bool(value[name])
++            if table == 'remote_job_bindings':
++                if tuple(raw[len(columns):2 + len(columns)]) != (value['seed']['owner_id'], value['seed']['task_id']):
++                    raise s.RemoteError('policy_unavailable')
++            if table == 'remote_operations' and raw[-1] != value['object_ids']['task_id']:
++                raise s.RemoteError('policy_unavailable')
++            if table == 'remote_preparations':
++                relative = value['task_id'] + '/runs/' + value['request_id']
++                identity = value['workspace_identity']
++                if (value['relative_name'] != relative
++                        or (identity is not None and identity['relative_name'] != relative)
++                        or ((value['phase'] == 'adopted') != (value['job_id'] is not None))
++                        or (value['phase'] in ('prepared', 'adopted') and identity is None)):
++                    raise s.RemoteError('policy_unavailable')
++            if table == 'remote_tasks' and value['owner_id'] != s.owner(s.Principal(**value['policy']['principal'])):
++                raise s.RemoteError('policy_unavailable')
+             result.append(getattr(s, TABLES[table][0])(**value))
+         return result
+     except (ValueError, TypeError, sqlite3.Error, s.RemoteError) as exc:
++        if isinstance(exc, s.RemoteError) and exc.code == 'policy_unavailable':
++            raise
+         raise s.RemoteError('storage_error') from exc
+ 
+ 
+@@ -194,9 +212,15 @@
+ 
+ 
+ def event(tx, entity, object_id, old=None, state=None, reason=None, request_id=None):
+-    s.emit_remote_event(tx, s.RemoteEvent(schema='cortados.cowork-event.v1', event_id=uid(), at_ms=now(),
+-        event='transition' if state is not None else 'refusal', entity=entity, object_id=object_id,
+-        request_id=request_id, from_state=old, state=state, reason=reason))
++    try:
++        s.emit_remote_event(tx, s.RemoteEvent(schema='cortados.cowork-event.v1', event_id=uid(), at_ms=now(),
++            event='transition' if state is not None else 'refusal', entity=entity, object_id=object_id,
++            request_id=request_id, from_state=old, state=state, reason=reason))
++    except Exception:
++        if tx is not None:
++            from .remote_runtime import current
++            current().fatal()
++        raise
+ 
+ 
+ def changed(record, **changes):
+@@ -274,7 +298,12 @@
+         raise s.RemoteError('policy_unavailable')
+     prep = prepared[0]
+     if (prep.phase != 'prepared' or prep.owner_id != seed.owner_id or prep.task_id != seed.task_id
+-            or prep.request_id != seed.request_id or prep.argument_hash != seed.argument_hash):
++            or prep.request_id != seed.request_id or prep.argument_hash != seed.argument_hash
++            or prep.expected_task_version != seed.expected_task_version
++            or prep.relative_name != seed.task_id + '/runs/' + seed.request_id
++            or seed.policy_snapshot != task.policy
++            or prep.workspace_identity is None
++            or prep.workspace_identity.relative_name != prep.relative_name):
+         raise s.RemoteError('policy_unavailable')
+     path = os.path.join(task.policy.roots.tasks_dir, prep.relative_name)
+     info = os.stat(path, follow_symlinks=False)
+--- a/integrations/mcp/file_transfer.py
++++ b/integrations/mcp/file_transfer.py
+@@ -74,9 +74,9 @@
+     runtime = _runtime()
+     if lease.lease_id not in runtime.leases:
+         raise s.RemoteError('ticket_invalid')
+-    if not runtime.enabled:
+-        close(lease, 'abort')
+-        raise s.RemoteError('permission_refused')
++    if not runtime.enabled or not runtime.ready or runtime.admission_failed:
++        close(lease, 'abort')
++        raise s.RemoteError('permission_refused' if not runtime.enabled else 'storage_error')
+     lease = runtime.leases[lease.lease_id]
+     now = int(time.monotonic() * 1000)
+     if now >= min(lease.deadline_ms, lease.idle_deadline_ms):
+@@ -165,7 +165,8 @@
+     if not body and next_offset != ticket.bytes:
+         close(lease, 'abort')
+         raise s.RemoteError('artifact_corrupt')
+-    _advance(lease, next_offset)
++    if body:
++        _advance(lease, next_offset)
+     if next_offset == ticket.bytes:
+         runtime.eof_leases.add(lease.lease_id)
+     return s.ReadResult(body=body, offset=next_offset, eof=next_offset == ticket.bytes)
+@@ -179,29 +180,38 @@
+     if lease.lease_id not in runtime.leases:
+         return
+     fd = runtime.descriptors.pop(lease.lease_id, None)
+-    identity = os.fstat(fd) if fd is not None else None
+-    if fd is not None:
+-        os.close(fd)
+-    ticket = _ticket(lease)
+-    if lease.direction == 'put' and ticket.state != 'consumed' and identity is not None:
+-        from .task_workspace import open_dir
+-        directory = open_dir(runtime.root_fds['staging_dir'], lease.task_id)
++    try:
+         try:
+-            observed = os.stat(lease.artifact_id, dir_fd=directory, follow_symlinks=False)
+-            if (observed.st_dev, observed.st_ino) != (identity.st_dev, identity.st_ino):
+-                raise s.RemoteError('task_quarantined')
+-            os.unlink(lease.artifact_id, dir_fd=directory)
+-            os.fsync(directory)
++            identity = os.fstat(fd) if fd is not None else None
+         finally:
+-            os.close(directory)
++            if fd is not None:
++                os.close(fd)
++        ticket = _ticket(lease)
++        if lease.direction == 'put' and ticket.state != 'consumed' and identity is not None:
++            from .task_workspace import open_dir
++            directory = open_dir(runtime.root_fds['staging_dir'], lease.task_id)
++            try:
++                observed = os.stat(lease.artifact_id, dir_fd=directory, follow_symlinks=False)
++                if (observed.st_dev, observed.st_ino) != (identity.st_dev, identity.st_ino):
++                    raise s.RemoteError('task_quarantined')
++                os.unlink(lease.artifact_id, dir_fd=directory)
++                os.fsync(directory)
++            finally:
++                os.close(directory)
++            with runtime.broker.store.transaction() as tx:
++                for reservation in _reservations(tx, lease):
++                    store.save(tx, 'remote_reservations', store.changed(reservation, materialized_bytes=0))
++        if ticket.state == 'claimed':
++            next_state = 'issued' if lease.direction == 'get' and reason == 'complete' else 'revoked'
++            with runtime.broker.store.transaction() as tx:
++                store.save(tx, 'remote_tickets', store.changed(ticket, state=next_state, lease_id=None, connection_id=None))
++        runtime.leases.pop(lease.lease_id, None)
++        runtime.eof_leases.discard(lease.lease_id)
+         with runtime.broker.store.transaction() as tx:
+-            for reservation in _reservations(tx, lease):
+-                store.save(tx, 'remote_reservations', store.changed(reservation, materialized_bytes=0))
+-    if ticket.state == 'claimed':
+-        next_state = 'issued' if lease.direction == 'get' and reason == 'complete' else 'revoked'
+-        with runtime.broker.store.transaction() as tx:
+-            store.save(tx, 'remote_tickets', store.changed(ticket, state=next_state, lease_id=None, connection_id=None))
+-    runtime.leases.pop(lease.lease_id)
+-    runtime.eof_leases.discard(lease.lease_id)
+-    with runtime.broker.store.transaction() as tx:
+-        store.event(tx, 'lease', lease.lease_id, 'open', 'closed')
++            store.event(tx, 'lease', lease.lease_id, 'open', 'closed')
++    except Exception:
++        runtime.fatal()
++        raise
++    finally:
++        runtime.leases.pop(lease.lease_id, None)
++        runtime.eof_leases.discard(lease.lease_id)
+--- a/integrations/mcp/transfer_tickets.py
++++ b/integrations/mcp/transfer_tickets.py
+@@ -33,6 +33,28 @@
+     return found[0]
+ 
+ 
++def require_publication(tx, row):
++    if row.origin == 'input':
++        return
++    found = store.rows(tx, 'remote_publications', 'job_id=? AND owner_id=? AND task_id=?',
++                       (row.job_id, row.owner_id, row.task_id))
++    if len(found) != 1 or found[0].state != 'complete':
++        raise s.RemoteError('publication_failed')
++    manifest = found[0].manifest
++    names = [entry.artifact.filename for entry in manifest]
++    ids = [entry.artifact.artifact_id for entry in manifest]
++    if names != sorted(set(names), key=lambda name: name.encode('utf-8')) or len(ids) != len(set(ids)):
++        raise s.RemoteError('artifact_corrupt')
++    if row.artifact_id not in ids:
++        raise s.RemoteError('artifact_corrupt')
++    for entry in manifest:
++        member = artifact(tx, row.owner_id, row.task_id, entry.artifact.artifact_id)
++        if (entry.phase != 'sealed' or member.state != 'sealed' or member.origin != 'output'
++                or member.job_id != row.job_id or s.plain(entry.artifact) != s.artifact_projection(member)
++                or entry.blob != member.blob):
++            raise s.RemoteError('artifact_corrupt')
++
++
+ def issue(tx, principal, args, direction):
+     runtime = _runtime()
+     owner_id = s.owner(principal)
+@@ -60,6 +82,8 @@
+         row = artifact(tx, owner_id, task.task_id, args['artifact_id'])
+         if direction == 'get' and row.state != 'sealed':
+             raise s.RemoteError('artifact_corrupt' if row.state == 'quarantined' else 'upload_incomplete')
++        if direction == 'get':
++            require_publication(tx, row)
+         if direction == 'put':
+             if row.state not in ('reserved', 'uploading'):
+                 raise s.RemoteError('ticket_consumed')
+@@ -106,6 +130,8 @@
+     task = store.get_owned(tx, ticket.owner_id, ticket.task_id)
+     if task.state in ('deleted', 'deleting', 'quarantined'):
+         raise s.RemoteError('task_deleted' if task.state != 'quarantined' else 'task_quarantined')
++    if direction == 'get':
++        require_publication(tx, artifact(tx, ticket.owner_id, ticket.task_id, ticket.artifact_id))
+     leases = tuple(runtime.leases.values())
+     limit = task.policy.limits.uploads_per_task if direction == 'put' else task.policy.limits.downloads_per_task
+     if (len(leases) >= runtime.config.limits.streams_per_installation
+--- a/integrations/mcp/remote_runtime.py
++++ b/integrations/mcp/remote_runtime.py
+@@ -36,8 +36,43 @@
+         self.ready = False
+         self.enabled = False
+         self.admission_failed = False
++        self.fatal_signalled = False
++        self.fatal_signal_failed = False
+         self.token = None
+         self.task_locks = {}
++
++    def authorize(self, principal):
++        if principal != self.config.principal or not self.enabled:
++            raise s.RemoteError('permission_refused')
++        if not self.ready or self.admission_failed or self.broker.store.admission_closed:
++            raise s.RemoteError('storage_error')
++
++    def fatal(self):
++        self.admission_failed = True
++        if self.broker:
++            self.broker.store.admission_closed = True
++        for timer in self.lease_timers.values():
++            timer.cancel()
++        self.lease_timers.clear()
++        for fd in tuple(self.descriptors.values()):
++            try:
++                os.close(fd)
++            except OSError:
++                pass
++        self.descriptors.clear()
++        self.leases.clear()
++        self.eof_leases.clear()
++        if not self.fatal_signalled:
++            self.fatal_signalled = True
++            try:
++                s.emit_remote_event(None, s.RemoteEvent(schema='cortados.cowork-event.v1',
++                    event_id=store.uid(), at_ms=store.now(), event='refusal', entity='runtime',
++                    object_id=None, request_id=None, from_state=None, state=None, reason='storage_error'))
++            except Exception:
++                self.fatal_signal_failed = True
++                raise
++        if self.fatal_signal_failed:
++            raise s.RemoteError('storage_error')
+ 
+     async def __aenter__(self):
+         from .config import load_config
+@@ -77,6 +112,8 @@
+             self.capacity = CapacityMonitor(self)
+             self.core = CoreBroker(self)
+             self.enabled = self.config.principal.enabled
++            with self.broker.store.transaction() as tx:
++                store.event(tx, 'runtime', None, state='ready')
+             self.ready = True
+             self.monitor_task = asyncio.create_task(self.capacity.run())
+             return self
+@@ -87,18 +124,44 @@
+             raise s.RemoteError('storage_error') from exc
+ 
+     async def __aexit__(self, exc_type, exc, tb):
++        failures = []
++        def record_fatal():
++            try:
++                self.fatal()
++            except Exception as error:
++                failures.append(error)
+         self.ready = False
+         for session in tuple(self.sessions.values()):
+             session.socket.close()
+             session.task.cancel()
+         if self.sessions:
+-            await asyncio.gather(*(session.task for session in self.sessions.values()), return_exceptions=True)
++            results = await asyncio.gather(*(session.task for session in self.sessions.values()), return_exceptions=True)
++            if any(isinstance(result, Exception) for result in results):
++                record_fatal()
++        from . import file_transfer
++        for lease in tuple(self.leases.values()):
++            try:
++                file_transfer.close(lease, 'abort')
++            except Exception:
++                record_fatal()
+         if self.monitor_task:
+             await self.capacity.close()
+             self.monitor_task.cancel()
+             await asyncio.gather(self.monitor_task, return_exceptions=True)
+         if self.broker:
+-            await self.broker.shutdown()
++            try:
++                await self.broker.shutdown()
++            except Exception:
++                record_fatal()
++                if self.broker.workers or any(not task.done() for task in self.broker.tasks):
++                    # Unknown process containment retains lifetime ownership.
++                    raise s.RemoteError('containment_failed')
++            try:
++                if not self.broker.store.admission_closed:
++                    with self.broker.store.transaction() as tx:
++                        store.event(tx, 'runtime', None, state='closed')
++            except Exception:
++                record_fatal()
+             self.broker.store.close()
+         for fd in self.root_fds.values():
+             os.close(fd)
+@@ -109,6 +172,8 @@
+         if self.token is not None:
+             CURRENT.reset(self.token)
+             self.token = None
++        if failures:
++            raise s.RemoteError('storage_error') from failures[0]
+ 
+     async def attach(self, server_socket, principal):
+         if not self.ready or principal != self.config.principal or not self.enabled:
+@@ -132,26 +197,67 @@
+         if owner_id != s.owner(self.config.principal):
+             raise s.RemoteError('permission_refused')
+         async with self.broker.admission_lock:
++            if not self.enabled:
++                return
+             self.enabled = False
++            with self.broker.store.transaction() as tx:
++                store.event(tx, 'runtime', None, 'ready', 'disabled')
+             with self.broker.store.transaction() as tx:
+                 transfer_tickets.revoke(tx, owner_id, None)
+             for lease in tuple(self.leases.values()):
+-                file_transfer.close(lease, 'abort')
++                try:
++                    file_transfer.close(lease, 'abort')
++                except Exception:
++                    self.fatal()
+ 
+     def task(self, task_id):
+         return store.get_owned(self.broker.store.db, s.owner(self.config.principal), task_id)
+ 
+     def binding(self, record):
+-        bindings = store.rows(self.broker.store.db, 'remote_job_bindings', 'job_id=?', (record['job_id'],))
+-        if record.get('execution_kind') != 'cowork_remote_v1' or len(bindings) != 1:
+-            raise s.RemoteError('policy_unavailable')
+-        return bindings[0]
++        if not self.classify(record):
++            raise s.RemoteError('policy_unavailable')
++        return store.rows(self.broker.store.db, 'remote_job_bindings', 'job_id=?', (record['job_id'],))[0]
+ 
+     def classify(self, record):
+         found = store.rows(self.broker.store.db, 'remote_job_bindings', 'job_id=?', (record['job_id'],))
+         if 'execution_kind' not in record and not found:
+             return False
+         if record.get('execution_kind') != 'cowork_remote_v1' or len(found) != 1:
++            raise s.RemoteError('policy_unavailable')
++        binding = found[0]
++        seed = binding.seed
++        task = self.task(seed.task_id)
++        from .remote_native import worker_binding, verify_binding
++        verify_binding(worker_binding(binding), seed.native_manifest)
++        operations = store.rows(self.broker.store.db, 'remote_operations',
++            'owner_id=? AND operation=? AND request_id=?', (seed.owner_id, 'delegate', seed.request_id))
++        publications = store.rows(self.broker.store.db, 'remote_publications', 'job_id=?', (binding.job_id,))
++        if (len(operations) != 1 or operations[0].object_ids.job_id != binding.job_id
++                or operations[0].object_ids.task_id != seed.task_id
++                or operations[0].argument_hash != seed.argument_hash
++                or len(publications) != 1 or publications[0].owner_id != seed.owner_id
++                or publications[0].task_id != seed.task_id
++                or seed.execution_policy != task.policy.execution_policy):
++            raise s.RemoteError('policy_unavailable')
++        prepared = store.rows(self.broker.store.db, 'remote_preparations', 'preparation_id=?', (seed.preparation_id,))
++        if (seed.owner_id != task.owner_id or seed.task_group_id != task.group_id
++                or seed.policy_snapshot != task.policy or not prepared):
++            raise s.RemoteError('policy_unavailable')
++        prep = prepared[0]
++        active = self.broker.store.db.execute('SELECT active FROM remote_job_bindings WHERE job_id=?',
++                                              (binding.job_id,)).fetchone()
++        if active != (int(task.active_job_id == binding.job_id),):
++            raise s.RemoteError('policy_unavailable')
++        if (prep.phase != 'adopted' or prep.job_id != binding.job_id
++                or prep.owner_id != seed.owner_id or prep.task_id != seed.task_id
++                or prep.request_id != seed.request_id or prep.argument_hash != seed.argument_hash
++                or prep.expected_task_version != seed.expected_task_version
++                or prep.workspace_identity != binding.workspace_identity
++                or binding.workspace_identity is None
++                or binding.workspace_identity.relative_name != prep.relative_name
++                or prep.relative_name != seed.task_id + '/runs/' + seed.request_id
++                or record['arguments']['request_id'] != seed.request_id
++                or record['cwd'] != os.path.join(task.policy.roots.tasks_dir, prep.relative_name)):
+             raise s.RemoteError('policy_unavailable')
+         return True
+ 
+--- a/integrations/mcp/remote_ipc.py
++++ b/integrations/mcp/remote_ipc.py
+@@ -74,6 +74,9 @@
+                     raise EOFError()
+                 self.seq += 1
+                 return {'result': response['result'], 'body': data}
++            except asyncio.CancelledError:
++                await self.close()
++                raise
+             except (OSError, EOFError, TimeoutError, s.RemoteError) as exc:
+                 await self.close()
+                 raise s.RemoteError('storage_error', CONNECTION_MESSAGE) from exc
+@@ -112,8 +115,7 @@
+ 
+ 
+ async def _stream(runtime, connection_id, op, args, body):
+-    if not runtime.enabled:
+-        raise s.RemoteError('permission_refused')
++    runtime.authorize(runtime.config.principal)
+     if not isinstance(args, dict) or set(args) != set(STREAM_FIELDS[op]):
+         raise s.RemoteError('invalid_request')
+     for key in ('ticket_id', 'lease_id'):
+@@ -208,6 +210,9 @@
+                 if exc.code == 'invalid_request' and op in STREAM_FIELDS:
+                     close_after = True
+             except Exception:
++                if runtime.broker.store.admission_closed:
++                    runtime.fatal()
++                    close_after = True
+                 result = s.RemoteError('storage_error').payload()
+             response = dict(v=1, seq=seq, op=op, body_bytes=len(result_body), result=result)
+             try:
+@@ -235,7 +240,12 @@
+             with runtime.broker.store.transaction() as tx:
+                 store.event(tx, 'runtime', None, reason=exc.code)
+     finally:
+-        for lease in tuple(runtime.leases.values()):
+-            if lease.connection_id == connection_id:
+-                transfer.close(lease, 'disconnect')
+-        socket.close()
++        try:
++            for lease in tuple(runtime.leases.values()):
++                if lease.connection_id == connection_id:
++                    try:
++                        transfer.close(lease, 'disconnect')
++                    except Exception:
++                        runtime.fatal()
++        finally:
++            socket.close()
+--- a/integrations/mcp/remote_capacity.py
++++ b/integrations/mcp/remote_capacity.py
+@@ -105,9 +105,12 @@
+ 
+     async def run(self):
+         interval = self.runtime.config.limits.workspace_poll_ms / 1000
++        previous = None
+         while not self.closed:
+             start = time.monotonic()
+             try:
++                if previous is not None and start - previous > interval:
++                    raise s.RemoteError('capacity_exhausted')
+                 usage = self.measure()
+                 limits = self.runtime.config.limits
+                 installation_bad = (self.unknown or usage.installation_measured_bytes + usage.installation_promised_bytes > limits.installation_bytes
+@@ -129,7 +132,9 @@
+                 for record in self.runtime.broker.store.active():
+                     if record.get('execution_kind') == 'cowork_remote_v1':
+                         await self.runtime.broker.stop(record['job_id'], 'capacity_exhausted')
+-            await asyncio.sleep(max(0, interval - (time.monotonic() - start)))
++            previous = start
++            # Wake before the hard next-sample deadline; no lateness tolerance is added.
++            await asyncio.sleep(max(0, (interval - (time.monotonic() - start)) / 2))
+ 
+     async def close(self):
+         self.closed = True

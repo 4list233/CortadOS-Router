@@ -1,0 +1,13 @@
+2026-10-18 17:53:57,434 INFO [20261018_175357_6da895] agent.turn_context: conversation turn: session=20261018_175357_6da895 model=initial-model provider=openrouter platform=cli history=0 msg='Use echo_test once, then report done.'
+2026-10-18 17:53:57,447 INFO [20261018_175357_6da895] agent.agent_runtime_helpers: switch_model: reasoning_config resolved for routed-model-A: None
+2026-10-18 17:53:57,472 INFO [20261018_175357_6da895] agent.agent_runtime_helpers: Model switched in-place: initial-model (openrouter) -> routed-model-A (openrouter)
+2026-10-18 17:53:57,473 INFO [20261018_175357_6da895] agent.agent_model_routing: Required route: request=20261018_175357_6da895:9564cd5a-1285-4d56-b4ce-5a39656d3afc:671e12f1:api:1 selected=openrouter/routed-model-A route=route-1 degraded=None
+2026-10-18 17:53:57,485 INFO [20261018_175357_6da895] agent.conversation_loop: API call #1: model=routed-model-A provider=openrouter in=? out=? total=? latency=0.0s usage=unavailable
+2026-10-18 17:53:57,863 INFO [20261018_175357_6da895] agent.tool_executor: tool echo_test completed (0.01s, 20 chars)
+2026-10-18 17:53:57,864 INFO [20261018_175357_6da895] agent.agent_runtime_helpers: switch_model: reasoning_config resolved for routed-model-B: None
+2026-10-18 17:53:57,865 INFO [20261018_175357_6da895] agent.agent_runtime_helpers: Model switched in-place: routed-model-A (openrouter) -> routed-model-B (openrouter)
+2026-10-18 17:53:57,865 INFO [20261018_175357_6da895] agent.agent_model_routing: Required route: request=20261018_175357_6da895:9564cd5a-1285-4d56-b4ce-5a39656d3afc:671e12f1:api:2 selected=openrouter/routed-model-B route=route-2 degraded=None
+2026-10-18 17:53:57,867 INFO [20261018_175357_6da895] agent.conversation_loop: API call #2: model=routed-model-B provider=openrouter in=? out=? total=? latency=0.0s usage=unavailable
+2026-10-18 17:53:57,869 INFO [20261018_175357_6da895] agent.conversation_loop: Turn ended: reason=text_response(finish_reason=stop) model=routed-model-B api_calls=2/5 budget=2/5 tool_turns=1 last_msg_role=assistant response_len=4 session=20261018_175357_6da895
+2026-10-18 17:53:57,871 INFO [20261018_175357_6da895] run_agent: OpenAI client closed (agent_close, shared=True, tcp_force_closed=0) thread=MainThread:8236777344 provider=openrouter base_url=https://test.invalid/v1 model=routed-model-B
+2026-10-18 17:53:57,871 INFO [20261018_175357_6da895] run_agent: OpenAI client closed (agent_close, shared=False, tcp_force_closed=0) thread=MainThread:8236777344 provider=openrouter base_url=https://test.invalid/v1 model=routed-model-B

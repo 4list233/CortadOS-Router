@@ -1,0 +1,13 @@
+{
+  "kind": "delivery",
+  "test_source": "/Users/velox/cortados/tests/test_cli_delivery_isolated.py",
+  "test_sha256": "636db31c25489536b93d20e6e6c132db30d9d708c8b261f5f69df6302e06f538",
+  "staged_runner": "/Users/velox/.cortados-builds/quota-sources-activation/plugins/cortados-pty/runner.py",
+  "staged_runner_sha256": "922963708783a25bcac875cfd530bc5aa21a7a8a4437dba8f2a3097e8aff33d6",
+  "tests": 25,
+  "failures": [],
+  "errors": [],
+  "skipped": [],
+  "successful_cli_launches": 0,
+  "network_calls": 0
+}

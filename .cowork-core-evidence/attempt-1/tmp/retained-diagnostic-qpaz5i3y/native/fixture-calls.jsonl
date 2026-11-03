@@ -1,0 +1,3 @@
+{"kind": "metadata", "pid": 94550, "ppid": 94539, "pgid": 94539, "sid": 94539, "method": "initialize", "params": {"clientInfo": {"name": "cortados-mcp-worker", "version": "1.0.0"}, "capabilities": {"experimentalApi": true}}}
+{"kind": "metadata", "pid": 94550, "ppid": 94539, "pgid": 94539, "sid": 94539, "method": "config/read", "params": {"includeLayers": true}}
+{"kind": "metadata", "pid": 94550, "ppid": 94539, "pgid": 94539, "sid": 94539, "method": "configRequirements/read", "params": {}}

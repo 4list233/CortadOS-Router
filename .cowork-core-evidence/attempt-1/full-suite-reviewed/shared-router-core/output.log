@@ -1,0 +1,37 @@
+test_degraded_uses_fallback (test_router.Bands.test_degraded_uses_fallback) ... ok
+test_outward_floors_blast_radius (test_router.Bands.test_outward_floors_blast_radius) ... ok
+test_r0_r1 (test_router.Bands.test_r0_r1) ... ok
+test_r2_decomposes_only_when_parts_or_parallel (test_router.Bands.test_r2_decomposes_only_when_parts_or_parallel) ... ok
+test_r3_by_difficulty_and_by_blast (test_router.Bands.test_r3_by_difficulty_and_by_blast) ... ok
+test_r4_never_by_score (test_router.Bands.test_r4_never_by_score) ... ok
+test_work_kind_reorders_lanes (test_router.Bands.test_work_kind_reorders_lanes) ... ok
+test_discord_shapes (test_router.CleanRequest.test_discord_shapes) ... ok
+test_expiring_headroom_goes_first (test_router.Scarcity.test_expiring_headroom_goes_first) ... ok
+test_fast_burning_lane_goes_behind (test_router.Scarcity.test_fast_burning_lane_goes_behind) ... ok
+test_model_pool_is_scored_separately (test_router.Scarcity.test_model_pool_is_scored_separately) ... ok
+test_scarce_lane_holds_subagents_to_minimum (test_router.Scarcity.test_scarce_lane_holds_subagents_to_minimum) ... ok
+test_spent_lane_is_skipped (test_router.Scarcity.test_spent_lane_is_skipped) ... ok
+test_context_policy_and_stickiness (test_router.ScoredSelection.test_context_policy_and_stickiness) ... /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pty.py:66: DeprecationWarning: This process (pid=94691) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+ok
+test_face_turns_have_a_floor_but_background_does_not (test_router.ScoredSelection.test_face_turns_have_a_floor_but_background_does_not) ... ok
+test_insight_work_goes_to_the_frontier (test_router.ScoredSelection.test_insight_work_goes_to_the_frontier) ... ok
+test_least_overqualified_model_that_clears_the_bar (test_router.ScoredSelection.test_least_overqualified_model_that_clears_the_bar) ... ok
+test_requirement_is_continuous_in_difficulty (test_router.ScoredSelection.test_requirement_is_continuous_in_difficulty) ... ok
+test_scarcity_moves_the_choice (test_router.ScoredSelection.test_scarcity_moves_the_choice) ... ok
+test_secondary_source_only_when_native_spent (test_router.ScoredSelection.test_secondary_source_only_when_native_spent) ... ok
+test_underused_frontier_pool_takes_hard_work (test_router.ScoredSelection.test_underused_frontier_pool_takes_hard_work) ... ok
+test_use_case_changes_the_winner_and_ceiling_never_by_score (test_router.ScoredSelection.test_use_case_changes_the_winner_and_ceiling_never_by_score) ... ok
+test_rejects_ceiling_outside_r4_and_non_grok_cursor (test_router.TableValidation.test_rejects_ceiling_outside_r4_and_non_grok_cursor) ... ok
+test_antigravity (test_router.UsageScreens.test_antigravity) ... ok
+test_claude (test_router.UsageScreens.test_claude) ... ok
+test_claude_fable_week_is_its_own_pool (test_router.UsageScreens.test_claude_fable_week_is_its_own_pool) ... ok
+test_codex (test_router.UsageScreens.test_codex) ... ok
+test_codex_named_limit (test_router.UsageScreens.test_codex_named_limit) ... ok
+test_cursor (test_router.UsageScreens.test_cursor) ... ok
+test_window_view_is_pct_vs_time (test_router.UsageScreens.test_window_view_is_pct_vs_time) ... ok
+
+----------------------------------------------------------------------
+Ran 30 tests in 0.077s
+
+OK

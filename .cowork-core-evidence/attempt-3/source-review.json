@@ -1,0 +1,114 @@
+{
+  "sources": {
+    "cortados_router/route_task.py": {
+      "sha256": "0926d833733ab05155aec08ce3343da288785d1d5d31fbd05862cc7c435212b9",
+      "lines": 117,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/broker.py": {
+      "sha256": "1c20988bdbfe36391e61b29523b1bcc3420decb119a0f91e52d2b2af9c6e9eca",
+      "lines": 414,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/job_store.py": {
+      "sha256": "e8ffc82b3a24a78ae8524f958beebc8d6e48175ff22a9da361b6b79c58c52119",
+      "lines": 319,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/codex.py": {
+      "sha256": "f86de48a4f99df93849e386530348e8c3897fb1ec031a47cc545bbda82d62872",
+      "lines": 147,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/worker.py": {
+      "sha256": "d450beb3c6351a42de5d3ff200b21657f100190dd3de6c595f6737d728515bc5",
+      "lines": 295,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/remote_config.py": {
+      "sha256": "199132ec2792e74852337ffa7811e62ed3101801b017680927e7ed21ee383014",
+      "lines": 66,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/remote_schemas.py": {
+      "sha256": "717973e2bce4ad34af217ec91226ca915bff2b9d825e8b2dd7f8f6507969ed07",
+      "lines": 390,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/remote_dispatch.py": {
+      "sha256": "73f1a79df985cc5de256f2aeeda4d37064091080da800d5ab23506b2b0b38133",
+      "lines": 241,
+      "changed_from_attempt_2": true
+    },
+    "integrations/mcp/remote_http.py": {
+      "sha256": "415a29d1338c157d58a482b050dc92cc279936146687473326ca3da1405cbb87",
+      "lines": 245,
+      "changed_from_attempt_2": true
+    },
+    "integrations/mcp/task_store.py": {
+      "sha256": "be7e3c43efa1e33ff38898c5adf7f5527933660a89f4fe3b05761c537c218481",
+      "lines": 323,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/task_workspace.py": {
+      "sha256": "e28115bb190cb2fddf99df75793b017ac0a7507753c01e9305d379e3c80f83c6",
+      "lines": 201,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/artifact_store.py": {
+      "sha256": "399fd3599a5a0496bb4d4cd3aeca0e0136a6038c97c5c254daf19442503179d6",
+      "lines": 180,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/file_transfer.py": {
+      "sha256": "b1894e0e42547e18059b12fc5b8f77bc5588de25334a3ea7b7aafa675fc71a95",
+      "lines": 219,
+      "changed_from_attempt_2": true
+    },
+    "integrations/mcp/transfer_tickets.py": {
+      "sha256": "5b21c43860d5e217cf30e7398ca56d39d673457b36b04211efc614100415ba36",
+      "lines": 155,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/remote_native.py": {
+      "sha256": "b76af4ed2c1074991e6b5ec153824c02b631e2a6642858e58f1c540f61f2d62f",
+      "lines": 111,
+      "changed_from_attempt_2": false
+    },
+    "integrations/mcp/remote_runtime.py": {
+      "sha256": "7a006e94cb445f2ff8b607763ea71cc79b3f65255b0cec700b8511e5dd9e1438",
+      "lines": 377,
+      "changed_from_attempt_2": true
+    },
+    "integrations/mcp/remote_ipc.py": {
+      "sha256": "53719f850a30d6d447c499b7e4f5f56ebdb92653c1c5dfe5d62c4aa537db1bd5",
+      "lines": 280,
+      "changed_from_attempt_2": true
+    },
+    "integrations/mcp/remote_capacity.py": {
+      "sha256": "a94a19b8ba315ec023f1ab22c61c66aae2ff46d4cf2c5fe1bc68177eadb12e6e",
+      "lines": 149,
+      "changed_from_attempt_2": true
+    }
+  },
+  "protected_identity": {
+    "contracts_sha256": {
+      "checked": 3,
+      "mismatches": []
+    },
+    "protected_prior_sha256": {
+      "checked": 641,
+      "mismatches": []
+    },
+    "fixture_files_sha256": {
+      "checked": 18,
+      "mismatches": []
+    }
+  },
+  "manifest_sha256": "585527a2aaca7780d0ca9509b92e466e7d891147d9866d13be01809643fc8967",
+  "head": "62fcd07b2e6a416dc4d1aee921f57e93a1966fc5",
+  "correction_patch_sha256": "8042de88889a8f35e91f69687a08895ee02f253938f683036f38d62bdc14983f",
+  "candidate_patch_sha256": "4176f43a551f067834242aeb5361ed2f708e2304059cae07497f7530f744be2c",
+  "compile": "18/18; no pycache",
+  "prior_reconstruction": "all18 match attempt-2 terminal source hashes"
+}

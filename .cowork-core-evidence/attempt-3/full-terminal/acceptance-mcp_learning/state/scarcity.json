@@ -1,0 +1,42 @@
+{
+ "fetched_at": 1792345935.702179,
+ "lanes": {
+  "local": {
+   "source": "vm_stat + ollama ps",
+   "windows": [],
+   "free_gb": 11.3,
+   "resident": [],
+   "scarcity": 1.0,
+   "fetched_at": 1792345935.7356439,
+   "tried_at": 1792345935.7356439,
+   "error": null,
+   "plan": "free"
+  },
+  "antigravity": {
+   "tried_at": 1792345935.825435,
+   "error": "RuntimeError: no quota groups on the /usage screen: ",
+   "plan": "Google AI Pro"
+  },
+  "cursor": {
+   "tried_at": 1792345935.856409,
+   "error": "ImportError: cannot import name 'quota_sources' from 'cortados_router' (/Users/velox/.local/share/cortados-workers/releases/mcp-learning-v1-20261017/venv/lib/python3.14/site-packages/cortados_router/__init__.py)",
+   "plan": "Cursor Pro"
+  },
+  "codex": {
+   "tried_at": 1792345935.918526,
+   "error": "RuntimeError: Quota source metadata is unavailable",
+   "plan": "ChatGPT 20x"
+  },
+  "claude": {
+   "tried_at": 1792345935.949609,
+   "error": "RuntimeError: no '% used' lines on the /usage screen: ",
+   "plan": "Claude Max 20x"
+  }
+ },
+ "learned_at": null,
+ "probe_sweep": {
+  "stale": 0,
+  "killed": 0,
+  "removed": 0
+ }
+}

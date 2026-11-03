@@ -1,0 +1,1287 @@
+{
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/annotate_preview_tool.py": [
+1789576588000000000,
+3947,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/ansi_strip.py": [
+1789576588000000000,
+4341,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/apply_layout_tool.py": [
+1789576588000000000,
+2335,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval.py": [
+1789576588000000000,
+67769,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_context.py": [
+1789576588000000000,
+15469,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_detection.py": [
+1789576588000000000,
+86301,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_floors.py": [
+1789576588000000000,
+9676,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_gateway_wait.py": [
+1789576588000000000,
+10626,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_human_wait.py": [
+1789576588000000000,
+8416,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_prompt.py": [
+1789576588000000000,
+17632,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/approval_smart.py": [
+1789576588000000000,
+7282,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/arg_coercion.py": [
+1789576588000000000,
+9068,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/async_delegation.py": [
+1789576588000000000,
+57061,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/audio_container.py": [
+1789576588000000000,
+2674,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/binary_extensions.py": [
+1789576588000000000,
+2274,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/blueprints.py": [
+1789576588000000000,
+9210,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/bot_failure_reasons.py": [
+1789576588000000000,
+3516,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/bot_live_delivery.py": [
+1789576588000000000,
+8824,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/bot_mode_dm.py": [
+1789576588000000000,
+36314,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/bot_mode_probe.py": [
+1789576588000000000,
+15639,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/bot_relay.py": [
+1789576588000000000,
+25577,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_camofox.py": [
+1789576588000000000,
+28441,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_camofox_state.py": [
+1789576588000000000,
+1566,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_cdp_tool.py": [
+1789576588000000000,
+22494,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_dialog_tool.py": [
+1789576588000000000,
+5405,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_extension_router.py": [
+1789576588000000000,
+6355,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_lightpanda.py": [
+1789576588000000000,
+13117,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_supervisor.py": [
+1789576588000000000,
+27603,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_supervisor_dialogs.py": [
+1789576588000000000,
+15371,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_supervisor_frames.py": [
+1789576588000000000,
+8335,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool.py": [
+1789576588000000000,
+68387,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_cdp.py": [
+1789576588000000000,
+6380,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_cloud.py": [
+1789576588000000000,
+12295,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_eval_policy.py": [
+1789576588000000000,
+8639,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_install.py": [
+1789576588000000000,
+16031,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_lifecycle.py": [
+1791238850000000000,
+31823,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_lightpanda_fallback.py": [
+1789576588000000000,
+10116,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_origin.py": [
+1789576588000000000,
+2913,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_real_profile.py": [
+1789576588000000000,
+16181,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_seed_profile.py": [
+1791238850000000000,
+9306,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_session.py": [
+1789576588000000000,
+30545,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_snapshot.py": [
+1789576588000000000,
+5350,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_tool_vision.py": [
+1789576588000000000,
+7148,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_use_cli.py": [
+1791238850000000000,
+43134,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/browser_vault_tool.py": [
+1789576588000000000,
+36657,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/budget_config.py": [
+1789576588000000000,
+5663,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/checkpoint_manager.py": [
+1789576588000000000,
+62645,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/clarify_gateway.py": [
+1789576588000000000,
+14074,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/clarify_tool.py": [
+1789576588000000000,
+15373,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/close_preview_tool.py": [
+1789576588000000000,
+2571,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/close_terminal_tool.py": [
+1789576588000000000,
+2056,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/code_execution_env.py": [
+1789576588000000000,
+14158,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/code_execution_rpc.py": [
+1789576588000000000,
+8696,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/code_execution_tool.py": [
+1789576588000000000,
+48939,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/code_kernel.py": [
+1789576588000000000,
+38064,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/code_kernel_remote.py": [
+1789576588000000000,
+18876,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/computer_use/tool.py": [
+1789576588000000000,
+55961,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/computer_use_tool.py": [
+1789576588000000000,
+1104,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/connectors/tool.py": [
+1789576588000000000,
+6000,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/credential_files.py": [
+1789576588000000000,
+17937,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/cronjob_job_args.py": [
+1789576588000000000,
+20316,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/cronjob_prompt_scan.py": [
+1789576588000000000,
+7861,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/cronjob_tools.py": [
+1789576588000000000,
+59797,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/daemon_pool.py": [
+1789576588000000000,
+3091,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/debug_helpers.py": [
+1789576588000000000,
+2187,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_model_routing.py": [
+1791424718000000000,
+4560,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool.py": [
+1791424718000000000,
+43668,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_child_run.py": [
+1789576588000000000,
+52313,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_config.py": [
+1789576588000000000,
+30271,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_dispatch.py": [
+1789576588000000000,
+26030,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_progress.py": [
+1789576588000000000,
+22709,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_registry.py": [
+1789576588000000000,
+15610,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_results.py": [
+1789576588000000000,
+20948,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_tasks.py": [
+1789576588000000000,
+8343,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegate_tool_toolsets.py": [
+1789576588000000000,
+5882,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegation_live_log.py": [
+1789576588000000000,
+13883,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/delegation_output_schema.py": [
+1789576588000000000,
+5722,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/desktop_ui.py": [
+1789576588000000000,
+2770,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/discord_tool.py": [
+1789576588000000000,
+31472,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/drive_preview_tool.py": [
+1789576588000000000,
+7033,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/env_passthrough.py": [
+1789576588000000000,
+6793,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/env_probe.py": [
+1789576588000000000,
+11445,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/fal_common.py": [
+1789576588000000000,
+7548,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/feishu_doc_tool.py": [
+1789576588000000000,
+3603,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/feishu_drive_tool.py": [
+1789576588000000000,
+8198,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/feishu_lark.py": [
+1789576588000000000,
+3248,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_operations.py": [
+1789576588000000000,
+77970,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_operations_common.py": [
+1789576588000000000,
+10396,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_operations_lint.py": [
+1789576588000000000,
+13701,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_operations_search.py": [
+1789576588000000000,
+49937,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_state.py": [
+1789576588000000000,
+9941,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_tools.py": [
+1789576588000000000,
+69165,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_tools_paths.py": [
+1789576588000000000,
+8884,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_tools_read_tracking.py": [
+1789576588000000000,
+14800,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/file_tools_write_guards.py": [
+1789576588000000000,
+27287,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/focus_pane_tool.py": [
+1789576588000000000,
+2631,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/fuzzy_match.py": [
+1789576588000000000,
+28350,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/homeassistant_tool.py": [
+1789576588000000000,
+14025,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/hook_output_spill.py": [
+1789576588000000000,
+4878,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/image_generation_catalog.py": [
+1789576588000000000,
+19998,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/image_generation_tool.py": [
+1789576588000000000,
+42959,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/image_source.py": [
+1789576588000000000,
+14590,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/interpreter_shutdown.py": [
+1789576588000000000,
+1225,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/interrupt.py": [
+1789576588000000000,
+5346,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/kanban_tools.py": [
+1789576588000000000,
+52053,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/kanban_tools_schemas.py": [
+1789576588000000000,
+22729,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/kanban_toolset_context.py": [
+1789576588000000000,
+1013,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/lazy_deps.py": [
+1789576588000000000,
+37076,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/managed_gateway_auth.py": [
+1789576588000000000,
+2896,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/managed_tool_gateway.py": [
+1789576588000000000,
+16997,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_dashboard_oauth.py": [
+1789576588000000000,
+5665,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_death_supervisor.py": [
+1789576588000000000,
+9341,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_oauth.py": [
+1789576588000000000,
+62444,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_oauth_device.py": [
+1789576588000000000,
+10484,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_oauth_manager.py": [
+1789576588000000000,
+24164,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_oauth_provider.py": [
+1789576588000000000,
+23494,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_schema_cache.py": [
+1789576588000000000,
+5175,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_agent.py": [
+1789576588000000000,
+14029,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_common.py": [
+1789576588000000000,
+5746,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_config.py": [
+1789576588000000000,
+17404,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_content.py": [
+1789576588000000000,
+11131,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_discovery.py": [
+1789576588000000000,
+33379,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_errors.py": [
+1789576588000000000,
+22662,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_handlers.py": [
+1789576588000000000,
+38358,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_health.py": [
+1789576588000000000,
+15879,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_lifecycle.py": [
+1789576588000000000,
+17512,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_loop.py": [
+1789576588000000000,
+13304,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_registration.py": [
+1789576588000000000,
+29181,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_sampling.py": [
+1789576588000000000,
+18431,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_schema.py": [
+1789576588000000000,
+13351,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_scope.py": [
+1789576588000000000,
+3012,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_server_run.py": [
+1789576588000000000,
+25071,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/mcp_tool_transport.py": [
+1789576588000000000,
+36501,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/memory_tool.py": [
+1789576588000000000,
+20728,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/memory_tool_store.py": [
+1789576588000000000,
+25022,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/microsoft_graph_auth.py": [
+1789576588000000000,
+7438,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/microsoft_graph_client.py": [
+1789576588000000000,
+10885,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/neutts_synth.py": [
+1789576588000000000,
+3134,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/open_preview_tool.py": [
+1789576588000000000,
+3854,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/openrouter_client.py": [
+1789576588000000000,
+1587,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/osv_check.py": [
+1789576588000000000,
+10589,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/patch_parser.py": [
+1789576588000000000,
+20376,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/path_security.py": [
+1789576588000000000,
+1508,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/plugin_guard.py": [
+1789576588000000000,
+12489,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/preview_tool.py": [
+1789576588000000000,
+3535,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/process_registry.py": [
+1789576588000000000,
+126809,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/process_registry_checkpoint.py": [
+1789576588000000000,
+6124,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/process_registry_notifications.py": [
+1789576588000000000,
+20701,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/process_registry_results.py": [
+1789576588000000000,
+4596,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/project_tools.py": [
+1789576588000000000,
+6450,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/pty_query_responder.py": [
+1789576588000000000,
+4709,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/react_to_message_tool.py": [
+1789576588000000000,
+6336,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/read_extract.py": [
+1789576588000000000,
+25189,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/read_preview_tool.py": [
+1789576588000000000,
+3262,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/read_terminal_tool.py": [
+1789576588000000000,
+3275,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/read_window_tool.py": [
+1789576588000000000,
+2613,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/schema_sanitizer.py": [
+1789576588000000000,
+19659,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/self_repo_guard.py": [
+1789576588000000000,
+21197,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/send_message_senders.py": [
+1789576588000000000,
+35757,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/send_message_targets.py": [
+1789576588000000000,
+11099,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/send_message_tool.py": [
+1789576588000000000,
+39570,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/session_search_tool.py": [
+1789576588000000000,
+42773,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/shell_heredoc.py": [
+1789576588000000000,
+8788,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_ledger.py": [
+1789576588000000000,
+18674,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_linter.py": [
+1789576588000000000,
+11118,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_manager_batch.py": [
+1789576588000000000,
+10419,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_manager_guards.py": [
+1789576588000000000,
+15422,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_manager_tool.py": [
+1789576588000000000,
+47897,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_provenance.py": [
+1789576588000000000,
+1885,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skill_usage.py": [
+1789576588000000000,
+37165,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skillevaluator_scan.py": [
+1789576588000000000,
+7363,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_ast_audit.py": [
+1789576588000000000,
+4142,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_guard.py": [
+1789576588000000000,
+54234,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub.py": [
+1789576588000000000,
+17714,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_clawhub.py": [
+1789576588000000000,
+27377,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_github.py": [
+1789576588000000000,
+27053,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_install.py": [
+1789576588000000000,
+14728,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_models.py": [
+1789576588000000000,
+14518,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_official.py": [
+1789576588000000000,
+19211,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_search.py": [
+1789576588000000000,
+9600,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_skillssh.py": [
+1789576588000000000,
+17634,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_hub_sources.py": [
+1789576588000000000,
+20944,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync.py": [
+1789576588000000000,
+23443,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync_bundled_ops.py": [
+1789576588000000000,
+10119,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync_client.py": [
+1789576588000000000,
+27582,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync_client_org.py": [
+1789576588000000000,
+14522,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync_client_wire.py": [
+1789576588000000000,
+17289,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_sync_optional.py": [
+1789576588000000000,
+11390,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_tool.py": [
+1789576588000000000,
+37587,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_tool_dedup.py": [
+1789576588000000000,
+3721,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_tool_plugin.py": [
+1789576588000000000,
+8474,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/skills_tool_setup.py": [
+1789576588000000000,
+7277,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/slash_confirm.py": [
+1789576588000000000,
+4839,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/spill_safety.py": [
+1789576588000000000,
+3063,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/subagent_worktree.py": [
+1789576588000000000,
+9397,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_hints.py": [
+1789576588000000000,
+8388,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_scope.py": [
+1789576588000000000,
+9966,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool.py": [
+1789576588000000000,
+69267,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_backends.py": [
+1789576588000000000,
+19439,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_background.py": [
+1789576588000000000,
+13652,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_config.py": [
+1789576588000000000,
+4896,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_guards.py": [
+1789576588000000000,
+11522,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_lifecycle.py": [
+1789576588000000000,
+13516,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_result.py": [
+1789576588000000000,
+15042,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/terminal_tool_sudo.py": [
+1789576588000000000,
+22501,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/thread_context.py": [
+1789576588000000000,
+3381,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/threat_patterns.py": [
+1789576588000000000,
+10008,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tip_tool.py": [
+1789576588000000000,
+3222,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tirith_security.py": [
+1789576588000000000,
+25813,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/todo_tool.py": [
+1789576588000000000,
+13102,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_backend_helpers.py": [
+1789576588000000000,
+12545,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_output_limits.py": [
+1789576588000000000,
+2710,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_output_truncate.py": [
+1789576588000000000,
+1448,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_result_storage.py": [
+1789576588000000000,
+14718,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_search.py": [
+1789576588000000000,
+31572,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_search_catalog.py": [
+1789576588000000000,
+13445,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tool_search_validation.py": [
+1789576588000000000,
+8609,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tour_tool.py": [
+1789576588000000000,
+6589,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_audio.py": [
+1789576588000000000,
+14540,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_cloud.py": [
+1789576588000000000,
+23384,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_command.py": [
+1789576588000000000,
+14307,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_common.py": [
+1789576588000000000,
+3926,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_local.py": [
+1789576588000000000,
+15789,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/transcription_tools.py": [
+1789576588000000000,
+31227,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_command_provider.py": [
+1789576588000000000,
+15550,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_streaming.py": [
+1789576588000000000,
+15214,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_text_normalize.py": [
+1789576588000000000,
+10598,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool.py": [
+1789576588000000000,
+37085,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_delivery.py": [
+1789576588000000000,
+19944,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_lifecycle.py": [
+1789576588000000000,
+8070,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_local.py": [
+1789576588000000000,
+9524,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_openai.py": [
+1789576588000000000,
+7872,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_plugins.py": [
+1789576588000000000,
+4576,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_providers.py": [
+1789576588000000000,
+30918,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/tts_tool_speaker.py": [
+1789576588000000000,
+16419,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/url_safety.py": [
+1789576588000000000,
+26138,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/video_generation_tool.py": [
+1789576588000000000,
+17307,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/vision_tools.py": [
+1789576588000000000,
+52617,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/vision_tools_image_prep.py": [
+1789576588000000000,
+14703,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/voice_client_config.py": [
+1789576588000000000,
+10553,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/voice_live.py": [
+1789576588000000000,
+9332,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/voice_mode.py": [
+1789576588000000000,
+73193,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/voice_mode_transcript.py": [
+1789576588000000000,
+5530,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/wake_word.py": [
+1789576588000000000,
+37289,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/wake_word_engines.py": [
+1789576588000000000,
+12022,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/web_result_cache.py": [
+1789576588000000000,
+13511,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/web_tools.py": [
+1789576588000000000,
+28374,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/web_tools_extract.py": [
+1789576588000000000,
+11497,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/web_tools_rescue.py": [
+1789576588000000000,
+6197,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/web_tools_truncate.py": [
+1789576588000000000,
+8375,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/website_policy.py": [
+1789576588000000000,
+8873,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/working_diff.py": [
+1789576588000000000,
+4440,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/write_approval.py": [
+1789576588000000000,
+12417,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/x_search_tool.py": [
+1789576588000000000,
+14979,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/xai_http.py": [
+1789576588000000000,
+10541,
+false
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/xai_video_tools.py": [
+1789576588000000000,
+4599,
+true
+],
+"/Users/velox/.cortados-builds/target-test-env/hermes-agent/tools/yuanbao_tools.py": [
+1789576588000000000,
+21901,
+true
+]
+}

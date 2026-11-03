@@ -1,0 +1,169 @@
+--- before/integrations/mcp/remote_dispatch.py
++++ after/integrations/mcp/remote_dispatch.py
+@@ -18,6 +18,13 @@
+         self.runtime = runtime
+ 
+     def task_result(self, task):
++        try:
++            return self._task_result(task)
++        except Exception:
++            self.runtime.fatal()
++            raise
++
++    def _task_result(self, task):
+         artifacts = store.rows(self.runtime.broker.store.db, 'remote_artifacts', 'owner_id=? AND task_id=?', (task.owner_id, task.task_id))
+         visible = []
+         for row in artifacts:
+@@ -36,15 +43,27 @@
+ 
+     def job_result(self, owner_id, task_id, job_id, *, include_result=False):
+         runtime = self.runtime
+-        bindings = store.rows(runtime.broker.store.db, 'remote_job_bindings', 'owner_id=? AND task_id=? AND job_id=?', (owner_id, task_id, job_id))
++        try:
++            bindings = store.rows(runtime.broker.store.db, 'remote_job_bindings', 'owner_id=? AND task_id=? AND job_id=?', (owner_id, task_id, job_id))
++        except Exception:
++            runtime.fatal()
++            raise
+         if not bindings:
+             raise s.RemoteError('job_not_found')
++        try:
++            return self._job_result(owner_id, task_id, job_id, bindings[0], include_result=include_result)
++        except Exception:
++            runtime.fatal()
++            raise
++
++    def _job_result(self, owner_id, task_id, job_id, binding, *, include_result):
++        runtime = self.runtime
+         record = runtime.broker.store.get(job_id)
+         runtime.binding(record)
+         if record.get('execution_kind') != 'cowork_remote_v1':
+             raise s.RemoteError('policy_unavailable')
+         publication = store.rows(runtime.broker.store.db, 'remote_publications', 'job_id=? AND owner_id=? AND task_id=?', (job_id, owner_id, task_id))[0]
+-        value = dict(kind='result' if include_result else 'job', job=record, binding=bindings[0], publication=publication)
++        value = dict(kind='result' if include_result else 'job', job=record, binding=binding, publication=publication)
+         if include_result:
+             value['artifacts'] = []
+             if publication.state == 'complete':
+@@ -71,10 +90,11 @@
+         except s.RemoteError as exc:
+             error = exc
+         except Exception:
++            runtime.fatal()
+             error = s.RemoteError('storage_error')
+         try:
+-            if error.code in ('storage_error', 'policy_unavailable', 'artifact_corrupt'):
+-                runtime.fatal()
++            # Owners latch integrity loss; a public code alone cannot distinguish
++            # a definitive acceptance rollback from an uncertain committed effect.
+             if runtime.broker.store.admission_closed:
+                 runtime.admission_failed = True
+                 runtime.fatal()
+--- before/integrations/mcp/task_store.py
++++ after/integrations/mcp/task_store.py
+@@ -179,6 +179,8 @@
+             result.append(getattr(s, TABLES[table][0])(**value))
+         return result
+     except (ValueError, TypeError, sqlite3.Error, s.RemoteError) as exc:
++        from .remote_runtime import current
++        current().fatal()
+         if isinstance(exc, s.RemoteError) and exc.code == 'policy_unavailable':
+             raise
+         raise s.RemoteError('storage_error') from exc
+--- before/integrations/mcp/transfer_tickets.py
++++ after/integrations/mcp/transfer_tickets.py
+@@ -34,11 +34,22 @@
+ 
+ 
+ def require_publication(tx, row):
++    try:
++        return _require_publication(tx, row)
++    except s.RemoteError as exc:
++        if exc.code != 'publication_failed':
++            _runtime().fatal()
++        raise
++
++
++def _require_publication(tx, row):
+     if row.origin == 'input':
+         return
+     found = store.rows(tx, 'remote_publications', 'job_id=? AND owner_id=? AND task_id=?',
+                        (row.job_id, row.owner_id, row.task_id))
+-    if len(found) != 1 or found[0].state != 'complete':
++    if len(found) != 1:
++        raise s.RemoteError('storage_error')
++    if found[0].state != 'complete':
+         raise s.RemoteError('publication_failed')
+     manifest = found[0].manifest
+     names = [entry.artifact.filename for entry in manifest]
+--- before/integrations/mcp/remote_runtime.py
++++ after/integrations/mcp/remote_runtime.py
+@@ -50,6 +50,22 @@
+             raise s.RemoteError('storage_error')
+         if self.capacity_failed and operation not in ('attach', 'bind', 'task_get', 'job_status', 'job_result', 'job_cancel', 'close'):
+             raise s.RemoteError('capacity_exhausted')
++
++    def fail_capacity(self):
++        if self.capacity_failed:
++            return
++        # Latch before auditing: failure is fatal, never a second transition attempt.
++        self.capacity_failed = True
++        self.admission_failed = True
++        if self.fatal_failed or self.broker.store.admission_closed:
++            self.fatal()
++            return
++        try:
++            with self.broker.store.transaction() as tx:
++                store.event(tx, 'runtime', None, 'ready' if self.enabled else 'disabled',
++                            'failed', reason='capacity_exhausted')
++        except Exception:
++            self.fatal()
+ 
+     def fatal(self):
+         self.admission_failed = True
+@@ -225,6 +241,15 @@
+         return store.rows(self.broker.store.db, 'remote_job_bindings', 'job_id=?', (record['job_id'],))[0]
+ 
+     def classify(self, record):
++        # Persisted discriminator/binding disagreement is integrity loss, unlike
++        # a preacceptance load_manifest refusal for a changed binary generation.
++        try:
++            return self._classify(record)
++        except Exception:
++            self.fatal()
++            raise
++
++    def _classify(self, record):
+         found = store.rows(self.broker.store.db, 'remote_job_bindings', 'job_id=?', (record['job_id'],))
+         if 'execution_kind' not in record and not found:
+             return False
+--- before/integrations/mcp/remote_capacity.py
++++ after/integrations/mcp/remote_capacity.py
+@@ -116,16 +116,14 @@
+                 installation_bad = (self.unknown or usage.installation_measured_bytes + usage.installation_promised_bytes > limits.installation_bytes
+                                     or usage.free_bytes < usage.installation_promised_bytes + limits.disk_headroom_bytes)
+                 if installation_bad:
+-                    self.runtime.capacity_failed = True
+-                    self.runtime.admission_failed = True
++                    self.runtime.fail_capacity()
+                 for item in usage.tasks:
+                     task = store.get_owned(self.runtime.broker.store.db, item.owner_id, item.task_id)
+                     bad = (installation_bad or task.task_id in self.invalid_tasks
+                            or item.measured_bytes + item.promised_bytes > task.policy.limits.task_bytes
+                            or item.artifact_slots > task.policy.limits.artifacts_per_task)
+                     if bad:
+-                        self.runtime.capacity_failed = True
+-                        self.runtime.admission_failed = True
++                        self.runtime.fail_capacity()
+                     if bad and task.active_job_id:
+                         await self.runtime.broker.stop(task.active_job_id, 'capacity_exhausted')
+                     if task.task_id in self.invalid_tasks and task.state not in ('deleted', 'quarantined', 'busy'):
+@@ -136,8 +134,7 @@
+             except (OSError, s.RemoteError) as exc:
+                 if isinstance(exc, s.RemoteError) and exc.code != 'capacity_exhausted':
+                     self.runtime.fatal()
+-                self.runtime.capacity_failed = True
+-                self.runtime.admission_failed = True
++                self.runtime.fail_capacity()
+                 for record in self.runtime.broker.store.active():
+                     if record.get('execution_kind') == 'cowork_remote_v1':
+                         await self.runtime.broker.stop(record['job_id'], 'capacity_exhausted')

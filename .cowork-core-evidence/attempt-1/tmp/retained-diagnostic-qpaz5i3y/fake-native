@@ -1,0 +1,11 @@
+#!/Users/velox/.cortados-builds/mcp-worker-qa-env/bin/python
+import os,sys,json,runpy
+from pathlib import Path
+if "exec" in sys.argv:
+ c=json.loads((Path(os.environ["CODEX_HOME"])/"fixture-control.json").read_text())
+ cwd=Path(sys.argv[sys.argv.index("-C")+1])
+ for name,data in c.get("output_hex",{}).items():
+  target=cwd/"outputs"/name; target.write_bytes(bytes.fromhex(data))
+ if c.get("output_directory"): (cwd/"outputs"/"nested").mkdir()
+ if c.get("output_symlink"): (cwd/"outputs"/"escape").symlink_to(c["output_symlink"])
+runpy.run_path('/Users/velox/.cortados-builds/cortados-router-repo/acceptance/mcp_worker/fake_codex.py',run_name="__main__")

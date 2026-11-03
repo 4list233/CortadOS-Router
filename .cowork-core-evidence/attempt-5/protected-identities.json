@@ -1,0 +1,82 @@
+{
+  "acceptance/cowork_mcp/MANIFEST.json": {
+    "sha256": "3a979fbaa015408dd1d84e5f1f564e933ec970633fc63bd05936726179855261",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/README.md": {
+    "sha256": "087515a515e670118e4425400d6bdbb99c72e97c3e2a6bd31c0973bd34eca22a",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/__init__.py": {
+    "sha256": "2249335cb74aed9f35d29d7dfae94f29801bbeb828678a2e5915cd634d63476f",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/evidence/baseline-ordinary.json": {
+    "sha256": "5bfe9c4d812264574eba636c96c630afa28948af19ef5767d2ee175efc60c287",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/evidence/benchmark-core.py": {
+    "sha256": "88b7ef0ac73e30aca3a3bb69c73e62c491fdc5fe0f3c82650dd5a6c348b95fb4",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/evidence/historical-007-parity.py": {
+    "sha256": "13c589377b96aed29912866eed5ba2d513642b9f77492eb80fc74bc7880ea677",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/evidence/run-full-suite.py": {
+    "sha256": "ad388fa0b362942a7d430bcdcd81c4f7925de39e8646794e9b68c82825042a42",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/evidence/suite-inventory.json": {
+    "sha256": "4a2724fe5ad70d7b91590dd2b61648131a869b9a3dd645c36ca7c3f4cbb13a89",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/fixtures/binary.bin": {
+    "sha256": "eca7a2fd17bcc909b49d0bf0c90c5fa1d026696c632e76f760ad73c1c3c5b5ea",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/fixtures/native_capture.json": {
+    "sha256": "2d7deb538ccfba4c1435289336e05d6b7110d6bac17ca08d7916c413ce55d8e2",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/fixtures/wire.json": {
+    "sha256": "fc6b6435801ffe581028d4688ff72e8a8eff0f32c02ef8ad74e9283302b74970",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/support.py": {
+    "sha256": "1b0ef9eb7c88187a96bd060a49e0a0b7d030f7aeb4888c4d88976ac05f5219a7",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_compatibility.py": {
+    "sha256": "d71d779d10d5db2123a501b2432c170fc1cd184a4f4991e013ccca2246538f1a",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_monitor_lifetime.py": {
+    "sha256": "cd606a9f4e155c577aecd60c4ca1268fe7522eddfef9c3a23bc6e213d2df1cd1",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_native_policy.py": {
+    "sha256": "e515bf2e3f13321c8545ee666a514ae1f9741a1d4d38267fc8b4318cbccc4767",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_performance.py": {
+    "sha256": "4c885e044424e53e767c4ef4f7afd20babef26061f2a2edf5765bf9d03f2c56e",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_recovery.py": {
+    "sha256": "20eab0c78e0aa4af173d0bddf57099ad49bf96768d71d9d21997f6f9c412e461",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_schemas.py": {
+    "sha256": "c0d36f405efc449a86d98948d1d3ad560a5899aca0797cee03a0f9940a7d9892",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_tasks.py": {
+    "sha256": "64ec58be0c18b15d6cbc8a0cabb5da75bac86c0b5f3ce39cc50f35f17d648c9b",
+    "matches_exam_commit": true
+  },
+  "acceptance/cowork_mcp/test_transfer.py": {
+    "sha256": "04533a3970c931805bdde96bf7266430dd4d5cba35e4cc7b0e4e2c0da65e7918",
+    "matches_exam_commit": true
+  }
+}

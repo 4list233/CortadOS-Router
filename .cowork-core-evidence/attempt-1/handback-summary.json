@@ -1,0 +1,391 @@
+{
+  "status": "candidate_not_accepted; native_integration_and_efficiency_host_QA_required",
+  "source_identity": "source-review.json",
+  "patch_sha256": "672771b8461d04793bafe30f3dd4da0e6cdcef10bd664a47488e4b27d5576d15",
+  "core": {
+    "methods": 72,
+    "raw_failures": 3,
+    "raw_errors": 51,
+    "skipped": 0,
+    "schema_methods_passed": 13,
+    "raw_output": "core-handback.log",
+    "classification": "host_boot_id_denied; error/failure_counts_overlap_for_one_cleanup_method"
+  },
+  "accumulated": {
+    "lanes": [
+      {
+        "name": "standalone",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 230,
+          "failures": 0,
+          "errors": 3,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/standalone/output.log"
+      },
+      {
+        "name": "test_auxiliary_model_routing",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 31,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_auxiliary_model_routing/output.log"
+      },
+      {
+        "name": "test_cron_dispatch_routing",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_cron_dispatch_routing/output.log"
+      },
+      {
+        "name": "test_delegation_model_routing",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 17,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_delegation_model_routing/output.log"
+      },
+      {
+        "name": "test_required_model_routing",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 15,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_required_model_routing/output.log"
+      },
+      {
+        "name": "test_required_routing_full_loop",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 5,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_required_routing_full_loop/output.log"
+      },
+      {
+        "name": "test_router_gateway_admission",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_router_gateway_admission/output.log"
+      },
+      {
+        "name": "test_router_reviews_cortados",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/test_router_reviews_cortados/output.log"
+      },
+      {
+        "name": "acceptance-cowork_mcp",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 72,
+          "failures": 3,
+          "errors": 51,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/acceptance-cowork_mcp/output.log"
+      },
+      {
+        "name": "acceptance-fresh_quota",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 130,
+          "failures": 0,
+          "errors": 2,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/acceptance-fresh_quota/output.log"
+      },
+      {
+        "name": "acceptance-mcp_learning",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 31,
+          "failures": 0,
+          "errors": 40,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/acceptance-mcp_learning/output.log"
+      },
+      {
+        "name": "acceptance-mcp_worker",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 53,
+          "failures": 3,
+          "errors": 96,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/acceptance-mcp_worker/output.log"
+      },
+      {
+        "name": "acceptance-native_profile",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 9,
+          "failures": 0,
+          "errors": 16,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/acceptance-native_profile/output.log"
+      },
+      {
+        "name": "acceptance-quota_evaluation",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 21,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/acceptance-quota_evaluation/output.log"
+      },
+      {
+        "name": "acceptance-quota_sources",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 83,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/acceptance-quota_sources/output.log"
+      },
+      {
+        "name": "acceptance-router_followup",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 6,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/acceptance-router_followup/output.log"
+      },
+      {
+        "name": "acceptance-training_teacher",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 61,
+          "failures": 1,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "umask077_fixture_failure; unchanged_lane_61_pass_with_umask022",
+        "raw_output": "full-suite-handback/acceptance-training_teacher/output.log"
+      },
+      {
+        "name": "benchmark",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 0,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/benchmark/output.log"
+      },
+      {
+        "name": "shared-test_router_nightly_runs",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 7,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/shared-test_router_nightly_runs/output.log"
+      },
+      {
+        "name": "shared-test_router_overnight",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 9,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/shared-test_router_overnight/output.log"
+      },
+      {
+        "name": "preserved-pty-delivery",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 25,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/preserved-pty-delivery/output.log"
+      },
+      {
+        "name": "preserved-pty-fd",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/preserved-pty-fd/output.log"
+      },
+      {
+        "name": "shared-router-core",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 30,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/shared-router-core/output.log"
+      },
+      {
+        "name": "migrated-learning",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 3,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/migrated-learning/output.log"
+      },
+      {
+        "name": "installed-teacher-adapter",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 7,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/installed-teacher-adapter/output.log"
+      },
+      {
+        "name": "historical-007-parity",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 4,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/historical-007-parity/output.log"
+      },
+      {
+        "name": "teacher-performance",
+        "raw_exit_code": 0,
+        "counts": {
+          "tests": 0,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "passed",
+        "raw_output": "full-suite-handback/teacher-performance/output.log"
+      },
+      {
+        "name": "core-performance",
+        "raw_exit_code": 1,
+        "counts": {
+          "tests": 0,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "classification": "environment_blocked",
+        "raw_output": "full-suite-handback/core-performance/output.log"
+      }
+    ],
+    "raw_pass_lanes": 19,
+    "nonpassing_lanes": 9,
+    "raw_totals": {
+      "tests": 857,
+      "failures": 7,
+      "errors": 208,
+      "skipped": 0
+    }
+  },
+  "benchmark": {
+    "cases_completed": 0,
+    "memory_efficiency": "unmeasured",
+    "sql_budget": "unmeasured",
+    "monitor_overshoot": "unmeasured",
+    "raw_report": "benchmark-handback.json",
+    "reason": "existing host_boot_id denied before first case"
+  },
+  "supplemental_diagnostics": {
+    "not_acceptance": true,
+    "host_identity": "invented via explicit patch",
+    "native_exec_count": 0,
+    "ground_truth": "diagnostic-state.json",
+    "driver": "diagnostic-retained.py",
+    "raw_output": "diagnostic-retained.log"
+  },
+  "historical_baseline": {
+    "baseline_report": "/Users/velox/.cortados-builds/cowork-mcp-verification/baseline-4ed7508/report.json",
+    "baseline_report_sha256": "30c1c7fa18d0fa714a0fd0d244b5563091a0dc4220545b7ba10317db13d1a8e1",
+    "original_baseline_totals": {
+      "tests": 785,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0
+    },
+    "original_baseline_pass": false
+  },
+  "source_hashes_stable": true,
+  "protected_pins_unchanged": true
+}

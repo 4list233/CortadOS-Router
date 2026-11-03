@@ -1,0 +1,6 @@
+2026-10-18 17:54:09,568 INFO [20261018_175409_5b8dfb] agent.turn_context: conversation turn: session=20261018_175409_5b8dfb model=initial-model provider=openrouter platform=cli history=0 msg='Report a result.'
+2026-10-18 17:54:09,580 INFO [20261018_175409_5b8dfb] agent.agent_runtime_helpers: switch_model: reasoning_config resolved for routed-model-A: None
+2026-10-18 17:54:09,606 INFO [20261018_175409_5b8dfb] agent.agent_runtime_helpers: Model switched in-place: initial-model (openrouter) -> routed-model-A (openrouter)
+2026-10-18 17:54:09,606 INFO [20261018_175409_5b8dfb] agent.agent_model_routing: Required route: request=20261018_175409_5b8dfb:c6b52960-d343-49d0-beab-8af35e0d6327:b90c2c37:api:1 selected=openrouter/routed-model-A route=route-1 degraded=None
+2026-10-18 17:54:09,608 INFO [20261018_175409_5b8dfb] agent.conversation_loop: Turn ended: reason=local_execution_blocked model=routed-model-A api_calls=1/5 budget=1/5 tool_turns=0 last_msg_role=assistant response_len=67 session=20261018_175409_5b8dfb
+2026-10-18 17:54:09,610 INFO [20261018_175409_5b8dfb] run_agent: OpenAI client closed (agent_close, shared=True, tcp_force_closed=0) thread=MainThread:8236777344 provider=openrouter base_url=https://test.invalid/v1 model=routed-model-A

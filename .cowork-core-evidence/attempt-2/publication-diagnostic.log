@@ -1,0 +1,59 @@
+test_committed_manifest_order_survives_reverse_artifact_query_order (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_committed_manifest_order_survives_reverse_artifact_query_order) ... Executing <Task pending name='Task-2' coro=<BuildPublicationRegressionExam.test_committed_manifest_order_survives_reverse_artifact_query_order() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py:94> wait_for=<Future pending cb=[BaseSelectorEventLoop._sock_read_done()(), Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.270 seconds
+ERROR
+test_sealed_output_is_not_downloadable_after_publication_failure (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_sealed_output_is_not_downloadable_after_publication_failure) ... Executing <Task pending name='Task-11' coro=<BuildPublicationRegressionExam.test_sealed_output_is_not_downloadable_after_publication_failure() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py:109> wait_for=<Future pending cb=[BaseSelectorEventLoop._sock_read_done()(), Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.215 seconds
+ERROR
+test_unpublished_output_rejects_existing_ticket_replay_and_claim (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_unpublished_output_rejects_existing_ticket_replay_and_claim) ... Executing <Task pending name='Task-20' coro=<BuildPublicationRegressionExam.test_unpublished_output_rejects_existing_ticket_replay_and_claim() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py:128> wait_for=<Future pending cb=[BaseSelectorEventLoop._sock_read_done()(), Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.214 seconds
+ERROR
+test_binding_derived_task_index_must_equal_immutable_seed (acceptance.cowork_mcp.test_recovery.BuildIntegrityRegressionExam.test_binding_derived_task_index_must_equal_immutable_seed) ... Executing <Task pending name='Task-29' coro=<BuildIntegrityRegressionExam.test_binding_derived_task_index_must_equal_immutable_seed() running at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py:102> wait_for=<Future pending cb=[BaseSelectorEventLoop._sock_read_done()(), Task.task_wakeup()] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py:181] created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.217 seconds
+Executing <Task finished name='Task-29' coro=<BuildIntegrityRegressionExam.test_binding_derived_task_index_must_equal_immutable_seed() done, defined at /Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_recovery.py:101> result=None created at /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py:110> took 0.152 seconds
+ok
+
+======================================================================
+ERROR: test_committed_manifest_order_survives_reverse_artifact_query_order (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_committed_manifest_order_survives_reverse_artifact_query_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 104, in test_committed_manifest_order_survives_reverse_artifact_query_order
+    self.assertEqual([row['filename'] for row in result['result']['artifacts']],['a.bin','z.bin'])
+                                                 ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+
+======================================================================
+ERROR: test_sealed_output_is_not_downloadable_after_publication_failure (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_sealed_output_is_not_downloadable_after_publication_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 117, in test_sealed_output_is_not_downloadable_after_publication_failure
+    self.assertEqual(result['result']['artifacts'],[])
+                     ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+
+======================================================================
+ERROR: test_unpublished_output_rejects_existing_ticket_replay_and_claim (acceptance.cowork_mcp.test_native_policy.BuildPublicationRegressionExam.test_unpublished_output_rejects_existing_ticket_replay_and_claim)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/runners.py", line 128, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/Users/velox/.cortados-builds/cortados-router-repo/acceptance/cowork_mcp/test_native_policy.py", line 129, in test_unpublished_output_rejects_existing_ticket_replay_and_claim
+    result=await self.terminal(task['task_id'],job);artifact=result['result']['artifacts'][0]
+                                                             ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+
+----------------------------------------------------------------------
+Ran 4 tests in 2.340s
+
+FAILED (errors=3)

@@ -1,0 +1,11 @@
+{
+  "core.log": "d21e806900a32dafea01a43551859df624f079a278d8be2f41c484e19df70f32",
+  "before-hashes.json": "61d7f755abbc12ef7073f176194cdecf8eaa7fe1525f7a08077c2ac50963648a",
+  "ordinary.log": "31e43249ec8fd07710fcd3224232af9ad83a40df53807dd628ee20ce91d219c4",
+  "checks.json": "eec9a534e9bebd8497c0b7eece31f4a3349d10dd2246b28eba0912458be5b814",
+  "core-final.log": "175fb7590343e3216b9ffdad9e1f56ccd7dac05004893acfcd82b905235beaa2",
+  "HANDBACK.md": "aac7805b2dadc2ff30a667fcc2ec9bf2753bfa30077f4b2afa405edeba60b20f",
+  "attempt-4.patch": "96fb438442bff28e4191533cc2917c7dfb84d5603be18abecf396786cacb8f50",
+  "source-freeze.json": "479a39f47e2978ef31cdcce63a45ee626f3147a46f10dba9f66afc67cbe4a267",
+  "cumulative-source.patch": "3aaeb88486d5e000d01288dd9c7f7b4f4272cd1819ef33d4497ab9a23bb3aee8"
+}

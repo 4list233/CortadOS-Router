@@ -1,0 +1,19 @@
+test_native_private_record_array_constraints_match_frozen_schema (acceptance.cowork_mcp.test_schemas.BuildClosedShapeRegressionExam.test_native_private_record_array_constraints_match_frozen_schema) ... ok
+test_cross_field_dimensions_and_retention_refuse (acceptance.cowork_mcp.test_schemas.SchemaExam.test_cross_field_dimensions_and_retention_refuse) ... ok
+test_duplicate_nonfinite_surrogate_json_rejected (acceptance.cowork_mcp.test_schemas.SchemaExam.test_duplicate_nonfinite_surrogate_json_rejected) ... ok
+test_every_config_key_required_and_unknown_refuses (acceptance.cowork_mcp.test_schemas.SchemaExam.test_every_config_key_required_and_unknown_refuses) ... ok
+test_every_new_owner_module_has_a_real_importable_boundary (acceptance.cowork_mcp.test_schemas.SchemaExam.test_every_new_owner_module_has_a_real_importable_boundary) ... ok
+test_integer_limits_reject_boolean_zero_missing_and_unknown (acceptance.cowork_mcp.test_schemas.SchemaExam.test_integer_limits_reject_boolean_zero_missing_and_unknown) ... ok
+test_nested_inputs_are_copied_and_immutable_without_implementation_requirement (acceptance.cowork_mcp.test_schemas.SchemaExam.test_nested_inputs_are_copied_and_immutable_without_implementation_requirement) ... ok
+test_principal_is_synthetic_and_installation_matches (acceptance.cowork_mcp.test_schemas.SchemaExam.test_principal_is_synthetic_and_installation_matches) ... ok
+test_private_record_constructors_freeze_and_reject_unknown_fields (acceptance.cowork_mcp.test_schemas.SchemaExam.test_private_record_constructors_freeze_and_reject_unknown_fields) ... ok
+test_projected_variants_and_unknown_cross_fields (acceptance.cowork_mcp.test_schemas.SchemaExam.test_projected_variants_and_unknown_cross_fields) ... ok
+test_remote_errors_are_closed_and_do_not_leak_worker_messages (acceptance.cowork_mcp.test_schemas.SchemaExam.test_remote_errors_are_closed_and_do_not_leak_worker_messages) ... ok
+test_request_unknown_identity_paths_and_filename_boundaries (acceptance.cowork_mcp.test_schemas.SchemaExam.test_request_unknown_identity_paths_and_filename_boundaries) ... ok
+test_root_geometry_and_base_state_identity_refuse (acceptance.cowork_mcp.test_schemas.SchemaExam.test_root_geometry_and_base_state_identity_refuse) ... ok
+test_wire_success_examples_and_errors_match_frozen_schema (acceptance.cowork_mcp.test_schemas.SchemaExam.test_wire_success_examples_and_errors_match_frozen_schema) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.932s
+
+OK
