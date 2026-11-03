@@ -166,7 +166,9 @@ class CollectTest(unittest.TestCase):
             {"window": f"w{i}", "pool": f"q{i}", "used_pct": 10.0} for i in range(40)]}}}
         out = self.collect(fixture_home(), scarcity_reader=lambda: sc)
         lane = out["lanes"][0]
-        self.assertIn({"source": "scarcity", "error": "pools_truncated"}, out["errors"])
+        self.assertIn({"source": "scarcity/x", "error": "pools_truncated"}, out["errors"])     # per-lane source
+        self.assertIn({"source": "scarcity/x", "error": "windows_truncated"}, out["errors"])
+        self.assertEqual(len(lane["windows"]), usage.WINDOWS_MAX)
         self.assertNotIn("_pools_truncated", lane)
         self.assertIsNone(lane["sample_age_s"]); self.assertTrue(lane["stale"])
         self.assertEqual(len(lane["windows"][0]["pool"]), usage.WINDOW_NAME_MAX)
@@ -375,9 +377,10 @@ class CollectTest(unittest.TestCase):
             usage.ROUTED_TOP, usage.BAND_TOP = keep
         self.assertEqual(r["last_7d"], [{"lane": "claude", "model": "sonnet", "calls": 2}])
         self.assertEqual(r["top_bands_7d"], [{"band": "B", "calls": 2}])
-        self.assertTrue(r["truncated"]); self.assertTrue(r["bands_truncated"])
+        self.assertTrue(r["today_truncated"]); self.assertTrue(r["last_7d_truncated"]); self.assertTrue(r["bands_truncated"])
         full = self.collect(home)["routed"]
-        self.assertNotIn("truncated", full); self.assertNotIn("bands_truncated", full)
+        for k in ("today_truncated", "last_7d_truncated", "bands_truncated", "truncated"):
+            self.assertNotIn(k, full)
 
     def test_window_nan_used_pct_has_no_left(self):
         sc = {"lanes": {"x": {"fetched_at": NOW, "windows": [{"window": "w", "pool": "all", "used_pct": float("nan")}]}}}
@@ -442,6 +445,137 @@ class CollectTest(unittest.TestCase):
         finally:
             usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
 
+    def test_hot_key_survives_eviction(self):
+        usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
+        hot, calls = fixture_home(), []
+        def reader():
+            calls.append(1)
+            return SCARCITY
+        hot_args = dict(state_dir=hot, scarcity_reader=reader, refusals=[], s1_probe=lambda url: {"available": True})
+        try:
+            usage.collect(**hot_args)
+            for _ in range(12):
+                usage.collect(state_dir=fixture_home(), scarcity_reader=lambda: {}, refusals=[],
+                              s1_probe=lambda url: {"available": True})
+                for _ in range(3):
+                    usage.collect(**hot_args)
+            self.assertIn(str(hot), usage._COLLECT_CACHE)
+            self.assertEqual(len(calls), 1)                      # every hammer was a memo hit
+            body = usage.collect(**hot_args, encoded=True)
+            self.assertIs(body, usage._COLLECT_CACHE[str(hot)][1])   # the memo holds the bytes: a hit serialises nothing
+        finally:
+            usage._COLLECT_CACHE.clear(); usage._COLLECT_FLIGHT.clear()
+
+
+# a 100 KB string publishes at most its first REASON_MAX (refusal reasons) or TEXT_MAX chars
+LEAKS = ("ssh_target", "100.64", "/Users/", "R" * (usage.REASON_MAX + 1))
+PAYLOADS = [{"ssh_target": "forest@100.64.0.9"}, "/Users/someone/.ssh/id", "R" * 100000,
+            [{"ssh_target": "x"}, ["/Users/a"]], {"available": False, "reason": "forest@100.64.0.9: /Users/x"},
+            "forest@100.64.0.9", "10.0.100.64", "ok\\Users"]
+
+
+class PublishTest(unittest.TestCase):
+    """The publish pass: a planted payload in ANY field of ANY section never reaches the body; real values do."""
+
+    def setUp(self):
+        self.home = fixture_home()
+
+    def view(self, sc=None, hw=None, runs=None, refusals=None, s1=None):
+        if hw is not None:
+            (self.home / "hardware" / "studio.json").write_text(json.dumps(hw))
+        return usage.collect(state_dir=self.home, scarcity_reader=lambda: sc if sc is not None else SCARCITY,
+                             refusals=refusals or [], runs_since_start=runs,
+                             s1_probe=s1 or (lambda u: {"available": True}), now=NOW)
+
+    def clean(self, view):
+        body = json.dumps(view, allow_nan=False)
+        for leak in LEAKS:
+            self.assertNotIn(leak, body)
+        self.assertLess(len(body), 200_000)
+        return body
+
+    def test_every_field_every_section(self):
+        lane = SCARCITY["lanes"]["claude"]
+        win = lane["windows"][0]
+        for bad in PAYLOADS:
+            for k in list(win) + ["extra"]:                                  # every window field
+                self.clean(self.view({"lanes": {"claude": {**lane, "windows": [{**win, k: bad}]}}}))
+            for k in ("fetched_at", "error", "error_kind", "windows", "config_dir", "extra"):   # every lane field
+                self.clean(self.view({"lanes": {"claude": {**lane, k: bad}}}))
+            self.clean(self.view({"lanes": {"forest@100.64.0.9": lane, "/Users/x": lane, "R" * 100000: lane}}))
+            self.clean(self.view({"lanes": {"x": {"fetched_at": NOW, "windows": [
+                {"window": "w", "pool": bad if isinstance(bad, str) else "p", "headroom_pct": 5.0}]}}}))  # pool keys
+            for k in list(HW_SAMPLE) + ["extra"]:                            # every hardware field
+                self.clean(self.view(hw={**HW_SAMPLE, k: bad}))
+            for k in _hk:
+                self.clean(self.view(hw={**HW_SAMPLE, "headroom": {**HW_SAMPLE["headroom"], k: bad}}))
+            for k in ("name", "size", "size_vram", "extra"):
+                self.clean(self.view(hw={**HW_SAMPLE, "ollama_models": [{"name": "q", k: bad}]}))
+            for k in ("field", "error", "extra"):
+                self.clean(self.view(hw={**HW_SAMPLE, "errors": [{"field": "chip", "error": "E", k: bad}]}))
+            self.clean(self.view(hw={**HW_SAMPLE, "errors": [bad], "ollama_models": [bad], "load_avg": [bad] * 9}))
+            self.clean(self.view(runs={"claude-cli/sonnet": 1, "forest@100.64.0.9/x": bad if not isinstance(bad, str) else 2,
+                                       "a/" + ("R" * 100000 if isinstance(bad, str) else "b"): 1}))
+            self.clean(self.view(refusals=[{"reason": bad if isinstance(bad, str) else "x", "at": NOW}]))
+            self.clean(self.view(s1=lambda u: {"available": False, "reason": bad, "status": bad, "x": bad}))
+        with (self.home / "child-tasks.jsonl").open("a") as f:
+            for bad in PAYLOADS:
+                f.write(json.dumps({"ts": NOW - 1, "task_id": "z" + str(len(str(bad))), "event": bad, "status": bad}) + "\n")
+                f.write(json.dumps({"ts": NOW - 1, "task_id": "y", "event": "finished", "status": bad}) + "\n")
+        self.clean(self.view())
+
+    def test_hw_error_field_is_a_sampler_field(self):
+        hw = self.view(hw={**HW_SAMPLE, "errors": [{"field": "/Users/a", "error": "E: x"},
+                                                   {"field": {"ssh_target": 1}, "error": "E"},
+                                                   {"field": "platform", "error": "OSError: y"}]})["hardware"][0]["data"]
+        self.assertEqual([e["field"] for e in hw["errors"]], ["unknown", None, "platform"])   # a container where the leaf is expected: null
+
+    def test_text_rule(self):
+        for bad in ("/Users/x", "a\\b", "u@h", "10.1.2.3", "x <b>", '{"a": 1}'):
+            self.assertEqual(usage._text(bad), "error", bad)
+        for good in ("week (all models)", "claude-opus-5-5", "2027-01-15 04:00", "claude#b", "qwen2.5:7b",
+                     "month (other models: Claude, GPT, Gemini \u2026)", "cursor (shared with Grok Bot)", "50%"):
+            self.assertEqual(usage._text(good), good)
+        self.assertEqual(len(usage._text("R" * 100000)), usage.TEXT_MAX)
+        self.assertIsNone(usage._text(5)); self.assertIsNone(usage._text({"a": "b"}))
+
+    def test_legit_values_publish_unchanged(self):
+        out = self.view(runs={"claude-cli/sonnet": 3})
+        hw = out["hardware"][0]["data"]
+        want = {k: v for k, v in HW_SAMPLE.items() if k not in ("mem_total_bytes", "errors")}
+        self.assertEqual({k: hw[k] for k in want}, want)
+        cur = {l["lane"]: l for l in out["lanes"]}["cursor"]
+        names = [w["window"] for w in cur["windows"]]
+        self.assertEqual(names, [w["window"] for w in SCARCITY["lanes"]["cursor"]["windows"]])   # incl. the ellipsis
+        claude = {l["lane"]: l for l in out["lanes"]}["claude"]["windows"][0]
+        src = SCARCITY["lanes"]["claude"]["windows"][0]
+        self.assertEqual({k: claude[k] for k in usage._WIN_KEYS if k in src}, {k: src[k] for k in usage._WIN_KEYS if k in src})
+        self.assertEqual(out["routed"]["provider_since_start"], {"claude-cli/sonnet": 3})
+        self.assertEqual(out["errors"], [])
+
+    def test_200_lanes_by_200_windows_bounded(self):
+        w = {**_wv("5-hour", 10.0, NOW + 3600, 5 * 3600, now=NOW), "pool": "all"}
+        sc = {"lanes": {f"l{i}": {"fetched_at": NOW, "windows": [{**w, "pool": f"p{j}"} for j in range(200)]}
+                        for i in range(200)}}
+        out = self.view(sc)
+        body = self.clean(out)
+        self.assertEqual(len(out["lanes"]), usage.LANES_MAX)
+        self.assertTrue(all(len(l["windows"]) == usage.WINDOWS_MAX for l in out["lanes"]))
+        self.assertTrue(all(len(l["pools"]) == usage.POOLS_MAX for l in out["lanes"]))
+        self.assertIn({"source": "scarcity", "error": "lanes_truncated"}, out["errors"])
+        self.assertIn({"source": "scarcity/l0", "error": "windows_truncated"}, out["errors"])
+        self.assertLessEqual(len(out["errors"]), usage.ERRORS_MAX)
+        self.assertEqual(out["errors"][-1], {"source": "usage", "error": "errors_truncated"})
+        self.assertLess(len(body), 200_000)
+
+    def test_load_avg_cut_flagged(self):
+        out = self.view(hw={**HW_SAMPLE, "load_avg": [1.0, 2.0, 3.0, 4.0]})
+        self.assertEqual(out["hardware"][0]["data"]["load_avg"], [1.0, 2.0, 3.0])
+        self.assertIn({"source": "hardware/studio.json", "error": "load_avg_truncated"}, out["errors"])
+
+
+_hk = usage._HW_HEADROOM_KEYS
+
 
 class EndpointTest(unittest.TestCase):
     def setUp(self):
@@ -488,7 +622,7 @@ class EndpointTest(unittest.TestCase):
         self.httpd.usage_view = lambda reg: usage.collect(
             state_dir=home, scarcity_reader=lambda: sc, refusals=[], s1_probe=lambda u: {"available": True}, now=NOW)
         out = self.get(TOKEN)
-        self.assertEqual(out["lanes"][0]["windows"][0]["resets_at"], {"deep": [None]})
+        self.assertIsNone(out["lanes"][0]["windows"][0]["resets_at"])      # a container where a leaf is expected
 
     def test_non_finite_view_is_a_500_not_invalid_json(self):
         self.httpd.usage_view = lambda reg: {"x": [float("inf")]}
@@ -528,7 +662,9 @@ class RealWiringTest(unittest.TestCase):
             reg = Registry(gateway_url="", token=TOKEN, claude_bin=["true"])
             httpd = ProviderServer(("127.0.0.1", 0), reg)
             try:
-                out = httpd.usage_view(reg)
+                raw = httpd.usage_view(reg)
+                self.assertIsInstance(raw, bytes)                   # the live view arrives encoded (memoised bytes)
+                out = json.loads(raw)
             finally:
                 httpd.server_close()
         finally:

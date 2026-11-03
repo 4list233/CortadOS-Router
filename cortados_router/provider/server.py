@@ -854,11 +854,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a JSON object")
         return body
 
-    def _json(self, code: int, data: dict[str, Any] | bytes, session=None, headers: dict[str, str] | None = None, *,
-              strict: bool = False) -> None:
+    def _json(self, code: int, data: dict[str, Any] | bytes, session=None, headers: dict[str, str] | None = None) -> None:
         # bytes: a body the caller already encoded (and validated), sent as is, so a large view is serialised once.
-        # strict: NaN/Infinity raise ValueError (before anything is sent) instead of emitting invalid JSON
-        raw = data if isinstance(data, bytes) else json.dumps(data, allow_nan=not strict).encode()
+        raw = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send_response(code)
         self._route_header(session)
         for k, v in (headers or {}).items():
@@ -948,7 +946,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "authentication_error", "bad or missing token")
             try:   # a bug in a source must not drop the connection: a clean 500, detail (type only) in the log
                 view = self.server.usage_view(self.server.registry)
-                body = json.dumps(view, allow_nan=False).encode()   # strict JSON for dashboards; before any byte is sent
+                # the live view arrives encoded (usage.collect memoises the bytes); a dict is encoded strictly here,
+                # before any byte is sent, so a NaN is a clean 500 and never invalid JSON
+                body = view if isinstance(view, bytes) else json.dumps(view, allow_nan=False).encode()
             except Exception as exc:
                 logger.warning("usage: view failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: usage view unavailable (see provider log)")
@@ -1629,7 +1629,7 @@ class ProviderServer(ThreadingHTTPServer):
         super().__init__(addr, Handler)
         self.registry = registry
 
-    def usage_view(self, registry: Registry) -> dict[str, Any]:
+    def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
         from cortados_router import paths, scarcity
         from cortados_router.provider import usage
@@ -1641,7 +1641,8 @@ class ProviderServer(ThreadingHTTPServer):
             s1_url = None
         return usage.collect(state_dir=paths.state_dir(), scarcity_reader=lambda: scarcity.current(refresh=False),
                              refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
-                             s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes())
+                             s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes(),
+                             encoded=True)
 
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
