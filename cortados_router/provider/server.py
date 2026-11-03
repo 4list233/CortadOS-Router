@@ -1632,7 +1632,7 @@ class ProviderServer(ThreadingHTTPServer):
             s1_url = None
         return usage.collect(state_dir=paths.state_dir(), scarcity_reader=lambda: scarcity.current(refresh=False),
                              refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
-                             s1_url=s1_url, freshness=scarcity.reading_freshness)
+                             s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes())
 
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,

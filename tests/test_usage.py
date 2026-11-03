@@ -12,7 +12,9 @@ import urllib.request
 from pathlib import Path
 
 from cortados_router import scarcity
+from cortados_router import hardware
 from cortados_router.provider import usage
+from tests import test_hardware
 from cortados_router.provider.server import ProviderServer, Registry
 
 NOW = 1_800_000_000.0
@@ -36,6 +38,12 @@ SCARCITY = {"fetched_at": NOW - 60, "lanes": {
     "codex#b": {"fetched_at": NOW - 60, "tried_at": NOW - 10, "error": "RuntimeError: screen refused", "error_kind": "parse",
                 "windows": [{**_wv("weekly", 10.0, NOW + 86400, 7 * 86400, now=NOW), "pool": "all"}]},
     "broken": {"fetched_at": "not-a-number", "windows": []}}}
+# Built FROM hardware.sample (the writer of hardware/<host>.json) with canned command output, so it cannot drift.
+HW_SAMPLE = hardware.sample(
+    run=test_hardware.fake_run({(hardware.SYSCTL, "-n", "hw.memsize"): FileNotFoundError(2, "No such file", "/Users/someone/sysctl")}),
+    fetch=lambda url, timeout=None: json.dumps({"models": [
+        {"name": "qwen", "size": 1, "size_vram": 1, "digest": "abc", "path": "/Users/someone/m"}]}),
+    system="Darwin", now=NOW - 30, hostname="studio")
 _TMP: list = []
 
 
@@ -52,10 +60,7 @@ def fixture_home() -> Path:
         {"ts": NOW - 100, "event": "started", "task_id": "t1"}, {"ts": NOW - 50, "event": "finished", "status": "succeeded", "task_id": "t1"},
         {"ts": NOW - 40, "event": "started", "task_id": "t2"}]) + "\nnot json\n")
     (d / "hardware").mkdir()
-    (d / "hardware" / "studio.json").write_text(json.dumps({
-        "host": "studio", "ncpu": 24, "mem_available_bytes": 1 << 30, "ssh_target": "forest@100.64.0.9",
-        "ollama_models": [{"name": "qwen", "size": 1, "size_vram": 1, "digest": "abc", "path": "/Users/someone/m"}],
-        "errors": [{"type": "OSError", "kind": "gpu", "message": "/Users/someone/x denied"}]}))
+    (d / "hardware" / "studio.json").write_text(json.dumps({**HW_SAMPLE, "ssh_target": "forest@100.64.0.9"}))
     return d
 
 
@@ -112,8 +117,12 @@ class CollectTest(unittest.TestCase):
         self.assertTrue(out["s1"]["available"])
         hw = out["hardware"][0]["data"]
         self.assertEqual(hw["host"], "studio"); self.assertNotIn("ssh_target", hw)
+        # every sampler field survives the filter (the allowlist matches the real writer), the extra key does not
+        self.assertEqual(set(hw), set(HW_SAMPLE))
+        self.assertEqual(hw["chip"], HW_SAMPLE["chip"]); self.assertEqual(hw["headroom"], HW_SAMPLE["headroom"])
         self.assertEqual(hw["ollama_models"], [{"name": "qwen", "size": 1, "size_vram": 1}])
-        self.assertEqual(hw["errors"], [{"type": "OSError", "kind": "gpu"}])
+        self.assertEqual(hw["mem_total_bytes"], {"available": False, "reason": "FileNotFoundError"})
+        self.assertEqual(hw["errors"], [{"field": "mem_total_bytes", "error": "FileNotFoundError"}])
         self.assertEqual(out["errors"], [])
 
     def test_missing_sources_reported(self):
@@ -137,6 +146,41 @@ class CollectTest(unittest.TestCase):
         lanes = {l["lane"]: l for l in self.collect(fixture_home(), freshness=scarcity.reading_freshness)["lanes"]}
         self.assertTrue(lanes["codex#b"]["stale"])                   # error + tried_at > fetched_at: stale at once
         self.assertFalse(lanes["claude"]["stale"])
+
+    def test_reading_for_other_login_shows_no_numbers(self):
+        # accounts reordered: each cached reading's config_dir now belongs to the other lane key
+        swapped = [("claude", "/Users/someone/.claude-acctB"), ("claude#b", "/Users/someone/.claude-acctA")]
+        lanes = {l["lane"]: l for l in self.collect(fixture_home(), claude_lanes=swapped)["lanes"]}
+        for k in ("claude", "claude#b"):
+            self.assertEqual((lanes[k]["left_pct"], lanes[k]["windows"], lanes[k]["pools"], lanes[k]["stale"],
+                              lanes[k]["error"]), (None, [], {}, True, "reading_for_other_login"))
+        self.assertEqual(lanes["codex"]["windows"][0]["window"], "weekly")          # non-Claude lanes untouched
+        same = [("claude", "/Users/someone/.claude-acctA"), ("claude#b", "/Users/someone/.claude-acctB")]
+        lanes = {l["lane"]: l for l in self.collect(fixture_home(), claude_lanes=same)["lanes"]}
+        self.assertEqual(lanes["claude"]["left_pct"], 80.0)
+        self.assertNotIn("/Users/", json.dumps(lanes))
+
+    def test_non_finite_and_pool_capped(self):
+        sc = {"lanes": {"x": {"fetched_at": float("inf"), "windows": [
+            {"window": "w", "pool": "p" * 500, "used_pct": 10.0}] + [
+            {"window": f"w{i}", "pool": f"q{i}", "used_pct": 10.0} for i in range(40)]}}}
+        lane = self.collect(fixture_home(), scarcity_reader=lambda: sc)["lanes"][0]
+        self.assertIsNone(lane["sample_age_s"]); self.assertTrue(lane["stale"])
+        self.assertEqual(len(lane["windows"][0]["pool"]), usage.WINDOW_NAME_MAX)
+        self.assertEqual(len(lane["pools"]), usage.POOLS_MAX)
+        json.dumps(lane, allow_nan=False)
+
+    def test_hardware_cap_keeps_freshest(self):
+        home = fixture_home()
+        old = home / "hardware" / "aaa.json"
+        old.write_text(json.dumps(HW_SAMPLE)); os.utime(old, (time.time() - 9999, time.time() - 9999))
+        keep = usage.HW_MAX_FILES
+        usage.HW_MAX_FILES = 1
+        try:
+            out = self.collect(home)
+        finally:
+            usage.HW_MAX_FILES = keep
+        self.assertEqual([h["file"] for h in out["hardware"]], ["studio.json"])
 
     def test_window_name_capped(self):
         long = {"lanes": {"claude": {"fetched_at": NOW, "windows": [{**_wv("week (" + "x" * 500 + ")", 1.0, NOW + 9, 9, now=NOW)}]}}}
