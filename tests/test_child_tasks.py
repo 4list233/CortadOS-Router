@@ -27,6 +27,8 @@ FAKE = textwrap.dedent('''\
                    "claudecode": os.environ.get("CLAUDECODE"),
                    "headers": os.environ.get("ANTHROPIC_CUSTOM_HEADERS"),
                    "pythonpath": os.environ.get("PYTHONPATH"), "pid": os.getpid(),
+                   "settings": (lambda p: p and {{"mode": os.stat(p).st_mode & 0o777, "body": json.load(open(p))}})(
+                       sys.argv[sys.argv.index("--settings") + 1] if "--settings" in sys.argv else None),
                    "env": {{k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL",
                            "CORTADOS_PROVIDER_TOKEN_FILE", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_MODEL",
                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL",
@@ -1376,7 +1378,7 @@ class ChildTaskTests(unittest.TestCase):
 
     def test_chrome_login_mode_env_and_argv(self):
         os.environ.update({"ANTHROPIC_BASE_URL": "http://x.invalid", "ANTHROPIC_AUTH_TOKEN": "tok-test-000000001",
-                           "ANTHROPIC_API_KEY": "", "ANTHROPIC_CUSTOM_HEADERS": "h: v", "ANTHROPIC_UNIX_SOCKET": "/s",
+                           "ANTHROPIC_API_KEY": "sk-ant-test-" + "0" * 40, "ANTHROPIC_CUSTOM_HEADERS": "h: v", "ANTHROPIC_UNIX_SOCKET": "/s",
                            "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "cortados",
                            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
                            "CORTADOS_PROVIDER_TOKEN": "tok-test-000000002", "CORTADOS_PROVIDER_URL": "http://p.invalid",
@@ -1401,8 +1403,9 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(seen["nested"], "1")
         self.assertEqual(meta["cred_fingerprints"], [])
         sp = a[a.index("--settings") + 1]
-        self.assertEqual(os.stat(sp).st_mode & 0o777, 0o600)
-        self.assertEqual(_load(sp), {"enabledPlugins": {ct.session.PLUGIN_ID: False}})
+        self.assertEqual(os.path.basename(sp), "session-login.json")
+        self.assertEqual(seen["settings"], {"mode": 0o600, "body": {"enabledPlugins": {ct.session.PLUGIN_ID: False}}})
+        self.assertFalse(os.path.exists(sp))   # removed with the child, like the routed child's settings file
         self.assertEqual(a[a.index("--model") + 1], "claude-sonnet-5-5")
         self.assertIn("--chrome", a)
         dis = a[a.index("--disallowedTools") + 1]
@@ -1410,6 +1413,18 @@ class ChildTaskTests(unittest.TestCase):
                   "mcp__playwright", "mcp__puppeteer", "mcp__cortados-route"):
             self.assertIn(t, dis)
         self.assertIn("mcp__claude-in-chrome__", a[a.index("--append-system-prompt") + 1])
+        # crash logs are released when the fingerprints are []: safe only while every launch-token key is forbidden
+        self.assertLessEqual(set(ct.LAUNCH_TOKEN_KEYS), set(ct.LOGIN_FORBIDDEN_ENV))
+        self.assertIn("SSH_AUTH_SOCK", ct.LOGIN_FORBIDDEN_ENV)
+        self.assertIn("CLAUDECODE", ct.LOGIN_FORBIDDEN_ENV)
+        self.assertNotIn("SSH_AUTH_SOCK", ct.LOGIN_ENV_ALLOW)
+        self.assertEqual(ct.credential_fingerprints(ct.launch_tokens(ct.login_env(os.environ))), [])
+        px = ct.login_env({"HTTPS_PROXY": "http://proxy:3128", "http_proxy": "http://u:p@proxy:3128",
+                           "HTTP_PROXY": "u@proxy:1", "NO_PROXY": "localhost", "SSL_CERT_FILE": "/ca.pem",
+                           "NODE_EXTRA_CA_CERTS": "/ca2.pem", "SSH_AUTH_SOCK": "/agent"})
+        self.assertEqual(px, {"HTTPS_PROXY": "http://proxy:3128", "NO_PROXY": "localhost",
+                              "SSL_CERT_FILE": "/ca.pem", "NODE_EXTRA_CA_CERTS": "/ca2.pem"})
+        self.assertRaises(ct.TaskError, ct.wait_max_s, {"CORTADOS_WAIT_MAX_S": 30})
         env = ct.login_env(dict(os.environ, CLAUDECODE="1"))
         for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
                   "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_SUBAGENT_MODEL",
