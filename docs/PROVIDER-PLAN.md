@@ -104,6 +104,17 @@ Not yet in P1, each needing a decision or another phase:
   (text and tool_use ids). If the endpoint restarts, or the client compacts or edits its history, the next request
   fails with 409 instead of rebuilding the session from the transcript. Two live conversations with identical
   histories (same opening, same text-only replies) are refused with 409 rather than guessed between.
+  What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
+  sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
+  `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
+  not compared, so the conversation continues; the CLI session still holds the original. (b) Compaction into one
+  summary user message leaves no assistant message, so the request opens a new conversation (not a 409); a compacted
+  history that keeps some but not all earlier assistant messages is a 409. (c) A removed or edited assistant message,
+  or a different tool_use id, is a 409: never continued, because the CLI session would answer from a history the
+  client no longer has. Rebuilding (b)/(c) from the transcript is still open. The live 409 bursts of 2026-11-03
+  (several conversations within two minutes) are therefore NOT explained by (a); remaining suspects are the idle reaper
+  (`CORTADOS_PROVIDER_IDLE_S`, 1800 s, closes every idle session in one sweep), a rewritten assistant text, or
+  partial compaction: the provider log needs the reason a find missed before a fix is chosen.
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.

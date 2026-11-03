@@ -355,6 +355,45 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(ra["content"][0]["text"], "tool said: from A")
         self.assertEqual(rb["content"][0]["text"], "tool said: from B")
 
+    def _two_tool_turns(self):
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history})
+        use = r1["content"][-1]
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
+        r2 = self.post({"tools": [READ_TOOL], "messages": history})
+        history += [{"role": "assistant", "content": r2["content"]}]
+        return history
+
+    def test_cleared_old_tool_result_content_still_continues_the_conversation(self):
+        # Claude Code's time-based microcompaction replaces old tool_result content with a placeholder. The match key
+        # (Registry.find) is the assistant reply fingerprints only, so this must keep continuing, not 409.
+        history = self._two_tool_turns()
+        history[2]["content"][0]["content"] = "[Old tool result content cleared]"
+        r = self.post({"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "thanks"}]})
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_a_different_earlier_tool_use_id_is_refused_not_continued(self):
+        history = self._two_tool_turns()
+        history[1] = {"role": "assistant", "content": [dict(history[1]["content"][-1], id="toolu_someone_else")]}
+        history[2]["content"][0]["tool_use_id"] = "toolu_someone_else"
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "thanks"}]}
+        self.assertEqual(self.status_of(body), 409)
+
+    def test_edited_earlier_assistant_text_is_refused_not_continued(self):
+        history = self._two_tool_turns()
+        history[3] = {"role": "assistant", "content": [{"type": "text", "text": "an answer this endpoint never wrote"}]}
+        body = {"tools": [READ_TOOL], "messages": history + [{"role": "user", "content": "thanks"}]}
+        self.assertEqual(self.status_of(body), 409)
+
+    def test_a_compacted_history_with_no_assistant_message_opens_a_new_conversation(self):
+        self._two_tool_turns()
+        summary = [{"role": "user", "content": "This session is being continued from a previous conversation. "
+                                               "Summary: read f0.md, it said hello."}]
+        self.assertEqual(self.post({"tools": [READ_TOOL], "messages": summary})["stop_reason"], "end_turn")
+        self.assertEqual(len(self.reg.sessions), 2)
+
     def test_an_ambiguous_history_is_refused_not_guessed(self):
         opening = [{"role": "user", "content": "hi"}]
         a = self.post({"tools": [READ_TOOL], "messages": opening})
