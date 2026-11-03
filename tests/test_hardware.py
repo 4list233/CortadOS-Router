@@ -179,6 +179,25 @@ class ParserTest(unittest.TestCase):
         self.assertGreater(len(IOREG), 1000)  # wider than any terminal: width never matters for -a
         self.assertEqual(hardware.parse_ioreg_gpu(IOREG), 37)
 
+    def test_ioreg_malformed_plist_is_a_reading_failure(self):
+        bad = ('<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><array><dict>'
+               '<key>IORegistryEntryName</key><string>AGX\x01</string></dict></array></plist>')
+        with self.assertRaises(ValueError):
+            hardware.parse_ioreg_gpu(bad)
+        base = fake_run()
+
+        def run(argv, timeout=None):
+            return bad if argv[0] == hardware.IOREG else base(argv)
+        data = hardware.sample(run=run, fetch=ok_fetch, system="Darwin", now=1.0, hostname="box")
+        self.assertIs(data["gpu_busy_pct"]["available"], False)
+        self.assertIn("gpu_busy_pct", [e["field"] for e in data["errors"]])
+
+    def test_ncpu_none_is_unavailable_with_reason(self):
+        with mock.patch.object(hardware.os, "cpu_count", return_value=None):
+            data = hardware.sample(run=fake_run(), fetch=ok_fetch, system="Darwin", now=1.0, hostname="box")
+        self.assertIs(data["ncpu"]["available"], False)
+        self.assertIn("ncpu", [e["field"] for e in data["errors"]])
+
     def test_ioreg_text_form_is_rejected(self):
         with self.assertRaises(ValueError):
             hardware.parse_ioreg_gpu('+-o AGX\n  "PerformanceStatistics" = {"Device Utilization %"=37}\n')
@@ -209,6 +228,22 @@ class RunnerTest(unittest.TestCase):
         big = Resp(b"a" * (hardware.MAX_OLLAMA_BYTES + 10))
         with mock.patch.object(hardware.urllib.request, "urlopen", return_value=big):
             with self.assertRaises(ValueError):
+                hardware.default_fetch("http://x")
+
+    def test_default_fetch_wall_clock_budget(self):
+        class Drip:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return b"a"  # one byte per read, forever: only the deadline stops it
+        clock = iter(range(0, 1000))
+        with mock.patch.object(hardware.urllib.request, "urlopen", return_value=Drip()), \
+                mock.patch.object(hardware.time, "monotonic", side_effect=lambda: float(next(clock))):
+            with self.assertRaises(TimeoutError):
                 hardware.default_fetch("http://x")
 
 
@@ -253,17 +288,53 @@ class WriteTest(unittest.TestCase):
     def test_every_created_level_is_0700(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "fresh-home")
+            before = stat.S_IMODE(os.stat(tmp).st_mode)
             hardware.write_atomic(os.path.join(home, "hardware", "box.json"), {"a": 1})
             self.assertEqual(stat.S_IMODE(os.stat(home).st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(os.stat(tmp).st_mode) & 0o777, stat.S_IMODE(os.stat(tmp).st_mode))
+            self.assertEqual(stat.S_IMODE(os.stat(tmp).st_mode), before)
+
+    def test_concurrent_mkdir_is_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "hardware")
+            real_mkdir = os.mkdir
+
+            def racing_mkdir(path, mode=0o777):
+                real_mkdir(path, 0o755)  # another sampler wins the race
+                raise FileExistsError(path)
+            with mock.patch.object(hardware.os, "mkdir", racing_mkdir):
+                hardware.write_atomic(os.path.join(target, "box.json"), {"a": 1})
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)  # not ours: mode untouched
 
     def test_owned_check_refuses_symlink(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):
             real = os.path.join(tmp, "real")
             os.mkdir(real)
-            os.symlink(real, os.path.join(tmp, "link"))
+            os.symlink(real, os.path.join(tmp, "hardware"))
             with self.assertRaises(PermissionError):
-                hardware.write_atomic(os.path.join(tmp, "link", "box.json"), {}, require_owned=True)
+                hardware.write_atomic(os.path.join(tmp, "hardware", "box.json"), {}, require_owned=True)
+
+    def test_owned_check_refuses_symlinked_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            elsewhere = os.path.join(tmp, "elsewhere")
+            os.mkdir(elsewhere)
+            home = os.path.join(tmp, "home")
+            os.symlink(elsewhere, home)
+            with env(CORTADOS_HOME=home, CORTADOS_HERMES_HOME=None):
+                with self.assertRaises(PermissionError):
+                    hardware.write_atomic(hardware.default_out_path("box"), {}, require_owned=True)
+            self.assertEqual(os.listdir(elsewhere), [])  # nothing created inside the link target
+
+    def test_owned_check_refuses_foreign_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):
+            with mock.patch.object(hardware.os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaises(PermissionError):
+                    hardware.write_atomic(hardware.default_out_path("box"), {}, require_owned=True)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "hardware")))
+
+    def test_owned_check_refuses_path_outside_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=os.path.join(tmp, "home"), CORTADOS_HERMES_HOME=None):
+            with self.assertRaises(PermissionError):
+                hardware.write_atomic(os.path.join(tmp, "other", "box.json"), {}, require_owned=True)
 
     def test_default_path_uses_cortados_home(self):
         with tempfile.TemporaryDirectory() as tmp, env(CORTADOS_HOME=tmp, CORTADOS_HERMES_HOME=None):

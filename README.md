@@ -441,7 +441,7 @@ A read-only `GET /resources` on the provider (same token) returns one JSON snaps
 `python3 -m cortados_router.hardware sample [--out [PATH]]` measures this machine like a subscription's "% left": host,
 chip, total and available memory (`vm_stat` free + inactive + speculative), CPU busy % (second sample of `top -l 2`),
 load averages, GPU busy % (Apple IOAccelerator "Device Utilization %"), the Ollama models resident now (`/api/ps`,
-0.5 s timeout), and a `headroom` block (free_mem_gb, cpu_idle_pct, gpu_idle_pct). It takes about 2 s (worst case about 20.5 s, every command hanging to its 4 s timeout). Anything that
+0.5 s timeout), and a `headroom` block (free_mem_gb, cpu_idle_pct, gpu_idle_pct). It takes about 2 s (worst case about 22 s: every command hanging to its 4 s timeout plus the 2 s Ollama fetch budget). Anything that
 cannot be read is marked unavailable with the reason and listed in `errors`; nothing is guessed. `--out` writes the
 JSON atomically to the state dir (`$CORTADOS_HOME`, else `$CORTADOS_HERMES_HOME`, else `~/.cortados`) as `hardware/<host>.json` (0600; directories it creates are 0700, existing ones keep their mode). Each sample carries `sampled_at` (epoch s). It feeds the dashboard next and
 routing later; nothing in routing reads it yet. Details: `docs/LOCAL-RESOURCES.md`.

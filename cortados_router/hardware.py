@@ -6,7 +6,7 @@ router reads it yet. Stdlib only. Every subprocess and the HTTP fetch is injecta
 `fetch`) so tests never depend on the host; every failure lands in `errors` and the field it
 would have filled is marked unavailable with the reason. Missing readings are unknown, never 0.
 
-Worst case one sample takes 5 x CMD_TIMEOUT + OLLAMA_TIMEOUT (about 20.5 s, every command hanging);
+Worst case one sample takes 5 x CMD_TIMEOUT + FETCH_BUDGET (about 22 s, every command hanging);
 normally about 2 s (top's two 1 s samples). A timer that fires more often than the worst case can overlap.
 
 CLI: python3 -m cortados_router.hardware sample [--out [PATH]]
@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import xml.parsers.expat
 
 from cortados_router.paths import state_dir
 
@@ -36,6 +37,7 @@ GIB = 2 ** 30
 CMD_TIMEOUT = 4  # seconds per command; top's two 1 s samples need ~2 s, so 4 s bounds a hang
 OLLAMA_URL = "http://127.0.0.1:11434/api/ps"
 OLLAMA_TIMEOUT = 0.5  # loopback: if Ollama answers at all it answers fast; do not stall sampling
+FETCH_BUDGET = 2.0  # total wall clock for one fetch: OLLAMA_TIMEOUT is per socket op and does not bound a dripping body
 MAX_OLLAMA_BYTES = 65536  # /api/ps lists a handful of models; more means it is not Ollama (and bounds memory)
 REASON_CHARS = 300  # a reason is for a human and a JSON field, not a stack dump
 # Absolute paths: launchd and cron give a minimal PATH. ioreg -a prints a plist, which has no line width
@@ -51,9 +53,20 @@ def default_run(argv, timeout=CMD_TIMEOUT):
 
 
 def default_fetch(url, timeout=OLLAMA_TIMEOUT):
-    """GET url. timeout is per socket operation; the size cap stops a dripping or huge body."""
+    """GET url. timeout is per socket operation; FETCH_BUDGET bounds the whole body read (a peer
+    dripping one byte per timeout would otherwise stall for hours); the size cap stops a huge body."""
+    deadline = time.monotonic() + FETCH_BUDGET
+    chunks, size = [], 0
     with urllib.request.urlopen(url, timeout=timeout) as response:
-        body = response.read(MAX_OLLAMA_BYTES + 1)
+        while size <= MAX_OLLAMA_BYTES:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"body not complete within {FETCH_BUDGET}s")  # an OSError: attempt() records it
+            chunk = response.read(min(8192, MAX_OLLAMA_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    body = b"".join(chunks)
     if len(body) > MAX_OLLAMA_BYTES:
         raise ValueError(f"response over {MAX_OLLAMA_BYTES} bytes")
     return body.decode("utf-8")
@@ -88,7 +101,10 @@ def parse_top_cpu(text):
 
 def parse_ioreg_gpu(text):
     """Device Utilization % from `ioreg -a -r -c IOAccelerator -d 1` (a plist array of accelerators)."""
-    devices = plistlib.loads(text.encode("utf-8") if isinstance(text, str) else text)
+    try:
+        devices = plistlib.loads(text.encode("utf-8") if isinstance(text, str) else text)
+    except xml.parsers.expat.ExpatError as exc:  # plistlib normalises detection failures only, not malformed XML
+        raise ValueError(f"ioreg plist is malformed: {exc}") from None
     if not isinstance(devices, list):
         raise ValueError("ioreg plist is not an array")
     values = []
@@ -144,7 +160,12 @@ def sample(run=default_run, fetch=default_fetch, system=None, now=None, hostname
     except OSError as exc:
         errors.append({"field": "load_avg", "error": str(exc)})
         out["load_avg"] = unavailable(str(exc))
-    out["ncpu"] = os.cpu_count()
+    ncpu = os.cpu_count()
+    if ncpu:
+        out["ncpu"] = ncpu
+    else:  # os.cpu_count() returns None when it cannot tell: unknown, with a reason, like every other field
+        errors.append({"field": "ncpu", "error": "os.cpu_count() returned None"})
+        out["ncpu"] = unavailable("os.cpu_count() returned None")
 
     if system == "Darwin":
         out["chip"] = attempt("chip", lambda: run([SYSCTL, "-n", "machdep.cpu.brand_string"]).strip()
@@ -190,18 +211,20 @@ def write_atomic(path, data, require_owned=False):
     mkdir's mode is masked by umask and Path.mkdir applies it to the leaf only). A directory that
     already exists keeps its mode: it is not ours to change (--out ./x.json, /tmp)."""
     path = Path(path)
+    owned_levels = _state_levels(path.parent) if require_owned else []
+    _check_owned(owned_levels, existing_only=True)  # before creating anything under a planted link
     missing = []
     parent = path.parent
-    while not parent.exists():
+    while not os.path.lexists(parent):  # lexists: a dangling symlink is present, not missing
         missing.append(parent)
         parent = parent.parent
     for directory in reversed(missing):
-        os.mkdir(directory, 0o700)
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:  # a concurrent sampler made it first: not ours, so its mode is left alone
+            continue
         os.chmod(directory, 0o700)
-    if require_owned:  # our own state tree: refuse a planted symlink or someone else's directory
-        info = os.lstat(path.parent)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            raise PermissionError(f"{path.parent} is not a directory owned by this user")
+    _check_owned(owned_levels, existing_only=False)  # every level now exists: re-check what was created
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as handle:  # adopt fd first so a failing fchmod still closes it
@@ -213,6 +236,30 @@ def write_atomic(path, data, require_owned=False):
         with contextlib.suppress(OSError):  # never mask the real error with a cleanup error
             os.unlink(tmp)
         raise
+
+
+def _state_levels(directory):
+    """The state dir and every level under it down to directory (require_owned is for our own tree only)."""
+    root = Path(state_dir())
+    directory = Path(directory)
+    try:
+        rel = directory.relative_to(root)
+    except ValueError:
+        raise PermissionError(f"{directory} is not under the state dir {root}") from None
+    levels = [root]
+    for part in rel.parts:
+        levels.append(levels[-1] / part)
+    return levels
+
+
+def _check_owned(levels, existing_only):
+    """lstat each level: a symlink, a non-directory or another user's directory anywhere in the tree is refused."""
+    for level in levels:
+        if existing_only and not os.path.lexists(level):
+            continue
+        info = os.lstat(level)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError(f"{level} is not a directory owned by this user")
 
 
 def main(argv=None):
