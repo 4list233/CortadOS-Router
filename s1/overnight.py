@@ -211,8 +211,10 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
         headers["Authorization"] = f"Bearer {token}"
     t0 = _time.monotonic()
     try:
-        # Built inside the try: Request() raises ValueError for what urlsplit rejects (e.g. 'http://[fd7a::9:8431').
+        # Built inside the try: Request() raises ValueError for what urlsplit rejects (e.g. 'http://[2001:db8::9:8431').
         req = urllib.request.Request(url, data=body, headers=headers)
+        if not req.host:   # 'http://' or 'http:///score' pass _normalize's scheme check; urlopen would call it an outage
+            raise ScorerConfigError(f"scorer URL from {scorer_url_source()} has no host; {RESOLVE_HINT}") from None
         with urllib.request.urlopen(req, timeout=timeout) as r:
             r.read()
     except urllib.error.HTTPError as e:   # before OSError: HTTPError is an OSError subclass
@@ -290,6 +292,7 @@ class Guard:
                              else release_hold_s)
         self.forced_releases = 0   # consecutive forced releases (supervisor lifetime); a normal resume resets it
         self.stuck_alerted = False   # 'cycle result marker cannot be removed' alerted once per supervisor lifetime
+        self.stop_seen = False   # the stop flag existed at some poll of the last run_cycle (set there, not by new_cycle)
         self.baseline_samples: list[float] = []
         self.last = None
         self.new_cycle()
@@ -320,16 +323,21 @@ class Guard:
         except ScorerConfigError as e:
             self._config_error(str(e))
             return None, None
-        except Exception as e:   # any other probe failure must not kill the supervisor (launchd would crash-loop it)
-            # Type name only: an unexpected exception's message can quote the scorer URL.
-            self._config_error(f"scorer probe raised {type(e).__name__} (URL from {scorer_url_source()})")
+        # Exception on purpose, NEVER BaseException: an unexpected probe fault must not kill the supervisor (launchd
+        # would crash-loop it), but main() turns SIGTERM (launchd unload, Ctrl-C) into KeyboardInterrupt, and a probe can
+        # block up to 30 s in urlopen; swallowing that (or SystemExit) would keep the cycle running past a stop.
+        except Exception as e:
+            # Type name only: an unexpected exception's message can quote the scorer URL. A distinct alert name, so a
+            # code fault (TypeError, ImportError) is not triaged as an operator setting.
+            self._config_error(f"scorer probe raised {type(e).__name__} (URL from {scorer_url_source()})",
+                               name="scorer_probe_crashed", kind="PROBE CRASHED")
             return None, None
 
-    def _config_error(self, detail: str) -> None:
+    def _config_error(self, detail: str, *, name: str = "scorer_probe_config", kind: str = "CONFIG ERROR") -> None:
         if not self.config_logged:
             self.config_logged = True
-            self.log(f"overnight: CONFIG ERROR: {detail}; the latency guard has no reading (not treated as back-pressure)")
-            self.alerter("scorer_probe_config", detail)
+            self.log(f"overnight: {kind}: {detail}; the latency guard has no reading (not treated as back-pressure)")
+            self.alerter(name, detail)
 
     def idle_probe(self) -> None:
         """No work tree running: every probe is a clean baseline sample."""
@@ -444,14 +452,15 @@ def _read_result(result_file: Path) -> str:
 
 
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
-              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
-              stop_seen: list | None = None) -> tuple[int, str]:
+              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
-    When stopflag and stop_seen are given, True is appended to stop_seen if the flag existed at any poll of this cycle, so an
-    operator who removes it during the TERM grace (to resume) is still read as a stop, not as a failure."""
+    guard.stop_seen is set when stopflag existed at any poll of this cycle (and after the child exits), so an operator who
+    removes it during the TERM grace (to resume) is still read as a stop, not as a failure. Residual race: a flag created
+    and removed entirely inside one poll_s window is never seen, and that rc 130 is read as an external TERM."""
+    guard.stop_seen = False
     def watch_stop():
-        if stopflag is not None and stop_seen is not None and not stop_seen and stopflag.exists():
-            stop_seen.append(True)
+        if stopflag is not None and not guard.stop_seen and stopflag.exists():
+            guard.stop_seen = True
     stale = False
     try:
         result_file.unlink()
@@ -465,7 +474,8 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
             # Silent otherwise: back-to-back cycling degrades to one cycle per idle interval (or a stale quota pins the
             # 5 h cooldown) every cycle until someone fixes the permissions.
             guard.stuck_alerted = True
-            guard.alerter("cycle_result_stuck", f"cannot remove {result_file} ({type(e).__name__}); cycle results may be a "
+            # The file name only: status alerts reach the dashboard and handbacks; the full path (account name) is logged above.
+            guard.alerter("cycle_result_stuck", f"cannot remove {result_file.name} ({type(e).__name__}); cycle results may be a "
                           "cycle old: 'worked' is read as idle, 'quota' still cools down")
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file))
@@ -615,10 +625,9 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
             return 0
         n += 1
         guard.idle_probe()
-        seen: list = []
         rc, result = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep, pidfile=pidfile,
-                               stopflag=stopflag, stop_seen=seen)
-        if rc == 130 and (stopflag is None or seen or stopflag.exists()):
+                               stopflag=stopflag)
+        if rc == 130 and (stopflag is None or guard.stop_seen or stopflag.exists()):
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
         if rc == 130:   # TERM from someone other than --stop (e.g. pkill -f nightly.sh): a hand-run supervisor must survive it

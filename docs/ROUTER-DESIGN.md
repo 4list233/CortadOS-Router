@@ -354,7 +354,9 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 
 Alerts: `guard_forced_resume` (a pause hit `CORTADOS_S1_MAX_PAUSE_S` or the scorer stayed unreadable; the detail counts forced
 releases in a row, reset by a normal resume), `scorer_probe_config` (the probe settings are unusable; alerts and logs name the setting
-that chose the URL, `CORTADOS_S1_URL` / `CORTADOS_S1_ENDPOINT` / default, never the URL itself). A stale result marker that cannot be
+that chose the URL, `CORTADOS_S1_URL` / `CORTADOS_S1_ENDPOINT` / default, never the URL itself), `scorer_probe_crashed`
+(the probe raised an unexpected exception, by type name: a code fault, not a setting), `cycle_result_stuck` (the result marker
+cannot be removed; once per supervisor). A stale result marker that cannot be
 removed makes the cycle count as idle. The failure backoff exponent and the persisted failure count are clamped.
 Stop: `s1/data/nightly.stop` means "the operator ran `nightly.sh --stop`", and only `--stop` creates it in continuous mode: a TERM from
 the supervisor (launchctl unload / `kickstart -k`, logout, shutdown) ends the cycle with exit 130 but leaves no flag, so the job comes

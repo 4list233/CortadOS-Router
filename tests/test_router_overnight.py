@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
+import http.client
 import os
 import signal
 import sys
@@ -85,7 +86,7 @@ class ReviewFixesRound3(unittest.TestCase):
                            log=logs.append, alerter=lambda n, d: alerts.append(d))
 
     def test_scheme_less_scorer_url_never_in_exception_log_or_alert(self):
-        for value, host in (('100.64.0.9:8431', '100.64.0.9'), ('studio.example.ts.net:8431', 'studio.example.ts.net')):
+        for value, host in (('192.0.2.9:8431', '192.0.2.9'), ('studio.example.ts.net:8431', 'studio.example.ts.net')):
             with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}):
                 with self.assertRaises(night.ScorerConfigError) as cm:
                     night.scorer_url()
@@ -101,13 +102,13 @@ class ReviewFixesRound3(unittest.TestCase):
 
     def test_malformed_url_is_a_config_error_not_a_crash(self):
         logs, alerts = [], []
-        with patch.dict(os.environ, {'CORTADOS_S1_URL': 'http://100.64.0.9:abc'}):
+        with patch.dict(os.environ, {'CORTADOS_S1_URL': 'http://192.0.2.9:abc'}):
             with self.assertRaises(night.ScorerConfigError) as cm:
-                night.probe_scorer_latency(url='http://100.64.0.9:abc/score', timeout=1)
-            self.assertNotIn('100.64.0.9', str(cm.exception))
-            g = self._guard(lambda: night.probe_scorer_latency(url='http://100.64.0.9:abc/score', timeout=1), logs, alerts)
+                night.probe_scorer_latency(url='http://192.0.2.9:abc/score', timeout=1)
+            self.assertNotIn('192.0.2.9', str(cm.exception))
+            g = self._guard(lambda: night.probe_scorer_latency(url='http://192.0.2.9:abc/score', timeout=1), logs, alerts)
             g.idle_probe()   # must not raise
-        self.assertEqual(len(alerts), 1); self.assertNotIn('100.64.0.9', '\n'.join(logs + alerts))
+        self.assertEqual(len(alerts), 1); self.assertNotIn('192.0.2.9', '\n'.join(logs + alerts))
 
     def _stale(self, marker):
         with tempfile.TemporaryDirectory() as tmp:
@@ -468,7 +469,7 @@ class ReviewFixesRound2(unittest.TestCase):
             self.assertEqual(night._load_failures(rf), night.MAX_FAILURES)
 
     def test_scorer_url_never_in_alert_or_log(self):
-        secret = 'http://100.64.0.9:8431'
+        secret = 'http://192.0.2.9:8431'
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -491,12 +492,12 @@ class ReviewFixesRound2(unittest.TestCase):
             with patch.dict(os.environ, {'CORTADOS_S1_URL': secret.replace('http', 'ftp')}):
                 with self.assertRaises(night.ScorerConfigError) as cm:
                     night.scorer_url()
-            self.assertNotIn('100.64.0.9', str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
+            self.assertNotIn('192.0.2.9', str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
             # unreachable: the OSError text is redacted too
             with patch.dict(os.environ, {'CORTADOS_S1_URL': secret}), patch('builtins.print') as pr, \
                     patch.object(night.urllib.request, 'urlopen', side_effect=OSError(f'cannot reach {secret}/score')):
                 self.assertIsNone(night.probe_scorer_latency(timeout=1))
-            self.assertNotIn('100.64.0.9', pr.call_args[0][0])
+            self.assertNotIn('192.0.2.9', pr.call_args[0][0])
         finally:
             srv.shutdown(); srv.server_close()
 
@@ -509,30 +510,34 @@ class ReviewFixesRound4(unittest.TestCase):
         return night.Guard(latency=latency, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, max_pause_s=1800,
                            log=logs.append, alerter=lambda n, d: alerts.append((n, d)))
 
-    def _survives(self, latency, host):
+    def _survives(self, latency, host, name='scorer_probe_config'):
         logs, alerts = [], []
         with patch('builtins.print') as pr:
             g = self._guard(latency, logs, alerts)
             g.idle_probe(); g.idle_probe()   # must not raise; second probe in the same cycle does not re-alert
         printed = '\n'.join(str(c.args[0]) for c in pr.call_args_list if c.args)
         text = '\n'.join(logs + [d for _, d in alerts]) + printed
-        self.assertEqual([n for n, _ in alerts], ['scorer_probe_config'])
-        self.assertNotIn(host, text)
+        self.assertEqual([n for n, _ in alerts], [name])
+        if host:
+            self.assertNotIn(host, text)
         return text
 
     def test_malformed_urls_are_config_errors_without_the_host(self):
-        for value, host in (('http://[fd7a:115c:a1e0::9:8431', 'fd7a'), ('http://studio-host:abc', 'studio-host')):
+        for value, host in (('http://[2001:db8::9:8431', '2001:db8'), ('http://studio-host:abc', 'studio-host'),
+                            ('http://', None), ('http:///score', None)):
             with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}):
                 with self.assertRaises(night.ScorerConfigError) as cm:
                     night.probe_scorer_latency(timeout=1)
-                self.assertNotIn(host, str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
+                if host:
+                    self.assertNotIn(host, str(cm.exception))
+                self.assertIn('CORTADOS_S1_URL', str(cm.exception))
                 self.assertIsNone(cm.exception.__cause__); self.assertTrue(cm.exception.__suppress_context__)
                 self._survives(lambda: night.probe_scorer_latency(timeout=1), host)
 
     def test_unexpected_probe_exception_is_a_config_error_by_type_name(self):
         def boom():
             raise RuntimeError('cannot talk to http://secret-host:8431/score')
-        text = self._survives(boom, 'secret-host')
+        text = self._survives(boom, 'secret-host', name='scorer_probe_crashed')
         self.assertIn('RuntimeError', text)
 
     def test_unexpected_probe_exception_does_not_kill_a_running_cycle(self):
@@ -544,7 +549,7 @@ class ReviewFixesRound4(unittest.TestCase):
             rc, _ = night.run_cycle([sys.executable, '-c', 'import time; time.sleep(0.2)'], g,
                                     result_file=Path(tmp) / 'r', poll_s=0.05)
         # (no baseline: the existing pause-to-measure / unreadable-release path may also alert; only the config alert is ours)
-        self.assertEqual(rc, 0); self.assertEqual([n for n, _ in alerts].count('scorer_probe_config'), 1, alerts)
+        self.assertEqual(rc, 0); self.assertEqual([n for n, _ in alerts].count('scorer_probe_crashed'), 1, alerts)
         self.assertNotIn('secret-host', repr(alerts) + '\n'.join(logs))
 
     def test_dropped_connection_is_an_outage_not_a_config_alert(self):
@@ -581,8 +586,8 @@ class ReviewFixesRound4(unittest.TestCase):
 
     def test_resolver_errors_keep_a_value_free_class_and_a_working_hint(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ep = Path(tmp) / 'ep.json'; ep.write_text('{"endpoints": {"studio": "http://100.64.0.9:8431"}}')
-            cases = (({'CORTADOS_S1_URL': '100.64.0.9:8431'}, 'not an http(s) URL'),
+            ep = Path(tmp) / 'ep.json'; ep.write_text('{"endpoints": {"studio": "http://192.0.2.9:8431"}}')
+            cases = (({'CORTADOS_S1_URL': '192.0.2.9:8431'}, 'not an http(s) URL'),
                      ({'CORTADOS_S1_ENDPOINTS': str(Path(tmp) / 'missing.json')}, 'does not exist'),
                      ({'CORTADOS_S1_ENDPOINTS': str(ep), 'CORTADOS_S1_ENDPOINT': 'stuido'}, 'not in the endpoints file'))
             for env, cls in cases:
@@ -591,13 +596,14 @@ class ReviewFixesRound4(unittest.TestCase):
                     with self.assertRaises(night.ScorerConfigError) as cm:
                         night.scorer_url()
                     msg = str(cm.exception)
-                    self.assertIn(cls, msg); self.assertNotIn('100.64.0.9', msg); self.assertNotIn('stuido', msg)
+                    self.assertIn(cls, msg); self.assertNotIn('192.0.2.9', msg); self.assertNotIn('stuido', msg)
                     self.assertIn('s1_endpoint.resolve_url()', msg)
-        # the hint is a command that works from the repo root
-        out = subprocess.run([sys.executable, '-c', 'from cortados_router import s1_endpoint; print(s1_endpoint.resolve_url())'],
-                             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
-                             env={k: v for k, v in os.environ.items() if not k.startswith('CORTADOS_S1_')})
-        self.assertEqual(out.returncode, 0, out.stderr); self.assertTrue(out.stdout.startswith('http'))
+            # the hint is a command that works from the repo root
+            out = subprocess.run([sys.executable, '-c', 'from cortados_router import s1_endpoint; print(s1_endpoint.resolve_url())'],
+                                 cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                                 env={**{k: v for k, v in os.environ.items() if not k.startswith('CORTADOS_S1_')},
+                                      'CORTADOS_ROUTER_TABLES': tmp})   # no machine-local s1-endpoints.json decides it
+            self.assertEqual(out.returncode, 0, out.stderr); self.assertTrue(out.stdout.startswith('http'))
 
     def test_unremovable_marker_alerts_once_per_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,6 +620,7 @@ class ReviewFixesRound4(unittest.TestCase):
                     self.assertEqual(night.run_cycle([sys.executable, '-c', 'pass'], g, result_file=rf, poll_s=0,
                                                      sleep=lambda s: None), (0, 'idle'))
             self.assertEqual([n for n, _ in alerts], ['cycle_result_stuck'])
+            self.assertNotIn(tmp, alerts[0][1]); self.assertIn('cannot remove r ', alerts[0][1])   # name only, no path
             self.assertIn("'quota' result is still honoured", '\n'.join(str(c.args[0]) for c in pr.call_args_list))
 
     def test_stop_flag_removed_during_grace_is_still_a_stop(self):
@@ -630,6 +637,24 @@ class ReviewFixesRound4(unittest.TestCase):
                                           stopflag=flag, poll_s=0.05)
             self.assertEqual((rc, sleeps), (130, []))
             self.assertFalse((Path(tmp) / 'r.failures').exists() and (Path(tmp) / 'r.failures').read_text().strip() != '0')
+
+    def test_torn_reply_is_an_outage_not_a_config_error(self):
+        """IncompleteRead/BadStatusLine are HTTPExceptions and NOT OSErrors: a scorer mid-restart is an outage."""
+        for exc in (http.client.IncompleteRead(b'partial'), http.client.BadStatusLine('garbage')):
+            self.assertFalse(isinstance(exc, OSError))   # the OSError arm alone would not catch it
+            with self.subTest(exc=type(exc).__name__), patch('builtins.print') as pr, \
+                    patch.object(night.urllib.request, 'urlopen', side_effect=exc):
+                self.assertIsNone(night.probe_scorer_latency(url='http://127.0.0.1:9/score', timeout=1))
+            self.assertIn('latency unknown', pr.call_args[0][0])
+
+    def test_stop_signals_from_the_probe_still_stop_the_supervisor(self):
+        """main() turns SIGTERM into KeyboardInterrupt; the broad probe catch must be Exception, never BaseException."""
+        for exc in (KeyboardInterrupt, SystemExit):
+            def boom(exc=exc):
+                raise exc
+            g = self._guard(boom, [], [])
+            with self.subTest(exc=exc.__name__), self.assertRaises(exc):
+                g.idle_probe()
 
 
 if __name__ == '__main__':
