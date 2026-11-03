@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import date, timedelta
@@ -292,6 +293,52 @@ class NightlyEndToEnd(unittest.TestCase):
         child.wait(timeout=10)
         self.assertTrue(mark.exists(), "the stopped run handled TERM (it was continued), not SIGKILLed")
         self.assertTrue((self.s1 / "data/nightly.stop").exists())
+
+    def test_stop_continues_a_stopped_grandchild_through_the_group(self):
+        # The supervisor's layout: the run (nightly.sh) leads its own group (start_new_session), a wrapper is its child, and
+        # the SIGSTOPped trainer is the wrapper's child. `pkill -P <run>` reaches only the wrapper; only the group CONT
+        # reaches the trainer. The trainer marks "early" if it resumed while the run was still handling TERM (--stop
+        # continued it) and "late" if it resumed only after the run exited (the kernel CONTs an orphaned stopped group).
+        mark, ready, exiting = self.tmp / "trainer-resumed", self.tmp / "trainer-ready", self.tmp / "run-exiting"
+        trainer = ("import os, signal\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                   f"open({str(ready)!r}, 'w').write(str(os.getpid()))\n"
+                   "os.kill(os.getpid(), signal.SIGSTOP)\n"
+                   f"open({str(mark)!r}, 'w').write('late' if os.path.exists({str(exiting)!r}) else 'early')\n")
+        wrapper = ("import signal, subprocess, sys\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                   f"subprocess.Popen([sys.executable, '-c', {trainer!r}]).wait()\n")
+        run = ("import os, signal, subprocess, sys, time\n"
+               f"subprocess.Popen([sys.executable, '-c', {wrapper!r}])\n"
+               "def term(*a):\n"
+               "    t = time.monotonic() + 5\n"   # give the trainer time to act, as nightly.sh's trap waits for its children
+               f"    while not os.path.exists({str(mark)!r}) and time.monotonic() < t: time.sleep(0.05)\n"
+               f"    open({str(exiting)!r}, 'w').close(); sys.exit(0)\n"
+               "signal.signal(signal.SIGTERM, term)\n"
+               "time.sleep(120)\n")
+        child = subprocess.Popen([sys.executable, "-c", run], start_new_session=True)
+        threading.Thread(target=child.wait, daemon=True).start()   # reap at once: a zombie run would hold --stop's 20 s wait
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", "--", f"-{child.pid}"], capture_output=True))
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(ready.exists(), "trainer started")
+        tpid = ready.read_text().strip()
+        st = ""
+        deadline = time.monotonic() + 5
+        while not st.startswith("T") and time.monotonic() < deadline:
+            st = subprocess.run(["ps", "-o", "stat=", "-p", tpid], capture_output=True, text=True).stdout.strip()
+            time.sleep(0.05)
+        self.assertTrue(st.startswith("T"), f"trainer is stopped: {st!r}")
+        (self.s1 / "data/nightly.pid").write_text(f"{child.pid}\n")
+        out = self._bare("--stop")
+        self.assertIn("stopped nightly", out.stdout)
+        deadline = time.monotonic() + 5
+        while not mark.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(mark.read_text() if mark.exists() else "never", "early",
+                         "--stop's group CONT resumed the stopped grandchild while the run was still alive")
 
     def _supervisor(self, scorer_port, **env):
         """overnight.py --continuous over the real nightly.sh in the temp s1; its probe hits the test's stub scorer, never :8431."""

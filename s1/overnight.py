@@ -23,6 +23,7 @@ import re
 import statistics
 import sys
 import time as _time
+import http.client
 import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -169,8 +170,9 @@ def scorer_url() -> str:
     from cortados_router import s1_endpoint
     try:
         return s1_endpoint.resolve_url().rstrip("/") + "/score"
-    except ValueError as e:   # the resolver's message can quote the URL: redact it and name the setting instead
-        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} does not resolve ({_redact_urls(str(e))})") from e
+    except ValueError:   # the resolver's message repr's the value, scheme-less hosts included: forward none of it
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} does not resolve "
+                                "(run cortados_router/s1_endpoint.py locally for the detail)") from None
 
 
 def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float | None:
@@ -192,6 +194,9 @@ def probe_scorer_latency(url: str | None = None, timeout: float = 30.0) -> float
             raise ScorerRefused(f"scorer refused (HTTP {e.code})") from None
         raise ScorerConfigError(f"scorer probe got HTTP {e.code} from the URL set by {scorer_url_source()}: "
                                 "check CORTADOS_S1_URL/ENDPOINT/TOKEN") from None
+    except http.client.HTTPException:   # e.g. InvalidURL for 'http://host:abc': a setting problem, not an outage
+        raise ScorerConfigError(f"scorer URL from {scorer_url_source()} is malformed "
+                                "(run cortados_router/s1_endpoint.py locally for the detail)") from None
     except OSError as e:
         print(f"overnight: scorer probe failed ({_redact_urls(str(e))}); latency unknown this probe", flush=True)
         return None
@@ -407,10 +412,10 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         result_file.unlink()
     except FileNotFoundError:
         pass
-    except OSError as e:   # a stale marker we cannot remove would be misread as this cycle's: the cycle is read as idle
+    except OSError as e:   # a stale marker we cannot remove would be misread as this cycle's: 'worked' is read as idle
         stale = True
-        print(f"overnight: WARNING: cannot remove stale cycle result {result_file} ({e}); this cycle will be treated as idle",
-              flush=True)
+        print(f"overnight: WARNING: cannot remove stale cycle result {result_file} ({e}); a 'worked' result will be treated "
+              "as idle", flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
                CORTADOS_S1_CYCLE_RESULT=str(result_file))
     guard.new_cycle()
@@ -434,11 +439,14 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 pass
             except OSError as e:
                 print(f"overnight: cannot clear pidfile {pidfile} ({e})", flush=True)
-    if stale:
+    result = _read_result(result_file)
+    if stale and result == "worked":
+        # A stale 'worked' would relaunch at once forever: degrade it to idle. 'quota' is honoured even if stale, because
+        # over-cooling is safe and dropping a real quota stop would relaunch into the exhausted window every idle interval.
         print(f"overnight: WARNING: cycle result {result_file} may be the previous cycle's; treating this cycle as idle",
               flush=True)
         return child.returncode, "idle"
-    return child.returncode, _read_result(result_file)
+    return child.returncode, result
 
 
 def recover_pidfile(pidfile: Path, *, ps=None, signaller=None, alive=None, log=lambda m: print(m, flush=True)) -> None:
@@ -555,9 +563,11 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
         n += 1
         guard.idle_probe()
         rc, result = run_cycle(command, guard, result_file=result_file, poll_s=poll_s, sleep=sleep, pidfile=pidfile)
-        if rc == 130:
+        if rc == 130 and (stopflag is None or stopflag.exists()):
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
+        if rc == 130:   # TERM from someone other than --stop (e.g. pkill -f nightly.sh): a hand-run supervisor must survive it
+            print(f"overnight: cycle {n} ended 130 without a stop flag (external TERM); treating as a failure", flush=True)
         delay, failures = next_delay(rc, result, idle_s, failures, quota_s)
         _save_failures(result_file, failures)
         what = f"failure #{failures}, backing off" if rc else {"worked": "worked", "quota": "quota stop, cooling down"}.get(

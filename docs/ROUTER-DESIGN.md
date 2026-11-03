@@ -347,7 +347,7 @@ evaluation/promotion was attempted) or `quota` (label.py stopped at the Claude h
 | `CORTADOS_S1_PROBE_S` | 30 | seconds between scorer latency probes |
 | `CORTADOS_S1_MAX_PAUSE_S` | 1800 | longest pause (min 60); past it the tree is resumed and `guard_forced_resume` alerts |
 | `CORTADOS_S1_RELEASE_HOLD_S` | = max pause | after a forced resume, no re-pause for this long (min 60): training runs at least as long as it was held, so a persistent 503 / low memory gives ~50% running instead of ~1% |
-| `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle |
+| `CORTADOS_S1_CYCLE_IDLE_S` | 900 | sleep after an idle cycle (min 60) |
 | `CORTADOS_S1_QUOTA_COOLDOWN_S` | 18000 | sleep after a `quota` cycle (min 60) |
 | `CORTADOS_S1_MIN_LEFT_PCT` | 15 | label.py per-account quota floor, 0-100 (invalid → logged, 15) |
 | `CORTADOS_S1_BENCH_REFRESH_S` | 86400 | benchmark/tiers refresh at most this often (a future-dated stamp counts as due) |

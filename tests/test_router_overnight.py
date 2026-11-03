@@ -76,6 +76,81 @@ class Overnight(unittest.TestCase):
             self.assertIn('PLAN 2500 1100',plan())
 
 
+class ReviewFixesRound3(unittest.TestCase):
+    """Scheme-less scorer URL never quoted, stale quota honoured, external TERM backs off, malformed URL is a config error."""
+
+    def _guard(self, latency, logs, alerts):
+        return night.Guard(latency=latency, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0, max_pause_s=1800,
+                           log=logs.append, alerter=lambda n, d: alerts.append(d))
+
+    def test_scheme_less_scorer_url_never_in_exception_log_or_alert(self):
+        for value, host in (('100.64.0.9:8431', '100.64.0.9'), ('studio.example.ts.net:8431', 'studio.example.ts.net')):
+            with self.subTest(value=value), patch.dict(os.environ, {'CORTADOS_S1_URL': value}):
+                with self.assertRaises(night.ScorerConfigError) as cm:
+                    night.scorer_url()
+                self.assertNotIn(host, str(cm.exception)); self.assertIn('CORTADOS_S1_URL', str(cm.exception))
+                logs, alerts = [], []
+                with patch('builtins.print') as pr:
+                    g = self._guard(lambda: night.probe_scorer_latency(timeout=1), logs, alerts)
+                    g.idle_probe()
+                printed = '\n'.join(str(c.args[0]) for c in pr.call_args_list if c.args)
+                text = '\n'.join(logs + alerts) + printed
+                self.assertTrue(alerts, 'the config error is alerted')
+                self.assertNotIn(host, text); self.assertNotIn('8431', text)
+
+    def test_malformed_url_is_a_config_error_not_a_crash(self):
+        logs, alerts = [], []
+        with patch.dict(os.environ, {'CORTADOS_S1_URL': 'http://100.64.0.9:abc'}):
+            with self.assertRaises(night.ScorerConfigError) as cm:
+                night.probe_scorer_latency(url='http://100.64.0.9:abc/score', timeout=1)
+            self.assertNotIn('100.64.0.9', str(cm.exception))
+            g = self._guard(lambda: night.probe_scorer_latency(url='http://100.64.0.9:abc/score', timeout=1), logs, alerts)
+            g.idle_probe()   # must not raise
+        self.assertEqual(len(alerts), 1); self.assertNotIn('100.64.0.9', '\n'.join(logs + alerts))
+
+    def _stale(self, marker):
+        with tempfile.TemporaryDirectory() as tmp:
+            rf = Path(tmp) / 'r'; rf.write_text(marker + '\n')
+            g = self._guard(lambda: 1.0, [], [])
+            real_unlink = Path.unlink
+            def unlink(self, *a, **k):
+                if self == rf:
+                    raise PermissionError(13, 'Permission denied')
+                return real_unlink(self, *a, **k)
+            with patch.object(Path, 'unlink', unlink), patch('builtins.print'):
+                return night.run_cycle([sys.executable, '-c', 'pass'], g, result_file=rf, poll_s=0, sleep=lambda s: None)
+
+    def test_stale_quota_marker_still_cools_down(self):
+        self.assertEqual(self._stale('quota'), (0, 'quota'))
+        self.assertEqual(self._stale('worked'), (0, 'idle'))
+
+    def test_rc_130_without_stop_flag_backs_off_instead_of_exiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = Path(tmp) / 'nightly.stop'
+            def loop(outcomes):
+                it = iter(outcomes); sleeps = []
+                g = self._guard(lambda: 1.0, [], [])
+                with patch.object(night, 'run_cycle', side_effect=lambda *a, **k: next(it)), patch('builtins.print') as pr:
+                    rc = night.run_continuous(['x'], g, result_file=Path(tmp) / 'r', idle_s=900, sleep=sleeps.append,
+                                              cycles=len(outcomes), stopflag=flag)
+                return rc, sleeps, '\n'.join(str(c.args[0]) for c in pr.call_args_list if c.args)
+            rc, sleeps, out = loop([(130, 'idle'), (0, 'worked')])
+            self.assertEqual((rc, sleeps), (0, [900])); self.assertIn('external TERM', out)
+            flag.touch()
+            rc, sleeps, out = loop([(130, 'idle'), (0, 'worked')])
+            # the flag is checked before the first cycle too, so set it mid-run: simulate --stop during cycle 1
+            self.assertEqual(rc, 0)
+            flag.unlink()
+            calls = iter([(130, 'idle'), (0, 'worked')])
+            def cycle(*a, **k):
+                flag.touch(); return next(calls)
+            g = self._guard(lambda: 1.0, [], [])
+            with patch.object(night, 'run_cycle', side_effect=cycle), patch('builtins.print'):
+                rc = night.run_continuous(['x'], g, result_file=Path(tmp) / 'r2', idle_s=900, sleep=lambda s: None,
+                                          cycles=2, stopflag=flag)
+            self.assertEqual(rc, 130)
+
+
 if __name__ == '__main__':unittest.main()
 
 
@@ -363,8 +438,9 @@ class ReviewFixesRound2(unittest.TestCase):
     def test_release_hold_env_default_and_minimum(self):
         mk = lambda: night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, max_pause_s=900, log=lambda m: None,
                                  alerter=lambda n, d: None)
-        os.environ.pop('CORTADOS_S1_RELEASE_HOLD_S', None)
-        self.assertEqual(mk().release_hold, 900)
+        with patch.dict(os.environ):   # restored on exit: the key's absence must not leak into later tests
+            os.environ.pop('CORTADOS_S1_RELEASE_HOLD_S', None)
+            self.assertEqual(mk().release_hold, 900)
         with patch.dict(os.environ, {'CORTADOS_S1_RELEASE_HOLD_S': '30'}), patch('builtins.print'):
             self.assertEqual(mk().release_hold, 900)   # below the 60 s minimum: the default
         with patch.dict(os.environ, {'CORTADOS_S1_RELEASE_HOLD_S': '120'}):
