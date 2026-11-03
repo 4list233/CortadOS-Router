@@ -92,14 +92,7 @@ CHILD_TOOLS = [
      "description": "State of a child task (running/succeeded/failed/cancelled), elapsed time, models used, and the final "
                     "result text when done (bounded; the full log path is included).",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
-    {"name": "wait_task",
-     "description": "Block until a child task ends or timeout_s passes (default and max 50 s: the Claude desktop app "
-                    "times MCP requests out at 60 s; CORTADOS_WAIT_MAX_S raises the cap for other clients), then "
-                    "return what task_status returns. If the result says state 'running', the task is not done: "
-                    "call wait_task again to keep waiting.",
-     "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"},
-                                                      "timeout_s": {"type": "number", "description": "0-50 (or CORTADOS_WAIT_MAX_S), default the max"}},
-                     "required": ["task_id"]}},
+    {"name": "wait_task"},              # built at tools/list time by _wait_task_tool(): its cap comes from the env
     {"name": "list_tasks",
      "description": "Most recent child tasks, newest first, with state and a short preview.",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "1-200, default 20"}}}},
@@ -108,6 +101,35 @@ CHILD_TOOLS = [
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
 ]
 _CHILD_NAMES = {t["name"] for t in CHILD_TOOLS}
+
+
+def _wait_task_tool() -> dict:
+    """The wait_task entry with the cap in force now (CORTADOS_WAIT_MAX_S, or the 50 s default) interpolated. A bad
+    CORTADOS_WAIT_MAX_S is named in the description; wait_task itself then fails with the same error."""
+    try:
+        ct = _child_module()
+        default = f"{ct.WAIT_MAX_S:g}"
+        try:
+            cap, bad = f"{ct.wait_max_s():g}", ""
+        except ct.TaskError as exc:
+            cap, bad = default, f" Misconfigured: {exc}; wait_task returns this error until it is fixed."
+    except ImportError:
+        cap = default = "50"
+        bad = ""
+    dflt = default if float(default) <= float(cap) else cap
+    return {"name": "wait_task",
+            "description": f"Block until a child task ends or timeout_s passes (default {dflt} s, max {cap} s: the "
+                           "Claude desktop app times MCP requests out at 60 s; CORTADOS_WAIT_MAX_S raises the cap for "
+                           "other clients), then return what task_status returns. If the result says state "
+                           "'running', the task is not done: call wait_task again to keep waiting." + bad,
+            "inputSchema": {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "timeout_s": {"type": "number", "description": f"0-{cap}, default {dflt}"}},
+                "required": ["task_id"]}}
+
+
+def _child_tools() -> list:
+    return [_wait_task_tool() if t["name"] == "wait_task" else t for t in CHILD_TOOLS]
 
 
 def _child_module():
@@ -150,7 +172,7 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
             out = ct.wait(a.get("task_id"), a.get("timeout_s"), red, provider_url=cfg.get("url", ""),
-                          token=token, max_s=ct.wait_max_s())
+                          token=token)              # wait() reads the cap via wait_max_s(); a bad one is a TaskError
         elif name == "list_tasks":
             out = {"tasks": ct.list_recent(a.get("limit", 20))}
         else:
@@ -274,7 +296,7 @@ def handle(msg: dict, cfg: dict) -> dict | None:
         return {**base, "result": {"protocolVersion": version, "capabilities": {"tools": {}},
                                     "serverInfo": {"name": "cortados-route", "version": "0"}}}
     if method == "tools/list":
-        return {**base, "result": {"tools": [TOOL] + CHILD_TOOLS}}
+        return {**base, "result": {"tools": [TOOL] + _child_tools()}}
     if method == "tools/call":
         a = params.get("arguments")
         if not isinstance(a, dict):

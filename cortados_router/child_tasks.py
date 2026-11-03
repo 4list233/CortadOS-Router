@@ -102,20 +102,34 @@ LOGS_WITHHELD_NOTE = ("logs withheld: the runner died before redaction, and the 
                       "credential and must not be read or shared.")
 LOG_TAIL_CHARS = 2_000              # stderr tail shown on failure
 # The Claude desktop app's Code session times every MCP request out at 60 s (observed 2026-11-03: "Request timed out"
-# at ~61 s on wait_task calls), so a wait defaults to and is capped at 50 s. Clients with a longer request timeout can
-# raise the cap with CORTADOS_WAIT_MAX_S (read by subagent_mcp.py via wait_max_s()).
-WAIT_MAX_S = 50
+# at ~61 s on wait_task calls). The reply must land before that, end to end: the polling loop AND the status() work
+# after it (a crashed child's recovery: RECOVERY_GRACE_S + a ps call; the run-record fetch, which shrinks to what is
+# left of the deadline, min 1 s). POST_WAIT_RESERVE_S covers that work plus a margin, so the default wait is 50 s.
+# Clients with a longer request timeout raise the cap with CORTADOS_WAIT_MAX_S (read via wait_max_s()).
+CLIENT_REQUEST_TIMEOUT_S = 60
+POST_WAIT_RESERVE_S = 10            # recovery (5 s grace + ps) + >= 1 s run fetch + slack for disk and JSON-RPC
+WAIT_MAX_S = CLIENT_REQUEST_TIMEOUT_S - POST_WAIT_RESERVE_S
+# No MCP client the router serves holds a request open for an hour; a larger value is almost surely a unit slip
+# (milliseconds), and taking it would let one wait_task call block its client far past any request timeout.
 WAIT_MAX_S_CEILING = 3600
+RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not worth starting short of zero
 
 
 def wait_max_s(env=None) -> float:
-    """The wait cap: CORTADOS_WAIT_MAX_S when it is a number in (0, 3600], else WAIT_MAX_S."""
-    raw = (os.environ if env is None else env).get("CORTADOS_WAIT_MAX_S", "")
+    """The wait cap: WAIT_MAX_S, or CORTADOS_WAIT_MAX_S when set. A set value that is not a number of seconds in
+    (0, WAIT_MAX_S_CEILING] raises TaskError (like CORTADOS_CHILD_MAX_S): a typo must not silently become 50 s."""
+    raw = (os.environ if env is None else env).get("CORTADOS_WAIT_MAX_S")
+    if raw is None or raw.strip() == "":
+        return float(WAIT_MAX_S)
     try:
         v = float(raw)
-    except (TypeError, ValueError):
-        return WAIT_MAX_S
-    return v if 0 < v <= WAIT_MAX_S_CEILING else WAIT_MAX_S
+    except ValueError:
+        raise TaskError(f"CORTADOS_WAIT_MAX_S={raw!r} is not a number of seconds") from None
+    if v != v or not 0 < v <= WAIT_MAX_S_CEILING:
+        raise TaskError(f"CORTADOS_WAIT_MAX_S={raw!r} must be more than 0 and at most {WAIT_MAX_S_CEILING} seconds")
+    return v
+
+
 NESTED_ENV = "CORTADOS_CHILD_TASK"  # set in every child: a child may not start children (runaway quota fan-out)
 # Claude Code refuses to start inside another Claude Code session when it sees this; the child is a fresh session.
 STRIP_ENV = ("CLAUDECODE",)
@@ -399,7 +413,7 @@ def log_event(event: str, **fields):
     return None
 
 
-def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
+def fetch_run(provider_url: str, token: str, run_id: str, timeout_s: float = RUN_FETCH_TIMEOUT_S) -> dict:
     """The provider's record of this run (GET /v1/cortados/runs/<id>): models and lanes it routed to. Failures come back
     as {"error": ...}, never raised; the token never appears in the text."""
     scrub = (lambda s: s.replace(token, "***")) if token else (lambda s: s)
@@ -408,7 +422,7 @@ def fetch_run(provider_url: str, token: str, run_id: str) -> dict:
     req = urllib.request.Request(provider_url.rstrip("/") + "/v1/cortados/runs/" + run_id, method="GET",
                                  headers={"x-api-key": token})
     try:
-        with _urlopen(req, timeout=RUN_FETCH_TIMEOUT_S) as resp:
+        with _urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return {"error": f"provider returned HTTP {exc.code}" + (" (no routed request recorded under this run id)"
@@ -817,7 +831,9 @@ def _release_recovered_logs(d: str, meta: dict, res: dict, red: "Redactor") -> b
     return True
 
 
-def status(task_id, red=None, provider_url="", token="") -> dict:
+def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
+    """deadline (time.monotonic()) bounds the run-record fetch: its timeout shrinks to what is left, min
+    RUN_FETCH_MIN_S, so wait_task's reply lands inside the client's request timeout."""
     red = red or Redactor((token,) if token else ())
     d = task_path(task_id)
     state, meta, res = _state(d)
@@ -866,7 +882,7 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
         # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
         out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
-                             else fetch_run(provider_url, token, task_id))
+                             else fetch_run(provider_url, token, task_id, _fetch_timeout(deadline)))
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
         # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
@@ -944,22 +960,36 @@ def _activity(out: dict, o: dict, act, meta: dict) -> list:
     return warnings
 
 
+def _fetch_timeout(deadline) -> float:
+    if deadline is None:
+        return RUN_FETCH_TIMEOUT_S
+    return max(RUN_FETCH_MIN_S, min(RUN_FETCH_TIMEOUT_S, deadline - time.monotonic()))
+
+
 def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="", max_s=None) -> dict:
-    cap = WAIT_MAX_S if max_s is None else max_s
-    if timeout_s is None:
-        timeout_s = cap
+    """Poll for up to timeout_s, then status(). End to end the call takes at most timeout_s + POST_WAIT_RESERVE_S
+    (the status() work after the loop is bounded by the same deadline), under CLIENT_REQUEST_TIMEOUT_S at the default."""
+    start = time.monotonic()
     try:
-        t = float(timeout_s)
+        cap = wait_max_s() if max_s is None else float(max_s)
+    except (TypeError, ValueError):
+        raise TaskError("max_s must be a number of seconds") from None
+    if cap != cap or cap <= 0:
+        raise TaskError("max_s must be a positive number of seconds")
+    try:
+        t = float(min(WAIT_MAX_S, cap) if timeout_s is None else timeout_s)
     except (TypeError, ValueError):
         raise TaskError("timeout_s must be a number of seconds") from None
     if t != t or t < 0 or t > cap:
         raise TaskError(f"timeout_s must be between 0 and {cap:g} (MCP clients time out longer tool calls); "
                         "call wait_task again to keep waiting")
     d = task_path(task_id)
-    end = time.monotonic() + t
-    while _state(d)[0] == "running" and time.monotonic() < end:
-        time.sleep(poll_s)
-    out = status(task_id, red, provider_url, token)
+    end = start + t
+    while time.monotonic() < end and _state(d)[0] == "running":     # deadline first: no state read past it
+        time.sleep(max(0.0, min(poll_s, end - time.monotonic())))
+    # The fetch gets what the reserve leaves after a possible recovery (RECOVERY_GRACE_S): at most ~5 s past the loop,
+    # or RUN_FETCH_MIN_S after a recovery that used its grace. Worst case ~t + 6 s + a ps call, under t + reserve.
+    out = status(task_id, red, provider_url, token, deadline=end + POST_WAIT_RESERVE_S - RECOVERY_GRACE_S)
     if out.get("state") == "running":
         out["wait_ended"] = (f"waited {t:g} s; the task is still running: call wait_task again to keep waiting "
                              "(or task_status to poll)")

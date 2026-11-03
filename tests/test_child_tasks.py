@@ -1679,23 +1679,82 @@ class ChildTaskTests(unittest.TestCase):
 
     def test_wait_cap_env_override(self):
         self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": "300"}), 300)
-        for bad in ("", "abc", "0", "-5", "99999", "nan"):
-            self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": bad}), 50)
+        self.assertEqual(ct.wait_max_s({"CORTADOS_WAIT_MAX_S": ""}), 50)
+        self.assertEqual(ct.wait_max_s({}), 50)
+        for bad in ("abc", "50s", "0", "-5", "5000", "99999", "nan"):
+            with self.assertRaises(ct.TaskError, msg=bad):
+                ct.wait_max_s({"CORTADOS_WAIT_MAX_S": bad})
         with self.assertRaises(ct.TaskError):
             ct.wait("t20261102000000-0000000a", 120, max_s=50)
+        for bad in (float("nan"), 0, -1, "x"):
+            with self.assertRaises(ct.TaskError, msg=repr(bad)):
+                ct.wait("t20261102000000-0000000a", 1, max_s=bad)
+
+    def test_wait_bad_env_cap_is_a_clear_tool_error(self):
+        os.environ["CORTADOS_WAIT_MAX_S"] = "50s"
+        r, _ = self.call("wait_task", task_id="t20261102000000-0000000a", timeout_s=1)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("CORTADOS_WAIT_MAX_S='50s'", r["content"][0]["text"])
+
+    def test_wait_default_honours_the_override(self):
+        # default = min(WAIT_MAX_S, cap): a lower cap lowers the default, a higher cap does not raise it
+        seen = []
+        with mock.patch.object(ct, "_state", lambda d: ("running", {}, {})), \
+                mock.patch.object(ct, "task_path", lambda tid: "/nonexistent"), \
+                mock.patch.object(ct, "status", lambda *a, **k: {"state": "running"}), \
+                mock.patch.object(ct.time, "sleep", lambda s: seen.append(s)):
+            with mock.patch.dict(os.environ, {"CORTADOS_WAIT_MAX_S": "0.05"}):
+                out = ct.wait("t20261102000000-0000000a", poll_s=0.01)
+            self.assertIn("waited 0.05 s", out["wait_ended"])
+            with mock.patch.dict(os.environ, {"CORTADOS_WAIT_MAX_S": "300"}):
+                with mock.patch.object(ct, "WAIT_MAX_S", 0.02):
+                    out = ct.wait("t20261102000000-0000000a", poll_s=0.01)
+            self.assertIn("waited 0.02 s", out["wait_ended"])
+
+    def test_tools_list_shows_the_wait_cap_in_force(self):
+        def wait_entry():
+            r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.cfg)
+            return next(t for t in r["result"]["tools"] if t["name"] == "wait_task")
+        os.environ.pop("CORTADOS_WAIT_MAX_S", None)
+        self.assertIn("0-50", wait_entry()["inputSchema"]["properties"]["timeout_s"]["description"])
+        os.environ["CORTADOS_WAIT_MAX_S"] = "300"
+        w = wait_entry()
+        self.assertIn("0-300, default 50", w["inputSchema"]["properties"]["timeout_s"]["description"])
+        self.assertIn("max 300 s", w["description"])
 
     def test_wait_still_running_says_call_again(self):
-        orig = ct.status
-        ct.status = lambda *a, **k: {"task_id": a[0], "state": "running"}
-        orig_state, orig_path = ct._state, ct.task_path
-        ct._state = lambda d: ("running", {}, {})
-        ct.task_path = lambda tid: "/nonexistent"
-        try:
-            out = ct.wait("t20261102000000-0000000a", 0.05, poll_s=0.01)
-        finally:
-            ct.status, ct._state, ct.task_path = orig, orig_state, orig_path
+        # a real sleeping fake child through the MCP call path
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start()
+        r, out = self.call("wait_task", task_id=tid, timeout_s=0.1)
+        self.assertFalse(r.get("isError"), r)
         self.assertEqual(out["state"], "running")
         self.assertIn("call wait_task again", out["wait_ended"])
+        self.call("cancel_task", task_id=tid)
+        self.call("wait_task", task_id=tid, timeout_s=30)
+
+    def test_wait_reply_lands_inside_the_client_budget_when_the_fetch_hangs(self):
+        # P1: a finished task's run-record fetch hanging must not push the reply past the client's 60 s timeout;
+        # the fetch timeout shrinks to what is left of the deadline (min RUN_FETCH_MIN_S).
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)        # let it finish
+        timeouts = []
+
+        def hanging(req, timeout=None):
+            timeouts.append(timeout)
+            time.sleep(timeout)
+            raise urllib.error.URLError("timed out")
+        with mock.patch.object(ct, "_urlopen", hanging), mock.patch.object(ct, "POST_WAIT_RESERVE_S", 6.5):
+            t0 = time.monotonic()
+            r, out = self.call("wait_task", task_id=tid, timeout_s=0.5)
+            elapsed = time.monotonic() - t0
+        self.assertFalse(r.get("isError"), r)
+        self.assertNotEqual(out["state"], "running")
+        self.assertIn("error", out["router_run"])
+        # budget: timeout_s 0.5 + reserve 6.5 = 7 s; the fetch gets end + reserve - recovery grace = ~2 s from now
+        self.assertLessEqual(timeouts[0], 2.0 + 0.01)
+        self.assertLess(elapsed, 0.5 + 6.5)
+        self.assertLess(elapsed, 3.0)                              # the unbounded fetch would have taken 10 s
 
     def test_unconfigured_url(self):
         self.cfg["url"] = ""
