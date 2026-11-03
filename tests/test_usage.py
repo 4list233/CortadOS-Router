@@ -1,6 +1,7 @@
 """GET /v1/cortados/usage: auth, each section from fixtures, missing sources in errors, stale scarcity flagged."""
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -32,11 +33,15 @@ SCARCITY = {"fetched_at": NOW - 60, "lanes": {
         {**_wv("month (included, both pools)", 70.0, NOW + 10 * 86400, 30.4 * 86400, now=NOW), "pool": "info"},
         {**_wv("month (Cursor models: Grok, Composer, Auto)", 30.0, NOW + 10 * 86400, 30.4 * 86400, now=NOW), "pool": "cursor-models"},
         {**_wv("month (other models: Claude, GPT, Gemini …)", 60.0, NOW + 10 * 86400, 30.4 * 86400, now=NOW), "pool": "other-models"}]},
+    "codex#b": {"fetched_at": NOW - 60, "tried_at": NOW - 10, "error": "RuntimeError: screen refused", "error_kind": "parse",
+                "windows": [{**_wv("weekly", 10.0, NOW + 86400, 7 * 86400, now=NOW), "pool": "all"}]},
     "broken": {"fetched_at": "not-a-number", "windows": []}}}
+_TMP: list = []
 
 
 def fixture_home() -> Path:
     d = Path(tempfile.mkdtemp())
+    _TMP.append(d)
     c = sqlite3.connect(d / "router.db")
     c.execute("CREATE TABLE routes (turn_id TEXT, ts REAL, lane TEXT, model TEXT, band TEXT)")
     c.executemany("INSERT INTO routes VALUES (?,?,?,?,?)", [
@@ -47,8 +52,21 @@ def fixture_home() -> Path:
         {"ts": NOW - 100, "event": "started", "task_id": "t1"}, {"ts": NOW - 50, "event": "finished", "status": "succeeded", "task_id": "t1"},
         {"ts": NOW - 40, "event": "started", "task_id": "t2"}]) + "\nnot json\n")
     (d / "hardware").mkdir()
-    (d / "hardware" / "studio.json").write_text(json.dumps({"host": "studio", "memory": {"free_gb": 40}}))
+    (d / "hardware" / "studio.json").write_text(json.dumps({
+        "host": "studio", "ncpu": 24, "mem_available_bytes": 1 << 30, "ssh_target": "forest@100.64.0.9",
+        "ollama_models": [{"name": "qwen", "size": 1, "size_vram": 1, "digest": "abc", "path": "/Users/someone/m"}],
+        "errors": [{"type": "OSError", "kind": "gpu", "message": "/Users/someone/x denied"}]}))
     return d
+
+
+def tearDownModule():
+    for d in _TMP:
+        for p in [d, *d.rglob("*")]:
+            try:
+                os.chmod(p, 0o700)
+            except OSError:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
 
 
 class CollectTest(unittest.TestCase):
@@ -79,7 +97,9 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(cur["label"], "cursor (shared with Grok Bot)")
         self.assertEqual(cur["pools"], {"cursor-models": 70.0, "other-models": 40.0})
         self.assertIn("error", lanes["broken"])                      # one bad lane does not erase the section
-        self.assertEqual(len(lanes), 5)
+        self.assertEqual(len(lanes), 6)
+        self.assertTrue(lanes["broken"]["stale"]); self.assertIsNone(lanes["broken"]["left_pct"])
+        self.assertEqual(lanes["broken"]["windows"], [])
         self.assertTrue(lanes["codex"]["stale"])                     # 7 h old > 6 h routing freshness
         self.assertEqual(out["routed"]["today"], [{"lane": "claude", "model": "sonnet", "calls": 2}])
         self.assertEqual(len(out["routed"]["last_7d"]), 2)
@@ -90,23 +110,79 @@ class CollectTest(unittest.TestCase):
         self.assertFalse(out["child_tasks"]["truncated"])
         self.assertEqual(out["child_tasks"]["unparsable_lines"], 1)
         self.assertTrue(out["s1"]["available"])
-        self.assertEqual(out["hardware"][0]["data"]["host"], "studio")
+        hw = out["hardware"][0]["data"]
+        self.assertEqual(hw["host"], "studio"); self.assertNotIn("ssh_target", hw)
+        self.assertEqual(hw["ollama_models"], [{"name": "qwen", "size": 1, "size_vram": 1}])
+        self.assertEqual(hw["errors"], [{"type": "OSError", "kind": "gpu"}])
         self.assertEqual(out["errors"], [])
 
     def test_missing_sources_reported(self):
         def boom():
             raise OSError("no cache")
-        out = self.collect(Path(tempfile.mkdtemp()), scarcity_reader=boom,
+        empty = Path(tempfile.mkdtemp()); _TMP.append(empty)
+        out = self.collect(empty, scarcity_reader=boom,
                            s1_probe=lambda url: {"available": False, "reason": "no S1 URL configured"})
         srcs = {e["source"] for e in out["errors"]}
         self.assertEqual(srcs, {"scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware"})
         self.assertEqual(out["hardware"], [])
         self.assertEqual(out["lanes"], [])
+        self.assertIn({"source": "scarcity", "error": "OSError"}, out["errors"])   # type only, no message text
 
     def test_no_paths_or_vendor_text_leak(self):
         blob = json.dumps(self.collect(fixture_home()))
         self.assertNotIn("/Users/", blob); self.assertNotIn(str(Path.home()), blob)
-        self.assertNotIn("example.com", blob)
+        self.assertNotIn("example.com", blob); self.assertNotIn("100.64.", blob); self.assertNotIn("digest", blob)
+
+    def test_freshness_rule_marks_failed_retry_stale(self):
+        lanes = {l["lane"]: l for l in self.collect(fixture_home(), freshness=scarcity.reading_freshness)["lanes"]}
+        self.assertTrue(lanes["codex#b"]["stale"])                   # error + tried_at > fetched_at: stale at once
+        self.assertFalse(lanes["claude"]["stale"])
+
+    def test_window_name_capped(self):
+        long = {"lanes": {"claude": {"fetched_at": NOW, "windows": [{**_wv("week (" + "x" * 500 + ")", 1.0, NOW + 9, 9, now=NOW)}]}}}
+        w = self.collect(fixture_home(), scarcity_reader=lambda: long)["lanes"][0]["windows"][0]["window"]
+        self.assertEqual(len(w), usage.WINDOW_NAME_MAX)
+
+    def test_bad_ts_counted_not_section_erased(self):
+        home = fixture_home()
+        with (home / "child-tasks.jsonl").open("a") as f:
+            f.write(json.dumps({"ts": "soon", "event": "started", "task_id": "z"}) + "\n")
+        out = self.collect(home)
+        self.assertEqual(out["child_tasks"]["unparsable_lines"], 2)
+        self.assertEqual(out["child_tasks"]["by_event"], {"finished": 1, "started": 1})
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads mode-000 files")
+    def test_unreadable_sources_report_type_only(self):
+        home = fixture_home()
+        os.chmod(home / "child-tasks.jsonl", 0)
+        os.chmod(home / "router.db", 0)
+        os.chmod(home / "hardware", 0)
+        with self.assertLogs("cortados.provider.usage", "WARNING"):
+            out = self.collect(home)
+        errs = {e["source"]: e["error"] for e in out["errors"]}
+        self.assertEqual(errs["child-tasks.jsonl"], "PermissionError")
+        self.assertEqual(errs["hardware"], "PermissionError")              # an unlistable dir is reported, not []
+        self.assertIn("router.db", errs)
+        self.assertEqual(out["hardware"], [])
+        blob = json.dumps(out)
+        self.assertNotIn("/Users/", blob); self.assertNotIn(str(Path.home()), blob); self.assertNotIn(str(home), blob)
+
+    def test_hardware_bounded(self):
+        home = fixture_home()
+        (home / "hardware" / "huge.json").write_bytes(b" " * (usage.HW_MAX_BYTES + 1))
+        out = self.collect(home)
+        self.assertIn({"source": "hardware/huge.json", "error": "oversize"}, out["errors"])
+        self.assertEqual([h["file"] for h in out["hardware"]], ["studio.json"])
+        keep = usage.HW_MAX_FILES
+        usage.HW_MAX_FILES = 1
+        try:
+            (home / "hardware" / "huge.json").unlink()
+            (home / "hardware" / "z.json").write_text("{}")
+            out = self.collect(home)
+        finally:
+            usage.HW_MAX_FILES = keep
+        self.assertIn({"source": "hardware", "error": "too_many_files"}, out["errors"])
+        self.assertEqual(len(out["hardware"]), 1)
 
     def test_child_tail_read_is_bounded(self):
         home = fixture_home()

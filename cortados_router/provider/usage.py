@@ -6,6 +6,8 @@ one short S1 health call. A source that fails is named in `errors`; nothing fall
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -19,15 +21,31 @@ S1_TIMEOUT_S = 1.5            # a dashboard GET must not hang on an unreachable 
 S1_CACHE_S = 10.0             # a 1 Hz dashboard must not add 1 req/s (and up to 1.5 s per GET) to the scorer
 CHILD_TAIL = 5000             # recent child-task events parsed (the log only grows and is never rotated)
 CHILD_TAIL_BYTES = 2 << 20    # ... and bytes read from its end: the read itself is bounded, not only the parse
+HW_MAX_BYTES = 64 << 10       # one node sample is ~1-2 KB; a larger file is not a sample and is never read into memory
+HW_MAX_FILES = 32             # one file per node; the fleet is a handful of machines, so more means a stray directory
+WINDOW_NAME_MAX = 60          # window names are captured vendor screen text, bounded only by the sampler's regex
+COLLECT_CACHE_S = 2.0         # a 1 Hz dashboard re-scans router.db and re-parses the child log at most every 2 s
+DB_TIMEOUT_S = 0.5            # a dashboard GET must not wait on a router.db writer holding the lock
+BAND_TOP = 5                  # the dashboard shows the five busiest bands; the rest are noise at this size
+S1_BODY_MAX = 4096            # /health is a tiny JSON; only its status is used, the body is drained, bounded
 
 # The keys scarcity.window_view writes (plus the pool/stale stamps the samplers add): the only ones passed through.
 _WIN_KEYS = ("window", "pool", "used_pct", "headroom_pct", "resets_at", "reset_epoch", "resets_in_h", "scarcity",
              "expiring_pct", "stale")
 # Lanes without general (pool "all") windows are headlined by this pool: the same fallback scarcity.finish routes on.
+# The fields the node hardware sampler writes (local_resources' per-node sample, saved as hardware/<host>.json): the
+# only ones passed through, so an unexpected key (an SSH target, a tailnet address) never reaches the dashboard JSON.
+_HW_KEYS = ("host", "chip", "os", "ncpu", "cpu_busy_pct", "gpu_busy_pct", "mem_total_bytes", "mem_available_bytes",
+            "load_avg", "headroom", "sampled_at", "schema")
+_HW_MODEL_KEYS = ("name", "size", "size_vram")
+_HW_ERR_KEYS = ("type", "kind")
 _FALLBACK_POOL = {"cursor": "cursor-models", "antigravity": "gemini"}
 # Pools a lane shares with another product (Forest 2026-11-03, docs.x.ai/grok-bot: Cursor and Grok Bot draw on one
 # weekly pool), so a dashboard reading "cursor" knows the headroom is not Cursor's alone.
 SHARED_WITH = {"cursor": ["Grok Bot"]}
+
+
+logger = logging.getLogger("cortados.provider.usage")
 
 
 def _lane_label(lane: str) -> str:
@@ -44,6 +62,8 @@ def _one_lane(lane: str, v: dict[str, Any], now: float, freshness: Callable | No
         fresh, failed = 0 <= now - fetched < STALE_AFTER_S, False
     wins = [{k: w.get(k) for k in _WIN_KEYS if k in w} for w in (v.get("windows") or []) if isinstance(w, dict)]
     for w in wins:
+        if isinstance(w.get("window"), str):
+            w["window"] = w["window"][:WINDOW_NAME_MAX]
         if isinstance(w.get("headroom_pct"), (int, float)):
             w["left_pct"] = float(w["headroom_pct"])
         elif isinstance(w.get("used_pct"), (int, float)):
@@ -80,12 +100,15 @@ def _lanes(scarcity: dict[str, Any], now: float, freshness: Callable | None) -> 
         try:                    # one malformed lane is reported on its own, not by erasing the whole section
             out.append(_one_lane(lane, v, now, freshness))
         except Exception as exc:
-            out.append({"lane": lane, "error": f"{type(exc).__name__}"})
+            # same shape as a good entry, flagged stale with no reading, so a dashboard never renders it healthy
+            out.append({"lane": lane, "label": _lane_label(lane), "account": lane.split("#", 1)[1] if "#" in lane else None,
+                        "left_pct": None, "windows": [], "pools": {}, "sample_age_s": None, "stale": True,
+                        "error": type(exc).__name__})
     return out
 
 
 def _routed(db_path: Path, now: float) -> dict[str, Any]:
-    c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+    c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
     try:
         day0 = time.mktime(  # local midnight
             time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
@@ -93,8 +116,8 @@ def _routed(db_path: Path, now: float) -> dict[str, Any]:
             rows = c.execute("SELECT lane, model, COUNT(*) FROM routes WHERE ts >= ? GROUP BY lane, model "
                              "ORDER BY 3 DESC", (since,)).fetchall()
             return [{"lane": l, "model": m, "calls": n} for l, m, n in rows]
-        bands = c.execute("SELECT band, COUNT(*) FROM routes WHERE ts >= ? GROUP BY band ORDER BY 2 DESC LIMIT 5",
-                          (now - 7 * 86400,)).fetchall()
+        bands = c.execute("SELECT band, COUNT(*) FROM routes WHERE ts >= ? GROUP BY band ORDER BY 2 DESC LIMIT ?",
+                          (now - 7 * 86400, BAND_TOP)).fetchall()
         return {"source": "router.db", "today": by(day0), "last_7d": by(now - 7 * 86400),
                 "top_bands_7d": [{"band": b, "calls": n} for b, n in bands]}
     finally:
@@ -120,10 +143,11 @@ def _child_tasks(path: Path, now: float) -> dict[str, Any]:
     for ln in lines:
         try:
             rec = json.loads(ln)
-        except ValueError:
+            recent = isinstance(rec, dict) and rec.get("task_id") and float(rec.get("ts") or 0) >= now - 7 * 86400
+        except (ValueError, TypeError):   # one bad record (or a non-numeric ts) is counted, not the section erased
             bad += 1
             continue
-        if isinstance(rec, dict) and rec.get("task_id") and float(rec.get("ts") or 0) >= now - 7 * 86400:
+        if recent:
             tid = str(rec["task_id"])
             last[tid] = str(rec.get("event"))          # child_tasks.log_event writes {"ts", "event", **fields}
             if rec.get("event") == "finished" and rec.get("status") is not None:
@@ -149,7 +173,7 @@ def _s1(url: str | None) -> dict[str, Any]:
     t = time.monotonic()
     try:
         with _NO_PROXY.open(f"{url.rstrip('/')}/health", timeout=S1_TIMEOUT_S) as r:
-            r.read(4096)
+            r.read(S1_BODY_MAX)
             res = {"available": True, "status": r.status, "latency_ms": round((time.monotonic() - t) * 1000)}
     except Exception as exc:
         res = {"available": False, "reason": type(exc).__name__, "latency_ms": round((time.monotonic() - t) * 1000)}
@@ -158,21 +182,68 @@ def _s1(url: str | None) -> dict[str, Any]:
     return dict(res)
 
 
+def _hw_sample(raw: Any) -> dict[str, Any]:
+    """Only the sampler's known fields; ollama_models and errors reduced to their known sub-fields."""
+    if not isinstance(raw, dict):
+        raise ValueError("not an object")
+    out = {k: raw[k] for k in _HW_KEYS if k in raw}
+    if isinstance(raw.get("ollama_models"), list):
+        out["ollama_models"] = [{k: m[k] for k in _HW_MODEL_KEYS if k in m}
+                                for m in raw["ollama_models"] if isinstance(m, dict)]
+    if isinstance(raw.get("errors"), list):   # type/kind only: a message can carry a host, path or command line
+        out["errors"] = [{k: e[k] for k in _HW_ERR_KEYS if k in e} for e in raw["errors"] if isinstance(e, dict)]
+    return out
+
+
 def _hardware(d: Path, now: float, errors: list) -> list[dict[str, Any]]:
+    try:   # Path.glob swallows a listing OSError, which would look exactly like "no samples yet"
+        files = sorted(p for p in (d / n for n in os.listdir(d)) if p.suffix == ".json")
+    except OSError as exc:
+        logger.warning("usage: hardware listing failed: %s", exc)
+        errors.append({"source": "hardware", "error": type(exc).__name__})
+        return []
+    if len(files) > HW_MAX_FILES:
+        errors.append({"source": "hardware", "error": "too_many_files"})
+        files = files[:HW_MAX_FILES]
     out = []
-    for f in sorted(d.glob("*.json")):
+    for f in files:
         try:
-            out.append({"file": f.name, "age_s": round(now - f.stat().st_mtime, 1), "data": json.loads(f.read_text())})
+            st = f.stat()
+            if st.st_size > HW_MAX_BYTES:
+                errors.append({"source": f"hardware/{f.name}", "error": "oversize"})
+                continue
+            with f.open("rb") as fh:
+                raw = fh.read(HW_MAX_BYTES + 1)
+            if len(raw) > HW_MAX_BYTES:   # grew between stat and read
+                errors.append({"source": f"hardware/{f.name}", "error": "oversize"})
+                continue
+            out.append({"file": f.name, "age_s": round(now - st.st_mtime, 1), "data": _hw_sample(json.loads(raw))})
         except Exception as exc:
+            logger.warning("usage: hardware/%s failed: %s", f.name, exc)
             errors.append({"source": f"hardware/{f.name}", "error": type(exc).__name__})   # OSError text carries the path
     return out
+
+
+_COLLECT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_COLLECT_LOCK = threading.Lock()
 
 
 def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], refusals: list[dict[str, Any]],
             runs_since_start: dict[str, int] | None = None, s1_url: str | None = None,
             s1_probe: Callable[[str | None], dict[str, Any]] = _s1, freshness: Callable | None = None,
             now: float | None = None) -> dict[str, Any]:
-    now = time.time() if now is None else now
+    if now is None:   # live calls (no injected clock) are memoised COLLECT_CACHE_S; tests pass now and never hit it
+        key = str(state_dir)
+        with _COLLECT_LOCK:
+            hit = _COLLECT_CACHE.get(key)
+            if hit and time.monotonic() - hit[0] < COLLECT_CACHE_S:
+                return json.loads(json.dumps(hit[1]))
+        res = collect(state_dir=state_dir, scarcity_reader=scarcity_reader, refusals=refusals,
+                      runs_since_start=runs_since_start, s1_url=s1_url, s1_probe=s1_probe, freshness=freshness,
+                      now=time.time())
+        with _COLLECT_LOCK:
+            _COLLECT_CACHE[key] = (time.monotonic(), res)
+        return json.loads(json.dumps(res))
     errors: list[dict[str, str]] = []
     notes: list[str] = []
     out: dict[str, Any] = {"generated_at": round(now, 3)}
@@ -181,7 +252,9 @@ def collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], r
         try:
             return fn()
         except Exception as exc:
-            errors.append({"source": name, "error": f"{type(exc).__name__}: {exc}"})
+            # the bare type only: OSError text carries the absolute path (home dir, username); detail goes to the log
+            logger.warning("usage: %s failed: %s", name, exc)
+            errors.append({"source": name, "error": type(exc).__name__})
             return empty
 
     out["lanes"] = guard("scarcity", lambda: _lanes(scarcity_reader(), now, freshness), [])
