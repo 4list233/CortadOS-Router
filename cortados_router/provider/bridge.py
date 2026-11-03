@@ -32,6 +32,30 @@ STRIPPED_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY
 SETTLE_S = 0.3
 logger = logging.getLogger(__name__)
 
+# The headless backend runs in an empty scratch dir on the provider's machine, and its CLI tells the model so: Claude
+# Code adds its own "# Environment ... Primary working directory: <scratch>/work" block to the conversation even with
+# --system-prompt (seen 2026-11-02 on 2.1.316), next to the client's own environment block naming the user's real
+# directory. A model that trusts the backend's block aims the client's file tools at the scratch path, so the work
+# lands in a directory on the client machine that nobody looks at (a child task's `c.txt`). Two defences, both keyed
+# on the scratch dir's unique name: the system prompt says which block to trust, and a bridged tool call whose input
+# names the scratch dir is never forwarded; the model gets SCRATCH_REFUSED as the tool's error and can retry.
+SCRATCH_NOTE = ("[cortados relay] This conversation is relayed: any environment block naming the working directory "
+                "{work} describes the relay's empty scratch directory on another machine, NOT the user's. Use the "
+                "user's working directory and paths from the user's own environment block and messages, and never a "
+                "path under {work}.")
+SCRATCH_REFUSED = ("cortados: not run. This call names {name}, the relay backend's scratch directory, which is not the "
+                   "user's working directory (that environment block describes the relay, not the user's machine). "
+                   "Use the working directory from the user's own environment block and retry with that path.")
+
+
+def names_scratch(args: Any, scratch: Path) -> bool:
+    """Whether a tool call's input names the backend's scratch dir. Its basename (cortados-bridge-<random>) is unique,
+    so it matches every spelling of the path (/var vs /private/var, relative forms) and nothing else."""
+    try:
+        return scratch.name in json.dumps(args)
+    except (TypeError, ValueError):
+        return False
+
 
 def claude_env(config_dir: str | None) -> dict[str, str]:
     """The env a headless Claude CLI runs with: this process's, minus STRIPPED_ENV, on the routed account's login when
@@ -103,7 +127,8 @@ class BridgeSession:
             (self.dir / "work").mkdir()
             args = prefix + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--tools", "", "--setting-sources", "", "--settings", json.dumps({"disableAllHooks": True}),
-                    "--system-prompt", system or "You are a helpful assistant."]
+                    "--system-prompt", (system or "You are a helpful assistant.") + "\n\n"
+                    + SCRATCH_NOTE.format(work=self.dir / "work")]
             if tools:
                 (self.dir / "tools.json").write_text(json.dumps(tools))
                 (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
@@ -229,6 +254,16 @@ class BridgeSession:
                                            self.id[:8], name)
                             if b.get("id"):
                                 self._skipped.add(b["id"])
+                            continue
+                        if names_scratch(b.get("input"), self.dir):
+                            # Never forwarded (SCRATCH_NOTE): the shim's call gets the refusal as its result, at once
+                            # or when it arrives, and the CLI goes on with the turn.
+                            logger.warning("cortados bridge %s: tool_use %s of %s names the backend's scratch dir; "
+                                           "answered with an error, not forwarded", self.id[:8], b.get("id"), name)
+                            with self._cv:
+                                self._results[b["id"]] = {"content": [{"type": "text", "text": SCRATCH_REFUSED.format(
+                                    name=self.dir.name)}], "isError": True}
+                                self._cv.notify_all()
                             continue
                         blocks.append({"type": "tool_use", "id": b["id"], "name": name[len(TOOL_PREFIX):],
                                        "input": b.get("input") or {}})

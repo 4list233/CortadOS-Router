@@ -11,7 +11,7 @@ Layout per task (all under a verified private 0700 directory, default ~/.config/
   meta.json     what was asked (task text length, cwd, orchestrator, permission mode, runner pid, start time)
   prompt.txt    the task text, fed to `claude -p` on stdin (never argv: argv is world-readable in `ps` and size-capped)
   session-*.json the launcher's 0600 settings (holds the provider token; never printed)
-  stdout.log    claude's `--output-format json` result;  stderr.log  claude's diagnostics
+  stdout.log    claude's `--output-format stream-json` events, ending in its result record;  stderr.log  claude's diagnostics
   result.json   written by the runner when the child ends: exit code, end time, cancelled/timed-out flags
   cancelled     marker written by cancel_task before it signals the runner's process group
 
@@ -63,6 +63,15 @@ _urlopen = urllib.request.urlopen   # tests replace this
 # too much blast radius to enable by a tool argument; widen with `allowed_tools` instead.
 PERMISSION_MODES = ("auto", "acceptEdits", "manual", "plan", "dontAsk")   # each is a 2.1.316 --permission-mode choice
 DEFAULT_PERMISSION_MODE = "auto"
+# Not every model can run in auto mode. Claude Code 2.1.316 checks the session model at startup and, for one it does not
+# support, logs "auto mode disabled: model <m> does not support auto mode" and drops the session to `default`; with
+# --permission-prompts none every approval-needing call is then denied ("no approval surface"). Verified 2026-11-02 on
+# 2.1.316 with --debug-file against a local capture endpoint (modelSupported=false): sub/claude-haiku-4-5-20251001 and
+# claude-haiku-4-5-20251001; supported: cortados, sub/claude-haiku-5-5, sonnet-4-6/5/5-5, opus-4-6/5-5, fable-5,
+# gpt-5.6-luna, gpt-6.1-sol, qwen-27b. The CLI's rule is "a name containing haiku, except claude-haiku-5-5".
+AUTO_MODE_EXCEPTIONS = ("claude-haiku-5-5",)
+# The mode a defaulted task gets on a model without auto mode: file edits in cwd still go through unattended.
+NO_AUTO_FALLBACK = "acceptEdits"
 # claude.ai connectors are disabled in token-auth sessions (the child authenticates to the provider with a token), so
 # the servers behind the user's connectors are loaded directly from this MCP config file when it exists.
 CONNECTORS_CONFIG = "~/.config/cortados/connectors.mcp.json"
@@ -189,6 +198,33 @@ def claude_bin() -> str:
     return found
 
 
+def auto_mode_supported(model: str) -> bool:
+    """Whether Claude Code (2.1.316) keeps a session on `model` (a launcher model: cortados or sub/<id>) in auto mode;
+    see AUTO_MODE_EXCEPTIONS for the verified rule."""
+    name = model.split("/", 1)[1] if model.startswith("sub/") else model
+    name = name.strip().lower()
+    return "haiku" not in name or any(name == e or name.startswith(e + "-") for e in AUTO_MODE_EXCEPTIONS)
+
+
+def resolve_permission_mode(permission_mode, orchestrator):
+    """(mode, note) for the child. Unset means auto where the child's model supports it, else NO_AUTO_FALLBACK, and the
+    note says why (returned by start_task and kept in meta). An explicit `auto` on a model without auto mode is
+    refused: the child would silently run in `default` and be denied every action that needs approval."""
+    model = pin_model(orchestrator)
+    if permission_mode is None:
+        if auto_mode_supported(model):
+            return DEFAULT_PERMISSION_MODE, None
+        return NO_AUTO_FALLBACK, (f"{model} has no auto mode in Claude Code, so this task runs in {NO_AUTO_FALLBACK}: "
+                                  "file edits in cwd go through; other actions that need approval (Bash that changes "
+                                  "files, network) are denied. Pass allowed_tools to widen, or pick another model.")
+    if permission_mode == "auto" and not auto_mode_supported(model):
+        raise TaskError(f"permission_mode 'auto' is not available for {model}: Claude Code drops a session on this model "
+                        "out of auto mode, and an unattended child would then be denied every action that needs "
+                        f"approval. Use {NO_AUTO_FALLBACK} (edits in cwd) or dontAsk with allowed_tools, or a model with "
+                        "auto mode (any non-haiku model, or claude-haiku-5-5).")
+    return permission_mode, None
+
+
 def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
     if not isinstance(task, str) or not task.strip():
         raise TaskError("start_task requires a non-empty 'task'")
@@ -199,7 +235,7 @@ def _validate(task, cwd, orchestrator, permission_mode, allowed_tools):
     if not os.path.isdir(cwd):
         raise TaskError(f"cwd {cwd!r} is not an existing directory")
     pin_model(orchestrator)
-    if permission_mode not in PERMISSION_MODES:
+    if permission_mode is not None and permission_mode not in PERMISSION_MODES:   # None: resolve_permission_mode picks
         raise TaskError(f"permission_mode {permission_mode!r} is not allowed; choose one of {', '.join(PERMISSION_MODES)} "
                         "(bypassPermissions is deliberately unavailable for unattended children)")
     tools = []
@@ -337,13 +373,15 @@ def select_connectors(names) -> dict | None:
     return {n: servers[n] for n in dict.fromkeys(names)}
 
 
-def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION_MODE, allowed_tools=None,
+def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tools=None,
           provider_url="", token_file=None, chrome=False, red=None, connectors=None) -> dict:
-    """`red` carries the launch credentials (env token and token file's token as they are now)."""
+    """`red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
+    None picks auto where the model supports it (resolve_permission_mode)."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    permission_mode, mode_note = resolve_permission_mode(permission_mode, orchestrator)
     selected = select_connectors(connectors)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
@@ -369,6 +407,9 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
                                   chrome, max_s, exe, selected)
+        if mode_note:
+            meta["permission_mode_note"] = mode_note
+            _write_json(os.path.join(d, "meta.json"), meta)
         with open(os.path.join(d, "runner.log"), "ab") as rlog:
             runner = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--run", d,
                                        "--lock-fd", str(lock_fd)],
@@ -395,7 +436,9 @@ def start(task, cwd, orchestrator="cortados", permission_mode=DEFAULT_PERMISSION
         raise TaskError(f"child task bookkeeping failed after spawn; the task was stopped ({type(exc).__name__}: "
                         f"{exc})") from None
     _REAP[task_id] = runner
-    out = {"task_id": task_id, "state": "running", "dir": d}
+    out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode}
+    if mode_note:
+        out["permission_mode_note"] = mode_note
     if prune_errors:
         out["prune_errors"] = prune_errors[:20]     # bounded: it goes into a tool result
     return out
@@ -426,7 +469,11 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     launch += ["--no-delegate-directive", "--no-gate"]
     # --permission-prompts none: nobody is there to answer, so anything that would prompt is denied deterministically
     # (as s1/outcome/agents.py runs its headless claude).
-    extra = ["-p", "--output-format", "json", "--permission-mode", permission_mode, "--permission-prompts", "none"]
+    # stream-json (which -p only allows with --verbose): every event, not only the result record, so status can say
+    # which tools the child really used, what it wrote where, and which permission mode it actually ran in (a
+    # system event names it, also when Claude Code leaves the requested mode).
+    extra = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", permission_mode,
+             "--permission-prompts", "none"]
     if tools:
         extra += ["--allowedTools", ",".join(tools)]
     # Opt-in per task, enforced both ways: --chrome when asked (the child acts in the user's real, signed-in Chrome, in
@@ -654,6 +701,9 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             for k in ("num_turns", "total_cost_usd", "session_id", "subtype"):
                 if k in o:
                     out[k] = o[k]
+        warnings = _activity(out, o, res.get("activity"), meta)
+        if warnings:
+            out["warnings"] = warnings
         if res.get("output_error"):
             out["output_error"] = res["output_error"]     # reported even when a (malformed) record was parsed
         if res.get("redact_error"):
@@ -686,6 +736,37 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             for k in ("result", "stdout_log", "stderr_log", "dir"):
                 out.pop(k, None)
     return red.tree(out)                        # every string (structured, before any serialization)
+
+
+def _activity(out: dict, o: dict, act, meta: dict) -> list:
+    """Copy what the child really did into the status `out`, and return the warnings a caller must not miss: a
+    "succeeded" child whose result text is only the model's claim (denied tools, no file written where it said, a
+    different permission mode)."""
+    warnings = []
+    denials = o.get("permission_denials") if isinstance(o, dict) else None
+    if isinstance(denials, list) and denials:
+        names = [str((x or {}).get("tool_name") or "?") for x in denials if isinstance(x, dict)]
+        out["permission_denials"] = names
+        warnings.append(f"{len(denials)} tool call(s) were denied ({', '.join(dict.fromkeys(names))}): nobody can "
+                        "approve a prompt in a child, so the work they were for was NOT done, whatever the result says")
+    if isinstance(act, dict):
+        out["tool_uses"] = act.get("tool_uses") or {}
+        out["tool_errors"] = act.get("tool_errors") or 0
+        if act.get("files_written"):
+            out["files_written"] = act["files_written"]
+        mode = act.get("effective_permission_mode")
+        if mode:
+            out["effective_permission_mode"] = mode
+            if mode != meta.get("permission_mode"):
+                warnings.append(f"the child ran in permission mode {mode!r}, not the requested "
+                                f"{meta.get('permission_mode')!r} (Claude Code left it)")
+        if act.get("writes_outside_cwd"):
+            out["writes_outside_cwd"] = act["writes_outside_cwd"]
+            warnings.append(f"the child wrote {len(act['writes_outside_cwd'])} file(s) outside its cwd "
+                            f"{meta.get('cwd')}: check writes_outside_cwd before trusting the result")
+    if meta.get("permission_mode_note"):
+        out["permission_mode_note"] = meta["permission_mode_note"]
+    return warnings
 
 
 def wait(task_id, timeout_s=WAIT_MAX_S, red=None, poll_s=0.5, provider_url="", token="") -> dict:
@@ -914,11 +995,24 @@ def redact_file(path: str, red: "Redactor", chunk: int = 1 << 20) -> None:
 
 
 def parse_output(raw: str):
-    """(output, error): claude's `-p --output-format json` result record, or why stdout is not one. A valid record is
-    an object with type "result", a boolean is_error and a string result."""
+    """(output, error): claude's result record, or why stdout is not one. stdout is `--output-format stream-json`
+    (one event per line, the result record last) or, for a task started before that, the single `json` record. A
+    valid record is an object with type "result", a boolean is_error and a string result."""
     raw = raw.strip()
     if not raw:
         return None, "the child printed nothing on stdout (no result record)"
+    lines = raw.splitlines()
+    if len(lines) > 1:
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") == "result":
+                raw = line
+                break
+        else:
+            return None, "stdout has no result record (the event stream ended without one); see stdout_log"
     try:
         out = json.loads(raw) if raw.startswith("{") else json.loads(raw.splitlines()[-1])
     except ValueError:
@@ -928,6 +1022,53 @@ def parse_output(raw: str):
     if out.get("type") != "result" or not isinstance(out.get("is_error"), bool) or not isinstance(out.get("result"), str):
         return out, "stdout is not a claude result record (needs type 'result', boolean is_error, string result)"
     return out, None
+
+
+# Tools whose input names the file they change, and the input key holding it (Claude Code 2.1.316 built-ins).
+WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
+MAX_ACTIVITY_PATHS = 50     # paths kept per list: enough to see what happened, bounded because it goes into status
+
+
+def summarize_stream(path: str, cwd: str) -> dict:
+    """What the child really did, from its stream-json events: tool_use counts by tool, how many tool results were
+    errors, the permission mode it actually ran in (the last one a system event named), and the files its file tools
+    wrote, with those outside cwd listed apart. A `result` saying "done" proves nothing on its own; this does."""
+    tool_uses: dict = {}
+    errors = 0
+    mode = None
+    written: list = []
+    outside: list = []
+    root = os.path.realpath(cwd)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type")
+            if kind == "system" and isinstance(ev.get("permissionMode"), str):
+                mode = ev["permissionMode"]
+            content = (ev.get("message") or {}).get("content") if kind in ("assistant", "user") else None
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if kind == "assistant" and b.get("type") == "tool_use":
+                    name = str(b.get("name") or "?")
+                    tool_uses[name] = tool_uses.get(name, 0) + 1
+                    key = WRITE_TOOLS.get(name)
+                    target = (b.get("input") or {}).get(key) if key and isinstance(b.get("input"), dict) else None
+                    if isinstance(target, str) and target:
+                        full = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
+                        if len(written) < MAX_ACTIVITY_PATHS:
+                            written.append(full)
+                        if os.path.commonpath([root, full]) != root and len(outside) < MAX_ACTIVITY_PATHS:
+                            outside.append(full)
+                elif kind == "user" and b.get("type") == "tool_result" and b.get("is_error"):
+                    errors += 1
+    return {"tool_uses": tool_uses, "tool_errors": errors, "effective_permission_mode": mode,
+            "files_written": written, "writes_outside_cwd": outside}
 
 
 class _CancelledBeforeSpawn(Exception):
@@ -1011,6 +1152,10 @@ def _run(d: str, lock_fd=None) -> int:
         result["output"] = red.tree(out)
     if err:
         result["output_error"] = err
+    try:
+        result["activity"] = red.tree(summarize_stream(os.path.join(d, "stdout.log"), spec["cwd"]))
+    except OSError as exc:                       # no stdout at all (the child never started): nothing to summarize
+        result["activity_error"] = f"could not read stdout.log: {type(exc).__name__}"
     result["ended_at"] = time.time()
     final = classify(result)
     started = spec.get("started_at")

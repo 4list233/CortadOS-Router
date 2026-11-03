@@ -65,6 +65,29 @@ FAKE = textwrap.dedent('''\
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "api_error_status": 413,
                           "result": "Request too large (max 32MB). Accumulated images..."}}))
         sys.exit(1)
+    if mode in ("stream-denied", "stream-outside"):
+        # claude -p --output-format stream-json --verbose: one event per line, the result record last
+        def ev(e):
+            print(json.dumps(e)); sys.stdout.flush()
+        ev({{"type": "system", "subtype": "init", "permissionMode": "auto", "cwd": os.getcwd()}})
+        if mode == "stream-denied":
+            ev({{"type": "system", "subtype": "status", "permissionMode": "default"}})   # Claude Code left auto
+            ev({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "id": "toolu_1", "name": "Write",
+                "input": {{"file_path": os.path.join(os.getcwd(), "a.txt"), "content": "x"}}}}]}}}})
+            ev({{"type": "user", "message": {{"content": [{{"type": "tool_result", "tool_use_id": "toolu_1",
+                "is_error": True, "content": "Permission for this tool use was denied."}}]}}}})
+            ev({{"type": "result", "subtype": "success", "is_error": False, "result": "I could not do it",
+                "num_turns": 2, "permission_denials": [{{"tool_name": "Write", "tool_use_id": "toolu_1",
+                                                         "tool_input": {{"file_path": "a.txt"}}}}]}})
+        else:
+            ev({{"type": "assistant", "message": {{"content": [
+                {{"type": "tool_use", "id": "toolu_1", "name": "Write",
+                  "input": {{"file_path": os.environ["FAKE_OUTSIDE"], "content": "child-ok"}}}},
+                {{"type": "tool_use", "id": "toolu_2", "name": "Edit", "input": {{"file_path": "inside.txt"}}}},
+                {{"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": {{"command": "true"}}}}]}}}})
+            ev({{"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 2,
+                "permission_denials": []}})
+        sys.exit(0)
     if mode == "badjson":
         print("this is not json")
         sys.exit(0)
@@ -244,7 +267,8 @@ class ChildTaskTests(unittest.TestCase):
         self.assertTrue(w["settings_removed"])                   # the token-bearing settings file is gone
         self.assertFalse([n for n in os.listdir(w["dir"]) if n.startswith("session-")])
         self.assertIn("-p", a)
-        self.assertEqual(a[a.index("--output-format") + 1], "json")
+        self.assertEqual(a[a.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", a)                 # -p only allows stream-json with --verbose
         self.assertEqual(a[a.index("--append-system-prompt") + 1], ct.CHILD_DIRECTIVE)   # cortados: child directive only
         self.assertNotIn("tok-test-000000001", " ".join(a))    # token never in argv
         self.assertEqual(seen["nested"], "1")
@@ -255,6 +279,73 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(ct.tasks_dir()).st_mode), 0o700)
         _, lst = self.call("list_tasks")
         self.assertEqual(lst["tasks"][0]["task_id"], tid)
+
+    # ---- permission modes the child's model really supports (2026-11-02 E2E: haiku + auto denied every write)
+    def test_auto_mode_support_follows_the_clis_rule(self):
+        for model in ("cortados", "sub/claude-sonnet-5", "sub/claude-opus-5-5", "sub/claude-haiku-5-5",
+                      "sub/gpt-6.1-sol", "sub/qwen-27b"):
+            self.assertTrue(ct.auto_mode_supported(model), model)
+        for model in ("sub/claude-haiku-4-5-20251001", "claude-haiku-4-5", "sub/CLAUDE-HAIKU-4-5"):
+            self.assertFalse(ct.auto_mode_supported(model), model)
+
+    def test_a_defaulted_mode_on_a_model_without_auto_is_accept_edits_and_says_why(self):
+        r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001")
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(out["permission_mode"], "acceptEdits")
+        self.assertIn("has no auto mode", out["permission_mode_note"])
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertEqual(a[a.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(w["permission_mode"], "acceptEdits")
+        self.assertIn("has no auto mode", w["permission_mode_note"])
+
+    def test_explicit_auto_on_a_model_without_auto_is_refused(self):
+        r, _ = self.call("start_task", task="hi", cwd=self.work, orchestrator="claude-haiku-4-5-20251001",
+                         permission_mode="auto")
+        self.assertTrue(r.get("isError"))
+        self.assertIn("'auto' is not available", r["content"][0]["text"])
+        self.assertIn("acceptEdits", r["content"][0]["text"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))     # nothing started
+        tid = self.start(orchestrator="claude-haiku-4-5-20251001", permission_mode="acceptEdits")   # an explicit
+        self.call("wait_task", task_id=tid, timeout_s=30)                                         # other mode runs
+
+    def test_a_defaulted_mode_on_a_model_with_auto_is_auto(self):
+        r, out = self.call("start_task", task="hi", cwd=self.work, orchestrator="sonnet")
+        self.assertEqual(out["permission_mode"], "auto")
+        self.assertNotIn("permission_mode_note", out)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    # ---- what the child really did, from its stream-json events
+    def test_denials_and_a_left_mode_are_warnings_on_a_succeeded_child(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-denied"
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertEqual(w["state"], "succeeded")                 # the CLI says success ...
+        self.assertEqual(w["permission_denials"], ["Write"])      # ... but it did not do the work
+        self.assertEqual(w["tool_uses"], {"Write": 1})
+        self.assertEqual(w["tool_errors"], 1)
+        self.assertEqual(w["effective_permission_mode"], "default")
+        joined = " ".join(w["warnings"])
+        self.assertIn("1 tool call(s) were denied (Write)", joined)
+        self.assertIn("ran in permission mode 'default', not the requested 'auto'", joined)
+
+    def test_writes_outside_cwd_are_reported(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-outside"
+        outside = os.path.join(self.tmp, "cortados-bridge-x1", "work", "c.txt")
+        os.environ["FAKE_OUTSIDE"] = outside
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertEqual(w["state"], "succeeded")
+        self.assertEqual(w["tool_uses"], {"Write": 1, "Edit": 1, "Bash": 1})
+        self.assertEqual(w["files_written"], [outside, os.path.join(self.work, "inside.txt")])
+        self.assertEqual(w["writes_outside_cwd"], [outside])
+        self.assertIn("wrote 1 file(s) outside its cwd", " ".join(w["warnings"]))
+        self.assertNotIn("permission_denials", w)
+
+    def test_a_stream_without_a_result_record_is_an_output_error(self):
+        out, err = ct.parse_output('{"type": "system", "subtype": "init"}\n{"type": "assistant", "message": {}}')
+        self.assertIsNone(out)
+        self.assertIn("no result record", err)
+        out, err = ct.parse_output('{"type": "system"}\n{"type": "result", "is_error": false, "result": "ok"}\n')
+        self.assertEqual((out["result"], err), ("ok", None))
 
     def test_pinned_orchestrator_and_allowlist(self):
         tid = self.start(orchestrator="opus", permission_mode="plan", allowed_tools=["Bash(git diff:*)", "Read"])

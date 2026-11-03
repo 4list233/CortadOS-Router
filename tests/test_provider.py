@@ -294,6 +294,21 @@ class EndpointTests(EndpointHarness):
         with self.assertLogs("cortados_router.provider.bridge", "WARNING"):
             self.assertEqual(self.status_of(body), 502)
 
+    def test_a_tool_call_naming_the_backend_scratch_dir_is_refused_not_forwarded(self):
+        # The backend CLI's own environment block names its scratch work dir (2026-11-02: a child's Write landed in
+        # <scratch>/work/c.txt on the client). Such a call never reaches the client; the model gets the refusal.
+        body = {"tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool scratch path"}]}
+        with self.assertLogs("cortados_router.provider.bridge", "WARNING") as logs:
+            r = self.post(body)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertFalse([b for b in r["content"] if b["type"] == "tool_use"])
+        self.assertIn("ERR cortados: not run", r["content"][-1]["text"])
+        self.assertTrue(any("scratch dir" in line for line in logs.output), logs.output)
+        seen = json.loads(Path(self.argv_file).read_text())
+        prompt = seen["argv"][seen["argv"].index("--system-prompt") + 1]
+        self.assertIn("[cortados relay]", prompt)
+        self.assertIn(os.path.basename(os.path.dirname(seen["cwd"])), prompt)   # names the scratch dir not to use
+
     def test_streaming_response_is_valid_sse(self):
         raw = self.post({"stream": True, "tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
         events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]

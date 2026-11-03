@@ -588,7 +588,8 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(r2["content"], [{"type": "text", "text": "tool said: hello"}])
         self.assertTrue(any("system prompt changed mid-conversation" in line for line in logs.output))
         start = [m for m in self.inbound() if m.get("method") == "thread/start"]
-        self.assertEqual([m["params"]["baseInstructions"] for m in start], ["A"])   # one thread, the original prompt
+        self.assertEqual([m["params"]["baseInstructions"].split("\n\n[cortados relay]")[0] for m in start],
+                         ["A"])                                     # one thread, the original prompt (+ the relay note)
 
     def test_a_changed_tool_set_on_a_continuation_is_warned_about_once_and_served_on_the_original_thread(self):
         # find() continues by history; the thread declared its tools on thread/start, so a tool added mid-conversation
@@ -728,7 +729,21 @@ class CodexEndpointTests(unittest.TestCase):
     def test_the_system_prompt_is_the_thread_base_instructions(self):
         self.post({"system": "Be terse.", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
         start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
-        self.assertEqual(start["baseInstructions"], "Be terse.")
+        base, note = start["baseInstructions"].split("\n\n", 1)
+        self.assertEqual(base, "Be terse.")
+        self.assertTrue(note.startswith("[cortados relay]"), note)      # bridge.SCRATCH_NOTE, naming the scratch dir
+
+    def test_a_call_naming_the_scratch_dir_is_refused_not_forwarded(self):
+        # Codex tells the model its cwd (the backend's scratch dir); a call aimed there would land in a directory on the
+        # client machine nobody looks at. It is answered with the refusal and the turn goes on; the client sees no call.
+        with self.assertLogs("cortados_router.provider.codex_bridge", level="WARNING") as logs:
+            r = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool scratch path"}]})
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertFalse([b for b in r["content"] if b["type"] == "tool_use"])
+        self.assertIn("ERR cortados: not run", r["content"][-1]["text"])
+        self.assertTrue(any("scratch dir" in line for line in logs.output), logs.output)
+        start = [m for m in self.inbound() if m.get("method") == "thread/start"][0]["params"]
+        self.assertIn(start["cwd"], start["baseInstructions"])           # the note names the dir not to use
 
     def test_an_unsupported_cli_version_is_refused_with_a_502(self):
         os.environ["FAKE_CODEX_VERSION"] = "0.1.0"

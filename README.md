@@ -321,7 +321,20 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
 - `permission_mode`: `auto` (default: a safety classifier approves or denies each action, so a child can run Bash and
   tests unattended), `acceptEdits`, `manual`, `dontAsk`, `plan`. The child also gets `--permission-prompts none`, so
   anything that would prompt is denied. `bypassPermissions` is deliberately not offered for unattended runs; widen
-  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead.
+  with `allowed_tools` (e.g. `["Bash(npm test:*)"]`) instead. Not every model has auto mode: Claude Code 2.1.316
+  drops a session on a haiku model other than `claude-haiku-5-5` to `default` at startup ("does not support auto
+  mode"), and a child then gets every approval-needing call denied ("no approval surface"). So with the mode unset
+  such a model gets `acceptEdits` (start_task and task_status say so in `permission_mode_note`), and an explicit
+  `auto` on it is refused at `start_task`.
+- What the child really did: the child prints `--output-format stream-json`, and `task_status` reports `tool_uses`
+  (counts by tool), `tool_errors`, `files_written`, `effective_permission_mode` (the mode Claude Code actually ran in)
+  and `permission_denials`, plus `warnings` when a "succeeded" child's result is not backed by its actions: denied
+  tool calls, a mode Claude Code left, or files written outside `cwd`.
+- Relay scratch dir: the provider's headless backend (Claude CLI or Codex) runs in an empty scratch dir, and its CLI
+  tells the model so in its own environment block, next to the client's real one. A model that trusted it aimed a
+  child's Write at `<scratch>/work/c.txt` (2026-11-02; the file landed on the client machine in a directory nobody
+  looks at). The backend's system prompt now says which block to trust, and a bridged tool call whose input names the
+  scratch dir is never forwarded: the model gets a tool error and retries with the user's path.
 - Every child gets a fixed CHILD TASK directive (`child_tasks.CHILD_DIRECTIVE`: do the work yourself, do not call
   `start_task`, end with a report) via `--append-system-prompt`, so the orchestrator directive in a shared
   `~/.claude/CLAUDE.md` does not make it delegate again. Children never get the whole-session ORCHESTRATOR directive

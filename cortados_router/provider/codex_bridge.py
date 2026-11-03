@@ -42,7 +42,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from cortados_router.provider.bridge import BridgeError, write_line
+from cortados_router.provider.bridge import SCRATCH_NOTE, SCRATCH_REFUSED, BridgeError, names_scratch, write_line
 from cortados_router.provider.codex_isolation import (BENIGN_MCP_TOOLS, DEFAULT_EXEC_YIELD_MS, LEAKED_ITEMS,
                                                        V1_APPROVALS, V2_APPROVALS, check_account, check_command_line,
                                                        check_effective_config, child_env, command_line, tool_aliases)
@@ -253,7 +253,9 @@ class CodexSession:
                         ", ".join(f"{wire} -> {client!a}" for wire, client in sorted(self._aliases.items())))
         params: dict[str, Any] = {
             "cwd": str(self.dir / "work"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
-            "baseInstructions": system or "You are a helpful assistant.",
+            # Codex tells the model its cwd too (the scratch work dir): the same note and guard as bridge.SCRATCH_NOTE.
+            "baseInstructions": (system or "You are a helpful assistant.") + "\n\n"
+                                + SCRATCH_NOTE.format(work=self.dir / "work"),
             "dynamicTools": [{"type": "function", "name": declared.get(t["name"], t["name"]),
                               "description": t.get("description", ""),
                               "inputSchema": t.get("input_schema") or {"type": "object"}} for t in tools]}
@@ -732,6 +734,15 @@ class CodexSession:
                 if call_id in self.emitted:
                     raise BridgeError(f"codex app-server reused tool call id {call_id}")
                 name = params.get("tool") or ""
+                scratch = getattr(self, "dir", None)    # set in __init__; unit tests build sessions without one
+                if scratch is not None and names_scratch(args, scratch):
+                    # Never forwarded (bridge.SCRATCH_NOTE): answered here with the refusal, and the turn goes on.
+                    logger.warning("codex conversation %s: item/tool/call %s (tool %s) names the backend's scratch "
+                                   "dir; answered with an error, not forwarded", self.id[:8], call_id, name)
+                    self._reply(msg["id"], {"success": False, "contentItems": [
+                        {"type": "inputText", "text": SCRATCH_REFUSED.format(name=scratch.name)}]},
+                        timeout=self._left(deadline, "while refusing a scratch-dir tool call"))
+                    return None
                 blocks.append({"type": "tool_use", "id": call_id, "name": self._aliases.get(name, name), "input": args})
                 self._call_tools[call_id] = self._aliases.get(name, name)
                 self._call_turn[call_id] = owner
