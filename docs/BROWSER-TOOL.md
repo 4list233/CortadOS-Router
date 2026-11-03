@@ -1,6 +1,6 @@
 # CortadOS browser tool (design, 2026-11-03)
 
-Status: design + spike (`integrations/browser/`), revised 2026-11-03 after an independent review against the real 0.0.84 package. Nothing is wired into `child_tasks.py` yet; see "Build tickets".
+Status: design + spike (`integrations/browser/`), revised 2026-11-03 after two independent review rounds against the real 0.0.84 package. Nothing is wired into `child_tasks.py` yet; see "Build tickets".
 
 ## Why
 Routed child tasks (`cortados_router/child_tasks.py`, headless `claude -p`) need browser walkthroughs and UI testing.
@@ -24,7 +24,8 @@ Forest's decision: CortadOS gets its own browser tool. Playwright is allowed, wi
 | 7 | `@playwright/mcp` | WebMCP: `browser_webmcp_list` / page-exposed tools inject tool descriptions authored by the page (prompt injection into the tool list). | by design | `--no-webmcp`; the filter's allowlist would drop such tools anyway. |
 | 7a | `@playwright/mcp`, Playwright | Environment overrides the config: every `PLAYWRIGHT_MCP_*` variable (`PROXY_SERVER`, `PROXY_BYPASS`, `CDP_ENDPOINT`, `PORT`, `CONFIG`, `EXECUTABLE_PATH`, `ALLOW_UNRESTRICTED_FILE_ACCESS`, `EXTENSION`, ...) is read above the config file; `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK` lets loopback skip the proxy. | by design | `run-mcp.sh` starts the server with `env -i` (see "Environment is part of the boundary"). |
 | 7b | Chromium | WebRTC and QUIC are UDP and bypass an HTTP proxy. | by design | Launch args `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, `--disable-quic`; never `--proxy-bypass`. |
-| 7c | Chromium | `chrome://` internal pages are reachable by navigation (review finding on 0.0.84). | by design | Noted; the profile is throwaway and no secrets live in it. The filter may refuse `chrome://` URLs in `browser_navigate` (B1b). |
+| 7c | `@playwright/mcp`, Chromium | `checkUrlAllowed` blocks only `file:`; `javascript:`, `data:`, `blob:`, `chrome://` navigations pass, and a `javascript:` / `data:` navigation runs script in the page exactly as the denied `browser_evaluate` would. | by design | The B1b filter admits only `http:`, `https:` and the exact URL `about:blank` in `browser_navigate` and in `browser_tabs` new-tab URLs; every other scheme is refused (allowlist, not a deny list). |
+| 7d | `@playwright/mcp` | Without `--ignore-roots` the server asks the client for its workspace roots (`roots/list`) and its file checks then allow reads and writes anywhere under them: the child's repo, `.env` included, for upload/drop, screenshots and `filename=` outputs. | by design | `--ignore-roots` in `run-mcp.sh` and in the install gate's listing (tool list unchanged by it), so the workspace is the cwd `<task>/browser`; the B1b filter also never forwards `roots/list`. |
 | 8 | `playwright` (npm and Python) | CVE-2025-59288 / GHSA-7mvr-c777-76hp: browser install scripts used `curl -k` (no TLS verification) -> MITM of the installer. | 1.55.1 | Pin playwright >= 1.55.1 (current 1.64.1); install only from our script. |
 | 9 | Chromium | Default persistent profile (`--user-data-dir` under the user's cache) keeps cookies across sessions; `--extension` / CDP endpoint modes attach to a real browser. | by design | `--isolated` (in-memory profile, gone when the task ends); never pass `--extension`, `--cdp-endpoint`, `--remote-debugging-port`. |
 | 10 | Chromium | Downloads land wherever the browser chooses. | by design | `--output-dir <task>/browser/` and download path inside the task dir. |
@@ -59,29 +60,45 @@ Both need the same egress proxy; the proxy is what actually enforces "no private
   `@playwright/mcp` 0.0.84, `playwright` / `playwright-core` 1.65.0-alpha-2026-10-30). Install copies both into the
   prefix and runs `npm ci --ignore-scripts` (exactly the lock, no install scripts).
 - Gates, any failure aborts the install: installed `@playwright/mcp` version == `PIN_MCP`; `playwright-core` >= 1.55.1;
-  `tools/list` of the installed server (same flags and scrubbed env as a task) == `tools-0.0.84.txt` byte for byte.
+  `tools/list` of the installed server == `tools-0.0.84.txt` byte for byte. The listing starts the server through
+  `run-mcp.sh` on a throwaway task with a dummy proxy (no page is opened), so flags and env are exactly a task's; it
+  reads until the `id:2` answer with a 30 s cap and prints the server's stderr when there is none
+  (`install.sh tools` shows the list on its own).
 - Browsers: `PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers <prefix>/node_modules/.bin/playwright install --only-shell chromium`
   (headless shell only; nothing global, nothing under `~/Library/Caches/ms-playwright`).
 - Script: `integrations/browser/install.sh`. The router package stays stdlib-only and never imports it.
 
 ### Per-task launch (stdio, no port)
 `install.sh config <task_dir> <proxy_url>` (B3 moves this into `child_tasks._prepare`) refuses with exit 2 unless the
-proxy URL is given and the pinned binary is executable (message carries the install command); there is no
-boundary-less config. It writes two files and the child gets `--mcp-config <task_dir>/browser-mcp.json`:
+proxy URL is given, has the exact shape `http://<token>@127.0.0.1:<port>` (token of at least 16 `[A-Za-z0-9_-]`; no
+other host, no https, no password, no path or bypass), and the pinned binary is executable (message carries the
+install command); there is no boundary-less config. It writes two files, both 0600 (inside the 0700 task dir), and
+the child gets `--mcp-config <task_dir>/browser-mcp.json`:
 ```json
-{"mcpServers": {"browser": {"command": "<repo>/integrations/browser/run-mcp.sh",
-  "args": ["<task_dir>", "<prefix>", "http://<token>@127.0.0.1:<egress_port>"]}}}
+{"mcpServers": {"browser": {"command": "<repo>/integrations/browser/run-mcp.sh", "args": ["<task_dir>", "<prefix>"]}}}
 ```
-`<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag):
+`<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag, plus the proxy):
 ```json
-{"browser": {"browserName": "chromium", "isolated": true, "launchOptions": {"headless": true, "chromiumSandbox": true,
-  "args": ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]}}}
+{"browser": {"browserName": "chromium", "isolated": true,
+  "launchOptions": {"headless": true, "chromiumSandbox": true,
+    "proxy": {"server": "http://127.0.0.1:<egress_port>", "username": "<token>", "password": ""},
+    "args": ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]},
+  "contextOptions": {"proxy": {"server": "http://127.0.0.1:<egress_port>", "username": "<token>", "password": ""}}}}
 ```
-`run-mcp.sh` then runs `cd <task>/browser && exec env -i PATH=<node dir>:/usr/bin:/bin HOME=<task>/browser/home
-TMPDIR=<task>/browser/tmp PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers <prefix>/node_modules/.bin/playwright-mcp
---config <task>/browser/config.json --headless --isolated --sandbox --no-webmcp --browser chromium
---proxy-server <proxy> --blocked-origins <list> --output-dir <task>/browser/out --block-service-workers
---timeout-navigation 30000 --timeout-action 10000`. With B1b the command becomes the stdio filter, which execs the wrapper.
+The proxy token lives only in this file, never in argv (`ps` shows argv to every local user) and never in
+`browser-mcp.json`. `run-mcp.sh` refuses with exit 2 unless both proxies are present, point at `127.0.0.1`, carry a
+username and have no `bypass`; then it runs `cd <task>/browser && exec env -i PATH=<node dir>:/usr/bin:/bin
+HOME=<task>/browser/home TMPDIR=<task>/browser/tmp PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers
+<prefix>/node_modules/.bin/playwright-mcp --config <task>/browser/config.json --headless --isolated --sandbox
+--no-webmcp --ignore-roots --browser chromium --blocked-origins <list> --output-dir <task>/browser/out
+--block-service-workers --timeout-navigation 30000 --timeout-action 10000`. With B1b the command becomes the stdio
+filter, which execs the wrapper. B6 confirms on the real build that the config-file proxy is what Chromium uses (a
+page fetch shows up in the proxy log; with the proxy stopped, navigation fails).
+- `--ignore-roots`: the workspace (the server's file boundary) is the cwd `<task>/browser`, never the client's roots
+  (item 7d). B1b's `<task>/browser/in` path check for upload/drop is then defence in depth, not the only line.
+- `--timeout-navigation 30000`: half the 60 s default, so a hung page fails a tool call well inside `browser_max_s`.
+  `--timeout-action 10000`: twice the 5 s default, because a cold headless shell on a loaded host misses 5 s on
+  ordinary clicks; still short enough that a stuck action returns an error instead of stalling the child.
 - `--blocked-origins` entries carry ports (`http://localhost:*;https://localhost:*;http://127.0.0.1:*;...;http://[::1]:*;
   ...;http://0.0.0.0:*`); without a port an entry does not match a dev server. First filter only.
 - Never: `--port`, `--host`, `--allowed-hosts`, `--extension`, `--cdp-endpoint`, `--executable-path`, `--proxy-bypass`,
@@ -105,8 +122,17 @@ Source of truth: `integrations/browser/tools-0.0.84.txt`, the pinned server's `t
 the installed server's list differs, so a version bump is a reviewed diff, never silent.
 1. **Server side, independent of Claude Code permissions (B1b):** `integrations/browser/mcp_filter.py`, a small stdlib
    stdio filter between `claude` and `run-mcp.sh`. It ALLOWLISTS: `tools/list` responses are rewritten to the allowed
-   names; a `tools/call` for any other name is answered with a JSON-RPC error and never forwarded; unknown methods
-   other than the MCP basics are refused; a malformed message closes the session (fail closed). Default allowlist =
+   names; a `tools/call` for any other name is answered with a JSON-RPC error and never forwarded; URL arguments of
+   `browser_navigate` and of `browser_tabs` new-tab calls must be `http:` / `https:` or exactly `about:blank`, every
+   other scheme (`javascript:`, `data:`, `blob:`, `chrome:`, `file:`, `view-source:`, ...) is refused, and so is a URL
+   that does not parse. Fail-closed cases, each with a unit test:
+   - client->server methods allowed: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`,
+     `notifications/cancelled`; anything else gets a JSON-RPC error (requests) or is dropped (notifications);
+   - a top-level JSON array (batch), invalid JSON, a non-object message or a line over the size cap closes the session;
+   - `tools/call` with missing `params`, non-object `params`, non-string `name` or non-object `arguments` is refused;
+   - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a
+     JSON-RPC error and never forwarded to Claude Code; server notifications other than progress/log/`list_changed`
+     are dropped, and a `tools/list_changed` makes the filter re-list and re-apply the allowlist. Default allowlist =
    the pinned list minus `browser_evaluate`, `browser_run_code_unsafe`, `browser_file_upload`, `browser_drop`.
    Grants add back `browser_evaluate` (`browser_js`) and `browser_file_upload` / `browser_drop` (`browser_upload`, with
    every path argument required to resolve under `<task_dir>/browser/in`). `browser_run_code_unsafe` is never
@@ -155,10 +181,16 @@ result text so the orchestrator can `Read` it.
   `browser_sites` (allow-only list), `browser_js`, `browser_upload`, `browser_file` (allow `file://` under cwd only),
   `browser_max_pages`, `browser_max_s`.
 - If the pinned install is missing -> refuse with the install command; never fall back to Chrome or a global Playwright.
+- The proxy bounds the browser, not the child. A child with a shell (`Bash`) could `curl` a private host or start
+  `<prefix>/node_modules/.bin/playwright-mcp` itself without the proxy, so "no boundary-less launch" holds for the MCP
+  path only. Therefore a `browser: true` child carries no shell tool by default: B3 adds `Bash` (and any other
+  command-running tool the child has) to its `--disallowedTools`. A shell is given back only when the requester is
+  separately granted it; gateway browser tasks never get it without a `shell` grant in the B4 table.
 
 ### Bot gateway
 Gateway-originated tasks (Slack/Telegram bots) carry `browser: true` only if the gateway's grant table lists the
-requester for `browser`; otherwise refuse with `browser not granted for this requester`. `browser_allow` with private
+requester for `browser`; otherwise refuse with `browser not granted for this requester`. Gateway browser tasks always
+run with `Bash` in `--disallowedTools` unless the requester also holds a `shell` grant (see Opt-in). `browser_allow` with private
 addresses, `browser_js`, `browser_upload`, `browser_file` need a separate `browser_private` / `browser_unsafe` grant.
 Refusals are logged, never silently downgraded.
 
@@ -171,8 +203,8 @@ pages visited (count + origins), refused hosts, downloads (name, size), artifact
 - `npm install --ignore-scripts @playwright/mcp@0.0.84` = 3 packages, under 1 s; it pulls a `playwright-core`
   1.65 alpha (>= 1.55.1, so CVE-2025-59288 is fixed).
 - Full 0.0.84 `--help` is committed as `integrations/browser/help-0.0.84.txt`. We pass `--config --headless --isolated
-  --sandbox --no-webmcp --browser --proxy-server --blocked-origins --output-dir --block-service-workers
-  --timeout-navigation --timeout-action`; never `--port --host --allowed-hosts --endpoint --extension --cdp-endpoint
+  --sandbox --no-webmcp --ignore-roots --browser --blocked-origins --output-dir --block-service-workers
+  --timeout-navigation --timeout-action` (the proxy comes from the config file, not `--proxy-server`); never `--port --host --allowed-hosts --endpoint --extension --cdp-endpoint
   --cdp-header --executable-path --shared-browser-context --storage-state --no-sandbox --ignore-https-errors
   --init-script --proxy-bypass --allow-unrestricted-file-access`.
 - Review round (2026-11-03): `tools/list` of 0.0.84 (`tools-0.0.84.txt`) has `browser_run_code_unsafe` and
@@ -180,6 +212,8 @@ pages visited (count + origins), refused hosts, downloads (name, size), artifact
   filter. Verified locally: `install.sh install` (npm ci of the lock, version gates, tool-list gate) passes on a
   throwaway `CORTADOS_HOME`; `config` exits 2 without a proxy URL or without the binary; the wrapper answers
   `initialize` with `PLAYWRIGHT_MCP_PORT` / `PLAYWRIGHT_MCP_CDP_ENDPOINT` set in the caller (scrubbed).
+- Review round 2: tool list unchanged by `--ignore-roots` and by `clientInfo.name`; the claims above are now pinned by
+  `tests/test_browser_tool.py` (stub server, stdlib, part of the full suite).
 - There is no `--save-trace` in 0.0.84. Trace/screenshot artifacts come from `--output-dir` (screenshots, `--save-session`
   to be evaluated in B1). `--isolated` keeps the profile in memory, so no `--user-data-dir` is passed.
 - Browser download still to do: `CORTADOS_HOME=<home> integrations/browser/install.sh install --browsers`
@@ -188,19 +222,29 @@ pages visited (count + origins), refused hosts, downloads (name, size), artifact
 ## Build tickets
 - B1 Pin + install: done in this branch except the browser download. `package.json` + `package-lock.json`, `npm ci
   --ignore-scripts`, version gates, `tools-0.0.84.txt` / `help-0.0.84.txt` as source of truth, `run-mcp.sh`, `config`
-  requiring proxy + binary. Test idea (B3 suite): run `install.sh config` with a fake `$BIN` (an executable stub in a
-  throwaway prefix) and assert the two JSON files exactly, exit 2 without proxy, exit 2 without `$BIN`; run
-  `run-mcp.sh` with a fake `$BIN` that dumps `env` and `argv` and assert only the four variables and the fixed flags.
+  requiring proxy + binary. Tests: `tests/test_browser_tool.py` with a stub `$BIN` in a throwaway prefix: the two
+  JSON files byte-exact and 0600, token absent from `browser-mcp.json` and argv; exit 2 without proxy, with a
+  wrong-shaped proxy, without `$BIN`, without config, and for a config whose proxy is missing, has a bypass or points
+  off loopback; a poisoned caller env reaches the stub as exactly `PATH HOME TMPDIR PLAYWRIGHT_BROWSERS_PATH` with
+  the fixed argv (incl. `--ignore-roots`) and cwd `<task>/browser`; `install.sh tools` lists through the wrapper and
+  shows the server's stderr when it fails.
 - B1b Stdio allowlist filter (stdlib, `integrations/browser/mcp_filter.py`): allowlist from `tools-0.0.84.txt` minus
-  the default-off tools, grants, path checks for upload/drop, `chrome://` / `file://` refusal in `browser_navigate`,
-  page counting, fail closed on anything unparseable. Unit tests with a fake server over pipes: hidden tools absent
-  from `tools/list`, `tools/call browser_run_code_unsafe` refused even when every grant is on, page cap.
+  the default-off tools, grants, path checks for upload/drop, URL scheme allowlist (`http:`, `https:`, `about:blank`)
+  in `browser_navigate` and `browser_tabs` new-tab, page counting, the fail-closed cases listed under "Tools on / off".
+  Unit tests with a fake server over pipes: hidden tools absent from `tools/list`, `tools/call browser_run_code_unsafe`
+  refused even when every grant is on, page cap; one refusal test per scheme (`javascript:alert(1)`, `JavaScript:`
+  mixed case, leading whitespace, `data:text/html,...`, `blob:`, `chrome://settings`, `file:///etc/passwd`,
+  `view-source:http://x`, unparseable) and admission of `http`, `https`, `about:blank` (but not `about:srcdoc`); one
+  test per fail-closed case (batch array, bad JSON, non-object, oversize line, bad `params` / `name` / `arguments`,
+  disallowed method, `roots/list` and `sampling/createMessage` from the server answered with an error and not seen by
+  the client).
 - B2 Egress proxy (stdlib): CONNECT + HTTP, 407 + token, resolve-once-and-pin, ANY-answer private-net deny, allow
   exceptions, tunnel byte budget, JSON event log. Unit tests with fake resolvers (no network), one per form:
   plain private v4, multi-answer with one private, `::1`, `::ffff:127.0.0.1`, `::ffff:7f00:1`, `64:ff9b::a00:1`,
   `0x7f000001`, `0177.0.0.1`, `127.1`, `2130706433`, `100.64.x` / `fd7a:115c:a1e0::`, link-local, `0.0.0.0`,
   rebinding (second resolution never happens), missing token -> 407.
-- B3 child_tasks: `browser` and `browser_*` fields, mutual exclusion with chrome, config writing, `--disallowedTools`,
+- B3 child_tasks: `browser` and `browser_*` fields, mutual exclusion with chrome, config writing, `--disallowedTools`
+  (browser denials plus `Bash` unless a shell grant; test that a `browser: true` child's argv carries it),
   proxy + filter lifecycle, output-dir watcher, cleanup of `<task>/browser`, artifacts in status. Tests use the fake
   claude binary and a fake `$BIN`; no real browser.
 - B4 Gateway grant check + refusal messages; tests.
