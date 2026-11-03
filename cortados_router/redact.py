@@ -1,4 +1,4 @@
-"""Credential redaction shared by the child-task runner (child_tasks.Redactor) and the provider's refusal records.
+"""Credential redaction for the child-task runner (child_tasks.Redactor builds on this class).
 
 One implementation: every credential and its JSON-escaped spelling (JSON output escapes quotes and backslashes in
 it), matched in a single alternation, longest first, so a shorter credential that is a prefix of a longer one never
@@ -41,8 +41,3 @@ class Redactor:
             return {self.text(str(k)): self.tree(v) for k, v in obj.items()}
         return obj
 
-
-def excerpt(red: Redactor, s: str, limit: int) -> str:
-    """At most `limit` characters of `s`, redacted first and truncated after (see the module docstring)."""
-    out = red.text(str(s))
-    return out if len(out) <= limit else out[:limit] + "…"

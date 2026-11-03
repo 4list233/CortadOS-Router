@@ -343,8 +343,9 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   child with 413, and Claude Code shows a 413 as "Request too large (max 32MB) … images".
 - Refusals: the provider logs every refusal it answers (JSON errors, SSE error events, the local relay's errors) and,
   for an authenticated request, records it under its `x-cortados-run-id`; an unauthenticated one is logged apart and
-  never recorded. Only a sanitized diagnostic is kept: status, error type, a fixed reason, and at most 200 characters
-  of backend text redacted (provider token, configured credentials, their JSON-escaped forms) before it is cut.
+  never recorded. Only status, error type and a fixed reason of the provider's own (for a backend failure, its
+  allowlisted category) are kept, and the log line names an endpoint id, never the path; backend text stays out of
+  both (the full message still goes to the client in the error response).
   `task_status` shows the last one as `provider_refusal` (and a `hint` for a 413).
 - State: `~/.config/cortados/tasks/<task_id>/` (0700; logs, `result.json`). The token-bearing settings file is deleted
   when the child exits; finished task dirs older than 14 days are pruned on the next `start_task`.

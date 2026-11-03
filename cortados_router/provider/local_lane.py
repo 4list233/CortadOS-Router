@@ -231,13 +231,13 @@ def _send_json(handler, code: int, data: dict[str, Any]) -> None:
         pass
 
 
-def _refused(handler, code: int, kind: str, reason: str, detail: str | None = None) -> None:
+def _refused(handler, code: int, kind: str, reason: str) -> None:
     """Log and record a refusal this relay answers itself, through the server's one refusal helper
-    (Handler._note_refusal: fixed reason, redacted and bounded detail, recorded only for an authenticated run). A
+    (Handler._note_refusal: a fixed reason only, never the node's text; recorded only for an authenticated run). A
     handler without it (a unit test's stand-in) records nothing; the answer to the client is the same either way."""
     note = getattr(handler, "_note_refusal", None)
     if note is not None:
-        note(code, kind, reason=reason, detail=detail)
+        note(code, kind, reason=reason)
 
 
 def _error(kind: str, message: str) -> dict[str, Any]:
@@ -286,8 +286,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         try:
             conn.connect()
         except (OSError, http.client.HTTPException) as exc:
-            _refused(handler, 503, "overloaded_error", "the local node is unreachable",
-                     f"node {node['node']}: {type(exc).__name__}: {exc}")
+            _refused(handler, 503, "overloaded_error", "the local node is unreachable")
             _send_json(handler, 503, _error("overloaded_error",
                        f"cortados: local node {node['node']} unreachable for sub/{pin_id(model)} "
                        f"({type(exc).__name__}: {exc}); it may be asleep or busy. No other model was tried."))
@@ -300,24 +299,21 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
             resp = conn.getresponse()
         except (OSError, http.client.HTTPException) as exc:
             # Connected, so the node is awake: it (or its gate) refused or dropped the request.
-            _refused(handler, 503, "overloaded_error", "the local node refused or dropped the request",
-                     f"node {node['node']}: {type(exc).__name__}: {exc}")
+            _refused(handler, 503, "overloaded_error", "the local node refused or dropped the request")
             _send_json(handler, 503, _error("overloaded_error",
                        f"cortados: local node {node['node']} accepted the connection for sub/{pin_id(model)}, then "
                        f"refused or dropped the request ({type(exc).__name__}: {exc}). No other model was tried."))
             return "unreachable"
         if resp.status == 401:                                   # the gate's refusal is the provider's problem,
             _bounded_read(resp)                                  # not the client's: a 503 that says so
-            _refused(handler, 503, "overloaded_error", "the local gate refused the provider's token",
-                     f"node {node['node']}")
+            _refused(handler, 503, "overloaded_error", "the local gate refused the provider's token")
             _send_json(handler, 503, _error("overloaded_error", "cortados: " + GATE_REFUSED.format(node=node["node"])
                                             + "; no other model was tried"))
             return "unreachable"
         if resp.status != 200:
             raw = _bounded_read(resp)
             if raw is None:                                      # truncated or stalled error body: say so, bounded
-                _refused(handler, 502, "api_error", "the local node's error body was truncated or stalled",
-                         f"node {node['node']}: HTTP {resp.status}")
+                _refused(handler, 502, "api_error", "the local node's error body was truncated or stalled")
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} answered HTTP "
                                                 f"{resp.status} and its error body was truncated or stalled"))
                 return "incomplete"
@@ -327,8 +323,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 raw = json.dumps(_error("api_error", f"cortados: local node {node['node']} answered HTTP "
                                         f"{resp.status}: {raw[:300].decode('utf-8', 'replace')}")).encode()
             code = resp.status if 400 <= resp.status < 600 else 502
-            _refused(handler, code, "api_error", "the local node answered an HTTP error",
-                     f"node {node['node']}: HTTP {resp.status}: {raw.decode('utf-8', 'replace')}")
+            _refused(handler, code, "api_error", "the local node answered an HTTP error")
             try:
                 handler.send_response(code)
                 handler.send_header("content-type", "application/json")
@@ -344,8 +339,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
                 msg = json.loads(raw)
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 # A read timeout lands here too (the node stalled past read_timeout_s on a non-streaming answer).
-                _refused(handler, 502, "api_error", "the local node's answer was unreadable or timed out",
-                         f"node {node['node']}: {type(exc).__name__}")
+                _refused(handler, 502, "api_error", "the local node's answer was unreadable or timed out")
                 _send_json(handler, 502, _error("api_error", f"cortados: local node {node['node']} sent an "
                                                 f"unreadable response ({type(exc).__name__})"))
                 return "incomplete"
@@ -388,8 +382,7 @@ def serve(handler, body: dict[str, Any], node: dict[str, Any], model: dict[str, 
         except (OSError, http.client.HTTPException):
             pass                                                 # the node stalled past read_timeout_s or dropped
         if not done:                                             # say so in the stream, not by a silent truncation
-            _refused(handler, 502, "api_error", "the local node stopped mid-answer (stalled or dropped)",
-                     f"node {node['node']}: read timeout {node['read_timeout_s']:g}s")
+            _refused(handler, 502, "api_error", "the local node stopped mid-answer (stalled or dropped)")
             ev = _error("api_error", f"cortados: local node {node['node']} stopped mid-answer (stalled past "
                         f"{node['read_timeout_s']:g}s or dropped the connection)")
             try:

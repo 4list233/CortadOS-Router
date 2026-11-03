@@ -26,7 +26,6 @@ import argparse
 import hmac
 import json
 import logging
-import os
 import re
 import secrets
 import sys
@@ -41,7 +40,6 @@ from typing import Any, Callable
 if __package__ in (None, ""):                           # run as a file: make the package importable
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cortados_router import redact
 from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
@@ -237,14 +235,12 @@ _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _RUN_ID_BAD = "cortados: x-cortados-run-id is not a run id"
 RUNS_PATH = "/v1/cortados/runs/"
 
-# What a refusal record (RunRecords.refuse) and the refusal log line may hold: the status, the error type, a fixed
-# reason string of this endpoint's own (a call site's, else the default for the status below), and optionally a short
-# excerpt of backend-derived text, redacted (provider token, configured credentials, their JSON-escaped spellings)
-# BEFORE it is cut to REFUSAL_DETAIL_MAX. The client's response still carries the full message; the record and the log
-# never carry request-derived text (a WireError or a bad pin can echo the request) or unredacted backend output.
-# 200 characters: enough for the backend's own error line (an HTTP status, a token count), short enough to keep a
-# multi-KB backend dump out of logs and run records.
-REFUSAL_DETAIL_MAX = 200
+# What a refusal record (RunRecords.refuse) and the refusal log line hold: the status, the error type, an endpoint id
+# from _ENDPOINT_IDS, and a fixed reason string of this endpoint's own (a call site's, the allowlisted
+# failure_diagnostic of a backend failure, else the default for the status below). Never any backend text, request
+# text or raw path: backend output can echo credentials (a local gate's token, a key in an upstream error body) and a
+# path can carry a client's secret (/v1/cortados/runs/<anything>). The client's response still carries the full
+# message, and backend failures keep their existing provider log lines.
 _REFUSAL_REASONS = {
     400: "the request was refused as invalid",
     401: "bad or missing token",
@@ -257,24 +253,28 @@ _REFUSAL_REASONS = {
     503: "no backend or lane is available for the request",
     BUSY_STATUS: "the conversation is busy with another request",
 }
-# Environment credentials the endpoint or its backends may hold; redacted from refusal details along with the provider
-# token, the anthropic-api keys and the local gates' tokens.
-_CREDENTIAL_ENV = ("CORTADOS_PROVIDER_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
-                   "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "CORTADOS_S1_TOKEN")
 
 
-def refusal_redactor(provider_token: str | None) -> redact.Redactor:
-    """A redactor over every credential this endpoint knows of. Raises if one source cannot be read: the caller then
-    keeps no detail at all (fail closed) rather than a detail redacted against an incomplete list."""
-    from cortados_router import api_credits
-    toks = [provider_token or ""] + [os.environ.get(k, "") for k in _CREDENTIAL_ENV]
-    toks += [key for _, key in api_credits.configured_orgs()]
-    try:
-        toks += [n.get("token") or "" for n in local_lane.nodes()]
-    except local_lane.LocalConfigError:
-        # A local config that does not load serves no local pin, so no gate token of it was ever sent anywhere.
-        pass
-    return redact.Redactor([t.strip() for t in toks if t and t.strip()])
+def endpoint_id(path: str | None) -> str:
+    """The allowlisted name a refusal log line gives a request path: never the path itself."""
+    p = (path or "").split("?")[0]
+    if p == "/v1/messages":
+        return "messages"
+    if p == "/v1/messages/count_tokens":
+        return "count_tokens"
+    if p == "/v1/responses":
+        return "responses"
+    if p.startswith(RUNS_PATH):
+        return "runs"
+    if p.startswith("/v1/models"):
+        return "models"
+    if p in ("/health", "/resources", "/bridge/call"):
+        return p[1:].replace("/", "_")
+    if p in ("/", "/dashboard"):
+        return "dashboard"
+    return "other"
+
+
 # Headers a client sends that name its conversation, for the failed-session tombstone (Registry.failure_key). Each was
 # confirmed on the real client's own requests to a capture endpoint (2026-11-02):
 #   x-cortados-run-id          this endpoint's own run header; the headless tools set it per run.
@@ -307,12 +307,9 @@ class RunRecords:
         # authenticated request (Handler._note_refusal), so a caller without the token cannot add or evict entries.
         self._refusals: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
 
-    def refuse(self, run_id: str, *, status: int, kind: str, reason: str, detail: str | None = None) -> None:
-        """Record one refusal: the status, the error type, a fixed reason and an already redacted, bounded detail
-        (Handler._note_refusal builds them; nothing here sees raw error text)."""
+    def refuse(self, run_id: str, *, status: int, kind: str, reason: str) -> None:
+        """Record one refusal: the status, the error type and a fixed reason (Handler._note_refusal; never raw text)."""
         entry = {"status": int(status), "type": str(kind), "reason": str(reason), "at": round(time.time(), 3)}
-        if detail:
-            entry["detail"] = str(detail)
         with self._lock:
             entries = self._refusals.pop(run_id, [])
             entries = (entries + [entry])[-self.PER_RUN:]      # the most recent PER_RUN refusals
@@ -590,9 +587,11 @@ class Registry:
         if not dead:
             return None
         diagnostic, failed_at, short = dead
-        return FailedSession(f"cortados: conversation {short} failed at "
-                             f"{time.strftime('%H:%M:%S', time.localtime(failed_at))} ({diagnostic}; details are in "
-                             "the provider log) and was closed: start a new conversation")
+        out = FailedSession(f"cortados: conversation {short} failed at "
+                            f"{time.strftime('%H:%M:%S', time.localtime(failed_at))} ({diagnostic}; details are in "
+                            "the provider log) and was closed: start a new conversation")
+        out.diagnostic = diagnostic                     # the allowlisted failure_diagnostic, for the refusal record
+        return out
 
     def fail(self, s, exc: object, key: str | None, *, unkeyed_reason: str | None = None) -> None:
         """Close a conversation whose backend failed. The caller holds `s.lock` and passes the failing request's own
@@ -644,6 +643,14 @@ class FailedSession(LostSession):
     """The request belongs to a conversation that was closed because its backend failed (a tombstone): answered with
     a terminal error (TERMINAL_STATUS / TERMINAL_ERROR) naming the failure's category, not the 409 of a conversation
     this endpoint never held or has forgotten."""
+    diagnostic: str | None = None
+
+
+def _failed_reason(exc: object) -> str:
+    """The refusal reason for a request on a failed conversation: fixed text plus the tombstone's allowlisted
+    failure_diagnostic (never the backend's own text)."""
+    diag = getattr(exc, "diagnostic", None)
+    return "the conversation already failed (terminal)" + (f": {diag}" if diag else "")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -683,39 +690,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None,
-               detail: str | None = None) -> None:
+    def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None) -> None:
         """Answer an error in the wire's shape. `message` goes to the client only; the log line and the run record get
-        the sanitized diagnostic of _note_refusal: `reason` (a fixed string of ours) and `detail` (backend text)."""
-        self._note_refusal(code, kind, reason=reason, detail=detail)
+        the fixed `reason` of _note_refusal."""
+        self._note_refusal(code, kind, reason=reason)
         self._json(code, w.error_json(kind, message))
 
-    def _note_refusal(self, code: int, kind: str, *, reason: str | None = None, detail: str | None = None) -> None:
+    def _note_refusal(self, code: int, kind: str, *, reason: str | None = None) -> None:
         """The ONE place a refusal is logged and recorded, for every failure path (JSON errors, SSE errors, the local
-        relay). Logged with its status, type and fixed reason (a 413 or 400 used to leave no line at all). An
-        authenticated POST that names a valid run id also records it there, so GET /v1/cortados/runs/<id> can tell a
-        headless client why it was refused. `detail`, when given, is redacted first and truncated after. Bookkeeping
-        only: it never raises into the response."""
+        relay). Logged with an endpoint id, its status, type and fixed reason (a 413 or 400 used to leave no line at
+        all). An authenticated POST that names a valid run id also records it there, so GET /v1/cortados/runs/<id> can
+        tell a headless client why it was refused. `reason` must be one of this endpoint's own fixed strings (see
+        _REFUSAL_REASONS). Bookkeeping only: it never raises into the response."""
         try:
-            path = (self.path or "").split("?")[0]
+            where = endpoint_id(self.path)
             if not getattr(self, "_authed", False):
                 # Logged apart and never recorded: an unauthenticated caller must not create or evict run records.
-                logger.warning("unauthenticated %s %s refused with %s %s", self.command, path, code, kind)
+                logger.warning("unauthenticated %s %s refused with %s %s", self.command, where, code, kind)
                 return
             reason = reason or _REFUSAL_REASONS.get(int(code), "refused")
-            excerpt = None
-            if detail:
-                try:
-                    excerpt = redact.excerpt(refusal_redactor(self.server.registry.token), detail, REFUSAL_DETAIL_MAX)
-                except Exception as exc:        # credentials unreadable: keep no detail rather than an unredacted one
-                    logger.warning("refusal detail dropped: credentials for redaction unavailable (%s)",
-                                   type(exc).__name__)
-            logger.warning("refused %s %s with %s %s: %s%s", self.command, path, code, kind, reason,
-                           f" ({excerpt})" if excerpt else "")
+            logger.warning("refused %s %s with %s %s: %s", self.command, where, code, kind, reason)
             if self.command == "POST":
                 run_id, valid = self._run_id()
                 if run_id and valid:
-                    self.server.registry.runs.refuse(run_id, status=code, kind=kind, reason=reason, detail=excerpt)
+                    self.server.registry.runs.refuse(run_id, status=code, kind=kind, reason=reason)
         except Exception as exc:
             logger.warning("refusal bookkeeping failed: %s", type(exc).__name__)
 
@@ -915,8 +913,8 @@ class Handler(BaseHTTPRequestHandler):
         reg = self.server.registry
         route = session.route or {}
         if not session.lock.acquire(timeout=TURN_TIMEOUT_S):
-            return self._json(BUSY_STATUS, wire.error_json("overloaded_error", "cortados: conversation busy; retry once "
-                              "the other request on it has finished"))
+            return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy; retry once the other "
+                               "request on it has finished", wire)
         try:
             if not created and session.history != turn.history:
                 return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
@@ -936,8 +934,7 @@ class Handler(BaseHTTPRequestHandler):
                                    f"cortados: sub/{local_lane.pin_id(local['model'])}: the conversation (≈{need // 1000}k "
                                    f"tokens) now exceeds {local['model']['id']}'s configured context ({cap // 1000}k); "
                                    "compact it or start a new conversation", wire,
-                                   reason="the conversation exceeds the local model's configured context",
-                                   detail=f"≈{need // 1000}k tokens over a {cap // 1000}k context")
+                                   reason="the conversation exceeds the local model's configured context")
             t0 = time.time()
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
@@ -947,7 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                 outcome = "incomplete"
                 try:
                     self._error(502, "api_error", f"cortados: local relay failed: {type(exc).__name__}", wire,
-                                reason="the local relay failed", detail=type(exc).__name__)
+                                reason="the local relay failed")
                 except Exception:
                     pass                         # headers may already be out; the client sees a broken response
             turn_ms = int((time.time() - t0) * 1000)
@@ -1042,9 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
                                reason="the request does not parse on this wire")
         except FailedSession as exc:
             logger.info("request on a failed conversation refused: %s", exc)
-            # The tombstone's message is the allowlisted failure_diagnostic, so it is safe to keep as the detail.
-            self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason="the conversation already failed (terminal)",
-                               detail=str(exc))
+            self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=_failed_reason(exc))
             if turn.stream:                             # an SSE error, as a streaming client gets any turn's failure
                 try:
                     self.send_response(200)
@@ -1084,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
-                                       reason="routing failed", detail=f"{type(exc).__name__}: {exc}")
+                                       reason="routing failed")
                 if route.get("error"):
                     if route.get("client_error"):       # a bad pin or exclusion (unserved model, emptied pool): the client's to fix
                         # It names the client's own pin or exclusion, request-derived: the record keeps the fixed reason.
@@ -1092,10 +1087,9 @@ class Handler(BaseHTTPRequestHandler):
                                            reason="the pin or exclusion names no model this endpoint can serve")
                     if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
                         return self._error(413, "request_too_large", f"cortados: {route['error']}", wire,
-                                           reason="the request is larger than every eligible model's context",
-                                           detail=str(route["error"]))
+                                           reason="the request is larger than every eligible model's context")
                     return self._error(503, "overloaded_error", f"cortados: {route['error']}", wire,
-                                       reason="no route is available", detail=str(route["error"]))
+                                       reason="no route is available")
                 logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
@@ -1104,7 +1098,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
                 logger.warning("backend start failed: %s", exc)
-                return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc), detail=str(exc))
+                return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
         if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
             return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
         msg_id = wire.new_message_id()
@@ -1236,10 +1230,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Both kinds are this endpoint's own text (a fixed LostSession message, or the tombstone's allowlisted
                 # diagnostic), recorded once here for the SSE and the JSON answer alike.
                 if failed:
-                    self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason="the conversation already failed (terminal)",
-                                       detail=str(stale))
+                    self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=_failed_reason(stale))
                 else:
-                    self._note_refusal(409, "invalid_request_error", reason="stale continuation", detail=str(stale))
+                    self._note_refusal(409, "invalid_request_error", reason="stale continuation")
                 if client_gone:
                     return
                 if turn.stream:
@@ -1262,9 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 # A failed session turn was already closed and tombstoned by the worker, under the session lock.
                 logger.warning("conversation %s failed: %s", session.id[:8], outcome["error"])
                 # Recorded for the SSE answer as well as the JSON one (a streaming client gets HTTP 200 + an error
-                # event, and used to leave no record): the allowlisted category plus a redacted excerpt.
-                self._note_refusal(502, "api_error", reason=failure_diagnostic(outcome["error"]),
-                                   detail=str(outcome["error"]))
+                # event, and used to leave no record): the allowlisted category only.
+                self._note_refusal(502, "api_error", reason=failure_diagnostic(outcome["error"]))
                 if client_gone:
                     return
                 if turn.stream:

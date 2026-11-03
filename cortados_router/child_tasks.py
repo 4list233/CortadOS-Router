@@ -667,8 +667,7 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None
         if refusals:
             last = refusals[-1]
-            detail = f" ({last['detail']})" if last.get("detail") else ""
-            out["provider_refusal"] = f"HTTP {last.get('status')} {last.get('type')}: {last.get('reason')}{detail}"
+            out["provider_refusal"] = f"HTTP {last.get('status')} {last.get('type')}: {last.get('reason')}"
         api_status = o.get("api_error_status") if isinstance(o, dict) else None
         if api_status is not None:
             out["api_error_status"] = api_status
