@@ -490,6 +490,47 @@ class NightlyEndToEnd(unittest.TestCase):
         out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="1200", CORTADOS_S1_EVAL_MINUTES="600")
         self.assertIn("EVAL_MINUTES=600 can never fit the 01:30-1200 window (>= 600); using 110", out.stdout)
 
+    def test_window_too_short_for_the_fallback_disables_the_deadline_check(self):
+        # DEADLINE=0300: the 01:30-03:00 window is 90 min, too short for the configured value AND the 110 fallback
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0300", CORTADOS_S1_EVAL_MINUTES="200")
+        self.assertTrue(out.stdout.startswith("90\n"), out.stdout + out.stderr)
+        self.assertIn("using 110", out.stdout)
+        self.assertIn("too short even for EVAL_MINUTES=110; deadline check disabled (0)", out.stdout)
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0300", CORTADOS_S1_EVAL_MINUTES="110")
+        self.assertIn("deadline check disabled (0)", out.stdout)
+        out = self.minutes_left("0130", CORTADOS_S1_DEADLINE="0700", CORTADOS_S1_EVAL_MINUTES="110")
+        self.assertEqual(out.stdout, "330\n", out.stdout)                    # a window that fits 110: no note
+
+    def test_valid_now_override_is_always_logged(self):
+        out = self.minutes_left(CORTADOS_S1_NOW="0619")
+        self.assertTrue(out.stdout.startswith("41\n"), out.stdout)
+        self.assertIn("CORTADOS_S1_NOW=0619 replaces the clock for the deadline check (test hook)", out.stdout)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_NOW="0619")
+        self.assertIn("CORTADOS_S1_NOW=0619 replaces the clock", log)
+        out = self.minutes_left("0130")
+        self.assertNotIn("CORTADOS_S1_NOW", out.stdout)
+
+    def test_continuous_mode_refreshes_benchmarks_at_most_once_per_interval(self):
+        repo = self.tmp / "router"; (repo / "bin").mkdir(parents=True)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\necho run >> \"$HOME/refresh.log\"\n")
+        calls = Path(self.env["HOME"]) / "refresh.log"
+        cont = {"CORTADOS_ROUTER_REPO": str(repo), "CORTADOS_S1_CONTINUOUS": "1"}
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, log)
+        self.assertTrue((self.s1 / "data/last-bench-refresh").read_text().strip().isdigit())
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertEqual(calls.read_text().count("run"), 1, "a fresh refresh is not repeated")
+        self.assertIn("benchmark/tiers refresh skipped", log)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_BENCH_REFRESH_S="0", **cont)
+        self.assertEqual(calls.read_text().count("run"), 2, "an expired interval refreshes again")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_ROUTER_REPO=str(repo))   # window mode: every night
+        self.assertEqual(calls.read_text().count("run"), 3, log)
+        _exe(repo / "bin/refresh-tiers.sh", "#!/bin/bash\nexit 4\n")
+        (self.s1 / "data/last-bench-refresh").write_text("5\n")
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, **cont)
+        self.assertIn("refresh-tiers.sh failed", log)
+        self.assertEqual((self.s1 / "data/last-bench-refresh").read_text(), "5\n", "a failed refresh is not stamped")
+
     def test_invalid_now_is_refused_or_falls_back_to_the_clock(self):
         for bad in ("730", "2500", "7", "abc"):
             out = self.minutes_left(bad)

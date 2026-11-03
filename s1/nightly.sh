@@ -65,6 +65,9 @@ hhmm "$DEADLINE" || { SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_DEADLINE=$DEA
 # minutes_left would read as "not enough time" every night (deferring the candidate forever)
 if [ -n "${CORTADOS_S1_NOW:-}" ] && ! hhmm "$CORTADOS_S1_NOW"; then
   SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_NOW=$CORTADOS_S1_NOW is not HHMM; using the clock. "; unset CORTADOS_S1_NOW
+elif [ -n "${CORTADOS_S1_NOW:-}" ]; then
+  # a valid override silently replacing the clock is a test hook; a leftover value in train-config.env must show in every log
+  SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_NOW=$CORTADOS_S1_NOW replaces the clock for the deadline check (test hook). "
 fi
 # ceiling: evaluation starts after labeling (~75 min into the window that opens at 01:30), so a value within 30 min of the whole
 # 01:30-to-deadline window (330 min to 07:00: >= 300) can never fit: every candidate would wait forever. That is a config error,
@@ -72,6 +75,11 @@ fi
 local window; window=$(minutes_left 0130)   # minutes in the 01:30-to-deadline window
 if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
   SETTING_NOTES="${SETTING_NOTES:-}EVAL_MINUTES=$EVAL_MINUTES can never fit the 01:30-$DEADLINE window (>= $((window - 30))); using 110. "; EVAL_MINUTES=110
+fi
+# the 110 fallback is re-checked: a window too short even for it (e.g. DEADLINE=0300: 90 min) would defer every candidate
+# forever, so the deadline check is disabled (0) with a logged reason; overnight.py's TERM at the deadline still applies
+if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
+  SETTING_NOTES="${SETTING_NOTES:-}the 01:30-$DEADLINE window is too short even for EVAL_MINUTES=$EVAL_MINUTES; deadline check disabled (0). "; EVAL_MINUTES=0
 fi
 }
 hhmm() { [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]; }   # 0000-2359
@@ -305,7 +313,25 @@ trap 'echo "stop requested"; touch "$STOPFLAG"; exit 130' TERM INT
 if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
 else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
 # every night: what Cursor/Antigravity/Codex list today + fresh benchmark scores → every model re-scored per use case.
-if [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then "$REPO_ROOT/bin/refresh-tiers.sh" || echo "refresh-tiers.sh failed (rc $?)"
+# Continuous mode runs a cycle every few minutes, and refresh-tiers.sh fetches public leaderboards (lmarena, swebench, epoch,
+# aider, ...): refreshing every cycle would hammer those sites for scores that change daily at most. So in continuous mode the
+# refresh runs at most once per CORTADOS_S1_BENCH_REFRESH_S (default 86400 = 24 h), timed from data/last-bench-refresh, which
+# is stamped only after a successful refresh (a failed one is retried next cycle). Window mode refreshes every night as before.
+bench_due=1
+if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ]; then
+  BENCH_REFRESH_S="${CORTADOS_S1_BENCH_REFRESH_S:-86400}"
+  whole "$BENCH_REFRESH_S" || { echo "CORTADOS_S1_BENCH_REFRESH_S=$BENCH_REFRESH_S is not a whole number up to 9 digits; using 86400"; BENCH_REFRESH_S=86400; }
+  BENCH_REFRESH_S=$(dec "$BENCH_REFRESH_S")
+  last_bench=$(cat data/last-bench-refresh 2>/dev/null)
+  if [[ "$last_bench" =~ ^[0-9]{1,12}$ ]] && [ $(( $(date +%s) - last_bench )) -lt "$BENCH_REFRESH_S" ]; then
+    echo "benchmark/tiers refresh skipped: last refresh $(( $(date +%s) - last_bench )) s ago, under CORTADOS_S1_BENCH_REFRESH_S=$BENCH_REFRESH_S (continuous mode)"
+    bench_due=0
+  fi
+fi
+if [ "$bench_due" = 0 ]; then :
+elif [ -x "$REPO_ROOT/bin/refresh-tiers.sh" ]; then
+  if "$REPO_ROOT/bin/refresh-tiers.sh"; then date +%s > data/last-bench-refresh
+  else echo "refresh-tiers.sh failed (rc $?)"; fi
 else echo "refresh-tiers.sh not found under $REPO_ROOT: skipped"; fi
 # The Air's router.db is rsynced here every 15 min by another machine; a stale copy means its recent usage is missing tonight.
 # Stale data is still valid data, so the night goes on, but the gap is logged and put in the status file for the dashboard.
