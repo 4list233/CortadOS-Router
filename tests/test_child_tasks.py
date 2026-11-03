@@ -1033,7 +1033,7 @@ class ChildTaskTests(unittest.TestCase):
     def test_token_in_json_inside_a_tool_result_survives_no_rotation(self):
         # stream-json: a tool result holding JSON text escapes the token twice (and JSON inside that, three times); a
         # raw pass with one escaped spelling missed it. The token has a quote and a backslash, and is rotated at once.
-        tok = 'tok"quo\\te-0005'
+        tok = 'tok"QXZQ\\te-0005'                       # QXZQ: uppercase, so it never occurs by chance in a random lowercase file name
         with open(self.cfg["token_file"], "w") as f:
             f.write(tok)
         self.cfg["token"] = "env-token-unrelated-02"
@@ -1048,9 +1048,9 @@ class ChildTaskTests(unittest.TestCase):
         for name in ("stdout.log", "stderr.log", "result.json"):
             with open(os.path.join(d, name)) as f:
                 data = f.read()
-            self.assertNotIn("quo", data, name)                    # no spelling of the token at any escaping depth
+            self.assertNotIn("QXZQ", data, name)                    # no spelling of the token at any escaping depth
             self.assertNotIn("te-0005", data, name)
-        self.assertNotIn("quo", r["content"][0]["text"])
+        self.assertNotIn("QXZQ", r["content"][0]["text"])
         with open(os.path.join(d, "stdout.log")) as f:             # still one JSON event per line, and decodable
             events = [json.loads(line) for line in f if line.startswith("{")]
         text = events[1]["message"]["content"][0]["content"][0]["text"]
