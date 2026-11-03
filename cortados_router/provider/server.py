@@ -69,7 +69,8 @@ TOMBSTONE_MAX = 256
 CLOSED_RECORD_MAX = 128
 CLOSED_RECORD_TTL_S = 3600.0
 # Largest last response a session keeps for a retry replay (_remember_reply): 1 MiB covers ordinary replies (text plus
-# tool calls) while bounding what each idle session can hold.
+# tool calls) while bounding what each idle session can hold. One reply per live session, so the aggregate is at most
+# live sessions x this cap, and the idle reaper (IDLE_S) bounds how long any of it is held.
 REPLAY_MAX_BYTES = 1 << 20
 # The answer to a request on a failed conversation must be terminal: an api_error (5xx, or an SSE `api_error`) is
 # what Claude Code and the Anthropic SDK retry, so a retryable shape would make the client re-send the same doomed
@@ -559,13 +560,20 @@ class Registry:
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         No match, or more than one, is a LostSession: never continue a conversation on a guess. With no match, a
         tombstone under `failure_key` makes it a FailedSession instead; a retry of the session's last answered turn
-        (see Replay) raises Replay with the stored response."""
+        (see Replay) raises Replay with the stored response. More than one such retry candidate is not replayed (it
+        falls through to the ordinary 409, whose diagnostic counts the candidates)."""
         if not turn.history:
             return None
         with self._lock:
             matches = [s for s in self.sessions.values() if s.history == turn.history]
-            replays = [] if matches else self._replays(turn)
+            replays = [] if matches else self._replays(turn, scope)
+            if len(replays) == 1:
+                # A client in a retry loop touches nothing else, so the replay itself must count as use: otherwise the
+                # idle reaper closes the conversation the client is still trying to recover.
+                replays[0][0].last_used = time.time()
         if len(matches) > 1:
+            logger.warning("409 lost conversation: class=ambiguous candidates=%d request_len=%d",
+                           len(matches), len(turn.history))
             raise LostSession(f"{len(matches)} live conversations have this exact history; refusing to pick one")
         if not matches:
             if len(replays) == 1:
@@ -580,15 +588,18 @@ class Registry:
             raise LostSession("a conversation this endpoint no longer holds (restarted, expired, or history edited)")
         return matches[0]
 
-    def _replays(self, turn: anthropic_wire.ClientTurn) -> list:
+    def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None) -> list:
         """(session, last_reply) for each live session this request is an exact retry of: its history is the session's
         minus the last reply, and its new user turn (turn_fingerprint) is the one that reply answered. Caller holds
         self._lock. last_reply[0] is the history length the reply belongs to, so a reply recorded for an older turn
-        (or a session mid-way through appending) never matches."""
+        (or a session mid-way through appending) never matches. Only sessions in the request's `scope` (the same
+        client and conversation identity, see conversation_scope) qualify, as in failure(): a stored reply is never
+        handed to another client's conversation that happens to share the history."""
         n, fp, out = len(turn.history), None, []
         for s in self.sessions.values():
             last = getattr(s, "last_reply", None)
-            if last and last[0] == len(s.history) == n + 1 and s.history[:n] == turn.history:
+            if (last and getattr(s, "scope", None) == scope and last[0] == len(s.history) == n + 1
+                    and s.history[:n] == turn.history):
                 fp = fp or anthropic_wire.turn_fingerprint(turn)
                 if last[1] == fp:
                     out.append((s, last))
@@ -597,7 +608,9 @@ class Registry:
     def _lost_diagnostic(self, turn: anthropic_wire.ClientTurn) -> str:
         """Why a continuation matched no live session, for the 409 log line: counts, lengths and a classification only
         (no fingerprints, no content). `retry_of_answered_turn`: the request is the best candidate's history minus its
-        last reply (a lost response, retried, with a different user turn or no stored reply to replay);
+        last reply (a lost response, retried, with a different user turn, no stored reply to replay, or more than one
+        live session it could be a retry of); `client_behind=<k>`: the request's history is a strict prefix of the
+        candidate's, k >= 2 replies short (a retry of an older turn: only the last one is ever replayed);
         `client_ahead`: the candidate's history is a strict prefix of the request's; `diverged_at=<i>`: the first
         index where they differ; `reaped_recently`: no live candidate, but this endpoint closed a conversation with
         the same first reply within CLOSED_RECORD_TTL_S; `no_candidate`: nothing shares the first reply."""
@@ -620,8 +633,11 @@ class Registry:
             return f"class=no_candidate candidates=0 request_len={len(h)} live_sessions={len(hists)}"
         best = max(cands, key=lambda c: (lcp(c), -abs(len(c) - len(h))))
         common = lcp(best)
-        if len(best) == len(h) + 1 and common == len(h):
+        behind = len(best) - len(h)
+        if common == len(h) and behind == 1:
             cls = "retry_of_answered_turn"
+        elif common == len(h) and behind >= 2:
+            cls = f"client_behind={behind}"
         elif common == len(best) < len(h):
             cls = "client_ahead"
         else:
@@ -718,11 +734,18 @@ def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     large replies in memory. Called before the reply's fingerprint is appended, under the session lock."""
     blocks, stop, usage = result
     try:
-        size = len(json.dumps([blocks, usage], default=str))
-    except (TypeError, ValueError):
-        size = REPLAY_MAX_BYTES + 1
-    session.last_reply = None if size > REPLAY_MAX_BYTES else (
-        len(session.history) + 1, anthropic_wire.turn_fingerprint(turn), msg_id, model, blocks, stop, usage)
+        size, why = len(json.dumps([blocks, usage], default=str)), None
+        if size > REPLAY_MAX_BYTES:
+            why = f"{size} bytes, over REPLAY_MAX_BYTES ({REPLAY_MAX_BYTES})"
+    except (TypeError, ValueError, RecursionError) as exc:
+        why = f"it does not serialize ({type(exc).__name__})"
+    if why:
+        # Its retry, if one comes, is then the ordinary 409: said here so that 409 can be told from a lost session.
+        logger.info("conversation %s: last response not kept for a retry replay: %s", str(session.id)[:8], why)
+        session.last_reply = None
+        return
+    session.last_reply = (len(session.history) + 1, anthropic_wire.turn_fingerprint(turn), msg_id, model, blocks,
+                          stop, usage)
 
 
 _unkeyed_logged = False                    # Registry.fail has logged a continuation it could not tombstone
@@ -1165,6 +1188,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, str(exc)),
                               headers={"x-should-retry": "false"})
         except Replay as rp:
+            # A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
+            # answer came from the conversation's own model, which the request no longer asks for.
+            changed = self._model_change(rp.session, body)
+            if changed:
+                return self._error(409, "invalid_request_error", changed, wire)
             _, _, msg_id, model, blocks, stop, usage = rp.last
             if turn.stream:
                 try:
@@ -1278,6 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
                     # backend is gone, so nothing is sent to it; the request is told what a fresh lookup would say.
                     outcome["stale"] = reg.failure(fail_key, turn.history, scope) or LostSession(
                         "the conversation was closed while this request waited for it; start a new conversation")
+                    outcome["stale_class"] = "closed_while_waiting"
                     return
                 if not created and session.history != turn.history:
                     # Registry.find ran before the lock: a second continuation with the same history (a client
@@ -1286,6 +1315,8 @@ class Handler(BaseHTTPRequestHandler):
                     # and drop a healthy conversation; it is a stale request, answered 409, and the session is kept.
                     outcome["stale"] = LostSession("the conversation moved on while this request waited for it: another "
                                                    "request with the same history was served first; send the current history")
+                    outcome["stale_class"] = "moved_on_while_waiting"
+                    outcome["stale_lens"] = (len(turn.history), len(session.history))
                     return
                 if turn.tool_results:
                     session.deliver(turn.tool_results, timeout=deadline - time.time())
@@ -1357,6 +1388,11 @@ class Handler(BaseHTTPRequestHandler):
                 if failed:
                     self._note_refusal(TERMINAL_STATUS, TERMINAL_ERROR, reason=_failed_reason(stale))
                 else:
+                    # The same classified line as find's 409s (lengths only), so every lost-conversation 409 has one.
+                    req_len, sess_len = outcome.get("stale_lens") or (len(turn.history), None)
+                    logger.warning("409 lost conversation: class=%s conversation=%s request_len=%d%s",
+                                   outcome.get("stale_class", "stale"), session.id[:8], req_len,
+                                   "" if sess_len is None else f" candidate_len={sess_len}")
                     self._note_refusal(409, "invalid_request_error", reason="stale continuation")
                 if client_gone:
                     return

@@ -430,6 +430,154 @@ class EndpointTests(EndpointHarness):
             self.assertEqual(self.status_of(other), 409)
         self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
 
+    def _answered_tool_turn(self, headers=None):
+        """One conversation at two replies (a tool_use, then its answer): the retry body of turn 2 and its reply."""
+        history = [{"role": "user", "content": "please use tool"}]
+        r1 = self.post({"tools": [READ_TOOL], "messages": history}, headers=headers)
+        history += [{"role": "assistant", "content": r1["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1["content"][-1]["id"],
+                                                  "content": "hello"}]}]
+        body = {"tools": [READ_TOOL], "messages": history}
+        return body, self.post(body, headers=headers)
+
+    def test_the_stored_reply_belongs_to_the_current_history_length(self):
+        body, _ = self._answered_tool_turn()
+        (session,) = self.reg.sessions.values()
+        self.assertEqual(session.last_reply[0], len(session.history))
+
+    def test_a_streaming_retry_replays_the_stored_response_as_sse(self):
+        body, r2 = self._answered_tool_turn()
+        (session,) = self.reg.sessions.values()
+        with mock.patch.object(session, "run_turn", side_effect=AssertionError("backend called")), \
+                mock.patch.object(session, "deliver", side_effect=AssertionError("backend called")):
+            raw = self.post(dict(body, stream=True))
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        self.assertEqual(events[0]["type"], "message_start")
+        self.assertEqual(events[0]["message"]["id"], r2["id"])
+        self.assertEqual(events[-1]["type"], "message_stop")
+        text = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+        self.assertEqual(text, r2["content"][0]["text"])
+        self.assertEqual([e for e in events if e["type"] == "message_delta"][0]["delta"]["stop_reason"],
+                         r2["stop_reason"])
+
+    def test_a_replay_counts_as_use_so_the_reaper_keeps_the_conversation(self):
+        body, r2 = self._answered_tool_turn()
+        (session,) = self.reg.sessions.values()
+        session.last_used = time.time() - 3600                         # idle for an hour before the retry
+        self.assertEqual(self.post(body), r2)
+        self.reg.reap(600)
+        self.assertEqual(list(self.reg.sessions.values()), [session])
+
+    def test_a_retry_from_another_scope_is_not_replayed(self):
+        body, r2 = self._answered_tool_turn(headers={"x-claude-code-session-id": "conversation-A"})
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            self.assertEqual(self.status_of(body, headers={"x-claude-code-session-id": "conversation-B"}), 409)
+        self.assertTrue(any("class=retry_of_answered_turn" in l for l in logs.output), logs.output)
+        self.assertEqual(self.post(body, headers={"x-claude-code-session-id": "conversation-A"}), r2)
+
+    def test_a_retry_that_changes_the_pinned_model_is_refused_not_replayed(self):
+        body, r2 = self._answered_tool_turn()
+        try:
+            self.post(dict(body, model="sub/opus"))
+            self.fail("a retry naming another model was served")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 409)
+            err = json.loads(exc.read())
+        self.assertIn("the model is fixed per conversation", err["error"]["message"])
+        self.assertNotIn(r2["id"], json.dumps(err))
+
+    def test_a_reply_over_the_replay_cap_is_not_kept_and_its_retry_409s(self):
+        with mock.patch.object(server, "REPLAY_MAX_BYTES", 16), \
+                self.assertLogs("cortados.provider", "INFO") as logs:
+            body, _ = self._answered_tool_turn()
+        (session,) = self.reg.sessions.values()
+        self.assertIsNone(session.last_reply)
+        self.assertTrue(any("not kept for a retry replay" in l and "over REPLAY_MAX_BYTES" in l
+                            for l in logs.output), logs.output)
+        self.assertEqual(self._409_class(body), "retry_of_answered_turn")
+
+    def test_an_unserialisable_reply_is_not_kept_and_says_why(self):
+        session = type("S", (), {"id": "abcdef0123", "history": ["x"], "last_reply": ("old",)})()
+        turn = wire.parse_request({"messages": [{"role": "user", "content": "hi"}]})
+        loop: list = []
+        loop.append(loop)                                              # json.dumps refuses a circular reference
+        with self.assertLogs("cortados.provider", "INFO") as logs:
+            server._remember_reply(session, turn, "msg_1", "cortados", ([{"type": "text", "text": "a"}], "end_turn",
+                                                                         {"x": loop}))
+        self.assertIsNone(session.last_reply)
+        self.assertTrue(any("does not serialize (ValueError)" in l for l in logs.output), logs.output)
+
+    def test_a_retry_two_turns_behind_with_the_same_user_text_409s_as_client_behind(self):
+        # Turn N and turn N+1 carry the same user text, so turn N's retry has the stored reply's turn fingerprint;
+        # only the history-length guard in _replays tells it is two replies behind, not a retry of the last turn.
+        body, r2 = self._answered_tool_turn()
+        history = body["messages"] + [{"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "thanks"}]
+        turn_n = {"tools": [READ_TOOL], "messages": history}
+        r3 = self.post(turn_n)
+        self.post({"tools": [READ_TOOL], "messages": history + [{"role": "assistant", "content": r3["content"]},
+                                                                {"role": "user", "content": "thanks"}]})
+        (session,) = self.reg.sessions.values()
+        self.assertEqual(len(session.history), 4)
+        self.assertEqual(session.last_reply[1], wire.turn_fingerprint(wire.parse_request(turn_n)))
+        self.assertEqual(self._409_class(turn_n), "client_behind=2")
+
+    def test_two_sessions_the_same_retry_could_replay_are_refused_not_guessed(self):
+        opening = [{"role": "user", "content": "hi"}]
+        a = self.post({"tools": [READ_TOOL], "messages": opening})
+        self.post({"tools": [READ_TOOL], "messages": opening})          # same opening, same text reply
+        follow = {"tools": [READ_TOOL], "messages": opening + [{"role": "assistant", "content": a["content"]},
+                                                               {"role": "user", "content": "more"}]}
+        sa, sb = list(self.reg.sessions.values())
+        replies = []
+        for live, aside in ((sa, sb), (sb, sa)):                        # advance each alone: together it is ambiguous
+            with self.reg._lock:
+                self.reg.sessions.pop(aside.id)
+            try:
+                replies.append(self.post(follow))
+            finally:
+                with self.reg._lock:
+                    self.reg.sessions[aside.id] = aside
+        self.assertNotEqual(replies[0]["id"], replies[1]["id"])
+        self.assertEqual(sa.history, sb.history)
+        with self.assertLogs("cortados.provider", "WARNING") as logs:
+            try:
+                self.post(follow)
+                self.fail("an ambiguous retry was replayed")
+            except urllib.error.HTTPError as exc:
+                self.assertEqual(exc.code, 409)
+                raw = exc.read().decode()
+        for r in replies:
+            self.assertNotIn(r["id"], raw)
+        line = next(l for l in logs.output if "409 lost conversation" in l)
+        self.assertIn("candidates=2", line)
+
+    def test_a_stale_continuation_whose_conversation_closed_while_waiting_is_classified(self):
+        body, r2 = self._answered_tool_turn()
+        (session,) = self.reg.sessions.values()
+        follow = {"tools": [READ_TOOL], "messages": body["messages"] + [
+            {"role": "assistant", "content": r2["content"]}, {"role": "user", "content": "thanks"}]}
+        codes = []
+
+        def continuation():
+            codes.append(self.status_of(follow))
+        session.lock.acquire()
+        try:
+            with self.assertLogs("cortados.provider", "WARNING") as logs:
+                t = threading.Thread(target=continuation)
+                t.start()
+                time.sleep(1.0)                                         # it has found the session and waits on the lock
+                with self.reg._lock:
+                    self.reg.sessions.pop(session.id)                   # closed meanwhile (a failure elsewhere, a reap)
+                session.lock.release()
+                t.join(30)
+        finally:
+            if session.lock.locked():
+                session.lock.release()
+            session.close()
+        self.assertEqual(codes, [409])
+        self.assertTrue(any("409 lost conversation: class=closed_while_waiting" in l for l in logs.output),
+                        logs.output)
+
     def _409_class(self, body):
         with self.assertLogs("cortados.provider", "WARNING") as logs:
             self.assertEqual(self.status_of(body), 409)
@@ -444,6 +592,12 @@ class EndpointTests(EndpointHarness):
         edited = list(history)
         edited[3] = {"role": "assistant", "content": [{"type": "text", "text": "an answer this endpoint never wrote"}]}
         self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": edited + tail}), "diverged_at=1")
+        # Retried two replies behind the live session (P2-1): named client_behind, not a divergence.
+        (session,) = self.reg.sessions.values()
+        self.post({"tools": [READ_TOOL], "messages": history + tail})     # the session is now at 3 replies
+        self.assertEqual(len(session.history), 3)
+        behind = history[:2] + [{"role": "user", "content": "a different turn"}]   # 1 reply, then a new turn
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": behind}), "client_behind=2")
         stranger = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
         self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": stranger + tail}), "no_candidate")
         self.reg.reap(-1)                               # every idle session is past a negative idle limit
@@ -454,7 +608,7 @@ class EndpointTests(EndpointHarness):
         a = self.post({"tools": [READ_TOOL], "messages": opening})
         self.post({"tools": [READ_TOOL], "messages": opening})          # same opening, same text reply
         follow = opening + [{"role": "assistant", "content": a["content"]}, {"role": "user", "content": "more"}]
-        self.assertEqual(self.status_of({"tools": [READ_TOOL], "messages": follow}), 409)
+        self.assertEqual(self._409_class({"tools": [READ_TOOL], "messages": follow}), "ambiguous")
 
     def test_a_toolless_call_never_blocks_a_session_waiting_for_a_tool_result(self):
         history = [{"role": "user", "content": "please use tool"}]
