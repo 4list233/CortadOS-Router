@@ -5,7 +5,15 @@ and model. Between two readings of the same window with no reset in between, tok
 Pooled over the last 14 days with intervals weighted by their Δ% (noisy 1-point moves count little). Output ~/.cortados/unit-cost.json:
   {pool: {"tokens_per_pct", "capacity_tokens" (=100×), "remaining_tokens" (from the latest reading), "intervals", "confidence"}}
 Refreshed daily by the nightly job and whenever the sampler runs with --learn. The router uses remaining_tokens to prefer the pool with the
-most ABSOLUTE room among the underused ones, and the readout shows "≈ N M tokens left" next to the percentage."""
+most ABSOLUTE room among the underused ones, and the readout shows "≈ N M tokens left" next to the percentage.
+
+Pools are per account: the bare lane keeps the old name (claude:all), another Claude account lane claude#b gets claude#b:all, so
+two logins never share one tokens_per_pct. Ledger rows carry `lane` (written by cortados_router/usage_ledger.py from the
+provider); rows without it (the old Hermes ledger) are charged to the bare lane's pool, as before.
+
+Caveat (2026-11-03): the ledger sees only turns run through the provider. Interactive use of the same login elsewhere (the
+Claude app, a direct `claude` / `codex` session) also moves the % but adds no tokens here, so tokens_per_pct is a LOWER BOUND
+until other usage sources are added. confidence is therefore capped at "rough" ("lower-bound" in the record says why)."""
 from __future__ import annotations
 
 # This file is also loaded by path (Hermes plugin loader, s1/, tests, `python core.py`): make its package importable.
@@ -27,7 +35,32 @@ from pathlib import Path
 STATE = Path(_env_get("CORTADOS_HOME") or Path.home() / ".cortados")
 OUT = STATE / "unit-cost.json"
 # ledger runtime/model → the pool its tokens are charged to
-def pool_of(runtime: str, model: str) -> str | None:
+def _acct(base: str, lane: str | None) -> str:
+    """The pool prefix for an account lane: claude#b -> 'claude#b'; no lane or the bare lane -> the vendor name."""
+    if lane and "#" in lane:
+        return base + "#" + lane.split("#", 1)[1]
+    return base
+
+
+def pool_of(runtime: str, model: str, lane: str | None = None) -> str | None:
+    p = _pool_of(runtime, model)
+    if p is None:
+        return None
+    vendor, _, rest = p.partition(":")
+    return f"{_acct(vendor, lane)}:{rest}"
+
+
+def window_pool(lane: str, window: str) -> str | None:
+    """Pool for a scarcity-history window of `lane` (claude, claude#b, codex …): WINDOW_POOL on the base lane, account kept."""
+    base = lane.split("#", 1)[0]
+    p = WINDOW_POOL.get((base, window))
+    if p is None:
+        return None
+    vendor, _, rest = p.partition(":")
+    return f"{_acct(vendor, lane)}:{rest}"
+
+
+def _pool_of(runtime: str, model: str) -> str | None:
     m = (model or "").lower()
     if runtime == "claude":
         return "claude:fable" if "fable" in m else "claude:all"
@@ -57,15 +90,20 @@ def learn(days: int = 14) -> dict:
             continue
         for lane, v in r["lanes"].items():
             for w in v.get("windows") or []:
-                p = WINDOW_POOL.get((lane, w[0]))
+                p = window_pool(lane, w[0])
                 if p:
                     series[p].append((r["ts"], float(w[1])))
     c = sqlite3.connect(STATE / "usage.db")
-    rows = c.execute("SELECT ts, runtime, model, input_tokens+output_tokens+cache_read_tokens+cache_write_tokens FROM usage WHERE ts > ?", (since,)).fetchall()
-    c.close()
+    try:
+        has_lane = "lane" in {r[1] for r in c.execute("PRAGMA table_info(usage)")}
+        lane_col = "lane" if has_lane else "NULL"
+        rows = c.execute(f"SELECT ts, runtime, model, input_tokens+output_tokens+cache_read_tokens+cache_write_tokens, {lane_col} FROM usage WHERE ts > ?",
+                         (since,)).fetchall()
+    finally:
+        c.close()
     tokens: dict[str, list[tuple[float, int]]] = defaultdict(list)
-    for ts, rt, model, tok in rows:
-        p = pool_of(rt, model)
+    for ts, rt, model, tok, lane in rows:
+        p = pool_of(rt, model, lane)
         if p and tok:
             tokens[p].append((ts, int(tok)))
     out = {}
@@ -85,7 +123,8 @@ def learn(days: int = 14) -> dict:
         if den > 0:
             tpp = num / den
             out[p] = {"tokens_per_pct": round(tpp), "capacity_tokens": round(100 * tpp), "remaining_tokens": round((100 - latest) * tpp) if latest is not None else None,
-                      "latest_used_pct": latest, "intervals": n, "pct_covered": round(den, 1), "confidence": "good" if den >= 20 and n >= 5 else "rough" if den >= 5 else "weak"}
+                      "latest_used_pct": latest, "intervals": n, "pct_covered": round(den, 1), "confidence": "rough" if den >= 5 else "weak", "lower_bound": True}
+            # never "good": provider-only ledger, so tokens_per_pct undercounts (see the module caveat)
         else:
             out[p] = {"tokens_per_pct": None, "intervals": 0, "confidence": "none", "latest_used_pct": latest}
     OUT.write_text(json.dumps({"learned_at": time.strftime("%Y-%m-%d %H:%M"), "days": days, "pools": out}, indent=1))

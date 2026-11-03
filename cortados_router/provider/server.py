@@ -379,6 +379,17 @@ def _route_lane(route: dict) -> str | None:
     return f"{lane}#{acct}" if lane and acct else lane
 
 
+def _ledger_turn(session: Any, usage: dict | None) -> None:
+    """One usage-ledger row per completed backend turn (unitcost learns tokens per % from it). Only routed sessions carry a
+    lane; a fixed-model session has no route, so its tokens cannot be charged to a pool and are not written."""
+    route = getattr(session, "route", None)
+    lane = _route_lane(route) if route else None
+    if not lane:
+        return
+    from cortados_router import usage_ledger
+    usage_ledger.record_async(lane, str(route.get("model") or ""), usage)
+
+
 def _route_pct_left(route: dict) -> float | None:
     """% left in the pool the route's model draws on, via core.headroom_pct_for (the min headroom across the lane's
     general windows and the model's own pool; None unless the reading is fresh, for the login the route EXECUTES on,
@@ -1170,6 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
                 _turn_t0 = time.time()
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
+                _ledger_turn(session, outcome["turn"][2])
                 session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
                 if session.route and not session.route_logged and reg.executed:
                     try:
