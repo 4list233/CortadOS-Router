@@ -91,7 +91,10 @@ def run_task(spec: dict, served, admit=None) -> dict:
 
     A task is claimed first, so no two workers launch paid work for it; every run is announced in attempts.jsonl
     before it starts, so a crash mid-run leaves a visible spent attempt (the run itself is safe to repeat)."""
-    admit = admit or (lambda lane, model: quota.admit(core, lane, model))
+    if admit is None:
+        from outcome import provider
+        # Provider mode: each band's door is the provider-revealed headroom of the lane its pinned model runs on.
+        admit = provider.admit if provider.enabled() else (lambda lane, model: quota.admit(core, lane, model))
     if not CLAIMS.take(spec["id"]):
         return {"skipped": "claimed by another worker"}
     try:
@@ -132,6 +135,10 @@ def _run_claimed(spec: dict, served, admit) -> dict:
                                   "band": rung["band"], "route": rung["route"], "started": time.time()})
         result = run_one(spec, rung)
         by_route[key] = result
+        served = (result.get("trace") or {}).get("served_model")
+        if served:                                     # provider mode: the model that actually served this band
+            row["served"] = {"model": served, "lane": result["trace"].get("served_lane"),
+                             "left_pct": result["trace"].get("left_pct")}
         store.append("runs", {**row, "result": result})
         counts["ran"] += 1
     if not counts["held"]:                             # every rung has a row: the task is ready for the judge

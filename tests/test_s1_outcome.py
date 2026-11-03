@@ -166,7 +166,10 @@ FAKE_CLAUDE = textwrap.dedent("""\
     prompt = sys.stdin.read()
     if "create" in prompt.lower():
         open("solution.txt", "w").write("done\\n")
-    print(json.dumps({{"type": "assistant", "message": {{"content": [{{"type": "tool_use", "name": "Write"}}]}}}}))
+    msg = {{"content": [{{"type": "tool_use", "name": "Write"}}]}}
+    if os.environ.get("FAKE_REVEAL"):
+        msg["model"] = os.environ["FAKE_REVEAL"]
+    print(json.dumps({{"type": "assistant", "message": msg}}))
     print(json.dumps({{"type": "result", "result": "Created solution.txt", "num_turns": 2, "usage": {{"output_tokens": 5}}}}))
     """)
 
@@ -207,6 +210,46 @@ class RunTests(OutcomeCase):
         env = self._dump()["env"]
         for key in agents.SCRUBBED_ENV:
             self.assertNotIn(key, env)
+
+    def _provider_mode(self, reveal):
+        p = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_BACKEND": "provider", "CORTADOS_PROVIDER_URL": "http://prov:8432/",
+                                         "CORTADOS_PROVIDER_TOKEN": "ptok", "FAKE_REVEAL": reveal})
+        p.start(); self.addCleanup(p.stop)
+
+    def test_provider_mode_runs_a_codex_band_as_a_claude_session_pinned_through_the_provider(self):
+        self._provider_mode("gpt-6-astra · 48% left")
+        rung = {"band": "R1", "route": {"lane": "codex", "provider": "codex-cli", "model": "gpt-6-astra"}}
+        result = run.run_one(_spec(), rung)
+        d = self._dump()
+        argv, env = d["argv"], d["env"]
+        self.assertEqual(argv[argv.index("--model") + 1], "sub/gpt-6-astra")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://prov:8432")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "ptok")
+        self.assertNotIn("ANTHROPIC_API_KEY", env)                              # never API billing
+        hdrs = env["ANTHROPIC_CUSTOM_HEADERS"].split("\n")
+        self.assertIn("x-cortados-reveal: 1", hdrs)
+        self.assertTrue(any(h.startswith("x-cortados-run-id: s1-outcome-run-") for h in hdrs))
+        # containment unchanged: Bash still sandboxed with an empty network allowlist
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["sandbox"]["network"]["allowedDomains"], [])
+        self.assertTrue(settings["sandbox"]["failIfUnavailable"])
+        t = result["trace"]
+        self.assertEqual((t["served_model"], t["served_lane"], t["left_pct"], t["via"]), ("gpt-6-astra", "codex", 48.0, "provider"))
+        from outcome import provider
+        ok, why = provider.admit("codex"); self.assertTrue(ok); self.assertIn("48%", why)
+
+    def test_provider_mode_low_headroom_on_the_serving_lane_holds_later_bands(self):
+        self._provider_mode("claude-opus-5-5 · 2% left")
+        run.run_one(_spec(), self._rung())
+        from outcome import provider
+        self.assertFalse(provider.admit("claude")[0])
+        self.assertTrue(provider.admit("codex")[0])
+
+    def test_local_mode_still_scrubs_the_gateway(self):
+        run.run_one(_spec(), self._rung())
+        d = self._dump()
+        self.assertEqual(d["argv"][d["argv"].index("--model") + 1], "claude-x")
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", d["env"])
 
     def test_each_claude_run_gets_a_private_short_scratch_root_that_is_removed(self):
         run.run_one(_spec(), self._rung())

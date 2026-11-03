@@ -7,8 +7,11 @@ Backends (2026-11-03): with CORTADOS_PROVIDER_URL set (token from CORTADOS_PROVI
 CORTADOS_PROVIDER_TOKEN_FILE, default ~/.config/cortados/provider-token), judge (sub/claude-fable-5-1) and generate
 (sub/<CORTADOS_OUTCOME_GENERATOR>) run through the cortados provider, which picks the account (claude, claude#b, codex)
 by scarcity; their quota door is the provider-revealed "% left" of the serving lane (outcome/provider.py), held below
-5 %. CORTADOS_OUTCOME_BACKEND=local restores the local CLI path and the local usage reading (quota.py). Ladder runs
-(agents.run_task) still use the local subscription CLIs and quota.py; quota.py now treats Claude's dropped 5-hour
+5 %. CORTADOS_OUTCOME_BACKEND=local restores the local CLI path and the local usage reading (quota.py). In provider
+mode every ladder band, Claude or Codex, runs as a sandboxed Claude Code session pointed at the provider
+(ANTHROPIC_BASE_URL/AUTH_TOKEN, `--model sub/<band model>`, run-id + reveal headers); the run row records the model and
+lane that served, and the band's door is provider.admit on that lane. Bash keeps an empty network allowlist; only the
+CLI process reaches the provider. In local mode quota.py treats Claude's dropped 5-hour
 panel as absent (weekly window required) and lets an unknown-ownership model ride the weekly window while the
 per-model panel is down (CORTADOS_OUTCOME_STRICT_PANEL=1 restores the old refusal).
 """
