@@ -25,6 +25,7 @@ from cortados_router.compat import getenv as _env_get
 
 import fcntl
 import json
+import logging
 import os
 import pty
 import re
@@ -881,9 +882,18 @@ def _sample_locked(force: bool = False, only: list[str] | None = None) -> dict[s
         out = _write_cache({l: lanes[l] for l in results}, now if covers_subscriptions else None, {"probe_sweep": sweep})
         if results and "--learn" in sys.argv or (results and time.time() - float(prev.get("learned_at") or 0) > 6 * 3600):
             try:
-                _learn_unit_costs(); out["learned_at"] = time.time()
-            except Exception:
-                pass
+                _learn_unit_costs()
+                # Persisted, not only returned: the 6-hour gate reads learned_at from disk, and a stale learn_error on disk
+                # would keep reporting a failure that a later learn already recovered from.
+                out = _write_cache({}, None, {"learned_at": time.time(), "learn_error": None, "learn_error_at": None})
+            except Exception as exc:      # visible, not swallowed: the router falls back to price-only weights while this fails
+                msg = f"{type(exc).__name__}: {str(exc)[:160]}"
+                logging.getLogger("cortados.scarcity").warning("unit-cost learning failed (%s)", msg)
+                out["learn_error"] = msg
+                try:
+                    _write_cache({}, None, {"learn_error": msg, "learn_error_at": time.time()})
+                except Exception as wexc:
+                    logging.getLogger("cortados.scarcity").warning("could not record the learn error in the cache (%s)", type(wexc).__name__)
         if results:
             with HISTORY.open("a") as h:
                 h.write(json.dumps({"ts": now, "lanes": {l: {"scarcity": v.get("scarcity"), "windows": [[w["window"], w["used_pct"], w["elapsed_pct"]] for w in v.get("windows") or []]}

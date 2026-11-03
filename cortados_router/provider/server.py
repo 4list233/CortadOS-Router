@@ -387,6 +387,28 @@ def _route_lane(route: dict) -> str | None:
     return f"{lane}#{acct}" if lane and acct else lane
 
 
+def _ledger_turn(session: Any, usage: dict | None) -> None:
+    """One usage-ledger row per completed backend turn (unitcost learns tokens per % from it). Only routed sessions carry a
+    lane; a fixed-model session has no route, so its tokens cannot be charged to a pool and are not written."""
+    route = getattr(session, "route", None)
+    lane = _route_lane(route) if route else None
+    if not lane:
+        return
+    from cortados_router import usage_ledger
+    usage_ledger.record_async(lane, str(route.get("model") or ""), usage)
+
+
+_ledger_hook_warned: set[str] = set()
+
+
+def _log_ledger_hook_failure(exc: BaseException) -> None:
+    """Type name only (the message could carry a path or usage payload), once per type, so a broken hook cannot flood the log."""
+    kind = type(exc).__name__
+    if kind not in _ledger_hook_warned:
+        _ledger_hook_warned.add(kind)
+        logger.warning("usage ledger hook failed (%s); the turn is unaffected; later %s failures are not logged", kind, kind)
+
+
 def _route_pct_left(route: dict) -> float | None:
     """% left in the pool the route's model draws on, via core.headroom_pct_for (the min headroom across the lane's
     general windows and the model's own pool; None unless the reading is fresh, for the login the route EXECUTES on,
@@ -1337,6 +1359,12 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["turn"] = session.run_turn(deadline - time.time())
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
                 _remember_reply(session, turn, msg_id, model, outcome["turn"])
+                try:
+                    _ledger_turn(session, outcome["turn"][2])
+                except Exception as exc:
+                    # The ledger only feeds unit-cost learning: it must never break a turn. Without this guard the reply
+                    # would go out while history fell behind the client, killing the conversation on its next continuation.
+                    _log_ledger_hook_failure(exc)
                 session.history.append(anthropic_wire.reply_fingerprint(outcome["turn"][0]))
                 if session.route and not session.route_logged and reg.executed:
                     try:
