@@ -75,8 +75,12 @@ CHILD_TOOLS = [
                              "than claude-haiku-5-5 have no auto mode: unset, they get acceptEdits; 'auto' is refused); acceptEdits: edits in cwd allowed, other approval-needing "
                              "tools denied; manual: approval-needing tools denied; dontAsk: only pre-approved tools "
                              "run; plan: read-only. bypassPermissions is deliberately not offered."},
-         "chrome": {"type": "boolean", "description": "Opt-in (default false): give the child Claude in Chrome, which "
-                    "acts in the user's real signed-in Chrome (each session gets its own tab group)."},
+         "chrome": {"type": "boolean", "description": "Opt-in (default false): LOGIN MODE. The child runs directly on "
+                    "the user's claude.ai login (NOT routed by S1; spends the main Claude subscription) so Claude in "
+                    "Chrome loads; it acts in the user's real signed-in Chrome in its own tab group. Model: cortados -> "
+                    "claude-sonnet-5-5, a claude-* or sub/claude-* model as given; non-Claude models are refused. "
+                    "osascript/open -a/Playwright/Puppeteer are blocked. connectors are refused (the login loads the "
+                    "user's claude.ai connectors). Refused if Claude settings set an API key/token/base URL."},
          "connectors": {"type": "array", "items": {"type": "string"}, "description": "Optional: names of servers "
                         "from ~/.config/cortados/connectors.mcp.json the child needs (default none). Each server's "
                         "tool schemas are sent with every request; loading them all can exceed the model's context "

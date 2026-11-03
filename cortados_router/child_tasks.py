@@ -129,8 +129,79 @@ CHILD_DIRECTIVE = ("You are a CortadOS CHILD TASK started by an orchestrator. Do
                    "report of what you did, what you verified, and anything left undone.")
 
 
+# --- chrome: true = LOGIN MODE (Forest's decision, 2026-11-03) ---------------------------------------------------
+# Measured with Claude Code 2.1.316: a session pointed at the provider (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, or
+# ANTHROPIC_API_KEY set, even empty) loads 30 tools and NO claude-in-chrome server; a plain claude.ai-login session loads
+# claude-in-chrome (22 mcp__claude-in-chrome__* tools). So a chrome child runs directly on the user's login, unrouted by
+# S1, spending the main Claude subscription. chrome: false is untouched.
+LOGIN_LANE = "login (unrouted, chrome)"
+# S1 cannot route a login-mode session, so the routed orchestrator `cortados` maps to this fixed model.
+LOGIN_DEFAULT_MODEL = "claude-sonnet-5-5"
+# Removed from a chrome child's env: each either sends the session to the provider/another backend or makes Claude Code
+# drop the login auth (which disables Claude in Chrome).
+LOGIN_STRIP_ENV = ("ANTHROPIC_BASE_URL",          # would route the session to the provider
+                   "ANTHROPIC_AUTH_TOKEN",        # token auth: Claude in Chrome does not load
+                   "ANTHROPIC_API_KEY",           # API-key auth (even empty): Claude in Chrome does not load
+                   "ANTHROPIC_CUSTOM_HEADERS",    # provider routing headers (run id, reveal) have no meaning here
+                   "ANTHROPIC_UNIX_SOCKET")       # another transport to a non-login backend
+LOGIN_STRIP_PREFIXES = ("CLAUDE_CODE_USE_",                # Bedrock/Vertex/Foundry/...: a different backend, no login
+                        "CLAUDE_CODE_SUBAGENT_MODEL")      # `cortados` subagent pin: meaningless without the provider
+LOGIN_STRIP_EXTRA = ("CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL",)  # same reason as the subagent pin
+# Settings files a login child reads; any of these keys in them would disable Chrome or send the session elsewhere.
+USER_CLAUDE_SETTINGS = "~/.claude/settings.json"   # tests point this elsewhere
+LOGIN_BAD_SETTINGS_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
+# Browser control other than Claude in Chrome is hard-blocked: a routed child without Chrome tools once drove the real
+# Chrome through osascript (17 Bash calls) and kept stealing screen focus; Playwright/Puppeteer are unwanted (security).
+CHROME_DISALLOWED_TOOLS = ("Bash(osascript:*)", "Bash(osascript *)", "Bash(open -a *)", "Bash(npx playwright*)",
+                           "Bash(playwright*)", "Bash(*puppeteer*)", "mcp__playwright", "mcp__puppeteer")
+CHROME_DIRECTIVE = ("BROWSER RULES: for any browser work use only the mcp__claude-in-chrome__* tools, working in your "
+                    "own tab group. Never control a browser through AppleScript/osascript, Playwright, Puppeteer, "
+                    "Selenium or by opening apps. If the Claude in Chrome tools are unavailable, stop and report that "
+                    "instead of improvising.")
+
+
 class TaskError(Exception):
     pass
+
+
+def login_model(name) -> str:
+    """The model a chrome (login-mode) child runs: `cortados` -> LOGIN_DEFAULT_MODEL (S1 cannot route a login session);
+    a Claude model or sub/<claude model> -> that model id; anything else is refused (the login only runs Claude)."""
+    if name == "cortados":
+        return LOGIN_DEFAULT_MODEL
+    model = pin_model(name)
+    model = model.split("/", 1)[1] if model.startswith("sub/") else model
+    if not model.startswith("claude-"):
+        raise TaskError(f"chrome tasks run on the user's claude.ai login, which can only run Claude models; {name!r} "
+                        f"({model}) is not one. Use cortados (= {LOGIN_DEFAULT_MODEL}) or a claude-* model.")
+    return model
+
+
+def check_login_settings(cwd: str) -> None:
+    """Fail closed: refuse a chrome child if a settings file it would load sets an API key/token/base URL in env or an
+    apiKeyHelper; each would disable Claude in Chrome or send the session away from the login."""
+    for path in (os.path.expanduser(USER_CLAUDE_SETTINGS), os.path.join(cwd, ".claude", "settings.json"),
+                 os.path.join(cwd, ".claude", "settings.local.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise TaskError(f"chrome task refused: cannot read {path} to check it ({type(exc).__name__})") from None
+        if not isinstance(cfg, dict):
+            continue
+        env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+        bad = [k for k in LOGIN_BAD_SETTINGS_ENV if k in env] + (["apiKeyHelper"] if "apiKeyHelper" in cfg else [])
+        if bad:
+            raise TaskError(f"chrome task refused: {path} sets {', '.join(bad)}, which would disable Claude in Chrome "
+                            "or send the session away from the claude.ai login; remove it or run without chrome")
+
+
+def login_env(environ) -> dict:
+    return {k: v for k, v in environ.items()
+            if k not in STRIP_ENV and k not in LOGIN_STRIP_ENV and k not in LOGIN_STRIP_EXTRA
+            and not k.startswith(LOGIN_STRIP_PREFIXES)}
 
 
 def tasks_dir() -> str:
@@ -398,11 +469,20 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
-    permission_mode, mode_note = resolve_permission_mode(permission_mode, orchestrator)
-    selected = select_connectors(connectors)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
-    if not provider_url:
+    login = None
+    if chrome:
+        login = login_model(orchestrator)
+        if connectors:
+            # Refused, not ignored: in login mode the user's claude.ai connectors load through the login itself, and a
+            # silently dropped list would hide that from the caller.
+            raise TaskError("connectors are not used with chrome: true (login mode loads the user's claude.ai "
+                            "connectors through the login itself); omit connectors")
+        check_login_settings(cwd)
+    permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
+    selected = select_connectors(None if chrome else connectors)
+    if not provider_url and not chrome:
         raise TaskError("start_task is not configured: set CORTADOS_PROVIDER_URL for the cortados-route MCP server")
     max_s = _max_s()
     exe = claude_bin()
@@ -423,7 +503,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
-                                  chrome, max_s, exe, selected)
+                                  chrome, max_s, exe, selected, login)
         if mode_note:
             meta["permission_mode_note"] = mode_note
             _write_json(os.path.join(d, "meta.json"), meta)
@@ -454,6 +534,8 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
                         f"{exc})") from None
     _REAP[task_id] = runner
     out = {"task_id": task_id, "state": "running", "dir": d, "permission_mode": permission_mode}
+    if login:
+        out.update(lane=LOGIN_LANE, model=login)
     if mode_note:
         out["permission_mode_note"] = mode_note
     if prune_errors:
@@ -474,9 +556,11 @@ def _abort_runner(runner, d: str) -> None:
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None):
+             exe, selected=None, login=None):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
+    if login:
+        return _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, login)
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
         launch += ["--token-file", token_file]
@@ -535,6 +619,29 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     return meta, env, cmd
 
 
+def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model):
+    """chrome: true. No launcher, no --settings provider file, no provider env: claude on the user's own login."""
+    cmd = [exe, "--model", model, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
+           permission_mode, "--permission-prompts", "none"]
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
+    cmd += ["--disallowedTools", ",".join(CHROME_DISALLOWED_TOOLS), "--chrome",
+            "--append-system-prompt", CHILD_DIRECTIVE + "\n\n" + CHROME_DIRECTIVE]
+    env = login_env(os.environ)
+    env[NESTED_ENV] = "1"
+    with open(os.open(os.path.join(d, "prompt.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
+              encoding="utf-8") as f:
+        f.write(task)
+    meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
+            "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
+            "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
+            "max_s": max_s, "runner_pid": None, "cred_fingerprints": [], "argv": cmd[1:]}
+    _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
+                                              "event": _event_fields(meta), "started_at": meta["started_at"]})
+    _write_json(os.path.join(d, "meta.json"), meta)
+    return meta, env, cmd
+
+
 def _add_child_directive(cmd: list) -> None:
     """Append CHILD_DIRECTIVE to the system prompt, LAST. Order: claude's own prompt, then CLAUDE.md, then the
     --append-system-prompt text; within that text a pinned orchestrator's whole-session directive comes first and the
@@ -549,7 +656,10 @@ def _add_child_directive(cmd: list) -> None:
 
 
 def _event_fields(meta: dict) -> dict:
-    return {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    out = {k: meta.get(k) for k in ("task_id", "cwd", "orchestrator", "permission_mode", "chrome")}
+    if meta.get("lane"):
+        out.update(lane=meta["lane"], model=meta.get("model"))
+    return out
 
 
 _REAP: dict = {}    # Popen handles of runners this server started: polled so an exited runner is reaped, not a zombie
@@ -718,6 +828,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
            "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
            "permission_mode": meta.get("permission_mode"), "dir": d,
            "stdout_log": os.path.join(d, "stdout.log"), "stderr_log": os.path.join(d, "stderr.log")}
+    if meta.get("lane"):
+        out.update(lane=meta["lane"], model=meta.get("model"))
     if res is not None:
         o = res.get("output") or {}
         out["exit_code"] = res.get("exit_code")
@@ -752,7 +864,9 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         if res.get("error"):
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
-        out["router_run"] = fetch_run(provider_url, token, task_id)
+        # A login-mode (chrome) task never went through the provider: there is no run record to fetch.
+        out["router_run"] = ({"note": "login mode: not routed, no provider run record"} if meta.get("lane")
+                             else fetch_run(provider_url, token, task_id))
         # Why the provider refused (Claude Code replaces a 413's message with its own "images" text, so the child's
         # result never says): the most recent refusal recorded under this run, plus a hint for the known cause.
         refusals = out["router_run"].get("refusals") if isinstance(out["router_run"], dict) else None

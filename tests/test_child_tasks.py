@@ -265,6 +265,10 @@ class ChildTaskTests(unittest.TestCase):
         p = mock.patch.object(ct, "MANAGED_DIRS", (os.path.join(self.tmp, "no-managed"),))
         p.start()
         self.addCleanup(p.stop)
+        self.user_settings = os.path.join(self.tmp, "user-settings.json")
+        us = mock.patch.object(ct, "USER_CLAUDE_SETTINGS", self.user_settings)
+        us.start()
+        self.addCleanup(us.stop)
         self.runs = {}
 
         def fake_urlopen(req, timeout=None):
@@ -1361,6 +1365,71 @@ class ChildTaskTests(unittest.TestCase):
         a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
         self.assertIn("--chrome", a)
         self.assertNotIn("--no-chrome", a)
+
+    def test_chrome_login_mode_env_and_argv(self):
+        os.environ.update({"ANTHROPIC_BASE_URL": "http://x.invalid", "ANTHROPIC_AUTH_TOKEN": "tok-test-000000001",
+                           "ANTHROPIC_API_KEY": "", "ANTHROPIC_CUSTOM_HEADERS": "h: v", "ANTHROPIC_UNIX_SOCKET": "/s",
+                           "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "cortados",
+                           "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados"})
+        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True)
+        self.assertEqual(out["lane"], ct.LOGIN_LANE)
+        self.assertEqual(out["model"], "claude-sonnet-5-5")
+        d = ct.task_path(out["task_id"])
+        _, st = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(st["lane"], ct.LOGIN_LANE)
+        self.assertIn("login mode", st["router_run"]["note"])
+        meta = _load(os.path.join(d, "meta.json"))
+        self.assertEqual((meta["lane"], meta["model"]), (ct.LOGIN_LANE, "claude-sonnet-5-5"))
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertNotIn("--settings", a)
+        self.assertEqual(a[a.index("--model") + 1], "claude-sonnet-5-5")
+        self.assertIn("--chrome", a)
+        dis = a[a.index("--disallowedTools") + 1]
+        for t in ("Bash(osascript:*)", "Bash(open -a *)", "Bash(*puppeteer*)", "mcp__playwright", "mcp__puppeteer"):
+            self.assertIn(t, dis)
+        self.assertIn("mcp__claude-in-chrome__", a[a.index("--append-system-prompt") + 1])
+        env = ct.login_env(dict(os.environ, CLAUDECODE="1"))
+        for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
+                  "ANTHROPIC_UNIX_SOCKET", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_SUBAGENT_MODEL",
+                  "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL", "CLAUDECODE"):
+            self.assertNotIn(k, env)
+        with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
+            self.assertIn(ct.LOGIN_LANE, f.read())
+
+    def test_chrome_model_mapping_and_refusals(self):
+        self.assertEqual(ct.login_model("cortados"), "claude-sonnet-5-5")
+        self.assertEqual(ct.login_model("claude-opus-5-5"), "claude-opus-5-5")
+        self.assertEqual(ct.login_model("sub/claude-haiku-5-5"), "claude-haiku-5-5")
+        for bad in ("gpt-6.1-sol", "qwen-27b"):
+            r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True, orchestrator=bad)
+            self.assertIn("only run Claude models", r["content"][0]["text"])
+        r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True, connectors=["a"])
+        self.assertIn("connectors are not used with chrome", r["content"][0]["text"])
+        r, out = self.call("start_task", task="x", cwd=self.work, chrome=True,
+                           orchestrator="claude-haiku-4-5-20251001")
+        self.assertEqual(out["permission_mode"], "acceptEdits")
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_chrome_refuses_api_settings(self):
+        cases = [(self.user_settings, {"env": {"ANTHROPIC_API_KEY": "x"}}),
+                 (os.path.join(self.work, ".claude", "settings.json"), {"apiKeyHelper": "x"}),
+                 (os.path.join(self.work, ".claude", "settings.local.json"), {"env": {"ANTHROPIC_BASE_URL": "x"}})]
+        os.makedirs(os.path.join(self.work, ".claude"))
+        for path, cfg in cases:
+            with open(path, "w") as f:
+                json.dump(cfg, f)
+            r, _ = self.call("start_task", task="x", cwd=self.work, chrome=True)
+            self.assertIn("chrome task refused", r["content"][0]["text"])
+            os.unlink(path)
+
+    def test_routed_argv_unchanged_without_chrome(self):
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        a = _load(os.path.join(self.work, "fake-argv.json"))["argv"]
+        self.assertIn("--settings", a)
+        self.assertNotIn("--disallowedTools", a)
+        self.assertNotIn("BROWSER RULES", a[a.index("--append-system-prompt") + 1])
+        self.assertNotIn("lane", _load(os.path.join(ct.task_path(tid), "meta.json")))
 
     def test_installed_claude_accepts_chrome_flags(self):
         import shutil

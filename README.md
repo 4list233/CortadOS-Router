@@ -370,10 +370,18 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
 - `claude -p` and deferred tool loading: with tool search on, a headless session may not have an MCP tool's schema
   loaded and report e.g. "start_task is not a function". Run such sessions with `ENABLE_TOOL_SEARCH=false` so every
   MCP tool is loaded up front.
-- `chrome: true` (default false) passes `--chrome` so the child can use Claude in Chrome, which acts in the user's real
-  signed-in Chrome: opt-in per task, no concurrency limit (each session gets its own tab group). Without it the
-  child gets an explicit `--no-chrome`, so a `claudeInChromeDefaultEnabled` setting cannot turn Chrome on. Chrome inside a
-  headless `-p` child is unverified until a live test.
+- `chrome: true` (default false) runs the child in LOGIN MODE (decided 2026-11-03): `claude` directly on the user's
+  claude.ai login, with no provider `--settings` file and with `ANTHROPIC_BASE_URL/AUTH_TOKEN/API_KEY/CUSTOM_HEADERS/
+  UNIX_SOCKET`, `CLAUDE_CODE_USE_*` and the subagent-model pins removed from its env. Why: through the provider (token
+  or API-key auth) Claude Code 2.1.316 loads no `claude-in-chrome` server; on the login it does. So chrome tasks are
+  NOT routed by S1 and spend the main Claude subscription; status shows `lane: "login (unrouted, chrome)"` and the
+  model. Model: `cortados` -> `claude-sonnet-5-5`; a `claude-*` or `sub/claude-*` model as given; anything else is
+  refused. Refused (fail closed) when `~/.claude/settings.json` or the cwd's `.claude/settings{,.local}.json` sets env
+  `ANTHROPIC_API_KEY/AUTH_TOKEN/BASE_URL` or `apiKeyHelper`. `connectors` is refused for chrome tasks (the login loads
+  the user's claude.ai connectors itself). Other browser control is blocked with `--disallowedTools` (osascript,
+  `open -a`, Playwright, Puppeteer) and the child is told to use only `mcp__claude-in-chrome__*` and to stop and report
+  if those tools are missing: a routed child once drove Chrome through osascript and kept stealing focus. Without
+  `chrome` the child gets an explicit `--no-chrome` and is routed exactly as before.
 - Connectors (opt-in): claude.ai connectors are disabled in token-auth sessions, so their servers are listed in
   `~/.config/cortados/connectors.mcp.json` (or the file named by `CORTADOS_CONNECTORS_MCP_CONFIG`). A child gets only
   the servers named in `connectors` (default none), written to a private per-task `--mcp-config` file that is removed
