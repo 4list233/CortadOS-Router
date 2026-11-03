@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -658,3 +658,216 @@ test('re-tracking a model moves it to the end; the cap still applies', async () 
   expect(trackedWorkerModels()).toEqual(['c', 'a', 'd'])
   resetWorkerModels()
 })
+
+test('resolveMaxTurns: positive integers on, 0/negative/junk off', async () => {
+  expect(resolveMaxTurns(40)).toBe(40)
+  expect(resolveMaxTurns('25')).toBe(25)
+  expect(resolveMaxTurns(12.9)).toBe(12)
+  for (const off of [0, -1, NaN, null, undefined, 'x', {}]) expect(resolveMaxTurns(off)).toBe(null)
+})
+
+test('fmtSecs words a 600000 ms timeout as 600 s, not 60000s', async () => {
+  expect(fmtSecs(600_000)).toBe('600 s')
+  expect(fmtSecs(1_499)).toBe('1 s')
+})
+
+test('newSessionId is a v4 UUID that isSessionUuid accepts; anything injectable is refused', async () => {
+  expect(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(newSessionId())).toBe(true)
+  expect(isSessionUuid(newSessionId())).toBe(true)
+  for (const bad of ['', 'x', '../etc', '12345678-1234-4123-8123-123456789abc; rm -rf /', '12345678-1234-4123-8123-123456789ABC',
+    '12345678-1234-1123-8123-123456789abc', '*', '$(id)', null, 42]) expect(isSessionUuid(bad)).toBe(false)
+})
+
+test('partialFromTranscript keeps the last assistant text and counts progress, skipping junk and a cut last line', async () => {
+  const lines = [
+    JSON.stringify({ type: 'user', message: { content: 'go' } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'first finding' }, { type: 'tool_use', name: 'WebSearch' }] } }),
+    'not json',
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch' }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'second finding' }] } }),
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"cut',
+  ].join('\n')
+  expect(partialFromTranscript(lines)).toEqual({ lastText: 'second finding', toolUses: 2, assistantTurns: 3 })
+  expect(partialFromTranscript('')).toEqual({ lastText: null, toolUses: 0, assistantTurns: 0 })
+})
+
+test('partialFromTranscript counts records sharing a message.id as one turn, every tool_use still counted', async () => {
+  const rec = (id: string, block: any) => JSON.stringify({ type: 'assistant', message: { id, content: [block] } })
+  const lines = [
+    rec('msg_1', { type: 'text', text: 'looking' }),
+    rec('msg_1', { type: 'tool_use', name: 'Grep' }),
+    rec('msg_1', { type: 'tool_use', name: 'Read' }),
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result' }] } }),
+    rec('msg_2', { type: 'text', text: 'found X' }),
+    rec('msg_2', { type: 'text', text: 'and Y' }),
+    rec('msg_2', { type: 'tool_use', name: 'Bash' }),
+  ].join('\n')
+  expect(partialFromTranscript(lines)).toEqual({ lastText: 'found X\nand Y', toolUses: 3, assistantTurns: 2 })
+})
+
+/** Register the mod and return its Agent handler. */
+function agentHandlerFor(opts: any): any {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, ...opts })
+  return agentHandler
+}
+
+test('the child runs --output-format json, a chosen --session-id and the stop-on-dead-tool line; --max-turns is opt-in', async () => {
+  let argv: string[] = []
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => { argv = a; return { exitCode: 0, stdout: '{"type":"system"}\n' + JSON.stringify({ type: 'result', result: 'pong', session_id: 's' }), stderr: '', isStdoutTruncated: false } } },
+    fs: { read: async () => '' }, ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(out.result.content[0].text.endsWith('pong')).toBe(true)
+  expect(out.result.prompt).toBe('say pong')                      // the parent sees its own prompt, not the suffix
+  expect(argv[argv.indexOf('-p') + 1]).toBe('say pong\n\n' + STOP_ON_DEAD_TOOL)
+  expect(argv[argv.indexOf('--output-format') + 1]).toBe('json')
+  expect(argv.includes('stream-json')).toBe(false)
+  expect(argv.includes('--verbose')).toBe(false)
+  expect(isSessionUuid(argv[argv.indexOf('--session-id') + 1])).toBe(true)
+  expect(argv.includes('--max-turns')).toBe(false)                 // default 0: off
+  const h40 = agentHandlerFor({ maxTurns: 40 })
+  await h40($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(argv[argv.indexOf('--max-turns') + 1]).toBe('40')
+})
+
+test('a tool-heavy successful child is not lost to the host stdout cap (result-only json)', async () => {
+  const CAP = 64 * 1024 // the fake host's output cap: stdout past it is cut and flagged truncated
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => {
+      const fmt = a[a.indexOf('--output-format') + 1]
+      const result = JSON.stringify({ type: 'result', result: 'built it', session_id: 's' })
+      // stream-json would emit every intermediate message first (here 200 tool-heavy messages of ~1 KiB each).
+      const full = fmt === 'stream-json'
+        ? Array.from({ length: 200 }, (_, i) => JSON.stringify({ type: 'assistant', i, pad: 'x'.repeat(1024) })).join('\n') + '\n' + result
+        : result
+      return { exitCode: 0, stdout: full.slice(0, CAP), stderr: '', isStdoutTruncated: full.length > CAP }
+    } },
+    fs: { read: async () => '' }, ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'build', description: 'd' }, async () => 'native')
+  expect(out.deny).toBe(undefined)
+  expect(out.result.status).toBe('completed')
+  expect(out.result.content[0].text.endsWith('built it')).toBe(true)
+})
+
+test('a timed-out child hands back its transcript text, session id, elapsed time and the timeout in seconds', async () => {
+  let sid = ''
+  let readPath = ''
+  let shArgv: string[] = []
+  const h = agentHandlerFor({ subagentTimeoutMs: 1 })
+  const $ = {
+    process: {
+      run: async (a: string[]) => {
+        if (a[0] === 'sh') { shArgv = a; return { exitCode: 0, stdout: `/home/u/.claude/projects/-work-my-repo/${a[4]}.jsonl\n`, stderr: '', isStdoutTruncated: false } }
+        sid = a[a.indexOf('--session-id') + 1]
+        await new Promise((r) => setTimeout(r, 5))
+        throw new Error('HooksError: claude aborted: still running after 60000s')
+      },
+    },
+    fs: {
+      read: async (p: string) => {
+        readPath = p
+        return JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'found A and B; WebSearch empty tok' }, { type: 'tool_use' }] } })
+      },
+    },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'research', description: 'd' }, async () => 'native')
+  expect(readPath).toBe(`/home/u/.claude/projects/-work-my-repo/${sid}.jsonl`)
+  expect(shArgv).toEqual(['sh', '-c', FIND_TRANSCRIPT_SH, 'sh', sid]) // fixed script, uuid as $1, never spliced in
+  expect(out.deny).toContain('(timeout 0 s)')
+  expect(out.deny).toContain(`session ${sid}`)
+  expect(out.deny).toContain('elapsed ')
+  expect(out.deny).toContain('1 assistant turns, 1 tool calls')
+  expect(out.deny).toContain('found A and B; WebSearch empty ***') // partial text, token scrubbed
+})
+
+test('an unreadable transcript still reports the session id and never throws', async () => {
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => {
+      if (a[0] === 'sh') return { exitCode: 0, stdout: `/h/.claude/projects/-w/${a[4]}.jsonl`, stderr: '', isStdoutTruncated: false }
+      return { exitCode: 1, stdout: JSON.stringify({ type: 'result', is_error: true, subtype: 'error_max_turns' }), stderr: '', isStdoutTruncated: false }
+    } },
+    fs: { read: async () => { throw new Error('ENOENT') } },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'x', description: 'd' }, async () => 'native')
+  expect(out.deny).toContain('did not complete cleanly (exit 1, error)')
+  expect(out.deny).toContain('transcript unreadable')
+  expect(/session [0-9a-f-]{36}/.test(out.deny)).toBe(true)
+})
+
+test('a long cwd (hashed project folder) still finds the transcript by session uuid', async () => {
+  const longCwd = '/Users/u/' + 'very-long-directory-name/'.repeat(12) + 'repo'
+  const hashed = '-Users-u-very-long-directory-name-very-long-d-3f9a1c2b' // the CLI's hashed folder: no slug of the cwd matches it
+  let readPath = ''
+  let sid = ''
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => {
+      if (a[0] === 'sh') {
+        // A fake `find`: the script searches by name only, never by the cwd.
+        expect(a[2]).toContain('-maxdepth 2')
+        expect(a[2]).toContain('-name "$1.jsonl"')
+        expect(a[2].includes(longCwd)).toBe(false)
+        return { exitCode: 0, stdout: `/h/.claude/projects/${hashed}/${a[4]}.jsonl\n`, stderr: '', isStdoutTruncated: false }
+      }
+      sid = a[a.indexOf('--session-id') + 1]
+      return { exitCode: 1, stdout: JSON.stringify({ type: 'result', is_error: true }), stderr: '', isStdoutTruncated: false }
+    } },
+    fs: { read: async (p: string) => { readPath = p; return JSON.stringify({ type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'half done' }] } }) } },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'x', description: 'd' }, async () => 'native')
+  expect(readPath).toBe(`/h/.claude/projects/${hashed}/${sid}.jsonl`)
+  expect(out.deny).toContain('half done')
+  expect(out.deny).toContain('1 assistant turns')
+})
+
+test('a transcript the find does not locate is reported, never read from a guessed path', async () => {
+  let reads = 0
+  const h = agentHandlerFor({})
+  const $ = {
+    process: { run: async (a: string[]) => {
+      if (a[0] === 'sh') return { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false }
+      return { exitCode: 1, stdout: JSON.stringify({ type: 'result', is_error: true }), stderr: '', isStdoutTruncated: false }
+    } },
+    fs: { read: async () => { reads += 1; return '' } },
+    ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+  }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'x', description: 'd' }, async () => 'native')
+  expect(reads).toBe(0)
+  expect(out.deny).toContain('transcript unreadable: Error: transcript not found')
+})
+
+for (const readable of [true, false]) {
+  test(`the whole refusal is token-scrubbed, path included (${readable ? 'readable' : 'unreadable'} transcript)`, async () => {
+    const TOKEN = 'SeCrEtToK3n'
+    const h = agentHandlerFor({ providerToken: TOKEN })
+    const $ = {
+      process: { run: async (a: string[]) => {
+        if (a[0] === 'sh') return { exitCode: 0, stdout: `/h/${TOKEN}/.claude/projects/-w-${TOKEN}/${a[4]}.jsonl`, stderr: '', isStdoutTruncated: false }
+        return { exitCode: 1, stdout: JSON.stringify({ type: 'result', is_error: true, result: `failed near ${TOKEN}` }), stderr: '', isStdoutTruncated: false }
+      } },
+      fs: { read: async (p: string) => {
+        if (!readable) throw new Error(`ENOENT: ${p}`)
+        return JSON.stringify({ type: 'assistant', message: { id: 'm', content: [{ type: 'text', text: `partial ${TOKEN}` }] } })
+      } },
+      ui: { status() {}, toast() {} }, http: { fetch: async () => ({ ok: false }) },
+    }
+    const out = await h($, { subagent_type: 'general-purpose', prompt: 'x', description: 'd' }, async () => 'native')
+    expect(typeof out.deny).toBe('string')
+    expect(out.deny.includes(TOKEN)).toBe(false)
+    expect(out.deny).toContain('/h/***/.claude/projects/-w-***/')
+    expect(out.deny).toContain(readable ? 'partial ***' : 'transcript unreadable')
+  })
+}

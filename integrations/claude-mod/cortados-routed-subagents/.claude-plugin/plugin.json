@@ -80,6 +80,12 @@
       "default": 600000,
       "description": "How long a routed subagent may run before it is aborted. Max 600000 (10 min), Claude Code's own limit for a mod's process; larger values are clamped, fractions are rounded down, invalid values use the default."
     },
+    "maxTurns": {
+      "type": "number",
+      "title": "Routed subagent max turns",
+      "default": 0,
+      "description": "Opt-in, off (0) by default. When positive, passed as claude -p --max-turns: a routed subagent stops after this many agentic turns instead of looping until the timeout kills it (incident 2026-11-03). Off by default because there is no evidence yet that a blanket budget is safe for builders, which can legitimately need many turns. A stopped or timed-out subagent still hands back its last assistant text, session id and elapsed time."
+    },
     "excludeBuilderOnReview": {
       "type": "boolean",
       "title": "Keep reviews off the builder's model",

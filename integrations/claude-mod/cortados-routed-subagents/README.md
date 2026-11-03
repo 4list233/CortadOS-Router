@@ -43,6 +43,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
 | `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under the `subagentTimeoutMs` ceiling). |
 | `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
+| `maxTurns` | `0` (off) | Opt-in. When positive, passed as `claude -p --max-turns N`: the child stops after N agentic turns instead of looping until the timeout kills it. Off by default because there is no evidence yet that a blanket turn budget is safe for builders: a legitimate build can need many turns, and a builder stopped mid-way has acted without finishing. The runaway case that prompted it (incident 2026-11-03) is covered without it by the partial-result handback and the stop-on-dead-tool prompt line. `0` (or any non-positive/invalid value) leaves the flag off. A stopped child is reported like any other failure, with its partial result (see **When a routed subagent fails**). |
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
@@ -138,6 +139,20 @@ These pass through to a normal in-process subagent on your direct model:
 Once a routed subagent has been launched it has already acted, so if it does not finish cleanly (nonzero exit, a
 terminal error, truncated output, or a result the Agent schema would reject) the mod returns a **refusal** with the
 reason — it never silently re-runs the task as a native subagent, which would duplicate any non-idempotent work.
+
+## When a routed subagent fails
+
+Each child runs with `--output-format json` (the result object only: `stream-json` would put every intermediate
+message on stdout, and a tool-heavy child could overrun the host's output cap and be refused even though it succeeded)
+and a `--session-id` (a v4 UUID) the mod chooses. On failure its transcript is found by that UUID with one fixed
+`find "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" -maxdepth 2 -name '<uuid>.jsonl'` (the UUID is checked against a
+strict regex and passed as an argument, never spliced into the script); it is not derived from the cwd, because
+Claude Code hashes long project-folder names. On a timeout, a `--max-turns` stop or any other unclean finish, the
+refusal names the elapsed time, the timeout in seconds, the session id and transcript path, how many assistant turns
+(distinct message ids) and tool calls the child made, and its **last assistant text** (last 4000 characters), so the
+parent can see how far it got instead of losing all the work. The whole refusal is scrubbed of the provider token. The
+child's prompt also ends with: "If a tool returns nothing useful twice in a row, stop and report what you have and
+what failed."
 
 ## Notes
 
