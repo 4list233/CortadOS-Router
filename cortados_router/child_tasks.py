@@ -713,7 +713,10 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         if o:
             text = o.get("result")
             text = text if isinstance(text, str) else ""
-            out["result"] = red.text(text)[:RESULT_CHARS]   # redact BEFORE truncating: a cut never splits a token
+            redacted, n = _text_result(red, text)            # redact BEFORE truncating: a cut never splits a token
+            out["result"] = redacted[:RESULT_CHARS]
+            if n:
+                out["redact_unparsed_lines"] = out.get("redact_unparsed_lines", 0) + n
             if len(text) > RESULT_CHARS:
                 out["result_truncated"] = f"{len(text)} characters; the full text is in stdout_log"
             usage = o.get("modelUsage")
@@ -730,8 +733,8 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
         if res.get("redact_error"):
             out["redact_error"] = res["redact_error"]
         if res.get("redact_unparsed_lines"):
-            # stdout lines that were not JSON got the raw pass only (no structural redaction): say so
-            out["redact_unparsed_lines"] = res["redact_unparsed_lines"]
+            # what the structural pass withheld (lines, strings or objects it could not parse or walk): say so
+            out["redact_unparsed_lines"] = out.get("redact_unparsed_lines", 0) + res["redact_unparsed_lines"]
         if res.get("error"):
             out["error"] = res["error"]
         # The router's own record of what this child was routed to (its requests carried x-cortados-run-id: task_id).
@@ -759,7 +762,13 @@ def status(task_id, red=None, provider_url="", token="") -> dict:
             # No pointer to the files that hold the raw credential: not the logs, and not the task dir that holds them.
             for k in ("result", "stdout_log", "stderr_log", "dir"):
                 out.pop(k, None)
-    return red.deep(out)                        # every string (structured, before any serialization; fails closed)
+    # Every other string structurally (before any serialization; fails closed). The result text is already redacted
+    # as text and possibly truncated: never reparsed structurally (a cut JSON result would no longer decode).
+    result = out.pop("result", None)
+    out = red.deep(out)
+    if result is not None and isinstance(out, dict):
+        out["result"] = result
+    return out
 
 
 def _activity(out: dict, o: dict, act, meta: dict) -> list:
@@ -992,11 +1001,35 @@ def credential_fingerprints(tokens) -> list:
 WITHHELD_EVENT = json.dumps({"type": "cortados_withheld", "reason": redact.WITHHELD})
 
 
+def _text_result(red: "Redactor", text):
+    """The child's final result text, redacted as TEXT (each credential at every ESCAPE_DEPTH escaping): (text, 0),
+    or (WITHHELD, 1) only if text() cannot run on it."""
+    try:
+        return red.text(text), 0
+    except Exception:
+        return redact.WITHHELD, 1
+
+
+def redact_record(red: "Redactor", value):
+    """(cleaned, withheld) for one decoded stdout record. Everything goes through red.deep_count (strict: JSON-looking
+    text that does not decode is withheld), EXCEPT the free-form `result` string of a type "result" record: that is
+    what the orchestrator reads, and prose may well start with `[`, `{` or `"`, so it gets text() redaction instead."""
+    if isinstance(value, dict) and value.get("type") == "result" and isinstance(value.get("result"), str):
+        rest = {k: v for k, v in value.items() if k != "result"}
+        cleaned, withheld = red.deep_count(rest)
+        if not isinstance(cleaned, dict) or "result" in cleaned:   # withheld, or a key that redacted onto "result"
+            return redact.WITHHELD, withheld + (0 if cleaned == redact.WITHHELD else 1)
+        text, n = _text_result(red, value["result"])
+        cleaned["result"] = text
+        return cleaned, withheld + n
+    return red.deep_count(value)
+
+
 def _structural(red: "Redactor", value):
-    """(serialized, withheld) for one decoded record: redacted by red.deep_count and re-serialized ASCII-only (so no
+    """(serialized, withheld) for one decoded record: redacted by redact_record and re-serialized ASCII-only (so no
     U+2028 or other line separator is written literally); WITHHELD_EVENT if it cannot be walked or serialized."""
     try:
-        cleaned, withheld = red.deep_count(value)
+        cleaned, withheld = redact_record(red, value)
         return json.dumps(cleaned), withheld
     except (ValueError, RecursionError):
         return WITHHELD_EVENT, 1
@@ -1265,7 +1298,7 @@ def _run(d: str, lock_fd=None) -> int:
         pass
     out, err = parse_output(raw)
     if out is not None:
-        result["output"], n = red.deep_count(out)      # fails closed: what cannot be walked is WITHHELD, and counted
+        result["output"], n = redact_record(red, out)  # fails closed: what cannot be walked is WITHHELD, and counted
         if n:
             result["redact_unparsed_lines"] = result.get("redact_unparsed_lines", 0) + n
     if err:

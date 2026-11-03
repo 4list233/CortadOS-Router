@@ -49,6 +49,14 @@ FAKE = textwrap.dedent('''\
         sys.stderr.write(os.environ.get("FAKE_STDERR", ""))
         print(json.dumps({{"type": "result", "is_error": True, "result": os.environ.get("FAKE_RESULT", "")}}))
         sys.exit(1)
+    if mode == "ok-result":
+        # a successful stream-json run whose final result text is FAKE_RESULT (FAKE_RESULT_TOKEN appends the token)
+        text = os.environ.get("FAKE_RESULT", "")
+        if os.environ.get("FAKE_RESULT_TOKEN"):
+            text += os.environ["ANTHROPIC_AUTH_TOKEN"]
+        print(json.dumps({{"type": "system", "subtype": "init", "permissionMode": "acceptEdits"}}))
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": text}}))
+        sys.exit(0)
     if mode == "crash-orphan":
         g = subprocess.Popen([sys.executable, "-c",
                               "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
@@ -644,6 +652,50 @@ class ChildTaskTests(unittest.TestCase):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
         self.assertNotIn("tok-test-000000001", json.dumps(w))
+
+    def _result_of(self, text, with_token=False):
+        os.environ["FAKE_CLAUDE_MODE"] = "ok-result"
+        os.environ["FAKE_RESULT"] = text
+        if with_token:
+            os.environ["FAKE_RESULT_TOKEN"] = "1"
+        try:
+            tid = self.start()
+            _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+            _, st = self.call("task_status", task_id=tid)
+        finally:
+            for k in ("FAKE_RESULT", "FAKE_RESULT_TOKEN"):
+                os.environ.pop(k, None)
+        self.assertEqual(w["state"], "succeeded", w)
+        return w, st
+
+    def test_free_form_results_that_look_like_json_come_back_intact(self):
+        for text in ("[report](report.md) is written", "[INFO] all done", "{summary} three files changed",
+                     '"Done" \u2014 nothing else to do', '  [1, 2, oops', '{"a": 1}'):
+            w, st = self._result_of(text)
+            self.assertEqual(w["result"], text)
+            self.assertEqual(st["result"], text)
+            self.assertNotIn("redact_unparsed_lines", w)
+
+    def test_a_result_holding_the_token_comes_back_masked(self):
+        w, st = self._result_of('[INFO] key is "', with_token=True)
+        for r in (w, st):
+            self.assertEqual(r["result"], '[INFO] key is "***')
+            self.assertNotIn(self.cfg["token"], json.dumps(r))
+        with open(os.path.join(ct.task_path(w["task_id"]), "result.json")) as f:
+            self.assertNotIn(self.cfg["token"], f.read())
+        escaped = self.cfg["token"]                               # escaped several times, still masked as text
+        for _ in range(ct.redact.ESCAPE_DEPTH):
+            escaped = json.dumps(escaped)[1:-1]
+        self.assertEqual(ct._text_result(ct.Redactor([self.cfg["token"]]), "x " + escaped), ("x ***", 0))
+
+    def test_an_oversized_json_result_is_truncated_not_withheld(self):
+        text = json.dumps([{"i": i, "note": "padding " * 3} for i in range(1200)])
+        self.assertGreater(len(text), ct.RESULT_CHARS)
+        w, st = self._result_of(text)
+        for r in (w, st):
+            self.assertEqual(r["result"], text[:ct.RESULT_CHARS])
+            self.assertIn("result_truncated", r)
+            self.assertNotIn("redact_unparsed_lines", r)
 
     # --- review round 2 ---------------------------------------------------------------------------------------------
 

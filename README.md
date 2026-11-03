@@ -342,7 +342,10 @@ Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, c
   Code as mode `default`, which is not treated as leaving the requested mode. A string that looks like JSON (an
   object, array or string literal) is decoded recursively, so a chain of quoted strings is unwound; one that does not
   decode is withheld, not text-redacted. Keys get the same treatment, and an object whose key cannot be redacted
-  safely, or whose redacted keys collide, is withheld whole.
+  safely, or whose redacted keys collide, is withheld whole. The one exception is the child's free-form final
+  `result` text (what `task_status` / `wait_task` return): prose may start with `[`, `{` or `"`, so it gets text
+  redaction (every credential at all eight escaping depths) when stdout is rewritten, in `result.json` and in the
+  status, and is never reparsed after truncation; it is withheld only if that redaction cannot run.
 - Threat model: redaction protects against ACCIDENTAL credential exposure in logs and tool results, at any realistic
   encoding depth, and fails closed on anything it cannot parse. Encodings a child builds on purpose to smuggle out its
   own token are out of scope: the child already holds that token in its environment, and the same OS user can read
