@@ -14,8 +14,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILTER = ROOT / "integrations" / "browser" / "mcp_filter.py"
 TOOLS = (ROOT / "integrations" / "browser" / "tools-0.0.84.txt").read_text().split()
+ARGS = json.loads((ROOT / "integrations" / "browser" / "args-0.0.84.json").read_text())
+# Tools of the pinned schemas that take `filename` (a server-side write path); the filter refuses it on each.
+FILENAME_TOOLS = ["browser_snapshot", "browser_console_messages", "browser_find", "browser_network_requests",
+                  "browser_network_request", "browser_take_screenshot", "browser_evaluate"]
 
-STUB = r'''import json, sys
+STUB = r'''import json, subprocess, sys
 names, log = open(sys.argv[1]).read().split(), open(sys.argv[2], "a")
 def send(m):
     sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
@@ -42,6 +46,15 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "notifications/resources/list_changed"})
         elif trig == "stray":
             send({"jsonrpc": "2.0", "id": "never-asked", "result": {}})
+        elif trig == "hold":
+            continue                                   # never answered (until the client cancels)
+        elif trig == "big":
+            sys.stdout.write("{\"x\":\"" + "a" * 8192 + "\"}\n"); sys.stdout.flush()
+        elif trig == "spawn":
+            # Like Playwright's Chromium: detached into a session (and group) of its own, inheriting stderr.
+            g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            open(sys.argv[2] + ".pid", "w").write(str(g.pid))
     send({"jsonrpc": "2.0", "id": m["id"], "result": {"ok": meth}})
 '''
 
@@ -55,6 +68,9 @@ class FilterTests(unittest.TestCase):
         (self.task / "browser" / "in" / "a.txt").write_text("x")
         (self.tmp / "tools").write_text("\n".join(TOOLS) + "\n")
         (self.tmp / "stub.py").write_text(STUB)
+        # The real per-tool keys, plus the stub's test-only `trigger` on browser_snapshot.
+        args = dict(ARGS, browser_snapshot=ARGS["browser_snapshot"] + ["trigger"])
+        (self.tmp / "args.json").write_text(json.dumps(args))
         self.log = self.tmp / "server.log"
         self.log.write_text("")
         self.p = None
@@ -68,9 +84,10 @@ class FilterTests(unittest.TestCase):
                 f.close()
         self._td.cleanup()
 
-    def start(self, *extra):
+    def start(self, *extra, args_file=True):
+        af = ["--args-file", str(self.tmp / "args.json")] if args_file else []
         self.p = subprocess.Popen(
-            [sys.executable, "-I", str(FILTER), "--task", str(self.task), *extra, "--",
+            [sys.executable, "-I", str(FILTER), "--task", str(self.task), *af, *extra, "--",
              sys.executable, "-I", str(self.tmp / "stub.py"), str(self.tmp / "tools"), str(self.log)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.buf = b""
@@ -87,13 +104,13 @@ class FilterTests(unittest.TestCase):
         while b"\n" not in self.buf:
             left = end - time.time()
             if left <= 0:
-                return None
+                self.fail("no answer from the filter within timeout")
             r, _, _ = select.select([self.p.stdout], [], [], left)
             if not r:
-                return None
+                self.fail("no answer from the filter within timeout")
             chunk = os.read(self.p.stdout.fileno(), 65536)
             if not chunk:
-                return None
+                self.fail("filter closed its output without an answer")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         return json.loads(line)
@@ -144,10 +161,36 @@ class FilterTests(unittest.TestCase):
         self.start("--grant", "browser_upload")
         ok = str(self.task / "browser" / "in" / "a.txt")
         self.assertIn("result", self.call(1, "browser_file_upload", paths=[ok]))
-        for i, bad in enumerate([["/etc/passwd"], [ok, "../../../x"], [str(self.task / "browser" / "in")], [5]]):
+        # Relative paths are refused outright: the server resolves them against <task>/browser, not in/, so
+        # 'in/../config.json' is the proxy config and 'a.txt' is <task>/browser/a.txt.
+        for i, bad in enumerate([["/etc/passwd"], [ok, "../../../x"], [str(self.task / "browser" / "in")], [5],
+                                 ["in/../config.json"], ["a.txt"], [""], [str(self.task / "browser" / "config.json")]]):
             self.assert_refused(self.call(10 + i, "browser_file_upload", paths=bad), 10 + i, -32004)
-        self.assert_refused(self.call(20, "browser_drop", path="/etc/hosts"), 20, -32004)
+            self.assert_refused(self.call(50 + i, "browser_drop", paths=bad), 50 + i, -32004)
         self.assertEqual(self.calls_seen(), ["browser_file_upload"])
+
+    # argument keys
+    def test_unknown_argument_keys_refused_on_every_tool(self):
+        self.start("--grant", "browser_js", "--grant", "browser_upload")
+        allowed = sorted(set(TOOLS) - {"browser_run_code_unsafe"})
+        for i, name in enumerate(allowed):
+            self.assert_refused(self.call(i, name, zz_unknown="x"), i, -32005)
+        self.assert_refused(self.call(99, "browser_drop", path="/etc/hosts"), 99, -32005)
+        self.assertEqual(self.calls_seen(), [])
+
+    def test_default_args_file_is_the_pinned_schema(self):
+        self.start(args_file=False)
+        self.assert_refused(self.call(1, "browser_snapshot", trigger="roots"), 1, -32005)
+        self.assertIn("result", self.call(2, "browser_snapshot", depth=2))
+        self.assertEqual(self.calls_seen(), ["browser_snapshot"])
+
+    def test_filename_refused_on_each_tool_that_takes_it(self):
+        self.start("--grant", "browser_js")
+        for name in FILENAME_TOOLS:
+            self.assertIn("filename", ARGS[name], name)   # the pinned schema really has it
+        for i, name in enumerate(FILENAME_TOOLS):
+            self.assert_refused(self.call(i, name, filename="config.json"), i, -32004)
+        self.assertEqual(self.calls_seen(), [])
 
     # URL rule
     def test_url_schemes_refused(self):
@@ -270,6 +313,79 @@ class FilterTests(unittest.TestCase):
         self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in self.recv()["result"]["tools"]}
         self.assertNotIn("browser_run_code_unsafe", names)
+
+    def test_server_line_cap_is_a_parameter(self):
+        self.start("--server-line-max", "4096")
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "browser_snapshot", "arguments": {"trigger": "big"}}})
+        self.assertEqual(self.p.wait(timeout=20), 1)
+        self.assertIn(b"server line over 4096 bytes", self.p.stderr.read())
+
+    def test_client_line_cap_is_a_parameter(self):
+        self.start("--client-line-max", "64")
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "a" * 100}})
+        self.assertEqual(self.p.wait(timeout=20), 1)
+        self.assertIn(b"client line over 64 bytes", self.p.stderr.read())
+
+    def test_nan_closes(self):
+        self.start()
+        self.send_raw(b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":NaN}}\n')
+        self.assert_closed()
+        self.assertEqual(self.server_saw(), [])
+
+    def test_duplicate_in_flight_id_refused_and_cancel_frees_it(self):
+        self.start()
+        hold = {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "browser_snapshot", "arguments": {"trigger": "hold"}}}
+        self.send(hold)
+        self.send({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+        r = self.recv()
+        self.assertIsNone(r["id"])
+        self.assertEqual(r["error"]["code"], -32600)
+        self.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}})
+        self.send({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+        self.assertEqual(self.recv(), {"jsonrpc": "2.0", "id": 7, "result": {"ok": "ping"}})
+
+    # close kills the whole tree, detached descendants included
+    def _grandchild(self):
+        self.assertEqual(self.call(1, "browser_snapshot", trigger="spawn")["id"], 1)
+        pid = int(Path(str(self.log) + ".pid").read_text())
+        os.kill(pid, 0)   # alive before close
+        return pid
+
+    def _assert_dead(self, pid):
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, 9)
+        self.fail(f"detached grandchild {pid} survived close()")
+
+    def test_close_kills_detached_grandchild(self):
+        self.start()
+        pid = self._grandchild()
+        self.send_raw(b"{not json\n")
+        self.assertEqual(self.p.wait(timeout=20), 1)
+        self._assert_dead(pid)
+        self.assertIn(b"closing session", self.p.stderr.read())   # EOF: nothing holds the stderr pipe any more
+
+    def test_eof_kills_detached_grandchild(self):
+        self.start()
+        pid = self._grandchild()
+        self.p.stdin.close()
+        self.assertEqual(self.p.wait(timeout=20), 0)
+        self._assert_dead(pid)
+
+    def test_sigterm_kills_detached_grandchild(self):
+        self.start()
+        pid = self._grandchild()
+        self.p.terminate()
+        self.assertEqual(self.p.wait(timeout=20), 1)
+        self._assert_dead(pid)
+        self.assertIn(b"closing session: signal", self.p.stderr.read())
 
     def test_client_eof_ends_session_cleanly(self):
         self.start()

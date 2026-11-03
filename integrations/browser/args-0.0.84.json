@@ -1,0 +1,123 @@
+{
+ "browser_click": [
+  "button",
+  "doubleClick",
+  "element",
+  "modifiers",
+  "target"
+ ],
+ "browser_close": [],
+ "browser_console_messages": [
+  "all",
+  "filename",
+  "level"
+ ],
+ "browser_drag": [
+  "endElement",
+  "endTarget",
+  "startElement",
+  "startTarget"
+ ],
+ "browser_drop": [
+  "data",
+  "element",
+  "paths",
+  "target"
+ ],
+ "browser_emulate_media": [
+  "colorScheme",
+  "contrast",
+  "forcedColors",
+  "media",
+  "reducedMotion"
+ ],
+ "browser_evaluate": [
+  "element",
+  "filename",
+  "function",
+  "target"
+ ],
+ "browser_file_upload": [
+  "paths"
+ ],
+ "browser_fill_form": [
+  "fields"
+ ],
+ "browser_find": [
+  "filename",
+  "maxResults",
+  "regex",
+  "text"
+ ],
+ "browser_handle_dialog": [
+  "accept",
+  "promptText"
+ ],
+ "browser_hover": [
+  "element",
+  "target"
+ ],
+ "browser_navigate": [
+  "url"
+ ],
+ "browser_navigate_back": [],
+ "browser_network_request": [
+  "filename",
+  "index",
+  "part"
+ ],
+ "browser_network_requests": [
+  "all",
+  "filename",
+  "filter",
+  "static"
+ ],
+ "browser_press_key": [
+  "key"
+ ],
+ "browser_resize": [
+  "height",
+  "width"
+ ],
+ "browser_run_code_unsafe": [
+  "code",
+  "filename"
+ ],
+ "browser_select_option": [
+  "element",
+  "target",
+  "values"
+ ],
+ "browser_snapshot": [
+  "boxes",
+  "depth",
+  "filename",
+  "target"
+ ],
+ "browser_tabs": [
+  "action",
+  "index",
+  "isolatedContext",
+  "url"
+ ],
+ "browser_take_screenshot": [
+  "element",
+  "filename",
+  "fullPage",
+  "scale",
+  "target",
+  "type"
+ ],
+ "browser_type": [
+  "element",
+  "slowly",
+  "submit",
+  "target",
+  "text"
+ ],
+ "browser_wait_for": [
+  "text",
+  "textGone",
+  "time"
+ ]
+}

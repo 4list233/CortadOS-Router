@@ -65,7 +65,8 @@ Both need the same egress proxy; the proxy is what actually enforces "no private
   reads until the `id:2` answer with a 30 s cap and prints the server's stderr when there is none. A stdout line that
   is not a JSON-RPC object, or an `id:2` answer without a tools list, fails the listing at once with the line and the
   server's stderr (a stdio server's stdout carries only protocol messages; garbage is never skipped)
-  (`install.sh tools` shows the list on its own).
+  (`install.sh tools` shows the list on its own); and each tool's `inputSchema.properties` keys == `args-0.0.84.json`
+  (`install.sh args`), the per-tool argument-key allowlist the filter enforces.
 - Browsers: `PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers <prefix>/node_modules/.bin/playwright install --only-shell chromium`
   (headless shell only; nothing global, nothing under `~/Library/Caches/ms-playwright`).
 - Script: `integrations/browser/install.sh`. The router package stays stdlib-only and never imports it.
@@ -77,7 +78,7 @@ other host, no https, no password, no path or bypass), and the pinned binary is 
 install command); there is no boundary-less config. It writes two files, both 0600 (inside the 0700 task dir), and
 the child gets `--mcp-config <task_dir>/browser-mcp.json`:
 ```json
-{"mcpServers": {"browser": {"command": "python3", "args": ["-I", "<repo>/integrations/browser/mcp_filter.py",
+{"mcpServers": {"browser": {"command": "<absolute python3>", "args": ["-I", "<repo>/integrations/browser/mcp_filter.py",
   "--task", "<task_dir>", "--", "<repo>/integrations/browser/run-mcp.sh", "<task_dir>", "<prefix>"]}}}
 ```
 `<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag, plus the proxy):
@@ -135,6 +136,12 @@ the installed server's list differs, so a version bump is a reviewed diff, never
      `notifications/cancelled`; anything else gets a JSON-RPC error (requests) or is dropped (notifications);
    - a top-level JSON array (batch), invalid JSON, a non-object message or a line over the size cap closes the session;
    - `tools/call` with missing `params`, non-object `params`, non-string `name` or non-object `arguments` is refused;
+   - `tools/call` with an argument key outside the tool's set in `args-0.0.84.json` is refused (-32005), `filename` is
+     refused on every tool (-32004: the server auto-names outputs under `--output-dir`), and upload/drop `paths` must be
+     absolute and resolve under `<task>/browser/in` (-32004);
+   - closing (bad input, stdin EOF, SIGTERM/SIGHUP) sends SIGTERM to the server's group, waits `EXIT_GRACE_S`, sends
+     SIGKILL, then kills every surviving descendant found by walking `ps` from the server pid (Playwright launches
+     Chromium detached, in its own group);
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a
      JSON-RPC error and never forwarded to Claude Code; server notifications other than progress/log/`list_changed`
      are dropped, and a `tools/list_changed` makes the filter re-list and re-apply the allowlist. Default allowlist =

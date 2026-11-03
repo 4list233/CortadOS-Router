@@ -6,6 +6,7 @@
 #   install.sh config <task_dir> < proxy_url   write <task_dir>/browser/config.json and <task_dir>/browser-mcp.json (0600);
 #                                              the proxy URL (it carries the token) is read from stdin, never argv
 #   install.sh tools                           print the installed server's tools/list (same launch as a task)
+#   install.sh args                            print its per-tool argument keys (the args-<pin>.json format)
 set -eu
 PIN_MCP=0.0.84        # >= 0.0.40 (CVE-2025-9611 DNS rebinding), >= 0.0.55 (file:// blocked); tools-0.0.84.txt pins its tools
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -48,7 +49,9 @@ write(f"{task}/browser/config.json", pw)
 # reaches it), which starts the server through run-mcp.sh (scrubbed env, fixed flags) as its child over pipes. No
 # "env" block here, because whatever Claude Code passes would be dropped by env -i anyway.
 filt = os.path.join(os.path.dirname(wrapper), "mcp_filter.py")
-write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": "python3",
+# The interpreter is recorded as an absolute path (the interpreter running this writer), so the PATH claude runs with cannot swap the
+# python that runs the filter.
+write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": sys.executable,
     "args": ["-I", filt, "--task", task, "--", wrapper, task, prefix]}}})
 print(f"{task}/browser-mcp.json")
 PY
@@ -58,18 +61,21 @@ write_config() {
   ( umask 077; printf '%s\n' "$2" | python3 -I -c "$WRITE_CONFIG_PY" "$HERE/run-mcp.sh" "$PREFIX" "$1" )
 }
 
-# tools/list of the installed server, one name per line, sorted. Started through run-mcp.sh on a throwaway task with
+# list_tools [names|args]: tools/list of the installed server. names: one name per line, sorted. args: JSON object
+# {tool: sorted inputSchema.properties keys}, the per-tool argument-key allowlist mcp_filter.py enforces. Started through run-mcp.sh on a throwaway task with
 # a dummy proxy (no page is opened), so the flags and scrubbed env are exactly a task's: the advertised tools depend
 # on them (--no-webmcp, --caps). Reads until the id:2 answer, 30 s cap (a slow host is not a mismatch); on failure
 # the server's stderr is shown so the cause is visible.
 list_tools() {
+  mode="${1:-names}"
   t="$(mktemp -d)"
   trap 'rm -rf "$t"' EXIT INT TERM
   write_config "$t" "http://listtoolsdummytoken0@127.0.0.1:9" >/dev/null
   rc=0
-  python3 -I - "$HERE/run-mcp.sh" "$t" "$PREFIX" <<'PY' || rc=$?
+  python3 -I - "$HERE/run-mcp.sh" "$t" "$PREFIX" "$mode" <<'PY' || rc=$?
 import json, os, signal, subprocess, sys, tempfile, threading
 cmd = ["sh"] + sys.argv[1:4]
+mode = sys.argv[4]
 # stderr to a file (a full pipe would stall the server); own process group so the kill reaches every child.
 errf = tempfile.TemporaryFile(mode="w+")
 p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True, start_new_session=True)
@@ -88,7 +94,10 @@ def read():
             if not isinstance(m, dict):
                 raise ValueError("not a JSON-RPC object")
             if m.get("id") == 2:
-                out["names"] = sorted(t["name"] for t in m["result"]["tools"])
+                tools = m["result"]["tools"]
+                out["names"] = sorted(t["name"] for t in tools)
+                # A tool without inputSchema.properties takes no arguments: its allowed key set is empty.
+                out["args"] = {t["name"]: sorted((t.get("inputSchema") or {}).get("properties") or {}) for t in tools}
                 return
         except (ValueError, KeyError, TypeError) as e:
             out["bad"] = f"{e.__class__.__name__}: {e}; line: {line.strip()[:200]!r}"
@@ -103,7 +112,10 @@ if "bad" in out:
 if "names" not in out:
     sys.stderr.write("list_tools: no tools/list answer within 30 s; server stderr:\n" + err)
     sys.exit(1)
-print("\n".join(out["names"]))
+if mode == "args":
+    print(json.dumps(out["args"], indent=1, sort_keys=True))
+else:
+    print("\n".join(out["names"]))
 PY
   rm -rf "$t"; trap - EXIT INT TERM
   return $rc
@@ -133,6 +145,15 @@ install)
     exit 1
   fi
   echo "tools/list matches tools-$PIN_MCP.txt"
+  # Argument-key gate: the filter refuses any tools/call key outside the tool's reviewed set (args-<pin>.json), so a
+  # bump that adds a key (a new path or URL argument) fails the install instead of passing silently, same as a name.
+  got="$(list_tools args)" || exit 1
+  if [ "$got" != "$(cat "$HERE/args-$PIN_MCP.json")" ]; then
+    echo "tools/list inputSchema.properties differ from $HERE/args-$PIN_MCP.json:" >&2
+    printf '%s\n' "$got" | diff "$HERE/args-$PIN_MCP.json" - >&2 || true
+    exit 1
+  fi
+  echo "tools/list argument keys match args-$PIN_MCP.json"
   if [ "${2:-}" = "--browsers" ]; then
     PLAYWRIGHT_BROWSERS_PATH="$PREFIX/browsers" "$PREFIX/node_modules/.bin/playwright" install --only-shell chromium
   else
@@ -156,5 +177,9 @@ tools)
   # The installed server's tool list (the install gate's input), for review of a pin bump.
   [ -x "$BIN" ] || { echo "tools: $BIN missing; run: $INSTALL_CMD" >&2; exit 2; }
   list_tools ;;
-*) echo "usage: $0 install [--browsers] | config <task_dir> < proxy_url | tools" >&2; exit 2 ;;
+args)
+  # The installed server's per-tool argument keys (the argument-key gate's input), for review of a pin bump.
+  [ -x "$BIN" ] || { echo "args: $BIN missing; run: $INSTALL_CMD" >&2; exit 2; }
+  list_tools args ;;
+*) echo "usage: $0 install [--browsers] | config <task_dir> < proxy_url | tools | args" >&2; exit 2 ;;
 esac
