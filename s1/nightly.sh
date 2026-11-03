@@ -28,10 +28,62 @@
 #   CORTADOS_S1_EVAL_MINUTES    minutes an evaluation needs (default 110). Evaluation is not started with less time than this
 #                               before the deadline: past evaluations took 78-100 min, and overnight.py TERMs at 07:00, so a late
 #                               start (2026-11-03: training ended 06:19) is always killed and wastes the night. 0 disables the check.
-#   CORTADOS_S1_DEADLINE        HHMM local (overnight.py sets TZ=America/Toronto) when overnight.py stops the run (default 0700)
+#   CORTADOS_S1_DEADLINE        HHMM local (overnight.py sets TZ=America/Toronto) when overnight.py stops the run (default 0700).
+#                               CORTADOS_S1_EVAL_MINUTES within 30 min of the 01:30-to-deadline window can never fit and falls back to 110.
+#   CORTADOS_S1_NOW             HHMM that replaces the clock for the deadline check (tests); not HHMM → logged, the clock is used
+#   nightly.sh --minutes-left [HHMM]   prints the minutes from HHMM (or now) to the deadline plus any settings notes and exits;
+#                               no pid file, stop flag or overnight.py (diagnostic / tests). An invalid HHMM exits 2.
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
+# `[ a -lt b ]` on a non-number or an out-of-range number prints "integer expression expected" and is simply false, so a
+# bad setting would silently take the permissive branch. Every configurable number a comparison reads is validated here:
+# 1-9 digits (well inside bash's 64-bit arithmetic), else the documented default, with a logged reason.
+# A validated value is then normalised to decimal: bash arithmetic reads 08 / 010 as octal (08 is an error, 010 is 8).
+whole() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
+dec() { echo "$((10#$1))"; }   # only ever called on a value whole() accepted
+setting() {   # setting <var name> <default> [<min>]: replace an invalid or too-small value with the default (logged once the log is open)
+  local v="${!1}" min="${3:-0}"
+  if ! whole "$v"; then
+    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is not a whole number up to 9 digits; using $2. "; printf -v "$1" '%s' "$2"; return
+  fi
+  v=$(dec "$v")
+  if [ "$v" -lt "$min" ]; then
+    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is below $min; using $2. "; v="$2"
+  fi
+  printf -v "$1" '%s' "$v"
+}
+deadline_settings() {   # the deadline settings (pure: no files touched); run after data/train-config.env is sourced
+EVAL_MINUTES="${CORTADOS_S1_EVAL_MINUTES:-110}"; setting EVAL_MINUTES 110
+DEADLINE="${CORTADOS_S1_DEADLINE:-0700}"
+hhmm "$DEADLINE" || { SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_DEADLINE=$DEADLINE is not HHMM; using 0700. "; DEADLINE=0700; }
+# an invalid clock override is dropped, not used: bash arithmetic on "abc" / "7" errors or prints nothing, and an empty
+# minutes_left would read as "not enough time" every night (deferring the candidate forever)
+if [ -n "${CORTADOS_S1_NOW:-}" ] && ! hhmm "$CORTADOS_S1_NOW"; then
+  SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_NOW=$CORTADOS_S1_NOW is not HHMM; using the clock. "; unset CORTADOS_S1_NOW
+fi
+# ceiling: evaluation starts after labeling (~75 min into the window that opens at 01:30), so a value within 30 min of the whole
+# 01:30-to-deadline window (330 min to 07:00: >= 300) can never fit: every candidate would wait forever. That is a config error,
+# not a policy: fall back to the default. Derived from the real window so a later CORTADOS_S1_DEADLINE allows a longer evaluation.
+local window; window=$(minutes_left 0130)   # minutes in the 01:30-to-deadline window
+if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
+  SETTING_NOTES="${SETTING_NOTES:-}EVAL_MINUTES=$EVAL_MINUTES can never fit the 01:30-$DEADLINE window (>= $((window - 30))); using 110. "; EVAL_MINUTES=110
+fi
+}
+hhmm() { [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]; }   # 0000-2359
+minutes_left() {   # minutes_left [HHMM]: minutes from now (or HHMM) to the next $DEADLINE (wraps: a 01:30 start has 330 min to 07:00)
+  # CORTADOS_S1_NOW (HHMM, validated in deadline_settings) overrides the clock so tests can pin the time of night
+  local now dl; now=${1:-${CORTADOS_S1_NOW:-$(date +%H%M)}}; now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
+  echo $(( (dl - now + 1440) % 1440 ))
+}
+# diagnostic / test hook, handled BEFORE any side effect (pid file, stop flag, overnight.py re-exec, which unloads the scorer):
+# print the minutes to the deadline for HHMM (or now) and the settings notes, then exit. An invalid HHMM is refused.
+if [ "${1:-}" = "--minutes-left" ]; then
+  if [ -f data/train-config.env ]; then set -a; . data/train-config.env; set +a; fi
+  deadline_settings
+  if [ -n "${2:-}" ] && ! hhmm "$2"; then echo "--minutes-left $2 is not HHMM (0000-2359)"; exit 2; fi
+  minutes_left "${2:-}"; [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES"; exit 0
+fi
 PIDFILE=data/nightly.pid; STOPFLAG=data/nightly.stop
 if [ "${1:-}" = "--stop" ]; then                       # the one supported way to stop a run: the loop AND its trainer, then the services come back
   touch "$STOPFLAG"
@@ -70,40 +122,11 @@ EVAL_FAIL_NIGHTS="${CORTADOS_S1_EVAL_FAIL_NIGHTS:-2}"     # evaluation unavailab
 HOLDOUT_BLOCKED_NIGHTS="${CORTADOS_S1_HOLDOUT_BLOCKED_NIGHTS:-2}"   # a candidate blocked by the holdout floor this many nights → ALERT
 LOG_KEEP="${CORTADOS_S1_LOG_KEEP:-14}"
 DB_MAX_AGE_MIN="${CORTADOS_S1_DB_MAX_AGE_MIN:-60}"   # the sync runs every 15 min; an hour means several missed syncs
-# `[ a -lt b ]` on a non-number or an out-of-range number prints "integer expression expected" and is simply false, so a
-# bad setting would silently take the permissive branch. Every configurable number a comparison reads is validated here:
-# 1-9 digits (well inside bash's 64-bit arithmetic), else the documented default, with a logged reason.
-# A validated value is then normalised to decimal: bash arithmetic reads 08 / 010 as octal (08 is an error, 010 is 8).
-whole() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
-dec() { echo "$((10#$1))"; }   # only ever called on a value whole() accepted
-setting() {   # setting <var name> <default> [<min>]: replace an invalid or too-small value with the default (logged once the log is open)
-  local v="${!1}" min="${3:-0}"
-  if ! whole "$v"; then
-    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is not a whole number up to 9 digits; using $2. "; printf -v "$1" '%s' "$2"; return
-  fi
-  v=$(dec "$v")
-  if [ "$v" -lt "$min" ]; then
-    SETTING_NOTES="${SETTING_NOTES:-}$1=$v is below $min; using $2. "; v="$2"
-  fi
-  printf -v "$1" '%s' "$v"
-}
 setting DB_MAX_AGE_MIN 60
 setting STALL_NIGHTS 2 1; setting EARLY_STOP_NIGHTS 2 1; setting EVAL_FAIL_NIGHTS 2 1; setting HOLDOUT_BLOCKED_NIGHTS 2 1   # 0 would alert on every night
 GPU_SETTLE="${CORTADOS_S1_GPU_SETTLE:-3}"; EVAL_SETTLE="${CORTADOS_S1_EVAL_SETTLE:-20}"
 setting GPU_SETTLE 3; setting EVAL_SETTLE 20
-EVAL_MINUTES="${CORTADOS_S1_EVAL_MINUTES:-110}"; setting EVAL_MINUTES 110
-# ceiling: the nightly window is 01:30-07:00 (330 min) and evaluation starts after labeling (~02:45, ~255 min left), so a value
-# >= 300 can never fit: every candidate would wait forever. That is a config error, not a policy: fall back to the default.
-if [ "$EVAL_MINUTES" -ge 300 ]; then
-  SETTING_NOTES="${SETTING_NOTES:-}EVAL_MINUTES=$EVAL_MINUTES can never fit the 01:30-07:00 window (>= 300); using 110. "; EVAL_MINUTES=110
-fi
-DEADLINE="${CORTADOS_S1_DEADLINE:-0700}"
-[[ "$DEADLINE" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]] || { SETTING_NOTES="${SETTING_NOTES:-}CORTADOS_S1_DEADLINE=$DEADLINE is not HHMM; using 0700. "; DEADLINE=0700; }
-minutes_left() {   # minutes_left [HHMM]: minutes from now (or HHMM) to the next $DEADLINE (wraps: a 01:30 start has 330 min to 07:00)
-  # CORTADOS_S1_NOW (HHMM) overrides the clock so tests can pin the time of night
-  local now dl; now=${1:-${CORTADOS_S1_NOW:-$(date +%H%M)}}; now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
-  echo $(( (dl - now + 1440) % 1440 ))
-}
+deadline_settings
 eval_time_ok() {   # eval_time_ok <run> <reason>: true when an evaluation can finish before the deadline; else logs why, raises
   # the eval_deferred streak (a candidate deferred night after night is a stall someone must see) and is false
   local left; left=$(minutes_left)
@@ -112,8 +135,6 @@ eval_time_ok() {   # eval_time_ok <run> <reason>: true when an evaluation can fi
   streak eval_deferred hit "$EVAL_FAIL_NIGHTS" "evaluation deferred: not enough time before the deadline"
   return 1
 }
-# diagnostic / test hook: print the minutes to the deadline for HHMM (or now) and the settings notes, then exit
-if [ "${1:-}" = "--minutes-left" ]; then minutes_left "${2:-}"; [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES"; exit 0; fi
 # write_pending <sft> <eval> <reason> <run>: atomic (tmp + mv, like mark_trained) and checked; a marker that cannot be written
 # is fatal: evaluating without it would let a TERM leave the trained run unmarked and the next retention pass delete it
 write_pending() {
@@ -368,6 +389,8 @@ if read_pending; then
     # this way: mid-training progress on a non-completed run resumes only within its own run folder (segment-target / iters-base),
     # not across date folders, so a training run cut off before completion is redone by a later night's run.
     # Only when the data is unchanged does a verdict mark it trained (mark_trained): newer labels were never trained on.
+    # Every rewrite of this marker below keeps "$p_sft", the data the candidate was TRAINED on (or recovery's deliberate
+    # "unknown"): stamping tonight's hash would claim it saw labels it never trained on, and a later verdict would then mark them trained.
     same_data=0; [ "$p_sft" = "$sft_hash" ] && same_data=1
     trained_mark() { [ "$same_data" -eq 1 ] && mark_trained; return 0; }
     if ! now_eval=$(eval_fingerprint); then
@@ -386,7 +409,7 @@ if read_pending; then
       echo "re-evaluation of $p_run failed; retried next night"; state event "$STATUS" pending_failure "$p_run (re-evaluation failed)"; eval_failed; exit 1
     fi
     if report_unavailable "$p_run"; then
-      write_pending "$sft_hash" "$now_eval" evaluation_failed "$p_run"
+      write_pending "$p_sft" "$now_eval" evaluation_failed "$p_run"
       echo "EVALUATION UNAVAILABLE again for $p_run: $(report_why "$p_run"); retried next night"
       state event "$STATUS" evaluation_failure "$p_run (retry)"; eval_failed; exit 1
     fi
@@ -394,7 +417,7 @@ if read_pending; then
     if [ "$same_data" -eq 1 ]; then next_msg="no new data, nothing to train"; else next_msg="the newer labels are trained next night"; fi
     if ! report_promotes "$p_run"; then
       if report_blocked "$p_run"; then
-        write_pending "$sft_hash" "$now_eval" holdout_blocked "$p_run"
+        write_pending "$p_sft" "$now_eval" holdout_blocked "$p_run"
         echo "pending $p_run still blocked: $(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['promote_blocked'])" "$p_run/report.json")"
         state event "$STATUS" skip "pending $p_run still holdout-blocked"; holdout_hit
       else
@@ -408,7 +431,7 @@ if read_pending; then
       rm -f data/pending-candidate; state event "$STATUS" promotion "$p_run (pending, $p_reason)"; trained_mark; holdout_clear
       echo "PROMOTED (retry) $p_run → $SERVE_POINTER; $next_msg"; echo "=== $(date) nightly end"; exit 0
     fi
-    write_pending "$sft_hash" "$now_eval" promotion_failed "$p_run"
+    write_pending "$p_sft" "$now_eval" promotion_failed "$p_run"
     echo "PROMOTION FAILED again for $p_run → $SERVE_POINTER"; state event "$STATUS" promotion_failure "$p_run (retry)"; exit 1
   else
     # New train labels. While the Claude holdout is below the floor the bar cannot judge ANY candidate: retraining would only
