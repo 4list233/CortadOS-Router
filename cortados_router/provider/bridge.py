@@ -2,6 +2,8 @@
 
 Owner of the rule that the headless CLI never runs a tool itself: it starts with no built-in tools, no user or
 project settings, no hooks and an empty scratch directory, and its only tools are the client's, served by the shim.
+One owner-approved exception (2026-11-03), outside this module: search_lane.py answers a web-search-only request
+(Claude Code's WebSearch, whose server tool cannot be bridged) on a separate one-shot CLI whose only tool is WebSearch.
 A turn ends either when the CLI finishes (end_turn) or when it calls a bridged tool the client has not answered yet
 (tool_use); the client's next request carries the results, which unblock the waiting shim calls.
 """

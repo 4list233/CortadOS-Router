@@ -21,7 +21,7 @@ from unittest import mock
 from cortados_router.provider import anthropic_wire as wire
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
-from cortados_router.provider import server
+from cortados_router.provider import search_lane, server
 from cortados_router.provider.server import ProviderServer, Registry
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
@@ -1906,10 +1906,46 @@ class RevealModelTests(unittest.TestCase):
             self.assertIsNone(server.reveal_model(route))
 
 
-class ServerToolTests(EndpointHarness):
-    """Anthropic server tools (web_search_*) cannot run on any backend here: incident 2026-11-03, where Claude Code's
-    WebSearch got an empty success with no links. The model must read that the search did not happen."""
+FAKE_SEARCH = """import json, os, sys, time
+open(os.environ["FAKE_SEARCH_LOG"], "a").write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
+    "env": {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CONFIG_DIR"))}}) + "\\n")
+mode = os.environ.get("FAKE_SEARCH_MODE", "ok")
+if mode == "fail":
+    sys.stderr.write("boom"); sys.exit(3)
+if mode == "sleep":
+    time.sleep(float(os.environ.get("FAKE_SEARCH_SLEEP", "5")))
+print(json.dumps({"type": "result", "is_error": False, "result": "1. Cortados - https://example.com/c - a router\\nAnswer: it routes.",
+                  "usage": {"input_tokens": 11, "output_tokens": 7}}))
+"""
+
+
+class SearchFakeMixin:
+    """A fake `claude -p` for the search lane, writing each call's argv and ANTHROPIC_* env to FAKE_SEARCH_LOG."""
+
+    def install_fake_search(self, mode="ok"):
+        path = os.path.join(self.scratch, "fake_search.py")
+        Path(path).write_text(FAKE_SEARCH)
+        self.search_log = os.path.join(self.scratch, "search.jsonl")
+        for k, v in (("FAKE_SEARCH_LOG", self.search_log), ("FAKE_SEARCH_MODE", mode)):
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        self.reg.search_bin = [sys.executable, path]
+
+    def search_calls(self):
+        if not os.path.exists(self.search_log):
+            return []
+        return [json.loads(line) for line in Path(self.search_log).read_text().splitlines()]
+
+
+class ServerToolTests(SearchFakeMixin, EndpointHarness):
+    """Anthropic server tools (web_search_*) cannot run on the bridged backends: incident 2026-11-03, where Claude Code's
+    WebSearch got an empty success with no links. When the search lane fails, the model must read that the search did
+    not happen (these tests run with a failing search CLI; SearchLaneTests covers the working lane)."""
     WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+
+    def setUp(self):
+        super().setUp()
+        self.install_fake_search("fail")
     SEARCH = {"model": "cortados", "tools": [WEB_SEARCH],
               "messages": [{"role": "user", "content": "Perform a web search for the query: cortados"}]}
 
@@ -1981,6 +2017,112 @@ class ServerToolTests(EndpointHarness):
                        "messages": [{"role": "user", "content": "please use tool"}]})
         self.assertEqual(r["stop_reason"], "tool_use")
         self.assertEqual(r["content"][-1]["name"], "Read")
+
+
+class SearchLaneTests(SearchFakeMixin, EndpointHarness):
+    """The search lane (search_lane.py): a web-search-only request runs a headless CLI with only WebSearch."""
+    SEARCH = ServerToolTests.REAL
+
+    def setUp(self):
+        super().setUp()
+        self.install_fake_search("ok")
+
+    def test_query_extraction(self):
+        q = search_lane.extract_query
+        self.assertEqual(q(self.SEARCH), "cortados router")
+        self.assertEqual(q({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Perform a web search for the query: a b"}]}]}), "a b")
+        self.assertEqual(q({"messages": [{"role": "user", "content": "plain words"}]}), "plain words")
+        self.assertEqual(q({"messages": []}), "")
+        self.assertEqual(q({}), "")
+
+    def test_json_reply_carries_the_result_and_usage(self):
+        r = self.post(self.SEARCH)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(r["usage"]["output_tokens"], 7)
+        self.assertFalse(os.path.exists(self.argv_file), "the bridge CLI is never started for a search")
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_sse_reply_carries_the_result(self):
+        raw = self.post(dict(self.SEARCH, stream=True))
+        self.assertIn("event: message_start", raw)
+        self.assertIn("https://example.com/c", raw)
+        self.assertIn('"stop_reason": "end_turn"', raw)
+
+    def test_argv_has_only_websearch_and_no_bridge_and_env_is_stripped(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://x", "ANTHROPIC_AUTH_TOKEN": "t",
+                                          "ANTHROPIC_API_KEY": "k"}):
+            self.post(self.SEARCH)
+        [call] = self.search_calls()
+        a = call["argv"]
+        self.assertEqual(a[a.index("--tools") + 1], "WebSearch")
+        self.assertEqual(a[a.index("--allowedTools") + 1], "WebSearch")
+        self.assertEqual(a[a.index("--model") + 1], search_lane.SEARCH_MODEL)
+        self.assertEqual(json.loads(a[a.index("--mcp-config") + 1]), {"mcpServers": {}})
+        self.assertIn("--strict-mcp-config", a)
+        self.assertIn("cortados router", a[a.index("-p") + 1])
+        self.assertFalse(any("bridge" in x or "mcp_shim" in x for x in a))
+        self.assertEqual(call["env"], {})
+        self.assertIn("cortados-search-", call["cwd"])
+
+    def test_named_account_runs_on_its_login_and_an_unknown_one_falls_back(self):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
+                mock.patch.object(self.reg, "claude_config_dir", lambda acct: "/cfg/b" if acct == "b" else None):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "zz"}), \
+                mock.patch.object(self.reg, "claude_config_dir", lambda acct: None):
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+
+    def test_nonzero_exit_falls_back_to_the_unavailable_text(self):
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        r = self.post(self.SEARCH)
+        self.assertIn("web_search is unavailable on this CortadOS lane", r["content"][0]["text"])
+        self.assertIn("exit_3", r["content"][0]["text"])
+
+    def test_timeout_falls_back_to_the_unavailable_text(self):
+        os.environ["FAKE_SEARCH_MODE"] = "sleep"
+        with mock.patch.object(search_lane, "SEARCH_TIMEOUT_S", 0.5):
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("timeout", r["content"][0]["text"])
+
+    def test_past_the_cap_the_reply_says_search_busy(self):
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(1)):
+            search_lane._slots.acquire()
+            try:
+                r = self.post(self.SEARCH)
+            finally:
+                search_lane._slots.release()
+        self.assertIn("search busy", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+
+    def test_concurrent_searches_are_capped(self):
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_SLEEP"] = "sleep", "1"
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_SLEEP", None)
+        out = []
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(2)):
+            ts = [threading.Thread(target=lambda: out.append(self.post(self.SEARCH)["content"][0]["text"]))
+                  for _ in range(4)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(sum("search busy" in t for t in out), 2)
+        self.assertEqual(sum("example.com" in t for t in out), 2)
+
+    def test_forced_client_tool_choice_is_still_400(self):
+        self.assertEqual(self.status_of(dict(self.SEARCH, tools=[ServerToolTests.WEB_SEARCH, READ_TOOL])), 400)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_a_non_search_server_tool_is_not_sent_to_the_search_lane(self):
+        r = self.post({"model": "cortados", "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}],
+                       "messages": [{"role": "user", "content": "x"}]})
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
 
 
 if __name__ == "__main__":

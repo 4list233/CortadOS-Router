@@ -44,7 +44,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
-from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
+from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing, search_lane
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
@@ -618,6 +618,7 @@ class Registry:
                  session_factories: dict[str, Callable[..., Any]] | None = None):
         self.gateway_url, self.token, self.claude_bin, self.model = gateway_url, token, claude_bin, model
         self.codex_bin, self.codex_home = codex_bin, codex_home
+        self.search_bin = claude_bin                # the search lane's CLI (search_lane.py); tests swap in a fake
         self.router, self.executed, self.log_outcome = router, executed, log_outcome
         # floor_turn(route, min_left_pct) -> refusal or None: rechecks and reserves a continuation's executing account
         # under the client's x-cortados-min-left-pct (routing.floor_turn). None: a floor on a continuation fails closed.
@@ -1269,13 +1270,37 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             session.lock.release()
 
-    def _server_tools_unavailable(self, turn, names: list[str], wire: Wire) -> None:
+    def _web_search(self, body: dict[str, Any], turn, names: list[str], wire: Wire) -> None:
+        """A web-search-only request on the search lane (search_lane.py: a headless Claude CLI with only WebSearch,
+        the one exception to bridge.py's no-tool rule). Its result text is the reply; any failure falls back to the
+        explicit unavailable reply, naming the failure class, never to an empty success."""
+        reg = self.server.registry
+        try:
+            cfg = search_lane.config_dir_for(reg)
+            result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
+                                     search_lane.extract_query(body), cfg)
+        except search_lane.SearchFailed as exc:
+            logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            reason = "search busy" if exc.kind == "busy" else f"the search lane failed: {exc.kind}"
+            return self._server_tools_unavailable(turn, names, wire, reason=reason)
+        logger.info("web search answered on the search lane (%s, %d chars)", search_lane.SEARCH_MODEL,
+                    len(result.text))
+        return self._reply_text(turn, result.text, result.usage, wire)
+
+    def _server_tools_unavailable(self, turn, names: list[str], wire: Wire, reason: str = "") -> None:
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
         not a 4xx: the client hands the text to the model as the tool's output, so the model reads why and stops
         retrying, where an HTTP error may be retried or surface only as a generic API error."""
         text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(sorted(set(names))))
-        logger.warning("request with server tool(s) %s answered as unavailable", sorted(set(names)))
-        msg_id, blocks, usage = wire.new_message_id(), [{"type": "text", "text": text}], {}
+        if reason:
+            text += f" (reason: {reason})"
+        logger.warning("request with server tool(s) %s answered as unavailable%s", sorted(set(names)),
+                       f" ({reason})" if reason else "")
+        return self._reply_text(turn, text, {}, wire)
+
+    def _reply_text(self, turn, text: str, usage: dict[str, int], wire: Wire) -> None:
+        """One complete end_turn text reply, as JSON or SSE."""
+        msg_id, blocks = wire.new_message_id(), [{"type": "text", "text": text}]
         if not turn.stream:
             return self._json(200, wire.message_json(msg_id, turn.model, blocks, "end_turn", usage))
         try:
@@ -1290,7 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
             self.wfile.flush()
         except OSError as gone:
-            logger.info("client gone while the server-tool refusal was written (%s)", gone)
+            logger.info("client gone while a server-tool reply was written (%s)", gone)
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
@@ -1334,6 +1359,8 @@ class Handler(BaseHTTPRequestHandler):
                 # A request whose only tools are server tools (Claude Code's WebSearch makes exactly such a call) asks
                 # for work no backend here can do. Answer it at once with text saying so, never spend a backend on it:
                 # a routed model would answer without searching, and the client would show that as an empty success.
+                if all(t.startswith("web_search_") for _, t in anthropic_wire.server_tool_kinds(body)):
+                    return self._web_search(body, turn, server_tools, wire)
                 return self._server_tools_unavailable(turn, server_tools, wire)
             if server_tools:
                 # Mixed with client tools: parse_request dropped the server tools, the client tools are served.

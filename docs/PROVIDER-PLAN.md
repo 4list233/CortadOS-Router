@@ -509,6 +509,19 @@ local lanes are evaluated. Ollama has no auth, so it stays on `127.0.0.1` and th
 (`cortados_router/local_gate.py`) on its Tailscale address; the lane sends the gate's token (`token_file_env`) on every
 probe and turn, and a gate 401 is a 503 naming it. `/v1/responses` (Codex) does not take local pins.
 
+## Web search lane (2026-11-03)
+
+Claude Code's WebSearch sends a request whose only tool is the Anthropic server tool `web_search_*` (often with a forced
+`tool_choice`). No bridged backend can run a server tool, so `cortados_router/provider/search_lane.py` serves it on a
+separate one-shot `claude -p` whose only tool is WebSearch (`--tools WebSearch --allowedTools WebSearch`, empty MCP
+config, no setting sources, `dontAsk`, empty scratch cwd, ANTHROPIC_* stripped as in the bridge). This is the one
+owner-approved exception to the bridge rule that the headless CLI never runs a tool itself. Model: `SEARCH_MODEL`
+(the routing table's W-fast Claude route, Haiku 4.5). Login: the default Claude login, or the account named by
+`CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json; unresolvable fails, never falls back).
+Timeout 120 s, at most 4 concurrent searches. The CLI's result text is the reply (JSON or SSE, end_turn, with usage);
+any failure (timeout, nonzero exit, bad output, busy, no login) answers with the explicit "unavailable" text naming the
+failure class. Searches are not routed by S1 and are not recorded in the usage ledger yet.
+
 ## Open
 
 - Cursor lane as a provider backend: needs its non-interactive and sandbox flags verified.
