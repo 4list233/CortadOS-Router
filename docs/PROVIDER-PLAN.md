@@ -104,6 +104,37 @@ Not yet in P1, each needing a decision or another phase:
   (text and tool_use ids). If the endpoint restarts, or the client compacts or edits its history, the next request
   fails with 409 instead of rebuilding the session from the transcript. Two live conversations with identical
   histories (same opening, same text-only replies) are refused with 409 rather than guessed between.
+  What the match compares (`Registry.find`: `session.history == turn.history`, the list of `reply_fingerprint`s,
+  sha256 of each assistant message's trimmed text + tool_use ids) decides each history rewrite (2026-11-03, tests in
+  `tests/test_provider.py`): (a) old tool_result content replaced by a placeholder (Claude Code microcompaction) is
+  not compared, so the conversation continues; the CLI session still holds the original. (b) Compaction into one
+  summary user message leaves no assistant message, so the request opens a new conversation (not a 409); a compacted
+  history that keeps some but not all earlier assistant messages is a 409. (c) A removed or edited assistant message,
+  or a different tool_use id, is a 409: never continued, because the CLI session would answer from a history the
+  client no longer has. Rebuilding (b)/(c) from the transcript is still open. The live 409 bursts of 2026-11-03
+  (12:32-12:42, ~40 across several long `claude -p` sessions; no restart, no sleep, reaper last ran 12:07) are NOT
+  explained by (a) or the reaper. Leading hypothesis: a lost/timed-out response retried by the client. The session
+  already holds turn N's reply, the retry's history is one reply shorter, and that 409 poisons every later request.
+  Now handled: (d) a request whose history is a live session's minus its last reply AND whose new user turn (content
+  + tool results, `anthropic_wire.turn_fingerprint`) is the one that reply answered gets the stored last response
+  again (same id, content, stop reason, usage), without the backend; logged as "replaying its last response". One
+  response per session, at most `REPLAY_MAX_BYTES` (1 MiB; larger replies are not kept and their retry stays a 409).
+  A different user turn on that history is still a 409, and so is a retry that also changes the `sub/` pin (the
+  "model is fixed per conversation" refusal). Replay needs a conversation identity header (one of
+  `CONVERSATION_ID_HEADERS`): a request without one is never replayed and gets the ordinary 409, since identity-less
+  sessions all share the empty scope and a stored reply would go to a stranger. Only sessions in the request's
+  conversation scope (client + identity) opened on the same wire (`/v1/messages` or `/v1/responses`) are replayed, more than one candidate is a 409, and a replay refreshes the conversation's idle clock so the reaper
+  does not close it mid-retry. (e) Every lost-conversation 409 logs one `409 lost conversation: class=<c> ...` line
+  (counts and lengths only, no content or fingerprints). From `Registry.find`: `class=<c> candidates=<n>
+  common_prefix=<i> request_len=<n> candidate_len=<n>` with `class` one of `retry_of_answered_turn` (one reply behind,
+  but not replayable: a different user turn, no stored reply, no identity, another scope or wire, or several
+  candidates),
+  `client_behind=<k>` (a strict prefix k >= 2 replies short: only the last turn is replayed), `client_ahead`,
+  `diverged_at=<i>`, `no_candidate`, or `reaped_recently` (the endpoint closed a conversation with the same first
+  reply within the last hour: `Registry.closed`, 128 entries); `class=ambiguous candidates=<n> request_len=<n>` when
+  several live sessions hold the exact history. From the turn worker, after waiting for the session lock:
+  `class=closed_while_waiting` or `class=moved_on_while_waiting` with `conversation=<id> request_len=<n>`
+  (and `candidate_len` for the latter). The next burst's log lines say which case it was.
 - Requests without tools (titles, summaries) always get their own throwaway CLI with the conversation as text.
 - Only `tool_choice: auto` is accepted (400 otherwise). `max_tokens` is not enforced: the CLI has no output-cap flag.
 - Responses are sent as SSE after the turn completes (with pings while waiting), not token by token.

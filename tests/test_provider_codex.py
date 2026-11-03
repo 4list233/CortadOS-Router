@@ -634,13 +634,16 @@ class CodexEndpointTests(unittest.TestCase):
                 codes.append(exc.code)
         session.lock.acquire()
         threads = [threading.Thread(target=continuation) for _ in range(2)]
-        for t in threads:
-            t.start()
-        time.sleep(1.0)                                                  # both have found the session and wait on the lock
-        session.lock.release()
-        for t in threads:
-            t.join(30)
+        with self.assertLogs("cortados.provider", level="WARNING") as logs:
+            for t in threads:
+                t.start()
+            time.sleep(1.0)                                              # both have found the session and wait on the lock
+            session.lock.release()
+            for t in threads:
+                t.join(30)
         self.assertEqual(sorted(codes), [200, 409])
+        self.assertTrue(any("409 lost conversation: class=moved_on_while_waiting" in l and "request_len=1" in l
+                            and "candidate_len=2" in l for l in logs.output), logs.output)
         self.assertEqual(list(self.reg.sessions.values()), [session])  # the healthy conversation was kept
         history += [{"role": "assistant", "content": [{"type": "text", "text": "tool said: hello"}]}, {"role": "user", "content": "thanks"}]
         self.assertEqual(self.post({"tools": [READ_TOOL], "messages": history})["content"], [{"type": "text", "text": "echo: thanks"}])
