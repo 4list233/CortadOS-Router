@@ -163,7 +163,9 @@ class Continuous(unittest.TestCase):
     def test_min_left_default_15_and_env(self):
         root = Path(__file__).resolve().parents[1] / 's1'
         self.assertIn('MIN_LEFT_PCT_DEFAULT = 15.0', (root / 'label.py').read_text())
-        self.assertIn('--min-left-pct "${CORTADOS_S1_MIN_LEFT_PCT:-15}"', (root / 'nightly.sh').read_text())
+        text = (root / 'nightly.sh').read_text()   # validated in nightly.sh, then passed on (behaviour: test_s1_nightly min_left)
+        self.assertIn('MIN_LEFT_PCT="${CORTADOS_S1_MIN_LEFT_PCT:-15}"', text)
+        self.assertIn('--min-left-pct "$MIN_LEFT_PCT"', text)
 
 
 import http.server
