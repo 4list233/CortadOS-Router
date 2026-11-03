@@ -1057,13 +1057,19 @@ def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="
     return out
 
 
-def list_recent(n=20) -> list:
+def list_recent(n=20, ids=None) -> list:
+    """`ids` (optional): list only these task ids (the bot gateway passes the ids it started, so a client's tasks
+    stay listed however many newer tasks the owner has)."""
     try:
         n = max(1, min(int(n), 200))            # bounded: the listing goes into a tool result
     except (TypeError, ValueError):
         raise TaskError("limit must be an integer") from None
     root = _private_root()
-    ids = sorted((x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x)), reverse=True)[:n]
+    names = (x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x))
+    if ids is not None:
+        wanted = {x for x in ids if isinstance(x, str)}
+        names = (x for x in names if x in wanted)
+    ids = sorted(names, reverse=True)[:n]
     rows = []
     for tid in ids:
         state, meta, res = _state(os.path.join(root, tid))

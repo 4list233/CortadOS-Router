@@ -9,6 +9,7 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
   `grokbot`. Sections 3.3 and ticket B2's per-client tokens are superseded. Usage by bots is still tracked and shown.
 - **Chrome is never allowed through the gateway** (refused, and removed from the advertised `start_task` schema).
 - The gateway will run on the Air on port 8434; phase 1 only builds and tests it.
+- The system prompt to paste into Grok Bot is [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md) (ticket B10).
 
 **Phase 1 built** (`cortados_router/bot_gateway.py`, tests `tests/test_bot_gateway.py`):
 - MCP streamable HTTP, plain JSON responses on `POST /mcp` (`initialize`, `notifications/initialized` → 202,
@@ -21,7 +22,7 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
 - Policy before any tool runs (refusals are JSON-RPC error `-32001`, counted and logged): `chrome` refused; `cwd` must
   resolve inside `--workspace-root` (no root = refuse to start); status/wait/cancel only on tasks the gateway started
   (`list_tasks` filtered likewise); caps: 2 concurrent tasks, 30 tasks/day, 200 `route_task`/day (UTC days, rebuilt
-  from the usage log at start so a restart neither resets caps nor orphans tasks).
+  from `bot-counters.json` and the usage log at start so a restart neither resets caps nor orphans tasks).
 - Attribution: `start_task` passes `client="grokbot"` to `child_tasks.start`, which records it in the task's
   `meta.json` and every `child-tasks.jsonl` event line; `route_task` sends `x-cortados-client: grokbot` to the
   provider. The gateway appends one line per call to `$CORTADOS_HOME/bot-usage.jsonl`

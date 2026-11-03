@@ -224,9 +224,88 @@ class GatewayTest(unittest.TestCase):
                 raise RuntimeError("child died")
             return self.child(name, a, cfg)
         self.gw.child = boom
-        with self.assertRaises(RuntimeError):
-            self.start()
+        with redirect_stderr(io.StringIO()):
+            r = self.start()
+        # item 7: a non-TaskError is a JSON-RPC -32603 naming only the type, not a dropped connection
+        self.assertEqual(r["error"]["code"], -32603)
+        self.assertEqual(r["error"]["message"], "internal error (RuntimeError)")
+        self.assertNotIn("child died", json.dumps(r))
         self.assertEqual(self.gw.running, set())
+
+    # -- review round P3 -------------------------------------------------------------------------------------------
+    def test_load_skips_bad_lines(self):
+        self.start()
+        with open(os.path.join(self.home, bg.USAGE_LOG), "a") as f:
+            f.write('[1, 2]\n"str"\n{"ts": "noon", "tool": "start_task", "outcome": "ok"}\n{"ts": true}\nnot json\n'
+                    + "[" * 100000 + "\n")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
+        self.assertIn("skipped 6", err.getvalue())
+        self.assertEqual(gw2.count("tasks"), 1)
+        self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
+
+    def test_counters_survive_lost_usage_log(self):
+        self.start(); self.tcall("route_task", task="q")
+        os.remove(os.path.join(self.home, bg.USAGE_LOG))      # as if two rotations dropped today's records
+        with open(os.path.join(self.home, bg.COUNTERS_FILE)) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["owned"], ["task-0001-abcdef"])
+        gw2 = bg.Gateway(TOKEN, self.root, {}, child=self.child, route=lambda *a, **k: {})
+        self.assertEqual(gw2.count("tasks"), 1)
+        self.assertEqual(gw2.count("routes"), 1)
+        self.assertEqual(gw2.tasks.get("task-0001-abcdef"), "grokbot")
+
+    def test_refresh_keeps_task_on_transient_error(self):
+        self.start()
+        flaky = {"content": [{"type": "text", "text": "task_status: could not read meta"}], "isError": True}
+        gone = {"content": [{"type": "text", "text": "task_status: no such task task-0001-abcdef"}], "isError": True}
+        self.gw.child = lambda n, a, c: flaky
+        self.gw._refresh_running()
+        self.assertEqual(self.gw.running, {"task-0001-abcdef"})
+        self.gw.child = lambda n, a, c: gone
+        self.gw._refresh_running()
+        self.assertEqual(self.gw.running, set())
+
+    def test_start_forwards_realpath(self):
+        real = os.path.join(self.root, "real")
+        os.mkdir(real)
+        link = os.path.join(self.root, "link")
+        os.symlink(real, link)
+        self.start(cwd=link)
+        self.assertEqual(self.child.calls[-1][1]["cwd"], os.path.realpath(real))
+
+    def test_list_asks_for_owned_ids(self):
+        self.start()
+        self.tcall("list_tasks")
+        name, a, _ = self.child.calls[-1]
+        self.assertEqual((name, a["ids"]), ("list_tasks", ["task-0001-abcdef"]))
+
+    def test_paths_stripped(self):
+        self.start()
+        sub = os.path.join(self.root, "proj")
+        os.mkdir(sub)
+
+        def child(name, a, cfg):
+            row = {"task_id": "task-0001-abcdef", "state": "running", "dir": "/Users/o/.cortados/x",
+                   "stdout_log": "/Users/o/x/stdout.log", "stderr_log": "/Users/o/x/stderr.log", "cwd": sub}
+            if name == "list_tasks":
+                row = {"tasks": [row]}
+            return {"content": [{"type": "text", "text": json.dumps(row)}]}
+        self.gw.child = child
+        st = json.loads(self.tcall("task_status", task_id="task-0001-abcdef")["result"]["content"][0]["text"])
+        lt = json.loads(self.tcall("list_tasks")["result"]["content"][0]["text"])["tasks"][0]
+        for out in (st, lt):
+            for k in bg.PATH_FIELDS:
+                self.assertNotIn(k, out)
+            self.assertEqual(out["cwd"], "proj")
+
+    def test_route_max_tokens_clamped(self):
+        seen = []
+        self.gw.route = lambda url, tok, task, ctx, mx, client=None: seen.append(mx) or {"content": []}
+        for v in (10 ** 9, "big", True, -5, 100):
+            self.tcall("route_task", task="q", max_tokens=v)
+        self.assertEqual(seen, [bg.MAX_ROUTE_TOKENS] * 4 + [100])
 
     def test_refresh_does_not_hold_lock(self):
         self.start()

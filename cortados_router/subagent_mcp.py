@@ -179,7 +179,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
             out = ct.wait(a.get("task_id"), a.get("timeout_s"), red, provider_url=cfg.get("url", ""),
                           token=token)              # wait() reads the cap via wait_max_s(); a bad one is a TaskError
         elif name == "list_tasks":
-            out = {"tasks": ct.list_recent(a.get("limit", 20))}
+            ids = a.get("ids")                  # internal (bot gateway): not advertised in the schema
+            out = {"tasks": ct.list_recent(a.get("limit", 20), ids if isinstance(ids, list) else None)}
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:

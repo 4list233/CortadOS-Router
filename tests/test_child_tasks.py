@@ -353,6 +353,10 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(ct.tasks_dir()).st_mode), 0o700)
         _, lst = self.call("list_tasks")
         self.assertEqual(lst["tasks"][0]["task_id"], tid)
+        _, only = self.call("list_tasks", ids=[tid, "t00000000000000-00000000"])   # bot gateway: owned ids only
+        self.assertEqual([t["task_id"] for t in only["tasks"]], [tid])
+        _, none = self.call("list_tasks", ids=[])
+        self.assertEqual(none["tasks"], [])
 
     # ---- permission modes the child's model really supports (2026-11-02 E2E: haiku + auto denied every write)
     def test_auto_mode_support_follows_the_clis_rule(self):
