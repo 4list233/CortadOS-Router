@@ -30,9 +30,13 @@ STRIPPED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI
 # `-c key=value` overrides (brief §B): no desktop notifications, no web search, no environment/project context in the
 # prompt (the client's system prompt is the whole prompt; project docs would read the scratch cwd anyway), and the
 # built-in openai provider, so a `model_provider` the home's config.toml sets (a mirror, another billing account)
-# cannot redirect the subscription lane the router logged.
+# cannot redirect the subscription lane the router logged. No permissions block either: Codex otherwise adds a developer
+# message "`sandbox_mode` is `read-only`: The sandbox only permits reading files" (captured 2026-11-02 from 0.166.0 on a
+# local endpoint). That describes the backend's own sandbox, which runs nothing; the model read it as a property of the
+# client's tools and refused a write without calling any ("this session's filesystem is read-only"). The sandbox itself
+# stays read-only (thread/start asks for it and the bridge checks the answer); only the misleading text goes.
 CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                    'model_provider="openai"')
+                    'model_provider="openai"', "include_permissions_instructions=false")
 # What config/read must show before thread/start (the effective config, every layer merged: config.toml, the -c
 # overrides, a managed requirements.toml). The overrides above are asked for and then checked, because a managed layer
 # wins over -c; chatgpt_base_url is the default backend of the ChatGPT login, the one the subscription bills to.
@@ -40,6 +44,7 @@ CONFIG_OVERRIDES = ("notify=[]", 'web_search="disabled"', "include_environment_c
 # it, and Codex then sent a ChatGPT-authenticated turn to the local Ollama endpoint); model_catalog_json replaces the
 # metadata of the models the route names. Both default to null and must stay so.
 EXPECTED_CONFIG = {"notify": [], "web_search": "disabled", "include_environment_context": False, "project_doc_max_bytes": 0,
+                   "include_permissions_instructions": False,
                    "model_provider": "openai", "chatgpt_base_url": "https://chatgpt.com/backend-api/",
                    "openai_base_url": None, "model_catalog_json": None}
 # The login the lane bills to: a ChatGPT subscription. An API-key login (or none) would bill elsewhere, or fail later

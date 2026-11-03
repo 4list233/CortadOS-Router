@@ -411,7 +411,7 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--enable"], ["code_mode_host"])
         overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
         for override in ("notify=[]", 'web_search="disabled"', "include_environment_context=false", "project_doc_max_bytes=0",
-                         'model_provider="openai"', "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
+                         'model_provider="openai"', "include_permissions_instructions=false", "mcp_servers.node_repl.enabled=false", "mcp_servers.docs.enabled=false",
                          f"features.code_mode.default_exec_yield_time_ms={int(provider_server.TURN_TIMEOUT_S * 1000)}"):
             self.assertIn(override, overrides)
         self.assertEqual(len([o for o in overrides if o.startswith("mcp_servers.")]), 2)   # [mcp_servers.x.env] is not a server
@@ -735,6 +735,8 @@ class CodexEndpointTests(unittest.TestCase):
         base, note = start["baseInstructions"].split("\n\n", 1)
         self.assertEqual(base, "Be terse.")
         self.assertTrue(note.startswith("[cortados relay]"), note)      # bridge.SCRATCH_NOTE, naming the scratch dir
+        self.assertIn("Your tools are the user's tools", note)           # a backend sandbox is not theirs (2026-11-02)
+        self.assertIn("does not apply to your tools", note)
 
     def test_a_call_naming_the_scratch_dir_is_refused_not_forwarded(self):
         # Codex tells the model its cwd (the backend's scratch dir); a call aimed there would land in a directory on the
@@ -1174,6 +1176,10 @@ class CodexSessionUnitTests(unittest.TestCase):
         # Captured on the provider host (codex-cli 0.163.0, throwaway CODEX_HOME, no login, no thread or turn).
         capture = json.loads(Path(__file__).with_name("fixtures").joinpath("codex-config-read-0.163.0.json").read_text())
         cfg = capture["response"]["result"]["config"]
+        # The capture predates the include_permissions_instructions=false override; it shows 0.163.0 has the key (at
+        # its default, true), so the override applies there as it does on 0.166.0. Applied here as -c would apply it.
+        self.assertIs(cfg["include_permissions_instructions"], True)
+        cfg["include_permissions_instructions"] = False
         self.assertEqual(cfg["features"]["code_mode"], {"default_exec_yield_time_ms": 1800000})
         self.assertNotIn("code_mode", cfg)                                # the top-level table is not a 0.163.0 key
         self.assertIn("features.code_mode.default_exec_yield_time_ms", capture["response"]["result"]["origins"])
@@ -1187,6 +1193,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         capture = json.loads(Path(__file__).with_name("fixtures").joinpath("codex-config-read-0.163.0.json").read_text())
         cfg = json.loads(json.dumps(capture["response"]["result"]["config"]))
         del cfg["features"]["code_mode"]
+        cfg["include_permissions_instructions"] = False          # the override the capture predates (see above)
         codex_isolation._yield_unreported_logged = False
         try:
             with self.assertLogs("cortados_router.provider.codex_isolation", "WARNING") as logs:
@@ -1214,6 +1221,7 @@ class CodexSessionUnitTests(unittest.TestCase):
         real = {"model_provider": "openai", "model_providers": {}, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
                 "openai_base_url": None, "model_catalog_json": None,
                 "web_search": "disabled", "project_doc_max_bytes": 0, "notify": [], "include_environment_context": False,
+                "include_permissions_instructions": False,
                 "mcp_servers": {"node_repl": {"enabled": False}, "computer-use": {"enabled": False},
                                 "openaiDeveloperDocs": {"url": "https://developers.openai.com/mcp", "enabled": False}},
                 "features": {**{f: False for f in codex_isolation.DISABLED_FEATURES}, "code_mode_host": True, "mentions_v2": True,
@@ -1229,6 +1237,10 @@ class CodexSessionUnitTests(unittest.TestCase):
         for needle in ('model_provider="mirror"', "chatgpt_base_url", 'web_search="live"', "model_providers.openai",
                        "['quiet', 'rogue']", "['apps', 'shell_tool']", "--codex-home"):
             self.assertIn(needle, text)
+        # A home or managed layer that keeps the permissions block ("sandbox is read-only", which a model applied to the
+        # client's tools and refused a write over) is refused like any other isolation override that did not hold.
+        with self.assertRaisesRegex(BridgeError, "include_permissions_instructions"):
+            codex_isolation.check_effective_config(dict(real, include_permissions_instructions=True))
         # The config `ollama launch codex` writes (seen live on the build Mac): a ChatGPT login whose turns go to Ollama.
         ollama = dict(real, openai_base_url="http://127.0.0.1:11434/api/codex/v1", model_catalog_json="/x/ollama-launch-models.json")
         with self.assertRaisesRegex(BridgeError, "openai_base_url.*model_catalog_json"):

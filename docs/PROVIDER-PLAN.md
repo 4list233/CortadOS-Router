@@ -232,6 +232,8 @@ done. The backend therefore runs on the real Codex home with everything switched
 ```
 codex app-server -c notify=[] -c web_search="disabled" -c include_environment_context=false -c project_doc_max_bytes=0
   -c model_provider="openai"                 # the built-in provider: a config.toml model_provider cannot redirect the lane
+  -c include_permissions_instructions=false  # no "sandbox is read-only" block: it describes the backend, not the
+                                             # client's tools, and a model refused a write over it (2026-11-02)
   -c features.code_mode.default_exec_yield_time_ms=<turn budget ms>   # code mode must not yield before the turn budget
                                              # (a top-level `code_mode` table is ignored by 0.163.0: captured live in
                                              # tests/fixtures/codex-config-read-0.163.0.json)

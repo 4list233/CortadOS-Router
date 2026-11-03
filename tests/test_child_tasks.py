@@ -1193,7 +1193,21 @@ class ChildTaskTests(unittest.TestCase):
         os.environ["FAKE_CLAUDE_MODE"] = "stream-manual"
         _, w = self.call("wait_task", task_id=self.start(permission_mode="manual"), timeout_s=30)
         self.assertEqual(w["effective_permission_mode"], "default")
-        self.assertNotIn("warnings", w)
+        self.assertFalse([x for x in w.get("warnings", []) if "permission mode" in x], w)   # only the no-tools one
+        self.assertEqual(len(w["warnings"]), 1)
+
+    def test_a_child_with_no_tool_calls_is_warned_about_and_one_with_calls_is_not(self):
+        # Found live (2026-11-02): a Codex child "succeeded" saying its filesystem was read-only, without one tool call.
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-manual"
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertEqual(w["state"], "succeeded")
+        self.assertEqual(w["tool_uses"], {})
+        self.assertTrue(any(x.startswith("no tool calls were made") for x in w["warnings"]), w)
+        os.environ["FAKE_CLAUDE_MODE"] = "stream-outside"
+        os.environ["FAKE_OUTSIDE"] = os.path.join(self.tmp, "elsewhere.txt")
+        _, w = self.call("wait_task", task_id=self.start(), timeout_s=30)
+        self.assertTrue(w["tool_uses"], w)
+        self.assertFalse(any(x.startswith("no tool calls") for x in w.get("warnings", [])), w)
 
     def _recovered(self, lines):
         d = os.path.join(self.tmp, "recovered")
