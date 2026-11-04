@@ -99,12 +99,13 @@ def read():
             if m.get("id") == 2:
                 tools = m["result"]["tools"]
                 out["names"] = sorted(t["name"] for t in tools)
-                # A tool without inputSchema.properties takes no arguments: its allowed key set is empty. A schema or
-                # properties that is not an object is malformed output (reported as such, never read as key names).
+                # A tool without inputSchema, or a schema without properties, takes no arguments: its allowed key set
+                # is empty. Only an ABSENT field defaults to {}: a present one must be an object ([] / "" / false /
+                # null are malformed output, reported as such, never coerced to "no arguments").
                 args = {}
                 for t in tools:
-                    schema = t.get("inputSchema") or {}
-                    props = (schema.get("properties") or {}) if isinstance(schema, dict) else None
+                    schema = t["inputSchema"] if "inputSchema" in t else {}
+                    props = schema.get("properties", {}) if isinstance(schema, dict) else None
                     if not isinstance(props, dict):
                         raise ValueError(f"inputSchema of {t['name']!r} is not an object with object properties")
                     args[t["name"]] = sorted(props)
