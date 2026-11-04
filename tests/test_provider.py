@@ -1924,6 +1924,18 @@ open(os.environ["FAKE_SEARCH_LOG"], "a").write(json.dumps({"argv": sys.argv[1:],
 mode = os.environ.get("FAKE_SEARCH_MODE", "ok")
 if mode == "fail":
     sys.stderr.write("boom"); sys.exit(3)
+if mode == "detach":
+    # double-fork a writer into its own session that holds stdout/stderr open, then answer normally and exit: the
+    # lane's group kill cannot reach it, so stdout never reaches EOF while it lives
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            open(os.environ["FAKE_SEARCH_PIDFILE"], "w").write(str(os.getpid()))
+            time.sleep(30); os._exit(0)
+        os._exit(0)
+    os.wait()
+    while not os.path.exists(os.environ["FAKE_SEARCH_PIDFILE"]):
+        time.sleep(0.01)
 if mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_SEARCH_SLEEP", "5")))
 if mode in ("bigout", "bigerr"):
@@ -2265,6 +2277,61 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertIn("output_too_large", r["content"][0]["text"])
         self.assertEqual(self.ledger, [])
         self.assertEqual(search_lane._slots._value, before)
+
+    def test_the_group_is_signalled_before_the_child_is_reaped(self):
+        # A reaped child's pid may be reused at once; signalling it as a group after the reap could kill a stranger.
+        calls = []
+        real_killpg, real_wait = os.killpg, subprocess.Popen.wait
+
+        def killpg(pid, sig):
+            calls.append("killpg")
+            return real_killpg(pid, sig)
+
+        def wait(proc, *a, **kw):
+            calls.append("wait")
+            return real_wait(proc, *a, **kw)
+
+        with mock.patch.object(search_lane.os, "killpg", side_effect=killpg), \
+                mock.patch.object(subprocess.Popen, "wait", autospec=True, side_effect=wait):
+            res = search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        self.assertIn("example.com", res.text)
+        self.assertEqual(calls[:2], ["killpg", "wait"])
+
+    def _fds(self):
+        return len(os.listdir("/dev/fd"))
+
+    def test_a_detached_writer_holding_the_pipes_fails_incomplete_within_the_timeout(self):
+        os.environ["FAKE_SEARCH_MODE"] = "detach"
+        pidfile = os.path.join(self.scratch, "detached.pid")
+        os.environ["FAKE_SEARCH_PIDFILE"] = pidfile
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_PIDFILE", None)
+
+        def reap_writer():
+            try:
+                os.kill(int(Path(pidfile).read_text()), 9)
+            except (OSError, ValueError):
+                pass
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+        self.addCleanup(reap_writer)
+        fds, threads, slots = self._fds(), threading.active_count(), search_lane._slots._value
+        t0 = time.monotonic()
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=2)
+        took = time.monotonic() - t0
+        self.assertEqual(cm.exception.kind, "incomplete_output",
+                         "a full-looking answer without EOF on stdout is not taken as a success")
+        self.assertLess(took, 6, "the run ends at its deadline, not when the detached writer lets go (30 s)")
+        self.assertEqual(search_lane._slots._value, slots, "the slot is released")
+        self.assertEqual(self._fds(), fds, "both pipes are closed")
+        self.assertEqual(threading.active_count(), threads, "no reader thread is left behind")
+        reap_writer()
+        # through the endpoint: unavailable, and no usage-ledger row
+        with mock.patch.object(search_lane, "SEARCH_TIMEOUT_S", 2):
+            r = self.post(self.SEARCH)
+        self.assertIn("incomplete_output", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+        self.assertEqual(search_lane._slots._value, slots)
 
     def test_start_failure_releases_the_slot(self):
         before = search_lane._slots._value

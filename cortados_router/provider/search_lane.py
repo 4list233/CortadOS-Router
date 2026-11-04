@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -56,10 +57,6 @@ BLOCKED_NOTE = "\n\nNever use results from these domains: {domains}."
 # 256 KiB is already generous. Past a cap the child is killed and the search fails as output_too_large.
 STDOUT_CAP = 4 * 1024 * 1024
 STDERR_CAP = 256 * 1024
-# How long the readers may take to hit EOF once the child's process group is gone; a reader still blocked after that
-# is abandoned (daemon thread) rather than hanging the request.
-_READER_JOIN_S = 5.0
-
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 
@@ -179,76 +176,76 @@ def search_evidence(events: list[dict[str, Any]]) -> bool:
 
 
 def _kill_group(p: subprocess.Popen) -> None:
-    """SIGKILL the child's whole process group (it was started in its own session), so a grandchild still holding a
-    pipe cannot keep the readers blocked. ProcessLookupError means the group is already empty: nothing to kill."""
+    """SIGKILL the child's whole process group (it was started in its own session). Called BEFORE the child is reaped:
+    while the leader is unreaped (alive or a zombie) its pid, and so the group id, cannot be reused, so the signal can
+    only reach this child's group. ProcessLookupError means the group is already empty; PermissionError is what macOS
+    reports for a group whose only member is the unreaped zombie leader (seen 2026-11-03). Both: nothing to kill."""
     try:
         os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 
+def _too_large() -> SearchFailed:
+    return SearchFailed("output_too_large", f"the CLI wrote past {STDOUT_CAP} bytes of stdout or {STDERR_CAP} bytes "
+                                            "of stderr")
+
+
 def _run_cli(cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float) -> tuple[int, str, str]:
-    """Run the CLI with both pipes drained by reader threads under STDOUT_CAP / STDERR_CAP. Returns (returncode,
-    stdout, stderr); raises SearchFailed("output_too_large") or SearchFailed("timeout") after killing and reaping the
-    child, and SearchFailed("start_failed") when it cannot be started. Only this thread kills or reaps the child."""
+    """Run the CLI and drain both pipes on THIS thread: one selectors loop over the two non-blocking pipes, under one
+    absolute deadline and STDOUT_CAP / STDERR_CAP. Returns (returncode, stdout, stderr) only when stdout reached EOF
+    before the deadline. Raises SearchFailed("output_too_large"), ("timeout") or ("incomplete_output": the deadline
+    passed with stdout still open, e.g. a detached grandchild in another session holds the pipe, so the capture may be
+    cut short and is never taken as an answer), and SearchFailed("start_failed") when it cannot be started.
+
+    No reader threads: a reader blocked on a pipe that something outside the killed group keeps open would never end,
+    leaking its fd and buffer. Cleanup order: signal the group first, reap the child second (_kill_group says why),
+    close both pipes last, on every path."""
     try:
         p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True)
     except OSError as exc:
         raise SearchFailed("start_failed", str(exc)) from None
-    over = threading.Event()
+    deadline = time.monotonic() + timeout
     bufs = {"stdout": bytearray(), "stderr": bytearray()}
-
-    def drain(pipe, buf: bytearray, cap: int) -> None:
-        fd = pipe.fileno()
-        try:
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    return
-                if len(buf) + len(chunk) > cap:
-                    over.set()                      # the main thread kills the child; stop holding its bytes
-                    return
-                buf += chunk
-        except OSError:                             # the pipe was closed under us during cleanup: nothing more to read
-            return
-
-    readers = [threading.Thread(target=drain, args=(p.stdout, bufs["stdout"], STDOUT_CAP), daemon=True,
-                                name="cortados-search-stdout"),
-               threading.Thread(target=drain, args=(p.stderr, bufs["stderr"], STDERR_CAP), daemon=True,
-                                name="cortados-search-stderr")]
+    caps = {"stdout": STDOUT_CAP, "stderr": STDERR_CAP}
     failure = None
+    sel = selectors.DefaultSelector()
     try:
-        for t in readers:
-            t.start()
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                p.wait(timeout=max(0.0, min(0.05, deadline - time.monotonic())))
+        for name, pipe in (("stdout", p.stdout), ("stderr", p.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            sel.register(pipe.fileno(), selectors.EVENT_READ, name)
+        while sel.get_map():                        # until both pipes reach EOF
+            left = deadline - time.monotonic()
+            if left <= 0:
+                failure = "deadline"
                 break
-            except subprocess.TimeoutExpired:
-                if over.is_set():
-                    failure = SearchFailed("output_too_large", f"the CLI wrote past {STDOUT_CAP} bytes of stdout or "
-                                                               f"{STDERR_CAP} bytes of stderr")
+            for key, _ in sel.select(timeout=left):
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:             # spurious wakeup: nothing to read yet
+                    continue
+                if not chunk:
+                    sel.unregister(key.fd)
+                    continue
+                buf = bufs[key.data]
+                if len(buf) + len(chunk) > caps[key.data]:
+                    failure = _too_large()          # stop holding its bytes; the finally kills the child
                     break
-                if time.monotonic() >= deadline:
-                    failure = SearchFailed("timeout", f"no answer in {timeout:.0f}s")
-                    break
+                buf += chunk
+            if failure is not None:
+                break
     finally:
-        _kill_group(p)                              # also stops stragglers of a child that exited by itself
+        sel.close()
+        _kill_group(p)                              # before the reap; also stops stragglers of a child that exited
         p.wait()
-        for t, pipe in zip(readers, (p.stdout, p.stderr)):
-            t.join(_READER_JOIN_S)
-            if t.is_alive():
-                # Something outside the killed group still holds the pipe open. Closing the fd under a blocked read
-                # could hand the number to an unrelated file, so the reader and its pipe are left to end on EOF.
-                logger.warning("search lane: %s reader still blocked %.0fs after the kill; abandoned", t.name,
-                               _READER_JOIN_S)
-            else:
-                pipe.close()
-    if failure is None and over.is_set():           # the child exited right after overflowing
-        failure = SearchFailed("output_too_large", f"the CLI wrote past {STDOUT_CAP} bytes of stdout or "
-                                                   f"{STDERR_CAP} bytes of stderr")
+        p.stdout.close()
+        p.stderr.close()
+    if failure == "deadline":
+        # Killed by us (still running at the deadline): a timeout. Exited by itself with stdout still held open
+        # elsewhere: what was captured may be a prefix, so it is not an answer.
+        failure = (SearchFailed("timeout", f"no answer in {timeout:.0f}s") if p.returncode == -signal.SIGKILL
+                   else SearchFailed("incomplete_output", f"stdout still open {timeout:.0f}s after the start"))
     if failure is not None:
         raise failure
     return (p.returncode, bufs["stdout"].decode("utf-8", "replace"), bufs["stderr"].decode("utf-8", "replace"))
@@ -258,7 +255,7 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         timeout: float | None = None, allowed: list[str] | None = None,
         blocked: list[str] | None = None) -> SearchResult:
     """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, output_too_large,
-    exit_<n>, bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
+    incomplete_output, exit_<n>, bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
     timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
     if not query:
         raise SearchFailed("no_query", "the request carries no user text to search for")
