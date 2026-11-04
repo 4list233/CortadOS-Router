@@ -1926,6 +1926,11 @@ if mode == "fail":
     sys.stderr.write("boom"); sys.exit(3)
 if mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_SEARCH_SLEEP", "5")))
+if mode in ("bigout", "bigerr"):
+    # write past the lane's cap, then hang: only a kill on overflow ends this child before the test's timeout
+    out = sys.stdout.buffer if mode == "bigout" else sys.stderr.buffer
+    out.write(b"x" * int(os.environ.get("FAKE_SEARCH_BYTES", "65536"))); out.flush()
+    time.sleep(30)
 def emit(e): print(json.dumps(e))
 emit({"type": "system", "subtype": "init"})
 if mode != "nosearch":
@@ -2108,12 +2113,10 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertIn("cortados-search-", call["cwd"])
 
     def test_named_account_runs_on_its_login_and_an_unknown_one_falls_back(self):
-        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
-                mock.patch.object(self.reg, "claude_config_dir", lambda acct: "/cfg/b" if acct == "b" else None):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
             self.post(self.SEARCH)
         self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
-        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "zz"}), \
-                mock.patch.object(self.reg, "claude_config_dir", lambda acct: None):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "zz"}), self._accounts(self.ACCTS):
             r = self.post(self.SEARCH)
         self.assertIn("unavailable", r["content"][0]["text"])
         self.assertIn("no_claude_lane", r["content"][0]["text"])
@@ -2196,8 +2199,8 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertEqual(search_lane._usage_int(7.0), 7)
         out = {"type": "result", "is_error": False, "result": "r",
                "usage": {"input_tokens": float("nan"), "output_tokens": 3}}
-        done = subprocess.CompletedProcess([], 0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE + [out]), "")
-        with mock.patch.object(search_lane.subprocess, "run", return_value=done):
+        done = (0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE + [out]), "")
+        with mock.patch.object(search_lane, "_run_cli", return_value=done):
             res = search_lane.run("claude", "q", None)
         self.assertEqual(res.usage, {"output_tokens": 3})
 
@@ -2205,16 +2208,97 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.post(self.SEARCH)
         self.assertEqual(self.ledger, [("claude", search_lane.SEARCH_MODEL, {"input_tokens": 11, "output_tokens": 7})])
         self.ledger.clear()
-        accts = [{"lane": "claude", "account": "a"}, {"lane": "claude#b", "account": "b"}]
-        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
-                mock.patch.object(self.reg, "claude_config_dir", lambda acct: "/cfg/b"), \
-                mock.patch("cortados_router.core._vendor_accounts", return_value=accts):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
             self.post(self.SEARCH)
         self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
         self.ledger.clear()
         os.environ["FAKE_SEARCH_MODE"] = "fail"
         self.post(self.SEARCH)
         self.assertEqual(self.ledger, [], "a failed search spent nothing worth learning from and is not recorded")
+
+    def _bounded_run(self, mode, **env):
+        """search_lane.run on the fake CLI in `mode` with small caps; returns (failure kind, seconds, slot delta)."""
+        os.environ["FAKE_SEARCH_MODE"] = mode
+        for k, v in env.items():
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        before = search_lane._slots._value
+        t0 = time.monotonic()
+        with mock.patch.object(search_lane, "STDOUT_CAP", 16 * 1024), \
+                mock.patch.object(search_lane, "STDERR_CAP", 4 * 1024), \
+                self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        return cm.exception.kind, time.monotonic() - t0, search_lane._slots._value - before
+
+    def test_oversized_stdout_kills_the_child_and_fails_output_too_large(self):
+        kind, took, delta = self._bounded_run("bigout", FAKE_SEARCH_BYTES=str(1024 * 1024))
+        self.assertEqual(kind, "output_too_large")
+        self.assertLess(took, 8, "the child is killed on overflow, not waited out (it sleeps 30 s)")
+        self.assertEqual(delta, 0, "the slot is released")
+
+    def test_oversized_stderr_kills_the_child_and_fails_output_too_large(self):
+        kind, took, delta = self._bounded_run("bigerr", FAKE_SEARCH_BYTES=str(256 * 1024))
+        self.assertEqual(kind, "output_too_large")
+        self.assertLess(took, 8)
+        self.assertEqual(delta, 0)
+
+    def test_output_under_the_caps_is_not_cut(self):
+        # 32 KiB to stderr is under the default 256 KiB cap; the child then hangs, so the run ends as a timeout
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_BYTES"] = "bigerr", str(32 * 1024)
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_BYTES", None)
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=1)
+        self.assertEqual(cm.exception.kind, "timeout")
+
+    def test_timeout_kills_the_child_and_releases_the_slot(self):
+        kind, took, delta = self._bounded_run("sleep", FAKE_SEARCH_SLEEP="30")
+        self.assertEqual(kind, "timeout")
+        self.assertLess(took, 14)
+        self.assertEqual(delta, 0)
+
+    def test_an_oversized_reply_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_BYTES"] = "bigout", str(64 * 1024)
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_BYTES", None)
+        before = search_lane._slots._value
+        with mock.patch.object(search_lane, "STDOUT_CAP", 16 * 1024):
+            r = self.post(self.SEARCH)
+        self.assertIn("output_too_large", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+        self.assertEqual(search_lane._slots._value, before)
+
+    def test_start_failure_releases_the_slot(self):
+        before = search_lane._slots._value
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run([os.path.join(self.scratch, "no-such-cli")], "q", None)
+        self.assertEqual(cm.exception.kind, "start_failed")
+        self.assertEqual(search_lane._slots._value, before)
+
+    def test_login_takes_dir_and_lane_from_one_accounts_snapshot(self):
+        # accounts.json changes between reads: account b moves from /cfg/b1 (lane claude#b) to /cfg/b2 (lane claude#x).
+        # Whatever is read, the pair must come from one snapshot, and the file is read once per search.
+        snaps = [[{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+                  {"lane": "claude#b", "account": "b", "config_dir": "/cfg/b1"}],
+                 [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+                  {"lane": "claude#x", "account": "b", "config_dir": "/cfg/b2"}]]
+        from cortados_router import core
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
+                mock.patch.object(core, "_vendor_accounts", side_effect=snaps) as reads:
+            who = search_lane.login()
+        self.assertEqual((who.config_dir, who.ledger_lane), ("/cfg/b1", "claude#b"))
+        self.assertEqual(reads.call_count, 1)
+        # end to end: the CLI runs on the dir and the ledger row is charged on the lane of the same snapshot
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
+                mock.patch.object(core, "_vendor_accounts", side_effect=list(snaps)) as reads:
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[-1]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b1"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
+        self.assertEqual(reads.call_count, 1)
+
+    def test_account_row(self):
+        from cortados_router import core
+        self.assertEqual(core.account_row(self.ACCTS, "b")["config_dir"], "/cfg/b")
+        self.assertIsNone(core.account_row(self.ACCTS, "zz"))
+        self.assertIsNone(core.account_row(self.ACCTS, None))
 
     def test_argv_streams_events(self):
         a = search_lane.argv("claude", "q")
@@ -2252,11 +2336,11 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         done = SEARCH_EVIDENCE + [{"type": "result", "is_error": False, "result": "first"},
                                   {"type": "result", "is_error": False, "result": "last",
                                    "usage": {"server_tool_use": {"web_search_requests": 0}}}]
-        with mock.patch.object(search_lane.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "noise\n" + "\n".join(json.dumps(e) for e in done), "")):
+        with mock.patch.object(search_lane, "_run_cli", return_value=(
+                0, "noise\n" + "\n".join(json.dumps(e) for e in done), "")):
             self.assertEqual(search_lane.run("claude", "q", None).text, "last", "the last result line is the answer")
-        with mock.patch.object(search_lane.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE), "")):
+        with mock.patch.object(search_lane, "_run_cli", return_value=(
+                0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE), "")):
             with self.assertRaises(search_lane.SearchFailed) as cm:
                 search_lane.run("claude", "q", None)
         self.assertEqual(cm.exception.kind, "bad_output")
@@ -2270,7 +2354,7 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
 
     def test_configured_account_runs_and_is_charged_on_that_account(self):
         with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b", "CLAUDE_CONFIG_DIR": "/cfg/a"}), \
-                mock.patch.object(self.reg, "claude_config_dir", lambda acct: "/cfg/b"), self._accounts(self.ACCTS):
+                self._accounts(self.ACCTS):
             self.post(self.SEARCH)
         self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
         self.assertEqual([row[0] for row in self.ledger], ["claude#b"])

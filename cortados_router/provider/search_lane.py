@@ -13,9 +13,11 @@ import logging
 import math
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +49,16 @@ PROMPT = ("Search the web for: {query}\n\n"
 # enforced filter.
 ALLOWED_NOTE = "\n\nOnly use results from these domains: {domains}."
 BLOCKED_NOTE = "\n\nNever use results from these domains: {domains}."
+
+# Byte caps on what the child may write, drained incrementally (never buffered whole): a stream-json run of one search
+# with a few fetched pages is well under 1 MiB, so 4 MiB of stdout is a runaway or hostile CLI, and up to
+# MAX_CONCURRENT of them must not hold unbounded memory in the provider. stderr only feeds a 300-char diagnostic, so
+# 256 KiB is already generous. Past a cap the child is killed and the search fails as output_too_large.
+STDOUT_CAP = 4 * 1024 * 1024
+STDERR_CAP = 256 * 1024
+# How long the readers may take to hit EOF once the child's process group is gone; a reader still blocked after that
+# is abandoned (daemon thread) rather than hanging the request.
+_READER_JOIN_S = 5.0
 
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 
@@ -166,11 +178,87 @@ def search_evidence(events: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _kill_group(p: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group (it was started in its own session), so a grandchild still holding a
+    pipe cannot keep the readers blocked. ProcessLookupError means the group is already empty: nothing to kill."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_cli(cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float) -> tuple[int, str, str]:
+    """Run the CLI with both pipes drained by reader threads under STDOUT_CAP / STDERR_CAP. Returns (returncode,
+    stdout, stderr); raises SearchFailed("output_too_large") or SearchFailed("timeout") after killing and reaping the
+    child, and SearchFailed("start_failed") when it cannot be started. Only this thread kills or reaps the child."""
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as exc:
+        raise SearchFailed("start_failed", str(exc)) from None
+    over = threading.Event()
+    bufs = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def drain(pipe, buf: bytearray, cap: int) -> None:
+        fd = pipe.fileno()
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return
+                if len(buf) + len(chunk) > cap:
+                    over.set()                      # the main thread kills the child; stop holding its bytes
+                    return
+                buf += chunk
+        except OSError:                             # the pipe was closed under us during cleanup: nothing more to read
+            return
+
+    readers = [threading.Thread(target=drain, args=(p.stdout, bufs["stdout"], STDOUT_CAP), daemon=True,
+                                name="cortados-search-stdout"),
+               threading.Thread(target=drain, args=(p.stderr, bufs["stderr"], STDERR_CAP), daemon=True,
+                                name="cortados-search-stderr")]
+    failure = None
+    try:
+        for t in readers:
+            t.start()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                p.wait(timeout=max(0.0, min(0.05, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                if over.is_set():
+                    failure = SearchFailed("output_too_large", f"the CLI wrote past {STDOUT_CAP} bytes of stdout or "
+                                                               f"{STDERR_CAP} bytes of stderr")
+                    break
+                if time.monotonic() >= deadline:
+                    failure = SearchFailed("timeout", f"no answer in {timeout:.0f}s")
+                    break
+    finally:
+        _kill_group(p)                              # also stops stragglers of a child that exited by itself
+        p.wait()
+        for t, pipe in zip(readers, (p.stdout, p.stderr)):
+            t.join(_READER_JOIN_S)
+            if t.is_alive():
+                # Something outside the killed group still holds the pipe open. Closing the fd under a blocked read
+                # could hand the number to an unrelated file, so the reader and its pipe are left to end on EOF.
+                logger.warning("search lane: %s reader still blocked %.0fs after the kill; abandoned", t.name,
+                               _READER_JOIN_S)
+            else:
+                pipe.close()
+    if failure is None and over.is_set():           # the child exited right after overflowing
+        failure = SearchFailed("output_too_large", f"the CLI wrote past {STDOUT_CAP} bytes of stdout or "
+                                                   f"{STDERR_CAP} bytes of stderr")
+    if failure is not None:
+        raise failure
+    return (p.returncode, bufs["stdout"].decode("utf-8", "replace"), bufs["stderr"].decode("utf-8", "replace"))
+
+
 def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         timeout: float | None = None, allowed: list[str] | None = None,
         blocked: list[str] | None = None) -> SearchResult:
-    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, exit_<n>,
-    bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
+    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, output_too_large,
+    exit_<n>, bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
     timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
     if not query:
         raise SearchFailed("no_query", "the request carries no user text to search for")
@@ -186,16 +274,11 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         shutil.rmtree(work, ignore_errors=True)
         raise SearchFailed("busy", f"{MAX_CONCURRENT} searches already running")
     try:
-        try:
-            p = subprocess.run(argv(claude_bin, query, allowed, blocked), cwd=work, env=bridge.claude_env(config_dir),
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise SearchFailed("timeout", f"no answer in {timeout:.0f}s") from None
-        except OSError as exc:
-            raise SearchFailed("start_failed", str(exc)) from None
-        if p.returncode != 0:
-            raise SearchFailed(f"exit_{p.returncode}", (p.stderr or p.stdout or "").strip()[-300:])
-        events = _events(p.stdout)
+        code, stdout, stderr = _run_cli(argv(claude_bin, query, allowed, blocked), cwd=work,
+                                        env=bridge.claude_env(config_dir), timeout=timeout)
+        if code != 0:
+            raise SearchFailed(f"exit_{code}", (stderr or stdout or "").strip()[-300:])
+        events = _events(stdout)
         out = next((e for e in reversed(events) if e.get("type") == "result"), None)
         if out is None:
             raise SearchFailed("bad_output", "the CLI's output has no result event")
@@ -224,12 +307,13 @@ class Login:
     ledger_lane: str | None
 
 
-def login(registry) -> Login:
+def login() -> Login:
     """The login a search runs on and the scarcity lane it draws on.
 
-    - CORTADOS_PROVIDER_SEARCH_ACCOUNT names an account: its config_dir (resolved through the Registry, the same
-      tables/accounts.json lookup routed Claude conversations use) and its lane (claude#b). A named account that
-      cannot be resolved fails the search rather than falling back to the default login.
+    - CORTADOS_PROVIDER_SEARCH_ACCOUNT names an account: its config_dir and its lane (claude#b), both taken from ONE
+      row of ONE read of tables/accounts.json (core.account_row, the lookup Registry.claude_config_dir also uses), so a
+      concurrent edit of the file cannot pair one snapshot's login with another's lane. A named account that cannot be
+      resolved fails the search rather than falling back to the default login.
     - Otherwise, with accounts configured: the FIRST account, which is the bare `claude` lane, passed as an explicit
       config_dir. Explicit because the child would otherwise inherit whatever CLAUDE_CONFIG_DIR the provider runs
       with (possibly account b) while the ledger said `claude`; bridge.claude_env overrides an inherited one.
@@ -243,10 +327,11 @@ def login(registry) -> Login:
     except Exception as exc:
         raise SearchFailed("no_claude_lane", f"tables/accounts.json is unreadable: {exc}") from None
     if account:
-        cfg = registry.claude_config_dir(account)
+        row = core.account_row(accounts, account)
+        cfg = row.get("config_dir") if row else None
         if not cfg:
             raise SearchFailed("no_claude_lane", f"account {account!r} has no resolvable login")
-        lane = next((a.get("lane") for a in accounts if a.get("account") == account), None)
+        lane = row.get("lane")
         if not lane:
             logger.warning("search lane: account %r has no lane in tables/accounts.json; this search is not recorded",
                            account)

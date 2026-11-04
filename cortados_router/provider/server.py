@@ -643,9 +643,8 @@ class Registry:
             return None
         try:
             from cortados_router import core
-            for a in core._vendor_accounts("claude", "claude", "claude-cli"):
-                if a.get("account") == account:
-                    return a.get("config_dir")
+            row = core.account_row(core._vendor_accounts("claude", "claude", "claude-cli"), account)
+            return row.get("config_dir") if row else None
         except Exception:
             pass
         return None
@@ -1276,7 +1275,7 @@ class Handler(BaseHTTPRequestHandler):
         explicit unavailable reply, naming the failure class, never to an empty success."""
         reg = self.server.registry
         try:
-            who = search_lane.login(reg)                # the login and its ledger lane, resolved together before launch
+            who = search_lane.login()               # the login and its ledger lane, resolved together before launch
             allowed, blocked = search_lane.domain_filters(body)
             result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
                                      search_lane.extract_query(body), who.config_dir, allowed=allowed, blocked=blocked)

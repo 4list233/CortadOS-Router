@@ -401,6 +401,15 @@ def _vendor_accounts(vendor: str, base_lane: str, base_provider: str) -> list[di
     return out
 
 
+def account_row(accounts: list[dict[str, Any]], account: str | None) -> dict[str, Any] | None:
+    """The row of one already-loaded `_vendor_accounts` list whose account id is `account`; None when no account is
+    named or none matches. Takes the list rather than reading accounts.json, so a caller that needs several fields of
+    one account (its config_dir AND its lane) gets them from a single snapshot of the file."""
+    if not account:
+        return None
+    return next((a for a in accounts if a.get("account") == account), None)
+
+
 def _base_provider(provider: str) -> str:
     """The backend a per-account provider maps to: `claude-cli#b` -> `claude-cli`."""
     return (provider or "").split("#", 1)[0]
