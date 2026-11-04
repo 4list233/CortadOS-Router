@@ -210,8 +210,9 @@ def _run_cli(cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float) -
     bufs = {"stdout": bytearray(), "stderr": bytearray()}
     caps = {"stdout": STDOUT_CAP, "stderr": STDERR_CAP}
     failure = None
-    sel = selectors.DefaultSelector()
-    try:
+    sel = None
+    try:                                            # from here on every path signals, reaps and closes (finally)
+        sel = selectors.DefaultSelector()           # can fail (EMFILE: kqueue needs an fd) with the child running
         for name, pipe in (("stdout", p.stdout), ("stderr", p.stderr)):
             os.set_blocking(pipe.fileno(), False)
             sel.register(pipe.fileno(), selectors.EVENT_READ, name)
@@ -236,11 +237,16 @@ def _run_cli(cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float) -
             if failure is not None:
                 break
     finally:
-        sel.close()
-        _kill_group(p)                              # before the reap; also stops stragglers of a child that exited
-        p.wait()
-        p.stdout.close()
-        p.stderr.close()
+        # Each step is guarded on its own, so one failing (a selector close error, an interrupted wait) can neither
+        # skip the kill and reap nor leave either pipe open.
+        for step in ((sel.close if sel is not None else None), lambda: _kill_group(p), p.wait,
+                     p.stdout.close, p.stderr.close):
+            if step is None:
+                continue
+            try:
+                step()                              # order: kill before the reap (_kill_group says why), pipes last
+            except Exception:
+                logger.exception("search lane: cleanup step failed")
     if failure == "deadline":
         # Killed by us (still running at the deadline): a timeout. Exited by itself with stdout still held open
         # elsewhere: what was captured may be a prefix, so it is not an answer.
@@ -298,10 +304,10 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
 @dataclass
 class Login:
     """Where a search runs and what it is charged to, resolved together before launch so the two cannot disagree.
-    config_dir None = the CLI runs on the provider's own default login. ledger_lane None = the login could not be
-    tied to a configured account lane, so the search is not recorded (charging it to `claude` would be a guess)."""
+    config_dir None = the CLI runs on the provider's own default login. ledger_lane is always a lane: a login that
+    cannot be tied to one fails in login() before launch (charging it to `claude` would be a guess)."""
     config_dir: str | None
-    ledger_lane: str | None
+    ledger_lane: str
 
 
 def login() -> Login:
@@ -315,8 +321,8 @@ def login() -> Login:
       config_dir. Explicit because the child would otherwise inherit whatever CLAUDE_CONFIG_DIR the provider runs
       with (possibly account b) while the ledger said `claude`; bridge.claude_env overrides an inherited one.
     - Otherwise (no accounts.json): the provider's own login, charged to `claude`, unless the provider's environment
-      carries a CLAUDE_CONFIG_DIR. That login matches no configured account, so the search runs (it is the same login
-      the bare claude lane's conversations use) but writes no ledger row, and that is logged."""
+      carries a CLAUDE_CONFIG_DIR. That login matches no configured account, so the search fails with no_claude_lane
+      before the CLI is launched: no quota is spent that the ledger cannot record."""
     from cortados_router import core
     account = os.environ.get(ACCOUNT_ENV, "").strip()
     try:
@@ -329,16 +335,16 @@ def login() -> Login:
         if not cfg:
             raise SearchFailed("no_claude_lane", f"account {account!r} has no resolvable login")
         lane = row.get("lane")
-        if not lane:
-            logger.warning("search lane: account %r has no lane in tables/accounts.json; this search is not recorded",
-                           account)
+        if not lane:                                # same rule as below: never spend quota no ledger row can record
+            raise SearchFailed("no_claude_lane", f"account {account!r} has no lane in tables/accounts.json")
         return Login(cfg, lane)
     first = accounts[0]
     if first.get("config_dir"):
         return Login(first["config_dir"], first.get("lane") or "claude")
     inherited = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     if inherited:
-        logger.warning("search lane: the provider's CLAUDE_CONFIG_DIR (%s) matches no configured account; the search "
-                       "runs on it but is not recorded in the usage ledger", inherited)
-        return Login(None, None)
+        # A search spends quota; one that could not be charged to any lane is refused before launch, not run
+        # unaccounted (the scarcity learner would never see that spend).
+        raise SearchFailed("no_claude_lane", f"the provider's CLAUDE_CONFIG_DIR ({inherited}) matches no configured "
+                                             "account, so the search could not be charged to a lane")
     return Login(None, "claude")

@@ -1291,11 +1291,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._server_tools_unavailable(turn, names, wire, reason="the search lane failed: internal")
         logger.info("web search answered on the search lane (%s, %d chars)", search_lane.SEARCH_MODEL,
                     len(result.text))
+        # Accounting, not a quota gate: scarcity/quota decide whether a lane may spend; the ledger only teaches
+        # unitcost tokens per %. So, like every other lane, the row is written after the fact (record_async) with no
+        # pre-launch reservation; a lost row weakens one learning interval and is logged at error level with the lane
+        # and run id. Only a completed search reaches here: every failure (incomplete_output included) returned above.
         try:
-            lane = who.ledger_lane
-            if lane:                                    # the search spent quota on this Claude account's pool
-                from cortados_router import usage_ledger
-                usage_ledger.record_async(lane, search_lane.SEARCH_MODEL, result.usage)
+            from cortados_router import usage_ledger
+            run_id, valid = self._run_id()
+            usage_ledger.record_async(who.ledger_lane, search_lane.SEARCH_MODEL, result.usage,
+                                      context=f"search lane, run {run_id if run_id and valid else '-'}")
         except Exception as exc:
             _log_ledger_hook_failure(exc)               # the ledger never breaks a reply (as _ledger_turn's caller)
         return self._reply_text(turn, result.text, result.usage, wire)

@@ -132,8 +132,12 @@ def _write(p: Path, row: tuple) -> None:
         c.close()
 
 
-def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None, path: Path | None = None) -> bool:
-    """Append one turn. `lane` is the scarcity lane (claude, claude#b, codex); its base is the runtime. Returns False on failure."""
+def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None, path: Path | None = None,
+           context: str | None = None) -> bool:
+    """Append one turn. `lane` is the scarcity lane (claude, claude#b, codex); its base is the runtime. Returns False on failure.
+    `context` (e.g. "search lane, run <id>") marks a write whose loss must be seen every time: its failure is logged at error
+    level with the lane and that context on EVERY occurrence, besides counting toward consecutive_failures(). Logged
+    once, after the busy retries (RETRY_S) are spent or on the first non-busy error."""
     global _consecutive_failures
     try:
         u = usage or {}
@@ -156,7 +160,10 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
         with _fail_lock:
             _consecutive_failures += 1
             n = _consecutive_failures
-        if n == 1 or n % LOG_EVERY == 0:
+        if context:
+            logger.error("usage ledger write failed for %s on lane %s (%s: %s); this spend is not recorded", context, lane,
+                         type(exc).__name__, str(exc)[:120])
+        elif n == 1 or n % LOG_EVERY == 0:
             logger.warning("usage ledger write failed (%s: %s); %d consecutive failures, logged on the first and every %d",
                            type(exc).__name__, str(exc)[:120], n, LOG_EVERY)
         return False
@@ -167,8 +174,9 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
     return True
 
 
-def record_async(lane: str, model: str, usage: dict | None) -> threading.Thread:
+def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None) -> threading.Thread:
     """Off the request thread, so even the sqlite timeout never delays a reply. Returns the started thread (tests join it)."""
-    t = threading.Thread(target=record, args=(lane, model, usage), name="cortados-usage-ledger", daemon=True)
+    t = threading.Thread(target=record, args=(lane, model, usage), kwargs={"context": context}, name="cortados-usage-ledger",
+                         daemon=True)
     t.start()
     return t

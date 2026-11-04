@@ -4,6 +4,7 @@ The fake runs the real mcp_shim, so every bridged call crosses the same process 
 """
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2077,8 +2078,9 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         # A successful search writes a usage-ledger row; capture it rather than touch any real usage.db.
         self.ledger = []
         p = mock.patch("cortados_router.usage_ledger.record_async",
-                       side_effect=lambda lane, model, usage: self.ledger.append((lane, model, usage)))
+                       side_effect=lambda lane, model, usage, **kw: self.ledger.append((lane, model, usage)))
         p.start()
+        self._ledger_patch = p
         self.addCleanup(p.stop)
 
     def test_query_extraction(self):
@@ -2278,6 +2280,59 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertEqual(self.ledger, [])
         self.assertEqual(search_lane._slots._value, before)
 
+    def _real_ledger_home(self):
+        """Stop the record_async mock and point CORTADOS_HOME at a throwaway dir: the real writer runs."""
+        self._ledger_patch.stop()
+        home = tempfile.mkdtemp(prefix="cortados-ledger-")
+        self.addCleanup(shutil.rmtree, home, True)
+        p = mock.patch.dict(os.environ, {"CORTADOS_HOME": home})
+        p.start()
+        self.addCleanup(p.stop)
+        return home
+
+    def _ledger_rows(self, home, want, wait=5.0):
+        db, rows, until = os.path.join(home, "usage.db"), [], time.monotonic() + wait
+        while time.monotonic() < until:
+            if os.path.exists(db):
+                c = sqlite3.connect(db)
+                try:
+                    rows = c.execute("SELECT lane, model, input_tokens, output_tokens FROM usage").fetchall()
+                except sqlite3.OperationalError:            # table not created yet
+                    rows = []
+                finally:
+                    c.close()
+                if len(rows) >= want:
+                    break
+            time.sleep(0.05)
+        return rows
+
+    def test_a_completed_search_persists_its_ledger_row(self):
+        home = self._real_ledger_home()
+        r = self.post(self.SEARCH)
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(self._ledger_rows(home, 1), [("claude", search_lane.SEARCH_MODEL, 11, 7)])
+
+    def test_a_failed_search_persists_no_ledger_row(self):
+        home = self._real_ledger_home()
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        r = self.post(self.SEARCH)
+        self.assertIn("exit_3", r["content"][0]["text"])
+        self.assertEqual(self._ledger_rows(home, 1, wait=1.0), [])
+
+    def test_a_ledger_write_failure_is_logged_at_error_with_the_lane_and_run(self):
+        home = self._real_ledger_home()
+        os.mkdir(os.path.join(home, "usage.db"))            # a directory where the db file must go: the write fails
+        with self.assertLogs("cortados.usage_ledger", "ERROR") as logs:
+            r = self.post(self.SEARCH, headers={"x-cortados-run-id": "search-run-0001"})
+            until = time.monotonic() + 5
+            while not logs.records and time.monotonic() < until:
+                time.sleep(0.05)
+        self.assertIn("https://example.com/c", r["content"][0]["text"], "the reply is unaffected")
+        msg = logs.output[0]
+        self.assertIn("ERROR", msg)
+        self.assertIn("lane claude", msg)
+        self.assertIn("search lane, run search-run-0001", msg)
+
     def test_the_group_is_signalled_before_the_child_is_reaped(self):
         # A reaped child's pid may be reused at once; signalling it as a group after the reap could kill a stranger.
         calls = []
@@ -2296,6 +2351,35 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
             res = search_lane.run(self.reg.search_bin, "q", None, timeout=10)
         self.assertIn("example.com", res.text)
         self.assertEqual(calls[:2], ["killpg", "wait"])
+
+    def test_a_selector_failure_still_signals_reaps_and_closes_both_pipes(self):
+        # EMFILE at selector construction, with the child already running: cleanup must still run in full.
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_SLEEP"] = "sleep", "30"
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_SLEEP", None)
+        calls, procs = [], []
+        real_killpg, real_wait = os.killpg, subprocess.Popen.wait
+
+        def killpg(pid, sig):
+            calls.append("killpg")
+            return real_killpg(pid, sig)
+
+        def wait(proc, *a, **kw):
+            calls.append("wait")
+            procs.append(proc)
+            return real_wait(proc, *a, **kw)
+
+        slots, t0 = search_lane._slots._value, time.monotonic()
+        with mock.patch.object(search_lane.selectors, "DefaultSelector", side_effect=OSError(24, "Too many open files")), \
+                mock.patch.object(search_lane.os, "killpg", side_effect=killpg), \
+                mock.patch.object(subprocess.Popen, "wait", autospec=True, side_effect=wait), \
+                self.assertRaises(OSError):
+            search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        self.assertLess(time.monotonic() - t0, 8, "the child is killed, not waited out")
+        self.assertEqual(calls[:2], ["killpg", "wait"])
+        p = procs[0]
+        self.assertEqual(p.returncode, -9, "the running child was killed and reaped")
+        self.assertTrue(p.stdout.closed and p.stderr.closed, "both pipes are closed")
+        self.assertEqual(search_lane._slots._value, slots)
 
     def _fds(self):
         return len(os.listdir("/dev/fd"))
@@ -2435,16 +2519,24 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/a"})
         self.assertEqual([row[0] for row in self.ledger], ["claude"])
 
-    def test_an_inherited_dir_matching_no_account_is_not_charged_to_claude(self):
+    def test_an_inherited_dir_matching_no_account_fails_before_the_cli_is_launched(self):
+        # The login cannot be charged to any lane, so no quota is spent on it: refused before launch, never run unrecorded.
         default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/else"}), self._accounts(default), \
-                self.assertLogs("cortados_router.provider.search_lane", "WARNING") as logs:
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/else"}), self._accounts(default):
             os.environ.pop(search_lane.ACCOUNT_ENV, None)
             r = self.post(self.SEARCH)
-        self.assertIn("https://example.com/c", r["content"][0]["text"], "the search still runs")
-        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/somewhere/else"})
-        self.assertEqual(self.ledger, [], "an unmatched login writes no ledger row")
-        self.assertTrue(any("matches no configured account" in m for m in logs.output))
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [], "the CLI is never invoked")
+        self.assertEqual(self.ledger, [])
+
+    def test_a_named_account_without_a_lane_fails_before_the_cli_is_launched(self):
+        rows = [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"}, {"account": "b", "config_dir": "/cfg/b"}]
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(rows):
+            r = self.post(self.SEARCH)
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(self.ledger, [])
 
     def test_default_without_accounts_or_inherited_dir_is_charged_to_claude(self):
         default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]

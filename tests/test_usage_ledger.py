@@ -107,6 +107,31 @@ class LedgerWrite(unittest.TestCase):
             self.assertEqual(calls["n"], 3)
             self.assertEqual(sqlite3.connect(p).execute("SELECT COUNT(*) FROM usage").fetchone()[0], 2)
 
+    def test_a_context_write_that_stays_busy_is_retried_then_logged_once_at_error(self):
+        # The search lane's rows carry a context: a busy db is still retried for RETRY_S (main's logic), and only the
+        # final failure is logged, at ERROR, with the lane and the context.
+        with tempfile.TemporaryDirectory() as d:
+            calls = {"n": 0}
+
+            def busy(path, row):
+                calls["n"] += 1
+                raise sqlite3.OperationalError("database is locked")
+            with mock.patch.object(usage_ledger, "_write", busy), mock.patch.object(usage_ledger, "RETRY_S", 0.3), \
+                    self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
+                self.assertFalse(usage_ledger.record("claude#b", "m", {}, path=Path(d) / "usage.db",
+                                                     context="search lane, run search-run-0001"))
+            self.assertGreater(calls["n"], 1, "retried before giving up")
+            self.assertEqual(len(cm.output), 1)
+            self.assertIn("lane claude#b", cm.output[0])
+            self.assertIn("search lane, run search-run-0001", cm.output[0])
+
+    def test_a_context_row_uses_the_lane_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "usage.db"
+            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 2}, path=p, context="search lane, run -"))
+            self.assertEqual(sqlite3.connect(p).execute("SELECT runtime, lane, input_tokens FROM usage").fetchall(),
+                             [("claude", "claude#b", 2)])
+
     def test_failure_does_not_raise_and_logs_type(self):
         with tempfile.TemporaryDirectory() as d:
             bad = Path(d) / "dir-not-db"
