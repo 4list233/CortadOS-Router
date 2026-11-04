@@ -262,10 +262,10 @@ class LedgerWrite(unittest.TestCase):
             c.close()
             self._hold_migrate_lock(db)
             t0 = time.monotonic()
-            with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+            with self.assertLogs("cortados.usage_ledger", "DEBUG") as cm:
                 self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 5}, path=db, context="search lane, run -"))
             self.assertLess(time.monotonic() - t0, 0.5 + 0.75)
-            self.assertTrue(any("migration skipped" in m for m in cm.output))
+            self.assertFalse(any(r.levelname == "ERROR" for r in cm.records))
             self.assertEqual(sqlite3.connect(db).execute("SELECT lane, input_tokens FROM usage").fetchall(), [("claude#b", 5)])
 
     def test_a_statement_past_the_deadline_is_interrupted(self):
@@ -282,6 +282,73 @@ class LedgerWrite(unittest.TestCase):
             self.assertLess(time.monotonic() - t0, 1.5)
             with self.assertRaises(sqlite3.OperationalError):     # and a spent deadline never starts an attempt
                 usage_ledger._write(db, (1.0, "claude", "m", 0, 0, 0, 0, "claude"), time.monotonic() - 1)
+
+    def test_an_index_build_longer_than_every_deadline_still_lands_rows_and_completes_in_the_background(self):
+        # Review r10: on an oversized legacy ledger every foreground CREATE INDEX outlasts the deadline and is rolled
+        # back. The lane column comes first, the row is written anyway, and one background thread (no record
+        # deadline) finishes the build.
+        import threading as th
+        attempts = {"fg": 0, "bg": 0}
+        real_build = usage_ledger._build_index
+
+        def build(c):
+            if th.current_thread().name == "cortados-usage-ledger-migrate":
+                attempts["bg"] += 1
+                return real_build(c)
+            attempts["fg"] += 1                                 # stands in for a build longer than any deadline
+            c.execute("WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r").fetchone()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_build_index", build), \
+                mock.patch.object(usage_ledger, "RETRY_S", 0.5), mock.patch.object(usage_ledger, "_BG_BACKOFF_S", 0.05), \
+                mock.patch.object(usage_ledger, "_bg_started", set()):
+            db = Path(d) / "usage.db"
+            self._legacy(db)
+            usage_ledger._consecutive_failures = 0
+            t0 = time.monotonic()
+            for i in range(3):
+                self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": i}, path=db, context="search lane, run -"))
+            self.assertLess(time.monotonic() - t0, 3 * 0.5 + 1.0, "each write stays inside its own deadline")
+            self.assertGreaterEqual(attempts["fg"], 1, "the foreground tried, and was interrupted")
+            until = time.monotonic() + 10
+            while time.monotonic() < until:
+                c = sqlite3.connect(db)
+                try:
+                    done = usage_ledger._migrated(c)
+                finally:
+                    c.close()
+                if done:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(done, "the background migration completed")
+            self.assertGreaterEqual(attempts["bg"], 1)
+            c = sqlite3.connect(db)
+            self.assertEqual(c.execute("SELECT lane, input_tokens FROM usage ORDER BY input_tokens").fetchall(),
+                             [("claude#b", 0), ("claude#b", 1), ("claude#b", 2)])
+            self.assertIn("usage_ts", [r[1] for r in c.execute("PRAGMA index_list(usage)")])
+            self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            c.close()
+            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 9}, path=db))
+
+    def test_background_migration_retries_with_backoff_until_it_succeeds(self):
+        calls = {"n": 0}
+        real = usage_ledger._ensure_lane_column
+
+        def flaky(c):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return real(c)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_ensure_lane_column", flaky), \
+                mock.patch.object(usage_ledger, "_BG_BACKOFF_S", 0.01), \
+                self.assertLogs("cortados.usage_ledger", "INFO") as cm:
+            db = Path(d) / "usage.db"
+            self._legacy(db)
+            usage_ledger._background_migrate(db)                # returns only once migrated
+            c = sqlite3.connect(db)
+            self.assertTrue(usage_ledger._migrated(c))
+            c.close()
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(sum("retried in" in m for m in cm.output), 2)
+        self.assertTrue(any("background migration" in m and "complete" in m for m in cm.output))
 
     def test_server_hook_skips_unrouted_and_writes_routed(self):
         from cortados_router.provider import server

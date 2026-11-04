@@ -31,6 +31,14 @@ _SCHEMA = ("CREATE TABLE IF NOT EXISTS usage (ts REAL, runtime TEXT, model TEXT,
 # table, and under the default rollback journal a long read held a SHARED lock that made record()'s commit time out (a
 # 2M-row ledger lost writes). The index bounds the scan; WAL lets a reader and this writer run at once.
 _TS_INDEX = "CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts)"
+# Reason: on an oversized legacy ledger the index build can outlast any record() deadline; interrupted, sqlite rolls it
+# back and the next call restarts it from zero, so a foreground-only build never finishes. A record() tries it for at
+# most this long (or half of what is left of its deadline) and otherwise hands it to the background migration below.
+INDEX_FOREGROUND_S = 1.0
+# The background migration's retry backoff: first wait, doubling, capped (a held lock or a busy db is transient).
+_BG_BACKOFF_S, _BG_BACKOFF_MAX_S = 1.0, 60.0
+_bg_lock = threading.Lock()
+_bg_started: set[str] = set()   # ledger paths whose background migration thread this process has started
 LOG_EVERY = 100          # a steady failure (full disk, read-only home) repeats every turn: one line per 100 turns stays readable
 _fail_lock = threading.Lock()
 _consecutive_failures = 0
@@ -104,30 +112,102 @@ def _migrate_lock(lf, deadline: float) -> bool:
             time.sleep(_RETRY_SLEEP_S)
 
 
+def _index_present(c: sqlite3.Connection) -> bool:
+    return bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='usage_ts'").fetchone())
+
+
+def _build_index(c: sqlite3.Connection) -> None:
+    """The ts index build: the one migration step whose length grows with the ledger."""
+    c.execute(_TS_INDEX)
+    c.commit()
+
+
+def _background_migrate(p: Path) -> None:
+    """The full migration with no record() deadline: blocking migrate lock, no progress handler, retried with backoff
+    until done. Runs on the one daemon thread _start_background_migration starts per ledger path."""
+    wait = _BG_BACKOFF_S
+    while True:
+        try:
+            c = sqlite3.connect(str(p), timeout=30.0)
+            try:
+                with open(str(p) + ".migrate", "a") as lf:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)   # off every request thread: blocking is fine here
+                    if not _migrated(c):
+                        if not _ensure_wal(c):
+                            raise sqlite3.OperationalError("WAL switch deferred")
+                        _ensure_lane_column(c)
+                        _build_index(c)
+                if _migrated(c):
+                    logger.info("usage ledger: background migration of %s complete", p)
+                    return
+                raise sqlite3.OperationalError("still not migrated after a full pass")
+            finally:
+                c.close()
+        except Exception as exc:
+            logger.warning("usage ledger: background migration of %s failed (%s: %s); retried in %.0fs", p,
+                           type(exc).__name__, str(exc)[:120], wait)
+            time.sleep(wait)
+            wait = min(wait * 2, _BG_BACKOFF_MAX_S)
+
+
+def _start_background_migration(p: Path) -> None:
+    """Start the background migration for `p` once per process. A thread that cannot start is logged and forgotten, so
+    a later record() tries again."""
+    key = str(p)
+    with _bg_lock:
+        if key in _bg_started:
+            return
+        _bg_started.add(key)
+    try:
+        threading.Thread(target=_background_migrate, args=(p,), name="cortados-usage-ledger-migrate", daemon=True).start()
+        logger.warning("usage ledger: the ts index build does not fit a write's deadline; it continues in the background")
+    except Exception as exc:
+        with _bg_lock:
+            _bg_started.discard(key)
+        logger.warning("usage ledger: background migration thread did not start (%s: %s); retried on the next write",
+                       type(exc).__name__, str(exc)[:120])
+
+
 def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> None:
-    """One-time setup: WAL first, then the table, the ts index and the lane column. Order matters: building the index
+    """One-time setup: WAL first, then the lane column, then the ts index. Order matters: building the index
     on a large rollback-journal ledger held the write lock for the whole build and concurrent records failed; in WAL
-    they only queue behind it. Reason for the lock file: without it every writer that saw "not migrated" raced to
+    they only queue behind it. The lane column (a fast ALTER, and the only step the row itself needs) comes before the
+    index, and the index build gets at most INDEX_FOREGROUND_S here: one that does not fit is interrupted and rolled
+    back, handed to the background migration, and this row is still written. Reason for the lock file: without it every writer that saw "not migrated" raced to
     switch the mode and build the index; under an exclusive flock on usage.db.migrate exactly one migrates and the
     others wait, then see it done (re-checked under the lock). The wait is bounded by record()'s deadline: a lock still
     held then skips the migration for this row, which is still written if the table already has the lane column (WAL
-    and the index are optimisations; the lane is the schema), and fails otherwise."""
+    and the index are optimisations; the lane is the schema), and fails otherwise. With the lane already there, the lock
+    is tried once, not waited for: only optimisations remain, and the holder may be a long background build."""
     if _migrated(c):
         return
+    has_lane = "lane" in {r[1] for r in c.execute("PRAGMA table_info(usage)")}
     with open(str(p) + ".migrate", "a") as lf:
-        if not _migrate_lock(lf, deadline):           # released on close
-            if "lane" in {r[1] for r in c.execute("PRAGMA table_info(usage)")}:
-                logger.warning("usage ledger: migration lock held elsewhere past the deadline; migration skipped for "
-                               "this row, retried on the next write")
+        if not _migrate_lock(lf, time.monotonic() if has_lane else deadline):   # released on close
+            if has_lane:
+                # debug, not warning: while a long background build holds the lock this is every write, and expected
+                logger.debug("usage ledger: migration lock held elsewhere; migration skipped for this row")
                 return
             raise sqlite3.OperationalError("usage ledger: no lane column, and the migration lock is held elsewhere")
         if _migrated(c):
             return
-        if _ensure_wal(c):
-            # not built in the rollback journal: that build is what blocked the writers; the next record retries
-            c.execute(_TS_INDEX)
-            c.commit()
+        wal = _ensure_wal(c)
         _ensure_lane_column(c)
+        with _bg_lock:
+            in_background = str(p) in _bg_started  # this process already hands the build to its background thread
+        if wal and not in_background and not _index_present(c):
+            # not built in the rollback journal: that build is what blocked the writers; the next record retries
+            stop = min(time.monotonic() + INDEX_FOREGROUND_S, time.monotonic() + max(0.0, deadline - time.monotonic()) / 2)
+            c.set_progress_handler(lambda: 1 if time.monotonic() > stop else 0, _PROGRESS_OPS)
+            try:
+                _build_index(c)
+            except sqlite3.OperationalError as exc:
+                if "interrupt" not in str(exc).lower():
+                    raise
+                c.rollback()
+                _start_background_migration(p)
+            finally:
+                c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)
 
 
 def _busy(exc: Exception) -> bool:
