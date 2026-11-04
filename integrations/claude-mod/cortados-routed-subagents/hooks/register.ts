@@ -37,6 +37,7 @@ type Cfg = {
   subagentTimeoutMs: number
   maxTurns: number
   excludeBuilderOnReview: boolean
+  mainSessionGuard: boolean
 }
 
 const FALLBACK: Cfg = {
@@ -73,6 +74,9 @@ const FALLBACK: Cfg = {
   // A review subagent is kept off the MAIN SESSION's own model AND the models routed (non-review) subagents ran on
   // since the last review (x-cortados-exclude-model, a comma-separated list; see workerModels).
   excludeBuilderOnReview: true,
+  // Warn-only main-session guard (see GUARD_* below): a toast + status counter when the main loop does a big edit or
+  // a build/test run itself. Never blocks. /cortados-guard on|off overrides this, persisted in $.store.
+  mainSessionGuard: true,
 }
 
 // The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
@@ -507,9 +511,97 @@ export function resolveTimeoutMs(v: unknown): number {
   return Math.min(MAX_SUBAGENT_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
 }
 
+// ---- Main-session guard (WARN ONLY) ------------------------------------------------------------------------------
+// The owner runs the main session on direct Claude and routes every subagent; the guard nudges the main session when
+// it does substantive work itself. It NEVER blocks, denies or rewrites a call (the owner chose "warn only"): every
+// guarded call goes to next(e) unchanged, and any failure in the guard's own bookkeeping is swallowed.
+
+/** An Edit/Write/NotebookEdit whose NEW content reaches either limit is "substantive". 40 lines is about one function
+ * or a screenful: the orchestrator directive's "trivial touch" (a one-line fix, a config tweak, a short docstring) stays
+ * far under it, while writing a new module or rewriting a block goes over. 2000 characters catches what is long but has
+ * few lines (minified JSON, long prose paragraphs, a generated table) that the line count alone would miss. */
+export const GUARD_EDIT_MAX_LINES = 40
+export const GUARD_EDIT_MAX_CHARS = 2000
+/** At most one guard toast per 10 minutes: one nudge per stretch of work is enough to be seen, and a toast on every
+ * edit of a long session would be noise the owner learns to ignore. The status-line counter still updates each time. */
+export const GUARD_TOAST_INTERVAL_MS = 10 * 60_000
+/** $.store key of the /cortados-guard on|off override; when unset the userConfig `mainSessionGuard` decides. */
+export const GUARD_STORE_KEY = 'mainSessionGuard'
+export const GUARD_COMMAND = 'cortados-guard'
+const GUARD_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'] as const
+
+/** The new content a file-writing call carries: Edit's new_string, Write's content, NotebookEdit's new_source. */
+export function newContentOf(tool: string, e: any): string {
+  const v = tool === 'Edit' ? e?.new_string : tool === 'Write' ? e?.content : tool === 'NotebookEdit' ? e?.new_source : ''
+  return typeof v === 'string' ? v : ''
+}
+
+/** Whether new content is a "big edit": over GUARD_EDIT_MAX_LINES lines or GUARD_EDIT_MAX_CHARS characters. */
+export function isBigEdit(content: string): boolean {
+  if (!content) return false
+  return content.split('\n').length > GUARD_EDIT_MAX_LINES || content.length > GUARD_EDIT_MAX_CHARS
+}
+
+/** A build or test run: python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test. Checked per command
+ * segment (split on ; & | ( ) and newlines) after leading VAR=value assignments, so `cd x && make` matches while
+ * `grep make Makefile` or `echo pytest` does not. A heuristic on the command text, not a parse of the shell. */
+export function isBuildOrTest(command: string): boolean {
+  for (const raw of String(command ?? '').split(/[;&|()\n]+/)) {
+    const seg = raw.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')
+    if (/^python[0-9.]*\s+(?:-\S+\s+)*-m\s+(?:unittest|pytest)\b/.test(seg)) return true
+    if (/^(?:pytest|py\.test)(?:\s|$)/.test(seg)) return true
+    if (/^g?make(?:\s|$)/.test(seg)) return true
+    if (/^(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:build|test)\b/.test(seg)) return true
+  }
+  return false
+}
+
+/** The kind of substantive work a main-session call is, or null when it is not substantive. */
+export function substantiveKind(tool: string, e: any): 'edit' | 'run' | null {
+  if (tool === 'Bash') return isBuildOrTest(e?.command) ? 'run' : null
+  return isBigEdit(newContentOf(tool, e)) ? 'edit' : null
+}
+
+/** The guard's status line: "main did 3 big edits, 1 build/test run", or undefined when nothing was counted. */
+export function guardStatusText(edits: number, runs: number): string | undefined {
+  const parts: string[] = []
+  if (edits) parts.push(`${edits} big edit${edits === 1 ? '' : 's'}`)
+  if (runs) parts.push(`${runs} build/test run${runs === 1 ? '' : 's'}`)
+  return parts.length ? `main did ${parts.join(', ')}; delegate to routed subagents` : undefined
+}
+
+/** The guard's toggle from /cortados-guard's argument: true/false, or null for anything else. */
+export function parseGuardArg(args: string): boolean | null {
+  const a = String(args ?? '').trim().toLowerCase()
+  if (a === 'on') return true
+  if (a === 'off') return false
+  return null
+}
+
+export type GuardState = { edits: number; runs: number; lastToastAt: number; override: boolean | undefined; loaded: boolean }
+
+/** Whether the guard is on: the /cortados-guard override in $.store when set (read once per mod load), else the
+ * userConfig default. */
+async function guardEnabled($: any, guard: GuardState, configDefault: boolean): Promise<boolean> {
+  if (!guard.loaded) {
+    const v = await $.store.get(GUARD_STORE_KEY)
+    guard.override = typeof v === 'boolean' ? v : undefined
+    guard.loaded = true
+  }
+  return guard.override ?? configDefault
+}
+
 export const register: Register = (on, options) => {
   const cfg: Cfg = { ...FALLBACK, ...(options as Partial<Cfg>) }
   const subagentTimeoutMs = resolveTimeoutMs(cfg.subagentTimeoutMs)
+
+  // Guard state for this session. Closure variables, so a mod reload (or Claude Code restart) starts the counters and
+  // the toast throttle over; the on/off override lives in $.store and survives both.
+  const guard: GuardState = { edits: 0, runs: 0, lastToastAt: -Infinity, override: undefined, loaded: false }
+  const guardDefault = cfg.mainSessionGuard !== false
+  /** What the status line rests on when the mod has nothing else to show: the guard's counter, if any. */
+  const restingStatus = (): string | undefined =>
+    (guard.override ?? guardDefault) ? guardStatusText(guard.edits, guard.runs) : undefined
 
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
     const subagentType = String(e.subagent_type ?? '')
@@ -724,9 +816,57 @@ export const register: Register = (on, options) => {
     } finally {
       // Guarded: a throw here would escape to the outer .catch and trigger a native re-dispatch (replay). Never
       // let clearing the status line do that.
-      try { $.ui.status(undefined) } catch { /* ignore */ }
+      // Restores the main-session guard's counter (one status line per plugin) rather than wiping it.
+      try { $.ui.status(restingStatus()) } catch { /* ignore */ }
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+  // ---- Main-session guard: WARN ONLY. Every call proceeds unchanged; only a toast and a status counter. ----------
+  for (const tool of GUARD_TOOLS) {
+    on('tool.call', { tool }, async ($: any, e: any, next: any) => {
+      try {
+        // Subagents (and teammates, engine forks) carry an agentId; only the main loop is nudged.
+        const kind = e?.agentId == null ? substantiveKind(tool, e) : null
+        if (kind && (await guardEnabled($, guard, guardDefault))) {
+          if (kind === 'edit') guard.edits += 1
+          else guard.runs += 1
+          $.ui.status(guardStatusText(guard.edits, guard.runs))
+          const now = Number(await $.clock.now())
+          if (now - guard.lastToastAt >= GUARD_TOAST_INTERVAL_MS) {
+            guard.lastToastAt = now
+            $.ui.toast(
+              kind === 'edit'
+                ? 'main session did a large edit; delegate this kind of work to a routed subagent'
+                : 'main session ran a build/test; delegate this kind of work to a routed subagent',
+            )
+          }
+        }
+      } catch { /* warn-only: a guard failure must never affect the call */ }
+      return next(e)
+    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+  }
+
+  on('session.start', async ($: any, e: any, next: any) => {
+    const r = await next(e)
+    try {
+      await $.command.register({ name: GUARD_COMMAND, description: 'Main-session guard (warn only): on, off, or no argument for its state.', argumentHint: '[on|off]', immediate: true })
+    } catch { /* the guard still runs from userConfig without its command */ }
+    return r
+  }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+
+  on('command.run', { command: GUARD_COMMAND }, async ($: any, e: any) => {
+    const want = parseGuardArg(e?.args)
+    if (want === null && String(e?.args ?? '').trim()) return { text: `usage: /${GUARD_COMMAND} on|off` }
+    if (want !== null) {
+      await $.store.set(GUARD_STORE_KEY, want)
+      guard.override = want
+      guard.loaded = true
+      $.ui.status(restingStatus())
+    }
+    const on_ = await guardEnabled($, guard, guardDefault)
+    const counts = guardStatusText(guard.edits, guard.runs)
+    return { text: `main-session guard ${on_ ? 'on' : 'off'} (warn only${on_ && counts ? `; ${counts}` : ''})` }
+  })
 
   // ---- Orchestrator mode: direct the main session to plan and delegate; routed subagents do the work. ----------
   if (cfg.orchestratorMode) {
