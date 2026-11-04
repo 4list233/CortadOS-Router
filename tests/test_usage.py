@@ -868,23 +868,19 @@ class EndpointTest(unittest.TestCase):
 
 
 class RealWiringTest(unittest.TestCase):
-    """ProviderServer.usage_view itself: refresh=False reaches scarcity even with the env switch on, state is the env's home."""
+    """ProviderServer.usage_view itself, with the real scarcity reader (scarcity.current is never called, nothing samples),
+    state from the env's throwaway CORTADOS_HOME."""
 
-    def test_usage_view_never_samples(self):
+    def view(self, home: Path) -> dict:
         import cortados_router.s1_endpoint as s1e
-        home = fixture_home()
-        seen = {}
         keep = (scarcity.current, scarcity.sample, s1e.resolve_url, os.environ.get("CORTADOS_SCARCITY_REFRESH"),
                 os.environ.get("CORTADOS_HOME"))
-        def fake_current(*a, **k):
-            seen["refresh"] = k.get("refresh", True)
-            return SCARCITY
         def no_url():
             raise RuntimeError("no endpoints file")
-        scarcity.current = fake_current
+        scarcity.current = lambda *a, **k: self.fail("usage_view must read scarcity.json strictly, not scarcity.current")
         scarcity.sample = lambda *a, **k: self.fail("usage_view must never sample")
         s1e.resolve_url = no_url
-        os.environ["CORTADOS_SCARCITY_REFRESH"] = "on"           # prove refresh=False (not the env switch) blocks sampling
+        os.environ["CORTADOS_SCARCITY_REFRESH"] = "on"           # prove the view itself (not the env switch) never samples
         os.environ["CORTADOS_HOME"] = str(home)
         try:
             reg = Registry(gateway_url="", token=TOKEN, claude_bin=["true"])
@@ -892,7 +888,7 @@ class RealWiringTest(unittest.TestCase):
             try:
                 raw = httpd.usage_view(reg)
                 self.assertIsInstance(raw, bytes)                   # the live view arrives encoded (memoised bytes)
-                out = json.loads(raw)
+                return json.loads(raw)
             finally:
                 httpd.server_close()
         finally:
@@ -902,9 +898,33 @@ class RealWiringTest(unittest.TestCase):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = val
-        self.assertIs(seen["refresh"], False)
+
+    def test_usage_view_never_samples(self):
+        home = fixture_home()
+        (home / "scarcity.json").write_text(json.dumps(SCARCITY))
+        out = self.view(home)
         self.assertIn({"lane": "claude", "model": "sonnet", "calls": 2}, out["routed"]["today"])   # read from CORTADOS_HOME
+        self.assertTrue(out["lanes"])
+        self.assertNotIn("scarcity", [e["source"] for e in out["errors"]])
         self.assertFalse(out["s1"]["available"])                  # resolve_url raising lands in the s1 section, not a 500
+
+    def test_missing_scarcity_cache_is_an_error_not_empty_lanes(self):
+        # Review P2: scarcity.current() returned an empty cache for a missing file, so the view showed lanes: [] silently
+        home = fixture_home()
+        self.assertFalse((home / "scarcity.json").exists())
+        out = self.view(home)
+        self.assertEqual(out["lanes"], [])
+        self.assertIn({"source": "scarcity", "error": "FileNotFoundError"}, out["errors"])
+
+    def test_corrupt_scarcity_cache_is_an_error_distinct_from_missing(self):
+        home = fixture_home()
+        (home / "scarcity.json").write_text("{not json")
+        out = self.view(home)
+        self.assertEqual(out["lanes"], [])
+        self.assertIn({"source": "scarcity", "error": "JSONDecodeError"}, out["errors"])
+        home2 = fixture_home()
+        (home2 / "scarcity.json").write_text("[1, 2]")             # valid JSON, wrong shape
+        self.assertIn({"source": "scarcity", "error": "ValueError"}, self.view(home2)["errors"])
 
 
 if __name__ == "__main__":

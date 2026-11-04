@@ -1639,7 +1639,9 @@ class ProviderServer(ThreadingHTTPServer):
         except Exception as exc:                        # reported by the s1 section as unavailable, with the reason
             logger.warning("usage: cannot resolve the S1 URL: %s", exc)
             s1_url = None
-        return usage.collect(state_dir=paths.state_dir(), scarcity_reader=lambda: scarcity.current(refresh=False),
+        state = paths.state_dir()
+        # strict cache-only read, not scarcity.current(refresh=False): that hides a missing/corrupt cache as no lanes
+        return usage.collect(state_dir=state, scarcity_reader=lambda: usage.read_scarcity_cache(state / "scarcity.json"),
                              refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
                              s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes(),
                              encoded=True)

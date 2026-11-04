@@ -189,6 +189,17 @@ def _ro_uri(db_path: Path) -> str:
     return Path(db_path).resolve().as_uri() + "?mode=ro"
 
 
+def read_scarcity_cache(path: Path) -> dict[str, Any]:
+    """scarcity.json as written by scarcity.sample, read strictly: no vendor CLI is opened, and nothing is swallowed.
+    Reason: scarcity.current() turns a missing or corrupt cache into an empty one (right for routing, which must not
+    break), but here that showed `lanes: []` with no error. A missing file raises FileNotFoundError, bad JSON
+    JSONDecodeError and a non-object ValueError, so collect's guard reports each under source "scarcity"."""
+    d = json.loads(Path(path).read_text())
+    if not isinstance(d, dict):
+        raise ValueError("scarcity.json is not a JSON object")
+    return d
+
+
 def _ro_connect(db_path: Path) -> sqlite3.Connection:
     """Read-only connection whose queries are interrupted (sqlite3.OperationalError "interrupted", reported by collect's
     guard as that source's error) once LEDGER_QUERY_S has passed. One helper so router.db and usage.db share the cap."""
