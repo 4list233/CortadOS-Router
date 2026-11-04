@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import secrets
 import sys
 import threading
 import urllib.error
@@ -72,6 +73,8 @@ CHILD_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "task": {"type": "string", "description": "The complete, self-contained task prompt."},
          "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
+         "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
+                   "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
                           "model such as fable, opus, sonnet, gpt-6.1-sol: that pins the child's MAIN model; the "
                           "child's subagents are still routed by S1."},
@@ -172,7 +175,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or None, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
-                           a.get("connectors"), client=cfg.get("client"))
+                           a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
+                           session_tag=cfg.get("session_tag"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -372,7 +376,10 @@ def _resolve_url() -> str:
 
 def main() -> None:
     cfg = {"url": _resolve_url(), "token": _resolve_token(),
-           "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}   # the child launcher reads the file
+           "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None,   # the child launcher reads the file
+           # One opaque Office tag per server process: Claude Code starts one cortados-route server per session, so
+           # the children it starts share a floor (provider/office.py). Random, not derived from any session id.
+           "session_tag": secrets.token_hex(8)}
     for line in sys.stdin:
         if not line.strip():
             continue

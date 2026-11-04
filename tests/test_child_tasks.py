@@ -551,6 +551,32 @@ class ChildTaskTests(unittest.TestCase):
         ev = [e for e in _events() if e.get("task_id") == tid]
         self.assertEqual([(e["event"], e.get("client")) for e in ev], [("started", "grokbot"), ("finished", "grokbot")])
 
+    def test_title_and_session_tag_pass_through_to_headers_and_events(self):
+        # The Office view: the title and the orchestrator's tag ride on the child's requests and on both events.
+        self.cfg = {**self.cfg, "session_tag": "3f9a1c2e9b7d4a10"}
+        tid = self.start(title="draft README section")
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        with open(os.path.join(self.work, "fake-argv.json")) as f:
+            headers = json.load(f)["headers"].split("\n")
+        self.assertIn("x-cortados-run-id: " + tid, headers)
+        self.assertIn("x-cortados-task-title: draft README section", headers)
+        self.assertIn("x-cortados-session: 3f9a1c2e9b7d4a10", headers)
+        self.assertIn("x-cortados-project: work", headers)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual([(e["event"], e.get("title"), e.get("session"), e.get("project")) for e in ev],
+                         [("started", "draft README section", "3f9a1c2e9b7d4a10", "work"),
+                          ("finished", "draft README section", "3f9a1c2e9b7d4a10", "work")])
+
+    def test_a_bad_title_or_tag_is_refused_before_anything_runs(self):
+        for kw in ({"title": "x" * 81}, {"title": "two\nlines"}, {"title": 7}):
+            r, _ = self.call("start_task", task="hello", cwd=self.work, **kw)
+            self.assertTrue(r.get("isError"), kw)
+            self.assertIn("title", r["content"][0]["text"])
+        with self.assertRaises(ct.TaskError):
+            ct.start("hello", self.work, provider_url=self.cfg["url"], session_tag="NOT-HEX")
+        self.assertFalse(os.path.exists(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")))
+
     def test_run_record_fetch_failure_is_a_field(self):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)

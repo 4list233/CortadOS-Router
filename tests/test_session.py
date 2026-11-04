@@ -342,3 +342,16 @@ class SessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OfficeHeaderTests(unittest.TestCase):
+    def test_office_headers_are_allowlisted_and_cannot_inject_lines(self):
+        from cortados_router import session as sess
+        h = sess.custom_headers("run-12345678", ["x-cortados-task-title: fix it", "X-Cortados-Session: 3f9a1c2e9b7d4a10"])
+        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-run-id: run-12345678",
+                                         "x-cortados-task-title: fix it", "x-cortados-session: 3f9a1c2e9b7d4a10"])
+        for bad in ("x-api-key: steal", "x-cortados-task-title: a\nx-api-key: steal", "x-cortados-project:",
+                    "x-cortados-device", "x-cortados-task-title: " + "x" * 81):
+            with self.assertRaises(sess.SessionError, msg=bad):
+                sess.custom_headers(None, [bad])
+

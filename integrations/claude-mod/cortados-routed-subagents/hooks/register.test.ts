@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -871,3 +871,149 @@ for (const readable of [true, false]) {
     expect(out.deny).toContain(readable ? 'partial ***' : 'transcript unreadable')
   })
 }
+
+// ---- Office view: tags on routed requests, heartbeats from the main session ---------------------------------------
+
+test('office titles and names fit the provider rules', async () => {
+  expect(officeTitle('Fix the tests (round 2): ok')).toBe('Fix the tests (round 2): ok')
+  expect(officeTitle('caf\u00e9\nline\ttab')).toBe('caf line tab')
+  expect(officeTitle('x'.repeat(200))!.length).toBe(80)
+  expect(officeTitle('\n\t')).toBe(null)
+  expect(officeName('CortadOS-Router')).toBe('CortadOS-Router')
+  expect(officeName('my project/x')).toBe('my project-x')
+  expect(officeName('pro.local', true)).toBe('pro.local')
+  expect(officeName('a b', true)).toBe('a-b')
+  expect(officeName('///')).toBe(null)
+  expect(baseName('/Users/x/Ai/CortadOS-Router/')).toBe('CortadOS-Router')
+})
+
+test('the session tag is a salted hash, never the raw id', async () => {
+  const a = await sessionTag('00112233445566778899aabbccddeeff', 'session-1')
+  expect(/^[0-9a-f]{16}$/.test(a)).toBe(true)
+  expect(a).toBe(await sessionTag('00112233445566778899aabbccddeeff', 'session-1'))
+  expect(a).not.toBe(await sessionTag('ffeeddccbbaa99887766554433221100', 'session-1'))
+  expect(a).not.toBe(await sessionTag('00112233445566778899aabbccddeeff', 'session-2'))
+  expect(officeHeaderLines({ session: a, project: 'P', device: 'pro', title: 'do it' }))
+    .toBe(`\nx-cortados-session: ${a}\nx-cortados-project: P\nx-cortados-device: pro\nx-cortados-task-title: do it`)
+  expect(officeHeaderLines({ session: 'not-a-tag', title: '' })).toBe('')
+  expect(officeHeaderLines({ session: null, title: 'a title' })).toBe('')
+})
+
+/** The mod registered with a full host stand-in: the store, session id/root/model, hostname, clock and fetch. */
+function officeHarness(opts: { officeView?: boolean } = {}) {
+  const handlers: Record<string, any> = {}
+  const on = (event: string, filterOrHandler: any, maybeHandler?: any) => {
+    const key = maybeHandler ? `${event}:${filterOrHandler?.tool ?? filterOrHandler?.command ?? ''}` : event
+    handlers[key] = maybeHandler ?? filterOrHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, mainSessionGuard: false, ...opts } as any)
+  const store: Record<string, unknown> = {}
+  const beats: any[] = []
+  const childHeaders: string[] = []
+  const logs: string[] = []
+  let now = 1_000_000
+  const $ = {
+    store: { get: async (k: string) => store[k], set: async (k: string, v: unknown) => { store[k] = v } },
+    session: { id: async () => 'raw-session-id-123', root: async () => '/Users/someone/Ai/CortadOS-Router', model: async () => 'claude-opus-5-5' },
+    clock: { now: async () => now },
+    process: {
+      run: async (argv: string[], o: any) => {
+        if (argv[0] === 'hostname') return { exitCode: 0, stdout: 'pro\n', stderr: '' }
+        childHeaders.push(String(o.env.ANTHROPIC_CUSTOM_HEADERS))
+        return { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '', isStdoutTruncated: false }
+      },
+    },
+    http: {
+      fetch: async (url: string, init: any) => {
+        if (url.endsWith('/v1/cortados/office/heartbeat')) { beats.push({ url, init, body: JSON.parse(init.body) }); return { status: 200, ok: true, headers: {}, text: '{}' } }
+        return { status: 404, ok: false, headers: {}, text: '{}' }
+      },
+    },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast() {}, log(m: string) { logs.push(m) } },
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+  return { handlers, $, store, beats, childHeaders, logs, settle, advance(ms: number) { now += ms } }
+}
+
+test('routed requests carry the office tags before the run id, never the raw session id', async () => {
+  const h = officeHarness()
+  const out = await h.handlers['tool.call:Agent'](h.$, { prompt: 'secret prompt text', description: 'Build the thing', subagent_type: 'general-purpose' }, async () => 'native')
+  expect(out.result.status).toBe('completed')
+  const { base } = splitRunId(h.childHeaders[0])
+  const salt = h.store[OFFICE_SALT_KEY] as string
+  expect(/^[0-9a-f]{32}$/.test(salt)).toBe(true)
+  const tag = await sessionTag(salt, 'raw-session-id-123')
+  expect(base).toBe(`x-cortados-reveal: 1\nx-cortados-session: ${tag}\nx-cortados-project: CortadOS-Router\nx-cortados-device: pro\nx-cortados-task-title: Build the thing`)
+  expect(h.childHeaders[0]).not.toContain('raw-session-id-123')
+  expect(h.childHeaders[0]).not.toContain('secret prompt')
+  // the salt is kept: a second session of this install reuses it
+  await h.handlers['tool.call:Agent'](h.$, { prompt: 'p', description: 'Again', subagent_type: 'general-purpose' }, async () => 'native')
+  expect(h.store[OFFICE_SALT_KEY]).toBe(salt)
+})
+
+test('officeView off sends no tags and registers no heartbeat hooks', async () => {
+  const h = officeHarness({ officeView: false })
+  await h.handlers['tool.call:Agent'](h.$, { prompt: 'p', description: 'Build', subagent_type: 'general-purpose' }, async () => 'native')
+  expect(splitRunId(h.childHeaders[0]).base).toBe('x-cortados-reveal: 1')
+  expect(h.handlers['turn.complete']).toBe(undefined)
+  expect(h.handlers['session.end']).toBe(undefined)
+})
+
+test('heartbeats: tool names on the main loop, throttled, idle on turn end, ended on session end', async () => {
+  const h = officeHarness()
+  const tool = h.handlers['tool.call']
+  const next = async (e: any) => e
+  await tool(h.$, { tool: 'Bash', command: 'rm -rf /secret/path' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(1)
+  const b = h.beats[0]
+  expect(b.init.method).toBe('POST')
+  expect(b.init.headers['x-api-key']).toBe('tok')
+  expect(b.body).toEqual({ session: await sessionTag(h.store[OFFICE_SALT_KEY] as string, 'raw-session-id-123'), project: 'CortadOS-Router', device: 'pro', model: 'claude-opus-5-5', status: 'working', tool: 'Bash' })
+  expect(JSON.stringify(h.beats)).not.toContain('/secret/path')
+  // a change within OFFICE_BEAT_MIN_MS is held back; after it, sent
+  await tool(h.$, { tool: 'Read', file_path: '/x' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(1)
+  h.advance(OFFICE_BEAT_MIN_MS)
+  await tool(h.$, { tool: 'Read', file_path: '/x' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(2)
+  // the same state again: only after the refresh interval
+  h.advance(OFFICE_BEAT_MIN_MS)
+  await tool(h.$, { tool: 'Read' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(2)
+  h.advance(OFFICE_BEAT_REFRESH_MS)
+  await tool(h.$, { tool: 'Read' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(3)
+  // a subagent's tool call is not the orchestrator's
+  h.advance(OFFICE_BEAT_REFRESH_MS)
+  await tool(h.$, { tool: 'Edit', agentId: 'a1' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(3)
+  await h.handlers['turn.complete'](h.$, { reason: 'answer' }, next)
+  await h.settle()
+  expect(h.beats[3].body.status).toBe('idle')
+  expect(h.beats[3].body.tool).toBe(null)
+  await h.handlers['session.end'](h.$, { reason: 'other', sessionId: 'raw-session-id-123' }, next)
+  expect(h.beats[4].body.status).toBe('ended')
+})
+
+test('a failing heartbeat is reported once and never breaks the tool call', async () => {
+  const h = officeHarness()
+  ;(h.$ as any).http.fetch = async () => { throw new Error('ECONNREFUSED tok') }
+  const next = async (e: any) => ({ ran: e.tool })
+  expect(await h.handlers['tool.call'](h.$, { tool: 'Bash' }, next)).toEqual({ ran: 'Bash' })
+  await h.settle()
+  h.advance(OFFICE_BEAT_REFRESH_MS)
+  await h.handlers['tool.call'](h.$, { tool: 'Grep' }, next)
+  await h.settle()
+  expect(h.logs.length).toBe(1)
+  expect(h.logs[0]).toContain('office heartbeat failed')
+  expect(h.logs[0]).not.toContain('tok')
+})
+
