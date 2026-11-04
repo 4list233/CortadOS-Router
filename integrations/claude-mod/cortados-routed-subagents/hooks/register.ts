@@ -728,9 +728,6 @@ export const register: Register = (on, options) => {
     const maxTurns = resolveMaxTurns(cfg.maxTurns)
     if (maxTurns !== null) args.push('--max-turns', String(maxTurns))
 
-    // While this child runs the status line is its own; the guard holds its counter until no child is active.
-    guard.routedActive += 1
-    $.ui.status(`↗ routed subagent (${description})`)
     type RunRes = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }
     const startedAt = Date.now()
     // Each run (the retry too) carries a fresh x-cortados-run-id, so its provider record can be fetched afterwards.
@@ -813,7 +810,14 @@ export const register: Register = (on, options) => {
         return `[${elapsed}; ${where}; transcript unreadable: ${scrubToken(String(err), token).slice(0, 200)}]`
       }
     }
+    // Counted inside the try, so the finally below always takes it back off, whatever throws. While any child runs
+    // the status line is its own; the guard holds its counter until none is active.
+    let counted = false
     try {
+      guard.routedActive += 1
+      counted = true
+      // Through guardTry: a status failure is reported once and never stops the launch.
+      guardTry($, guard, 'status', () => $.ui.status(`↗ routed subagent (${description})`))
       let res = await runChild(customHeaders, subagentTimeoutMs)
       let p = parseResult(res.stdout)
       let note = ''
@@ -879,10 +883,9 @@ export const register: Register = (on, options) => {
       // let clearing the status line do that.
       // Restores the main-session guard's counter (one status line per plugin) rather than wiping it — once the
       // last routed child is done; while another still runs, its line stays.
-      try {
-        guard.routedActive = Math.max(0, guard.routedActive - 1)
-        if (guard.routedActive === 0) $.ui.status(restingStatus())
-      } catch { /* ignore */ }
+      if (counted) guard.routedActive = Math.max(0, guard.routedActive - 1)
+      // guardPublish publishes only once no child is active, and never throws: a failure gets its one notice.
+      guardPublish($, guard, restingStatus())
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 

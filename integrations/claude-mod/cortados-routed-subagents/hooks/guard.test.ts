@@ -319,3 +319,89 @@ test('while a routed subagent runs the guard leaves its status line alone, then 
   expect(out.result.status).toBe('completed')
   expect(statuses.at(-1)).toBe('main did 1 big edit; delegate to routed subagents')
 })
+
+// ---- Review r2 regressions: the routed-child count and the status restore ---------------------------------------
+
+/** A $ whose routed children each wait on their own deferred, in launch order; `statusFails(text)` decides a throw. */
+function routedWorld(statusFails: (text: string | undefined, n: number) => boolean = () => false) {
+  const children: Array<ReturnType<typeof deferred<any>>> = []
+  const statuses: (string | undefined)[] = []
+  const logs: string[] = []
+  let n = 0
+  const $: any = {
+    store: { get: async () => undefined, set: async () => {} },
+    clock: { now: async () => 5 },
+    process: {
+      run: (argv: string[]) => {
+        if (argv[0] === 'sh') return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false })
+        const d = deferred<any>()
+        children.push(d)
+        return d.promise
+      },
+    },
+    fs: { read: async () => '' },
+    http: { fetch: async () => ({ ok: false, status: 404, headers: {}, text: '{}' }) },
+    session: { model: async () => 'claude-opus' },
+    ui: {
+      status(t: string | undefined) { n += 1; if (statusFails(t, n)) throw new Error('status down'); statuses.push(t) },
+      toast() {},
+      log(t: string) { logs.push(t) },
+    },
+  }
+  const done = { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'm' }), stderr: '', isStdoutTruncated: false }
+  return { $, children, statuses, logs, finish: (i: number) => children[i].resolve(done) }
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 0))
+const nativeMustNotRun = async () => { throw new Error('native must not run') }
+const okNext: any = async () => ({ result: {} })
+const COUNTER = (n: number) => `main did ${n} big edit${n === 1 ? '' : 's'}; delegate to routed subagents`
+
+test('a startup status failure still launches the child, is reported once, and leaves no routed count behind', async () => {
+  const h = handlersOf()
+  const w = routedWorld((t) => typeof t === 'string' && t.startsWith('↗'))
+  const agent = h.Agent(w.$, { prompt: 'p', description: 'a' }, nativeMustNotRun)
+  await tick()
+  expect(w.children.length).toBe(1)                // launched despite the status failure
+  w.finish(0)
+  expect((await agent).result.status).toBe('completed')
+  await h.Edit(w.$, edit(BIG), okNext)
+  expect(w.statuses.at(-1)).toBe(COUNTER(1))       // the count went back to 0: the guard publishes again
+  expect(w.logs.filter((l) => l.includes('status failed')).length).toBe(1)
+})
+
+test('a failed counter restore after a child is reported once and the next publish still lands', async () => {
+  const h = handlersOf()
+  let failedOnce = false
+  const w = routedWorld((t) => { if (!failedOnce && t === COUNTER(1)) { failedOnce = true; return true } return false })
+  const agent = h.Agent(w.$, { prompt: 'p', description: 'a' }, nativeMustNotRun)
+  await tick()
+  await h.Edit(w.$, edit(BIG), okNext)             // counted while the child runs: not published
+  w.finish(0)
+  expect((await agent).result.status).toBe('completed')
+  expect(failedOnce).toBe(true)                    // the restore was attempted and failed
+  expect(w.logs.filter((l) => l.includes('main-session guard status failed')).length).toBe(1)
+  await h.Edit(w.$, edit(BIG), okNext)
+  expect(w.statuses.at(-1)).toBe(COUNTER(2))
+})
+
+for (const order of [[0, 1], [1, 0]] as const) {
+  test(`two routed children at once: the counter returns only after both finish (order ${order.join(',')})`, async () => {
+    const h = handlersOf()
+    const w = routedWorld()
+    const a = h.Agent(w.$, { prompt: 'p', description: 'a' }, nativeMustNotRun)
+    const b = h.Agent(w.$, { prompt: 'p', description: 'b' }, nativeMustNotRun)
+    await tick()
+    expect(w.children.length).toBe(2)
+    await h.Edit(w.$, edit(BIG), okNext)
+    expect(w.statuses).toEqual(['↗ routed subagent (a)', '↗ routed subagent (b)'])
+    w.finish(order[0])
+    await (order[0] === 0 ? a : b)
+    expect(w.statuses.includes(COUNTER(1))).toBe(false) // one child still runs: its line is not overwritten
+    w.finish(order[1])
+    await (order[1] === 0 ? a : b)
+    expect(w.statuses.at(-1)).toBe(COUNTER(1))
+    await h.Edit(w.$, edit(BIG), okNext)
+    expect(w.statuses.at(-1)).toBe(COUNTER(2))          // the count is back to 0
+  })
+}
