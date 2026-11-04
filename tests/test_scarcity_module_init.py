@@ -37,7 +37,9 @@ class ConcurrentFirstUseTest(unittest.TestCase):
 
         def use():
             try:
-                got.append(core._scarcity_module().lane_scarcity)
+                mod = core._scarcity_module()
+                mod.lane_scarcity                  # a half-executed module has no lane_scarcity yet
+                got.append(mod)
             except Exception as exc:       # recorded and asserted below, never swallowed
                 errors.append(exc)
         with mock.patch.object(importlib.util, "spec_from_file_location", side_effect=slow_spec):
@@ -49,7 +51,8 @@ class ConcurrentFirstUseTest(unittest.TestCase):
                 t.join()
         self.assertEqual(errors, [])
         self.assertEqual(len(got), 4)
-        self.assertEqual(len({id(core._sc_mod)}), 1)
+        self.assertTrue(all(m is got[0] for m in got))         # one module object, loaded once, for every caller
+        self.assertIs(got[0], core._sc_mod)
 
     def test_a_failed_load_is_not_published(self):
         real = importlib.util.spec_from_file_location
