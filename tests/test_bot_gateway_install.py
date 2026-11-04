@@ -111,58 +111,96 @@ class PlistTest(InstallerHarness):
         self.assertIn(f"--workspace-root {self.home / 'cortados-bot-workspace'}", cmdline)
         self.assertIn("-m cortados_router.bot_gateway", cmdline)
 
-    def test_design_a_sources_provider_env(self):
+    def test_design_a_runs_the_data_launcher(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=1\n")
         r, tok = self.install()
         doc = self.check_common(r, tok)
         args = doc["ProgramArguments"]
-        self.assertEqual(args[:3], ["/bin/zsh", "-f", "-c"])
-        script = args[3]
-        self.assertIn(f". {self.home / '.cortados' / 'provider.env'}", script)
-        self.assertIn('CORTADOS_PROVIDER_TOKEN="$t"', script)
-        self.assertIn("unset $n", script)                    # every exported variable is dropped before the allowlist
-        self.assertNotIn("set -a", script)                   # only the token is exported, not the whole file
-        self.gateway_args(script)
+        self.assertEqual(args[:3], ["/usr/bin/python3", "-I", str(REPO / "integrations" / "bot-gateway" / "launch.py")])
+        self.assertEqual(args[3:8], ["--provider-env", str(self.home / ".cortados" / "provider.env"),
+                                     "--python", "/usr/bin/python3", "--"])
+        self.assertNotIn("/bin/zsh", args)                    # provider.env is never executed as shell code
+        self.gateway_args(" ".join(args[8:]) + " -m cortados_router.bot_gateway")
 
-    def test_design_a_script_runs_with_only_the_allowlist_exported(self):
-        """Run the plist's zsh line with the gateway swapped for `env`: only the allowlist reaches the child, even
-        for variables provider.env exports explicitly or the launching environment carries."""
-        if not os.path.exists("/bin/zsh"):
-            self.skipTest("no /bin/zsh")
-        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=leak\n"
-                          "export OTHER_SECRET=exported-secret-value\n"
+    def run_plist_launcher(self, doc, extra_env=None):
+        """Run the plist's real ProgramArguments with the gateway interpreter swapped for a fake that records its
+        argv and environment. Returns (CompletedProcess, argv list or None, env dict or None)."""
+        rec = Path(self.tmp.name) / "rec"
+        rec.mkdir(exist_ok=True)
+        fake = self.bin / "fake-python"
+        # A python fake, not sh: a shell adds PWD/SHLVL/_ of its own, which would hide what the launcher passed.
+        fake.write_text("#!/usr/bin/python3 -I\nimport os, sys\n"
+                        f"open({str(rec / 'argv')!r}, 'w').write('\\n'.join(sys.argv) + '\\n')\n"
+                        f"open({str(rec / 'env')!r}, 'w').write(''.join(f'{{k}}={{v}}\\n' for k, v in os.environ.items()))\n")
+        fake.chmod(0o755)
+        args = list(doc["ProgramArguments"])
+        args[args.index("--python") + 1] = str(fake)
+        env = dict(doc["EnvironmentVariables"], HOME=str(self.home), **(extra_env or {}))
+        p = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30, cwd=doc["WorkingDirectory"])
+        argv = (rec / "argv").read_text().splitlines() if (rec / "argv").exists() else None
+        got = (dict(l.split("=", 1) for l in (rec / "env").read_text().splitlines() if "=" in l)
+               if (rec / "env").exists() else None)
+        return p, argv, got
+
+    def test_design_a_child_gets_only_the_allowlist(self):
+        self.provider_env(f"# provider settings\n\nexport CORTADOS_PROVIDER_TOKEN='{PROVIDER_SECRET}'\n"
+                          "OTHER=leak\nexport OTHER_SECRET=exported-secret-value\n"
                           "export HTTPS_PROXY=http://proxy.invalid:3128\n"
+                          "export t=scratch-collision\n"
                           "export CORTADOS_PROVIDER_URL=http://elsewhere:1\n")
         r, tok = self.install()
         doc = self.check_common(r, tok)
-        script = doc["ProgramArguments"][3].split("exec ")[0] + "exec /usr/bin/env"
-        launch_env = dict(doc["EnvironmentVariables"], PYTHONPATH="/nowhere", http_proxy="http://proxy.invalid:1")
-        p = subprocess.run(["/bin/zsh", "-f", "-c", script], env=launch_env, capture_output=True, text=True,
-                           timeout=30)
+        p, argv, got = self.run_plist_launcher(doc, {"PYTHONPATH": "/nowhere", "http_proxy": "http://proxy.invalid:1",
+                                                     "t": "inherited", "OTHER_SECRET": "inherited-secret"})
         self.assertEqual(p.returncode, 0, p.stderr)
-        got = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
-        # zsh itself adds SHLVL and _ (the program being run) when it execs; neither comes from provider.env.
-        self.assertRegex(got.pop("SHLVL", "1"), r"^[0-9]+$")
-        self.assertEqual(got.pop("_", "/usr/bin/env"), "/usr/bin/env")
+        # The fake runs under /usr/bin/python3, Apple's xcrun shim, which adds its developer-tools variables, and
+        # Python's C-locale coercion adds LC_CTYPE. Those come from the interpreter, not from the launcher, and none
+        # of them carries a value from provider.env or the launching environment (checked below).
+        for k in ("SDKROOT", "CPATH", "LIBRARY_PATH", "MANPATH", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"):
+            got.pop(k, None)
         self.assertEqual(set(got), {"HOME", "PATH", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL",
                                     "CORTADOS_PROVIDER_TOKEN"})
         self.assertEqual(got["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)
         self.assertEqual(got["CORTADOS_PROVIDER_URL"], f"http://{FAKE_IP}:8432")
         self.assertEqual(got["HOME"], str(self.home))
         self.assertEqual(got["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
-        self.assertNotIn("exported-secret-value", p.stdout)
-        self.assertNotIn("proxy.invalid", p.stdout)
+        self.assertEqual(argv[1:4], ["-B", "-m", "cortados_router.bot_gateway"])
+        self.assertNotIn("--enable-start-task", argv)
+        self.assertFalse(any(PROVIDER_SECRET in a for a in argv))
+        self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
+        dump = (Path(self.tmp.name) / "rec" / "env").read_text()
+        for leaked in ("proxy.invalid", "exported-secret-value", "inherited", "scratch-collision", "/nowhere", "leak"):
+            self.assertNotIn(leaked, dump)
 
-    def test_design_a_empty_token_stops_the_start(self):
-        if not os.path.exists("/bin/zsh"):
-            self.skipTest("no /bin/zsh")
-        self.provider_env("CORTADOS_PROVIDER_TOKEN=\n")
+    def test_design_a_shell_code_refused_with_78_and_nothing_runs(self):
+        cases = {
+            "set -x": "set -x\n",
+            "trap": "trap 'echo $CORTADOS_PROVIDER_TOKEN' EXIT\n",
+            "debug trap": "trap 'export HTTPS_PROXY=x' DEBUG\n",
+            "command substitution": "OTHER=$(id -u)\n",
+            "backticks": "OTHER=`id -u`\n",
+            "expansion in double quotes": 'OTHER="$HOME"\n',
+            "readonly": "export LOCKED=1\nreadonly LOCKED\n",
+            "command": "echo hi\n",
+            "chained": "OTHER=1; echo hi\n",
+            "function": "f() { :; }\n",
+            "set -a": "set -a\n",
+        }
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         r, tok = self.install()
         doc = self.check_common(r, tok)
-        script = doc["ProgramArguments"][3].split("exec ")[0] + "exec /usr/bin/env"
-        p = subprocess.run(["/bin/zsh", "-f", "-c", script], env=dict(doc["EnvironmentVariables"]),
-                           capture_output=True, text=True, timeout=30)
-        self.assertEqual(p.returncode, 78)
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n{bad}")
+                rec = Path(self.tmp.name) / "rec"
+                for f in ("argv", "env"):
+                    (rec / f).unlink(missing_ok=True) if rec.exists() else None
+                p, argv, got = self.run_plist_launcher(doc)
+                self.assertEqual(p.returncode, 78, p.stderr)
+                self.assertIsNone(argv)
+                self.assertRegex(p.stderr, r"line [23]:")       # the first refused line (line 1 is the token)
+                self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
+                self.assertNotIn(bad.strip(), p.stderr)          # the line number is named, never the content
 
     def test_design_b_provider_token_file(self):
         self.provider_env("CORTADOS_PROVIDER_CLAUDE_BIN=claude\n")       # no token variable
@@ -215,7 +253,7 @@ class PlistTest(InstallerHarness):
                 self._fake("tailscale", f"echo {ip}\n")
                 r = self.run_sh("plist")
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn(f"--host {ip} ", plistlib.loads(self.plist().read_bytes())["ProgramArguments"][3])
+                self.assertIn(f"--host {ip} ", " ".join(plistlib.loads(self.plist().read_bytes())["ProgramArguments"]))
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
@@ -265,3 +303,104 @@ class LaunchctlTest(InstallerHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LauncherTest(unittest.TestCase):
+    """launch.py directly, with a fake execve: what it would exec, and exit 78 for every config failure."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bot_gateway_launch", SCRIPT.parent / "launch.py")
+        cls.launch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.launch)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.envfile = Path(self.tmp.name) / "provider.env"
+        self.environ = {"HOME": self.tmp.name, "CORTADOS_HOME": self.tmp.name + "/.cortados",
+                        "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432", "PYTHONPATH": "/nowhere",
+                        "HTTPS_PROXY": "http://proxy.invalid:1", "t": "inherited"}
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, text, mode=0o600):
+        self.envfile.write_text(text)
+        os.chmod(self.envfile, mode)
+
+    def run_main(self, flags=("--host", FAKE_IP, "--port", "8434")):
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.launch.main(["--provider-env", str(self.envfile), "--python", "/usr/bin/python3", "--", *flags],
+                                  environ=self.environ, execve=lambda *a: self.calls.append(a))
+        return rc, err.getvalue()
+
+    def test_quoted_values(self):
+        p = self.launch.parse_env("A=plain-1.2:x@y\nexport B='single # kept'\nC=\"double 'q' #\"\n"
+                                  "  # indented comment\nD=\nE=''\n")
+        self.assertEqual(p, {"A": "plain-1.2:x@y", "B": "single # kept", "C": "double 'q' #", "D": "", "E": ""})
+
+    def test_execve_args_env_and_no_token_in_argv(self):
+        self.write(f'export CORTADOS_PROVIDER_TOKEN="{PROVIDER_SECRET}"\n')
+        rc, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        (prog, argv, env), = self.calls
+        self.assertEqual(prog, "/usr/bin/python3")
+        self.assertEqual(argv, ["/usr/bin/python3", "-B", "-m", "cortados_router.bot_gateway",
+                                "--host", FAKE_IP, "--port", "8434"])
+        self.assertFalse(any(PROVIDER_SECRET in a for a in argv))
+        self.assertEqual(env, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CORTADOS_PROVIDER_TOKEN": PROVIDER_SECRET,
+                               "HOME": self.tmp.name, "CORTADOS_HOME": self.tmp.name + "/.cortados",
+                               "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432"})
+        self.assertNotIn(PROVIDER_SECRET, err)
+
+    def test_every_config_failure_exits_78(self):
+        good = f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n"
+        cases = {
+            "no token": ("OTHER=1\n", {}, None),
+            "empty token": ("CORTADOS_PROVIDER_TOKEN=\n", {}, None),
+            "empty quoted token": ("CORTADOS_PROVIDER_TOKEN=''\n", {}, None),
+            "token with space": ("CORTADOS_PROVIDER_TOKEN='a b c d e f g h'\n", {}, None),
+            "token twice": (good + good, {}, None),
+            "unquoted shell syntax": ("CORTADOS_PROVIDER_TOKEN=a;b\n", {}, None),
+            "unbalanced quote": ("CORTADOS_PROVIDER_TOKEN='abc\n", {}, None),
+            "backslash": ("CORTADOS_PROVIDER_TOKEN=a\\b\n", {}, None),
+            "dollar in single quotes": ("CORTADOS_PROVIDER_TOKEN='a$b'\n", {}, None),
+            "group writable": (good, {"mode": 0o620}, None),
+            "missing HOME": (good, {"unset": "HOME"}, None),
+            "missing URL": (good, {"unset": "CORTADOS_PROVIDER_URL"}, None),
+            "https URL": (good, {"url": "https://x:1"}, None),
+            "start_task flag": (good, {}, ("--enable-start-task",)),
+            "not UTF-8": (None, {}, None),
+        }
+        for name, (text, opt, flags) in cases.items():
+            with self.subTest(name):
+                self.calls.clear()
+                env_backup = dict(self.environ)
+                if text is None:
+                    self.envfile.write_bytes(b"CORTADOS_PROVIDER_TOKEN=\xff\xfe\n")
+                    os.chmod(self.envfile, 0o600)
+                else:
+                    self.write(text, opt.get("mode", 0o600))
+                if "unset" in opt:
+                    self.environ.pop(opt["unset"])
+                if "url" in opt:
+                    self.environ["CORTADOS_PROVIDER_URL"] = opt["url"]
+                rc, err = self.run_main(flags) if flags else self.run_main()
+                self.environ = env_backup
+                self.assertEqual(rc, 78, err)
+                self.assertEqual(self.calls, [])
+                self.assertNotIn(PROVIDER_SECRET, err)
+
+    def test_symlink_and_missing_file_exit_78(self):
+        real = Path(self.tmp.name) / "real.env"
+        real.write_text(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        os.chmod(real, 0o600)
+        self.envfile.symlink_to(real)
+        self.assertEqual(self.run_main()[0], 78)
+        self.envfile.unlink()
+        self.assertEqual(self.run_main()[0], 78)
+        self.assertEqual(self.calls, [])

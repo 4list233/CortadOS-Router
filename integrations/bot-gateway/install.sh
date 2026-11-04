@@ -10,7 +10,8 @@
 #   install.sh status   launchctl state, an unauthenticated POST /mcp (expected: 401), the log path and line count;
 #                       prints no token and no log contents
 # Secrets: this script never reads, prints or copies a token value. Of ~/.cortados/provider.env it checks only whether
-# a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output).
+# a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output). At run time launch.py reads that file
+# as data (never as shell code) and execs the gateway with an explicit environment.
 set -eu
 
 LABEL=com.cortados.bot-gateway
@@ -88,8 +89,8 @@ cmd_token() {
 cmd_plist() {
   secret_ok "$TOKEN_FILE" || die "no usable $TOKEN_FILE: run 'install.sh token' first"
   [ -f "$REPO/cortados_router/bot_gateway.py" ] || die "$REPO is not a CortadOS checkout (no cortados_router/bot_gateway.py)"
-  # Provider token for route_task. (a) preferred: provider.env assigns CORTADOS_PROVIDER_TOKEN, and the LaunchAgent
-  # sources that file at start, so the value is in neither the plist nor any command line. (b) otherwise: a 0600 file
+  # Provider token for route_task. (a) preferred: provider.env assigns CORTADOS_PROVIDER_TOKEN, and the LaunchAgent's
+  # launcher (launch.py) reads it as data at start, so the value is in neither the plist nor any command line. (b) otherwise: a 0600 file
   # the owner creates, passed by path (CORTADOS_PROVIDER_TOKEN_FILE). Only the variable name is checked here.
   if [ -f "$PROVIDER_ENV" ] && grep -Eq '^(export[[:space:]]+)?CORTADOS_PROVIDER_TOKEN=' "$PROVIDER_ENV"; then
     mode=env
@@ -103,10 +104,10 @@ cmd_plist() {
   chmod 700 "$WORKSPACE"
   [ -e "$LOG" ] || ( umask 077; : > "$LOG" )
   python3 -I - "$PLIST" "$LABEL" "$mode" "$ip" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$WORKSPACE" "$LOG" \
-    "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" "$HOME" <<'PY'
-import os, plistlib, shlex, sys
+    "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" <<'PY'
+import os, plistlib, sys
 (plist, label, mode, ip, port, repo, py, token_file, workspace, log,
- provider_env, provider_token_file, state_dir, home) = sys.argv[1:15]
+ provider_env, provider_token_file, state_dir) = sys.argv[1:14]
 url = f"http://{ip}:8432"
 gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", ip, "--port", port,
            "--token-file", token_file, "--workspace-root", workspace,
@@ -115,21 +116,11 @@ gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", ip, "--port"
            "--children-run-as-me"]
 env = {"CORTADOS_PROVIDER_URL": url, "CORTADOS_HOME": state_dir, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 if mode == "env":
-    # zsh -f: no startup files, so only provider.env is read. Sourcing alone is not a boundary (an `export X=` line in
-    # provider.env would reach the gateway), so after sourcing the token is copied into a shell-local variable, EVERY
-    # exported variable is unset, the result is checked (any survivor stops the start), and only this allowlist is
-    # exported: HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (the plist's, not provider.env's) and
-    # CORTADOS_PROVIDER_TOKEN. Not `env -i NAME=value ...`: that puts the token on env's argv, which ps shows to every
-    # local user. zsh itself adds only SHLVL and _ when it execs. No LANG: python 3.9 coerces the C locale to UTF-8. Exit 78 (EX_CONFIG) when provider.env fails to
-    # source or yields an empty token, instead of running without one.
-    q = shlex.quote
-    allow = {"HOME": home, "PATH": env["PATH"], "CORTADOS_HOME": state_dir, "CORTADOS_PROVIDER_URL": url}
-    script = (". " + q(provider_env) + " || exit 78; t=\"$CORTADOS_PROVIDER_TOKEN\"; [ -n \"$t\" ] || exit 78; "
-              "for n in ${(k)parameters[(R)*export*]}; do unset $n; done; "
-              "[ -z \"${(k)parameters[(R)*export*]}\" ] || exit 78; "
-              "export " + " ".join(f"{k}={q(v)}" for k, v in allow.items()) + " CORTADOS_PROVIDER_TOKEN=\"$t\"; "
-              "unset t; exec " + " ".join(q(a) for a in gateway))
-    args = ["/bin/zsh", "-f", "-c", script]
+    # launch.py reads provider.env as DATA (never executes it), takes only CORTADOS_PROVIDER_TOKEN, and execs the
+    # gateway with exactly HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (both from this plist) and the token.
+    # python3 -I: no PYTHON* variable and no user site directory affect the launcher. Why not sourcing: README.md.
+    args = [py, "-I", os.path.join(repo, "integrations", "bot-gateway", "launch.py"),
+            "--provider-env", provider_env, "--python", py, "--"] + gateway[4:]
 else:
     env["CORTADOS_PROVIDER_TOKEN_FILE"] = provider_token_file
     args = gateway
@@ -146,7 +137,7 @@ os.chmod(tmp, 0o644)
 os.replace(tmp, plist)
 PY
   if command -v plutil >/dev/null 2>&1; then plutil -lint "$PLIST" >/dev/null || die "plutil rejected $PLIST"; fi
-  echo "plist: wrote $PLIST (gateway on $ip:$PORT, provider http://$ip:8432, provider token: $([ "$mode" = env ] && echo "sourced from $PROVIDER_ENV" || echo "file $PROVIDER_TOKEN_FILE"))"
+  echo "plist: wrote $PLIST (gateway on $ip:$PORT, provider http://$ip:8432, provider token: $([ "$mode" = env ] && echo "read by launch.py from $PROVIDER_ENV" || echo "file $PROVIDER_TOKEN_FILE"))"
   echo "next: $HERE/install.sh load"
 }
 
