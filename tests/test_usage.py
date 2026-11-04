@@ -294,6 +294,112 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(out["bots"]["calls"], 4)
         self.assertEqual(out["bots"]["unparsable_lines"], 1)   # "[1]" is JSON but not a record: skipped, not counted bad
 
+    def test_bots_unknown_tool_name_bucketed_gateway_to_view(self):
+        # Review P2: a refused call logs the tool name the bot sent; a secret-looking one must not reach by_tool.
+        from unittest import mock
+        from cortados_router import bot_gateway as bg
+        home, root = fixture_home(), Path(tempfile.mkdtemp())
+        _TMP.append(root)
+        secret = "sk-live-SECRETVALUE0123456789"
+        with mock.patch.dict(os.environ, {"CORTADOS_HOME": str(home), "CORTADOS_SCARCITY_REFRESH": "off"}):
+            gw = bg.Gateway("gw-token-0123456789abcdef", str(root), {}, child=lambda *a: {}, route=lambda *a, **k: {})
+            with self.assertRaises(bg.PolicyRefusal):
+                gw.call(secret, {})
+        self.assertIn(secret, (home / "bot-usage.jsonl").read_text())       # the gateway did log it raw
+        out = self.collect(home, now=time.time())
+        self.assertNotIn("SECRETVALUE", json.dumps(out))
+        self.assertEqual(out["bots"]["by_tool"].get(usage.BOT_OTHER_TOOL), 1)
+        self.assertTrue(set(out["bots"]["by_tool"]) <= set(bg.EXPOSED) | {usage.BOT_OTHER_TOOL})
+
+    def test_ledger_scan_does_not_block_concurrent_record(self):
+        # Review P2: under the rollback journal a long view scan made record()'s commit time out.
+        home = fixture_home()
+        db = home / "usage.db"
+        c = sqlite3.connect(db)
+        self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertIn("usage_ts", [r[1] for r in c.execute("PRAGMA index_list(usage)")])
+        c.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?)",
+                      ((NOW - (i % 600000), "claude", f"m{i % 40}", 1, 1, 0, 0, "claude") for i in range(300000)))
+        c.commit(); c.close()
+        stop, results = threading.Event(), []
+
+        def writer():
+            while not stop.is_set():
+                results.append(usage_ledger.record("codex", "gpt", {"input_tokens": 1}, path=db))
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            outs = [usage._ledger(db, NOW) for _ in range(5)]
+        finally:
+            stop.set(); t.join()
+        self.assertTrue(results and all(results), f"{results.count(False)} of {len(results)} writes failed")
+        self.assertTrue(all(o["last_7d"] for o in outs))
+
+    def test_ledger_query_time_capped(self):
+        home = fixture_home()
+        keep = usage.LEDGER_QUERY_S, usage._PROGRESS_OPS
+        usage.LEDGER_QUERY_S, usage._PROGRESS_OPS = -1.0, 1   # already past the deadline, checked every VM step
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                usage._ledger(home / "usage.db", NOW)
+        finally:
+            usage.LEDGER_QUERY_S, usage._PROGRESS_OPS = keep
+
+    def test_home_path_with_hash_and_question_mark_opens_read_only(self):
+        # Review P2: a string-built 'file:' URI read '#'/'?' as fragment/query, dropping mode=ro (and creating files).
+        base = Path(tempfile.mkdtemp())
+        _TMP.append(base)
+        home = base / "we#ird?home"
+        shutil.copytree(fixture_home(), home)
+        before = sorted(p.relative_to(base) for p in base.rglob("*"))
+        out = self.collect(home)
+        self.assertEqual(sorted(p.relative_to(base) for p in base.rglob("*")), before)
+        self.assertEqual(out["routed"]["today"][0]["calls"], 2)
+        self.assertEqual(out["ledger"]["today"][0]["turns"], 2)
+        self.assertNotIn("router.db", [e["source"] for e in out["errors"]])
+        self.assertNotIn("usage.db", [e["source"] for e in out["errors"]])
+
+    def test_tail_read_ignores_bytes_appended_after_size_check(self):
+        # Review P2: a bare f.read() after the size check read whatever was appended since, past the byte cap.
+        from unittest import mock
+        home = fixture_home()
+        path = home / "child-tasks.jsonl"
+        keep = usage.CHILD_TAIL_BYTES
+        usage.CHILD_TAIL_BYTES = 64
+        real_open = Path.open
+        reads = []
+
+        class Racing:
+            def __init__(self, f):
+                self.f = f
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                self.f.close()
+            def seek(self, *a):
+                return self.f.seek(*a)
+            def tell(self):
+                pos = self.f.tell()
+                with real_open(path, "ab") as w:          # a writer appends right after the size was taken
+                    w.write(b"x" * 10000 + b"\n")
+                return pos
+            def read(self, *a):
+                data = self.f.read(*a)
+                reads.append(len(data))
+                return data
+
+        def fake_open(self, *a, **k):
+            f = real_open(self, *a, **k)
+            return Racing(f) if self == path else f
+        try:
+            with mock.patch.object(Path, "open", fake_open):
+                lines, cut = usage._tail_lines(path)
+        finally:
+            usage.CHILD_TAIL_BYTES = keep
+        self.assertEqual(reads, [64])
+        self.assertTrue(cut)
+        self.assertFalse(any("xxxx" in ln for ln in lines))
+
     def test_bots_absent_reported(self):
         home = fixture_home()
         (home / "bot-usage.jsonl").unlink()

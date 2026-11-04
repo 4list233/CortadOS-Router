@@ -36,6 +36,24 @@ class LedgerWrite(unittest.TestCase):
             self.assertTrue(usage_ledger.record("codex", "gpt-6", {"input_tokens": 1}, path=p))
             self.assertIn("lane", {r[1] for r in sqlite3.connect(p).execute("PRAGMA table_info(usage)")})
 
+    def test_old_rollback_ledger_migrates_to_wal_with_ts_index(self):
+        # the usage view scans by ts while turns are recorded: WAL + an index on ts keep the writer unblocked
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "usage.db"
+            c = sqlite3.connect(p)
+            c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
+            c.commit()
+            self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            c.close()
+            for _ in range(2):                                  # idempotent: the second write migrates nothing
+                self.assertTrue(usage_ledger.record("codex", "gpt-6", {"input_tokens": 1}, path=p))
+            c = sqlite3.connect(p)
+            self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual([r[1] for r in c.execute("PRAGMA index_list(usage)")], ["usage_ts"])
+            plan = " ".join(str(r) for r in c.execute("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM usage WHERE ts >= 0"))
+            self.assertIn("usage_ts", plan)
+            c.close()
+
     def test_failure_does_not_raise_and_logs_type(self):
         with tempfile.TemporaryDirectory() as d:
             bad = Path(d) / "dir-not-db"

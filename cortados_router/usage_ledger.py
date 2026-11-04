@@ -18,6 +18,10 @@ logger = logging.getLogger("cortados.usage_ledger")
 TIMEOUT_S = 0.5          # a turn's reply must never wait on this file; a lost row only weakens one learning interval
 _SCHEMA = ("CREATE TABLE IF NOT EXISTS usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
            "cache_read_tokens INTEGER, cache_write_tokens INTEGER, lane TEXT)")
+# Reason: the usage view (/v1/cortados/usage) scans this table by time window; with no index every scan read the whole
+# table, and under the default rollback journal a long read held a SHARED lock that made record()'s commit time out (a
+# 2M-row ledger lost writes). The index bounds the scan; WAL lets a reader and this writer run at once.
+_TS_INDEX = "CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts)"
 LOG_EVERY = 100          # a steady failure (full disk, read-only home) repeats every turn: one line per 100 turns stays readable
 _fail_lock = threading.Lock()
 _consecutive_failures = 0
@@ -54,6 +58,21 @@ def _ensure_lane_column(c: sqlite3.Connection) -> None:
         raise
 
 
+def _ensure_wal(c: sqlite3.Connection) -> None:
+    """Switch the ledger to WAL once (the mode is persistent in the file, so later connections only read it). The switch
+    needs the file to itself; if a reader holds it right now the switch fails, which is logged and retried on the next
+    record, and this row is still written in the old mode: losing a turn to a migration step is worse than one more try."""
+    if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    try:
+        mode = c.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    except sqlite3.OperationalError as exc:
+        logger.warning("usage ledger: WAL switch deferred (%s); retried on the next write", str(exc)[:120])
+        return
+    if str(mode).lower() != "wal":
+        logger.warning("usage ledger: journal_mode stayed %r (WAL refused); retried on the next write", mode)
+
+
 def _int(v: Any) -> int:
     try:
         return max(0, int(v or 0))
@@ -75,7 +94,9 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
         c = sqlite3.connect(str(p), timeout=TIMEOUT_S)
         try:
             c.execute(_SCHEMA)
+            c.execute(_TS_INDEX)      # IF NOT EXISTS: idempotent, and a racing creator is serialised by the write lock
             c.commit()
+            _ensure_wal(c)
             _ensure_lane_column(c)
             c.execute("INSERT INTO usage (ts, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, lane) "
                       "VALUES (?,?,?,?,?,?,?,?)", row)

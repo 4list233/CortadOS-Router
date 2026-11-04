@@ -19,6 +19,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.bot_gateway import EXPOSED as _BOT_TOOLS
+
 STALE_AFTER_S = 6 * 3600      # scarcity.reading_freshness's routing default: the dashboard calls stale what routing does
 S1_TIMEOUT_S = 1.5            # a dashboard GET must not hang on an unreachable scorer
 S1_CACHE_S = 10.0             # a 1 Hz dashboard must not add 1 req/s (and up to 1.5 s per GET) to the scorer
@@ -35,6 +37,13 @@ HW_MODELS_MAX = 32            # models Ollama holds loaded on one node at once: 
 HW_ERRORS_MAX = 16            # hardware.sample() records at most one error per field (~11 fields); more is not a sample
 LABEL_MAX = 60                # lane keys / account labels come from scarcity.json keys: bounded like window names
 DB_TIMEOUT_S = 0.5            # a dashboard GET must not wait on a router.db writer holding the lock
+# Reason: a ledger scan must never hold the view (or usage.db) for long; past this the query is interrupted and the
+# source is reported as an error, instead of a dashboard GET running unbounded over a huge table.
+LEDGER_QUERY_S = 1.0
+_PROGRESS_OPS = 10_000        # sqlite VM steps between deadline checks: cheap, and well under a millisecond apart
+# Tool names in bot-usage.jsonl outside the gateway's own tool set (a refused call logs whatever name the bot sent, which
+# could be any string, even a secret) are counted under this one label, never published as written.
+BOT_OTHER_TOOL = "other"
 BAND_TOP = 5                  # the dashboard shows the five busiest bands; the rest are noise at this size
 S1_BODY_MAX = 4096            # /health is a tiny JSON; only its status is used, the body is drained, bounded
 
@@ -174,8 +183,14 @@ def _lanes(scarcity: dict[str, Any], now: float, freshness: Callable | None,
     return out
 
 
+def _ro_uri(db_path: Path) -> str:
+    """A read-only sqlite URI. Path.as_uri() percent-encodes '#', '?' and '%', which a string-built 'file:' URI would
+    read as a fragment / query: '?mode=ro' would then be ignored and sqlite could create a file at a truncated path."""
+    return Path(db_path).resolve().as_uri() + "?mode=ro"
+
+
 def _routed(db_path: Path, now: float) -> dict[str, Any]:
-    c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    c = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
     try:
         day0 = time.mktime(  # local midnight
             time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
@@ -206,8 +221,9 @@ def _tail_lines(path: Path) -> tuple[list[str], bool]:
     with path.open("rb") as f:
         f.seek(0, 2)
         size = f.tell()
-        f.seek(max(0, size - CHILD_TAIL_BYTES))
-        data = f.read()
+        n = min(size, CHILD_TAIL_BYTES)
+        f.seek(size - n)
+        data = f.read(n)              # exactly the snapshot's tail: bytes appended after the size check are not read
     lines = data.decode("utf-8", "replace").splitlines()
     truncated = size > CHILD_TAIL_BYTES
     if truncated:
@@ -221,7 +237,9 @@ def _tail_lines(path: Path) -> tuple[list[str], bool]:
 def _ledger(db_path: Path, now: float) -> dict[str, Any]:
     """usage.db (usage_ledger.record, one row per completed backend turn): turns and tokens per lane x model. Rows the
     Hermes plugin wrote before `lane` existed fall back to their runtime, so old history still shows under its vendor."""
-    c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    c = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
+    deadline = time.monotonic() + LEDGER_QUERY_S
+    c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)   # non-zero: interrupt
     try:
         cols = {r[1] for r in c.execute("PRAGMA table_info(usage)")}
         lane = "COALESCE(lane, runtime, '(none)')" if "lane" in cols else "COALESCE(runtime, '(none)')"
@@ -265,7 +283,8 @@ def _bots(path: Path, now: float) -> dict[str, Any]:
                 continue
             if recent:
                 by_client[str(rec.get("client"))] += 1
-                by_tool[str(rec.get("tool"))] += 1
+                tool = rec.get("tool")
+                by_tool[tool if isinstance(tool, str) and tool in _BOT_TOOLS else BOT_OTHER_TOOL] += 1
                 by_outcome[str(rec.get("outcome"))] += 1
     return {"window": "7d", "calls": sum(by_client.values()), "by_client": dict(by_client), "by_tool": dict(by_tool),
             "by_outcome": dict(by_outcome), "unparsable_lines": bad, "truncated": truncated}
