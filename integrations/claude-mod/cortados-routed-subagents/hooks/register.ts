@@ -578,17 +578,76 @@ export function parseGuardArg(args: string): boolean | null {
   return null
 }
 
-export type GuardState = { edits: number; runs: number; lastToastAt: number; override: boolean | undefined; loaded: boolean }
+export type GuardState = {
+  edits: number
+  runs: number
+  lastToastAt: number
+  override: boolean | undefined
+  loaded: boolean
+  /** Bumped whenever /cortados-guard sets the override: a store read begun before that is stale and is dropped. */
+  gen: number
+  /** Failure kinds already reported (each is reported once per mod load). */
+  reported: Set<string>
+  /** Routed subagents running now: while any is, the status line is theirs and the guard does not publish. */
+  routedActive: number
+}
+
+export function newGuardState(): GuardState {
+  return { edits: 0, runs: 0, lastToastAt: -Infinity, override: undefined, loaded: false, gen: 0, reported: new Set(), routedActive: 0 }
+}
+
+/** The one-line diagnostic for a guard step that failed. Names the step and the error's class only, never its message
+ * or any input, so it can carry no credential or file content. */
+export function guardDiagnostic(where: string, err: unknown): string {
+  const name = err && typeof err === 'object' && typeof (err as any).name === 'string' ? (err as any).name : typeof err
+  const cls = /^[A-Za-z0-9_]{1,40}$/.test(name) ? name : 'Error'
+  return `cortados-routed-subagents: main-session guard ${where} failed (${cls}); the tool call ran unchanged`
+}
+
+/** Report a guard failure ONCE per kind, as a dim transcript notice ($.ui.log is not sent to the model). Never throws:
+ * a diagnostic that cannot be shown is dropped, so the call it is about still runs. */
+function guardReport($: any, guard: GuardState, where: string, err: unknown): void {
+  if (guard.reported.has(where)) return
+  guard.reported.add(where)
+  try {
+    const r = $.ui.log(guardDiagnostic(where, err))
+    if (r && typeof r.then === 'function') r.then(undefined, () => {})
+  } catch { /* nowhere left to report; the call still runs */ }
+}
+
+/** Run one guard side effect ($.ui.status / $.ui.toast), reporting a failure, sync or async, once under `where`. */
+function guardTry($: any, guard: GuardState, where: string, fn: () => unknown): void {
+  try {
+    const r: any = fn()
+    if (r && typeof r.then === 'function') r.then(undefined, (err: unknown) => guardReport($, guard, where, err))
+  } catch (err) {
+    guardReport($, guard, where, err)
+  }
+}
 
 /** Whether the guard is on: the /cortados-guard override in $.store when set (read once per mod load), else the
- * userConfig default. */
+ * userConfig default. A read that resolves after a /cortados-guard toggle is stale (its gen moved on) and is dropped,
+ * so a slow first read can never undo the toggle. A failed read is reported once and falls back to the default. */
 async function guardEnabled($: any, guard: GuardState, configDefault: boolean): Promise<boolean> {
   if (!guard.loaded) {
-    const v = await $.store.get(GUARD_STORE_KEY)
-    guard.override = typeof v === 'boolean' ? v : undefined
-    guard.loaded = true
+    const gen = guard.gen
+    try {
+      const v = await $.store.get(GUARD_STORE_KEY)
+      if (!guard.loaded && guard.gen === gen) {
+        guard.override = typeof v === 'boolean' ? v : undefined
+        guard.loaded = true
+      }
+    } catch (err) {
+      guardReport($, guard, 'store read', err)
+    }
   }
   return guard.override ?? configDefault
+}
+
+/** Put the guard's counter on the status line, unless a routed subagent owns it right now. */
+function guardPublish($: any, guard: GuardState, text: string | undefined): void {
+  if (guard.routedActive > 0) return
+  guardTry($, guard, 'status', () => $.ui.status(text))
 }
 
 export const register: Register = (on, options) => {
@@ -597,7 +656,7 @@ export const register: Register = (on, options) => {
 
   // Guard state for this session. Closure variables, so a mod reload (or Claude Code restart) starts the counters and
   // the toast throttle over; the on/off override lives in $.store and survives both.
-  const guard: GuardState = { edits: 0, runs: 0, lastToastAt: -Infinity, override: undefined, loaded: false }
+  const guard: GuardState = newGuardState()
   const guardDefault = cfg.mainSessionGuard !== false
   /** What the status line rests on when the mod has nothing else to show: the guard's counter, if any. */
   const restingStatus = (): string | undefined =>
@@ -669,6 +728,8 @@ export const register: Register = (on, options) => {
     const maxTurns = resolveMaxTurns(cfg.maxTurns)
     if (maxTurns !== null) args.push('--max-turns', String(maxTurns))
 
+    // While this child runs the status line is its own; the guard holds its counter until no child is active.
+    guard.routedActive += 1
     $.ui.status(`↗ routed subagent (${description})`)
     type RunRes = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean }
     const startedAt = Date.now()
@@ -816,32 +877,45 @@ export const register: Register = (on, options) => {
     } finally {
       // Guarded: a throw here would escape to the outer .catch and trigger a native re-dispatch (replay). Never
       // let clearing the status line do that.
-      // Restores the main-session guard's counter (one status line per plugin) rather than wiping it.
-      try { $.ui.status(restingStatus()) } catch { /* ignore */ }
+      // Restores the main-session guard's counter (one status line per plugin) rather than wiping it — once the
+      // last routed child is done; while another still runs, its line stays.
+      try {
+        guard.routedActive = Math.max(0, guard.routedActive - 1)
+        if (guard.routedActive === 0) $.ui.status(restingStatus())
+      } catch { /* ignore */ }
     }
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
   // ---- Main-session guard: WARN ONLY. Every call proceeds unchanged; only a toast and a status counter. ----------
   for (const tool of GUARD_TOOLS) {
     on('tool.call', { tool }, async ($: any, e: any, next: any) => {
+      // Every step is guarded on its own and reports its failure once (guardReport); whatever fails, the call below
+      // runs exactly once and unchanged.
       try {
         // Subagents (and teammates, engine forks) carry an agentId; only the main loop is nudged.
         const kind = e?.agentId == null ? substantiveKind(tool, e) : null
         if (kind && (await guardEnabled($, guard, guardDefault))) {
           if (kind === 'edit') guard.edits += 1
           else guard.runs += 1
-          $.ui.status(guardStatusText(guard.edits, guard.runs))
-          const now = Number(await $.clock.now())
-          if (now - guard.lastToastAt >= GUARD_TOAST_INTERVAL_MS) {
+          guardPublish($, guard, guardStatusText(guard.edits, guard.runs))
+          let now = NaN
+          try {
+            now = Number(await $.clock.now())
+          } catch (err) {
+            guardReport($, guard, 'clock', err)
+          }
+          // No usable time: skip the toast rather than toast on every call; the counter above still counted it.
+          if (Number.isFinite(now) && now - guard.lastToastAt >= GUARD_TOAST_INTERVAL_MS) {
             guard.lastToastAt = now
-            $.ui.toast(
-              kind === 'edit'
-                ? 'main session did a large edit; delegate this kind of work to a routed subagent'
-                : 'main session ran a build/test; delegate this kind of work to a routed subagent',
-            )
+            const text = kind === 'edit'
+              ? 'main session did a large edit; delegate this kind of work to a routed subagent'
+              : 'main session ran a build/test; delegate this kind of work to a routed subagent'
+            guardTry($, guard, 'toast', () => $.ui.toast(text))
           }
         }
-      } catch { /* warn-only: a guard failure must never affect the call */ }
+      } catch (err) {
+        guardReport($, guard, 'bookkeeping', err)
+      }
       return next(e)
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
   }
@@ -850,22 +924,33 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     try {
       await $.command.register({ name: GUARD_COMMAND, description: 'Main-session guard (warn only): on, off, or no argument for its state.', argumentHint: '[on|off]', immediate: true })
-    } catch { /* the guard still runs from userConfig without its command */ }
+    } catch (err) {
+      // The guard still runs from userConfig without its command; say the toggle is missing.
+      guardReport($, guard, `/${GUARD_COMMAND} registration`, err)
+    }
     return r
   }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
   on('command.run', { command: GUARD_COMMAND }, async ($: any, e: any) => {
     const want = parseGuardArg(e?.args)
     if (want === null && String(e?.args ?? '').trim()) return { text: `usage: /${GUARD_COMMAND} on|off` }
+    let note = ''
     if (want !== null) {
-      await $.store.set(GUARD_STORE_KEY, want)
+      // In memory first, and the generation bumped, so a first store read still in flight cannot undo this.
       guard.override = want
       guard.loaded = true
-      $.ui.status(restingStatus())
+      guard.gen += 1
+      guardPublish($, guard, restingStatus())
+      try {
+        await $.store.set(GUARD_STORE_KEY, want)
+      } catch (err) {
+        guardReport($, guard, 'store write', err)
+        note = '; not saved, applies to this session only'
+      }
     }
     const on_ = await guardEnabled($, guard, guardDefault)
     const counts = guardStatusText(guard.edits, guard.runs)
-    return { text: `main-session guard ${on_ ? 'on' : 'off'} (warn only${on_ && counts ? `; ${counts}` : ''})` }
+    return { text: `main-session guard ${on_ ? 'on' : 'off'} (warn only${on_ && counts ? `; ${counts}` : ''}${note})` }
   })
 
   // ---- Orchestrator mode: direct the main session to plan and delegate; routed subagents do the work. ----------

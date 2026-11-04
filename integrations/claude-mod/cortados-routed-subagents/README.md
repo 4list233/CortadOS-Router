@@ -94,8 +94,16 @@ Each substantive call bumps a session counter shown on the mod's status line (`m
 run; delegate to routed subagents`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;
 a toast per edit would be noise). The counters and the throttle live in memory and start over when the mod reloads.
 
+While a routed subagent is running, the status line stays its own (`↗ routed subagent (...)`): the guard keeps
+counting and still toasts, and puts its counter back once the last routed child finishes. A guard step that fails
+(store read or write, clock, status, toast, registering `/cortados-guard`) is reported **once per kind** as a dim
+transcript notice naming only the step and the error class (no message text, no input), and the tool call still runs
+exactly once, unchanged. A failed `$.ui.status`/`$.ui.toast` underneath the host is dropped and reported by the host
+itself, since those calls are fire-and-forget.
+
 `/cortados-guard off` / `/cortados-guard on` turns it off or on and is kept in the mod's `$.store`, so it survives
-restarts and overrides `mainSessionGuard`; `/cortados-guard` with no argument reports the state. No model calls, no
+restarts and overrides `mainSessionGuard` (it takes effect at once, even if the first store read is still in flight;
+if saving fails it applies to this session only and says so); `/cortados-guard` with no argument reports the state. No model calls, no
 network.
 
 ## Independent reviews
