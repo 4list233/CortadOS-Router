@@ -129,6 +129,7 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
     claude_scratch = tempfile.mkdtemp(prefix="oc-", dir="/tmp")
     from outcome import provider
     via = provider.enabled()
+    secret = ""                                    # the provider token, redacted from every trace (provider mode only)
     try:
         if via and lane in ("claude", "codex"):
             # Every band, Claude or Codex, runs as a Claude Code session against the provider, pinned to the band's model,
@@ -179,6 +180,10 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
             raise ValueError(f"lane {lane!r} has no task runner")
         trace.update(exit=code, seconds=round(secs, 1), timed_out=code is None,
                      stderr_tail=err[-1000:] if code not in (0, None) else "", outward_calls=_read_calls(calls))
+        if secret:
+            # The whole trace, outward_calls included: an agent could relay the token through a mock outward call, and
+            # that journal reaches runs.jsonl and the judge prompt too (Codex review r5 P3-2).
+            trace = json.loads(json.dumps(trace).replace(secret, "[redacted]"))
         return trace
     finally:
         containment.sweep(claude_scratch)

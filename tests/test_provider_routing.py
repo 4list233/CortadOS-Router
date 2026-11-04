@@ -485,7 +485,7 @@ class MinLeftFloorTests(unittest.TestCase):
         import time as _t
         self.now = _t.time()
         self._keep = (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings,
-                      core.claude_login_identity)
+                      core.claude_login_identity, core.codex_login_identity)
         core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-floor-"))
         # The effective login of the env the bridge would start the CLI with: its CLAUDE_CONFIG_DIR, else ~/.claude.
         core.claude_login_identity = lambda env: env.get("CLAUDE_CONFIG_DIR") or "~/.claude"
@@ -497,7 +497,7 @@ class MinLeftFloorTests(unittest.TestCase):
 
     def tearDown(self):
         (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings,
-         core.claude_login_identity) = self._keep
+         core.claude_login_identity, core.codex_login_identity) = self._keep
 
     def win(self, used, pool="all", stale=False, reset=None, name=None):
         return {"window": name or ("week" if pool == "all" else f"week ({pool})"), "pool": pool, "used_pct": used,
@@ -511,10 +511,11 @@ class MinLeftFloorTests(unittest.TestCase):
         core.subscription_readings = lambda: rd
         return rd
 
-    def pin(self, model, floor=None):
+    def pin(self, model, floor=None, codex_home=None):
         body = {"model": model, "messages": [{"role": "user", "content": "x"}]}
         return routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3",
-                              codex_bin="python3", **({"min_left_pct": floor} if floor is not None else {}))
+                              codex_bin="python3", **({"min_left_pct": floor} if floor is not None else {}),
+                              **({"codex_home": codex_home} if codex_home else {}))
 
     def ledger(self):
         p = core.STATE / "floor-reservations.jsonl"
@@ -594,7 +595,18 @@ class MinLeftFloorTests(unittest.TestCase):
         for _ in range(20):                                               # 20 continuations of the same run
             self.assertIsNone(routing.floor_turn(core, route, 5))
         self.assertEqual(len(self.ledger()), 1)
-        self.assertEqual([self.pin("sub/opus", 5).get("provider") for _ in range(2)], ["claude-cli"] * 2)
+        # The reservation ages out (a reading sampled more than IN_FLIGHT_S after it now shows the work): the next turn
+        # re-charges once, and only once.
+        from cortados_router.provider import floor as floor_mod
+        p = core.STATE / "floor-reservations.jsonl"
+        rows = self.ledger()
+        rows[0]["ts"] = self.now - 60 - floor_mod.IN_FLIGHT_S - 120
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        self.assertIsNone(routing.floor_turn(core, route, 5))
+        self.assertIsNone(routing.floor_turn(core, route, 5))
+        self.assertEqual([r["conv"] for r in self.ledger()], [route["route_id"]] * 2)
+        p.write_text(json.dumps(rows[0]) + "\n")                       # back to one aged-out row: three new runs fit
+        self.assertEqual([self.pin("sub/opus", 5).get("provider") for _ in range(3)], ["claude-cli"] * 3)
         self.assertNotEqual(self.pin("sub/opus", 5).get("provider"), "claude-cli")   # 4th RUN does not fit
 
     def test_fable_runs_admitted_without_a_pool_window_count_when_it_returns(self):
@@ -607,12 +619,22 @@ class MinLeftFloorTests(unittest.TestCase):
         self.assertTrue(r.get("quota_blocked"), r)
         self.assertIn("2 run(s) outstanding", r["error"])
 
-    def test_codex_pin_under_a_floor_holds_its_reading_is_not_bound_to_the_login(self):
-        self.readings([self.win(10)], [self.win(10)], codex={"fetched_at": self.now - 60, "failed": False,
-                                                            "windows": [self.win(10)]})
-        r = self.pin("sub/gpt-6.1-sol", 5)
-        self.assertTrue(r.get("quota_blocked"))
-        self.assertIn("not bound to the login", r["error"])
+    def test_codex_pin_under_a_floor_needs_the_reading_of_the_executing_home(self):
+        core.codex_login_identity = lambda env: env.get("CODEX_HOME")    # the home codex_isolation.child_env sets
+        codex = {"fetched_at": self.now - 60, "failed": False, "windows": [self.win(10)]}
+        self.readings([self.win(10)], [self.win(10)], codex=codex)
+        r = self.pin("sub/gpt-6.1-sol", 5, codex_home="/homes/provider")
+        self.assertTrue(r.get("quota_blocked"))                          # a reading sampled before the stamp existed
+        self.assertIn("not sampled from the login", r["error"])
+        codex["login"] = "/homes/sampler"                                # sampled on another home: held
+        self.assertTrue(self.pin("sub/gpt-6.1-sol", 5, codex_home="/homes/provider").get("quota_blocked"))
+        codex["login"] = "/homes/provider"                               # the provider's own --codex-home: admitted
+        r = self.pin("sub/gpt-6.1-sol", 5, codex_home="/homes/provider")
+        self.assertEqual(r.get("provider"), "codex-cli", r)
+        self.assertEqual(self.ledger()[-1]["lane"], "codex")
+        # the continuation proves the same home: a provider started on another home is refused
+        self.assertIsNone(routing.floor_turn(core, r, 5, "/homes/provider"))
+        self.assertIn("not sampled from the login", routing.floor_turn(core, r, 5, "/homes/elsewhere"))
 
     def test_floor_only_tightens_a_spent_account_stays_out(self):
         self.readings([self.win(10)], [self.win(10)])
@@ -629,8 +651,9 @@ class MinLeftFloorTests(unittest.TestCase):
         self.assertIn("would pass", why)
         self.assertEqual({row["lane"] for row in self.ledger()}, {"claude"})
         self.assertIn("unknown", routing.floor_turn(core, None, 5))
-        local = {"model": "m", "route": {"chosen": {"lane": "local"}}}
-        self.assertIsNone(routing.floor_turn(core, local, 5))              # a local node has no subscription floor
+        for lane in ("local", "local-studio"):                             # routed and pinned spellings of a local node
+            local = {"model": "m", "route": {"chosen": {"lane": lane}}}
+            self.assertIsNone(routing.floor_turn(core, local, 5))          # a local node has no subscription floor
 
 
 class ExcludeModelTests(unittest.TestCase):

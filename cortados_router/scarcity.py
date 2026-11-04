@@ -367,6 +367,28 @@ def claude_login_identity(env: dict[str, str]) -> str | None:
     return os.path.realpath(os.path.join(home, ".claude"))
 
 
+# Env that makes a Codex CLI authenticate with something other than the stored login of its CODEX_HOME (an API key, an
+# access token, another endpoint): with any set, the env cannot be pinned to one stored login. The provider's Codex
+# backend strips exactly these (codex_isolation.STRIPPED_ENV), so its login is always the home's auth.json.
+_CODEX_LOGIN_OVERRIDES = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL")
+
+
+def codex_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Codex CLI started with `env` runs on: its resolved CODEX_HOME (else $HOME/.codex), whose auth.json
+    holds the login. None when the env cannot be pinned to one stored login (an override above, or a relative path).
+    Two homes holding the same ChatGPT account are two identities here: conservative, never wrongly equal."""
+    if any(env.get(k) for k in _CODEX_LOGIN_OVERRIDES):
+        return None
+    ch = env.get("CODEX_HOME")
+    if ch:
+        d = os.path.expanduser(ch)
+        return os.path.realpath(d) if os.path.isabs(d) else None
+    home = env.get("HOME") or os.path.expanduser("~")
+    if not os.path.isabs(home):
+        return None
+    return os.path.realpath(os.path.join(home, ".codex"))
+
+
 def _ensure_trust(config_dir: str) -> None:
     """A fresh per-account CLAUDE_CONFIG_DIR has not accepted the workspace-trust dialog, which blocks the /usage TUI on
     the folder the probe runs in. Pre-accept it for the home folder so the probe reaches the usage screen."""
@@ -661,7 +683,10 @@ def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, note
         # without persisting boot screens, credentials or prompt contents.
         raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
     wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
+    # `login`: the CODEX_HOME login this sampler's CLI ran on (metadata only), so a reading can be proven to belong to
+    # the login a consumer executes on (provider/floor.py), as Claude readings are.
     return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
+            "login": codex_login_identity(env),
             "binary": binary, "discovery_notes": notes,
             **({"configured_binary_missing": missing_bin} if missing_bin else {})}
 

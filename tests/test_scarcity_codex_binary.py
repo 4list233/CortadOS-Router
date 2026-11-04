@@ -256,6 +256,30 @@ class CodexBinaryTest(unittest.TestCase):
                          sc.failure_kind("RuntimeError: 1 of 3 nodes unreachable"))
 
 
+class CodexLoginStampTest(unittest.TestCase):
+    """A Codex reading records the CODEX_HOME login it was sampled from (metadata only; no CLI is opened here)."""
+
+    def test_identity_rule(self):
+        self.assertEqual(sc.codex_login_identity({"CODEX_HOME": "/tmp"}), os.path.realpath("/tmp"))
+        self.assertEqual(sc.codex_login_identity({"HOME": "/tmp"}), os.path.realpath("/tmp/.codex"))
+        self.assertIsNone(sc.codex_login_identity({"CODEX_HOME": "rel/home"}))       # cwd-relative: unpinnable
+        for k in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL"):
+            self.assertIsNone(sc.codex_login_identity({"CODEX_HOME": "/tmp", k: "x"}), k)
+
+    def test_the_probe_stamps_the_login_of_its_env(self):
+        with mock.patch.object(sc, "tui_capture", return_value="screen"), \
+             mock.patch.object(sc, "parse_codex_status", return_value=[]), \
+             mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
+            rec = sc._codex_probe({"CODEX_HOME": "/tmp"}, "/bin/codex", None, [])
+        self.assertEqual(rec["login"], os.path.realpath("/tmp"))
+
+    def test_the_provider_executing_login_matches_a_reading_of_its_own_home(self):
+        from cortados_router.provider import floor
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-ambient"}):      # stripped by the bridge's child env
+            got = floor.executing_login({"provider": "codex-cli", "codex_home": "/tmp"})
+        self.assertEqual(got, sc.codex_login_identity({"CODEX_HOME": "/tmp"}))
+
+
 class FailedReadingTest(unittest.TestCase):
     """A failed try must persist error_kind and be logged once per kind, on every sampler path."""
 

@@ -497,6 +497,11 @@ def _reading_for_other_login(reading: dict[str, Any], c: dict[str, Any]) -> bool
     return "config_dir" in reading and reading.get("config_dir") != c.get("config_dir")
 
 
+def codex_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Codex CLI started with `env` runs on (scarcity's rule, which also stamps each Codex reading's `login`)."""
+    return _scarcity_module().codex_login_identity(env)
+
+
 def claude_login_identity(env: dict[str, str]) -> str | None:
     """The login a Claude CLI started with `env` runs on (scarcity's rule, which also stamps each reading's `login`)."""
     return _scarcity_module().claude_login_identity(env)
