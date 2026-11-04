@@ -344,6 +344,21 @@ class RunRecords:
             while len(self._runs) > self.MAX_RUNS:
                 self._runs.popitem(last=False)
 
+    def all_refusals(self) -> list[dict[str, Any]]:
+        """Every recorded refusal (for GET /v1/cortados/usage's 24-hour counts)."""
+        with self._lock:
+            return [dict(e) for es in self._refusals.values() for e in es]
+
+    def model_counts(self) -> dict[str, int]:
+        """Routed entries per provider/model since start (in memory, bounded; for GET /v1/cortados/usage)."""
+        with self._lock:
+            out: dict[str, int] = {}
+            for es in self._runs.values():
+                for e in es:
+                    k = f"{e['provider']}/{e['model']}"
+                    out[k] = out.get(k, 0) + 1
+            return out
+
     def summary(self, run_id: str) -> dict[str, Any] | None:
         """The run's answer: the primary entry (the first that had tools, the agent's own loop, else the first), the
         distinct models in order (`models`, every entry, tool-less side calls included) and the distinct models of the
@@ -839,8 +854,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a JSON object")
         return body
 
-    def _json(self, code: int, data: dict[str, Any], session=None, headers: dict[str, str] | None = None) -> None:
-        raw = json.dumps(data).encode()
+    def _json(self, code: int, data: dict[str, Any] | bytes, session=None, headers: dict[str, str] | None = None) -> None:
+        # bytes: a body the caller already encoded (and validated), sent as is, so a large view is serialised once.
+        raw = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send_response(code)
         self._route_header(session)
         for k, v in (headers or {}).items():
@@ -925,6 +941,18 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == "/v1/cortados/usage":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:   # a bug in a source must not drop the connection: a clean 500, detail (type only) in the log
+                view = self.server.usage_view(self.server.registry)
+                # the live view arrives encoded (usage.collect memoises the bytes); a dict is encoded strictly here,
+                # before any byte is sent, so a NaN is a clean 500 and never invalid JSON
+                body = view if isinstance(view, bytes) else json.dumps(view, allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("usage: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: usage view unavailable (see provider log)")
+            return self._json(200, body)
         if self.path.split("?")[0].startswith(RUNS_PATH):
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -1600,6 +1628,23 @@ class ProviderServer(ThreadingHTTPServer):
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
         self.registry = registry
+
+    def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
+        """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
+        from cortados_router import paths, scarcity
+        from cortados_router.provider import usage
+        try:
+            from cortados_router.s1_endpoint import resolve_url
+            s1_url = resolve_url()
+        except Exception as exc:                        # reported by the s1 section as unavailable, with the reason
+            logger.warning("usage: cannot resolve the S1 URL: %s", exc)
+            s1_url = None
+        state = paths.state_dir()
+        # strict cache-only read, not scarcity.current(refresh=False): that hides a missing/corrupt cache as no lanes
+        return usage.collect(state_dir=state, scarcity_reader=lambda: usage.read_scarcity_cache(state / "scarcity.json"),
+                             refusals=registry.runs.all_refusals(), runs_since_start=registry.runs.model_counts(),
+                             s1_url=s1_url, freshness=scarcity.reading_freshness, claude_lanes=scarcity.claude_lanes(),
+                             encoded=True)
 
 
 def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, codex_home: str | None,
