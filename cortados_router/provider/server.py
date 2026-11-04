@@ -23,6 +23,8 @@ P2: the route's provider picks the backend (SESSION_FACTORIES): `claude-cli` run
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -141,21 +143,38 @@ _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
 
 
-# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, or loading
-# anything but its own inline code and same-origin fetches.
+# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, sniffed as
+# another type, or sending its Referer. Its Content-Security-Policy is _dashboard_csp(): it pins the one inline script.
 DASHBOARD_HEADERS = {
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
 }
+# script-src carries only the hash of the page's own inline script (no 'unsafe-inline'): markup injected into the page
+# could not run a script. base-uri/form-action/frame-ancestors 'none': no base rewrite, no form post, no framing.
+_DASHBOARD_CSP = ("default-src 'none'; script-src '{h}'; style-src 'unsafe-inline'; connect-src 'self'; "
+                  "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
 def _dashboard_html() -> bytes:
-    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage)."""
+    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage).
+    Read once with its CSP: the page must hold exactly one inline <script>, whose sha256 the CSP pins."""
     if "b" not in _dashboard_cache:
-        _dashboard_cache["b"] = _DASHBOARD_PATH.read_bytes()
+        b = _DASHBOARD_PATH.read_bytes()
+        scripts = re.findall(rb"<script>(.*?)</script>", b, re.S)
+        if len(scripts) != 1 or b.count(b"<script") != 1:   # a second script would be blocked by the pinned CSP
+            raise ValueError("dashboard page must hold exactly one inline <script>")
+        digest = base64.b64encode(hashlib.sha256(scripts[0]).digest()).decode()
+        _dashboard_cache["csp"] = _DASHBOARD_CSP.format(h=f"sha256-{digest}")
+        _dashboard_cache["b"] = b
     return _dashboard_cache["b"]
+
+
+def _dashboard_csp() -> str:
+    """The Content-Security-Policy for the page _dashboard_html() returned."""
+    _dashboard_html()
+    return _dashboard_cache["csp"]
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
 # Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
@@ -911,13 +930,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/dashboard"):
             try:
                 html = _dashboard_html()                # static page; the data it shows (/v1/cortados/usage) still needs the token
-            except OSError:
+                csp = _dashboard_csp()
+            except (OSError, ValueError) as exc:
+                logger.warning("dashboard page unavailable: %s", type(exc).__name__)
                 return self._error(500, "api_error", "dashboard page unavailable")
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(html)))
             for k, v in DASHBOARD_HEADERS.items():
                 self.send_header(k, v)
+            self.send_header("Content-Security-Policy", csp)
             self.end_headers()
             self.wfile.write(html)
             return

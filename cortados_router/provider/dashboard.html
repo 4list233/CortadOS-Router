@@ -31,13 +31,14 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; width:60px; }
 td.barcell { width:40%; }
 .cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
 ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
-.card.errors { border-color:var(--bad); } #status.err { color:var(--bad); }
+.card.errors { border-color:var(--bad); } #status.err, #storage { color:var(--bad); }
+body.stale main { opacity:.55; }
 #login { max-width:360px; margin:80px auto; }
 #login input { width:100%; padding:7px; margin:8px 0; font:inherit; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
 </style>
 </head>
 <body>
-<header><h1>CortadOS Router · usage</h1><span id="status"></span><button id="logout" hidden>Forget token</button></header>
+<header><h1>CortadOS Router · usage</h1><span id="status"></span><span id="storage" hidden></span><button id="logout" hidden>Forget token</button></header>
 <form id="login" class="card" hidden>
   <div class="title">Provider token</div>
   <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/usage.</div>
@@ -47,11 +48,21 @@ ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
 <main id="main" hidden></main>
 <script>
 "use strict";
+// EVERY: the scarcity cache behind the lane cards is refreshed every few minutes and the 7-day counts move slowly, so a
+// 30 s poll shows changes promptly while the server's 2 s collect memo keeps several open tabs from re-scanning its logs.
 const KEY = "cortados-usage-token", URL_ = "/v1/cortados/usage", EVERY = 30000;
 const $ = (id) => document.getElementById(id);
-let timer = null;
-function getTok() { try { return sessionStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
-function setTok(t) { try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) {} }
+let timer = null, lastOk = null;
+// sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
+// and the page says so, instead of losing the token and asking for it again on every poll.
+let memTok = "", storageOk = true;
+function storageFailed() {
+  storageOk = false;
+  const s = $("storage"); s.hidden = false; s.textContent = "Browser storage unavailable; the token is kept only for this page";
+}
+function getTok() { if (!storageOk) return memTok; try { return sessionStorage.getItem(KEY) || memTok; } catch (e) { storageFailed(); return memTok; } }
+function setTok(t) { memTok = t || ""; if (!storageOk) return;
+  try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { storageFailed(); } }
 // Every string from the endpoint goes in through textContent: lane names and errors are data, never markup.
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = String(text); return e; }
 function add(parent, ...kids) { for (const k of kids) if (k) parent.appendChild(k); return parent; }
@@ -91,6 +102,7 @@ function tok(n) { return (typeof n === "number") ? (n >= 1e6 ? (n / 1e6).toFixed
 function capped(o, keys) { return keys.some(k => o && o[k]) ? "list capped" : ""; }
 
 function render(d) {
+  document.body.classList.remove("stale");
   const m = $("main"); m.replaceChildren();
   const errors = d.errors || [];
   const bySrc = (p) => errors.filter(e => e && typeof e.source === "string" && (e.source === p || e.source.indexOf(p + "/") === 0));
@@ -114,6 +126,7 @@ function render(d) {
     Object.entries(l.pools || {}).forEach(([p, v]) => add(c, el("div", "sub", "pool " + p + ": " + pct(v) + " left")));
     add(c, el("div", "sub", "sample " + age(l.sample_age_s) + " old" + (l.stale ? " (stale)" : "")));
     if (l.error) add(c, el("div", "sub err", "error: " + l.error));
+    errors.filter(e => e && e.source === "scarcity/" + l.lane).forEach(e => add(c, el("div", "sub err", errText(e))));
     add(lanes, c);
   });
   if (!(d.lanes || []).length) {
@@ -192,6 +205,7 @@ function render(d) {
   add(m, section("Notes"));
   const notes = el("ul"); (d.notes || []).forEach(n => add(notes, el("li", null, n)));
   add(m, add(el("div", "card"), notes));
+  lastOk = new Date();
   const st = $("status"); st.className = errors.length ? "err" : "";
   st.textContent = "updated " + new Date().toLocaleTimeString() + (d.generated_at ? " · generated " + when(d.generated_at) : "") +
     (errors.length ? " · " + errors.length + " error" + (errors.length === 1 ? "" : "s") : "");
@@ -207,9 +221,15 @@ async function refresh() {
   try {
     const res = await fetch(URL_, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
     if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
-    if (!res.ok) { $("status").textContent = "error " + res.status; return; }
+    if (!res.ok) return failed("error " + res.status);
     render(await res.json());
-  } catch (e) { $("status").textContent = "fetch failed: " + (e && e.message ? e.message : e); }
+  } catch (e) { failed("fetch failed: " + (e && e.message ? e.message : e)); }
+}
+// A failed poll leaves the last good view on screen, greyed, with the failure in red: never shown as current.
+function failed(msg) {
+  document.body.classList.add("stale");
+  const st = $("status"); st.className = "err";
+  st.textContent = msg + (lastOk ? " · showing data from " + lastOk.toLocaleTimeString() : "");
 }
 function start() { $("login").hidden = true; $("main").hidden = false; $("logout").hidden = false; refresh(); if (!timer) timer = setInterval(refresh, EVERY); }
 $("login").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("tok").value.trim(); if (!t) return; setTok(t); start(); });
