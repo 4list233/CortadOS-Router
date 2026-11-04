@@ -524,7 +524,7 @@ inherited `CLAUDE_CONFIG_DIR` that matches no configured account (or a named acc
 `no_claude_lane` before the CLI is launched, so no search spends quota the ledger cannot record. A completed search's
 ledger row is written after the fact like every other lane's (the ledger is accounting, not the quota gate); a failed
 write is logged at error level with the lane and run id. The request thread only puts the row on a bounded in-process
-queue (`usage_ledger.QUEUE_MAX`); one writer thread commits it in batches and retries while usage.db is locked or
+queue (`usage_ledger.QUEUE_MAX`); one writer thread, started with the endpoint and restarted by a supervisor, commits it in batches and retries while usage.db is locked or
 migrating, so the request path never touches SQLite or a file lock. A row is lost only on a full queue, a batch that
 keeps failing with a non-busy error, or exit with rows still queued; each is counted and shown as `ledger.lost`
 (with `ledger.queued`) in /v1/cortados/usage, and logged "LOST". The request's policy headers bind the lane before launch, as on routed calls: `x-cortados-exclude-model`

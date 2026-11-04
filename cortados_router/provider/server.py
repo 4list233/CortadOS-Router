@@ -1849,6 +1849,9 @@ class ProviderServer(ThreadingHTTPServer):
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
         self.registry = registry
+        # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
+        from cortados_router import usage_ledger
+        usage_ledger.start()
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""

@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -184,7 +185,10 @@ class LedgerWrite(unittest.TestCase):
             self.assertTrue(usage_ledger.record("codex", "gpt-6", {"input_tokens": 1}, path=p))
 
     def test_record_async_writes_row(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}):
+        w = usage_ledger.Writer()
+        self.addCleanup(w.shutdown, 0.5)
+        with mock.patch.object(usage_ledger, "_W", w), tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}):
+            self.assertTrue(w.start())
             self.assertTrue(usage_ledger.record_async("claude#b", "claude-sonnet-5", {"input_tokens": 4, "output_tokens": 1}))
             self.assertTrue(usage_ledger.flush(5))
             rows = sqlite3.connect(Path(d) / "usage.db").execute("SELECT runtime, input_tokens, lane FROM usage").fetchall()
@@ -290,7 +294,19 @@ class LedgerWrite(unittest.TestCase):
     def _lost(self):
         return usage_ledger.stats()["lost"]
 
+    def _fresh(self, maxsize=usage_ledger.QUEUE_MAX, start=True):
+        """A new Writer in place of the module's, with real threads; shut down at cleanup."""
+        w = usage_ledger.Writer(maxsize)
+        p = mock.patch.object(usage_ledger, "_W", w)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(w.shutdown, 0.5)
+        if start:
+            self.assertTrue(w.start())
+        return w
+
     def test_a_locked_db_never_blocks_the_request_path_and_the_rows_land_once_it_frees(self):
+        self._fresh()
         # Review r12: the request thread only queues. Another connection holds SQLite's writer lock (as a long index
         # build does); record_async still returns at once, the writer retries, and every row lands when it is released.
         with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "TIMEOUT_S", 0.05):
@@ -317,6 +333,7 @@ class LedgerWrite(unittest.TestCase):
             self.assertEqual(usage_ledger.stats()["queued"], 0)
 
     def test_a_migrating_ledger_never_blocks_the_request_path(self):
+        self._fresh()
         # a legacy ledger (no lane column) whose migrate lock another process holds: the writer retries (MigrationBusy
         # is busy), the request path is untouched, and the rows land once the lock is released
         with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "RETRY_S", 0.2):
@@ -336,14 +353,15 @@ class LedgerWrite(unittest.TestCase):
             self.assertEqual(self._lost(), lost0)
 
     def test_the_batched_drain_writes_every_row(self):
+        self._fresh()
         with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "BATCH_MAX", 7):
             db = Path(d) / "usage.db"
             batches = []
             real = usage_ledger._write_rows
 
-            def spy(p, rows, deadline):
+            def spy(p, rows, deadline, guard=None):
                 batches.append(len(rows))
-                return real(p, rows, deadline)
+                return real(p, rows, deadline, guard)
             with mock.patch.object(usage_ledger, "_write_rows", spy):
                 for i in range(100):
                     usage_ledger.record_async("codex", "gpt", {"input_tokens": 1}, path=db)
@@ -354,47 +372,146 @@ class LedgerWrite(unittest.TestCase):
 
     def test_a_full_queue_counts_the_lost_rows_and_the_usage_api_reports_them(self):
         from cortados_router.provider import usage as usage_view
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
-                mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=2)), \
-                mock.patch.object(usage_ledger, "_ensure_writer"):              # no writer: the queue stays full
-            lost0 = self._lost()
+        w = self._fresh(maxsize=2, start=False)                         # no writer: the queue stays full
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}):
             with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
                 results = [usage_ledger.record_async("codex", "gpt", {}) for _ in range(5)]
-            self.assertEqual(results, [True, True, False, False, False])
-            self.assertEqual(self._lost() - lost0, 3)
+                self.assertEqual(results, [True, True, False, False, False])
+                out = usage_view.collect(state_dir=Path(d), scarcity_reader=lambda: {}, refusals=[],
+                                         s1_probe=lambda u: {"available": False}, now=time.time())
+            self.assertEqual(w.lost, 3)
             self.assertTrue(any("LOST" in m and "queue is full" in m for m in cm.output))
-            self.assertEqual(usage_ledger.stats()["queued"], 2)
-            out = usage_view.collect(state_dir=Path(d), scarcity_reader=lambda: {}, refusals=[],
-                                     s1_probe=lambda u: {"available": False}, now=time.time())
-            self.assertEqual(out["ledger"]["lost"], self._lost())
+            self.assertEqual(out["ledger"]["lost"], 3)
             self.assertEqual(out["ledger"]["queued"], 2)
-            # drain the patched queue so the shutdown below does not count these rows
-            while not usage_ledger._queue.empty():
-                usage_ledger._queue.get_nowait()
-                usage_ledger._queue.task_done()
+            while not w.q.empty():                                      # not counted by the cleanup shutdown
+                w.q.get_nowait()
+                w.q.task_done()
 
     def test_a_full_queue_context_row_is_logged_at_error_with_lane_and_context(self):
-        with mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=1)), \
-                mock.patch.object(usage_ledger, "_ensure_writer"):
-            usage_ledger._queue.put_nowait(None)
-            with self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
-                self.assertFalse(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run r1"))
+        w = self._fresh(maxsize=1, start=False)
+        w.q.put_nowait(None)
+        self.assertFalse(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run r1"))
+        with self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
+            w.fold_drops()
         self.assertIn("lane claude#b", cm.output[0])
         self.assertIn("search lane, run r1", cm.output[0])
+        w.q.get_nowait()
+        w.q.task_done()
+
+    def test_a_start_failure_until_the_queue_fills_still_recovers(self):
+        # Review r13 P2-1: the writer cannot start until the queue is full; the supervisor (not a request) keeps
+        # retrying, and once a start succeeds the stranded rows are written. Rows refused while full are counted lost.
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "SUPERVISE_S", 0.05):
+            db = Path(d) / "usage.db"
+            w = self._fresh(maxsize=3, start=False)
+            real, allow = w._start_writer_thread, {"ok": False}
+
+            def start_writer():
+                if not allow["ok"]:
+                    raise RuntimeError("can't start new thread")
+                return real()
+            w._start_writer_thread = start_writer
+            with self.assertLogs("cortados.usage_ledger", "WARNING"):
+                self.assertTrue(w.start())
+                results = [usage_ledger.record_async("codex", "gpt", {"input_tokens": i}, path=db) for i in range(5)]
+                self.assertEqual(results, [True, True, True, False, False])
+                time.sleep(0.2)                                          # several failed starts
+                self.assertFalse(db.exists())
+                allow["ok"] = True
+                self.assertTrue(w.flush(10))
+            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage").fetchone()[0], 3)
+            self.assertEqual(w.lost, 2)
+            self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=db), "accepting rows again")
+            self.assertTrue(w.flush(5))
+
+    def test_record_async_never_waits_on_the_lifecycle_lock(self):
+        # Review r13 P2-2: the request path takes no lifecycle lock; with Writer.lock held elsewhere it still returns
+        w = self._fresh(maxsize=1, start=False)
+        done = []
+        with w.lock:
+            t = threading.Thread(target=lambda: done.append(
+                [usage_ledger.record_async("codex", "gpt", {}, path=Path("/nonexistent/u.db")) for _ in range(3)]))
+            t.start()
+            t.join(1.0)
+            self.assertFalse(t.is_alive(), "record_async blocked on the writer's lock")
+        self.assertEqual(done, [[True, False, False]])
+        w.q.get_nowait()
+        w.q.task_done()
+        w.fold_drops()
+
+    def test_shutdown_during_a_batch_write_commits_it_or_counts_it_lost_exactly_once(self):
+        # Review r13 P2-3: shutdown while the writer is inside a batch's write. Either the commit lands (lost 0) or
+        # shutdown revokes the batch, its commit rolls back and its result is ignored (lost 1, no row) - never both.
+        for release_first in (False, True):
+            with self.subTest(release_first=release_first), tempfile.TemporaryDirectory() as d:
+                db = Path(d) / "usage.db"
+                w = self._fresh()
+                entered, release = threading.Event(), threading.Event()
+                real = usage_ledger._write_rows
+
+                def slow(p, rows, deadline, guard=None):
+                    entered.set()
+                    release.wait(5)
+                    return real(p, rows, deadline, guard)
+                with mock.patch.object(usage_ledger, "_write_rows", slow):
+                    usage_ledger.record_async("codex", "gpt", {"input_tokens": 1}, path=db)
+                    self.assertTrue(entered.wait(5))
+                    if release_first:
+                        release.set()
+                        self.assertTrue(w.flush(5))
+                    n = w.shutdown(0.1)
+                    release.set()
+                    w.writer.join(5)
+                rows = sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage").fetchone()[0] if db.exists() else 0
+                self.assertEqual(rows + w.lost, 1, f"rows={rows} lost={w.lost}: exactly one disposition")
+                self.assertEqual(n, w.lost)
+                self.assertEqual(rows, 1 if release_first else 0)
+
+    def test_shutdown_of_a_failing_batch_counts_it_once(self):
+        # the reproduced lost=2: a batch that keeps failing (non-busy) while shutdown runs is counted once
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_WRITER_BACKOFF_S", 0.2):
+            bad = Path(d) / "usage.db"
+            bad.mkdir()
+            w = self._fresh()
+            with self.assertLogs("cortados.usage_ledger", "WARNING"):
+                usage_ledger.record_async("claude#b", "m", {}, path=bad)
+                time.sleep(0.1)                                          # inside its retries
+                w.shutdown(0.05)
+                w.writer.join(5)
+            self.assertEqual(w.lost, 1)
+
+    def test_shutdown_between_taking_a_row_and_claiming_it_counts_it_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "usage.db"
+            w = self._fresh()
+            taken, release = threading.Event(), threading.Event()
+
+            def pause():
+                taken.set()
+                release.wait(5)
+            w._after_take = pause
+            with self.assertLogs("cortados.usage_ledger", "WARNING"):
+                usage_ledger.record_async("codex", "gpt", {}, path=db)
+                self.assertTrue(taken.wait(5))
+                self.assertEqual(w.shutdown(0.1), 0, "not on the queue and not claimed: the writer counts it")
+                release.set()
+                w.writer.join(5)
+            self.assertEqual(w.lost, 1)
+            self.assertFalse(db.exists())
 
     def test_shutdown_counts_what_is_left_in_the_queue(self):
-        with mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=10)), \
-                mock.patch.object(usage_ledger, "_ensure_writer"):
-            for _ in range(4):
-                self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=Path("/nonexistent/usage.db")))
-            lost0 = self._lost()
-            with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
-                self.assertEqual(usage_ledger.shutdown(timeout=0.05), 4)
-            self.assertEqual(self._lost() - lost0, 4)
-            self.assertIn("exited with rows still queued", cm.output[0])
-            self.assertEqual(usage_ledger.stats()["queued"], 0)
+        w = self._fresh(maxsize=10, start=False)
+        for _ in range(4):
+            self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=Path("/nonexistent/usage.db")))
+        with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+            self.assertEqual(w.shutdown(timeout=0.05), 4)
+        self.assertEqual(w.lost, 4)
+        self.assertIn("exited with rows still queued", cm.output[0])
+        self.assertEqual(w.stats()["queued"], 0)
+        self.assertFalse(usage_ledger.record_async("codex", "gpt", {}), "a shut-down writer accepts nothing")
 
     def test_a_non_busy_failure_counts_the_batch_lost_after_its_tries(self):
+        self._fresh()
         with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_WRITER_BACKOFF_S", 0.01):
             bad = Path(d) / "usage.db"
             bad.mkdir()                                     # a directory where the db must go

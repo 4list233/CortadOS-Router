@@ -5,8 +5,11 @@ Schema is the one unitcost.learn reads, plus `lane` (the scarcity lane the turn 
 Claude accounts are two separate pools.
 
 A write never breaks or slows a turn. The request path only calls record_async, which puts the row on a bounded
-in-process queue and returns: a request thread never opens SQLite or takes a file lock. One background writer thread
-drains the queue in committed batches and retries while the db is locked or migrating, so the queue is the only buffer
+in-process queue and returns: a request thread never opens SQLite, takes a file lock or a lifecycle lock (a row it
+cannot queue goes on a lock-free drop list the supervisor counts and logs). The writer starts with the provider
+(start()), never from a request, and a supervisor thread restarts it whenever it is not running. It owns each row's
+single disposition (committed or counted lost); shutdown stops it and counts, exactly once, what it did not write.
+One background writer thread drains the queue in committed batches and retries while the db is locked or migrating, so the queue is the only buffer
 while a migration (lane column, ts index) holds the db. A row is lost only when the queue is full, when the db keeps
 failing with a non-busy error, or when the process exits with rows still queued; each loss is counted (`stats()`, shown
 in /v1/cortados/usage under `ledger.lost`) and logged, never silent. A usage row is accounting for unitcost, not quota
@@ -16,12 +19,14 @@ record() is the synchronous single-row writer (tests, fixtures, tools); it is ne
 from __future__ import annotations
 
 import atexit
+import contextlib
 import fcntl
 import logging
 import queue
 import sqlite3
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -60,14 +65,12 @@ _WRITER_BACKOFF_S, _WRITER_BACKOFF_MAX_S = 0.05, 5.0   # between retries of a bu
 # A non-busy error (unopenable path, corrupt file, full disk) is not a lock to wait out: the batch is retried this many
 # times and then counted lost, so one bad batch cannot stop the rows behind it forever.
 NON_BUSY_TRIES = 3
-# At exit the writer gets this long to commit what is queued (a clean stop should not lose the last turn's row); exit
-# must not hang on a locked db, so what is still queued then is counted lost and logged.
+# At exit the writer gets this long to finish (a clean stop should not lose the last turn's row); exit must not hang
+# on a locked db, so what is still unwritten then is counted lost and logged.
 SHUTDOWN_DRAIN_S = 2.0
-_queue: "queue.Queue[tuple[Path, tuple, str | None]]" = queue.Queue(maxsize=QUEUE_MAX)
-_state_lock = threading.Lock()
-_lost = 0
-_inflight = 0            # rows the writer has taken off the queue and not yet committed or counted lost
-_writer: threading.Thread | None = None
+# The supervisor's tick: how soon a dead (or never started) writer is restarted and request-path drops are logged.
+SUPERVISE_S = 1.0
+_GET_WAIT_S = 0.1        # the writer's wait for a row, so it sees the stop event promptly
 
 
 def db_path() -> Path:
@@ -261,8 +264,9 @@ def _write(p: Path, row: tuple, deadline: float) -> None:
     _write_rows(p, [row], deadline)
 
 
-def _write_rows(p: Path, rows: list[tuple], deadline: float) -> None:
-    """_write for a batch: every row in one committed transaction, or none."""
+def _write_rows(p: Path, rows: list[tuple], deadline: float, guard: Any = None) -> None:
+    """_write for a batch: every row in one committed transaction, or none. `guard()`, when given, is a context
+    manager entered around the commit (the async writer decides the batch's disposition there)."""
     left = deadline - time.monotonic()
     if left <= 0:
         raise sqlite3.OperationalError("usage ledger: write deadline (RETRY_S) passed")
@@ -273,7 +277,15 @@ def _write_rows(p: Path, rows: list[tuple], deadline: float) -> None:
         c.commit()
         background = _migrate(c, p, deadline)
         c.executemany(_INSERT, rows)
-        c.commit()
+        if guard is None:
+            c.commit()
+        else:
+            try:
+                with guard():
+                    c.commit()
+            except BaseException:
+                c.rollback()
+                raise
     finally:
         c.close()
     if background:                                  # after this row's commit, never before (Codex review r11)
@@ -341,147 +353,291 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
     return True
 
 
-def stats() -> dict[str, int]:
-    """The async writer's counters for /v1/cortados/usage: `queued` rows not yet committed (on the queue or in the
-    batch being written) and `lost` rows since this process started."""
-    with _state_lock:
-        return {"queued": _queue.qsize() + _inflight, "lost": _lost}
+class _Batch:
+    """One path's rows the writer has claimed. Its single disposition (committed, or counted lost) is decided under
+    Writer.lock: `done` once the writer committed or counted it, `revoked` once shutdown counted it lost instead."""
+    __slots__ = ("path", "items", "done", "revoked")
+
+    def __init__(self, path: Path, items: list):
+        self.path, self.items, self.done, self.revoked = path, items, False, False
 
 
-def _count_lost(n: int, why: str, contexts: list[tuple[str, str]]) -> None:
-    global _lost
-    with _state_lock:
-        _lost += n
-        total = _lost
-    for lane, context in contexts:
-        logger.error("usage ledger row LOST for %s on lane %s (%s); %d lost since start", context, lane, why, total)
-    if not contexts:
-        logger.warning("usage ledger: %d row(s) LOST (%s); %d lost since start", n, why, total)
+class _Revoked(Exception):
+    """Shutdown took the batch away before its commit: rolled back, already counted lost by shutdown."""
 
 
-def _ensure_writer() -> None:
-    """Start the writer thread if it is not running. A failed start is logged; the row stays queued and the next
-    record_async tries again."""
-    global _writer
-    with _state_lock:
-        if _writer is not None and _writer.is_alive():
-            return
-        t = threading.Thread(target=_writer_loop, name="cortados-usage-ledger-writer", daemon=True)
+class Writer:
+    """The async ledger writer: a bounded queue, one writer thread, and a supervisor thread that (re)starts it.
+
+    The request path (put) never takes `lock`: it does queue.put_nowait and, when the row cannot be queued, a
+    deque.append (atomic) that the supervisor folds into the lost counter and logs. `lock` is held only by the
+    writer, the supervisor, stats() and shutdown(), each for a few statements (and around a batch's commit)."""
+
+    def __init__(self, maxsize: int = QUEUE_MAX):
+        self.q: "queue.Queue[tuple[Path, tuple, str | None]]" = queue.Queue(maxsize=maxsize)
+        self.drops: "deque[tuple[str, str | None, str]]" = deque()
+        self.lock = threading.Lock()
+        self.lost = 0
+        self.claimed: list[_Batch] = []
+        self.closed = False
+        self.stop = threading.Event()
+        self.writer: threading.Thread | None = None
+        self.supervisor: threading.Thread | None = None
+        self._start_failures = 0
+
+    # -- request path ------------------------------------------------------------------------------------------
+    def put(self, item: tuple, lane: str, context: str | None) -> bool:
+        if self.closed:
+            self.drops.append((lane, context, "the ledger writer is shut down"))
+            return False
         try:
-            t.start()
-        except Exception as exc:
-            logger.warning("usage ledger: writer thread did not start (%s: %s); %d row(s) wait on the queue",
-                           type(exc).__name__, str(exc)[:120], _queue.qsize())
+            self.q.put_nowait(item)
+            return True
+        except queue.Full:
+            self.drops.append((lane, context, f"the ledger queue is full ({self.q.maxsize} rows waiting)"))
+            return False
+
+    # -- lifecycle ---------------------------------------------------------------------------------------------
+    def start(self) -> bool:
+        """Start the supervisor (it starts the writer). Called at provider startup; idempotent. False if it could
+        not start (logged; the next start() tries again)."""
+        with self.lock:
+            if self.closed or (self.supervisor is not None and self.supervisor.is_alive()):
+                return not self.closed
+            t = threading.Thread(target=self._supervise, name="cortados-usage-ledger-supervisor", daemon=True)
+            try:
+                t.start()
+            except Exception as exc:
+                err = exc
+            else:
+                self.supervisor = t
+                return True
+        logger.error("usage ledger: supervisor thread did not start (%s: %s); rows wait on the queue",
+                     type(err).__name__, str(err)[:120])
+        return False
+
+    def _start_writer_thread(self) -> threading.Thread:
+        t = threading.Thread(target=self._write_loop, name="cortados-usage-ledger-writer", daemon=True)
+        t.start()
+        return t
+
+    def _supervise(self) -> None:
+        while not self.stop.is_set():
+            self.fold_drops()
+            if self.writer is None or not self.writer.is_alive():
+                try:
+                    self.writer = self._start_writer_thread()
+                    if self._start_failures:
+                        logger.warning("usage ledger: writer thread started after %d failed start(s)",
+                                       self._start_failures)
+                    self._start_failures = 0
+                except Exception as exc:
+                    self._start_failures += 1
+                    if self._start_failures == 1 or self._start_failures % 60 == 0:
+                        logger.error("usage ledger: writer thread did not start (%s: %s); %d row(s) wait on the queue; "
+                                     "retried every %.0fs", type(exc).__name__, str(exc)[:120], self.q.qsize(),
+                                     SUPERVISE_S)
+            self.stop.wait(SUPERVISE_S)
+        self.fold_drops()
+
+    def fold_drops(self) -> None:
+        """Count and log the rows the request path could not queue (one line, plus an error per context row)."""
+        got = []
+        while True:
+            try:
+                got.append(self.drops.popleft())
+            except IndexError:
+                break
+        if got:
+            self._count_lost(len(got), got[0][2], [(lane, ctx) for lane, ctx, _ in got if ctx])
+
+    def _count_lost(self, n: int, why: str, contexts: list) -> None:
+        with self.lock:
+            self.lost += n
+            total = self.lost
+        for lane, context in contexts:
+            logger.error("usage ledger row LOST for %s on lane %s (%s); %d lost since start", context, lane, why, total)
+        if len(contexts) < n:
+            logger.warning("usage ledger: %d row(s) LOST (%s); %d lost since start", n, why, total)
+
+    # -- the writer --------------------------------------------------------------------------------------------
+    def _after_take(self) -> None:
+        """Test seam: between taking rows off the queue and claiming them."""
+
+    def _write_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                items = [self.q.get(timeout=_GET_WAIT_S)]
+            except queue.Empty:
+                continue
+            while len(items) < BATCH_MAX:
+                try:
+                    items.append(self.q.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                self._after_take()
+                self._handle(items)
+            except Exception:                       # a bug here must not kill the writer (the supervisor restarts
+                logger.exception("usage ledger writer: unexpected error")   # it anyway, but the rows are counted)
+                self._lose(items, "writer error")
+            finally:
+                for _ in items:
+                    self.q.task_done()
+
+    def _lose(self, items: list, why: str) -> None:
+        self._count_lost(len(items), why, [(it[1][7], it[2]) for it in items if it[2]])
+
+    def _handle(self, items: list) -> None:
+        by_path: dict[Path, list] = {}
+        for it in items:
+            by_path.setdefault(it[0], []).append(it)
+        with self.lock:
+            if self.closed:                         # shutdown already ran: these rows are this writer's to count
+                late = True
+            else:
+                late = False
+                batches = [_Batch(p, its) for p, its in by_path.items()]
+                self.claimed.extend(batches)
+        if late:
+            self._lose(items, "the process was shutting down before they were written")
             return
-        _writer = t
+        for b in batches:
+            why = None
+            try:
+                why = self._write_batch(b)
+            finally:
+                with self.lock:
+                    if b in self.claimed:
+                        self.claimed.remove(b)
+                    mine = not b.revoked and not b.done
+                    if mine:
+                        b.done = True
+            if why is not None and mine:            # revoked: shutdown counted it; done: committed
+                self._lose(b.items, why)
+
+    @contextlib.contextmanager
+    def _commit_guard(self, b: _Batch):
+        """Held around a batch's commit: the commit and its disposition happen together, so a shutdown either sees
+        the batch committed or revokes it before the commit (which then rolls back), never both."""
+        with self.lock:
+            if b.revoked:
+                raise _Revoked()
+            yield
+            b.done = True
+
+    def _write_batch(self, b: _Batch) -> str | None:
+        """Commit one path's rows, retrying while busy (locked, migrating) until stopped, and a non-busy error
+        NON_BUSY_TRIES times. None when committed (or revoked by shutdown); else why the rows are lost."""
+        rows = [it[1] for it in b.items]
+        wait, tries = _WRITER_BACKOFF_S, 0
+        while True:
+            try:
+                b.path.parent.mkdir(parents=True, exist_ok=True)
+                _write_rows(b.path, rows, time.monotonic() + RETRY_S, lambda: self._commit_guard(b))
+                _succeeded()
+                return None
+            except _Revoked:
+                return None
+            except Exception as exc:
+                if not _busy(exc):
+                    tries += 1
+                    if tries >= NON_BUSY_TRIES:
+                        _failed(exc, len(rows), [], "LOST")
+                        return f"{type(exc).__name__}: {str(exc)[:120]}"
+                elif wait == _WRITER_BACKOFF_S:     # the first busy retry of this batch: once, not per retry
+                    _failed(exc, len(rows), [], "queued, retried until the db is free")
+            if self.stop.wait(wait):
+                return "the process exited while the db was still busy"
+            wait = min(wait * 2, _WRITER_BACKOFF_MAX_S)
+
+    # -- views -------------------------------------------------------------------------------------------------
+    def stats(self) -> dict[str, int]:
+        self.fold_drops()
+        with self.lock:
+            inflight = sum(len(b.items) for b in self.claimed if not (b.done or b.revoked))
+            return {"queued": self.q.qsize() + inflight, "lost": self.lost}
+
+    def flush(self, timeout: float) -> bool:
+        until = time.monotonic() + timeout
+        while self.q.unfinished_tasks:
+            if time.monotonic() >= until:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def shutdown(self, timeout: float | None = None) -> int:
+        """Stop the writer, giving it `timeout` (SHUTDOWN_DRAIN_S) to finish what is queued; then count, exactly once,
+        what it did not write: any batch it still holds (revoked, so its later commit rolls back and its result is
+        ignored) and whatever is left on the queue. Returns the rows counted lost here."""
+        timeout = SHUTDOWN_DRAIN_S if timeout is None else timeout
+        until = time.monotonic() + timeout
+        self.flush(timeout)                         # the writer drains while it runs
+        self.stop.set()
+        w = self.writer
+        if w is not None and w.is_alive():
+            w.join(max(0.0, until - time.monotonic()))
+        n, contexts = 0, []
+        with self.lock:
+            self.closed = True
+            for b in self.claimed:
+                if not (b.done or b.revoked):
+                    b.revoked = True
+                    n += len(b.items)
+                    contexts += [(it[1][7], it[2]) for it in b.items if it[2]]
+            self.claimed = []
+        while True:
+            try:
+                it = self.q.get_nowait()
+            except queue.Empty:
+                break
+            self.q.task_done()
+            n += 1
+            if it[2]:
+                contexts.append((it[1][7], it[2]))
+        if n:
+            self._count_lost(n, "the process exited with rows still queued", contexts)
+        self.fold_drops()
+        return n
+
+
+_W = Writer()
+
+
+def start() -> bool:
+    """Start the async writer (provider startup). Idempotent."""
+    return _W.start()
+
+
+def stats() -> dict[str, int]:
+    """For /v1/cortados/usage: `queued` rows not yet committed and `lost` rows since this process started."""
+    return _W.stats()
+
+
+def flush(timeout: float) -> bool:
+    """Wait up to `timeout` for every queued row to be committed or counted lost. True when drained."""
+    return _W.flush(timeout)
+
+
+def shutdown(timeout: float | None = None) -> int:
+    return _W.shutdown(timeout)
 
 
 def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None,
                  path: Path | None = None) -> bool:
-    """Queue one turn for the writer thread and return at once; never touches SQLite or a lock, never raises. Returns
-    False when the row was not queued (queue full, or a bad row): it is then counted lost and logged."""
+    """Queue one turn for the writer and return at once: no SQLite, no lock beyond the queue's own, never raises.
+    False when the row could not be queued (full queue, shut down, bad input): it is counted lost and logged by the
+    supervisor."""
     try:
         item = (path or db_path(), _row(lane, model, usage, None), context)
-        _queue.put_nowait(item)
-    except queue.Full:
-        _count_lost(1, f"the ledger queue is full ({QUEUE_MAX} rows waiting)", [(lane, context)] if context else [])
-        return False
     except Exception as exc:
-        _count_lost(1, f"{type(exc).__name__}: {str(exc)[:120]}", [(lane, context)] if context else [])
+        _W.drops.append((lane, context, f"{type(exc).__name__}: {str(exc)[:120]}"))
         return False
-    _ensure_writer()
-    return True
+    return _W.put(item, lane, context)
 
 
-def _take_batch() -> list[tuple[Path, tuple, str | None]]:
-    global _inflight
-    batch = [_queue.get()]
-    while len(batch) < BATCH_MAX:
-        try:
-            batch.append(_queue.get_nowait())
-        except queue.Empty:
-            break
-    with _state_lock:
-        _inflight += len(batch)
-    return batch
+def _at_exit() -> None:
+    _W.shutdown()
 
 
-def _done(n: int) -> None:
-    global _inflight
-    with _state_lock:
-        _inflight -= n
-    for _ in range(n):
-        _queue.task_done()
-
-
-def _write_batch(p: Path, items: list[tuple[Path, tuple, str | None]]) -> None:
-    """Commit one path's rows, retrying while busy (locked, migrating) for as long as it takes, and a non-busy error
-    NON_BUSY_TRIES times before counting the rows lost."""
-    rows = [it[1] for it in items]
-    contexts = [(it[1][7], it[2]) for it in items if it[2]]
-    wait, tries = _WRITER_BACKOFF_S, 0
-    while True:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            _write_rows(p, rows, time.monotonic() + RETRY_S)
-            _succeeded()
-            return
-        except Exception as exc:
-            if not _busy(exc):
-                tries += 1
-                if tries >= NON_BUSY_TRIES:
-                    _failed(exc, len(rows), [], "LOST")
-                    _count_lost(len(rows), f"{type(exc).__name__}: {str(exc)[:120]}", contexts)
-                    return
-            elif wait == _WRITER_BACKOFF_S:         # the first busy retry of this batch: once, not per retry
-                _failed(exc, len(rows), [], "queued, retried until the db is free")
-        time.sleep(wait)
-        wait = min(wait * 2, _WRITER_BACKOFF_MAX_S)
-
-
-def _writer_loop() -> None:
-    while True:
-        batch = _take_batch()
-        try:
-            by_path: dict[Path, list] = {}
-            for it in batch:
-                by_path.setdefault(it[0], []).append(it)
-            for p, items in by_path.items():
-                _write_batch(p, items)
-        except Exception:                           # a bug here must not kill the writer and strand the queue
-            logger.exception("usage ledger writer: unexpected error; %d row(s) counted lost", len(batch))
-            _count_lost(len(batch), "writer error", [])
-        finally:
-            _done(len(batch))
-
-
-def flush(timeout: float) -> bool:
-    """Wait up to `timeout` for every queued row to be committed or counted lost. True when the queue is drained."""
-    until = time.monotonic() + timeout
-    while _queue.unfinished_tasks:
-        if time.monotonic() >= until:
-            return False
-        time.sleep(0.01)
-    return True
-
-
-def shutdown(timeout: float | None = None) -> int:
-    """At process exit: give the writer SHUTDOWN_DRAIN_S to commit, then take what is still queued off the queue and
-    count it lost (with the batch in flight), logged in one line. Returns the rows counted lost here."""
-    flush(SHUTDOWN_DRAIN_S if timeout is None else timeout)
-    left = 0
-    while True:
-        try:
-            _queue.get_nowait()
-        except queue.Empty:
-            break
-        _queue.task_done()
-        left += 1
-    with _state_lock:
-        left += _inflight
-    if left:
-        _count_lost(left, "the process exited with rows still queued", [])
-    return left
-
-
-atexit.register(shutdown)
+atexit.register(_at_exit)
