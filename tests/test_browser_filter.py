@@ -576,11 +576,15 @@ class FilterTests(unittest.TestCase):
     def _proc(self, pid, reaped):
         return self.FakeProc(pid, reaped=reaped)
 
-    def _record_signals(self, m, f, action=None):
+    def _record_signals(self, m, f, action=None, killpg_delay=0):
         sent = []
         orig = (m.os.kill, m.os.killpg, m.EXIT_GRACE_S)
+
+        def killpg(pid, sig):
+            time.sleep(killpg_delay)   # a slow signal: a reap not serialised with it lands inside
+            sent.append(("killpg", pid, sig, f.proc.reaped))
         m.os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
-        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig, f.proc.reaped))
+        m.os.killpg = killpg
         m.EXIT_GRACE_S = 0.1   # the fake never exits on a (recorded, unsent) signal
         try:
             (action or f.kill_tree)()
@@ -647,6 +651,43 @@ class FilterTests(unittest.TestCase):
         self.assertTrue(f.proc.reaped)
         self.assertEqual(sent, [("killpg", 400, signal.SIGKILL, False)])
 
+    def test_check_and_group_signal_are_one_locked_step(self):
+        # P2 round 6: the delay is inside killpg, not poll, so only a lock held across poll() AND killpg() keeps the
+        # reaper (at 0.1 s) out until the signal is sent; a lock around poll() alone would let it reap mid-signal.
+        m, f = self._bare_filter()
+        f.proc = self.FakeProc(400)
+        reaper = threading.Thread(target=lambda: (time.sleep(0.1), setattr(f.proc, "exited", True), f._server_poll()))
+
+        def closer():
+            reaper.start()
+            f._kill_server_group(signal.SIGKILL)
+            reaper.join()
+        sent = self._record_signals(m, f, action=closer, killpg_delay=0.3)
+        self.assertTrue(f.proc.reaped)
+        self.assertEqual(sent, [("killpg", 400, signal.SIGKILL, False)])
+
+    def test_identity_failure_reported_once_gone_pid_silent(self):
+        # P2 round 6: an identity lookup that fails for any reason but a gone pid is reported (once per process).
+        if sys.platform != "darwin":
+            self.skipTest("macOS-only (libproc)")
+        m, _ = self._bare_filter()
+        p = subprocess.Popen(["/bin/sleep", "0"])
+        p.wait()
+        orig = (m.LIBPROC, m._IDENTITY_REPORTED)
+        err = io.StringIO()
+        try:
+            m._IDENTITY_REPORTED = False
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(m.Filter._identity(p.pid))           # gone: silent
+                self.assertEqual(err.getvalue(), "")
+                m.LIBPROC = str(self.tmp / "no-such-libproc.dylib")
+                self.assertIsNone(m.Filter._identity(os.getpid()))     # library missing: reported ...
+                self.assertIsNone(m.Filter._identity(os.getpid()))     # ... once
+        finally:
+            m.LIBPROC, m._IDENTITY_REPORTED = orig
+        self.assertEqual(err.getvalue().count("kernel process identity unavailable"), 1, err.getvalue())
+        self.assertIn("not killed by command line", err.getvalue())
+
     def test_procargs2_parser_keeps_exact_boundaries(self):
         # P1 round 5: argv is read at the aligned start after the exec path, exactly argc entries, never into env.
         m, _ = self._bare_filter()
@@ -664,7 +705,8 @@ class FilterTests(unittest.TestCase):
         # The reviewer's case: empty argv[0], the flag only as a substring of an argument, the real flag in the env.
         trick = buf(["", f"--x=a--user-data-dir={T}/browser/tmp/p"], env=[f"--user-data-dir={T}/browser/tmp/p"])
         self.assertIsNone(m.parse_procargs2(trick))
-        self.assertIsNone(m.parse_procargs2(buf(["a", "", "b"])))                            # empty entry
+        self.assertEqual(m.parse_procargs2(buf(["a", "", "b"])), ["a", "", "b"])            # empty later entry kept
+        self.assertIsNone(m.parse_procargs2(buf(["", "b"])))                                 # empty argv[0]
         self.assertIsNone(m.parse_procargs2(buf(["a", "b"])[:-1]))                           # unterminated
         self.assertIsNone(m.parse_procargs2(buf(["a"], pad=b"\0\0X\0\0\0")))                  # non-NUL padding
         self.assertIsNone(m.parse_procargs2(b"\0\0\0\0" + buf(["a"])[4:]))                  # argc 0

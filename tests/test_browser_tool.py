@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -34,7 +35,10 @@ if open(os.path.join(os.path.dirname(sys.argv[1]), "mode")).read() == "notjson":
 for line in sys.stdin:
     m = json.loads(line)
     if m.get("id") is not None:
-        res = {"tools": [{"name": n} for n in names]} if m["method"] == "tools/list" else {}
+        mode = open(os.path.join(os.path.dirname(sys.argv[1]), "mode")).read()
+        # mode "schema:<json>": every tool carries that inputSchema value (to test malformed schemas).
+        extra = {"inputSchema": json.loads(mode[len("schema:"):])} if mode.startswith("schema:") else {}
+        res = ({"tools": [dict({"name": n}, **extra) for n in names]} if m["method"] == "tools/list" else {})
         print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": res}), flush=True)
 '''
 
@@ -211,6 +215,38 @@ class BrowserScriptsTests(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertIn("malformed MCP protocol output", r.stderr)
         self.assertIn("NOT JSON", r.stderr)
+
+    def test_tool_listing_fails_on_non_object_input_schema(self):
+        # A present inputSchema / properties that is not an object is reported as malformed output at once: no
+        # truthiness coercion, so falsy values ([], "", false, null) never pass as "no arguments". (A non-object used
+        # to kill the reader thread with an uncaught AttributeError: a 30 s wait blaming a missing answer.)
+        bad = ['"x"', "[]", '""', "false", "null", "0", "[1]",
+               '{"properties": []}', '{"properties": ""}', '{"properties": false}', '{"properties": null}',
+               '{"properties": "x"}']
+        for schema in bad:
+            with self.subTest(schema=schema):
+                self.stub(mode="schema:" + schema)
+                t0 = time.monotonic()
+                r = self.sh(INSTALL, "args")
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertEqual(r.stdout, "")
+                self.assertIn("malformed MCP protocol output", r.stderr)
+                self.assertIn("inputSchema of", r.stderr)
+                self.assertNotIn("within 30 s", r.stderr)
+                self.assertLess(time.monotonic() - t0, 25)
+
+    def test_args_listing_defaults_only_absent_fields(self):
+        # Absent inputSchema (the default stub) or absent / empty-object properties: no arguments, exit 0.
+        for schema in ['{}', '{"type": "object"}', '{"properties": {}}']:
+            with self.subTest(schema=schema):
+                self.stub(mode="schema:" + schema)
+                r = self.sh(INSTALL, "args")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(json.loads(r.stdout), {n: [] for n in TOOLS.split()})
+        self.stub(mode='schema:{"properties": {"url": {}, "a": {}}}')
+        r = self.sh(INSTALL, "args")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {n: ["a", "url"] for n in TOOLS.split()})
 
 
 if __name__ == "__main__":
