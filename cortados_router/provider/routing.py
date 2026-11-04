@@ -379,7 +379,8 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
         # Reserve the turn on the account that will execute it, atomically with its floor recheck (floor.reserve): a
         # concurrent request may have taken the last room since the filter above, so a refusal here is a quota refusal.
         route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
-        why = floor.reserve(core, {**chosen, "codex_home": codex_home}, model, min_left_pct, readings, conv=route_id)
+        bound = _bind_codex(chosen, codex_home)
+        why = floor.reserve(core, {**chosen, **bound}, model, min_left_pct, readings, conv=route_id)
         if why:
             return {"router": execution_routing.ROUTER, "quota_blocked": True,
                     "error": f"sub/{model}: {chosen['provider']}: {why}"}
@@ -400,7 +401,8 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
             "account": chosen["account"], "config_dir": chosen["config_dir"],
             "context_length": cap_of(chosen), "route_id": route_id, "api_request_id": "",
             "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route,
-            **({"min_left_pct": min_left_pct} if min_left_pct is not None else {})}
+            **({"min_left_pct": min_left_pct} if min_left_pct is not None else {}),
+            **({"codex_home": bound["codex_login"]} if min_left_pct is not None and bound else {})}
 
 
 def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *, client: str,
@@ -578,13 +580,16 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         lane = chosen.get("lane")
         if lane and _floor_exempt(lane):
             return r                               # a local node spends no subscription quota: the floor does not apply
-        why = floor.reserve(core, floor_candidate(r, codex_home), r.get("model") or "", min_left_pct,
+        bound = _bind_codex(floor_candidate(r), codex_home)
+        why = floor.reserve(core, {**floor_candidate(r, codex_home), **bound}, r.get("model") or "", min_left_pct,
                             conv=r.get("route_id")) \
             if lane else "routed account unknown; cannot check x-cortados-min-left-pct"
         if why:
             return {"router": execution_routing.ROUTER, "quota_blocked": True,
                     "error": f"routed to {r.get('provider')}/{r.get('model')} on {lane}: {why}"}
         r["min_left_pct"] = min_left_pct           # the session keeps it: every continuation is rechecked under it
+        if bound:
+            r["codex_home"] = bound["codex_login"]  # the backend starts on exactly the home that was checked
     return r
 
 
@@ -595,6 +600,16 @@ def _floor_exempt(lane: str) -> bool:
     return base == "local" or base.startswith(local_lane.LANE_PREFIX)
 
 
+def _bind_codex(cand: dict[str, Any], codex_home: str | None) -> dict[str, Any]:
+    """For a Codex candidate: {"codex_login": <canonical home>} resolved once, now, from the provider's --codex-home.
+    The floor checks that identity and the route carries it, so the backend starts on that very directory
+    (server.Registry.new) and every continuation is checked against it, never re-resolved. {} for other providers."""
+    if str(cand.get("provider") or "").split("#", 1)[0] != "codex-cli":
+        return {}
+    login = floor.executing_login({**cand, "codex_home": codex_home, "codex_login": None})
+    return {"codex_login": login} if login else {}
+
+
 def floor_candidate(route: dict[str, Any], codex_home: str | None = None) -> dict[str, Any]:
     """The executing account of a chosen route, in the shape floor.block reads (lane, provider, account, config_dir, and
     the provider's --codex-home for a Codex route)."""
@@ -602,7 +617,9 @@ def floor_candidate(route: dict[str, Any], codex_home: str | None = None) -> dic
     return {"lane": chosen.get("lane"), "provider": route.get("provider") or chosen.get("provider"),
             "account": route.get("account", chosen.get("account")),
             "config_dir": route["config_dir"] if "config_dir" in route else chosen.get("config_dir"),
-            "codex_home": codex_home}
+            "codex_home": codex_home,
+            # A conversation opened under a floor carries the canonical home its backend runs on: that is its identity.
+            **({"codex_login": route["codex_home"]} if route.get("codex_home") else {})}
 
 
 def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float, codex_home: str | None = None) -> str | None:

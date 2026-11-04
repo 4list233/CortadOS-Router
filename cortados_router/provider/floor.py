@@ -64,6 +64,11 @@ def executing_login(cand: dict[str, Any]) -> str | None:
     codex_isolation.child_env, which strips every key/token override, so the login is that home's auth.json."""
     from cortados_router import core
     if str(cand.get("provider") or "").split("#", 1)[0] == "codex-cli":
+        if cand.get("codex_login"):
+            # The canonical home this conversation's backend was (or will be) started on, bound at admission: never
+            # re-resolved, so a CODEX_HOME symlink moved after admission or between turns cannot change the identity
+            # checked from the one executing (Codex review fu1).
+            return cand["codex_login"]
         import os
         from cortados_router.provider.codex_isolation import child_env
         home = os.path.abspath(os.path.expanduser(cand.get("codex_home") or os.environ.get("CODEX_HOME") or "~/.codex"))
