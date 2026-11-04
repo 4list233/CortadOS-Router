@@ -91,8 +91,9 @@ cmd_plist() {
   [ -f "$REPO/cortados_router/bot_gateway.py" ] || die "$REPO is not a CortadOS checkout (no cortados_router/bot_gateway.py)"
   # Provider token for route_task. (a) preferred: provider.env assigns CORTADOS_PROVIDER_TOKEN, and the LaunchAgent's
   # launcher (launch.py) reads it as data at start, so the value is in neither the plist nor any command line. (b) otherwise: a 0600 file
-  # the owner creates, passed by path (CORTADOS_PROVIDER_TOKEN_FILE). Only the variable name is checked here.
-  if [ -f "$PROVIDER_ENV" ] && grep -Eq '^(export[[:space:]]+)?CORTADOS_PROVIDER_TOKEN=' "$PROVIDER_ENV"; then
+  # the owner creates, read by launch.py (--provider-token-file). Only the variable name is checked here, with the
+  # same line grammar launch.py accepts (leading spaces/tabs, optional export), so the two never pick differently.
+  if [ -f "$PROVIDER_ENV" ] && grep -Eq '^[[:blank:]]*(export[[:blank:]]+)?CORTADOS_PROVIDER_TOKEN=' "$PROVIDER_ENV"; then
     mode=env
   elif secret_ok "$PROVIDER_TOKEN_FILE"; then
     mode=file

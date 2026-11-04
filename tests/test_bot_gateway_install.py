@@ -109,7 +109,6 @@ class PlistTest(InstallerHarness):
         self.assertIn(f"--host {FAKE_IP} --port 8434", cmdline)
         self.assertIn(f"--token-file {self.token_path()}", cmdline)
         self.assertIn(f"--workspace-root {self.home / 'cortados-bot-workspace'}", cmdline)
-        self.assertIn("-m cortados_router.bot_gateway", cmdline)
 
     def test_design_a_runs_the_data_launcher(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=1\n")
@@ -120,7 +119,7 @@ class PlistTest(InstallerHarness):
         self.assertEqual(args[3:8], ["--provider-env", str(self.home / ".cortados" / "provider.env"),
                                      "--python", "/usr/bin/python3", "--"])
         self.assertNotIn("/bin/zsh", args)                    # provider.env is never executed as shell code
-        self.gateway_args(" ".join(args[8:]) + " -m cortados_router.bot_gateway")
+        self.gateway_args(" ".join(args[8:]))
 
     def run_plist_launcher(self, doc, extra_env=None):
         """Run the plist's real ProgramArguments with the gateway interpreter swapped for a fake that records its
@@ -164,7 +163,8 @@ class PlistTest(InstallerHarness):
         self.assertEqual(got["CORTADOS_PROVIDER_URL"], f"http://{FAKE_IP}:8432")
         self.assertEqual(got["HOME"], str(self.home))
         self.assertEqual(got["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
-        self.assertEqual(argv[1:4], ["-B", "-m", "cortados_router.bot_gateway"])
+        self.assertEqual(argv[1:5], ["-I", "-S", "-B", "-c"])
+        self.assertIn("runpy.run_module('cortados_router.bot_gateway'", argv[5])
         self.assertNotIn("--enable-start-task", argv)
         self.assertFalse(any(PROVIDER_SECRET in a for a in argv))
         self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
@@ -202,6 +202,30 @@ class PlistTest(InstallerHarness):
                 self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
                 self.assertNotIn(bad.strip(), p.stderr)          # the line number is named, never the content
 
+    def test_selector_accepts_leading_blanks_like_the_launcher(self):
+        """install.sh picks design (a) for every line form launch.py accepts, so an indented assignment never
+        silently selects the fallback file."""
+        self.assertEqual(self.run_sh("token").returncode, 0)
+        ptf = self.token_path().parent / "bot-gateway-provider-token"
+        ptf.write_text(PROVIDER_SECRET)
+        os.chmod(ptf, 0o600)                     # present, so a selector miss would quietly pick design (b)
+        for line in (f"  export CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}", f"\tCORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}",
+                     f" \texport\tCORTADOS_PROVIDER_TOKEN='{PROVIDER_SECRET}'"):
+            with self.subTest(repr(line[:12])):
+                self.provider_env(line + "\n")
+                r = self.run_sh("plist")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                args = plistlib.loads(self.plist().read_bytes())["ProgramArguments"]
+                self.assertEqual(args[3], "--provider-env")
+                self.assertEqual(self.launcher_parses(args[4]), PROVIDER_SECRET)
+
+    def launcher_parses(self, path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bot_gateway_launch_sel", SCRIPT.parent / "launch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.parse_env(Path(path).read_text())["CORTADOS_PROVIDER_TOKEN"]
+
     def design_b(self):
         self.provider_env("CORTADOS_PROVIDER_CLAUDE_BIN=claude\n")       # no token variable
         r = self.run_sh("token")
@@ -218,7 +242,7 @@ class PlistTest(InstallerHarness):
         self.assertEqual(args[:3], ["/usr/bin/python3", "-I", str(REPO / "integrations" / "bot-gateway" / "launch.py")])
         self.assertEqual(args[3:8], ["--provider-token-file", str(ptf), "--python", "/usr/bin/python3", "--"])
         self.assertNotIn("CORTADOS_PROVIDER_TOKEN_FILE", doc["EnvironmentVariables"])
-        self.gateway_args(" ".join(args[8:]) + " -m cortados_router.bot_gateway")
+        self.gateway_args(" ".join(args[8:]))
 
     def test_design_b_child_environment_not_contaminated(self):
         """Fallback mode goes through the same launcher: an inherited PYTHONPATH (with a sitecustomize.py), proxies
@@ -382,8 +406,9 @@ class LauncherTest(LauncherBase):
         self.assertEqual(rc, 0, err)
         (prog, argv, env), = self.calls
         self.assertEqual(prog, "/usr/bin/python3")
-        self.assertEqual(argv, ["/usr/bin/python3", "-B", "-m", "cortados_router.bot_gateway",
+        self.assertEqual(argv, ["/usr/bin/python3", "-I", "-S", "-B", "-c", self.launch.bootstrap(),
                                 "--host", FAKE_IP, "--port", "8434"])
+        self.assertIn(repr(str(REPO)), self.launch.bootstrap())
         self.assertFalse(any(PROVIDER_SECRET in a for a in argv))
         self.assertEqual(env, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CORTADOS_PROVIDER_TOKEN": PROVIDER_SECRET,
                                "HOME": self.tmp.name, "CORTADOS_HOME": self.tmp.name + "/.cortados",
@@ -557,3 +582,58 @@ class LauncherRound3Test(LauncherBase):
                 with self.assertRaises(SystemExit):
                     self.launch.main(argv, environ=self.environ, execve=lambda *a: self.calls.append(a))
         self.assertEqual(self.calls, [])
+
+
+class ChildIsolationTest(unittest.TestCase):
+    """Review r4: the gateway child itself runs isolated. The REAL /usr/bin/python3 runs the child, with marker
+    sitecustomize/usercustomize files in the throwaway HOME's user site and in PYTHONPATH; none may run, and argv must
+    still reach the gateway's argparse."""
+
+    PY = "/usr/bin/python3"
+
+    def setUp(self):
+        if not os.path.exists(self.PY):
+            self.skipTest("no /usr/bin/python3")
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.home = t / "home"
+        self.home.mkdir()
+        self.marker = t / "marker"
+        hook = f"open({str(self.marker)!r}, 'a').write(__name__ + chr(10))\n"
+        user_site = subprocess.run([self.PY, "-c", "import site; print(site.getusersitepackages())"],
+                                   env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, capture_output=True,
+                                   text=True, timeout=60).stdout.strip()
+        self.assertTrue(user_site.startswith(str(self.home)), user_site)
+        self.pypath = t / "pypath"
+        for d in (Path(user_site), self.pypath):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "sitecustomize.py").write_text(hook)
+            (d / "usercustomize.py").write_text(hook)
+        self.envfile = t / "provider.env"
+        self.envfile.write_text(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        os.chmod(self.envfile, 0o600)
+        self.env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", "CORTADOS_HOME": str(t / "state"),
+                    "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432", "PYTHONPATH": str(self.pypath)}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_markers_would_run_without_isolation(self):
+        """The setup is live: a plain python with this HOME and PYTHONPATH does import the hooks."""
+        subprocess.run([self.PY, "-c", "pass"], env=self.env, timeout=60, check=True)
+        self.assertTrue(self.marker.exists())
+
+    def test_gateway_child_loads_no_site_hooks_and_gets_its_argv(self):
+        # Loopback with a missing token file: the real gateway parses its flags, then refuses to start (exit 2)
+        # without binding anything; its message proves argparse saw --token-file.
+        missing = Path(self.tmp.name) / "no-such-token"
+        ws = Path(self.tmp.name) / "ws"
+        ws.mkdir()
+        p = subprocess.run([self.PY, "-I", str(SCRIPT.parent / "launch.py"), "--provider-env", str(self.envfile),
+                            "--python", self.PY, "--", "--host", "127.0.0.1", "--port", "1",
+                            "--token-file", str(missing), "--workspace-root", str(ws)],
+                           env=self.env, capture_output=True, text=True, timeout=60, cwd=str(REPO))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("bot-gateway: refusing to start: cannot open the token file", p.stderr)
+        self.assertFalse(self.marker.exists(), self.marker.read_text() if self.marker.exists() else "")
+        self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)

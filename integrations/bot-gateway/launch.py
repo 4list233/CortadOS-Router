@@ -1,7 +1,8 @@
 """Bot gateway launcher (the LaunchAgent's program; integrations/bot-gateway/install.sh writes the plist that runs it).
 
 Takes the provider token for route_task from ONE credential source, either ~/.cortados/provider.env (design a) or an
-owner-made 0600 token file (design b), WITHOUT executing anything, then execs the gateway with an explicit environment.
+owner-made 0600 token file (design b), WITHOUT executing anything, then execs the gateway with an explicit environment
+(python -I -S -B, through a fixed bootstrap that adds only this checkout to sys.path).
 Both designs go through here (review r3), so the gateway never inherits launchd's environment (PYTHONPATH, proxies, an
 ambient CORTADOS_PROVIDER_TOKEN that would override the file). Reason (review r2): sourcing provider.env as shell code lets anything in it
 (set -x, traps, command substitution, readonly or exported variables) print the token, pass it to another program or
@@ -40,6 +41,12 @@ MAX_BYTES = 64 * 1024            # provider.env is a few lines; a bigger file is
 # Phase-1 gateway flags, exact spellings: flag -> takes a value. Anything else (notably --enable-start-task or any
 # prefix of it, which the gateway's argparse would expand) is refused: phase 1 is route_task only (owner decision
 # 2026-11-03). --children-run-as-me is required by the gateway for a tailnet --host; with no start_task it starts no child.
+# The checkout this launcher lives in (integrations/bot-gateway/launch.py -> the repo root): the only sys.path entry the
+# gateway child gets besides the standard library.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# -I: isolated (no PYTHON* variables, no user site, no cwd on sys.path); -S: no site module at all (no sitecustomize);
+# -B: no .pyc writes into the checkout.
+CHILD_OPTS = ("-I", "-S", "-B")
 ALLOWED_FLAGS = {"--host": True, "--port": True, "--token-file": True, "--workspace-root": True,
                  "--children-run-as-me": False}
 
@@ -165,7 +172,16 @@ def build(argv, environ) -> tuple:
         env[k] = v
     if not env["CORTADOS_PROVIDER_URL"].startswith("http://"):
         raise ConfigError("CORTADOS_PROVIDER_URL is not an http:// URL")
-    return o.python, [o.python, "-B", "-m", "cortados_router.bot_gateway", *flags], env
+    return o.python, [o.python, *CHILD_OPTS, "-c", bootstrap(), *flags], env
+
+
+def bootstrap() -> str:
+    """The child's -c program: put this checkout first on sys.path, then run the gateway as __main__ (runpy keeps
+    sys.argv[1:], the flags, for its argparse). Reason (review r4): with -B alone Python still imports sitecustomize /
+    usercustomize from the user site under HOME, code that would see the token and could edit sys.argv; -I -S turn off
+    the user site, PYTHON* variables, the cwd entry and site itself, so the explicit path below is the only addition."""
+    return ("import sys; sys.path.insert(0, %r); import runpy; "
+            "runpy.run_module('cortados_router.bot_gateway', run_name='__main__', alter_sys=True)" % REPO)
 
 
 def main(argv=None, environ=None, execve=os.execve) -> int:

@@ -479,7 +479,8 @@ LaunchAgent already keeps its token in that file, so the gateway uses the same f
 secret to keep in step. Fallback, design (b): if provider.env does not assign the name, `plist` uses a 0600 file the
 owner creates himself, `~/.config/cortados/bot-gateway-provider-token`, holding the token alone. If neither exists,
 `plist` refuses to run. The installer only checks that a line assigns the variable *name* `CORTADOS_PROVIDER_TOKEN`
-(`grep -q`); it never reads the value.
+(`grep -q`, with the launcher's own line grammar: leading spaces or tabs and an optional `export`); it never reads
+the value.
 
 Both designs run the same stdlib launcher: `/usr/bin/python3 -I integrations/bot-gateway/launch.py
 (--provider-env F | --provider-token-file F) --python /usr/bin/python3 -- <gateway flags>`. It:
@@ -498,7 +499,10 @@ Both designs run the same stdlib launcher: `/usr/bin/python3 -I integrations/bot
 - passes gateway flags only if each is an exact phase-1 spelling (`--host`, `--port`, `--token-file`,
   `--workspace-root`, `--children-run-as-me`). So no abbreviation of `--enable-start-task` gets through, and the
   gateway's own argparse no longer expands abbreviations either (`allow_abbrev=False`);
-- `os.execve`s `python3 -B -m cortados_router.bot_gateway` with an explicit environment: exactly `HOME`, a fixed
+- `os.execve`s the gateway as `python3 -I -S -B -c <bootstrap>`. The fixed bootstrap puts only this checkout on
+  `sys.path` and runs `cortados_router.bot_gateway` with `runpy`. `-I -S` keep the child from loading any
+  `sitecustomize` / `usercustomize` from the user site under `HOME` or from `PYTHONPATH`, code that would see the
+  token and could edit the gateway's argv (review r4). The child gets an explicit environment: exactly `HOME`, a fixed
   `PATH`, `CORTADOS_HOME` and `CORTADOS_PROVIDER_URL` (all from the plist) plus the token. launchd's own environment
   (a `PYTHONPATH`, proxies, an ambient `CORTADOS_PROVIDER_TOKEN`) never reaches the gateway. The token is never on a
   command line and never printed.
