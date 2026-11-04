@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -580,10 +581,12 @@ def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: 
                          config_dir=config_dir, **kw)
 
 
-def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> CodexSession:
+def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None,
+                   codex_home: str | None = None, **kw) -> CodexSession:
     # Code mode must not yield to the model before the request's turn budget is spent (codex_isolation.EXEC_YIELD_KEY).
-    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, exec_yield_ms=int(TURN_TIMEOUT_S * 1000),
-                        **kw)   # Codex multi-account is Phase B
+    # `codex_home`: the canonical home a floor-checked route was admitted on (routing._bind_codex); else the provider's.
+    return CodexSession(codex_bin=reg.codex_bin, codex_home=codex_home or reg.codex_home,
+                        exec_yield_ms=int(TURN_TIMEOUT_S * 1000), **kw)   # Codex multi-account is Phase B
 
 
 # Backend per route provider. Each factory takes the registry (for its binary and gateway settings, read at call time
@@ -665,7 +668,17 @@ class Registry:
                 raise UnservedProvider(f"routed to account {route['account']!r} on {route['provider']!r}, "
                                        f"which has no resolvable login (config_dir missing)")
             kw["account"], kw["config_dir"] = route["account"], cfg
+        codex_login = None
+        if factory is self._factories.get("codex-cli"):
+            # Every Codex session, floor or not, is started on ONE canonical home frozen here (the floor-checked home
+            # when the route carries it, routing._bind_codex; else the provider's), and remembers it: a CODEX_HOME
+            # symlink moved later cannot change which login a running backend uses, and a floor sent on a later
+            # continuation is checked against this identity, never a re-resolved one (Codex review fu2).
+            home = (route or {}).get("codex_home") or self.codex_home or getenv("CODEX_HOME") or "~/.codex"
+            codex_login = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
+            kw["codex_home"] = codex_login
         s = factory(self, **kw)
+        s.codex_login = codex_login
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
@@ -1480,7 +1493,10 @@ class Handler(BaseHTTPRequestHandler):
             eff = max(v for v in (kept, floor) if v is not None) if (kept is not None or floor is not None) else None
             if eff is not None:
                 session.min_left_pct = eff
-                why = (reg.floor_turn(getattr(session, "route", None), eff) if reg.floor_turn is not None else
+                route_now = getattr(session, "route", None)
+                if route_now and getattr(session, "codex_login", None):
+                    route_now = {**route_now, "codex_home": session.codex_login}   # the running backend's frozen home
+                why = (reg.floor_turn(route_now, eff) if reg.floor_turn is not None else
                        "this endpoint cannot check x-cortados-min-left-pct on a continuation")
                 if why:
                     return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
@@ -1794,7 +1810,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
 
         def router(body, client, exclude_model=None, min_left_pct=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct)
+                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct,
+                                  codex_home=codex_home)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])
@@ -1806,7 +1823,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
                         codex_home=codex_home, model=fixed_model, router=router, executed=executed,
                         log_outcome=log_turn_outcome)
     if not fixed_model:
-        registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor)
+        registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

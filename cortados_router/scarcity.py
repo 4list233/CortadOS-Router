@@ -367,6 +367,28 @@ def claude_login_identity(env: dict[str, str]) -> str | None:
     return os.path.realpath(os.path.join(home, ".claude"))
 
 
+# Env that makes a Codex CLI authenticate with something other than the stored login of its CODEX_HOME (an API key, an
+# access token, another endpoint): with any set, the env cannot be pinned to one stored login. The provider's Codex
+# backend strips exactly these (codex_isolation.STRIPPED_ENV), so its login is always the home's auth.json.
+_CODEX_LOGIN_OVERRIDES = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_BASE_URL")
+
+
+def codex_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Codex CLI started with `env` runs on: its resolved CODEX_HOME (else $HOME/.codex), whose auth.json
+    holds the login. None when the env cannot be pinned to one stored login (an override above, or a relative path).
+    Two homes holding the same ChatGPT account are two identities here: conservative, never wrongly equal."""
+    if any(env.get(k) for k in _CODEX_LOGIN_OVERRIDES):
+        return None
+    ch = env.get("CODEX_HOME")
+    if ch:
+        d = os.path.expanduser(ch)
+        return os.path.realpath(d) if os.path.isabs(d) else None
+    home = env.get("HOME") or os.path.expanduser("~")
+    if not os.path.isabs(home):
+        return None
+    return os.path.realpath(os.path.join(home, ".codex"))
+
+
 def _ensure_trust(config_dir: str) -> None:
     """A fresh per-account CLAUDE_CONFIG_DIR has not accepted the workspace-trust dialog, which blocks the /usage TUI on
     the folder the probe runs in. Pre-accept it for the home folder so the probe reaches the usage screen."""
@@ -619,6 +641,11 @@ MAX_DISCOVERY_NOTES = 10        # a short list: enough to name the broken manife
 
 def _codex() -> dict[str, Any]:
     env = _cli_env()
+    # Resolve and freeze the login BEFORE the sampler starts, and run the sampler on exactly that directory: a CODEX_HOME
+    # symlink that moves A -> B mid-probe must not stamp A's usage as B's (Codex review fu1). Metadata only.
+    login = codex_login_identity(env)
+    if login:
+        env = {**env, "CODEX_HOME": login}
     searched: list[str] = []
     notes: list[str] = []
     binary, missing_bin = _codex_binary(env, searched=searched, notes=notes)
@@ -628,7 +655,7 @@ def _codex() -> dict[str, Any]:
         raise CodexNotFound(searched)
     notes = [n[:200] for n in notes[:MAX_DISCOVERY_NOTES]]
     try:
-        return _codex_probe(env, binary, missing_bin, notes)
+        return _codex_probe(env, binary, missing_bin, notes, login=login)
     except Exception as exc:
         # Discovery succeeded but the probe did not: keep which binary ran and what discovery tripped over, so a
         # fallback past a malformed manifest is visible next to the boot or parser failure it may explain.
@@ -639,7 +666,8 @@ def _codex() -> dict[str, Any]:
         raise
 
 
-def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str]) -> dict[str, Any]:
+def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str],
+                 login: str | None = None) -> dict[str, Any]:
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -661,7 +689,10 @@ def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, note
         # without persisting boot screens, credentials or prompt contents.
         raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
     wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
+    # `login`: the canonical CODEX_HOME this sampler's CLI was started on, frozen by _codex before the launch (metadata
+    # only), so a reading can be proven to belong to the login a consumer executes on (provider/floor.py).
     return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
+            "login": login,
             "binary": binary, "discovery_notes": notes,
             **({"configured_binary_missing": missing_bin} if missing_bin else {})}
 

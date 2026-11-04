@@ -15,9 +15,9 @@ The per-call reveal ("· N% left", never sent for the codex lane) and a spent re
 open a hold that only a /resources reading sampled AFTER it, showing the lane above the floor, clears; a hold never
 ages into an admit. The door is advisory and reserves nothing: the provider is the single enforcer. Every call carries
 x-cortados-min-left-pct (MIN_LEFT_PCT); the provider checks and reserves the account that EXECUTES each turn, opening and
-continuation alike, and refuses (429) below the floor (cortados_router/provider/floor.py). Provider mode is Claude-only
-for now: Codex readings carry no login identity, so the provider holds Codex under a floor and this door holds the codex
-lane up front (generation, which runs on Codex, is idle in provider mode until Codex readings name their login).
+continuation alike, and refuses (429) below the floor (cortados_router/provider/floor.py). Codex takes part: its
+readings carry the CODEX_HOME login they were sampled from, and the provider admits a Codex turn only when that equals
+the login its Codex backend executes on (a reading from another home, or one sampled before the stamp, is refused).
 """
 from __future__ import annotations
 
@@ -209,11 +209,6 @@ def admit(lane: str, model: str | None = None, now: float | None = None, urlopen
     """The quota door on the provider backend: an advisory pre-check plus the durable holds from reveals and refusals
     (see the module docstring). Reserves nothing: the provider reserves on the account it executes on. Fails closed."""
     now = time.time() if now is None else now
-    if lane == "codex":
-        # The provider holds every Codex account under the floor this loop sends (floor.py: Codex readings carry no
-        # login identity, so a healthy reading cannot be proven to be the executing login's). Held up front, so
-        # generation and Codex bands do not spend a 429 per cycle; provider mode is Claude-only until they do.
-        return False, "codex: held, codex readings not bound to a login (provider mode is Claude-only for now)"
     snap, err = resources(now, urlopen)
     if snap is None:
         why = f"{lane}: held, {err}"
