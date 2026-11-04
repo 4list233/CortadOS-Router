@@ -13,6 +13,7 @@ from pathlib import Path
 
 from cortados_router import scarcity
 from cortados_router import hardware
+from cortados_router import usage_ledger
 from cortados_router.provider import usage
 from tests import test_hardware
 from cortados_router.provider.server import ProviderServer, Registry
@@ -58,7 +59,18 @@ def fixture_home() -> Path:
     c.commit(); c.close()
     (d / "child-tasks.jsonl").write_text("\n".join(json.dumps(r) for r in [
         {"ts": NOW - 100, "event": "started", "task_id": "t1"}, {"ts": NOW - 50, "event": "finished", "status": "succeeded", "task_id": "t1"},
-        {"ts": NOW - 40, "event": "started", "task_id": "t2"}]) + "\nnot json\n")
+        {"ts": NOW - 40, "event": "started", "task_id": "t2", "client": "grokbot"}]) + "\nnot json\n")
+    # usage.db written BY usage_ledger.record (the provider's writer), so the fixture cannot drift from its schema
+    usage_ledger.record("claude#b", "sonnet", {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100},
+                        ts=NOW - 10, path=d / "usage.db")
+    usage_ledger.record("claude#b", "sonnet", {"input_tokens": 1, "output_tokens": 2}, ts=NOW - 20, path=d / "usage.db")
+    usage_ledger.record("codex", "gpt", {"input_tokens": 7}, ts=NOW - 3 * 86400, path=d / "usage.db")
+    usage_ledger.record("codex", "gpt", {"input_tokens": 9}, ts=NOW - 30 * 86400, path=d / "usage.db")
+    (d / "bot-usage.jsonl").write_text("\n".join(json.dumps(r) for r in [   # bot_gateway.record's line shape
+        {"ts": NOW - 30, "client": "grokbot", "tool": "route_task", "task_id": None, "outcome": "ok"},
+        {"ts": NOW - 20, "client": "grokbot", "tool": "start_task", "task_id": "t2", "outcome": "ok"},
+        {"ts": NOW - 10, "client": "grokbot", "tool": "route_task", "task_id": None, "outcome": "refused", "reason": "cap"},
+        {"ts": NOW - 30 * 86400, "client": "grokbot", "tool": "route_task", "task_id": None, "outcome": "ok"}]) + "\n")
     (d / "hardware").mkdir()
     (d / "hardware" / "studio.json").write_text(json.dumps({**HW_SAMPLE, "ssh_target": "forest@100.64.0.9"}))
     return d
@@ -112,6 +124,13 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(out["refusals"], {"window": "24h", "by_reason": {"bad pin": 2}, "total": 2})
         self.assertEqual(out["child_tasks"]["by_event"], {"finished": 1, "started": 1})
         self.assertEqual(out["child_tasks"]["by_status"], {"succeeded": 1})
+        self.assertEqual(out["child_tasks"]["by_client"], {"direct": 1, "grokbot": 1})
+        self.assertEqual(out["ledger"]["today"], [{"lane": "claude#b", "model": "sonnet", "turns": 2, "input_tokens": 11,
+                                                   "output_tokens": 7, "cache_read_tokens": 100, "cache_write_tokens": 0}])
+        self.assertEqual([(r["lane"], r["turns"]) for r in out["ledger"]["last_7d"]], [("claude#b", 2), ("codex", 1)])
+        self.assertEqual(out["bots"], {"window": "7d", "calls": 3, "by_client": {"grokbot": 3},
+                                       "by_tool": {"route_task": 2, "start_task": 1}, "by_outcome": {"ok": 2, "refused": 1},
+                                       "unparsable_lines": 0, "truncated": False})
         self.assertFalse(out["child_tasks"]["truncated"])
         self.assertEqual(out["child_tasks"]["unparsable_lines"], 1)
         self.assertTrue(out["s1"]["available"])
@@ -132,7 +151,7 @@ class CollectTest(unittest.TestCase):
         out = self.collect(empty, scarcity_reader=boom,
                            s1_probe=lambda url: {"available": False, "reason": "no S1 URL configured"})
         srcs = {e["source"] for e in out["errors"]}
-        self.assertEqual(srcs, {"scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware"})
+        self.assertEqual(srcs, {"scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware", "usage.db", "bot-usage.jsonl"})
         self.assertEqual(out["hardware"], [])
         self.assertEqual(out["lanes"], [])
         self.assertIn({"source": "scarcity", "error": "OSError"}, out["errors"])   # type only, no message text
@@ -254,6 +273,33 @@ class CollectTest(unittest.TestCase):
         usage._S1_CACHE["http://127.0.0.1:9"] = (time.monotonic(), {"available": True, "status": 200})
         self.assertTrue(usage._s1("http://127.0.0.1:9")["available"])   # served from the memo, no second probe
         usage._S1_CACHE.clear()
+
+    def test_ledger_rows_without_lane_fall_back_to_runtime(self):
+        home = fixture_home()
+        (home / "usage.db").unlink()
+        c = sqlite3.connect(home / "usage.db")      # the Hermes plugin's schema: no lane column
+        c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+                  "cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
+        c.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?)", (NOW - 5, "claude", "opus", 3, 4, 0, 0))
+        c.commit(); c.close()
+        out = self.collect(home)
+        self.assertEqual(out["ledger"]["today"][0]["lane"], "claude")
+        self.assertEqual(out["ledger"]["today"][0]["turns"], 1)
+
+    def test_bots_read_rotated_log_and_count_bad_lines(self):
+        home = fixture_home()
+        (home / "bot-usage.jsonl.1").write_text(json.dumps(
+            {"ts": NOW - 86400, "client": "grokbot", "tool": "route_task", "outcome": "ok"}) + "\n[1]\nnope\n")
+        out = self.collect(home)
+        self.assertEqual(out["bots"]["calls"], 4)
+        self.assertEqual(out["bots"]["unparsable_lines"], 1)   # "[1]" is JSON but not a record: skipped, not counted bad
+
+    def test_bots_absent_reported(self):
+        home = fixture_home()
+        (home / "bot-usage.jsonl").unlink()
+        out = self.collect(home)
+        self.assertEqual(out["bots"], {})
+        self.assertIn({"source": "bot-usage.jsonl", "error": "absent"}, out["errors"])
 
     def test_s1_without_url(self):
         self.assertEqual(usage._s1(None)["available"], False)

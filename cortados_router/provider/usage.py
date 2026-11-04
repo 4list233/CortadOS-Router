@@ -83,7 +83,7 @@ _IPV6_RE = re.compile(r"::|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){3,}")
 
 def _has_address(x: str) -> bool:
     return bool(_IPV4_RE.search(x) or _IPV6_RE.search(x))
-_SOURCES = ("scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware", "usage")
+_SOURCES = ("scarcity", "router.db", "child-tasks.jsonl", "s1", "hardware", "usage.db", "bot-usage.jsonl", "usage")
 _NOTE_RUNS = ("routed.provider_since_start comes from the provider's in-memory run records: since process "
               "start, bounded LRU, no timestamps")
 _NOTE_REFUSALS = ("refusals are the provider's in-memory records (authenticated requests naming a run id); "
@@ -201,7 +201,8 @@ def _routed(db_path: Path, now: float) -> dict[str, Any]:
         c.close()
 
 
-def _child_tasks(path: Path, now: float) -> dict[str, Any]:
+def _tail_lines(path: Path) -> tuple[list[str], bool]:
+    """The last CHILD_TAIL lines within the last CHILD_TAIL_BYTES of an append-only JSONL log, and whether it was cut."""
     with path.open("rb") as f:
         f.seek(0, 2)
         size = f.tell()
@@ -214,7 +215,66 @@ def _child_tasks(path: Path, now: float) -> dict[str, Any]:
     if len(lines) > CHILD_TAIL:
         truncated = True
         lines = lines[-CHILD_TAIL:]
+    return lines, truncated
+
+
+def _ledger(db_path: Path, now: float) -> dict[str, Any]:
+    """usage.db (usage_ledger.record, one row per completed backend turn): turns and tokens per lane x model. Rows the
+    Hermes plugin wrote before `lane` existed fall back to their runtime, so old history still shows under its vendor."""
+    c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(usage)")}
+        lane = "COALESCE(lane, runtime, '(none)')" if "lane" in cols else "COALESCE(runtime, '(none)')"
+        day0 = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))   # local midnight, as _routed
+        def by(since: float) -> list[dict[str, Any]]:
+            rows = c.execute(f"SELECT {lane}, COALESCE(model, '(none)'), COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                             "SUM(cache_read_tokens), SUM(cache_write_tokens) FROM usage WHERE ts >= ? "
+                             "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT ?", (since, ROUTED_TOP)).fetchall()
+            return [{"lane": l, "model": m, "turns": n, "input_tokens": i, "output_tokens": o, "cache_read_tokens": cr,
+                     "cache_write_tokens": cw} for l, m, n, i, o, cr, cw in rows]
+        today, week = by(day0), by(now - 7 * 86400)
+        res = {"source": "usage.db", "today": today, "last_7d": week}
+        if len(today) >= ROUTED_TOP:
+            res["today_truncated"] = True
+        if len(week) >= ROUTED_TOP:
+            res["last_7d_truncated"] = True
+        return res
+    finally:
+        c.close()
+
+
+def _bots(path: Path, now: float) -> dict[str, Any]:
+    """bot-usage.jsonl (bot_gateway.record: one line per bot tool call, {"ts", "client", "tool", "task_id", "outcome"}):
+    7-day call counts per client, tool and outcome, so Grok Bots' share is visible. The gateway rotates the log to
+    bot-usage.jsonl.1 at 5 MB; the rotated tail is read too, else a fresh rotation would hide most of the week."""
+    by_client: Counter = Counter()
+    by_tool: Counter = Counter()
+    by_outcome: Counter = Counter()
+    bad, truncated = 0, False
+    for p in (path.with_name(path.name + ".1"), path):
+        if not p.exists():
+            continue
+        lines, cut = _tail_lines(p)
+        truncated = truncated or cut
+        for ln in lines:
+            try:
+                rec = json.loads(ln)
+                recent = isinstance(rec, dict) and float(rec.get("ts") or 0) >= now - 7 * 86400
+            except (ValueError, TypeError):
+                bad += 1
+                continue
+            if recent:
+                by_client[str(rec.get("client"))] += 1
+                by_tool[str(rec.get("tool"))] += 1
+                by_outcome[str(rec.get("outcome"))] += 1
+    return {"window": "7d", "calls": sum(by_client.values()), "by_client": dict(by_client), "by_tool": dict(by_tool),
+            "by_outcome": dict(by_outcome), "unparsable_lines": bad, "truncated": truncated}
+
+
+def _child_tasks(path: Path, now: float) -> dict[str, Any]:
+    lines, truncated = _tail_lines(path)
     last: dict[str, str] = {}
+    client: dict[str, str] = {}
     status: dict[str, str] = {}
     bad = 0
     for ln in lines:
@@ -227,10 +287,14 @@ def _child_tasks(path: Path, now: float) -> dict[str, Any]:
         if recent:
             tid = str(rec["task_id"])
             last[tid] = str(rec.get("event"))          # child_tasks.log_event writes {"ts", "event", **fields}
+            if rec.get("client"):                      # bot_gateway's tasks carry client (e.g. grokbot); others do not
+                client[tid] = str(rec["client"])
             if rec.get("event") == "finished" and rec.get("status") is not None:
                 status[tid] = str(rec["status"])
     # truncated: the 7-day window may be clipped (only the log's tail is read), so counts can under-report
+    # by_client: tasks per client; a task no event attributes was started directly (Claude app / Claude Code)
     return {"window": "7d", "by_event": dict(Counter(last.values())), "by_status": dict(Counter(status.values())),
+            "by_client": dict(Counter(client.get(t, "direct") for t in last)),
             "unparsable_lines": bad, "truncated": truncated}
 
 
@@ -457,6 +521,8 @@ _HW_CARD = _Obj({**{k: _Hw(_text if k in ("host", "os", "chip") else _number) fo
                                             HW_MODELS_MAX, "models_truncated")),
                  "errors": _List(_Obj({"field": _hw_field, "error": _kind}), HW_ERRORS_MAX, "errors_truncated")})
 _ROUTE = _Obj({"lane": _label, "model": _text, "calls": _number})
+_LEDGER_ROW = _Obj({"lane": _label, "model": _text, "turns": _number, "input_tokens": _number, "output_tokens": _number,
+                    "cache_read_tokens": _number, "cache_write_tokens": _number})
 _COUNTS = lambda cut: _Map(_text, _number, MAP_MAX, cut, merge=_add)   # noqa: E731
 _VIEW = _Obj({
     "generated_at": _number,
@@ -469,8 +535,15 @@ _VIEW = _Obj({
     "refusals": _Obj({"window": _enum("24h"), "by_reason": _Map(_reason, _number, MAP_MAX, "refusals_truncated", merge=_add),
                       "total": _number}),
     "child_tasks": _Obj({"window": _enum("7d"), "by_event": _COUNTS("by_event_truncated"),
-                         "by_status": _COUNTS("by_status_truncated"), "unparsable_lines": _number,
+                         "by_status": _COUNTS("by_status_truncated"), "by_client": _COUNTS("by_client_truncated"),
+                         "unparsable_lines": _number,
                          "truncated": _bool}),
+    "ledger": _Obj({"source": _enum("usage.db"), "today": _List(_LEDGER_ROW, ROUTED_TOP, "today_truncated"),
+                    "last_7d": _List(_LEDGER_ROW, ROUTED_TOP, "last_7d_truncated"),
+                    "today_truncated": _bool, "last_7d_truncated": _bool}),
+    "bots": _Obj({"window": _enum("7d"), "calls": _number, "by_client": _COUNTS("bots_by_client_truncated"),
+                  "by_tool": _COUNTS("by_tool_truncated"), "by_outcome": _COUNTS("by_outcome_truncated"),
+                  "unparsable_lines": _number, "truncated": _bool}),
     "s1": _Obj({"available": _bool, "status": _number, "latency_ms": _number, "reason": _label}),
     "hardware": _List(_Obj({"file": _file, "age_s": _number, "data": _HW_CARD}, source=("hardware", "file")),
                       HW_MAX_FILES, "too_many_files"),
@@ -479,6 +552,7 @@ _VIEW = _Obj({
 _ERROR = _Obj({"source": _source, "error": _label})
 # the section a top-level cut is reported under (a lane or hardware card names itself through its _Obj source)
 _SECTION_SOURCE = {"lanes": "scarcity", "routed": "router.db", "child_tasks": "child-tasks.jsonl", "s1": "s1",
+                   "ledger": "usage.db", "bots": "bot-usage.jsonl",
                    "hardware": "hardware"}
 
 
@@ -654,6 +728,18 @@ def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], 
     else:
         errors.append({"source": "child-tasks.jsonl", "error": "absent"})
         out["child_tasks"] = {}
+    udb = state_dir / "usage.db"
+    if udb.exists():
+        out["ledger"] = guard("usage.db", lambda: _ledger(udb, now), {})
+    else:
+        errors.append({"source": "usage.db", "error": "absent"})
+        out["ledger"] = {}
+    bpath = state_dir / "bot-usage.jsonl"
+    if bpath.exists() or bpath.with_name(bpath.name + ".1").exists():
+        out["bots"] = guard("bot-usage.jsonl", lambda: _bots(bpath, now), {})
+    else:
+        errors.append({"source": "bot-usage.jsonl", "error": "absent"})   # the bot gateway has never run here
+        out["bots"] = {}
     out["s1"] = guard("s1", lambda: s1_probe(s1_url), {"available": False, "reason": "probe failed"})
     if not isinstance(out["s1"], dict) or not out["s1"].get("available"):
         errors.append({"source": "s1", "error": str(out["s1"].get("reason") if isinstance(out["s1"], dict) else None)})
