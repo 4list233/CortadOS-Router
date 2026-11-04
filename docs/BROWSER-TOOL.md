@@ -149,12 +149,18 @@ the installed server's list differs, so a version bump is a reviewed diff, never
      kernel argv (`KERN_PROCARGS2`) has a whole `--user-data-dir=<path>` entry whose realpath is inside
      `<task>/browser/tmp` (TMPDIR, so `--isolated` puts the profile there). That still finds a browser reparented
      after the server exited on its own, and never a shell or other program that merely mentions the task dir; where
-     the kernel identity is unavailable (not macOS, call failed) nothing is killed by command line.
+     the kernel identity is unavailable (not macOS, call failed) nothing is killed by command line. The argv buffer is
+     parsed exactly (argv[0] at the 8-byte-aligned offset after the exec path, then exactly argc NUL-terminated
+     entries, never the environment that follows); an unterminated or empty entry, non-NUL padding or an out-of-range
+     argc makes the process "not ours".
      Recorded pids carry their `ps` start time (`lstart`), re-checked right before every signal, so a pid recycled by
      an unrelated process is skipped. The descendant walk starts only from the server pid with the start time recorded
      at spawn, so a recycled server pid's children are never adopted; the server's group is signalled only while the
-     server is still an unreaped child, never after (its former members are signalled one by one, each verified). A
-     failing `ps` (error or nonzero exit) is reported on stderr with its message.
+     server is still an unreaped child, never after (its former members are signalled one by one, each verified). One
+     lock owns the server process: every poll/wait goes through it and the "unreaped? then signal the group" step runs
+     under it, so no other thread can reap the server in between. A failing `ps` (error or nonzero exit, in the
+     process listing and in each start-time check) is reported on stderr with its message, and means nothing is
+     signalled for that pid.
      SIGTERM/SIGHUP handlers only write a byte to a self-pipe; a coordinator thread runs the close, so a signal
      landing while the main thread holds the filter's state lock cannot deadlock;
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a

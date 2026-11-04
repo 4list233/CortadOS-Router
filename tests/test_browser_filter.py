@@ -2,6 +2,7 @@
 stub MCP server (stdlib python over pipes) that records every message it receives, so each test checks both what the
 client sees and that refused requests never reached the server. No node, npm or browser."""
 import contextlib
+import signal
 import io
 import json
 import os
@@ -472,6 +473,7 @@ class FilterTests(unittest.TestCase):
         f = mcp_filter.Filter.__new__(mcp_filter.Filter)
         f.browsers_root = os.path.realpath(self.browsers) if browsers_path else None
         f.task_tmp = os.path.realpath(self.task / "browser" / "tmp")
+        f.proc_lock = threading.Lock()
         return mcp_filter, f
 
     def test_server_exit_spares_non_browser_with_task_profile_flag(self):
@@ -551,23 +553,39 @@ class FilterTests(unittest.TestCase):
             p.wait()
         self.assertIsNone(m.Filter._identity(p.pid))   # gone: unknown, never guessed
 
-    def _proc(self, pid, reaped):
-        class Proc:
-            def poll(self): return 0 if reaped else None
-            def wait(self, timeout=None): return 0
-        pr = Proc()
-        pr.pid = pid
-        return pr
+    class FakeProc:
+        """Stateful stand-in for the server Popen: once it has exited, the first poll()/wait() reaps it (reaped flips),
+        exactly like Popen; poll_delay makes the first poll() slow, to open a check-then-signal window."""
+        def __init__(self, pid, exited=False, reaped=False, poll_delay=0):
+            self.pid, self.args = pid, ["server"]
+            self.exited, self.reaped, self.poll_delay = exited or reaped, reaped, poll_delay
 
-    def _record_signals(self, m, f):
+        def poll(self):
+            rc = None if not self.exited else 0
+            if self.poll_delay:
+                d, self.poll_delay = self.poll_delay, 0
+                time.sleep(d)      # the answer above is already decided: a reap by another thread now goes unseen
+            if rc is not None:
+                self.reaped = True
+            return rc
+
+        def wait(self, timeout=None):
+            self.exited = self.reaped = True
+            return 0
+
+    def _proc(self, pid, reaped):
+        return self.FakeProc(pid, reaped=reaped)
+
+    def _record_signals(self, m, f, action=None):
         sent = []
-        orig = (m.os.kill, m.os.killpg)
+        orig = (m.os.kill, m.os.killpg, m.EXIT_GRACE_S)
         m.os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
-        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig))
+        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig, f.proc.reaped))
+        m.EXIT_GRACE_S = 0.1   # the fake never exits on a (recorded, unsent) signal
         try:
-            f.kill_tree()
+            (action or f.kill_tree)()
         finally:
-            m.os.kill, m.os.killpg = orig
+            m.os.kill, m.os.killpg, m.EXIT_GRACE_S = orig
         return sent
 
     def test_descendants_need_the_recorded_server_start(self):
@@ -609,7 +627,88 @@ class FilterTests(unittest.TestCase):
         f.descendants = lambda: {}
         f._ps_full = lambda: []
         f.owned_by_task = lambda rows=None: {}
-        self.assertEqual(self._record_signals(m, f), [("killpg", 400, 15), ("killpg", 400, 9)])
+        self.assertEqual(self._record_signals(m, f), [("killpg", 400, 15, False), ("killpg", 400, 9, False)])
+
+    def test_concurrent_reap_never_lets_the_group_be_signalled(self):
+        # P1 round 5: the server has exited; the closer's poll() says "unreaped" but is slow, and meanwhile another
+        # thread reaps it (its pid is free for reuse). With every poll/wait serialised under proc_lock, the reap waits
+        # for the whole check-and-signal step, so no group signal is ever sent after the reap.
+        m, f = self._bare_filter()
+        f.proc = self.FakeProc(400, poll_delay=0.3)
+        f.proc.exited = False                     # unreaped and still running when the closer checks ...
+        reaper = threading.Thread(target=lambda: (time.sleep(0.1), setattr(f.proc, "exited", True), f._server_poll()))
+
+        def closer():
+            reaper.start()
+            f._kill_server_group(signal.SIGKILL)  # ... which takes 0.3 s; the reaper runs at 0.1 s
+            reaper.join()
+            f._kill_server_group(signal.SIGKILL)  # after the reap: nothing
+        sent = self._record_signals(m, f, action=closer)
+        self.assertTrue(f.proc.reaped)
+        self.assertEqual(sent, [("killpg", 400, signal.SIGKILL, False)])
+
+    def test_procargs2_parser_keeps_exact_boundaries(self):
+        # P1 round 5: argv is read at the aligned start after the exec path, exactly argc entries, never into env.
+        m, _ = self._bare_filter()
+        T = str(self.task)
+
+        def buf(argv, env=(), path=b"/b/headless_shell", pad=None):
+            n = len(path) + 1
+            pad = b"\0" * (-(-n // 8) * 8 - n) if pad is None else pad
+            return (len(argv).to_bytes(4, sys.byteorder) + path + b"\0" + pad
+                    + b"".join(a.encode() + b"\0" for a in argv) + b"".join(e.encode() + b"\0" for e in env))
+        ok = ["/b/headless_shell", "--headless", f"--user-data-dir={T}/browser/tmp/p"]
+        self.assertEqual(m.parse_procargs2(buf(ok, env=["HOME=/h"])), ok)
+        for plen in range(1, 18):   # every padding length
+            self.assertEqual(m.parse_procargs2(buf(["a", "b"], path=b"/" + b"x" * plen)), ["a", "b"])
+        # The reviewer's case: empty argv[0], the flag only as a substring of an argument, the real flag in the env.
+        trick = buf(["", f"--x=a--user-data-dir={T}/browser/tmp/p"], env=[f"--user-data-dir={T}/browser/tmp/p"])
+        self.assertIsNone(m.parse_procargs2(trick))
+        self.assertIsNone(m.parse_procargs2(buf(["a", "", "b"])))                            # empty entry
+        self.assertIsNone(m.parse_procargs2(buf(["a", "b"])[:-1]))                           # unterminated
+        self.assertIsNone(m.parse_procargs2(buf(["a"], pad=b"\0\0X\0\0\0")))                  # non-NUL padding
+        self.assertIsNone(m.parse_procargs2(b"\0\0\0\0" + buf(["a"])[4:]))                  # argc 0
+        self.assertIsNone(m.parse_procargs2((1 << 20).to_bytes(4, sys.byteorder) + buf(["a"])[4:]))  # argc huge
+        self.assertIsNone(m.parse_procargs2(buf(["a", "b"])[:4] + buf(["a"])[4:]))           # argc > strings
+        self.assertIsNone(m.parse_procargs2(b"\1\0\0\0" + b"\0" * 7 + b"a\0"))              # no exec path
+        self.assertIsNone(m.parse_procargs2(b"\1\0"))                                        # truncated
+
+    def test_identity_refuses_empty_argv0_with_flag_in_env(self):
+        # The same regression against the real kernel buffer: empty argv[0], the flag only in the environment.
+        if sys.platform != "darwin":
+            self.skipTest("macOS-only (libproc)")
+        m, _ = self._bare_filter()
+        flag = f"--user-data-dir={self.task}/browser/tmp/p"
+        p = subprocess.Popen(["", "-c", "sleep 30; :", f"--x=a{flag}"], executable="/bin/bash", env={"Z": flag})
+        try:
+            time.sleep(0.3)
+            self.assertIsNone(m.Filter._identity(p.pid))
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_start_of_reports_ps_failure(self):
+        # P2 round 5: _start_of checks ps's exit: a failure is reported with stderr and means "do not signal".
+        m, _ = self._bare_filter()
+        fake = self.tmp / "ps"
+        orig = m.PS
+        m.PS = str(fake)
+        try:
+            for script, want, msg in [("echo 'ps: boom' >&2; exit 2", None, "ps: boom"),
+                                      ("exit 1", None, ""),                           # pid gone: silent
+                                      ("echo 'Tue Nov  3 10:00:00 2026'", "Tue Nov 3 10:00:00 2026", "")]:
+                fake.write_text("#!/bin/sh\n" + script + "\n")
+                fake.chmod(0o755)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(m.Filter._start_of(123), want)
+                if msg:
+                    self.assertIn("ps exited 2", err.getvalue())
+                    self.assertIn(msg, err.getvalue())
+                else:
+                    self.assertEqual(err.getvalue(), "")
+        finally:
+            m.PS = orig
 
     def test_ps_failure_exit_is_reported(self):
         # P2 round 4: a nonzero ps exit is not an empty process table: it is reported with ps's stderr.

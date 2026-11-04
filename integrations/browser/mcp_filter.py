@@ -79,6 +79,12 @@ PS_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
 LIBPROC = "/usr/lib/libproc.dylib"
 PROC_PIDPATHINFO_MAXSIZE = 4096
 CTL_KERN, KERN_PROCARGS2 = 1, 49
+# xnu pads the exec path in KERN_PROCARGS2 with NULs so argv[0] starts pointer-aligned (8 bytes on 64-bit macOS),
+# measured from the byte after argc. Knowing the exact start is what makes an empty argv[0] detectable (it would
+# otherwise look like more padding and shift every argv entry by one, into the environment).
+PROCARGS_ALIGN = 8
+# Upper bound on argc accepted from the kernel buffer (far above any browser's argv; a bigger count is corrupt).
+PROCARGS_MAX_ARGC = 1 << 16
 # Executable names of the browsers Playwright installs under PLAYWRIGHT_BROWSERS_PATH (Chromium, Chrome for Testing, the
 # headless shell, old and new layouts) and their macOS helper apps ("Chromium Helper (Renderer)"). Ownership by command
 # line accepts only these, so a shell or any other program whose argv mentions the task dir is never killed.
@@ -137,6 +143,34 @@ def allowed_tools(pinned, grants):
     return frozenset(allowed - NEVER)
 
 
+def parse_procargs2(data):
+    """argv from a KERN_PROCARGS2 buffer, or None when its boundaries are not exact (fail closed: not our process).
+    Layout: int32 argc; exec path, NUL; NUL padding up to the next PROCARGS_ALIGN boundary; argc NUL-terminated argv
+    strings; then the environment, which is never read. Refused: argc out of range, an unterminated string, padding
+    that is not all NULs, and any empty argv entry (argv[0] empty is indistinguishable from padding, so empties are
+    refused everywhere)."""
+    if len(data) < 4:
+        return None
+    argc = int.from_bytes(data[:4], sys.byteorder)
+    if not 1 <= argc <= PROCARGS_MAX_ARGC:
+        return None
+    body = data[4:]
+    end = body.find(b"\0")
+    if end <= 0:
+        return None                         # no exec path, or unterminated
+    pos = -(-(end + 1) // PROCARGS_ALIGN) * PROCARGS_ALIGN
+    if pos > len(body) or body[end:pos].strip(b"\0"):
+        return None
+    argv = []
+    for _ in range(argc):
+        nul = body.find(b"\0", pos)
+        if nul < 0 or nul == pos:
+            return None                     # unterminated within the buffer, or empty
+        argv.append(body[pos:nul].decode("utf-8", "surrogateescape"))
+        pos = nul + 1
+    return argv
+
+
 def url_ok(url):
     """Allowlist, not a deny list: exactly about:blank, or an http(s) URL with a host. The scheme must be lowercase and
     first (no leading whitespace or control characters: browsers strip those, so ' javascript:' or 'JavaScript:' would
@@ -175,6 +209,10 @@ class Filter:
         self.pending = {}          # forwarded client request id (json key) -> method
         self.own_seq = 0
         self.closer = None         # ident of the thread running close(); set once
+        # Owns the server Popen's lifecycle: every poll()/wait() (which may reap it) goes through _server_poll /
+        # _server_wait under this lock, and _kill_server_group checks "still unreaped" and signals the group under it,
+        # so no other thread can reap the server (freeing its pid for reuse) between the check and the killpg.
+        self.proc_lock = threading.Lock()
         # {pid: lstart} of descendants seen while running (poll) or at stdin EOF, for kill_tree. The start time is kept
         # with the pid and re-checked before every signal, so a pid recycled after the process exited is never hit.
         self.known_tree = {}
@@ -253,12 +291,18 @@ class Filter:
     def _start_of(pid):
         """lstart of pid now, or None if it is gone (or ps fails: then nothing is signalled)."""
         try:
-            out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                                 errors="replace", timeout=5, env=PS_ENV).stdout
+            r = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                               errors="replace", timeout=5, env=PS_ENV)
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"mcp_filter: ps failed, pid {pid} not signalled: {e}\n")
             return None
-        return " ".join(out.split()) or None
+        if r.returncode != 0:
+            # ps -p exits 1 with no message for a pid that is gone (normal, silent); anything else is reported.
+            if r.stderr.strip() or r.returncode != 1:
+                sys.stderr.write(f"mcp_filter: ps exited {r.returncode}, pid {pid} not signalled: "
+                                 f"{r.stderr.strip()[:500]}\n")
+            return None
+        return " ".join(r.stdout.split()) or None
 
     def _signal(self, pid, start, sig, group):
         """Send sig to pid (or the group it leads) only if pid still has the start time it was recorded with: a pid
@@ -295,18 +339,8 @@ class Filter:
                 return None
         except (OSError, AttributeError, ValueError):
             return None
-        data = raw.raw[:size.value]
-        # KERN_PROCARGS2: int32 argc, exec path NUL, NUL padding, then argc NUL-terminated argv strings.
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        rest = data[4:]
-        end = rest.find(b"\0")
-        if end < 0:
-            return None
-        rest = rest[end:].lstrip(b"\0")
-        argv = rest.split(b"\0")[:argc]
-        if len(argv) != argc:
-            return None
-        return exe, [a.decode("utf-8", "surrogateescape") for a in argv]
+        argv = parse_procargs2(raw.raw[:size.value])
+        return None if argv is None else (exe, argv)
 
     def is_task_browser(self, pid):
         """True if pid is a Playwright browser under the pinned browsers path running with a --user-data-dir inside
@@ -371,7 +405,7 @@ class Filter:
         tree.update(self.descendants())
         self._kill_server_group(signal.SIGTERM)
         try:
-            self.proc.wait(timeout=EXIT_GRACE_S)
+            self._server_wait(EXIT_GRACE_S)
         except subprocess.TimeoutExpired:
             sys.stderr.write("mcp_filter: server ignored SIGTERM; killing\n")
         self._kill_server_group(signal.SIGKILL)
@@ -396,18 +430,35 @@ class Filter:
         """Signal the server's group only while the server is our unreaped child: until then its pid (and so the group
         id) cannot be reused. Once it is reaped the numeric group may be a replacement, so nothing is sent to it; the
         group's former members are recorded descendants, signalled one by one after their start time is verified."""
-        if self.proc.poll() is not None:
-            return
-        try:
-            os.killpg(self.proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            # Gone, or (macOS) EPERM for a group left with only the unreaped server zombie: nothing to signal there;
-            # descendants are handled by the caller.
-            pass
+        with self.proc_lock:
+            if self.proc.poll() is not None:
+                return
+            try:
+                os.killpg(self.proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                # Gone, or (macOS) EPERM for a group left with only the unreaped server zombie: nothing to signal
+                # there; descendants are handled by the caller.
+                pass
+
+    def _server_poll(self):
+        with self.proc_lock:
+            return self.proc.poll()
+
+    def _server_wait(self, timeout):
+        """Popen.wait(timeout) built on _server_poll, so the lock is held only for each non-blocking poll and a closer
+        waiting to signal the group is never blocked for the whole grace period."""
+        deadline = time.monotonic() + timeout
+        while True:
+            rc = self._server_poll()
+            if rc is not None:
+                return rc
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(getattr(self.proc, "args", "server"), timeout)
+            time.sleep(0.05)
 
     def poll_tree(self):
         """Record the server's descendants every TREE_POLL_S while it runs (see TREE_POLL_S)."""
-        while self.closer is None and self.proc.poll() is None:
+        while self.closer is None and self._server_poll() is None:
             tree = self.descendants()
             with self.state_lock:
                 self.known_tree.update(tree)
@@ -595,7 +646,7 @@ class Filter:
                 self.on_server(msg)
         except (BrokenPipeError, OSError) as e:
             self.close(f"pipe error: {e}")
-        self.close("server closed its output", code=self.proc.poll() or 0)
+        self.close("server closed its output", code=self._server_poll() or 0)
 
     def run(self, stdin=None):
         # Termination by signal takes the same path as any other close (browser included), via the self-pipe: a handler
@@ -621,7 +672,7 @@ class Filter:
         except OSError as e:
             sys.stderr.write(f"mcp_filter: closing server stdin: {e}\n")
         try:
-            rc = self.proc.wait(timeout=EXIT_GRACE_S)
+            rc = self._server_wait(EXIT_GRACE_S)
         except subprocess.TimeoutExpired:
             rc = 0
         self.close("client closed its input", code=rc if rc and rc > 0 else 0)
