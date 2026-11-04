@@ -345,6 +345,35 @@ class CollectTest(unittest.TestCase):
         finally:
             usage.LEDGER_QUERY_S, usage._PROGRESS_OPS = keep
 
+    def test_routed_query_time_capped_and_reported_as_error(self):
+        # Review P2: router.db reads had no execution deadline; they share _ledger's progress-handler cap.
+        home = fixture_home()
+        keep = usage.LEDGER_QUERY_S, usage._PROGRESS_OPS
+        usage.LEDGER_QUERY_S, usage._PROGRESS_OPS = -1.0, 1
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                usage._routed(home / "router.db", NOW)
+            out = self.collect(home)
+        finally:
+            usage.LEDGER_QUERY_S, usage._PROGRESS_OPS = keep
+        self.assertIn({"source": "router.db", "error": "OperationalError"}, out["errors"])
+
+    def test_large_indexed_router_db_collects_within_deadline(self):
+        home = fixture_home()
+        c = sqlite3.connect(home / "router.db")
+        c.execute("CREATE INDEX IF NOT EXISTS routes_ts ON routes(ts)")          # as core.DDL creates it
+        c.executemany("INSERT INTO routes VALUES (?,?,?,?,?)",
+                      ((f"x{i}", NOW - 30 * 86400 - i, "claude", f"m{i % 40}", "B") for i in range(300000)))
+        c.executemany("INSERT INTO routes VALUES (?,?,?,?,?)",
+                      ((f"y{i}", NOW - (i % 500000), "codex", f"m{i % 40}", "C") for i in range(50000)))
+        c.commit(); c.close()
+        t0 = time.monotonic()
+        r = usage._routed(home / "router.db", NOW)
+        self.assertLess(time.monotonic() - t0, usage.LEDGER_QUERY_S)
+        self.assertTrue(r["last_7d"])
+        out = self.collect(home)
+        self.assertNotIn("router.db", [e["source"] for e in out["errors"]])
+
     def test_home_path_with_hash_and_question_mark_opens_read_only(self):
         # Review P2: a string-built 'file:' URI read '#'/'?' as fragment/query, dropping mode=ro (and creating files).
         base = Path(tempfile.mkdtemp())

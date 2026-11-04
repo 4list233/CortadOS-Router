@@ -54,6 +54,59 @@ class LedgerWrite(unittest.TestCase):
             self.assertIn("usage_ts", plan)
             c.close()
 
+    def test_legacy_ledger_migration_with_concurrent_writers_loses_no_row(self):
+        # Review P2: the first CREATE INDEX on a large rollback-journal ledger held the write lock and concurrent
+        # record() calls returned False. WAL first, one migrator under the lock file, and busy retries: every row lands.
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "usage.db"
+            c = sqlite3.connect(p)
+            c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
+            c.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?)",
+                          ((float(i % 99991), "claude", f"m{i % 40}", 1, 1, 0, 0) for i in range(200000)))
+            c.commit()
+            self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            c.close()
+            usage_ledger._consecutive_failures = 0
+            per, results, go = 25, [], threading.Event()
+
+            def writer(k):
+                go.wait()
+                for j in range(per):
+                    results.append(usage_ledger.record("codex", "gpt", {"input_tokens": 1}, ts=1e9 + k * 1000 + j, path=p))
+            ts = [threading.Thread(target=writer, args=(k,)) for k in range(4)]
+            # one attempt's busy wait shorter than the index build, as on a multi-million-row ledger with the real
+            # 0.5 s timeout: the old writer then dropped rows; the retry budget (RETRY_S) must still land every one
+            with mock.patch.object(usage_ledger, "TIMEOUT_S", 0.005):
+                for t in ts:
+                    t.start()
+                go.set()
+                for t in ts:
+                    t.join()
+            self.assertEqual(results.count(False), 0, f"{results.count(False)} of {len(results)} writes failed")
+            c = sqlite3.connect(p)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage WHERE ts >= 1e9").fetchone()[0], 4 * per)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 200000 + 4 * per)
+            self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertIn("usage_ts", [r[1] for r in c.execute("PRAGMA index_list(usage)")])
+            c.close()
+
+    def test_busy_db_is_retried_not_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "usage.db"
+            self.assertTrue(usage_ledger.record("codex", "gpt", {}, path=p))
+            real, calls = usage_ledger._write, {"n": 0}
+
+            def flaky(path, row):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise sqlite3.OperationalError("database is locked")
+                real(path, row)
+            with mock.patch.object(usage_ledger, "_write", flaky):
+                self.assertTrue(usage_ledger.record("codex", "gpt", {}, path=p))
+            self.assertEqual(calls["n"], 3)
+            self.assertEqual(sqlite3.connect(p).execute("SELECT COUNT(*) FROM usage").fetchone()[0], 2)
+
     def test_failure_does_not_raise_and_logs_type(self):
         with tempfile.TemporaryDirectory() as d:
             bad = Path(d) / "dir-not-db"

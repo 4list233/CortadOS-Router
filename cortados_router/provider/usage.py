@@ -37,8 +37,8 @@ HW_MODELS_MAX = 32            # models Ollama holds loaded on one node at once: 
 HW_ERRORS_MAX = 16            # hardware.sample() records at most one error per field (~11 fields); more is not a sample
 LABEL_MAX = 60                # lane keys / account labels come from scarcity.json keys: bounded like window names
 DB_TIMEOUT_S = 0.5            # a dashboard GET must not wait on a router.db writer holding the lock
-# Reason: a ledger scan must never hold the view (or usage.db) for long; past this the query is interrupted and the
-# source is reported as an error, instead of a dashboard GET running unbounded over a huge table.
+# Reason: a db scan (usage.db or router.db) must never hold the view, or the db, for long; past this the query is
+# interrupted and the source is reported as an error, instead of a dashboard GET running unbounded over a huge table.
 LEDGER_QUERY_S = 1.0
 _PROGRESS_OPS = 10_000        # sqlite VM steps between deadline checks: cheap, and well under a millisecond apart
 # Tool names in bot-usage.jsonl outside the gateway's own tool set (a refused call logs whatever name the bot sent, which
@@ -189,8 +189,17 @@ def _ro_uri(db_path: Path) -> str:
     return Path(db_path).resolve().as_uri() + "?mode=ro"
 
 
-def _routed(db_path: Path, now: float) -> dict[str, Any]:
+def _ro_connect(db_path: Path) -> sqlite3.Connection:
+    """Read-only connection whose queries are interrupted (sqlite3.OperationalError "interrupted", reported by collect's
+    guard as that source's error) once LEDGER_QUERY_S has passed. One helper so router.db and usage.db share the cap."""
     c = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
+    deadline = time.monotonic() + LEDGER_QUERY_S
+    c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)   # non-zero: interrupt
+    return c
+
+
+def _routed(db_path: Path, now: float) -> dict[str, Any]:
+    c = _ro_connect(db_path)
     try:
         day0 = time.mktime(  # local midnight
             time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
@@ -237,9 +246,7 @@ def _tail_lines(path: Path) -> tuple[list[str], bool]:
 def _ledger(db_path: Path, now: float) -> dict[str, Any]:
     """usage.db (usage_ledger.record, one row per completed backend turn): turns and tokens per lane x model. Rows the
     Hermes plugin wrote before `lane` existed fall back to their runtime, so old history still shows under its vendor."""
-    c = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=DB_TIMEOUT_S)
-    deadline = time.monotonic() + LEDGER_QUERY_S
-    c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)   # non-zero: interrupt
+    c = _ro_connect(db_path)
     try:
         cols = {r[1] for r in c.execute("PRAGMA table_info(usage)")}
         lane = "COALESCE(lane, runtime, '(none)')" if "lane" in cols else "COALESCE(runtime, '(none)')"
