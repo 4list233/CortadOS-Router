@@ -97,11 +97,11 @@ class LedgerWrite(unittest.TestCase):
             self.assertTrue(usage_ledger.record("codex", "gpt", {}, path=p))
             real, calls = usage_ledger._write, {"n": 0}
 
-            def flaky(path, row):
+            def flaky(path, row, *rest):
                 calls["n"] += 1
                 if calls["n"] < 3:
                     raise sqlite3.OperationalError("database is locked")
-                real(path, row)
+                real(path, row, *rest)
             with mock.patch.object(usage_ledger, "_write", flaky):
                 self.assertTrue(usage_ledger.record("codex", "gpt", {}, path=p))
             self.assertEqual(calls["n"], 3)
@@ -113,7 +113,7 @@ class LedgerWrite(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             calls = {"n": 0}
 
-            def busy(path, row):
+            def busy(path, row, *rest):
                 calls["n"] += 1
                 raise sqlite3.OperationalError("database is locked")
             with mock.patch.object(usage_ledger, "_write", busy), mock.patch.object(usage_ledger, "RETRY_S", 0.3), \
@@ -209,6 +209,79 @@ class LedgerWrite(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("lane claude#b", errors[0])
         self.assertIn("search lane, run search-run-0001", errors[0])
+
+    def _hold_migrate_lock(self, db):
+        """Another process holding usage.db.migrate (as the reviewer did); returns it, killed at cleanup."""
+        import subprocess
+        import sys
+        ready = Path(str(db) + ".held")
+        code = ("import fcntl, sys, time, pathlib; f = open(sys.argv[1] + '.migrate', 'a'); "
+                "fcntl.flock(f.fileno(), fcntl.LOCK_EX); pathlib.Path(sys.argv[1] + '.held').touch(); time.sleep(60)")
+        proc = subprocess.Popen([sys.executable, "-c", code, str(db)])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        until = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "the lock holder started")
+        return proc
+
+    def _legacy(self, db):
+        c = sqlite3.connect(db)
+        c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
+        c.commit()
+        c.close()
+
+    def test_thread_start_failure_with_the_migrate_lock_held_returns_within_the_deadline_and_logs_error(self):
+        # The reviewer's case: no worker thread (the fallback runs on the request thread) and the migrate lock held by
+        # another process on a ledger that still needs its lane column. record must not block on the lock.
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
+                mock.patch.object(usage_ledger, "RETRY_S", 1.0):
+            db = Path(d) / "usage.db"
+            self._legacy(db)
+            self._hold_migrate_lock(db)
+            usage_ledger._consecutive_failures = 0
+            t0 = time.monotonic()
+            with mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
+                    self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+                self.assertIsNone(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run search-run-0001"))
+            took = time.monotonic() - t0
+        self.assertLess(took, 1.0 + 0.75, "bounded by RETRY_S plus a small margin, not by the lock holder (60 s)")
+        errors = [r.getMessage() for r in cm.records if r.levelname == "ERROR"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("lane claude#b", errors[0])
+        self.assertIn("search lane, run search-run-0001", errors[0])
+        self.assertEqual(usage_ledger.consecutive_failures(), 1, "the failure is counted")
+
+    def test_migrate_lock_held_but_schema_has_the_lane_the_row_is_still_written(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "RETRY_S", 0.5):
+            db = Path(d) / "usage.db"
+            c = sqlite3.connect(db)
+            c.execute(usage_ledger._SCHEMA)                     # current schema, still rollback journal: not migrated
+            c.commit()
+            c.close()
+            self._hold_migrate_lock(db)
+            t0 = time.monotonic()
+            with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+                self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 5}, path=db, context="search lane, run -"))
+            self.assertLess(time.monotonic() - t0, 0.5 + 0.75)
+            self.assertTrue(any("migration skipped" in m for m in cm.output))
+            self.assertEqual(sqlite3.connect(db).execute("SELECT lane, input_tokens FROM usage").fetchall(), [("claude#b", 5)])
+
+    def test_a_statement_past_the_deadline_is_interrupted(self):
+        # sqlite work is bounded too: a statement that would run forever (an endless recursive query standing in for
+        # a huge index build) is interrupted at the deadline by the progress handler
+        def endless(c, p, deadline):
+            c.execute("WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r").fetchone()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_migrate", endless):
+            db = Path(d) / "usage.db"
+            t0 = time.monotonic()
+            with self.assertRaises(sqlite3.OperationalError) as cm:
+                usage_ledger._write(db, (1.0, "claude", "m", 0, 0, 0, 0, "claude"), time.monotonic() + 0.3)
+            self.assertIn("interrupted", str(cm.exception))
+            self.assertLess(time.monotonic() - t0, 1.5)
+            with self.assertRaises(sqlite3.OperationalError):     # and a spent deadline never starts an attempt
+                usage_ledger._write(db, (1.0, "claude", "m", 0, 0, 0, 0, "claude"), time.monotonic() - 1)
 
     def test_server_hook_skips_unrouted_and_writes_routed(self):
         from cortados_router.provider import server
