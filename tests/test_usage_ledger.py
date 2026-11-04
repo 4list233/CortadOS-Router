@@ -191,6 +191,25 @@ class LedgerWrite(unittest.TestCase):
             rows = sqlite3.connect(Path(d) / "usage.db").execute("SELECT runtime, input_tokens, lane FROM usage").fetchall()
             self.assertEqual(rows, [("claude", 4, "claude#b")])
 
+    def test_record_async_writes_the_row_synchronously_when_the_thread_cannot_start(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
+                mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
+                self.assertLogs("cortados.usage_ledger", "WARNING"):
+            self.assertIsNone(usage_ledger.record_async("claude#b", "m", {"input_tokens": 3}, context="search lane, run -"))
+            rows = sqlite3.connect(Path(d) / "usage.db").execute("SELECT runtime, lane, input_tokens FROM usage").fetchall()
+        self.assertEqual(rows, [("claude", "claude#b", 3)])
+
+    def test_a_failed_synchronous_fallback_write_logs_error_with_lane_and_context(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
+                mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
+                self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+            (Path(d) / "usage.db").mkdir()                  # a directory where the db must go: the fallback write fails
+            self.assertIsNone(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run search-run-0001"))
+        errors = [r.getMessage() for r in cm.records if r.levelname == "ERROR"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("lane claude#b", errors[0])
+        self.assertIn("search lane, run search-run-0001", errors[0])
+
     def test_server_hook_skips_unrouted_and_writes_routed(self):
         from cortados_router.provider import server
         with mock.patch.object(usage_ledger, "record_async") as rec:

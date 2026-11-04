@@ -174,9 +174,19 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
     return True
 
 
-def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None) -> threading.Thread:
-    """Off the request thread, so even the sqlite timeout never delays a reply. Returns the started thread (tests join it)."""
-    t = threading.Thread(target=record, args=(lane, model, usage), kwargs={"context": context}, name="cortados-usage-ledger",
-                         daemon=True)
-    t.start()
+def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None) -> threading.Thread | None:
+    """Off the request thread, so even the sqlite timeout never delays a reply. Returns the started thread (tests join it),
+    or None when the worker could not be started (RuntimeError "can't start new thread" under thread exhaustion) and the
+    row was written synchronously instead. Reason for the fallback: by now the quota is already spent, so losing the row
+    to a failed thread start is worse than holding this one reply for record()'s bounded retries (RETRY_S). The
+    synchronous write keeps the same retries, failure counting and `context` ERROR logging, and never raises."""
+    try:
+        t = threading.Thread(target=record, args=(lane, model, usage), kwargs={"context": context},
+                             name="cortados-usage-ledger", daemon=True)
+        t.start()
+    except Exception as exc:
+        logger.warning("usage ledger: worker thread did not start (%s: %s); writing the row for lane %s%s synchronously",
+                       type(exc).__name__, str(exc)[:120], lane, f" ({context})" if context else "")
+        record(lane, model, usage, context=context)
+        return None
     return t
