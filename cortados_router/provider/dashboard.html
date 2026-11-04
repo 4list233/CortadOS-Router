@@ -1,137 +1,242 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CortadOS Router</title>
+<title>CortadOS Router · usage</title>
 <style>
-  :root { --bg:#fff; --fg:#111; --mut:#666; --card:#f6f6f7; --line:#e3e3e6; --ok:#1a7f37; --warn:#b35900; --bad:#b00020; --accent:#3257d6; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --fg:#e8e8ea; --mut:#9aa0a6; --card:#181b20; --line:#2a2e35; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#6b8afd; } }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding:16px; border-bottom:1px solid var(--line); }
-  h1 { font-size:18px; margin:0; }
-  .mut { color:var(--mut); }
-  main { padding:16px; max-width:1100px; margin:0 auto; }
-  section { margin-bottom:22px; }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 10px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:12px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
-  .card h3 { margin:0 0 6px; font-size:14px; }
-  .row { display:flex; justify-content:space-between; gap:8px; }
-  .chip { display:inline-block; padding:2px 8px; border-radius:999px; background:var(--card); border:1px solid var(--line); font-size:12px; margin:2px 4px 2px 0; }
-  .chip.ok{color:var(--ok);} .chip.warn{color:var(--warn);} .chip.bad{color:var(--bad);}
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
-  th { color:var(--mut); font-weight:600; }
-  .big { font-size:26px; font-weight:600; }
-  button,input { font:inherit; padding:7px 12px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
-  button { cursor:pointer; }
-  #err { color:var(--bad); padding:0 16px; }
-  #gate { padding:16px; }
-  .fit { color:var(--accent); }
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#e1e4e8; --bar:#2f7de1; --low:#d9822b; --bad:#d73a49; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#181b21; --fg:#e6e8eb; --muted:#8b949e; --line:#2a2f37; --bar:#4c9aff; --low:#e3a04f; --bad:#f06b78; } }
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+header { display:flex; align-items:center; gap:12px; padding:14px 22px; border-bottom:1px solid var(--line); }
+header h1 { font-size:17px; margin:0; }
+#status { color:var(--muted); margin-left:auto; }
+button { font:inherit; padding:4px 10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; cursor:pointer; }
+main { padding:18px 22px; max-width:1400px; margin:0 auto; }
+h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:22px 0 8px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:12px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+.card.stale { opacity:.55; }
+.title { font-weight:600; }
+.sub { color:var(--muted); font-size:12px; }
+.bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:6px 0; }
+.bar > div { height:100%; background:var(--bar); }
+.bar.low > div { background:var(--low); } .bar.bad > div { background:var(--bad); }
+.big { font-size:22px; font-weight:600; }
+table { width:100%; border-collapse:collapse; }
+td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+th { color:var(--muted); font-weight:500; font-size:12px; }
+td.num { text-align:right; font-variant-numeric:tabular-nums; width:60px; }
+td.barcell { width:40%; }
+.cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
+ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
+.card.errors { border-color:var(--bad); } #status.err, #storage { color:var(--bad); }
+body.stale main { opacity:.55; }
+#login { max-width:360px; margin:80px auto; }
+#login input { width:100%; padding:7px; margin:8px 0; font:inherit; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
 </style>
 </head>
 <body>
-<header>
-  <h1>CortadOS Router</h1>
-  <span class="mut" id="sub">resource pool</span>
-  <span style="margin-left:auto"></span>
-  <span class="mut" id="stamp"></span>
-  <button id="refresh">Refresh</button>
-</header>
-<div id="err"></div>
-<div id="gate" hidden>
-  <p>Enter the provider token to load the dashboard.</p>
-  <input id="token" type="password" size="40" placeholder="CORTADOS_PROVIDER_TOKEN" autocomplete="off">
-  <button id="save">Load</button>
-</div>
+<header><h1>CortadOS Router · usage</h1><span id="status"></span><span id="storage" hidden></span><button id="logout" hidden>Forget token</button></header>
+<form id="login" class="card" hidden>
+  <div class="title">Provider token</div>
+  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/usage.</div>
+  <input id="tok" type="password" autocomplete="off" required>
+  <button type="submit">Open dashboard</button>
+</form>
 <main id="main" hidden></main>
-
 <script>
 "use strict";
-const $ = s => document.querySelector(s);
-const TKEY = "cortados.providerToken";
-let timer = null;
+// EVERY: the scarcity cache behind the lane cards is refreshed every few minutes and the 7-day counts move slowly, so a
+// 30 s poll shows changes promptly while the server's 2 s collect memo keeps several open tabs from re-scanning its logs.
+const KEY = "cortados-usage-token", URL_ = "/v1/cortados/usage", EVERY = 30000;
+const $ = (id) => document.getElementById(id);
+let timer = null, lastOk = null;
+// sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
+// and the page says so, instead of losing the token and asking for it again on every poll.
+let memTok = "", storageOk = true;
+function storageFailed() {
+  storageOk = false;
+  const s = $("storage"); s.hidden = false; s.textContent = "Browser storage unavailable; the token is kept only for this page";
+}
+// Every good read is copied into memTok, so storage that fails after startup keeps the token rather than reopening the login.
+function getTok() { if (!storageOk) return memTok;
+  try { const t = sessionStorage.getItem(KEY); if (t) memTok = t; return t || memTok; } catch (e) { storageFailed(); return memTok; } }
+function setTok(t) { memTok = t || ""; if (!storageOk) return;
+  try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { storageFailed(); } }
+// Every string from the endpoint goes in through textContent: lane names and errors are data, never markup.
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = String(text); return e; }
+function add(parent, ...kids) { for (const k of kids) if (k) parent.appendChild(k); return parent; }
+function age(s) { if (s === null || s === undefined || isNaN(s)) return "?"; s = Math.round(s); if (s < 90) return s + " s"; if (s < 5400) return Math.round(s / 60) + " min"; if (s < 172800) return Math.round(s / 3600) + " h"; return Math.round(s / 86400) + " d"; }
+function pct(v) { return (typeof v === "number") ? Math.round(v) + "%" : "–"; }
+function bar(v) { const b = el("div", "bar"); const f = el("div"); const p = Math.max(0, Math.min(100, Number(v) || 0)); f.style.width = p + "%"; if (p < 10) b.classList.add("bad"); else if (p < 30) b.classList.add("low"); return add(b, f); }
+function section(title) { return el("h2", null, title); }
+function table(rows, cols, maxOf) {
+  const t = el("table"), head = el("tr");
+  cols.forEach(c => add(head, el("th", null, c.h)));
+  add(t, head);
+  const max = Math.max(1, ...rows.map(maxOf || (() => 0)));
+  if (!rows.length) { const tr = el("tr"); const td = el("td", "sub", "none"); td.colSpan = cols.length; add(t, add(tr, td)); }
+  rows.forEach(r => { const tr = el("tr"); cols.forEach(c => {
+    if (c.bar) { const td = el("td", "barcell"); const b = el("div", "bar"); const f = el("div"); f.style.width = (100 * (Number(c.bar(r)) || 0) / max) + "%"; add(tr, add(td, add(b, f))); }
+    else add(tr, el("td", c.num ? "num" : null, c.v(r)));
+  }); add(t, tr); });
+  return t;
+}
+function card(title, sub) { const c = el("div", "card"); add(c, el("div", "title", title)); if (sub) add(c, el("div", "sub", sub)); return c; }
+function countTable(obj, label) { const rows = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
+  return table(rows, [{h: label, v: r => r[0]}, {h: "", bar: r => r[1]}, {h: "n", num: true, v: r => r[1]}], r => r[1]); }
 
-function gib(b) { return (b === null || b === undefined) ? "—" : (b / (2 ** 30)).toFixed(1) + " GiB"; }
-function pct(n) { return (n === null || n === undefined) ? "—" : Math.round(n) + "%"; }
-function esc(s) { const d = document.createElement("div"); d.textContent = (s === null || s === undefined) ? "" : String(s); return d.innerHTML; }
-function num(v) { return (v === null || v === undefined) ? "—" : esc(v); }   // numbers are escaped too: a stray string in the data can never inject HTML
+// Shape: cortados_router/provider/usage.py _VIEW (the publish schema). errors[] = {source, error}: every failed or absent
+// source; it is drawn first and counted in the header, never folded away, so a missing scarcity.json is not read as "no lanes".
+function errText(e) { return (e && typeof e === "object") ? ((e.source || "?") + ": " + (e.error || "error")) : String(e); }
+function when(t) { return (typeof t === "number") ? new Date(t * 1000).toLocaleTimeString() : (t || ""); }
+// A hardware field is its value or the sampler's {available: false, reason} shape.
+function off(v) { return v && typeof v === "object" && !Array.isArray(v) && v.available === false; }
+function hwLine(c, name, v, fmt) {
+  if (v === undefined || v === null) return;
+  if (off(v)) add(c, el("div", "sub err", name + ": unavailable (" + (v.reason || "error") + ")"));
+  else add(c, el("div", "sub", name + ": " + (fmt ? fmt(v) : v)));
+}
+function gb(b) { return (typeof b === "number") ? (b / 1073741824).toFixed(1) + " GB" : "–"; }
+function tok(n) { return (typeof n === "number") ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n)) : "–"; }
+function capped(o, keys) { return keys.some(k => o && o[k]) ? "list capped" : ""; }
 
-let memToken = "";   // fallback when localStorage is blocked, so a token entered this session still works
-function token() { try { return localStorage.getItem(TKEY) || memToken; } catch (e) { return memToken; } }
-function setToken(t) { memToken = t; try { localStorage.setItem(TKEY, t); } catch (e) {} }
+function render(d) {
+  document.body.classList.remove("stale");
+  const m = $("main"); m.replaceChildren();
+  const errors = d.errors || [];
+  const bySrc = (p) => errors.filter(e => e && typeof e.source === "string" && (e.source === p || e.source.indexOf(p + "/") === 0));
+  add(m, section("Errors (" + errors.length + ")"));
+  const ec = el("div", "card" + (errors.length ? " errors" : ""));
+  if (errors.length) { const ul = el("ul"); errors.forEach(e => add(ul, el("li", "err", errText(e)))); add(ec, ul); }
+  else add(ec, el("div", "sub", "none: every source answered"));
+  add(m, ec);
 
-async function load() {
-  const t = token();
-  if (!t) { $("#gate").hidden = false; $("#main").hidden = true; return; }
+  add(m, section("Resources (% left)"));
+  const lanes = el("div", "grid");
+  (d.lanes || []).forEach(l => {
+    let sub = l.account ? "account " + l.account : "";
+    if (l.shared_with && l.shared_with.length) sub = (sub ? sub + " · " : "") + "shared with " + l.shared_with.join(", ");
+    const c = card(l.label || l.lane, sub);
+    if (l.stale) c.classList.add("stale");
+    add(c, el("div", "big", pct(l.left_pct)), bar(l.left_pct));
+    (l.windows || []).forEach(w => { const left = (typeof w.headroom_pct === "number") ? w.headroom_pct : w.left_pct;
+      add(c, el("div", "sub", (w.window || "window") + (w.pool && w.pool !== "all" ? " [" + w.pool + "]" : "") + ": " + pct(left) + " left" +
+        (w.resets_at ? " · resets " + w.resets_at : "") + (w.stale ? " (stale)" : ""))); });
+    Object.entries(l.pools || {}).forEach(([p, v]) => add(c, el("div", "sub", "pool " + p + ": " + pct(v) + " left")));
+    add(c, el("div", "sub", "sample " + age(l.sample_age_s) + " old" + (l.stale ? " (stale)" : "")));
+    if (l.error) add(c, el("div", "sub err", "error: " + l.error));
+    errors.filter(e => e && e.source === "scarcity/" + l.lane).forEach(e => add(c, el("div", "sub err", errText(e))));
+    add(lanes, c);
+  });
+  if (!(d.lanes || []).length) {
+    const se = bySrc("scarcity");
+    add(lanes, el("div", se.length ? "sub err" : "sub", "no lane readings" + (se.length ? " (" + se.map(errText).join("; ") + ")" : "")));
+  }
+  add(m, lanes);
+
+  const r = d.routed || {};
+  add(m, section("Routed calls"));
+  const cols = el("div", "cols");
+  const lm = [{h: "lane", v: x => x.lane}, {h: "model", v: x => x.model}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}];
+  add(cols, add(card("Today", capped(r, ["today_truncated"])), table(r.today || [], lm, x => x.calls)));
+  add(cols, add(card("Last 7 days", capped(r, ["last_7d_truncated"])), table(r.last_7d || [], lm, x => x.calls)));
+  add(cols, add(card("Top S1 bands (7 d)", capped(r, ["bands_truncated"])), table(r.top_bands_7d || [], [{h: "band", v: x => x.band}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}], x => x.calls)));
+  add(cols, add(card("This provider since start"), countTable(r.provider_since_start, "lane/model")));
+  add(m, cols);
+
+  const lg = d.ledger || {};
+  add(m, section("Tokens (usage ledger)"));
+  const lc = el("div", "cols");
+  const tm = [{h: "lane", v: x => x.lane}, {h: "model", v: x => x.model}, {h: "turns", num: true, v: x => x.turns},
+    {h: "in", num: true, v: x => tok(x.input_tokens)}, {h: "out", num: true, v: x => tok(x.output_tokens)},
+    {h: "cache r", num: true, v: x => tok(x.cache_read_tokens)}, {h: "cache w", num: true, v: x => tok(x.cache_write_tokens)}];
+  add(lc, add(card("Today", capped(lg, ["today_truncated"])), table(lg.today || [], tm)));
+  add(lc, add(card("Last 7 days", capped(lg, ["last_7d_truncated"])), table(lg.last_7d || [], tm)));
+  add(m, lc);
+
+  add(m, section("Refusals, child tasks, bots, S1"));
+  const h = el("div", "cols");
+  const rf = d.refusals || {};
+  add(h, add(card("Refusals (24 h)", "total " + (rf.total || 0)), countTable(rf.by_reason, "reason")));
+  const ct = d.child_tasks || {};
+  const ctSub = [ct.truncated ? "log tail clipped" : "", ct.unparsable_lines ? ct.unparsable_lines + " unparsable lines" : ""].filter(Boolean).join(" · ");
+  add(h, add(card("Child tasks (7 d)", ctSub), countTable(ct.by_client, "client"), countTable(ct.by_status, "status"), countTable(ct.by_event, "event")));
+  const bt = d.bots || {};
+  const btSub = ["calls " + (bt.calls || 0), bt.truncated ? "log tail clipped" : "", bt.unparsable_lines ? bt.unparsable_lines + " unparsable lines" : ""].filter(Boolean).join(" · ");
+  add(h, add(card("Bot gateway (7 d)", btSub), countTable(bt.by_client, "client"), countTable(bt.by_tool, "tool"), countTable(bt.by_outcome, "outcome")));
+  const s1 = d.s1 || {};
+  const s1c = card("S1 scorer", typeof s1.status === "number" ? "HTTP " + s1.status : "");
+  add(s1c, el("div", "big" + (s1.available ? "" : " err"), s1.available ? "up" : "down"));
+  if (s1.reason) add(s1c, el("div", "sub err", s1.reason));
+  if (typeof s1.latency_ms === "number") add(s1c, el("div", "sub", "latency " + Math.round(s1.latency_ms) + " ms"));
+  add(h, s1c);
+  add(m, h);
+
+  add(m, section("Hardware"));
+  const hw = el("div", "grid");
+  (d.hardware || []).forEach(x => { const v = x.data || {};
+    const c = card(typeof v.host === "string" ? v.host : x.file, typeof v.chip === "string" ? v.chip : "");
+    ["cpu_busy_pct", "gpu_busy_pct"].forEach(k => { const n = k === "cpu_busy_pct" ? "CPU busy" : "GPU busy";
+      if (typeof v[k] === "number") add(c, el("div", "sub", n + " " + pct(v[k])), bar(v[k])); else hwLine(c, n, v[k]); });
+    hwLine(c, "memory available", v.mem_available_bytes, gb);
+    hwLine(c, "memory total", v.mem_total_bytes, gb);
+    hwLine(c, "load", v.load_avg, a => Array.isArray(a) ? a.map(n => typeof n === "number" ? n.toFixed(2) : "–").join(" ") : a);
+    const hr = v.headroom;
+    if (hr && typeof hr === "object") {
+      hwLine(c, "free memory", hr.free_mem_gb, n => n + " GB");
+      hwLine(c, "CPU idle", hr.cpu_idle_pct, pct);
+      hwLine(c, "GPU idle", hr.gpu_idle_pct, pct);
+    }
+    const om = v.ollama_models;
+    if (off(om)) hwLine(c, "Ollama", om);
+    else add(c, el("div", "sub", "Ollama: " + ((om || []).length ? om.map(o => (o && o.name) || "?").join(", ") : "none resident")));
+    (v.errors || []).forEach(e => add(c, el("div", "sub err", "error " + (e.field || "unknown") + ": " + (e.error || "error"))));
+    bySrc("hardware/" + x.file).forEach(e => add(c, el("div", "sub err", errText(e))));
+    add(c, el("div", "sub", "sample " + age(x.age_s) + " old"));
+    add(hw, c);
+  });
+  if (!(d.hardware || []).length) {
+    const he = bySrc("hardware");
+    add(hw, el("div", he.length ? "sub err" : "sub", "no hardware samples" + (he.length ? " (" + he.map(errText).join("; ") + ")" : "")));
+  }
+  add(m, hw);
+
+  add(m, section("Notes"));
+  const notes = el("ul"); (d.notes || []).forEach(n => add(notes, el("li", null, n)));
+  add(m, add(el("div", "card"), notes));
+  lastOk = new Date();
+  const st = $("status"); st.className = errors.length ? "err" : "";
+  st.textContent = "updated " + new Date().toLocaleTimeString() + (d.generated_at ? " · generated " + when(d.generated_at) : "") +
+    (errors.length ? " · " + errors.length + " error" + (errors.length === 1 ? "" : "s") : "");
+}
+
+function showLogin(msg) {
+  if (timer) { clearInterval(timer); timer = null; }
+  $("main").hidden = true; $("logout").hidden = true; $("login").hidden = false;
+  $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
+}
+async function refresh() {
+  const t = getTok(); if (!t) return showLogin();
   try {
-    const r = await fetch("/resources", { headers: { "authorization": "Bearer " + t } });
-    if (r.status === 401) { $("#err").textContent = "Token rejected. Enter it again."; $("#gate").hidden = false; $("#main").hidden = true; return; }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const snap = await r.json();
-    $("#err").textContent = "";
-    $("#gate").hidden = true; $("#main").hidden = false;
-    render(snap);
-    $("#stamp").textContent = "updated " + new Date().toLocaleTimeString();
-  } catch (e) {
-    $("#err").textContent = "Could not reach the provider (" + e.message + ").";
-  }
+    const res = await fetch(URL_, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+    if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
+    if (!res.ok) return failed("error " + res.status);
+    render(await res.json());
+  } catch (e) { failed("fetch failed: " + (e && e.message ? e.message : e)); }
 }
-
-function render(s) {
-  const u = s.usage || {}, subs = s.subscriptions || {}, dev = s.devices || {};
-  const errs = [u.error && ("usage: " + u.error), subs.error && ("subscriptions: " + subs.error)].filter(Boolean);
-  const lat = u.s1_latency_ms || {};
-  const deg = u.degraded || {};
-  const bands = Object.entries(u.by_band || {}).map(([b, n]) => `<span class="chip">${esc(b)} · ${num(n)}</span>`).join("") || "—";
-  const lanes = Object.entries(u.by_lane || {}).sort((a, b) => b[1] - a[1]).map(([l, n]) => `<span class="chip">${esc(l)} · ${num(n)}</span>`).join("") || "—";
-  const recent = (u.recent || []).map(r => `<tr><td>${new Date((r.ts||0)*1000).toLocaleTimeString()}</td><td>${esc(r.band)}</td><td>${esc(r.lane)}/${esc(r.model)}</td><td>${r.degraded ? '<span class="chip bad">degraded</span>' : ''}</td><td class="mut">${num(r.response_chars)} ch</td></tr>`).join("");
-
-  const subCards = Object.entries(subs).filter(([k]) => k !== "error").map(([lane, h]) => {
-    const w = h.tightest || {};
-    const cls = h.ok === false ? "bad" : (h.expiring_pct > 10 ? "warn" : "ok");
-    return `<div class="card"><h3>${esc(lane)}</h3>
-      <div class="row"><span class="mut">scarcity</span><span>${num(h.scarcity)}</span></div>
-      <div class="row"><span class="mut">expiring</span><span class="${h.expiring_pct>10?'fit':''}">${pct(h.expiring_pct)}</span></div>
-      ${w.window ? `<div class="row"><span class="mut">${esc(w.window)}</span><span>${pct(w.used_pct)} used / ${pct(w.elapsed_pct)} elapsed</span></div>` : ""}
-      ${w.resets_at ? `<div class="row"><span class="mut">resets</span><span>${esc(w.resets_at)}</span></div>` : ""}
-      <span class="chip ${cls}">${h.ok === false ? "spent" : "ok"}</span></div>`;
-  }).join("") || '<p class="mut">No subscription readings cached yet.</p>';
-
-  let devHtml;
-  if (dev.status === "ok") {
-    devHtml = (dev.nodes || []).map(n => `<div class="card"><h3>${esc(n.id)} <span class="mut">${esc(n.role)||""}</span></h3>
-      <div class="row"><span class="mut">status</span><span class="${n.status==='online'?'fit':''}">${esc(n.status)}</span></div>
-      <div class="row"><span class="mut">GPU headroom</span><span>${gib(n.gpu_headroom_estimate_bytes)}</span></div>
-      <div class="row"><span class="mut">GPU util</span><span>${pct(n.gpu_utilization_pct)}</span></div>
-      <div>${(n.fits||[]).map(m=>`<span class="chip fit">${esc(m)}</span>`).join("") || '<span class="mut">nothing fits</span>'}</div></div>`).join("")
-      + `<div class="card"><h3>pool</h3><div class="row"><span class="mut">headroom</span><span>${gib(dev.pool_headroom_estimate_bytes)}</span></div>
-         <div>${(dev.pool_fits||[]).map(m=>`<span class="chip fit">${esc(m)}</span>`).join("") || '<span class="mut">—</span>'}</div></div>`;
-  } else {
-    devHtml = `<p class="mut">Devices ${esc(dev.status)}${dev.error ? ": " + esc(dev.error) : ""}. Set CORTADOS_LOCAL_RESOURCES_CONFIG on the provider to meter local compute.</p>`;
-  }
-
-  $("#main").innerHTML = `
-    ${errs.length ? `<p class="chip bad">${errs.map(esc).join(" · ")}</p>` : ""}
-    <section><h2>Usage</h2>
-      <div class="grid">
-        <div class="card"><div class="mut">routes logged</div><div class="big">${num(u.total_routes)}</div></div>
-        <div class="card"><div class="mut">degraded</div><div class="big">${num(deg.count ?? 0)}<span class="mut" style="font-size:14px"> / ${num(deg.of ?? 0)}</span></div></div>
-        <div class="card"><div class="mut">S1 latency</div><div class="big">${num(lat.median)}<span class="mut" style="font-size:14px"> ms median</span></div><div class="mut">p90 ${num(lat.p90)} ms${lat.window?` · last ${num(lat.window)}`:""}</div></div>
-      </div>
-      <p>${bands}</p><p>${lanes}</p>
-      ${recent ? `<table><thead><tr><th>time</th><th>band</th><th>route</th><th></th><th>size</th></tr></thead><tbody>${recent}</tbody></table>` : ""}
-    </section>
-    <section><h2>Subscriptions</h2><div class="grid">${subCards}</div></section>
-    <section><h2>Devices &amp; model fit <span class="mut" style="text-transform:none">(estimate — weights only, not an admission promise)</span></h2><div class="grid">${devHtml}</div></section>`;
+// A failed poll leaves the last good view on screen, greyed, with the failure in red: never shown as current.
+function failed(msg) {
+  document.body.classList.add("stale");
+  const st = $("status"); st.className = "err";
+  st.textContent = msg + (lastOk ? " · showing data from " + lastOk.toLocaleTimeString() : "");
 }
-
-$("#save").addEventListener("click", () => { const v = $("#token").value.trim(); if (v) { setToken(v); $("#token").value = ""; load(); } });
-$("#refresh").addEventListener("click", load);
-load();
-timer = setInterval(load, 20000);
+function start() { $("login").hidden = true; $("main").hidden = false; $("logout").hidden = false; refresh(); if (!timer) timer = setInterval(refresh, EVERY); }
+$("login").addEventListener("submit", (ev) => { ev.preventDefault(); const t = $("tok").value.trim(); if (!t) return; setTok(t); start(); });
+$("logout").addEventListener("click", () => { setTok(""); showLogin("Token forgotten."); });
+if (getTok()) start(); else showLogin();
 </script>
 </body>
 </html>

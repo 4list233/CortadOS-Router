@@ -23,6 +23,8 @@ P2: the route's provider picks the backend (SESSION_FACTORIES): `claude-cli` run
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -33,6 +35,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -141,11 +144,90 @@ _DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 _dashboard_cache: dict = {}
 
 
+# The page holds no data or secret, so it needs no token; these headers keep it from being cached, framed, sniffed as
+# another type, or sending its Referer. Its Content-Security-Policy is _dashboard_csp(): it pins the one inline script.
+DASHBOARD_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+# script-src carries only the hash of the page's own inline script (no 'unsafe-inline'): markup injected into the page
+# could not run a script. base-uri/form-action/frame-ancestors 'none': no base rewrite, no form post, no framing.
+_DASHBOARD_CSP = ("default-src 'none'; script-src '{h}'; style-src 'unsafe-inline'; connect-src 'self'; "
+                  "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+class _ScriptPage(HTMLParser):
+    """The page's one inline script, as an HTML parser sees it: the parser is the only source of both the count and the
+    hashed body, so a decoy in a comment, an attribute or a CDATA section can neither be counted nor be hashed in
+    place of the script that runs. Tag names are lowercased by the parser, so any case counts."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.n = 0
+        self.inside = False
+        self.closed = False
+        self.parts: list[str] = []
+        self.bad: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script":
+            self.n += 1
+            self.inside = True
+            if attrs:   # src= would load another script; any attribute is outside what the page needs
+                self.bad = self.bad or "script tag with attributes"
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "script":
+            self.n += 1
+            self.bad = self.bad or "self-closing script tag"
+
+    def handle_data(self, data):
+        if self.inside:
+            self.parts.append(data)   # script content arrives raw (CDATA mode), possibly in several chunks
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.inside:
+            self.inside, self.closed = False, True
+
+
+def _dashboard_script(page: bytes) -> str:
+    """The body of the page's single inline <script>, or ValueError: any count but one, attributes, a self-closing or
+    unclosed script, undecodable bytes, or markup the parser cannot handle."""
+    p = _ScriptPage()
+    try:
+        p.feed(page.decode("utf-8"))   # UnicodeDecodeError is a ValueError
+        p.close()
+    except (NotImplementedError, AssertionError) as exc:
+        # Python 3.9's HTMLParser raises these on malformed declarations (`<![bogus]>`); unhandled, the request thread
+        # dies and the client sees a dropped connection instead of a 500
+        raise ValueError(f"dashboard page markup not parseable: {type(exc).__name__}") from exc
+    if p.n != 1:
+        raise ValueError(f"dashboard page must hold exactly one inline <script>, found {p.n}")
+    if p.bad:
+        raise ValueError(f"dashboard page: {p.bad}")
+    if p.inside or not p.closed:
+        raise ValueError("dashboard page: unclosed script")
+    return "".join(p.parts)
+
+
 def _dashboard_html() -> bytes:
-    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /resources)."""
+    """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage).
+    Read once with its CSP: the page must hold exactly one inline <script>, whose sha256 (of the body the parser
+    found, UTF-8 encoded as the browser hashes it) the CSP pins."""
     if "b" not in _dashboard_cache:
-        _dashboard_cache["b"] = _DASHBOARD_PATH.read_bytes()
+        b = _DASHBOARD_PATH.read_bytes()
+        body = _dashboard_script(b)
+        digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode()
+        _dashboard_cache["csp"] = _DASHBOARD_CSP.format(h=f"sha256-{digest}")
+        _dashboard_cache["b"] = b
     return _dashboard_cache["b"]
+
+
+def _dashboard_csp() -> str:
+    """The Content-Security-Policy for the page _dashboard_html() returned."""
+    _dashboard_html()
+    return _dashboard_cache["csp"]
 # SSE pings while a turn runs, so the client's read timeout does not fire during a long think.
 PING_S = 10.0
 # Seconds a socket read or write may block (http.server applies it to the connection). A client that stops reading
@@ -921,12 +1003,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
             try:
-                html = _dashboard_html()                # static page; the data it shows (/resources) still needs the token
-            except OSError:
+                html = _dashboard_html()                # static page; the data it shows (/v1/cortados/usage) still needs the token
+                csp = _dashboard_csp()
+            except (OSError, ValueError) as exc:
+                logger.warning("dashboard page unavailable: %s", type(exc).__name__)
                 return self._error(500, "api_error", "dashboard page unavailable")
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(html)))
+            for k, v in DASHBOARD_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Security-Policy", csp)
             self.end_headers()
             self.wfile.write(html)
             return
