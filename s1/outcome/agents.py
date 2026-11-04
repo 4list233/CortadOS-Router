@@ -39,6 +39,8 @@ CLAUDE_SETTINGS = {"disableAllHooks": True,
 CODEX_TASK_TOOL_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty")
 MOCK_SERVER = str(Path(__file__).with_name("mock_tools.py"))
 FINAL_TEXT_CHARS = 4000
+# A provider 429 as the Claude CLI reports it ("API Error: 429 ...", or a JSON status 429).
+QUOTA_429_RE = re.compile(r"(API Error:?\s*429|\"status\"\s*:\s*429|rate_limit_error)")
 
 
 def claude_bin() -> str:
@@ -50,7 +52,9 @@ def codex_bin() -> str:
 
 
 def child_env(extra: dict | None = None) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV}
+    # ANTHROPIC_CUSTOM_HEADERS is never inherited: the child gets exactly the loop's own headers (provider_env) or none,
+    # so an ambient header can neither loosen nor confuse the provider's floor and run attribution.
+    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV and k != "ANTHROPIC_CUSTOM_HEADERS"}
     env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:" + env.get("PATH", "")
     env.update(extra or {})
     return env
@@ -105,7 +109,8 @@ def provider_env(run_id: str) -> dict:
     from outcome import provider
     url, token = provider.config()
     return {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token,
-            "ANTHROPIC_CUSTOM_HEADERS": f"x-cortados-run-id: {run_id}\nx-cortados-reveal: 1"}
+            "ANTHROPIC_CUSTOM_HEADERS": f"x-cortados-run-id: {run_id}\nx-cortados-reveal: 1\n"
+                                        f"{provider.MIN_LEFT_HEADER}: {provider.MIN_LEFT_HEADER_VALUE}"}
 
 
 def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: list, timeout_s: int) -> dict:
@@ -140,6 +145,10 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                          served_lane=provider.lane_of(served, lane))
             if served:                                 # the serving lane's headroom feeds provider.admit for later bands
                 provider._record(trace["served_lane"], model, trace.get("left_pct"), served)
+            elif (code != 0 or trace.get("is_error")) and _quota_refusal(out, err):
+                # A ladder run refused for quota (usage limit, quota exhausted, provider 429) with no reveal: a durable
+                # spent hold on the requested lane, so the next admission cannot pass on an older healthy reading.
+                provider._record(lane, model, None, f"ladder run refused for quota: {(err or out)[-200:]}", spent=True)
         elif lane == "claude":
             code, out, err, secs = _run(_claude_argv(model, calls, outward_tools), cwd=workspace, timeout=timeout_s, stdin=prompt,
                                         env=child_env({"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch}))
@@ -165,6 +174,13 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
         containment.sweep(claude_scratch)
         shutil.rmtree(claude_scratch, ignore_errors=True)
         shutil.rmtree(journal_dir, ignore_errors=True)
+
+
+def _quota_refusal(out: str, err: str) -> bool:
+    """A failed run's output names a quota refusal (only failed runs are checked: a task's own text may say "quota")."""
+    import label
+    tail = f"{out[-4000:]}\n{err[-4000:]}"
+    return bool(label.QUOTA_RE.search(tail) or QUOTA_429_RE.search(tail))
 
 
 def _claude_argv(model: str, calls: str, outward_tools: list) -> list:

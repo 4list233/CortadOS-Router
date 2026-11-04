@@ -235,6 +235,24 @@ def _exclude_model_header(headers) -> tuple[str | None, bool]:
     return ",".join(items), valid
 
 
+# Request header carrying the client's own quota floor: a percentage of weekly headroom below which the provider must not
+# serve the request on an account (routing.min_left_block). It only tightens; absent, routing is exactly as before.
+MIN_LEFT_HEADER = "x-cortados-min-left-pct"
+_MIN_LEFT_BAD = "cortados: x-cortados-min-left-pct is not a number from 0 to 100"
+
+
+def _min_left_header(headers) -> tuple[float | None, bool]:
+    """(floor, valid) of the x-cortados-min-left-pct header; (None, True) when absent or empty."""
+    raw = (headers.get(MIN_LEFT_HEADER) or "").strip()
+    if not raw:
+        return None, True
+    try:
+        v = float(raw)
+    except ValueError:
+        return None, False
+    return (v, True) if 0.0 <= v <= 100.0 else (None, False)
+
+
 # Request header naming the client's run (the routed-subagents mod runs each subagent as a headless `claude -p`, whose
 # JSON output names only `cortados`): every routed request of the run is recorded under it, and
 # GET /v1/cortados/runs/<id> tells the client which model really ran (to label it, and to keep a later review off it).
@@ -1290,9 +1308,13 @@ class Handler(BaseHTTPRequestHandler):
                 exclude, valid = _exclude_model_header(self.headers)   # read for a new conversation only
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
+                floor, valid = _min_left_header(self.headers)
+                if not valid:
+                    return self._error(400, "invalid_request_error", _MIN_LEFT_BAD, wire)
                 try:
                     route = reg.router(wire.routing_body(body), self._client(),
-                                       **({"exclude_model": exclude} if exclude else {}))
+                                       **({"exclude_model": exclude} if exclude else {}),
+                                       **({"min_left_pct": floor} if floor is not None else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
@@ -1302,6 +1324,9 @@ class Handler(BaseHTTPRequestHandler):
                         # It names the client's own pin or exclusion, request-derived: the record keeps the fixed reason.
                         return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire,
                                            reason="the pin or exclusion names no model this endpoint can serve")
+                    if route.get("quota_blocked"):      # the client's x-cortados-min-left-pct floor excluded every account
+                        return self._error(429, "rate_limit_error", f"cortados: {route['error']}", wire,
+                                           reason="no account is above the client's quota floor")
                     if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
                         return self._error(413, "request_too_large", f"cortados: {route['error']}", wire,
                                            reason="the request is larger than every eligible model's context")
@@ -1609,9 +1634,9 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client, exclude_model=None):
+        def router(body, client, exclude_model=None, min_left_pct=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin, exclude_model=exclude_model)
+                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])

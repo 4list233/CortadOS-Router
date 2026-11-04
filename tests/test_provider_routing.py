@@ -477,6 +477,69 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertIn("unreadable", self.pin("sub/opus")["error"])
 
 
+class MinLeftFloorTests(unittest.TestCase):
+    """x-cortados-min-left-pct: accounts below the client's floor are excluded before ranking; absent = unchanged."""
+
+    def setUp(self):
+        self._keep = (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings)
+        core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-floor-"))
+        core.lane_health = lambda: {}
+        core.decide = lambda text, ctx=None: (_ for _ in ()).throw(AssertionError("pin must not be scored"))
+        core._vendor_accounts = lambda *a: [
+            {"lane": "claude", "provider": "claude-cli", "account": "a", "reserve": False, "config_dir": "/x/a"},
+            {"lane": "claude#b", "provider": "claude-cli#b", "account": "b", "reserve": True, "config_dir": "/x/b"}]
+
+    def tearDown(self):
+        (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings) = self._keep
+
+    def readings(self, a_used, b_used, fable_a=None):
+        wa = [{"window": "week", "pool": "all", "used_pct": a_used, "headroom_pct": None, "reset_epoch": 9e9, "stale": False}]
+        if fable_a is not None:
+            wa.append({"window": "week_fable", "pool": "fable", "used_pct": fable_a, "headroom_pct": None,
+                       "reset_epoch": 9e9, "stale": False})
+        wb = [{"window": "week", "pool": "all", "used_pct": b_used, "headroom_pct": None, "reset_epoch": 9e9, "stale": False}]
+        core.subscription_readings = lambda: {"claude": {"fetched_at": 1, "failed": False, "windows": wa},
+                                              "claude#b": {"fetched_at": 1, "failed": False, "windows": wb}}
+
+    def pin(self, model, floor=None):
+        body = {"model": model, "messages": [{"role": "user", "content": "x"}]}
+        return routing.choose(core, body, client="claude-cli", conversation_id="c", claude_bin="python3",
+                              codex_bin="python3", **({"min_left_pct": floor} if floor is not None else {}))
+
+    def test_absent_header_keeps_todays_choice(self):
+        self.readings(97, 60)
+        core.subscription_readings = lambda: (_ for _ in ()).throw(AssertionError("no floor: readings not consulted"))
+        self.assertEqual(self.pin("sub/opus")["provider"], "claude-cli")     # reserve spared, as before
+
+    def test_floor_excludes_the_low_account_before_ranking(self):
+        self.readings(97, 60)
+        r = self.pin("sub/opus", 5)
+        self.assertEqual(r["provider"], "claude-cli#b")                     # the reserve serves; the 3%-left one does not
+        self.assertTrue(any("x-cortados-min-left-pct" in h for h in r["route"]["hard_rules"]))
+
+    def test_floor_with_no_account_left_is_a_quota_refusal(self):
+        self.readings(97, 99)
+        r = self.pin("sub/opus", 5)
+        self.assertTrue(r.get("quota_blocked"))
+        self.assertIn("x-cortados-min-left-pct", r["error"])
+
+    def test_floor_reads_the_models_own_pool(self):
+        self.readings(10, 99, fable_a=98)
+        r = self.pin("sub/fable", 5)
+        self.assertTrue(r.get("quota_blocked"))
+        self.assertIn("week_fable", r["error"])
+
+    def test_floor_excludes_an_account_with_no_reading(self):
+        core.subscription_readings = lambda: {"claude#b": {"fetched_at": 1, "failed": False, "windows": [
+            {"window": "week", "pool": "all", "used_pct": 10, "headroom_pct": None, "reset_epoch": 9e9, "stale": False}]}}
+        self.assertEqual(self.pin("sub/opus", 5)["provider"], "claude-cli#b")
+
+    def test_floor_only_tightens_a_spent_account_stays_out(self):
+        self.readings(10, 10)
+        core.lane_health = lambda: {"claude": {"ok": False, "why": "spent", "pools": {}, "config_dir": "/x/a"}}
+        self.assertEqual(self.pin("sub/opus", 0)["provider"], "claude-cli#b")
+
+
 class ExcludeModelTests(unittest.TestCase):
     """x-cortados-exclude-model: a new conversation stays off one model, so a review never runs on its builder's model."""
 

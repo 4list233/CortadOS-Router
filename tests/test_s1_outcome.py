@@ -194,6 +194,9 @@ FAKE_CLAUDE = textwrap.dedent("""\
     if os.environ.get("FAKE_REVEAL"):
         msg["model"] = os.environ["FAKE_REVEAL"]
     print(json.dumps({{"type": "assistant", "message": msg}}))
+    if os.environ.get("FAKE_QUOTA"):
+        print(json.dumps({{"type": "result", "result": "Usage limit reached; quota exhausted", "is_error": True}}))
+        sys.exit(1)
     print(json.dumps({{"type": "result", "result": "Created solution.txt", "num_turns": 2, "usage": {{"output_tokens": 5}}}}))
     """)
 
@@ -235,10 +238,30 @@ class RunTests(OutcomeCase):
         for key in agents.SCRUBBED_ENV:
             self.assertNotIn(key, env)
 
-    def _provider_mode(self, reveal):
+    def _provider_mode(self, reveal, **extra):
         p = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_BACKEND": "provider", "CORTADOS_PROVIDER_URL": "http://prov:8432/",
-                                         "CORTADOS_PROVIDER_TOKEN": "ptok", "FAKE_REVEAL": reveal})
+                                         "CORTADOS_PROVIDER_TOKEN": "ptok", "FAKE_REVEAL": reveal, **extra})
         p.start(); self.addCleanup(p.stop)
+        for k in [k for k in os.environ if k.startswith("ANTHROPIC_")]:   # ambient ANTHROPIC_* of the test's own shell
+            del os.environ[k]
+        os.environ["ANTHROPIC_CUSTOM_HEADERS"] = "x-ambient: leaked"         # must be replaced, never inherited
+
+    def test_provider_mode_child_gets_exactly_the_loops_headers(self):
+        self._provider_mode("gpt-6-astra · 48% left")
+        run.run_one(_spec(), {"band": "R1", "route": {"lane": "codex", "provider": "codex-cli", "model": "gpt-6-astra"}})
+        hdrs = self._dump()["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n")
+        self.assertEqual(sorted(h.split(":")[0] for h in hdrs),
+                         ["x-cortados-min-left-pct", "x-cortados-reveal", "x-cortados-run-id"])
+        self.assertIn("x-cortados-min-left-pct: 5", hdrs)
+
+    def test_provider_mode_ladder_quota_refusal_writes_a_spent_hold(self):
+        self._provider_mode("", FAKE_QUOTA="1")
+        from outcome import provider, store
+        run.run_one(_spec(), self._rung())
+        rows = [r for r in store.read("provider_headroom") if r.get("spent")]
+        self.assertEqual([r["lane"] for r in rows], ["claude"])
+        _set_resources(provider, _readings(claude=50))   # sampled before the refusal: cannot clear it
+        self.assertFalse(provider.admit("claude")[0])
 
     def test_provider_mode_runs_a_codex_band_as_a_claude_session_pinned_through_the_provider(self):
         self._provider_mode("gpt-6-astra · 48% left")
@@ -741,6 +764,49 @@ class ProviderBackendTests(OutcomeCase):
                 seen.append((req.full_url, _j.loads(req.data), dict(req.header_items())))
             return R(_j.dumps({"model": served, "content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}).encode())
         return op
+
+    def test_every_call_carries_the_min_left_header(self):
+        seen = []
+        self.p.ask("claude", "claude-fable-5-1", "sys", "u", urlopen=self._urlopen("claude-fable-5-1 · 61% left", "hi", seen))
+        self.assertEqual(seen[0][2].get("X-cortados-min-left-pct"), "5")
+
+    def test_admissions_reserve_and_status_does_not(self):
+        _set_resources(self.p, _readings(claude=8))       # 8 % left: three 1 % calls fit above the 5 % floor, not four
+        for _ in range(3):
+            self.p.status()
+        self.assertEqual([self.p.admit("claude")[0] for _ in range(4)], [True, True, True, False])
+        self.assertIn("outstanding", self.p.admit("claude")[1])
+
+    def test_a_carried_forward_low_model_pool_holds_an_absent_one_falls_back(self):
+        snap = _readings(claude=50)
+        w = snap["readings"]["claude"]["windows"]
+        w.append({"window": "week (fable)", "pool": "fable", "used_pct": 98, "headroom_pct": 2,
+                  "reset_epoch": w[0]["reset_epoch"], "stale": True})
+        _set_resources(self.p, snap)
+        ok, why = self.p.admit("claude", "claude-fable-5-1", reserve=False)
+        self.assertFalse(ok); self.assertIn("carried-forward", why)
+        w.pop()
+        _set_resources(self.p, snap)
+        ok, why = self.p.admit("claude", "claude-fable-5-1", reserve=False)
+        self.assertTrue(ok); self.assertIn("panel missing", why)
+
+    def test_cached_readings_keep_ageing(self):
+        import time as _t
+        snap = _readings(claude=50)
+        now = _t.time()
+        self.p._resources_cache.update(at=now, snap=snap, local_at=now)
+        self.assertTrue(self.p.admit("claude", now=now + 30, reserve=False)[0])
+        # Within the cache TTL nothing is re-read, but an hour later (simulated by an old local fetch) the reading is old.
+        self.p._resources_cache.update(at=now + 3600, local_at=now)
+        ok, why = self.p.admit("claude", now=now + 3600, reserve=False)
+        self.assertFalse(ok); self.assertIn("no fresh usage reading", why)
+
+    def test_unknown_reset_holds(self):
+        snap = _readings(claude=50)
+        snap["readings"]["claude"]["windows"][0]["reset_epoch"] = None
+        _set_resources(self.p, snap)
+        ok, why = self.p.admit("claude", reserve=False)
+        self.assertFalse(ok); self.assertIn("reset time unknown", why)
 
     def test_enabled_only_with_a_url_and_not_forced_local(self):
         self.assertTrue(self.p.enabled())

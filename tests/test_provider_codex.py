@@ -149,6 +149,22 @@ class CodexEndpointTests(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())["error"]
 
+    def test_the_min_left_header_reaches_the_router_and_its_block_is_a_429(self):
+        seen = []
+        self.reg.router = lambda body, client, **kw: seen.append(kw) or dict(self.route)
+        h = provider_server.MIN_LEFT_HEADER
+        body = {"model": "sub/opus", "tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self.send_with(body, {})[0], 200)
+        self.assertEqual(seen, [{}])                          # absent header: the router call is exactly as before
+        self.assertEqual(self.send_with(body, {h: "5"})[0], 200)
+        self.assertEqual(seen[-1], {"min_left_pct": 5.0})
+        for bad in ("abc", "-1", "101"):
+            code, err = self.send_with(body, {h: bad})
+            self.assertEqual((code, err["type"]), (400, "invalid_request_error"), bad)
+        self.reg.router = lambda body, client, **kw: {"error": "below floor", "quota_blocked": True}
+        code, err = self.send_with(body, {h: "5"})
+        self.assertEqual((code, err["type"]), (429, "rate_limit_error"))
+
     def test_an_exclude_header_that_is_not_a_model_id_answers_400(self):
         calls = []
         self.reg.router = lambda body, client, exclude_model=None: calls.append(exclude_model) or dict(self.route)

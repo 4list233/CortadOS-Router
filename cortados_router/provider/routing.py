@@ -258,8 +258,36 @@ def readable_model_name(model: str) -> str:
     return model
 
 
+def min_left_block(core, lane: str, model: str, min_left_pct: float | None, readings: dict | None = None) -> str | None:
+    """Why the account on `lane` may not serve `model` under the client's x-cortados-min-left-pct floor, or None.
+    The floor only tightens: it is applied on top of every existing gate, to the cached reading's current weekly windows
+    that bound the model (general + the model's own pool). An account with no readable weekly figure is excluded too:
+    a floor the provider cannot check would otherwise pass silently (fail closed, the client asked for a guarantee)."""
+    if min_left_pct is None:
+        return None
+    readings = core.subscription_readings() if readings is None else readings
+    reading = readings.get(lane) if isinstance(readings, dict) else None
+    if not isinstance(reading, dict) or reading.get("failed"):
+        return f"no current usage reading to check x-cortados-min-left-pct {min_left_pct:g}"
+    weekly = [w for w in reading.get("windows") or [] if str(w.get("window") or "").startswith("week") and not w.get("stale")]
+    pools = sorted({w.get("pool") for w in weekly if w.get("pool") not in (None, "all")})
+    pool = core._scarcity_module().pool_for(lane, model or "", pools) if pools else None
+    relevant = [w for w in weekly if (w.get("pool") or "all") == "all" or (pool and w.get("pool") == pool)]
+    if not relevant:
+        return f"no current weekly window to check x-cortados-min-left-pct {min_left_pct:g}"
+    for w in relevant:
+        left = w.get("headroom_pct")
+        if left is None and isinstance(w.get("used_pct"), (int, float)):
+            left = 100.0 - float(w["used_pct"])
+        if not isinstance(left, (int, float)):
+            return f"{w.get('window')}: no usage figure to check x-cortados-min-left-pct {min_left_pct:g}"
+        if left < min_left_pct:
+            return f"{w.get('window')}: {left:.0f}% left, below the client's floor x-cortados-min-left-pct {min_left_pct:g}"
+    return None
+
+
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
-                  claude_bin: str = "claude", codex_bin: str = "codex") -> dict[str, Any]:
+                  claude_bin: str = "claude", codex_bin: str = "codex", min_left_pct: float | None = None) -> dict[str, Any]:
     """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
     (a pin that the band would refuse still runs; that is what pinning is for). What stays is the router's accounting
     and safety: only a model the tables serve on claude-cli or codex-cli, only a configured account whose subscription
@@ -336,6 +364,14 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
         return {"router": execution_routing.ROUTER, "fit_blocked": True,
                 "error": f"sub/{model}: the request (≈{need // 1000}k tokens) does not fit any {family} account's "
                          f"input ceiling ({ch_of[id(too_big[0])]['why']})"}
+    floored = []
+    if min_left_pct is not None:                   # the client's floor (x-cortados-min-left-pct): before ranking, only tightens
+        readings = core.subscription_readings()
+        for c in cands:
+            why = min_left_block(core, c["lane"], model, min_left_pct, readings) if ch_of[id(c)].get("ok", True) else None
+            if why:
+                ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
+                floored.append(c)
     ok_of = lambda c: ch_of[id(c)].get("ok", True)
     # Account choice is core's static ranking (core.resolve's unscored path): reserves spared while a non-reserve sibling
     # has room, then expiring credit first and scarce last, then configured order.
@@ -361,7 +397,7 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
                 parts.append(f"{label}: " + "; ".join(f"{c['provider']} ({why_of(c)})" for c in group))
         # The API-credit lane is Anthropic's: there is no api/ pin for a Codex model to point at.
         hint = f"; pin api/{model} to spend API credit instead" if spent and provider == "claude-cli" else ""
-        return {"router": execution_routing.ROUTER,
+        return {"router": execution_routing.ROUTER, **({"quota_blocked": True} if floored else {}),
                 "error": f"sub/{model}: no {family} subscription account can take this request ({' | '.join(parts)}){hint}"}
     chosen = {**live[0], "pool": ch_of[id(live[0])].get("pool")}
     route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
@@ -466,7 +502,8 @@ def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, 
 
 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
-           codex_bin: str = "codex", exclude_model: str | None = None) -> dict[str, Any]:
+           codex_bin: str = "codex", exclude_model: str | None = None,
+           min_left_pct: float | None = None) -> dict[str, Any]:
     """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
     A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
     list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
@@ -494,7 +531,7 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{pinned} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
         r = choose_pinned(core, body, pinned, client=client, conversation_id=conversation_id, claude_bin=claude_bin,
-                          codex_bin=codex_bin)
+                          codex_bin=codex_bin, min_left_pct=min_left_pct)
         if not r.get("error") and hit(r.get("model")):
             # Defence in depth, as on the S1 path: the review guarantee must hold on what was selected, not only on
             # how the client spelled the pin.
@@ -549,4 +586,13 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         return {"router": execution_routing.ROUTER,
                 "error": f"internal: routed to the excluded model {r.get('model')} ({r.get('provider')}); refused "
                          "(x-cortados-exclude-model)"}
+    if min_left_pct is not None and not r.get("error"):
+        # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
+        # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
+        lane = ((r.get("route") or {}).get("chosen") or {}).get("lane") or r.get("lane")
+        why = min_left_block(core, lane, r.get("model") or "", min_left_pct) if lane else \
+            "routed account unknown; cannot check x-cortados-min-left-pct"
+        if why:
+            return {"router": execution_routing.ROUTER, "quota_blocked": True,
+                    "error": f"routed to {r.get('provider')}/{r.get('model')} on {lane}: {why}"}
     return r
