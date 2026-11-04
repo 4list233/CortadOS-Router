@@ -88,7 +88,14 @@ class DashboardTest(unittest.TestCase):
             "two": good.replace("</body>", "<script>alert(1)</script></body>"),
             "upper": good.replace("</body>", "<SCRIPT>alert(1)</SCRIPT></body>"),
             "mixed": good.replace("</body>", "<ScRiPt src=x></sCrIpT></body>"),
-            "only_upper": good.replace("<script>", "<SCRIPT>").replace("</script>", "</SCRIPT>"),
+            "only_upper_attr": good.replace("<script>", "<SCRIPT id=x>"),
+            # decoys: a fake <script> the parser does not see as one, beside the real script that would run
+            "comment_decoy": good.replace("<script>", "<!--<script>decoy</script>--><script id=real>", 1),
+            "attribute_decoy": good.replace("<script>", '<div title="<script>decoy</script>"></div><script id=real>', 1),
+            "cdata_decoy": good.replace("<script>", "<![CDATA[<script>decoy</script>]]><script id=real>", 1),
+            "self_closing": good.replace("</body>", "<script/></body>"),
+            "unclosed": good.replace("</script>", ""),
+            "bogus_decl": good.replace("<body>", "<body><![bogus]>"),   # NotImplementedError inside 3.9's parser
         }
         d = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
         for name, page in cases.items():
@@ -99,6 +106,15 @@ class DashboardTest(unittest.TestCase):
                 urllib.request.urlopen(self.base + "/dashboard", timeout=10)
             self.assertEqual(cm.exception.code, 500, name)
             cm.exception.close()
+        # a comment decoy beside a plain script is served, and the CSP hashes the script that runs, not the decoy
+        f = d / "decoy_ok.html"
+        f.write_text("<!--<script>decoy</script>--><SCRIPT>actual</SCRIPT>")
+        server._DASHBOARD_PATH = f
+        server._dashboard_cache.clear()
+        with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:
+            csp = _csp(r.headers["content-security-policy"])
+        want = base64.b64encode(hashlib.sha256(b"actual").digest()).decode()
+        self.assertEqual(csp["script-src"], [f"'sha256-{want}'"])
         restore()
         with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:   # the real page still serves
             self.assertEqual(r.status, 200)

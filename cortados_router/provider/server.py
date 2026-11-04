@@ -158,33 +158,67 @@ _DASHBOARD_CSP = ("default-src 'none'; script-src '{h}'; style-src 'unsafe-inlin
                   "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-class _ScriptCounter(HTMLParser):
-    """Counts <script> start tags, whatever their case or attributes."""
+class _ScriptPage(HTMLParser):
+    """The page's one inline script, as an HTML parser sees it: the parser is the only source of both the count and the
+    hashed body, so a decoy in a comment, an attribute or a CDATA section can neither be counted nor be hashed in
+    place of the script that runs. Tag names are lowercased by the parser, so any case counts."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.n = 0
+        self.inside = False
+        self.closed = False
+        self.parts: list[str] = []
+        self.bad: str | None = None
 
     def handle_starttag(self, tag, attrs):
         if tag == "script":
             self.n += 1
+            self.inside = True
+            if attrs:   # src= would load another script; any attribute is outside what the page needs
+                self.bad = self.bad or "script tag with attributes"
 
-    handle_startendtag = handle_starttag
+    def handle_startendtag(self, tag, attrs):
+        if tag == "script":
+            self.n += 1
+            self.bad = self.bad or "self-closing script tag"
+
+    def handle_data(self, data):
+        if self.inside:
+            self.parts.append(data)   # script content arrives raw (CDATA mode), possibly in several chunks
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.inside:
+            self.inside, self.closed = False, True
+
+
+def _dashboard_script(page: bytes) -> str:
+    """The body of the page's single inline <script>, or ValueError: any count but one, attributes, a self-closing or
+    unclosed script, undecodable bytes, or markup the parser cannot handle."""
+    p = _ScriptPage()
+    try:
+        p.feed(page.decode("utf-8"))   # UnicodeDecodeError is a ValueError
+        p.close()
+    except (NotImplementedError, AssertionError) as exc:
+        # Python 3.9's HTMLParser raises these on malformed declarations (`<![bogus]>`); unhandled, the request thread
+        # dies and the client sees a dropped connection instead of a 500
+        raise ValueError(f"dashboard page markup not parseable: {type(exc).__name__}") from exc
+    if p.n != 1:
+        raise ValueError(f"dashboard page must hold exactly one inline <script>, found {p.n}")
+    if p.bad:
+        raise ValueError(f"dashboard page: {p.bad}")
+    if p.inside or not p.closed:
+        raise ValueError("dashboard page: unclosed script")
+    return "".join(p.parts)
 
 
 def _dashboard_html() -> bytes:
     """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage).
-    Read once with its CSP: the page must hold exactly one inline <script>, whose sha256 the CSP pins."""
+    Read once with its CSP: the page must hold exactly one inline <script>, whose sha256 (of the body the parser
+    found, UTF-8 encoded as the browser hashes it) the CSP pins."""
     if "b" not in _dashboard_cache:
         b = _DASHBOARD_PATH.read_bytes()
-        # Counted by an HTML parser (it lowercases tag names, so <SCRIPT> and <ScRiPt src=…> count too), and the one
-        # script must also be the exact `<script>…</script>` the hash is taken over: anything else would leave a
-        # second script, or a different body, outside the pin.
-        counter = _ScriptCounter()
-        counter.feed(b.decode("utf-8")); counter.close()
-        scripts = re.findall(rb"<script>(.*?)</script>", b, re.S)
-        if counter.n != 1 or len(scripts) != 1:
-            raise ValueError("dashboard page must hold exactly one inline <script>")
-        digest = base64.b64encode(hashlib.sha256(scripts[0]).digest()).decode()
+        body = _dashboard_script(b)
+        digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode()
         _dashboard_cache["csp"] = _DASHBOARD_CSP.format(h=f"sha256-{digest}")
         _dashboard_cache["b"] = b
     return _dashboard_cache["b"]
