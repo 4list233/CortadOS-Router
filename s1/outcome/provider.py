@@ -6,10 +6,15 @@ scarcity and refuses on its own spent gates. This is the teacher's (s1/label.py)
 same `x-cortados-reveal` headroom answer, same retry classification.
 
 On by default when CORTADOS_PROVIDER_URL is set; CORTADOS_OUTCOME_BACKEND=local forces the old local CLI path. With
-the provider on, the quota door for these calls reads the provider-revealed "% left" of the lane that served the last
-call instead of this machine's usage reading (which on the Studio is missing for Codex and lacks Claude's dropped
-5-hour panel). The 95 % stop rule is kept as "hold below 5 % left". The last-hour-before-reset rule cannot be applied
-here (the reveal carries no reset time); the provider's own gates cover the spent case.
+the provider on, the quota door (`admit`) reads the provider's authenticated GET /resources: the cached usage reading
+of every account the provider can route to (claude, claude#b, codex, ...), window by window (core.subscription_readings).
+A lane is admitted only if one of its accounts has a FRESH reading (< quota.MAX_READING_AGE_S old, last try not
+failed) whose weekly windows for the model (general + the model's own pool) are all >= 5 % left (the 95 % stop rule)
+and none resets within the hour (STOP_HOURS_BEFORE_RESET). /resources unreachable or unreadable: hold (fail closed).
+The per-call reveal ("· N% left", never sent for the codex lane) and a spent refusal are a supplementary signal: they
+open a hold that only a /resources reading sampled AFTER it, showing the lane above the floor, clears; a hold never
+ages into an admit. Known limit: the provider picks the account; the door admits when any account of the lane is above
+the floor, and the provider's ranking prefers the least scarce one.
 """
 from __future__ import annotations
 
@@ -28,9 +33,9 @@ TOKEN_FILE_DEFAULT = Path.home() / ".config/cortados/provider-token"
 TIMEOUT_S = 900
 # Hold a lane once it reports less than this much left: the loop's 95 % stop rule (quota.STOP_PROJECTED_PCT).
 MIN_LEFT_PCT = 100.0 - quota.STOP_PROJECTED_PCT
-# A headroom reading older than the quota module's reading age is not trusted to HOLD forever: past it, the next call
-# re-learns the figure (the provider still refuses a spent account itself).
-MAX_HEADROOM_AGE_S = quota.MAX_READING_AGE_S
+# GET /resources is re-read at most once a minute: the door runs before every band and batch, while the readings
+# behind it change only on the sampler's ~20-minute cycle, so a minute's cache hides nothing and spares the provider.
+RESOURCES_TTL_S = 60
 MAX_TOKENS = 16000
 RUN_ID = f"s1-outcome-{time.strftime('%Y%m%d')}-{os.getpid()}"
 
@@ -102,26 +107,92 @@ def _record(lane: str, model: str, left: float | None, served, spent: bool = Fal
                                        "served": served, "spent": spent})
 
 
-def admit(lane: str, model: str | None = None, now: float | None = None) -> tuple[bool, str]:
-    """The quota door on the provider backend: hold a lane whose last revealed headroom (fresh) is below MIN_LEFT_PCT,
-    was a spent refusal, or was not revealed at all (unknown headroom cannot honour the stop rule; set
-    CORTADOS_OUTCOME_ALLOW_UNREVEALED=1 to continue on the provider's own spent gate). No reading yet: admit — the
-    first call is how the headroom is learned, and the provider refuses a spent account itself."""
+_resources_cache: dict = {"at": 0.0, "snap": None, "local_at": 0.0}
+
+
+def resources(now: float | None = None, urlopen=urllib.request.urlopen) -> tuple[dict | None, str]:
+    """(snapshot, error) of the provider's GET /resources, cached RESOURCES_TTL_S. Any failure is an error, never data."""
     now = time.time() if now is None else now
-    rows = [r for r in store.read("provider_headroom") if r.get("lane") == lane and now - r.get("ts", 0) < MAX_HEADROOM_AGE_S]
-    if not rows:
-        return True, f"{lane}: no fresh provider headroom reading; the provider gates this call"
-    last = rows[-1]
-    if last.get("spent"):
-        return False, f"{lane}: provider refused the last call as spent ({str(last.get('served'))[:120]})"
-    left = last.get("left_pct")
-    if left is None:
-        if os.environ.get("CORTADOS_OUTCOME_ALLOW_UNREVEALED") == "1":
-            return True, f"{lane}: headroom not revealed; continuing on the provider's own gate"
-        return False, f"{lane}: provider did not reveal % left for {last.get('served')}; stop rule cannot be honoured"
-    if left < MIN_LEFT_PCT:
-        return False, f"{lane}: {left:.0f}% left on {last.get('served')} (< {MIN_LEFT_PCT:.0f}%)"
-    return True, f"{lane}: {left:.0f}% left on {last.get('served')}"
+    c = _resources_cache
+    if c["snap"] is not None and 0 <= now - c["at"] < RESOURCES_TTL_S:
+        return c["snap"], ""
+    try:
+        url, token = config()
+        req = urllib.request.Request(url + "/resources", headers={"x-api-key": token, "authorization": f"Bearer {token}"})
+        with urlopen(req, timeout=30) as r:
+            snap = json.loads(r.read().decode("utf-8"))
+        if not isinstance(snap, dict) or not isinstance(snap.get("readings"), dict) or "error" in snap["readings"]:
+            raise ValueError("no per-window readings in /resources (provider older than this loop, or its reading failed)")
+    except (ProviderError, urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError) as exc:
+        return None, f"provider /resources unreadable: {type(exc).__name__}: {str(exc)[:160]}"
+    c.update(at=now, snap=snap, local_at=now)
+    return snap, ""
+
+
+def _pool_of(model: str | None) -> str:
+    return "fable" if "fable" in (model or "").lower() else "all"
+
+
+def _account_verdict(reading: dict, model: str | None, age_s: float) -> tuple[bool, str]:
+    if reading.get("failed"):
+        return False, "last usage try failed"
+    if not isinstance(reading.get("fetched_at"), (int, float)) or not 0 <= age_s < quota.MAX_READING_AGE_S:
+        return False, "no fresh usage reading"
+    weekly = [w for w in reading.get("windows") or [] if str(w.get("window") or "").startswith("week") and not w.get("stale")]
+    general = [w for w in weekly if (w.get("pool") or "all") == "all"]
+    if not general:
+        return False, "no current weekly window"
+    pool = _pool_of(model)
+    own = [w for w in weekly if w.get("pool") == pool] if pool != "all" else []
+    # The model's own pool panel is sometimes missing (Fable's per-model panel down): the general weekly windows still
+    # bound it, as the loop's local door does since 3c32cd3 (owner decision); the reason line says so.
+    relevant, note = general + own, ("" if pool == "all" or own else f" ({pool} panel missing: general weekly only)")
+    worst = None
+    for w in relevant:
+        left = w.get("headroom_pct")
+        left = (100.0 - float(w["used_pct"])) if left is None and isinstance(w.get("used_pct"), (int, float)) else left
+        if not isinstance(left, (int, float)):
+            return False, f"{w.get('window')}: no usage figure"
+        if left < MIN_LEFT_PCT:
+            return False, f"{w.get('window')}: {left:.0f}% left (< {MIN_LEFT_PCT:.0f}%)"
+        reset = w.get("reset_epoch")
+        if isinstance(reset, (int, float)) and (reset - (reading["fetched_at"] + age_s)) < quota.STOP_HOURS_BEFORE_RESET * 3600:
+            return False, f"{w.get('window')}: resets within {quota.STOP_HOURS_BEFORE_RESET:.0f} h"
+        worst = left if worst is None else min(worst, left)
+    return True, f"{worst:.0f}% weekly left{note}"
+
+
+def admit(lane: str, model: str | None = None, now: float | None = None, urlopen=urllib.request.urlopen) -> tuple[bool, str]:
+    """The quota door on the provider backend (see the module docstring). Fails closed on every unknown."""
+    now = time.time() if now is None else now
+    snap, err = resources(now, urlopen)
+    if snap is None:
+        why = f"{lane}: held, {err}"
+        print(f"  · quota door: {why}", flush=True)
+        return False, why
+    gen = snap.get("generated_at") if isinstance(snap.get("generated_at"), (int, float)) else None
+    if gen is None:
+        return False, f"{lane}: held, /resources has no generated_at"
+    local_at = _resources_cache["local_at"] or now
+    holds = [r for r in store.read("provider_headroom") if r.get("lane") == lane and
+             (r.get("spent") or (isinstance(r.get("left_pct"), (int, float)) and r["left_pct"] < MIN_LEFT_PCT))]
+    hold_ts = max((float(r.get("ts", 0)) for r in holds), default=None)
+    reasons = []
+    for acct, reading in sorted(snap["readings"].items()):
+        if acct.split("#", 1)[0] != lane or not isinstance(reading, dict):
+            continue
+        age = gen - float(reading.get("fetched_at") or 0)
+        ok, why = _account_verdict(reading, model, age)
+        # The reading's sample time on THIS machine's clock (provider clock skew cancels: age is provider-relative).
+        sampled_local = local_at - age
+        if ok and hold_ts is not None and sampled_local <= hold_ts:
+            ok, why = False, "held since a low/spent reveal; awaiting a usage reading sampled after it"
+        reasons.append(f"{acct} {why}")
+        if ok:
+            return True, f"{lane}: {acct} {why}"
+    if not reasons:
+        reasons.append("no account of this lane in /resources")
+    return False, f"{lane}: held: " + "; ".join(reasons)
 
 
 def status() -> dict[str, str]:

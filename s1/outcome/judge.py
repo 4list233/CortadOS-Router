@@ -96,6 +96,8 @@ def judge(limit: int = 0, ask=None, admit=None) -> dict:
         except Exception as exc:                       # retried next pass; the ladder stays unjudged
             counts["failed"] += 1
             print(f"  ! judge {lad['id']}: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+            if isinstance(exc, provider.ProviderError):
+                break                                  # a provider-side failure (401, 503, down) fails every ladder alike
             continue
         store.append("outcomes", {"id": store.digest_id("outcome", lad["id"]), "task_id": lad["id"],
                                   "split": common.split_of(lad["id"]), "teacher": TEACHER, "s1_band": lad["s1_band"],

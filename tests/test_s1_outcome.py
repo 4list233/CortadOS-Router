@@ -18,6 +18,27 @@ sys.path.insert(0, str(REPO / "s1"))
 from outcome import agents, codex_preflight, containment, generate, judge, mine, quota, run, store, tasks  # noqa: E402
 
 
+def _readings(**lanes):
+    """A provider GET /resources snapshot: lane -> % left on its weekly window (None: no fresh reading)."""
+    import time as _t
+    now = _t.time()
+    rd = {}
+    for lane, left in lanes.items():
+        lane = lane.replace("_b", "#b")
+        if left is None:
+            rd[lane] = {"fetched_at": now - 7200, "failed": False, "windows": []}
+        else:
+            rd[lane] = {"fetched_at": now - 60, "failed": False, "windows": [
+                {"window": "week (all models)" if lane.startswith("claude") else "week", "pool": "all",
+                 "used_pct": 100.0 - left, "headroom_pct": left, "reset_epoch": now + 86400, "stale": False}]}
+    return {"generated_at": now, "subscriptions": {}, "readings": rd}
+
+
+def _set_resources(provider, snap):
+    import time as _t
+    provider._resources_cache.update(at=_t.time(), snap=snap, local_at=_t.time())
+
+
 def _jsonl(path: Path, rows) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
@@ -42,6 +63,8 @@ class OutcomeCase(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        from outcome import provider
+        provider._resources_cache.update(at=0.0, snap=None, local_at=0.0)
 
 
 class MineTests(OutcomeCase):
@@ -236,14 +259,22 @@ class RunTests(OutcomeCase):
         t = result["trace"]
         self.assertEqual((t["served_model"], t["served_lane"], t["left_pct"], t["via"]), ("gpt-6-astra", "codex", 48.0, "provider"))
         from outcome import provider
-        ok, why = provider.admit("codex"); self.assertTrue(ok); self.assertIn("48%", why)
+        _set_resources(provider, _readings(codex=48))
+        ok, why = provider.admit("codex"); self.assertTrue(ok); self.assertIn("48%", why)   # /resources decides
 
     def test_provider_mode_low_headroom_on_the_serving_lane_holds_later_bands(self):
         self._provider_mode("claude-opus-5-5 · 2% left")
-        run.run_one(_spec(), self._rung())
         from outcome import provider
+        import time as _t
+        snap = _readings(claude=50, codex=50)
+        run.run_one(_spec(), self._rung())
+        _set_resources(provider, snap)                    # readings sampled BEFORE the 2% reveal: they cannot clear it
         self.assertFalse(provider.admit("claude")[0])
         self.assertTrue(provider.admit("codex")[0])
+        for r in snap["readings"].values():               # a reading sampled after the reveal, above the floor, clears it
+            r["fetched_at"] = snap["generated_at"] = _t.time() + 5
+        _set_resources(provider, snap)
+        self.assertTrue(provider.admit("claude")[0])
 
     def test_local_mode_still_scrubs_the_gateway(self):
         run.run_one(_spec(), self._rung())
@@ -712,28 +743,90 @@ class ProviderBackendTests(OutcomeCase):
         with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_BACKEND": "local"}):
             self.assertFalse(self.p.enabled())
 
-    def test_a_call_is_a_sub_pin_with_reveal_and_records_the_serving_lanes_headroom(self):
+    def test_a_call_is_a_sub_pin_with_reveal_and_the_door_reads_resources(self):
         seen = []
         out = self.p.ask("claude", "claude-fable-5-1", "sys", "u", urlopen=self._urlopen("claude-fable-5-1 · 61% left", "hi", seen))
         self.assertEqual(out, "hi")
         url, body, headers = seen[0]
         self.assertTrue(url.endswith("/v1/messages")); self.assertEqual(body["model"], "sub/claude-fable-5-1")
         self.assertEqual(headers.get("X-cortados-reveal"), "1")
-        ok, why = self.p.admit("claude"); self.assertTrue(ok); self.assertIn("61%", why)
-        self.p.ask("codex", "gpt-6-astra", "", "u", urlopen=self._urlopen("gpt-6-astra · 3% left"))
-        ok, why = self.p.admit("codex"); self.assertFalse(ok); self.assertIn("3%", why)   # the 95 % stop rule, as % left
-        self.assertTrue(self.p.admit("claude")[0])                                         # per lane
+        # Codex answers are unrevealed in production (server._UNIDENTIFIED_LANES): only /resources can decide.
+        self.p.ask("codex", "gpt-6-astra", "", "u", urlopen=self._urlopen("gpt-6-astra"))
+        got = []
+        def res(req, timeout):
+            import io, json as _j
+            got.append((req.full_url, dict(req.header_items())))
+            class R(io.BytesIO):
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+            return R(_j.dumps(_readings(claude=61, codex=3)).encode())
+        ok, why = self.p.admit("codex", "gpt-6-astra", urlopen=res); self.assertFalse(ok); self.assertIn("3%", why)   # 95 % rule
+        self.assertTrue(got[0][0].endswith("/resources")); self.assertEqual(got[0][1].get("X-api-key"), "tok")
+        self.assertTrue(self.p.admit("claude", "claude-fable-5-1", urlopen=res)[0])
+        self.assertEqual(len(got), 1)                                      # cached for RESOURCES_TTL_S
 
-    def test_unrevealed_headroom_holds_unless_allowed(self):
-        self.p.ask("claude", "claude-fable-5-1", "", "u", urlopen=self._urlopen("claude-fable-5-1"))
-        self.assertFalse(self.p.admit("claude")[0])
+    def test_resources_unreachable_holds_fail_closed(self):
+        import urllib.error
+        def down(req, timeout):
+            raise urllib.error.URLError("refused")
+        ok, why = self.p.admit("codex", urlopen=down)
+        self.assertFalse(ok); self.assertIn("/resources unreadable", why)
+
+    def test_an_old_provider_without_readings_holds(self):
+        _set_resources(self.p, None)
+        import io, json as _j
+        class R(io.BytesIO):
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+        ok, why = self.p.admit("claude", urlopen=lambda req, timeout: R(_j.dumps({"generated_at": 1, "subscriptions": {}}).encode()))
+        self.assertFalse(ok); self.assertIn("no per-window readings", why)
+
+    def test_a_stale_reading_or_failed_try_holds(self):
+        _set_resources(self.p, _readings(codex=None))
+        self.assertFalse(self.p.admit("codex")[0])
+        snap = _readings(codex=50); snap["readings"]["codex"]["failed"] = True
+        _set_resources(self.p, snap)
+        self.assertFalse(self.p.admit("codex")[0])
+
+    def test_any_account_above_the_floor_admits_the_lane(self):
+        _set_resources(self.p, _readings(claude=2, claude_b=40))
+        ok, why = self.p.admit("claude", "claude-opus-5-5"); self.assertTrue(ok); self.assertIn("claude#b", why)
+
+    def test_a_hold_never_ages_into_an_admit(self):
+        import time as _t
+        self.p._record("claude", "claude-fable-5-1", 3.0, "claude-fable-5-1 · 3% left")
+        snap = _readings(claude=50)
+        for r in snap["readings"].values():
+            r["fetched_at"] -= 4000                                         # sampled before the hold, and stale
+        import io, json as _j
+        class R(io.BytesIO):
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+        self.assertFalse(self.p.admit("claude", now=_t.time() + 3601,
+                                      urlopen=lambda req, timeout: R(_j.dumps(snap).encode()))[0])
+        self.p._record("codex", "gpt-6-astra", None, "HTTP 429", spent=True)
+        _set_resources(self.p, _readings(codex=50))                         # sampled 60 s before the spent refusal
+        self.assertFalse(self.p.admit("codex")[0])
+
+    def test_allow_unrevealed_no_longer_bypasses_the_stop_rule(self):
+        _set_resources(self.p, _readings(claude=2))
         with mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_ALLOW_UNREVEALED": "1"}):
-            self.assertTrue(self.p.admit("claude")[0])
+            self.assertFalse(self.p.admit("claude")[0])
 
-    def test_no_reading_yet_admits_and_the_codex_hold_no_longer_needs_a_local_reading(self):
-        ok, why = self.p.admit("codex")
-        self.assertTrue(ok, why)
-        self.assertNotIn("missing or stale", why)
+    def test_last_hour_before_a_weekly_reset_holds(self):
+        import time as _t
+        snap = _readings(codex=50); snap["readings"]["codex"]["windows"][0]["reset_epoch"] = _t.time() + 1800
+        _set_resources(self.p, snap)
+        ok, why = self.p.admit("codex"); self.assertFalse(ok); self.assertIn("resets within", why)
+
+    def test_fable_uses_its_own_pool_window_when_present(self):
+        import time as _t
+        snap = _readings(claude=50)
+        snap["readings"]["claude"]["windows"].append({"window": "week (fable)", "pool": "fable", "used_pct": 98.0,
+                                                       "headroom_pct": 2.0, "reset_epoch": _t.time() + 86400})
+        _set_resources(self.p, snap)
+        self.assertFalse(self.p.admit("claude", "claude-fable-5-1")[0])
+        self.assertTrue(self.p.admit("claude", "claude-opus-5-5")[0])
 
     def test_judge_and_generate_default_to_the_provider(self):
         from outcome import generate as gen

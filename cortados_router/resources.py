@@ -118,5 +118,10 @@ def snapshot(core, *, local_config: str | None = None, usage_limit: int = 12,
                                 "tightest": h.get("tightest"), "why": h.get("why")} for lane, h in health.items()}
     except Exception as exc:
         subscriptions = {"error": f"{type(exc).__name__}: {exc}"}
-    return {"generated_at": now, "usage": usage, "subscriptions": subscriptions,
+    readings_of = getattr(core, "subscription_readings", None)
+    try:
+        readings = readings_of() if readings_of else {}
+    except Exception as exc:
+        readings = {"error": f"{type(exc).__name__}: {exc}"}
+    return {"generated_at": now, "usage": usage, "subscriptions": subscriptions, "readings": readings,
             "devices": _devices_and_fit(local_snapshot(local_config, now=now, sampler=sampler))}

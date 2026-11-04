@@ -77,6 +77,8 @@ def generate(limit: int = 0, ask=None, admit=None) -> dict:
         except Exception as exc:                       # the batch is retried on the next pass: its seeds stay pending
             counts["failed_batches"] += 1
             print(f"  ! generation batch failed: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+            if isinstance(exc, provider.ProviderError):
+                break                                  # a provider-side failure fails every batch alike: stop the pass
             continue
         answered = set()
         for item in reply if isinstance(reply, list) else []:
