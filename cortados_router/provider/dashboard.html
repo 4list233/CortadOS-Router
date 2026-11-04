@@ -60,7 +60,9 @@ function storageFailed() {
   storageOk = false;
   const s = $("storage"); s.hidden = false; s.textContent = "Browser storage unavailable; the token is kept only for this page";
 }
-function getTok() { if (!storageOk) return memTok; try { return sessionStorage.getItem(KEY) || memTok; } catch (e) { storageFailed(); return memTok; } }
+// Every good read is copied into memTok, so storage that fails after startup keeps the token rather than reopening the login.
+function getTok() { if (!storageOk) return memTok;
+  try { const t = sessionStorage.getItem(KEY); if (t) memTok = t; return t || memTok; } catch (e) { storageFailed(); return memTok; } }
 function setTok(t) { memTok = t || ""; if (!storageOk) return;
   try { if (t) sessionStorage.setItem(KEY, t); else sessionStorage.removeItem(KEY); } catch (e) { storageFailed(); } }
 // Every string from the endpoint goes in through textContent: lane names and errors are data, never markup.

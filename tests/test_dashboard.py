@@ -75,6 +75,34 @@ class DashboardTest(unittest.TestCase):
         self.assertNotRegex(html, r"(?i)<(iframe|object|embed)\b")
         self.assertNotRegex(html, r"(?i)@import|url\(")
 
+    def test_page_without_exactly_one_script_is_refused(self):
+        # the CSP pins one script by hash: a page with none, two, or a script the exact `<script>` match misses is a 500
+        good = server._DASHBOARD_PATH.read_text()
+        old_path = server._DASHBOARD_PATH
+        def restore():
+            server._DASHBOARD_PATH = old_path
+            server._dashboard_cache.clear()
+        self.addCleanup(restore)
+        cases = {
+            "zero": good.replace("<script>", "<!--").replace("</script>", "-->"),
+            "two": good.replace("</body>", "<script>alert(1)</script></body>"),
+            "upper": good.replace("</body>", "<SCRIPT>alert(1)</SCRIPT></body>"),
+            "mixed": good.replace("</body>", "<ScRiPt src=x></sCrIpT></body>"),
+            "only_upper": good.replace("<script>", "<SCRIPT>").replace("</script>", "</SCRIPT>"),
+        }
+        d = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
+        for name, page in cases.items():
+            f = d / f"{name}.html"; f.write_text(page)
+            server._DASHBOARD_PATH = f
+            server._dashboard_cache.clear()
+            with self.assertRaises(urllib.error.HTTPError, msg=name) as cm:
+                urllib.request.urlopen(self.base + "/dashboard", timeout=10)
+            self.assertEqual(cm.exception.code, 500, name)
+            cm.exception.close()
+        restore()
+        with urllib.request.urlopen(self.base + "/dashboard", timeout=10) as r:   # the real page still serves
+            self.assertEqual(r.status, 200)
+
     def test_usage_still_needs_auth(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(self.base + "/v1/cortados/usage", timeout=10)
@@ -86,6 +114,7 @@ class DashboardTest(unittest.TestCase):
 #   fetch500      a good render, then a poll answered 500
 #   fetchthrow    a good render, then a poll whose fetch rejects
 #   storagethrow  sessionStorage throws on every call; the login form is submitted, then the poll answers the view
+#   storagelater  sessionStorage works at startup (token "tok"), then throws; the next poll still carries the token
 # It prints every text node under main (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN.
 _NODE_HARNESS = r"""
 const fs = require("fs");
@@ -101,8 +130,9 @@ function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: 
 const ids = new Proxy({}, { get: (o, i) => o[i] || (o[i] = mk("div")) });
 global.document = { createElement: mk, getElementById: (i) => ids[i], body: mk("body") };
 const boom = () => { throw new Error("SecurityError"); };
-global.sessionStorage = mode === "storagethrow" ? { getItem: boom, setItem: boom, removeItem: boom }
-                                               : { getItem: () => "tok", setItem() {}, removeItem() {} };
+let broken = mode === "storagethrow";
+global.sessionStorage = { getItem: () => broken ? boom() : "tok", setItem: (k, v) => broken ? boom() : undefined,
+                          removeItem: () => broken ? boom() : undefined };
 global.setInterval = () => 1; global.clearInterval = () => {};
 let auth = "", polls = 0;
 const ok = { status: 200, ok: true, json: async () => view };
@@ -118,7 +148,8 @@ const tick = () => new Promise(r => setImmediate(r));
   else if (mode === "storagethrow") {
     ids.tok.value = "typed-token"; ids.login.on.submit({ preventDefault() {} });
     await tick(); await tick(); await refresh(); await tick();
-  } else { await refresh(); await tick(); }
+  } else if (mode === "storagelater") { broken = true; await refresh(); await tick(); }
+  else { await refresh(); await tick(); }
   function text(n, out) { if (n.textContent) out.push((n.className.includes("err") ? "[ERR] " : "") + n.textContent);
     n.kids.forEach(k => text(k, out)); return out; }
   console.log(text(ids.main, []).join("\n"));
@@ -206,6 +237,12 @@ class DashboardRenderTest(unittest.TestCase):
         self.assertIn("LOGIN: hidden AUTH: Bearer typed-token POLLS: 2", out)    # no login loop: the polls carry it
         self.assertIn("Resources (% left)", out)
         self.assertIn("BODY: \n", out)
+
+    def test_storage_failing_after_startup_keeps_token(self):
+        out = self.run_page(self.view(), "storagelater")
+        self.assertIn("STORAGE: Browser storage unavailable; the token is kept only for this page", out)
+        self.assertIn("LOGIN: hidden AUTH: Bearer tok POLLS: 2", out)            # the startup read was kept in memTok
+        self.assertIn("Resources (% left)", out)
 
 
 if __name__ == "__main__":

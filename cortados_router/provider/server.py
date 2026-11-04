@@ -35,6 +35,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -157,13 +158,31 @@ _DASHBOARD_CSP = ("default-src 'none'; script-src '{h}'; style-src 'unsafe-inlin
                   "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
+class _ScriptCounter(HTMLParser):
+    """Counts <script> start tags, whatever their case or attributes."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.n = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script":
+            self.n += 1
+
+    handle_startendtag = handle_starttag
+
+
 def _dashboard_html() -> bytes:
     """The served dashboard page (static HTML/JS; the page itself asks for the token and fetches /v1/cortados/usage).
     Read once with its CSP: the page must hold exactly one inline <script>, whose sha256 the CSP pins."""
     if "b" not in _dashboard_cache:
         b = _DASHBOARD_PATH.read_bytes()
+        # Counted by an HTML parser (it lowercases tag names, so <SCRIPT> and <ScRiPt src=…> count too), and the one
+        # script must also be the exact `<script>…</script>` the hash is taken over: anything else would leave a
+        # second script, or a different body, outside the pin.
+        counter = _ScriptCounter()
+        counter.feed(b.decode("utf-8")); counter.close()
         scripts = re.findall(rb"<script>(.*?)</script>", b, re.S)
-        if len(scripts) != 1 or b.count(b"<script") != 1:   # a second script would be blocked by the pinned CSP
+        if counter.n != 1 or len(scripts) != 1:
             raise ValueError("dashboard page must hold exactly one inline <script>")
         digest = base64.b64encode(hashlib.sha256(scripts[0]).digest()).decode()
         _dashboard_cache["csp"] = _DASHBOARD_CSP.format(h=f"sha256-{digest}")
