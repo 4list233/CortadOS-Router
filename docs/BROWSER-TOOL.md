@@ -141,7 +141,11 @@ the installed server's list differs, so a version bump is a reviewed diff, never
      absolute and resolve under `<task>/browser/in` (-32004);
    - closing (bad input, stdin EOF, SIGTERM/SIGHUP) sends SIGTERM to the server's group, waits `EXIT_GRACE_S`, sends
      SIGKILL, then kills every surviving descendant found by walking `ps` from the server pid (Playwright launches
-     Chromium detached, in its own group);
+     Chromium detached, in its own group), every descendant recorded by a walk repeated every 2 s while running, and
+     every process of this user whose command line names `<task>/browser` (TMPDIR and so Chromium's
+     `--user-data-dir` live there), which still finds a browser reparented after the server exited on its own.
+     SIGTERM/SIGHUP handlers only write a byte to a self-pipe; a coordinator thread runs the close, so a signal
+     landing while the main thread holds the filter's state lock cannot deadlock;
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a
      JSON-RPC error and never forwarded to Claude Code; server notifications other than progress/log/`list_changed`
      are dropped, and a `tools/list_changed` makes the filter re-list and re-apply the allowlist. Default allowlist =

@@ -7,6 +7,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -55,6 +56,18 @@ for line in sys.stdin:
             g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             open(sys.argv[2] + ".pid", "w").write(str(g.pid))
+        elif trig == "exit":
+            sys.exit(3)                                # the server dies on its own, no answer
+        elif trig == "spawn_exit":
+            # Chromium-like grandchild named by the task's browser dir (its --user-data-dir lives under TMPDIR), made an
+            # orphan at once (double fork) so no descendant walk can ever see it; then the server dies abruptly.
+            prof = open(sys.argv[2] + ".task").read() + "/browser/tmp/playwright_chromiumdev_profile-x"
+            code = ("import subprocess, sys; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', "
+                    "'--user-data-dir=' + sys.argv[1]], start_new_session=True, stdin=subprocess.DEVNULL, "
+                    "stdout=subprocess.DEVNULL); open(sys.argv[2], 'w').write(str(g.pid))")
+            subprocess.run([sys.executable, "-c", code, prof, sys.argv[2] + ".pid"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL)
+            sys.exit(3)
     send({"jsonrpc": "2.0", "id": m["id"], "result": {"ok": meth}})
 '''
 
@@ -73,6 +86,7 @@ class FilterTests(unittest.TestCase):
         (self.tmp / "args.json").write_text(json.dumps(args))
         self.log = self.tmp / "server.log"
         self.log.write_text("")
+        Path(str(self.log) + ".task").write_text(str(self.task))
         self.p = None
 
     def tearDown(self):
@@ -386,6 +400,83 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(self.p.wait(timeout=20), 1)
         self._assert_dead(pid)
         self.assertIn(b"closing session: signal", self.p.stderr.read())
+
+    def _stderr_eof(self, timeout=10):
+        """Read the filter's stderr to EOF in a thread; fail if something (a surviving grandchild) holds it open."""
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.p.stderr.read()), daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            self.fail("filter stderr still open: a descendant survived holding it")
+        return out[0]
+
+    def test_server_exit_kills_orphaned_task_browser_process(self):
+        # P2-1: the server exits on its own after launching a detached child that is already an orphan; only the
+        # command-line ownership (the task's browser dir) can find it.
+        self.start()
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "browser_snapshot", "arguments": {"trigger": "spawn_exit"}}})
+        self.p.wait(timeout=20)
+        pid = int(Path(str(self.log) + ".pid").read_text())
+        self._assert_dead(pid)
+        self.assertIn(b"closing session: server closed its output", self._stderr_eof())
+
+    def test_server_exit_kills_descendant_seen_by_poll(self):
+        # P2-1: a detached child that does NOT name the task dir, seen by the periodic walk before the server dies.
+        self.start()
+        pid = self._grandchild()
+        time.sleep(3)   # > TREE_POLL_S: the poll has recorded it
+        self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "browser_snapshot", "arguments": {"trigger": "exit"}}})
+        self.p.wait(timeout=20)
+        self._assert_dead(pid)
+        self.assertIn(b"closing session: server closed its output", self._stderr_eof())
+
+    def test_owned_by_task_matches_path_component_only(self):
+        sys.path.insert(0, str(FILTER.parent))
+        try:
+            import mcp_filter
+        finally:
+            sys.path.remove(str(FILTER.parent))
+        f = mcp_filter.Filter.__new__(mcp_filter.Filter)
+        f.markers = ["/t/task1/browser"]
+        uid = os.getuid()
+        rows = [(10, 10, 1, uid, "chrome --user-data-dir=/t/task1/browser/tmp/p"),
+                (11, 10, 10, uid, "x /t/task1/browser"),
+                (12, 12, 1, uid, "chrome --user-data-dir=/t/task1/browserX/tmp"),
+                (13, 13, 1, uid, "chrome --user-data-dir=/t/task10/browser/tmp"),
+                (14, 14, 1, uid + 1, "chrome /t/task1/browser/tmp"),
+                (os.getpid(), 1, 1, uid, "self /t/task1/browser/tmp")]
+        self.assertEqual(f.owned_by_task(rows), {10: 10, 11: 10})
+
+    def test_sigterm_while_main_thread_holds_state_lock(self):
+        # P2-2: the signal lands while the main thread holds state_lock; the handler must not take it.
+        driver = self.tmp / "driver.py"
+        driver.write_text(
+            "import os, signal, sys, time\n"
+            f"sys.path.insert(0, {str(FILTER.parent)!r})\n"
+            "import mcp_filter as m\n"
+            "orig = m.Filter.on_client\n"
+            "def on_client(self, msg):\n"
+            "    if msg.get('method') == 'ping':\n"
+            "        with self.state_lock:\n"
+            "            os.kill(os.getpid(), signal.SIGTERM)\n"
+            "            time.sleep(1)\n"
+            "    return orig(self, msg)\n"
+            "m.Filter.on_client = on_client\n"
+            "m.main(sys.argv[1:])\n")
+        self.p = subprocess.Popen(
+            [sys.executable, "-I", str(driver), "--task", str(self.task), "--args-file", str(self.tmp / "args.json"),
+             "--", sys.executable, "-I", str(self.tmp / "stub.py"), str(self.tmp / "tools"), str(self.log)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        try:
+            rc = self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("filter deadlocked: SIGTERM while the main thread held state_lock")
+        self.assertEqual(rc, 1)
+        self.assertIn(b"closing session: signal 15", self._stderr_eof())
 
     def test_client_eof_ends_session_cleanly(self):
         self.start()

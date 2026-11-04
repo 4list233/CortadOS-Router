@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +71,10 @@ PS = "/bin/ps"
 # The filter's own request ids (re-list after list_changed) carry this prefix; client ids with it are refused so the
 # two can never collide.
 OWN_ID_PREFIX = "cortados-filter-"
+# Descendants are sampled this often while the session runs, so a server that exits abruptly (its detached children
+# reparented and no longer reachable by the walk) still leaves a recent tree behind for close(). 2 s keeps the cost to
+# one ps per 2 s while bounding the window in which a newly launched child is known only by its command line.
+TREE_POLL_S = 2
 
 # Fixed refusal reasons (never echo request content back).
 E_METHOD = (-32601, "method not allowed by the CortadOS browser filter")
@@ -154,7 +159,15 @@ class Filter:
         self.pending = {}          # forwarded client request id (json key) -> method
         self.own_seq = 0
         self.closer = None         # ident of the thread running close(); set once
-        self.known_tree = set()    # descendants seen before the server was let go (stdin EOF), for kill_tree
+        self.known_tree = set()    # descendants seen while running (poll) or at stdin EOF, for kill_tree
+        # Ownership that survives reparenting: run-mcp.sh points TMPDIR at <task>/browser/tmp and --isolated puts
+        # Chromium's --user-data-dir under it, so every browser process carries this task's unique browser dir in its
+        # command line. Both spellings, since TMPDIR is built from the --task string (which may not be the realpath).
+        self.markers = sorted({os.path.join(os.path.abspath(task_dir), "browser"),
+                               os.path.join(os.path.realpath(task_dir), "browser")})
+        # Self-pipe for SIGTERM/SIGHUP: the handler only writes a byte (no locks); a coordinator thread runs close().
+        self.sig_r, self.sig_w = os.pipe()
+        os.set_blocking(self.sig_w, False)
         # New session so close() can signal the server's group (wrapper, node). Not the browser: Playwright launches
         # Chromium detached, in a group of its own; close() finds it by walking descendants (kill_tree).
         self.proc = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -181,7 +194,7 @@ class Filter:
             closer, self.closer = self.closer, self.closer or threading.get_ident()
         if closer is not None:
             if closer == threading.get_ident():
-                return   # re-entered on the closing thread (a signal during close): let that close finish
+                return   # re-entered on the closing thread: let that close finish
             # Another thread is closing: wait for its os._exit. Returning would let the main thread end the
             # interpreter and cut the other thread's kill_tree short, leaving the browser alive.
             threading.Event().wait()
@@ -191,19 +204,47 @@ class Filter:
         os._exit(code)
 
     @staticmethod
-    def _ps():
-        """[(pid, pgid, ppid)] of every process; [] if ps fails (reported, the group kill still ran)."""
+    def _ps_full():
+        """[(pid, pgid, ppid, uid, command)] of every process; [] if ps fails (reported, the group kill still ran).
+        -ww: unlimited width, so a long Chromium command line is never truncated before the task's browser dir."""
         try:
-            out = subprocess.run([PS, "-axo", "pid=,pgid=,ppid="], capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run([PS, "-ww", "-axo", "pid=,pgid=,ppid=,uid=,command="], capture_output=True,
+                                 text=True, errors="replace", timeout=5).stdout
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"mcp_filter: ps failed, descendants not walked: {e}\n")
             return []
         rows = []
         for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 3 and all(p.isdigit() for p in parts):
-                rows.append(tuple(int(p) for p in parts))
+            parts = line.split(None, 4)
+            if len(parts) >= 4 and all(p.isdigit() for p in parts[:4]):
+                rows.append((*(int(p) for p in parts[:4]), parts[4] if len(parts) == 5 else ""))
         return rows
+
+    def _ps(self):
+        """[(pid, pgid, ppid)] of every process."""
+        return [r[:3] for r in self._ps_full()]
+
+    def owned_by_task(self, rows=None):
+        """{pid: pgid} of this user's processes whose command line names this task's browser dir (a path component
+        boundary, so task1 never matches task10). Never the filter itself or its parent (the child's claude), whatever
+        their argv says. A child shell command that names <task>/browser at close time is killed too: the session is
+        ending and that dir is the browser's."""
+        me, parent, uid = os.getpid(), os.getppid(), os.getuid()
+        found = {}
+        for pid, pgid, _, puid, cmd in (self._ps_full() if rows is None else rows):
+            if pid in (me, parent) or puid != uid:
+                continue
+            for m in self.markers:
+                i = cmd.find(m)
+                while i != -1:
+                    end = i + len(m)
+                    if end == len(cmd) or cmd[end] in "/ ":
+                        found[pid] = pgid
+                        break
+                    i = cmd.find(m, i + 1)
+                if pid in found:
+                    break
+        return found
 
     def descendants(self):
         """PIDs below the server process (Chromium included: its group differs, its parent chain does not)."""
@@ -221,22 +262,26 @@ class Filter:
 
     def kill_tree(self):
         """SIGTERM the server's group, wait up to EXIT_GRACE_S, SIGKILL it; then SIGKILL every descendant (and the group
-        it leads) still alive. The walk happens first: once node is gone its children are reparented and unreachable."""
+        it leads) still alive, and every process of this user that names the task's browser dir. The walk happens first:
+        once node is gone its children are reparented and unreachable; the periodic poll (known_tree) and the
+        command-line match cover a server that already exited on its own before close()."""
         with self.state_lock:
             tree = set(self.known_tree)
         tree |= self.descendants()
         try:
             os.killpg(self.proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # the server's group is already gone; descendants are handled below
+        except (ProcessLookupError, PermissionError):
+            # Gone, or (macOS) EPERM for a group left with only the unreaped server zombie: nothing to signal there;
+            # descendants are handled below.
+            pass
         try:
             self.proc.wait(timeout=EXIT_GRACE_S)
         except subprocess.TimeoutExpired:
             sys.stderr.write("mcp_filter: server ignored SIGTERM; killing\n")
         try:
             os.killpg(self.proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # exited on SIGTERM
+        except (ProcessLookupError, PermissionError):
+            pass  # exited on SIGTERM (EPERM as above)
         alive = {pid: pgid for pid, pgid, _ in self._ps()}
         for pid in tree:
             if pid not in alive:
@@ -246,8 +291,44 @@ class Filter:
                     os.killpg(pid, signal.SIGKILL)   # a detached leader (Chromium): its renderers share its group
                 else:
                     os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # exited between the ps and the kill
+            except (ProcessLookupError, PermissionError):
+                pass  # exited between the ps and the kill (EPERM: a zombie-only group on macOS, or a reused pid)
+        # Ownership by command line survives reparenting. Repeated (bounded) because a dying browser can still be
+        # forking helpers between one ps and the kill.
+        me_pgid = os.getpgid(0)
+        for _ in range(3):
+            owned = self.owned_by_task()
+            if not owned:
+                break
+            for pid, pgid in owned.items():
+                try:
+                    if pgid == pid and pgid != me_pgid:
+                        os.killpg(pid, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass  # exited between the ps and the kill (or not ours after all: never retried as root)
+            time.sleep(0.1)
+
+    def poll_tree(self):
+        """Record the server's descendants every TREE_POLL_S while it runs (see TREE_POLL_S)."""
+        while self.closer is None and self.proc.poll() is None:
+            tree = self.descendants()
+            with self.state_lock:
+                self.known_tree |= tree
+            time.sleep(TREE_POLL_S)
+
+    def on_signal(self, signum, frame):
+        # Runs on the main thread between bytecodes, possibly while it holds state_lock: no locks, no close() here.
+        # One byte to the self-pipe; the coordinator thread does the close.
+        try:
+            os.write(self.sig_w, bytes([signum & 0xff]))
+        except OSError:
+            pass  # pipe full: a byte is already waiting, which is all the coordinator needs
+
+    def signal_loop(self):
+        data = os.read(self.sig_r, 1)
+        self.close(f"signal {data[0] if data else '?'}")
 
     # client -> server
     def on_client(self, msg):
@@ -422,10 +503,13 @@ class Filter:
         self.close("server closed its output", code=self.proc.poll() or 0)
 
     def run(self, stdin=None):
-        # Termination by signal takes the same path as any other close (browser included).
+        # Termination by signal takes the same path as any other close (browser included), via the self-pipe: a handler
+        # calling close() directly would take state_lock, deadlocking if the signal lands while the main thread holds it.
+        threading.Thread(target=self.signal_loop, daemon=True).start()
         for sig in (signal.SIGTERM, signal.SIGHUP):
-            signal.signal(sig, lambda signum, frame: self.close(f"signal {signum}"))
+            signal.signal(sig, self.on_signal)
         threading.Thread(target=self.server_loop, daemon=True).start()
+        threading.Thread(target=self.poll_tree, daemon=True).start()
         try:
             for msg in self.read_lines(stdin or sys.stdin.buffer, self.client_line_max, "client"):
                 self.on_client(msg)
