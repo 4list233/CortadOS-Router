@@ -20,20 +20,10 @@ from outcome import store
 # Forest 2026-10-21: surplus quota may be spent up to 95 % projected. Lower leaves allowance to expire unused;
 # higher risks Forest's own work hitting the cap before the reset.
 STOP_PROJECTED_PCT = 95.0
-# Forest 2026-10-21: never in the last hour before a reset, so a late burst cannot spill the next window's start.
-STOP_HOURS_BEFORE_RESET = 1.0
-# The sampler refreshes every ~20 minutes; routing tolerates 6-hour-old readings, but a loop that spends steadily
-# must not act on a reading older than an hour.
-MAX_READING_AGE_S = 3600
-# Assumed share of a window one admitted call consumes until the next sample shows the real figure. Not yet measured
-# (ENG-10: recorded as an assumption): an agent run on a fixture task is a few hundred thousand tokens at most, about
-# 1 % of a weekly window on the plans seen so far. Too small: workers overshoot 95 % between samples. Too large: the
-# loop stalls until each new sample although room is left.
-ASSUMED_PCT_PER_CALL = 1.0
-# How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
-# timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and the loop overshoots.
-# Longer: finished work is counted twice and the loop pauses early.
-IN_FLIGHT_S = 900 + 1200
+# The stop rules shared with the provider's floor (one canonical copy, with their reasons): never in the last hour
+# before a reset, no reading older than an hour, 1 % assumed per call, in-flight horizon, Fable pool cost 2x.
+from cortados_router.provider.floor import (ASSUMED_PCT_PER_CALL, IN_FLIGHT_S, MAX_READING_AGE_S,  # noqa: E402
+                                            POOL_CAP_SCALE, STOP_HOURS_BEFORE_RESET)
 LANES = ("claude", "codex")
 
 _thread_lock = threading.Lock()
@@ -105,7 +95,6 @@ FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
 # 1 % of the weekly budget (ASSUMED_PCT_PER_CALL); Fable's cap is HALF that budget, so the same call is ~2 % of Fable's
 # cap. Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
 # scale, so pending calls are not under-counted when the panel recovers before they appear in a sample (Codex review).
-POOL_CAP_SCALE = {"fable": 2.0}
 
 
 def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:

@@ -145,10 +145,13 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                          served_lane=provider.lane_of(served, lane))
             if served:                                 # the serving lane's headroom feeds provider.admit for later bands
                 provider._record(trace["served_lane"], model, trace.get("left_pct"), served)
-            elif (code != 0 or trace.get("is_error")) and _quota_refusal(out, err):
-                # A ladder run refused for quota (usage limit, quota exhausted, provider 429) with no reveal: a durable
-                # spent hold on the requested lane, so the next admission cannot pass on an older healthy reading.
-                provider._record(lane, model, None, f"ladder run refused for quota: {(err or out)[-200:]}", spent=True)
+            if (code != 0 or trace.get("is_error")) and _quota_refusal(out, err):
+                # A ladder run refused for quota (usage limit, quota exhausted, provider 429), whether or not an earlier
+                # turn revealed a model: a durable spent hold on the requested lane, so the next admission cannot pass
+                # on an older healthy reading (Codex review r3).
+                why = f"ladder run refused for quota: {(err or out)[-200:]}"
+                for held in sorted({lane, trace["served_lane"]}):
+                    provider._record(held, model, None, why, spent=True)
         elif lane == "claude":
             code, out, err, secs = _run(_claude_argv(model, calls, outward_tools), cwd=workspace, timeout=timeout_s, stdin=prompt,
                                         env=child_env({"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch}))

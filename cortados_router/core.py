@@ -580,6 +580,10 @@ def subscription_readings() -> dict[str, dict[str, Any]]:
         out[lane] = {"fetched_at": v.get("fetched_at"), "failed": failed,
                      "windows": [{k: w.get(k) for k in ("window", "pool", "used_pct", "headroom_pct", "reset_epoch", "stale")}
                                  for w in (v.get("windows") or []) if isinstance(w, dict)]}
+        if "config_dir" in v:
+            # The login the reading was sampled from (scarcity stamps Claude readings): provider/floor.py requires it to
+            # match the executing account, and holds when it is absent.
+            out[lane]["config_dir"] = v.get("config_dir")
     return out
 
 

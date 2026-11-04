@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 from cortados_router import execution_routing
 from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import floor
 from cortados_router.provider import local_lane
 
 logger = logging.getLogger("cortados.provider.routing")
@@ -258,34 +259,6 @@ def readable_model_name(model: str) -> str:
     return model
 
 
-def min_left_block(core, lane: str, model: str, min_left_pct: float | None, readings: dict | None = None) -> str | None:
-    """Why the account on `lane` may not serve `model` under the client's x-cortados-min-left-pct floor, or None.
-    The floor only tightens: it is applied on top of every existing gate, to the cached reading's current weekly windows
-    that bound the model (general + the model's own pool). An account with no readable weekly figure is excluded too:
-    a floor the provider cannot check would otherwise pass silently (fail closed, the client asked for a guarantee)."""
-    if min_left_pct is None:
-        return None
-    readings = core.subscription_readings() if readings is None else readings
-    reading = readings.get(lane) if isinstance(readings, dict) else None
-    if not isinstance(reading, dict) or reading.get("failed"):
-        return f"no current usage reading to check x-cortados-min-left-pct {min_left_pct:g}"
-    weekly = [w for w in reading.get("windows") or [] if str(w.get("window") or "").startswith("week") and not w.get("stale")]
-    pools = sorted({w.get("pool") for w in weekly if w.get("pool") not in (None, "all")})
-    pool = core._scarcity_module().pool_for(lane, model or "", pools) if pools else None
-    relevant = [w for w in weekly if (w.get("pool") or "all") == "all" or (pool and w.get("pool") == pool)]
-    if not relevant:
-        return f"no current weekly window to check x-cortados-min-left-pct {min_left_pct:g}"
-    for w in relevant:
-        left = w.get("headroom_pct")
-        if left is None and isinstance(w.get("used_pct"), (int, float)):
-            left = 100.0 - float(w["used_pct"])
-        if not isinstance(left, (int, float)):
-            return f"{w.get('window')}: no usage figure to check x-cortados-min-left-pct {min_left_pct:g}"
-        if left < min_left_pct:
-            return f"{w.get('window')}: {left:.0f}% left, below the client's floor x-cortados-min-left-pct {min_left_pct:g}"
-    return None
-
-
 def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conversation_id: str,
                   claude_bin: str = "claude", codex_bin: str = "codex", min_left_pct: float | None = None) -> dict[str, Any]:
     """Route a `sub/`-pinned conversation: the person chose the model, so S1 is not asked and the band is not applied
@@ -368,7 +341,7 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     if min_left_pct is not None:                   # the client's floor (x-cortados-min-left-pct): before ranking, only tightens
         readings = core.subscription_readings()
         for c in cands:
-            why = min_left_block(core, c["lane"], model, min_left_pct, readings) if ch_of[id(c)].get("ok", True) else None
+            why = floor.check(core, c, model, min_left_pct, readings) if ch_of[id(c)].get("ok", True) else None
             if why:
                 ch_of[id(c)] = {**ch_of[id(c)], "ok": False, "why": why}
                 floored.append(c)
@@ -400,6 +373,13 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
         return {"router": execution_routing.ROUTER, **({"quota_blocked": True} if floored else {}),
                 "error": f"sub/{model}: no {family} subscription account can take this request ({' | '.join(parts)}){hint}"}
     chosen = {**live[0], "pool": ch_of[id(live[0])].get("pool")}
+    if min_left_pct is not None:
+        # Reserve the turn on the account that will execute it, atomically with its floor recheck (floor.reserve): a
+        # concurrent request may have taken the last room since the filter above, so a refusal here is a quota refusal.
+        why = floor.reserve(core, chosen, model, min_left_pct, readings)
+        if why:
+            return {"router": execution_routing.ROUTER, "quota_blocked": True,
+                    "error": f"sub/{model}: {chosen['provider']}: {why}"}
     route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
     # skipped has core.resolve's shape ({lane, model, pool, why}): core.footer and s1/outcome/run.py read it as dicts.
     skipped = [{"lane": c["lane"], "model": model, "pool": ch_of[id(c)].get("pool"), "why": why_of(c)} for c in excluded]
@@ -415,7 +395,8 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     return {"router": execution_routing.ROUTER, "provider": chosen["provider"], "model": model,
             "account": chosen["account"], "config_dir": chosen["config_dir"],
             "context_length": cap_of(chosen), "route_id": route_id, "api_request_id": "",
-            "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route}
+            "degraded": False, "band": "pin", "pinned": True, "decision": decision, "route": route,
+            **({"min_left_pct": min_left_pct} if min_left_pct is not None else {})}
 
 
 def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[str, Any], *, client: str,
@@ -589,10 +570,27 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     if min_left_pct is not None and not r.get("error"):
         # The routed path's floor check runs on the account select chose (execution_routing ranks inside select); a
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
-        lane = ((r.get("route") or {}).get("chosen") or {}).get("lane") or r.get("lane")
-        why = min_left_block(core, lane, r.get("model") or "", min_left_pct) if lane else \
+        chosen = (r.get("route") or {}).get("chosen") or {}
+        lane = chosen.get("lane")
+        why = floor.reserve(core, floor_candidate(r), r.get("model") or "", min_left_pct) if lane else \
             "routed account unknown; cannot check x-cortados-min-left-pct"
         if why:
             return {"router": execution_routing.ROUTER, "quota_blocked": True,
                     "error": f"routed to {r.get('provider')}/{r.get('model')} on {lane}: {why}"}
+        r["min_left_pct"] = min_left_pct           # the session keeps it: every continuation is rechecked under it
     return r
+
+
+def floor_candidate(route: dict[str, Any]) -> dict[str, Any]:
+    """The executing account of a chosen route, in the shape floor.block reads (lane, provider, config_dir)."""
+    chosen = (route.get("route") or {}).get("chosen") or {}
+    return {"lane": chosen.get("lane"), "provider": route.get("provider") or chosen.get("provider"),
+            "config_dir": route["config_dir"] if "config_dir" in route else chosen.get("config_dir")}
+
+
+def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float) -> str | None:
+    """A continuation's paid turn under the floor: recheck and reserve its session's executing account (the one
+    account this conversation runs on), before the turn is sent to the backend."""
+    if not route or not ((route.get("route") or {}).get("chosen") or {}).get("lane"):
+        return "the conversation's executing account is unknown; cannot check x-cortados-min-left-pct"
+    return floor.reserve(core, floor_candidate(route), route.get("model") or "", min_left_pct)

@@ -254,6 +254,15 @@ class RunTests(OutcomeCase):
                          ["x-cortados-min-left-pct", "x-cortados-reveal", "x-cortados-run-id"])
         self.assertIn("x-cortados-min-left-pct: 5", hdrs)
 
+    def test_provider_mode_reveal_then_429_still_writes_a_spent_hold(self):
+        self._provider_mode("claude-opus-5-5 · 60% left", FAKE_QUOTA="1")
+        from outcome import provider, store
+        run.run_one(_spec(), self._rung())
+        rows = store.read("provider_headroom")
+        self.assertTrue(any(r.get("spent") and r["lane"] == "claude" for r in rows), rows)
+        _set_resources(provider, _readings(claude=50))
+        self.assertFalse(provider.admit("claude")[0])
+
     def test_provider_mode_ladder_quota_refusal_writes_a_spent_hold(self):
         self._provider_mode("", FAKE_QUOTA="1")
         from outcome import provider, store
@@ -770,12 +779,24 @@ class ProviderBackendTests(OutcomeCase):
         self.p.ask("claude", "claude-fable-5-1", "sys", "u", urlopen=self._urlopen("claude-fable-5-1 · 61% left", "hi", seen))
         self.assertEqual(seen[0][2].get("X-cortados-min-left-pct"), "5")
 
-    def test_admissions_reserve_and_status_does_not(self):
-        _set_resources(self.p, _readings(claude=8))       # 8 % left: three 1 % calls fit above the 5 % floor, not four
-        for _ in range(3):
-            self.p.status()
-        self.assertEqual([self.p.admit("claude")[0] for _ in range(4)], [True, True, True, False])
-        self.assertIn("outstanding", self.p.admit("claude")[1])
+    def test_the_door_is_advisory_and_reserves_nothing(self):
+        from outcome import store
+        _set_resources(self.p, _readings(claude=8))
+        self.assertEqual([self.p.admit("claude")[0] for _ in range(5)], [True] * 5)   # the provider reserves, not the loop
+        self.assertEqual(store.read("provider_admissions"), [])
+
+    def test_the_door_charges_a_fable_call_at_the_pool_scale(self):
+        snap = _readings(claude=50)
+        w = snap["readings"]["claude"]["windows"]
+        fable = {"window": "week (fable)", "pool": "fable", "used_pct": 93.0, "headroom_pct": 7.0,
+                 "reset_epoch": w[0]["reset_epoch"], "stale": False}
+        w.append(fable)
+        _set_resources(self.p, snap)
+        self.assertTrue(self.p.admit("claude", "claude-fable-5-1")[0])            # 7 - 2 = 5: admitted
+        fable.update(used_pct=93.5, headroom_pct=6.5)
+        _set_resources(self.p, snap)
+        ok, why = self.p.admit("claude", "claude-fable-5-1")                      # 6.5 - 2 < 5: held
+        self.assertFalse(ok); self.assertIn("2% call", why)
 
     def test_a_carried_forward_low_model_pool_holds_an_absent_one_falls_back(self):
         snap = _readings(claude=50)
@@ -783,11 +804,11 @@ class ProviderBackendTests(OutcomeCase):
         w.append({"window": "week (fable)", "pool": "fable", "used_pct": 98, "headroom_pct": 2,
                   "reset_epoch": w[0]["reset_epoch"], "stale": True})
         _set_resources(self.p, snap)
-        ok, why = self.p.admit("claude", "claude-fable-5-1", reserve=False)
+        ok, why = self.p.admit("claude", "claude-fable-5-1")
         self.assertFalse(ok); self.assertIn("carried-forward", why)
         w.pop()
         _set_resources(self.p, snap)
-        ok, why = self.p.admit("claude", "claude-fable-5-1", reserve=False)
+        ok, why = self.p.admit("claude", "claude-fable-5-1")
         self.assertTrue(ok); self.assertIn("panel missing", why)
 
     def test_cached_readings_keep_ageing(self):
@@ -795,17 +816,17 @@ class ProviderBackendTests(OutcomeCase):
         snap = _readings(claude=50)
         now = _t.time()
         self.p._resources_cache.update(at=now, snap=snap, local_at=now)
-        self.assertTrue(self.p.admit("claude", now=now + 30, reserve=False)[0])
+        self.assertTrue(self.p.admit("claude", now=now + 30)[0])
         # Within the cache TTL nothing is re-read, but an hour later (simulated by an old local fetch) the reading is old.
         self.p._resources_cache.update(at=now + 3600, local_at=now)
-        ok, why = self.p.admit("claude", now=now + 3600, reserve=False)
+        ok, why = self.p.admit("claude", now=now + 3600)
         self.assertFalse(ok); self.assertIn("no fresh usage reading", why)
 
     def test_unknown_reset_holds(self):
         snap = _readings(claude=50)
         snap["readings"]["claude"]["windows"][0]["reset_epoch"] = None
         _set_resources(self.p, snap)
-        ok, why = self.p.admit("claude", reserve=False)
+        ok, why = self.p.admit("claude")
         self.assertFalse(ok); self.assertIn("reset time unknown", why)
 
     def test_enabled_only_with_a_url_and_not_forced_local(self):

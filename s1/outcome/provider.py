@@ -13,8 +13,9 @@ failed) whose weekly windows for the model (general + the model's own pool) are 
 and none resets within the hour (STOP_HOURS_BEFORE_RESET). /resources unreachable or unreadable: hold (fail closed).
 The per-call reveal ("· N% left", never sent for the codex lane) and a spent refusal are a supplementary signal: they
 open a hold that only a /resources reading sampled AFTER it, showing the lane above the floor, clears; a hold never
-ages into an admit. The provider picks the account; every call carries x-cortados-min-left-pct (MIN_LEFT_PCT), so the
-provider excludes accounts below the floor before ranking and refuses (429) when none remains.
+ages into an admit. The door is advisory and reserves nothing: the provider is the single enforcer. Every call carries
+x-cortados-min-left-pct (MIN_LEFT_PCT); the provider checks and reserves the account that EXECUTES each turn, opening and
+continuation alike, and refuses (429) below the floor (cortados_router/provider/floor.py).
 """
 from __future__ import annotations
 
@@ -157,27 +158,21 @@ def _left(w: dict):
     return left
 
 
-def _key(acct: str, w: dict) -> str:
-    """The reservation key of one window of one account, in quota.py's scheme (lane|pool|<pool>, lane|win|<window>)."""
-    pool = w.get("pool") or "all"
-    return f"{acct}|pool|{pool}" if pool != "all" else f"{acct}|win|{w.get('window')}"
 
-
-def _account_verdict(reading: dict, model: str | None, age_s: float, acct: str = "",
-                     reserved: dict | None = None) -> tuple[bool, str, list]:
-    """(ok, why, reservation keys) for one account. `age_s` is the reading's age NOW (provider-relative age at the
-    fetch plus local time elapsed since it), so a cached snapshot keeps ageing. `reserved` counts this loop's calls
-    admitted since the reading was sampled: each is assumed to cost quota.ASSUMED_PCT_PER_CALL of every window."""
-    reserved = reserved or {}
+def _account_verdict(reading: dict, model: str | None, age_s: float) -> tuple[bool, str]:
+    """Advisory: whether one account of the lane looks able to take a call. `age_s` is the reading's age NOW
+    (provider-relative age at the fetch plus local time since it), so a cached snapshot keeps ageing. The binding check
+    and the reservation are the provider's (cortados_router/provider/floor.py, on the account that executes, under
+    the x-cortados-min-left-pct header every call carries); this pre-check only spares a request that would be refused."""
     if reading.get("failed"):
-        return False, "last usage try failed", []
+        return False, "last usage try failed"
     if not isinstance(reading.get("fetched_at"), (int, float)) or not 0 <= age_s < quota.MAX_READING_AGE_S:
-        return False, "no fresh usage reading", []
+        return False, "no fresh usage reading"
     weekly_all = [w for w in reading.get("windows") or [] if str(w.get("window") or "").startswith("week")]
     weekly = [w for w in weekly_all if not w.get("stale")]
     general = [w for w in weekly if (w.get("pool") or "all") == "all"]
     if not general:
-        return False, "no current weekly window", []
+        return False, "no current weekly window"
     pool = _pool_of(model)
     own = [w for w in weekly if w.get("pool") == pool] if pool != "all" else []
     if pool != "all" and not own:
@@ -187,44 +182,30 @@ def _account_verdict(reading: dict, model: str | None, age_s: float, acct: str =
         carried = [w for w in weekly_all if w.get("pool") == pool]
         low = [w for w in carried if not isinstance(_left(w), (int, float)) or _left(w) < MIN_LEFT_PCT]
         if low:
-            return False, f"{low[0].get('window')}: carried-forward {pool} pool reading below the floor or unknown", []
+            return False, f"{low[0].get('window')}: carried-forward {pool} pool reading below the floor or unknown"
     relevant, note = general + own, ("" if pool == "all" or own else f" ({pool} panel missing: general weekly only)")
     worst = None
     for w in relevant:
         left = _left(w)
         if not isinstance(left, (int, float)):
-            return False, f"{w.get('window')}: no usage figure", []
-        n = reserved.get(_key(acct, w), 0)
-        after = left - (n + 1) * quota.ASSUMED_PCT_PER_CALL
-        if after < MIN_LEFT_PCT:
-            return False, (f"{w.get('window')}: {left:.0f}% left, {n} call(s) outstanding; one more would pass "
-                           f"the {MIN_LEFT_PCT:.0f}% floor"), []
+            return False, f"{w.get('window')}: no usage figure"
+        # One call's assumed cost, scaled for a pool's smaller cap (quota.POOL_CAP_SCALE: Fable 2x), must stay above it.
+        per_call = quota.ASSUMED_PCT_PER_CALL * quota.POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
+        if left - per_call < MIN_LEFT_PCT:
+            return False, f"{w.get('window')}: {left:.0f}% left (one {per_call:g}% call would pass {MIN_LEFT_PCT:.0f}%)"
         reset = w.get("reset_epoch")
         if not isinstance(reset, (int, float)):
             # Unknown reset: the loop cannot show it is outside the final hour before reset, so it holds (fail closed).
-            return False, f"{w.get('window')}: reset time unknown", []
+            return False, f"{w.get('window')}: reset time unknown"
         if (reset - (reading["fetched_at"] + age_s)) < quota.STOP_HOURS_BEFORE_RESET * 3600:
-            return False, f"{w.get('window')}: resets within {quota.STOP_HOURS_BEFORE_RESET:.0f} h", []
+            return False, f"{w.get('window')}: resets within {quota.STOP_HOURS_BEFORE_RESET:.0f} h"
         worst = left if worst is None else min(worst, left)
-    return True, f"{worst:.0f}% weekly left{note}", sorted(_key(acct, w) for w in relevant)
+    return True, f"{worst:.0f}% weekly left{note}"
 
 
-def _reserved(since_of: dict) -> dict:
-    """Admissions this loop made through the provider door since each key's reading was sampled (minus quota.IN_FLIGHT_S,
-    as quota._reserved: work admitted earlier is assumed visible in the reading)."""
-    counts: dict = {}
-    for row in store.read("provider_admissions"):
-        for k in row.get("windows", []):
-            if k in since_of and float(row.get("ts", 0)) >= since_of[k] - quota.IN_FLIGHT_S:
-                counts[k] = counts.get(k, 0) + 1
-    return counts
-
-
-def admit(lane: str, model: str | None = None, now: float | None = None, urlopen=urllib.request.urlopen,
-          reserve: bool = True) -> tuple[bool, str]:
-    """The quota door on the provider backend (see the module docstring). Fails closed on every unknown. On yes (and
-    `reserve`), the admitted account's windows are reserved durably, under quota.py's cross-process lock, so outstanding
-    calls count before another is admitted; status() checks without reserving."""
+def admit(lane: str, model: str | None = None, now: float | None = None, urlopen=urllib.request.urlopen) -> tuple[bool, str]:
+    """The quota door on the provider backend: an advisory pre-check plus the durable holds from reveals and refusals
+    (see the module docstring). Reserves nothing: the provider reserves on the account it executes on. Fails closed."""
     now = time.time() if now is None else now
     snap, err = resources(now, urlopen)
     if snap is None:
@@ -236,37 +217,30 @@ def admit(lane: str, model: str | None = None, now: float | None = None, urlopen
         return False, f"{lane}: held, /resources has no generated_at"
     local_at = _resources_cache["local_at"] or now
     elapsed = max(0.0, now - local_at)               # the cached snapshot keeps ageing by local time since its fetch
-    with quota._thread_lock, (store.home() / "quota.lock").open("a") as lock:
-        quota.fcntl.flock(lock.fileno(), quota.fcntl.LOCK_EX)
-        holds = [r for r in store.read("provider_headroom") if r.get("lane") == lane and
-                 (r.get("spent") or (isinstance(r.get("left_pct"), (int, float)) and r["left_pct"] < MIN_LEFT_PCT))]
-        hold_ts = max((float(r.get("ts", 0)) for r in holds), default=None)
-        reasons = []
-        for acct, reading in sorted(snap["readings"].items()):
-            if acct.split("#", 1)[0] != lane or not isinstance(reading, dict):
-                continue
-            fetch_age = gen - float(reading.get("fetched_at") or 0)
-            # The reading's sample time on THIS machine's clock (provider clock skew cancels: age is provider-relative);
-            # it stays the original sample time for the hold comparison, however long the snapshot is cached.
-            sampled_local = local_at - fetch_age
-            keys = [_key(acct, w) for w in reading.get("windows") or []]
-            reserved = _reserved({k: sampled_local for k in keys})
-            ok, why, rkeys = _account_verdict(reading, model, fetch_age + elapsed, acct, reserved)
-            if ok and hold_ts is not None and sampled_local <= hold_ts:
-                ok, why = False, "held since a low/spent reveal; awaiting a usage reading sampled after it"
-            reasons.append(f"{acct} {why}")
-            if ok:
-                if reserve:
-                    store.append("provider_admissions", {"ts": now, "lane": lane, "account": acct, "model": model,
-                                                         "windows": rkeys})
-                return True, f"{lane}: {acct} {why}"
+    holds = [r for r in store.read("provider_headroom") if r.get("lane") == lane and
+             (r.get("spent") or (isinstance(r.get("left_pct"), (int, float)) and r["left_pct"] < MIN_LEFT_PCT))]
+    hold_ts = max((float(r.get("ts", 0)) for r in holds), default=None)
+    reasons = []
+    for acct, reading in sorted(snap["readings"].items()):
+        if acct.split("#", 1)[0] != lane or not isinstance(reading, dict):
+            continue
+        fetch_age = gen - float(reading.get("fetched_at") or 0)
+        # The reading's sample time on THIS machine's clock (provider clock skew cancels: age is provider-relative);
+        # it stays the original sample time for the hold comparison, however long the snapshot is cached.
+        sampled_local = local_at - fetch_age
+        ok, why = _account_verdict(reading, model, fetch_age + elapsed)
+        if ok and hold_ts is not None and sampled_local <= hold_ts:
+            ok, why = False, "held since a low/spent reveal or refusal; awaiting a usage reading sampled after it"
+        reasons.append(f"{acct} {why}")
+        if ok:
+            return True, f"{lane}: {acct} {why}"
     if not reasons:
         reasons.append("no account of this lane in /resources")
     return False, f"{lane}: held: " + "; ".join(reasons)
 
 
 def status() -> dict[str, str]:
-    return {lane: admit(lane, reserve=False)[1] for lane in quota.LANES}
+    return {lane: admit(lane)[1] for lane in quota.LANES}
 
 
 def ask_claude(model: str, system: str, user: str, timeout_s: int = TIMEOUT_S) -> str:

@@ -227,6 +227,31 @@ class CodexEndpointTests(unittest.TestCase):
                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "hello"}]}]
         return {"model": next_model, "tools": [READ_TOOL], "messages": history}
 
+    def test_every_continuation_is_rechecked_under_the_sessions_floor(self):
+        calls = []
+        self.reg.router = lambda body, client, **kw: dict(CODEX_ROUTE, min_left_pct=5.0,
+                                                          route={"chosen": {"lane": "codex"}})
+        self.reg.floor_turn = lambda route, floor: calls.append(floor) or None
+        body = self.continuation("cortados", "cortados")
+        h = provider_server.MIN_LEFT_HEADER
+        code, err = self.send_with(body, {h: "101"})                    # validated on a continuation too
+        self.assertEqual((code, err["type"]), (400, "invalid_request_error"))
+        self.assertEqual(calls, [])
+        self.reg.floor_turn = lambda route, floor: calls.append(floor) or "week: 3% left, below the floor"
+        code, err = self.send_with(body, {})                             # no header: the session's floor still holds
+        self.assertEqual((code, err["type"]), (429, "rate_limit_error"))
+        self.assertIn("below the floor", err["message"])
+        self.assertEqual(calls, [5.0])
+        self.send_with(body, {h: "10"})                                  # a stricter header tightens it
+        self.assertEqual(calls, [5.0, 10.0])
+        self.send_with(body, {h: "1"})                                   # a looser one never loosens it
+        self.assertEqual(calls, [5.0, 10.0, 10.0])
+
+    def test_a_continuation_without_any_floor_is_never_checked(self):
+        self.reg.floor_turn = lambda route, floor: self.fail("no floor: no check")
+        body = self.continuation("cortados", "cortados")
+        self.assertEqual(self.send_with(body, {})[0], 200)
+
     def test_a_pinned_conversation_continues_under_the_same_pin_or_cortados(self):
         self.pin_router()
         body = self.continuation("sub/opus", "sub/claude-opus-5-5")     # alias and full name are the same pin
