@@ -31,6 +31,7 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; width:60px; }
 td.barcell { width:40%; }
 .cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
 ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
+.card.errors { border-color:var(--bad); } #status.err { color:var(--bad); }
 #login { max-width:360px; margin:80px auto; }
 #login input { width:100%; padding:7px; margin:8px 0; font:inherit; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
 </style>
@@ -74,8 +75,31 @@ function card(title, sub) { const c = el("div", "card"); add(c, el("div", "title
 function countTable(obj, label) { const rows = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
   return table(rows, [{h: label, v: r => r[0]}, {h: "", bar: r => r[1]}, {h: "n", num: true, v: r => r[1]}], r => r[1]); }
 
+// Shape: cortados_router/provider/usage.py _VIEW (the publish schema). errors[] = {source, error}: every failed or absent
+// source; it is drawn first and counted in the header, never folded away, so a missing scarcity.json is not read as "no lanes".
+function errText(e) { return (e && typeof e === "object") ? ((e.source || "?") + ": " + (e.error || "error")) : String(e); }
+function when(t) { return (typeof t === "number") ? new Date(t * 1000).toLocaleTimeString() : (t || ""); }
+// A hardware field is its value or the sampler's {available: false, reason} shape.
+function off(v) { return v && typeof v === "object" && !Array.isArray(v) && v.available === false; }
+function hwLine(c, name, v, fmt) {
+  if (v === undefined || v === null) return;
+  if (off(v)) add(c, el("div", "sub err", name + ": unavailable (" + (v.reason || "error") + ")"));
+  else add(c, el("div", "sub", name + ": " + (fmt ? fmt(v) : v)));
+}
+function gb(b) { return (typeof b === "number") ? (b / 1073741824).toFixed(1) + " GB" : "–"; }
+function tok(n) { return (typeof n === "number") ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n)) : "–"; }
+function capped(o, keys) { return keys.some(k => o && o[k]) ? "list capped" : ""; }
+
 function render(d) {
   const m = $("main"); m.replaceChildren();
+  const errors = d.errors || [];
+  const bySrc = (p) => errors.filter(e => e && typeof e.source === "string" && (e.source === p || e.source.indexOf(p + "/") === 0));
+  add(m, section("Errors (" + errors.length + ")"));
+  const ec = el("div", "card" + (errors.length ? " errors" : ""));
+  if (errors.length) { const ul = el("ul"); errors.forEach(e => add(ul, el("li", "err", errText(e)))); add(ec, ul); }
+  else add(ec, el("div", "sub", "none: every source answered"));
+  add(m, ec);
+
   add(m, section("Resources (% left)"));
   const lanes = el("div", "grid");
   (d.lanes || []).forEach(l => {
@@ -85,56 +109,92 @@ function render(d) {
     if (l.stale) c.classList.add("stale");
     add(c, el("div", "big", pct(l.left_pct)), bar(l.left_pct));
     (l.windows || []).forEach(w => { const left = (typeof w.headroom_pct === "number") ? w.headroom_pct : w.left_pct;
-      add(c, el("div", "sub", (w.window || "window") + ": " + pct(left) + " left" + (w.resets_at ? " · resets " + w.resets_at : ""))); });
+      add(c, el("div", "sub", (w.window || "window") + (w.pool && w.pool !== "all" ? " [" + w.pool + "]" : "") + ": " + pct(left) + " left" +
+        (w.resets_at ? " · resets " + w.resets_at : "") + (w.stale ? " (stale)" : ""))); });
+    Object.entries(l.pools || {}).forEach(([p, v]) => add(c, el("div", "sub", "pool " + p + ": " + pct(v) + " left")));
     add(c, el("div", "sub", "sample " + age(l.sample_age_s) + " old" + (l.stale ? " (stale)" : "")));
-    if (l.error) add(c, el("div", "sub err", l.error_kind || l.error));
+    if (l.error) add(c, el("div", "sub err", "error: " + l.error));
     add(lanes, c);
   });
-  if (!(d.lanes || []).length) add(lanes, el("div", "sub", "no lane readings"));
+  if (!(d.lanes || []).length) {
+    const se = bySrc("scarcity");
+    add(lanes, el("div", se.length ? "sub err" : "sub", "no lane readings" + (se.length ? " (" + se.map(errText).join("; ") + ")" : "")));
+  }
   add(m, lanes);
+
   const r = d.routed || {};
   add(m, section("Routed calls"));
   const cols = el("div", "cols");
   const lm = [{h: "lane", v: x => x.lane}, {h: "model", v: x => x.model}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}];
-  add(cols, add(card("Today"), table(r.today || [], lm, x => x.calls)));
-  add(cols, add(card("Last 7 days"), table(r.last_7d || [], lm, x => x.calls)));
-  add(cols, add(card("Top S1 bands (7 d)"), table(r.top_bands_7d || [], [{h: "band", v: x => x.band}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}], x => x.calls)));
+  add(cols, add(card("Today", capped(r, ["today_truncated"])), table(r.today || [], lm, x => x.calls)));
+  add(cols, add(card("Last 7 days", capped(r, ["last_7d_truncated"])), table(r.last_7d || [], lm, x => x.calls)));
+  add(cols, add(card("Top S1 bands (7 d)", capped(r, ["bands_truncated"])), table(r.top_bands_7d || [], [{h: "band", v: x => x.band}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}], x => x.calls)));
   add(cols, add(card("This provider since start"), countTable(r.provider_since_start, "lane/model")));
   add(m, cols);
-  add(m, section("Refusals, child tasks, S1"));
+
+  const lg = d.ledger || {};
+  add(m, section("Tokens (usage ledger)"));
+  const lc = el("div", "cols");
+  const tm = [{h: "lane", v: x => x.lane}, {h: "model", v: x => x.model}, {h: "turns", num: true, v: x => x.turns},
+    {h: "in", num: true, v: x => tok(x.input_tokens)}, {h: "out", num: true, v: x => tok(x.output_tokens)},
+    {h: "cache r", num: true, v: x => tok(x.cache_read_tokens)}, {h: "cache w", num: true, v: x => tok(x.cache_write_tokens)}];
+  add(lc, add(card("Today", capped(lg, ["today_truncated"])), table(lg.today || [], tm)));
+  add(lc, add(card("Last 7 days", capped(lg, ["last_7d_truncated"])), table(lg.last_7d || [], tm)));
+  add(m, lc);
+
+  add(m, section("Refusals, child tasks, bots, S1"));
   const h = el("div", "cols");
   const rf = d.refusals || {};
   add(h, add(card("Refusals (24 h)", "total " + (rf.total || 0)), countTable(rf.by_reason, "reason")));
   const ct = d.child_tasks || {};
-  add(h, add(card("Child tasks (7 d)", ct.truncated ? "log tail clipped" : ""), countTable(ct.by_status, "status"), countTable(ct.by_event, "event")));
+  const ctSub = [ct.truncated ? "log tail clipped" : "", ct.unparsable_lines ? ct.unparsable_lines + " unparsable lines" : ""].filter(Boolean).join(" · ");
+  add(h, add(card("Child tasks (7 d)", ctSub), countTable(ct.by_client, "client"), countTable(ct.by_status, "status"), countTable(ct.by_event, "event")));
+  const bt = d.bots || {};
+  const btSub = ["calls " + (bt.calls || 0), bt.truncated ? "log tail clipped" : "", bt.unparsable_lines ? bt.unparsable_lines + " unparsable lines" : ""].filter(Boolean).join(" · ");
+  add(h, add(card("Bot gateway (7 d)", btSub), countTable(bt.by_client, "client"), countTable(bt.by_tool, "tool"), countTable(bt.by_outcome, "outcome")));
   const s1 = d.s1 || {};
-  const s1c = card("S1 scorer", s1.status || "");
+  const s1c = card("S1 scorer", typeof s1.status === "number" ? "HTTP " + s1.status : "");
   add(s1c, el("div", "big" + (s1.available ? "" : " err"), s1.available ? "up" : "down"));
+  if (s1.reason) add(s1c, el("div", "sub err", s1.reason));
   if (typeof s1.latency_ms === "number") add(s1c, el("div", "sub", "latency " + Math.round(s1.latency_ms) + " ms"));
   add(h, s1c);
   add(m, h);
+
   add(m, section("Hardware"));
   const hw = el("div", "grid");
   (d.hardware || []).forEach(x => { const v = x.data || {};
-    const c = card(v.host || x.file, v.chip || "");
-    if (typeof v.cpu_busy_pct === "number") add(c, el("div", "sub", "CPU busy " + pct(v.cpu_busy_pct)), bar(v.cpu_busy_pct));
-    if (typeof v.gpu_busy_pct === "number") add(c, el("div", "sub", "GPU busy " + pct(v.gpu_busy_pct)), bar(v.gpu_busy_pct));
-    Object.keys(v).filter(k => k.indexOf("mem_") === 0).forEach(k => add(c, el("div", "sub", k.slice(4).replace(/_/g, " ") + ": " + v[k])));
-    if (v.headroom !== undefined) add(c, el("div", "sub", "headroom: " + (typeof v.headroom === "object" ? JSON.stringify(v.headroom) : v.headroom)));
-    const om = v.ollama_models || [];
-    add(c, el("div", "sub", "Ollama: " + (om.length ? om.map(o => (typeof o === "object" ? (o.name || o.model || JSON.stringify(o)) : o)).join(", ") : "none resident")));
+    const c = card(typeof v.host === "string" ? v.host : x.file, typeof v.chip === "string" ? v.chip : "");
+    ["cpu_busy_pct", "gpu_busy_pct"].forEach(k => { const n = k === "cpu_busy_pct" ? "CPU busy" : "GPU busy";
+      if (typeof v[k] === "number") add(c, el("div", "sub", n + " " + pct(v[k])), bar(v[k])); else hwLine(c, n, v[k]); });
+    hwLine(c, "memory available", v.mem_available_bytes, gb);
+    hwLine(c, "memory total", v.mem_total_bytes, gb);
+    hwLine(c, "load", v.load_avg, a => Array.isArray(a) ? a.map(n => typeof n === "number" ? n.toFixed(2) : "–").join(" ") : a);
+    const hr = v.headroom;
+    if (hr && typeof hr === "object") {
+      hwLine(c, "free memory", hr.free_mem_gb, n => n + " GB");
+      hwLine(c, "CPU idle", hr.cpu_idle_pct, pct);
+      hwLine(c, "GPU idle", hr.gpu_idle_pct, pct);
+    }
+    const om = v.ollama_models;
+    if (off(om)) hwLine(c, "Ollama", om);
+    else add(c, el("div", "sub", "Ollama: " + ((om || []).length ? om.map(o => (o && o.name) || "?").join(", ") : "none resident")));
+    (v.errors || []).forEach(e => add(c, el("div", "sub err", "error " + (e.field || "unknown") + ": " + (e.error || "error"))));
+    bySrc("hardware/" + x.file).forEach(e => add(c, el("div", "sub err", errText(e))));
     add(c, el("div", "sub", "sample " + age(x.age_s) + " old"));
     add(hw, c);
   });
-  if (!(d.hardware || []).length) add(hw, el("div", "sub", "no hardware samples"));
+  if (!(d.hardware || []).length) {
+    const he = bySrc("hardware");
+    add(hw, el("div", he.length ? "sub err" : "sub", "no hardware samples" + (he.length ? " (" + he.map(errText).join("; ") + ")" : "")));
+  }
   add(m, hw);
-  add(m, section("Notes and errors"));
-  const ne = el("div", "cols");
-  const notes = el("ul"); (d.notes || []).forEach(n => add(notes, el("li", null, typeof n === "string" ? n : JSON.stringify(n))));
-  const errs = el("ul"); (d.errors || []).forEach(e => add(errs, el("li", "err", typeof e === "string" ? e : ((e.source || "?") + ": " + (e.error || JSON.stringify(e))))));
-  add(ne, add(card("Notes"), notes), add(card("Errors"), errs));
-  add(m, ne);
-  $("status").textContent = "updated " + new Date().toLocaleTimeString() + (d.generated_at ? " · generated " + d.generated_at : "");
+
+  add(m, section("Notes"));
+  const notes = el("ul"); (d.notes || []).forEach(n => add(notes, el("li", null, n)));
+  add(m, add(el("div", "card"), notes));
+  const st = $("status"); st.className = errors.length ? "err" : "";
+  st.textContent = "updated " + new Date().toLocaleTimeString() + (d.generated_at ? " · generated " + when(d.generated_at) : "") +
+    (errors.length ? " · " + errors.length + " error" + (errors.length === 1 ? "" : "s") : "");
 }
 
 function showLogin(msg) {
