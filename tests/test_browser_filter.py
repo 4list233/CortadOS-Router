@@ -1,9 +1,12 @@
 """integrations/browser/mcp_filter.py (docs/BROWSER-TOOL.md, ticket B1b). The filter runs as a subprocess in front of a
 stub MCP server (stdlib python over pipes) that records every message it receives, so each test checks both what the
 client sees and that refused requests never reached the server. No node, npm or browser."""
+import contextlib
+import io
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,18 +62,19 @@ for line in sys.stdin:
         elif trig == "exit":
             sys.exit(3)                                # the server dies on its own, no answer
         elif trig == "spawn_exit":
-            # Chromium-like grandchild: argv[0] is a headless-shell path under the browsers path and its --user-data-dir
-            # is under the task's TMPDIR (a /bin/sh running sleep, so ps shows exactly that argv), made an orphan at once
-            # (double fork) so no descendant walk can ever see it; then the server dies abruptly.
-            # argv[0] comes from <log>.exe, so a test can point it outside the browsers path (a decoy that must survive).
+            # Chromium-like grandchild with its --user-data-dir under the task's TMPDIR, made an orphan at once (double
+            # fork) so no descendant walk can ever see it; then the server dies abruptly. It executes <log>.exe (a
+            # re-signed copy of bash, so the kernel's executable path is that file) with argv[0] from <log>.argv0, so a
+            # test can run a real browser-named binary, one outside the browsers path, or a shell forging argv[0].
             prof = open(sys.argv[2] + ".task").read() + "/browser/tmp/playwright_chromiumdev_profile-x"
             exe = open(sys.argv[2] + ".exe").read()
-            code = ("import subprocess, sys; g = subprocess.Popen([sys.argv[3], '-c', 'sleep 120; :', 'x', "
-                    "'--user-data-dir=' + sys.argv[1]], executable='/bin/sh', start_new_session=True, "
+            argv0 = open(sys.argv[2] + ".argv0").read()
+            code = ("import subprocess, sys; g = subprocess.Popen([sys.argv[4], '-c', 'sleep 120; :', 'x', "
+                    "'--user-data-dir=' + sys.argv[1]], executable=sys.argv[3], start_new_session=True, "
                     "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
                     "open(sys.argv[2], 'w').write(str(g.pid))")
-            subprocess.run([sys.executable, "-c", code, prof, sys.argv[2] + ".pid", exe], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL)
+            subprocess.run([sys.executable, "-c", code, prof, sys.argv[2] + ".pid", exe, argv0],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             sys.exit(3)
     send({"jsonrpc": "2.0", "id": m["id"], "result": {"ok": meth}})
 '''
@@ -93,7 +97,7 @@ class FilterTests(unittest.TestCase):
         Path(str(self.log) + ".task").write_text(str(self.task))
         self.browsers = self.tmp / "browsers"
         self.fake_exe = self.browsers / "chromium_headless_shell-1" / "chrome-mac" / "headless_shell"
-        Path(str(self.log) + ".exe").write_text(str(self.fake_exe))
+        self.spawn_as(self.fake_exe)
         self.p = None
 
     def tearDown(self):
@@ -113,6 +117,23 @@ class FilterTests(unittest.TestCase):
              sys.executable, "-I", str(self.tmp / "stub.py"), str(self.tmp / "tools"), str(self.log)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.buf = b""
+
+    def spawn_as(self, exe, argv0=None):
+        Path(str(self.log) + ".exe").write_text(str(exe))
+        Path(str(self.log) + ".argv0").write_text(str(argv0 or exe))
+
+    def fake_browser(self, path):
+        """A real executable at path (bash copied and ad-hoc re-signed: a copied platform binary is killed by the
+        kernel), so proc_pidpath reports that path. Skips the test where that is not possible (not macOS)."""
+        if sys.platform != "darwin" or not os.path.exists("/usr/bin/codesign"):
+            self.skipTest("kernel executable identity is macOS-only (libproc)")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile("/bin/bash", path)
+        os.chmod(path, 0o755)
+        r = subprocess.run(["/usr/bin/codesign", "-f", "-s", "-", str(path)], capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest(f"codesign failed: {r.stderr.strip()}")
+        return path
 
     def send_raw(self, data):
         self.p.stdin.write(data)
@@ -421,7 +442,8 @@ class FilterTests(unittest.TestCase):
 
     def test_server_exit_kills_orphaned_task_browser_process(self):
         # P2-1: the server exits on its own after launching a detached child that is already an orphan; only the
-        # command-line ownership (the task's browser dir) can find it.
+        # command-line ownership (a real executable under the browsers path, the task's profile) can find it.
+        self.fake_browser(self.fake_exe)
         self.start()
         self.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "browser_snapshot", "arguments": {"trigger": "spawn_exit"}}})
@@ -455,7 +477,17 @@ class FilterTests(unittest.TestCase):
     def test_server_exit_spares_non_browser_with_task_profile_flag(self):
         # P2 round 3: an orphan whose --user-data-dir is the task's, but whose executable is not under the browsers
         # path, is not the task's browser and survives the close.
-        Path(str(self.log) + ".exe").write_text(str(self.tmp / "elsewhere" / "headless_shell"))
+        self.spawn_as(self.fake_browser(self.tmp / "elsewhere" / "headless_shell"))
+        self._assert_survives_spawn_exit()
+
+    def test_server_exit_spares_shell_forging_browser_argv0(self):
+        # P1 round 4: a shell whose argv[0] (all ps shows) is the browser path under the browsers dir, with the task's
+        # profile flag: the kernel's executable is the shell, so it is not the task's browser and survives.
+        self.fake_browser(self.tmp / "unused")   # skips off macOS like the positive test
+        self.spawn_as("/bin/bash", argv0=self.fake_exe)
+        self._assert_survives_spawn_exit()
+
+    def _assert_survives_spawn_exit(self):
         self.start()
         self.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "browser_snapshot", "arguments": {"trigger": "spawn_exit"}}})
@@ -470,6 +502,7 @@ class FilterTests(unittest.TestCase):
                 pass
 
     def test_owned_by_task_needs_browser_exe_and_profile_token(self):
+        # Decided on the kernel's (executable, argv) per pid (_identity, mocked here), never on the ps text.
         _, f = self._bare_filter()
         uid = os.getuid()
         B, T = str(self.browsers), str(self.task)
@@ -478,23 +511,121 @@ class FilterTests(unittest.TestCase):
         helper = (f"{B}/chromium-1/chrome-mac/Chromium.app/Contents/Frameworks/Chromium Framework.framework/Helpers/"
                   "Chromium Helper (Renderer).app/Contents/MacOS/Chromium Helper (Renderer)")
         st = "Tue Nov  3 10:00:00 2026"
-        rows = [(10, 10, 1, uid, st, f"{shell} --headless {prof}"),                                  # yes
-                (11, 10, 10, uid, st, f"{helper} --type=renderer {prof}"),                           # yes (helper)
-                (20, 20, 1, uid, st, f"/bin/zsh -c ls {T}/browser/tmp/p {prof}"),                    # a shell
-                (21, 21, 1, uid, st, f"{shell} --user-data-dir=/x https://e.test{T}/browser/tmp/p"),  # URL only
-                (22, 22, 1, uid, st, f"{shell} --app=https://e.test/?{prof}"),                       # flag in a URL
-                (23, 23, 1, uid, st, f"{shell} --user-data-dir=/backup{T}/browser/tmp/p"),           # leading path
-                (24, 24, 1, uid, st, f"{self.tmp}/elsewhere/headless_shell {prof}"),                 # not under B
-                (25, 25, 1, uid, st, f"{B}/node-1/bin/node {prof}"),                                 # not a browser
-                (26, 26, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmpX/p"),                 # sibling dir
-                (27, 27, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmp/../../../etc"),       # traversal
-                (28, 28, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmp"),                    # tmp itself
-                (29, 29, 1, uid, st, f"/backup{shell} {prof}"),                                      # exe collision
-                (30, 30, 1, uid + 1, st, f"{shell} {prof}"),                                         # other user
-                (os.getpid(), 1, 1, uid, st, f"{shell} {prof}")]                                     # self
+        cases = [(10, 10, uid, shell, [shell, "--headless", prof]),                                 # yes
+                 (11, 10, uid, helper, [helper, "--type=renderer", prof]),                          # yes (helper)
+                 (20, 20, uid, "/bin/zsh", ["/bin/zsh", "-c", f"ls {T}/browser/tmp/p", prof]),       # a shell
+                 (21, 21, uid, shell, [shell, "--user-data-dir=/x", f"https://e.test{T}/browser/tmp/p"]),  # URL only
+                 (22, 22, uid, shell, [shell, f"--app=https://e.test/?{prof}"]),                    # flag in a URL
+                 (23, 23, uid, shell, [shell, f"--user-data-dir=/backup{T}/browser/tmp/p"]),        # leading path
+                 (24, 24, uid, f"{self.tmp}/elsewhere/headless_shell", ["headless_shell", prof]),   # not under B
+                 (25, 25, uid, f"{B}/node-1/bin/node", ["node", prof]),                             # not a browser
+                 (26, 26, uid, shell, [shell, f"--user-data-dir={T}/browser/tmpX/p"]),              # sibling dir
+                 (27, 27, uid, shell, [shell, f"--user-data-dir={T}/browser/tmp/../../../etc"]),    # traversal
+                 (28, 28, uid, shell, [shell, f"--user-data-dir={T}/browser/tmp"]),                 # tmp itself
+                 (29, 29, uid, f"/backup{shell}", [f"/backup{shell}", prof]),                       # exe collision
+                 (31, 31, uid, "/bin/bash", [shell, "-c", "sleep 120", prof]),                      # forged argv[0]
+                 (32, 32, uid, None, [shell, prof]),                                                # identity unknown
+                 (30, 30, uid + 1, shell, [shell, prof]),                                           # other user
+                 (os.getpid(), 1, uid, shell, [shell, prof])]                                       # self
+        rows = [(pid, pgid, 1, u, st, " ".join(argv)) for pid, pgid, u, _, argv in cases]
+        ident = {pid: (exe, argv) if exe else None for pid, _, _, exe, argv in cases}
+        f._identity = ident.get
         self.assertEqual(f.owned_by_task(rows), {10: (10, st), 11: (10, st)})
         _, off = self._bare_filter(browsers_path=False)
+        off._identity = ident.get
         self.assertEqual(off.owned_by_task(rows), {})   # no --browsers-path: nothing is owned by command line
+
+    def test_identity_is_the_kernel_executable_not_argv0(self):
+        if sys.platform != "darwin":
+            self.skipTest("macOS-only (libproc)")
+        m, _ = self._bare_filter()
+        p = subprocess.Popen(["/forged/headless_shell", "-c", "sleep 30; :", "x", "--user-data-dir=/a b"],
+                             executable="/bin/bash")
+        try:
+            time.sleep(0.3)
+            exe, argv = m.Filter._identity(p.pid)
+            self.assertEqual(os.path.realpath(exe), os.path.realpath("/bin/bash"))
+            self.assertEqual(argv, ["/forged/headless_shell", "-c", "sleep 30; :", "x", "--user-data-dir=/a b"])
+        finally:
+            p.kill()
+            p.wait()
+        self.assertIsNone(m.Filter._identity(p.pid))   # gone: unknown, never guessed
+
+    def _proc(self, pid, reaped):
+        class Proc:
+            def poll(self): return 0 if reaped else None
+            def wait(self, timeout=None): return 0
+        pr = Proc()
+        pr.pid = pid
+        return pr
+
+    def _record_signals(self, m, f):
+        sent = []
+        orig = (m.os.kill, m.os.killpg)
+        m.os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
+        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig))
+        try:
+            f.kill_tree()
+        finally:
+            m.os.kill, m.os.killpg = orig
+        return sent
+
+    def test_descendants_need_the_recorded_server_start(self):
+        # P1 round 4: after the server is reaped its pid may be a new process; its children are never adopted.
+        _, f = self._bare_filter()
+        old, new = "Tue Nov  3 10:00:00 2026", "Tue Nov  3 11:00:00 2026"
+        uid = os.getuid()
+        f.proc = self._proc(400, reaped=True)
+        f.server_start = old
+        rows = [(400, 400, 1, uid, new, "x"), (401, 400, 400, uid, new, "y"), (402, 402, 401, uid, new, "z")]
+        f._ps_full = lambda: rows
+        self.assertEqual(f.descendants(), {})
+        f.server_start = None                      # start unknown: walk disabled, never guessed
+        self.assertEqual(f.descendants(), {})
+        rows[0] = (400, 400, 1, uid, old, "x")     # the original server: its tree is adopted
+        f.server_start = old
+        self.assertEqual(f.descendants(), {401: new, 402: new})
+
+    def test_reaped_server_replacement_group_not_signalled(self):
+        # P1 round 4: the server is reaped and its pid now leads an unrelated group with a child. Nothing is sent to
+        # that group or its members (no group signal after the reap; the walk refuses the recycled root).
+        m, f = self._bare_filter()
+        old, new = "Tue Nov  3 10:00:00 2026", "Tue Nov  3 11:00:00 2026"
+        uid = os.getuid()
+        f.state_lock = threading.Lock()
+        f.known_tree = {}
+        f.proc = self._proc(400, reaped=True)
+        f.server_start = old
+        f._ps_full = lambda: [(400, 400, 1, uid, new, "x"), (401, 400, 400, uid, new, "y")]
+        f._start_of = lambda pid: new
+        f.owned_by_task = lambda rows=None: {}
+        self.assertEqual(self._record_signals(m, f), [])
+
+    def test_unreaped_server_group_is_signalled(self):
+        m, f = self._bare_filter()
+        f.state_lock = threading.Lock()
+        f.known_tree = {}
+        f.proc = self._proc(400, reaped=False)
+        f.descendants = lambda: {}
+        f._ps_full = lambda: []
+        f.owned_by_task = lambda rows=None: {}
+        self.assertEqual(self._record_signals(m, f), [("killpg", 400, 15), ("killpg", 400, 9)])
+
+    def test_ps_failure_exit_is_reported(self):
+        # P2 round 4: a nonzero ps exit is not an empty process table: it is reported with ps's stderr.
+        m, _ = self._bare_filter()
+        fake = self.tmp / "ps"
+        fake.write_text("#!/bin/sh\necho 'ps: boom' >&2\nexit 2\n")
+        fake.chmod(0o755)
+        orig, m.PS = m.PS, str(fake)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(m.Filter._ps_full(), [])
+        finally:
+            m.PS = orig
+        self.assertIn("ps exited 2", err.getvalue())
+        self.assertIn("ps: boom", err.getvalue())
 
     def test_recycled_pid_not_signalled(self):
         # P2 round 3: a recorded pid whose start time changed belongs to another process now; neither it nor the
@@ -505,24 +636,12 @@ class FilterTests(unittest.TestCase):
         f.state_lock = threading.Lock()
         f.known_tree = {500: old, 501: old}
 
-        class Proc:
-            pid = 400
-            def poll(self): return 0
-            def wait(self, timeout=None): return 0
-        f.proc = Proc()
+        f.proc = self._proc(400, reaped=True)
         f.descendants = lambda: {}
         f._ps_full = lambda: [(500, 500, 1, os.getuid(), new, "x"), (501, 777, 1, os.getuid(), old, "y")]
         f._start_of = lambda pid: {500: new, 501: old, 600: new}.get(pid)
         f.owned_by_task = lambda rows=None: {600: (600, old)}
-        sent = []
-        orig = (m.os.kill, m.os.killpg)
-        m.os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
-        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig))
-        try:
-            f.kill_tree()
-        finally:
-            m.os.kill, m.os.killpg = orig
-        self.assertEqual(sent, [("kill", 501, 9)])
+        self.assertEqual(self._record_signals(m, f), [("kill", 501, 9)])
 
     def test_sigterm_while_main_thread_holds_state_lock(self):
         # P2-2: the signal lands while the main thread holds state_lock; the handler must not take it.

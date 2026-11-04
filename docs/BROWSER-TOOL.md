@@ -143,14 +143,18 @@ the installed server's list differs, so a version bump is a reviewed diff, never
    - closing (bad input, stdin EOF, SIGTERM/SIGHUP) sends SIGTERM to the server's group, waits `EXIT_GRACE_S`, sends
      SIGKILL, then kills every surviving descendant found by walking `ps` from the server pid (Playwright launches
      Chromium detached, in its own group), every descendant recorded by a walk repeated every 2 s while running, and
-     every process of this user that is this task's browser: its executable is a Playwright Chromium / Chrome for
-     Testing / headless-shell binary under `--browsers-path` (the `PLAYWRIGHT_BROWSERS_PATH` run-mcp.sh sets, written by
-     `install.sh config`) and it has a whole `--user-data-dir=<path>` argument whose realpath is inside
+     every process of this user that is this task's browser: its kernel-reported executable (libproc `proc_pidpath`,
+     never argv[0], which a process can forge) is a Playwright Chromium / Chrome for Testing / headless-shell binary
+     under `--browsers-path` (the `PLAYWRIGHT_BROWSERS_PATH` run-mcp.sh sets, written by `install.sh config`) and its
+     kernel argv (`KERN_PROCARGS2`) has a whole `--user-data-dir=<path>` entry whose realpath is inside
      `<task>/browser/tmp` (TMPDIR, so `--isolated` puts the profile there). That still finds a browser reparented
-     after the server exited on its own, and never a shell or other program that merely mentions the task dir.
+     after the server exited on its own, and never a shell or other program that merely mentions the task dir; where
+     the kernel identity is unavailable (not macOS, call failed) nothing is killed by command line.
      Recorded pids carry their `ps` start time (`lstart`), re-checked right before every signal, so a pid recycled by
-     an unrelated process is skipped; the server's own group is signalled after it is reaped only while another
-     member of it is still alive.
+     an unrelated process is skipped. The descendant walk starts only from the server pid with the start time recorded
+     at spawn, so a recycled server pid's children are never adopted; the server's group is signalled only while the
+     server is still an unreaped child, never after (its former members are signalled one by one, each verified). A
+     failing `ps` (error or nonzero exit) is reported on stderr with its message.
      SIGTERM/SIGHUP handlers only write a byte to a self-pipe; a coordinator thread runs the close, so a signal
      landing while the main thread holds the filter's state lock cannot deadlock;
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a

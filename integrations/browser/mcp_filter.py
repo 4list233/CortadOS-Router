@@ -18,6 +18,7 @@ tool boundary that holds even if Claude Code's --disallowedTools is misconfigure
 Stdlib only. Refusals are JSON-RPC errors with fixed reason text; nothing from a refused request is echoed back.
 """
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -72,6 +73,12 @@ EXIT_GRACE_S = 5
 PS = "/bin/ps"
 # ps runs in the C locale so `lstart` is always five whitespace-separated fields ("Tue Nov  3 20:12:42 2026").
 PS_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+# Kernel process identity on macOS (libproc's proc_pidpath and sysctl KERN_PROCARGS2), via ctypes: ps prints argv,
+# which a process writes itself, so an executable path read from ps text proves nothing. Off macOS (or if either call is
+# unavailable) the identity is unknown and nothing is killed by command line.
+LIBPROC = "/usr/lib/libproc.dylib"
+PROC_PIDPATHINFO_MAXSIZE = 4096
+CTL_KERN, KERN_PROCARGS2 = 1, 49
 # Executable names of the browsers Playwright installs under PLAYWRIGHT_BROWSERS_PATH (Chromium, Chrome for Testing, the
 # headless shell, old and new layouts) and their macOS helper apps ("Chromium Helper (Renderer)"). Ownership by command
 # line accepts only these, so a shell or any other program whose argv mentions the task dir is never killed.
@@ -185,6 +192,11 @@ class Filter:
         # Chromium detached, in a group of its own; close() finds it by walking descendants (kill_tree).
         self.proc = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      start_new_session=True)
+        # The server's start time, read while it is our unreaped child (its pid cannot be reused yet). descendants()
+        # adopts children only of a process with this pid AND this start time; None (ps failed) disables the walk.
+        self.server_start = self._start_of(self.proc.pid)
+        if self.server_start is None:
+            sys.stderr.write("mcp_filter: server start time unknown; descendant walk disabled\n")
 
     # output helpers
     def to_client(self, msg):
@@ -221,13 +233,17 @@ class Filter:
         """[(pid, pgid, ppid, uid, lstart, command)] of every process; [] if ps fails (reported, the group kill still
         ran). -ww: unlimited width, so a long Chromium command line is never truncated before its --user-data-dir."""
         try:
-            out = subprocess.run([PS, "-ww", "-axo", "pid=,pgid=,ppid=,uid=,lstart=,command="], capture_output=True,
-                                 text=True, errors="replace", timeout=5, env=PS_ENV).stdout
+            r = subprocess.run([PS, "-ww", "-axo", "pid=,pgid=,ppid=,uid=,lstart=,command="], capture_output=True,
+                               text=True, errors="replace", timeout=5, env=PS_ENV)
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"mcp_filter: ps failed, descendants not walked: {e}\n")
             return []
+        if r.returncode != 0:
+            # subprocess.run does not raise on a failed exit: without this an empty list would silently skip cleanup.
+            sys.stderr.write(f"mcp_filter: ps exited {r.returncode}, descendants not walked: {r.stderr.strip()[:500]}\n")
+            return []
         rows = []
-        for line in out.splitlines():
+        for line in r.stdout.splitlines():
             parts = line.split(None, 9)
             if len(parts) >= 9 and all(p.isdigit() for p in parts[:4]):
                 rows.append((*(int(p) for p in parts[:4]), " ".join(parts[4:9]), parts[9] if len(parts) == 10 else ""))
@@ -258,19 +274,55 @@ class Filter:
             return False  # exited since the check (EPERM: a zombie-only group on macOS)
         return True
 
-    def is_task_browser(self, cmd):
-        """True if cmd (a ps command line) is a Playwright browser under the pinned browsers path running with a
-        --user-data-dir inside <task>/browser/tmp. Tokens, not substrings: the executable is everything before the first
-        " -" (Chromium's argv[0] may contain spaces, its flags never start without "--"); the profile flag must be one
-        whole token. A path with spaces in it does not match (fails safe: nothing is killed by command line)."""
+    @staticmethod
+    def _identity(pid):
+        """(executable path, argv) of pid as the kernel reports them, or None if unknown (not macOS, call failed, process
+        gone). The path is proc_pidpath's (the vnode actually executed, symlinks resolved), not argv[0]."""
+        try:
+            libproc = ctypes.CDLL(LIBPROC, use_errno=True)
+            libc = ctypes.CDLL(None, use_errno=True)
+            buf = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+            n = libproc.proc_pidpath(ctypes.c_int(pid), buf, ctypes.c_uint32(PROC_PIDPATHINFO_MAXSIZE))
+            if n <= 0:
+                return None
+            exe = buf.raw[:n].decode("utf-8", "surrogateescape")
+            mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+            size = ctypes.c_size_t(0)
+            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0 or size.value < 4:
+                return None
+            raw = ctypes.create_string_buffer(size.value)
+            if libc.sysctl(mib, 3, raw, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+                return None
+        except (OSError, AttributeError, ValueError):
+            return None
+        data = raw.raw[:size.value]
+        # KERN_PROCARGS2: int32 argc, exec path NUL, NUL padding, then argc NUL-terminated argv strings.
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        rest = data[4:]
+        end = rest.find(b"\0")
+        if end < 0:
+            return None
+        rest = rest[end:].lstrip(b"\0")
+        argv = rest.split(b"\0")[:argc]
+        if len(argv) != argc:
+            return None
+        return exe, [a.decode("utf-8", "surrogateescape") for a in argv]
+
+    def is_task_browser(self, pid):
+        """True if pid is a Playwright browser under the pinned browsers path running with a --user-data-dir inside
+        <task>/browser/tmp, judged on the kernel's executable path and argv (_identity), never on ps text. The profile
+        flag must be one whole argv entry. Unknown identity: False (fails safe: nothing is killed by command line)."""
         if self.browsers_root is None:
             return False
-        exe, sep, rest = cmd.partition(" -")
+        ident = self._identity(pid)
+        if ident is None:
+            return False
+        exe, argv = ident
         if not os.path.isabs(exe) or not BROWSER_EXE.match(os.path.basename(exe)):
             return False
         if not os.path.realpath(exe).startswith(self.browsers_root + os.sep):
             return False
-        for tok in ("-" + rest).split() if sep else ():
+        for tok in argv[1:]:
             if tok.startswith("--user-data-dir="):
                 d = tok[len("--user-data-dir="):]
                 if os.path.isabs(d) and os.path.realpath(d).startswith(self.task_tmp + os.sep):
@@ -285,17 +337,22 @@ class Filter:
         for pid, pgid, _, puid, start, cmd in (self._ps_full() if rows is None else rows):
             if pid in (me, parent) or puid != uid:
                 continue
-            if self.is_task_browser(cmd):
+            # The ps text is only a cheap pre-filter (no flag, no kernel lookup); the decision is is_task_browser's.
+            if "--user-data-dir=" in cmd and self.is_task_browser(pid):
                 found[pid] = (pgid, start)
         return found
 
     def descendants(self):
-        """{pid: lstart} below the server process (Chromium included: its group differs, its parent chain does not)."""
+        """{pid: lstart} below the server process (Chromium included: its group differs, its parent chain does not).
+        Empty unless this snapshot shows the server pid with the start time recorded at spawn: after the server is
+        reaped its pid may belong to an unrelated process, whose children must never be adopted."""
         rows = self._ps_full()
         kids, starts = {}, {}
         for pid, _, ppid, _, start, _ in rows:
             kids.setdefault(ppid, []).append(pid)
             starts[pid] = start
+        if self.server_start is None or starts.get(self.proc.pid) != self.server_start:
+            return {}
         found, todo = {}, [self.proc.pid]
         while todo:
             for c in kids.get(todo.pop(), []):
@@ -336,12 +393,11 @@ class Filter:
             time.sleep(0.1)
 
     def _kill_server_group(self, sig):
-        """Signal the server's group. Before the server is reaped its pid cannot be reused, so the group is ours. After
-        it is reaped the group id is still ours only while another member is alive (POSIX never hands out a pid that is
-        a live group's id); with no member left, the pid may now belong to an unrelated process: skipped."""
+        """Signal the server's group only while the server is our unreaped child: until then its pid (and so the group
+        id) cannot be reused. Once it is reaped the numeric group may be a replacement, so nothing is sent to it; the
+        group's former members are recorded descendants, signalled one by one after their start time is verified."""
         if self.proc.poll() is not None:
-            if not any(pgid == self.proc.pid and pid != self.proc.pid for pid, pgid, *_ in self._ps_full()):
-                return
+            return
         try:
             os.killpg(self.proc.pid, sig)
         except (ProcessLookupError, PermissionError):
