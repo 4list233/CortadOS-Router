@@ -1707,7 +1707,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
 
         def router(body, client, exclude_model=None, min_left_pct=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct)
+                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct,
+                                  codex_home=codex_home)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])
@@ -1719,7 +1720,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
                         codex_home=codex_home, model=fixed_model, router=router, executed=executed,
                         log_outcome=log_turn_outcome)
     if not fixed_model:
-        registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor)
+        registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

@@ -29,6 +29,8 @@ MAX_READING_AGE_S = 3600
 # most, about 1 % of a weekly window on the plans seen so far. The provider charges it once per conversation (reserve's
 # `conv`, the route_id), so a long ladder run is not refused mid-run by its own turn count (Codex review r4). Too small:
 # spending overshoots the floor between samples. Too large: work stalls until each new sample although room is left.
+# Known limit (Codex review r5 P3-4): the charge bounds runs, not turns; one conversation's later turns are seen only by
+# the next reading. The S1 loop's 900 s run timeout bounds that for its runs; ENG-10 stays open to measure %/run.
 ASSUMED_PCT_PER_CALL = 1.0
 # How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
 # timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and spending overshoots.
@@ -55,10 +57,17 @@ def _key(lane: str, w: dict) -> str:
 
 
 def executing_login(cand: dict[str, Any]) -> str | None:
-    """The login a Claude CLI for this candidate EXECUTES on: the effective login of the env the bridge starts it with
-    (bridge.claude_env), so an inherited CLAUDE_CONFIG_DIR or OAuth token is never mistaken for the sampler's login.
-    The same expression as server._route_pct_left (the reveal)."""
+    """The login the CLI for this candidate EXECUTES on, stated the way its backend builds the child's env.
+    Claude: the effective login of bridge.claude_env, so an inherited CLAUDE_CONFIG_DIR or OAuth token is never mistaken
+    for the sampler's login (the same expression as server._route_pct_left, the reveal).
+    Codex: the home codex_bridge resolves (the provider's --codex-home, else CODEX_HOME, else ~/.codex) under
+    codex_isolation.child_env, which strips every key/token override, so the login is that home's auth.json."""
     from cortados_router import core
+    if str(cand.get("provider") or "").split("#", 1)[0] == "codex-cli":
+        import os
+        from cortados_router.provider.codex_isolation import child_env
+        home = os.path.abspath(os.path.expanduser(cand.get("codex_home") or os.environ.get("CODEX_HOME") or "~/.codex"))
+        return core.codex_login_identity(child_env(home))
     from cortados_router.provider.bridge import claude_env
     # Registry.new applies a config_dir only when the route names an account; otherwise the default login runs.
     return core.claude_login_identity(claude_env(cand.get("config_dir") if cand.get("account") else None))
@@ -66,12 +75,12 @@ def executing_login(cand: dict[str, Any]) -> str | None:
 
 def _identity_unproven(cand: dict[str, Any], reading: dict[str, Any]) -> str | None:
     """Why the reading cannot be shown to come from the login this candidate executes on, or None.
-    Codex: readings carry no identity of the login that sampled them, and the provider executes on its own
-    --codex-home login, so a reading for account A could authorize spending on login B (Codex review r3): held.
-    Claude: the reading's `login` stamp (scarcity: the login its sampler CLI effectively ran on) must equal the login
-    this provider's CLI would execute on; config_dir alone is not proof (None == None says nothing about the inherited
-    env). A reading without the stamp, or an executing login that cannot be stated, holds."""
-    if str(cand.get("provider") or "").split("#", 1)[0] != "claude-cli":
+    Claude and Codex: the reading's `login` stamp (scarcity: the login its sampler CLI effectively ran on) must equal
+    the login this provider's CLI would execute on (executing_login); config_dir alone is not proof (None == None says
+    nothing about the inherited env), and a Codex reading for home A never authorizes spending on the provider's home B
+    (Codex review r3). A reading without the stamp (one sampled before stamping existed), or an executing login that
+    cannot be stated, holds. Any other provider has no stamped readings: held."""
+    if str(cand.get("provider") or "").split("#", 1)[0] not in ("claude-cli", "codex-cli"):
         return "usage reading is not bound to the login this provider executes on"
     login = reading.get("login")
     if not (isinstance(login, str) and login) or login != executing_login(cand):
