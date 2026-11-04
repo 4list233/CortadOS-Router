@@ -1926,9 +1926,28 @@ if mode == "fail":
     sys.stderr.write("boom"); sys.exit(3)
 if mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_SEARCH_SLEEP", "5")))
-print(json.dumps({"type": "result", "is_error": False, "result": "1. Cortados - https://example.com/c - a router\\nAnswer: it routes.",
-                  "usage": {"input_tokens": 11, "output_tokens": 7}}))
+def emit(e): print(json.dumps(e))
+emit({"type": "system", "subtype": "init"})
+if mode != "nosearch":
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "WebSearch",
+                                                        "input": {"query": "q"}}]}})
+    if mode == "toolerror":
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1", "is_error": True,
+                                                       "content": "<tool_use_error>search failed</tool_use_error>"}]}})
+    else:
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1",
+                                                       "content": "Web search results for query: q"}]}})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}})
+emit({"type": "result", "subtype": "success", "is_error": False,
+      "result": "1. Cortados - https://example.com/c - a router\\nAnswer: it routes.",
+      "usage": {"input_tokens": 11, "output_tokens": 7, "server_tool_use": {"web_search_requests": 0}}})
 """
+
+
+# The stream events of a WebSearch that ran (the shape a live CLI run produced, 2026-11-03).
+SEARCH_EVIDENCE = [
+    {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "WebSearch", "input": {}}]}},
+    {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1", "content": "results"}]}}]
 
 
 class SearchFakeMixin:
@@ -2175,8 +2194,9 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertIsNone(search_lane._usage_int(float("inf")))
         self.assertIsNone(search_lane._usage_int(True))
         self.assertEqual(search_lane._usage_int(7.0), 7)
-        out = {"is_error": False, "result": "r", "usage": {"input_tokens": float("nan"), "output_tokens": 3}}
-        done = subprocess.CompletedProcess([], 0, json.dumps(out), "")
+        out = {"type": "result", "is_error": False, "result": "r",
+               "usage": {"input_tokens": float("nan"), "output_tokens": 3}}
+        done = subprocess.CompletedProcess([], 0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE + [out]), "")
         with mock.patch.object(search_lane.subprocess, "run", return_value=done):
             res = search_lane.run("claude", "q", None)
         self.assertEqual(res.usage, {"output_tokens": 3})
@@ -2195,6 +2215,100 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         os.environ["FAKE_SEARCH_MODE"] = "fail"
         self.post(self.SEARCH)
         self.assertEqual(self.ledger, [], "a failed search spent nothing worth learning from and is not recorded")
+
+    def test_argv_streams_events(self):
+        a = search_lane.argv("claude", "q")
+        self.assertEqual(a[a.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", a)
+
+    def test_a_reply_without_a_search_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"] = "nosearch"
+        r = self.post(self.SEARCH)
+        text = r["content"][0]["text"]
+        self.assertIn("web_search is unavailable on this CortadOS lane", text)
+        self.assertIn("no search was performed", text)
+        self.assertNotIn("example.com", text, "an answer from memory must not reach the client")
+        self.assertEqual(self.ledger, [])
+
+    def test_a_failed_websearch_tool_call_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"] = "toolerror"
+        r = self.post(self.SEARCH)
+        self.assertIn("no search was performed", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+
+    def test_search_evidence(self):
+        ev = search_lane.search_evidence
+        self.assertTrue(ev(SEARCH_EVIDENCE))
+        self.assertFalse(ev([]))
+        self.assertFalse(ev(SEARCH_EVIDENCE[:1]), "a tool_use with no result is not a search")
+        self.assertFalse(ev(SEARCH_EVIDENCE[1:]), "a result for no WebSearch call is not a search")
+        other = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "Bash"}]}},
+                 SEARCH_EVIDENCE[1]]
+        self.assertFalse(ev(other))
+        empty = [SEARCH_EVIDENCE[0], {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "ws1", "content": [{"type": "text", "text": " "}]}]}}]
+        self.assertFalse(ev(empty))
+        # a server-side usage count of 0 (what the live CLI reports even after a search) does not veto stream evidence
+        done = SEARCH_EVIDENCE + [{"type": "result", "is_error": False, "result": "first"},
+                                  {"type": "result", "is_error": False, "result": "last",
+                                   "usage": {"server_tool_use": {"web_search_requests": 0}}}]
+        with mock.patch.object(search_lane.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "noise\n" + "\n".join(json.dumps(e) for e in done), "")):
+            self.assertEqual(search_lane.run("claude", "q", None).text, "last", "the last result line is the answer")
+        with mock.patch.object(search_lane.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE), "")):
+            with self.assertRaises(search_lane.SearchFailed) as cm:
+                search_lane.run("claude", "q", None)
+        self.assertEqual(cm.exception.kind, "bad_output")
+
+    def _accounts(self, rows):
+        from cortados_router import core
+        return mock.patch.object(core, "_vendor_accounts", return_value=rows)
+
+    ACCTS = [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+             {"lane": "claude#b", "account": "b", "config_dir": "/cfg/b"}]
+
+    def test_configured_account_runs_and_is_charged_on_that_account(self):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b", "CLAUDE_CONFIG_DIR": "/cfg/a"}), \
+                mock.patch.object(self.reg, "claude_config_dir", lambda acct: "/cfg/b"), self._accounts(self.ACCTS):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
+
+    def test_default_with_accounts_runs_on_the_first_account_explicitly_despite_an_inherited_dir(self):
+        # The provider runs with account b's dir in its env; the default search must not inherit it while charging
+        # `claude`: it runs on the first account (the bare claude lane) explicitly.
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/cfg/b"}), self._accounts(self.ACCTS):
+            os.environ.pop(search_lane.ACCOUNT_ENV, None)
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/a"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude"])
+
+    def test_an_inherited_dir_matching_no_account_is_not_charged_to_claude(self):
+        default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/else"}), self._accounts(default), \
+                self.assertLogs("cortados_router.provider.search_lane", "WARNING") as logs:
+            os.environ.pop(search_lane.ACCOUNT_ENV, None)
+            r = self.post(self.SEARCH)
+        self.assertIn("https://example.com/c", r["content"][0]["text"], "the search still runs")
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/somewhere/else"})
+        self.assertEqual(self.ledger, [], "an unmatched login writes no ledger row")
+        self.assertTrue(any("matches no configured account" in m for m in logs.output))
+
+    def test_default_without_accounts_or_inherited_dir_is_charged_to_claude(self):
+        default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", search_lane.ACCOUNT_ENV)}
+        with mock.patch.dict(os.environ, env, clear=True), self._accounts(default):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {})
+        self.assertEqual([row[0] for row in self.ledger], ["claude"])
+
+    def test_unreadable_accounts_fail_the_search(self):
+        from cortados_router import core
+        with mock.patch.object(core, "_vendor_accounts", side_effect=core.AccountsConfigError("bad")):
+            r = self.post(self.SEARCH)
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
 
     def test_forced_client_tool_choice_is_still_400(self):
         self.assertEqual(self.status_of(dict(self.SEARCH, tools=[ServerToolTests.WEB_SEARCH, READ_TOOL])), 400)

@@ -1276,13 +1276,14 @@ class Handler(BaseHTTPRequestHandler):
         explicit unavailable reply, naming the failure class, never to an empty success."""
         reg = self.server.registry
         try:
-            cfg = search_lane.config_dir_for(reg)
+            who = search_lane.login(reg)                # the login and its ledger lane, resolved together before launch
             allowed, blocked = search_lane.domain_filters(body)
             result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
-                                     search_lane.extract_query(body), cfg, allowed=allowed, blocked=blocked)
+                                     search_lane.extract_query(body), who.config_dir, allowed=allowed, blocked=blocked)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
-            reason = "search busy" if exc.kind == "busy" else f"the search lane failed: {exc.kind}"
+            reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
+                      else f"the search lane failed: {exc.kind}")
             return self._server_tools_unavailable(turn, names, wire, reason=reason)
         except Exception:
             # Anything else is a bug in the lane: the client still gets a complete reply (never a dropped
@@ -1292,7 +1293,7 @@ class Handler(BaseHTTPRequestHandler):
         logger.info("web search answered on the search lane (%s, %d chars)", search_lane.SEARCH_MODEL,
                     len(result.text))
         try:
-            lane = search_lane.ledger_lane()
+            lane = who.ledger_lane
             if lane:                                    # the search spent quota on this Claude account's pool
                 from cortados_router import usage_ledger
                 usage_ledger.record_async(lane, search_lane.SEARCH_MODEL, result.usage)

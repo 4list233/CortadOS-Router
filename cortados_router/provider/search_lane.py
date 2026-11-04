@@ -111,7 +111,9 @@ def argv(claude_bin: str | list[str], query: str, allowed: list[str] | None = No
     # the client's system prompt. Kept deliberately; the provider host is the owner's own machine.
     return prefix + ["-p", prompt(query, allowed, blocked), "--model", SEARCH_MODEL,
                      "--tools", "WebSearch", "--allowedTools", "WebSearch",
-                     "--output-format", "json", "--setting-sources", "",
+                     # stream-json (needs --verbose in -p mode) so the WebSearch tool_use/tool_result events are seen:
+                     # a final result alone cannot show that a search actually ran (see search_evidence)
+                     "--output-format", "stream-json", "--verbose", "--setting-sources", "",
                      # no hooks either (as bridge.py): a user hook must not run inside the one lane that runs a tool
                      "--settings", json.dumps({"disableAllHooks": True}),
                      "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}}),
@@ -125,11 +127,50 @@ def _usage_int(v: Any) -> int | None:
     return max(0, int(v))
 
 
+def _events(stdout: str) -> list[dict[str, Any]]:
+    """The JSON objects of a stream-json run, one per line; lines that are not JSON objects are skipped."""
+    out = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    return out
+
+
+def _blocks(event: dict[str, Any]) -> list[dict[str, Any]]:
+    msg = event.get("message")
+    c = msg.get("content") if isinstance(msg, dict) else None
+    return [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
+
+
+def search_evidence(events: list[dict[str, Any]]) -> bool:
+    """True when the run shows a WebSearch that ran: an assistant `tool_use` named WebSearch answered by a user
+    `tool_result` for the same id that is not an error and carries content. A nonempty final text is not evidence:
+    the model can answer from memory (and invent URLs) without searching. The result's usage.server_tool_use
+    .web_search_requests is not used: a live run (2026-11-03) reported 0 there although a search happened."""
+    ids = {b.get("id") for e in events if e.get("type") == "assistant" for b in _blocks(e)
+           if b.get("type") == "tool_use" and b.get("name") == "WebSearch" and b.get("id")}
+    for e in events:
+        if e.get("type") != "user":
+            continue
+        for b in _blocks(e):
+            if (b.get("type") == "tool_result" and b.get("tool_use_id") in ids and not b.get("is_error")
+                    and bridge._result_text(b.get("content")).strip()):
+                return True
+    return False
+
+
 def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         timeout: float | None = None, allowed: list[str] | None = None,
         blocked: list[str] | None = None) -> SearchResult:
     """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, exit_<n>,
-    bad_output, cli_error, empty, start_failed); never returns an empty success."""
+    bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
     timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
     if not query:
         raise SearchFailed("no_query", "the request carries no user text to search for")
@@ -154,12 +195,14 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
             raise SearchFailed("start_failed", str(exc)) from None
         if p.returncode != 0:
             raise SearchFailed(f"exit_{p.returncode}", (p.stderr or p.stdout or "").strip()[-300:])
-        try:
-            out = json.loads(p.stdout)
-        except ValueError:
-            raise SearchFailed("bad_output", "the CLI's output is not JSON") from None
-        if not isinstance(out, dict) or out.get("is_error"):
-            raise SearchFailed("cli_error", str(out.get("result") if isinstance(out, dict) else out)[:300])
+        events = _events(p.stdout)
+        out = next((e for e in reversed(events) if e.get("type") == "result"), None)
+        if out is None:
+            raise SearchFailed("bad_output", "the CLI's output has no result event")
+        if out.get("is_error"):
+            raise SearchFailed("cli_error", str(out.get("result"))[:300])
+        if not search_evidence(events):
+            raise SearchFailed("no_search", "no search was performed")
         text = out.get("result")
         if not isinstance(text, str) or not text.strip():
             raise SearchFailed("empty", "the CLI returned no text")
@@ -172,32 +215,48 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
         shutil.rmtree(work, ignore_errors=True)
 
 
-def config_dir_for(registry) -> str | None:
-    """The login the search runs on: the account named by CORTADOS_PROVIDER_SEARCH_ACCOUNT (resolved through the
-    Registry, the same tables/accounts.json lookup routed Claude conversations use), else the default login, which
-    is what the bridge uses for the bare `claude` lane. A named account that cannot be resolved fails the search
-    rather than falling back to the default login."""
-    account = os.environ.get(ACCOUNT_ENV, "").strip()
-    if not account:
-        return None
-    cfg = registry.claude_config_dir(account)
-    if not cfg:
-        raise SearchFailed("no_claude_lane", f"account {account!r} has no resolvable login")
-    return cfg
+@dataclass
+class Login:
+    """Where a search runs and what it is charged to, resolved together before launch so the two cannot disagree.
+    config_dir None = the CLI runs on the provider's own default login. ledger_lane None = the login could not be
+    tied to a configured account lane, so the search is not recorded (charging it to `claude` would be a guess)."""
+    config_dir: str | None
+    ledger_lane: str | None
 
 
-def ledger_lane() -> str | None:
-    """The scarcity lane a search draws on, for the usage ledger: the named account's lane from tables/accounts.json
-    (claude#b), else the bare `claude` lane (the default login, the one the bare claude lane runs on). None when the
-    named account is not configured (the search itself already failed then) or the accounts file is unreadable."""
+def login(registry) -> Login:
+    """The login a search runs on and the scarcity lane it draws on.
+
+    - CORTADOS_PROVIDER_SEARCH_ACCOUNT names an account: its config_dir (resolved through the Registry, the same
+      tables/accounts.json lookup routed Claude conversations use) and its lane (claude#b). A named account that
+      cannot be resolved fails the search rather than falling back to the default login.
+    - Otherwise, with accounts configured: the FIRST account, which is the bare `claude` lane, passed as an explicit
+      config_dir. Explicit because the child would otherwise inherit whatever CLAUDE_CONFIG_DIR the provider runs
+      with (possibly account b) while the ledger said `claude`; bridge.claude_env overrides an inherited one.
+    - Otherwise (no accounts.json): the provider's own login, charged to `claude`, unless the provider's environment
+      carries a CLAUDE_CONFIG_DIR. That login matches no configured account, so the search runs (it is the same login
+      the bare claude lane's conversations use) but writes no ledger row, and that is logged."""
+    from cortados_router import core
     account = os.environ.get(ACCOUNT_ENV, "").strip()
-    if not account:
-        return "claude"
     try:
-        from cortados_router import core
-        for a in core._vendor_accounts("claude", "claude", "claude-cli"):
-            if a.get("account") == account:
-                return a.get("lane")
-    except Exception:
-        logger.warning("search lane: accounts lookup for the ledger failed; this search is not recorded")
-    return None
+        accounts = core._vendor_accounts("claude", "claude", "claude-cli")
+    except Exception as exc:
+        raise SearchFailed("no_claude_lane", f"tables/accounts.json is unreadable: {exc}") from None
+    if account:
+        cfg = registry.claude_config_dir(account)
+        if not cfg:
+            raise SearchFailed("no_claude_lane", f"account {account!r} has no resolvable login")
+        lane = next((a.get("lane") for a in accounts if a.get("account") == account), None)
+        if not lane:
+            logger.warning("search lane: account %r has no lane in tables/accounts.json; this search is not recorded",
+                           account)
+        return Login(cfg, lane)
+    first = accounts[0]
+    if first.get("config_dir"):
+        return Login(first["config_dir"], first.get("lane") or "claude")
+    inherited = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if inherited:
+        logger.warning("search lane: the provider's CLAUDE_CONFIG_DIR (%s) matches no configured account; the search "
+                       "runs on it but is not recorded in the usage ledger", inherited)
+        return Login(None, None)
+    return Login(None, "claude")

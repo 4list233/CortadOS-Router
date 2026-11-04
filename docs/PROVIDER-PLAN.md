@@ -516,14 +516,21 @@ Claude Code's WebSearch sends a request whose only tool is the Anthropic server 
 separate one-shot `claude -p` whose only tool is WebSearch (`--tools WebSearch --allowedTools WebSearch`, empty MCP
 config, no setting sources, `dontAsk`, empty scratch cwd, ANTHROPIC_* stripped as in the bridge). This is the one
 owner-approved exception to the bridge rule that the headless CLI never runs a tool itself. Model: `SEARCH_MODEL`
-(the routing table's W-fast Claude route, Haiku 4.5). Login: the default Claude login, or the account named by
-`CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json; unresolvable fails, never falls back).
+(the routing table's W-fast Claude route, Haiku 4.5). Login (`search_lane.login`, resolved together with the ledger
+lane before launch): the account named by `CORTADOS_PROVIDER_SEARCH_ACCOUNT` (resolved through tables/accounts.json;
+unresolvable fails, never falls back); else, with accounts configured, the first account (the bare `claude` lane)
+passed as an explicit `CLAUDE_CONFIG_DIR`, overriding any the provider inherited; else the provider's own login. An
+inherited `CLAUDE_CONFIG_DIR` that matches no configured account still runs but writes no ledger row (logged).
 Hooks are off (`--settings '{"disableAllHooks": true}'`) and every `ANTHROPIC_*` variable is stripped by prefix
 (`bridge.claude_env`), so e.g. `ANTHROPIC_CUSTOM_HEADERS` never reaches api.anthropic.com. The query is capped at 2000
 characters (`query_too_long`) and rides in argv, like the bridge's system prompt. The web_search tool's
 `allowed_domains` / `blocked_domains` are carried into the prompt ("only use results from ...; never use results
 from ...") as an instruction to the search model, not an enforced filter.
-Timeout 120 s, at most 4 concurrent searches. The CLI's result text is the reply (JSON or SSE, end_turn, with usage);
+Timeout 120 s, at most 4 concurrent searches. The CLI runs with `--output-format stream-json --verbose`; a reply needs
+evidence that a search ran: a WebSearch `tool_use` answered by a non-error, nonempty `tool_result`. Without it the
+reply is "unavailable" with reason "no search was performed" and no ledger row (the result's
+`usage.server_tool_use.web_search_requests` is not used: the live CLI reports 0 there after a real search). The last
+`result` line's text is the reply (JSON or SSE, end_turn, with usage);
 any failure (timeout, nonzero exit, bad output, busy, no login, an unexpected error: `internal`) answers with the
 explicit "unavailable" text naming the failure class. Searches are not routed by S1. A successful search is recorded in
 the usage ledger against the Claude lane it ran on (`claude`, or the named account's lane such as `claude#b`).
