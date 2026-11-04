@@ -629,5 +629,9 @@ def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float, codex_ho
         return "the conversation's executing account is unknown; cannot check x-cortados-min-left-pct"
     if _floor_exempt(route["route"]["chosen"]["lane"]):
         return None
+    if str(route.get("provider") or "").split("#", 1)[0] == "codex-cli" and not route.get("codex_home"):
+        # A Codex continuation must name the home its backend was frozen on (server.Registry.new): resolving it again
+        # could accept another login's reading for a backend still running on the first (Codex review fu2).
+        return "the conversation's executing Codex home is unbound; cannot check x-cortados-min-left-pct"
     return floor.reserve(core, floor_candidate(route, codex_home), route.get("model") or "", min_left_pct,
                          conv=route.get("route_id"))

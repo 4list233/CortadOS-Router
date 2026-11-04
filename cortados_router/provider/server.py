@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -667,9 +668,17 @@ class Registry:
                 raise UnservedProvider(f"routed to account {route['account']!r} on {route['provider']!r}, "
                                        f"which has no resolvable login (config_dir missing)")
             kw["account"], kw["config_dir"] = route["account"], cfg
-        if route and route.get("codex_home") and factory is self._factories.get("codex-cli"):
-            kw["codex_home"] = route["codex_home"]  # start on exactly the home the floor checked (routing._bind_codex)
+        codex_login = None
+        if factory is self._factories.get("codex-cli"):
+            # Every Codex session, floor or not, is started on ONE canonical home frozen here (the floor-checked home
+            # when the route carries it, routing._bind_codex; else the provider's), and remembers it: a CODEX_HOME
+            # symlink moved later cannot change which login a running backend uses, and a floor sent on a later
+            # continuation is checked against this identity, never a re-resolved one (Codex review fu2).
+            home = (route or {}).get("codex_home") or self.codex_home or getenv("CODEX_HOME") or "~/.codex"
+            codex_login = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
+            kw["codex_home"] = codex_login
         s = factory(self, **kw)
+        s.codex_login = codex_login
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
@@ -1484,7 +1493,10 @@ class Handler(BaseHTTPRequestHandler):
             eff = max(v for v in (kept, floor) if v is not None) if (kept is not None or floor is not None) else None
             if eff is not None:
                 session.min_left_pct = eff
-                why = (reg.floor_turn(getattr(session, "route", None), eff) if reg.floor_turn is not None else
+                route_now = getattr(session, "route", None)
+                if route_now and getattr(session, "codex_login", None):
+                    route_now = {**route_now, "codex_home": session.codex_login}   # the running backend's frozen home
+                why = (reg.floor_turn(route_now, eff) if reg.floor_turn is not None else
                        "this endpoint cannot check x-cortados-min-left-pct on a continuation")
                 if why:
                     return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
