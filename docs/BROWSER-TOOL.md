@@ -65,7 +65,8 @@ Both need the same egress proxy; the proxy is what actually enforces "no private
   reads until the `id:2` answer with a 30 s cap and prints the server's stderr when there is none. A stdout line that
   is not a JSON-RPC object, or an `id:2` answer without a tools list, fails the listing at once with the line and the
   server's stderr (a stdio server's stdout carries only protocol messages; garbage is never skipped)
-  (`install.sh tools` shows the list on its own).
+  (`install.sh tools` shows the list on its own); and each tool's `inputSchema.properties` keys == `args-0.0.84.json`
+  (`install.sh args`), the per-tool argument-key allowlist the filter enforces.
 - Browsers: `PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers <prefix>/node_modules/.bin/playwright install --only-shell chromium`
   (headless shell only; nothing global, nothing under `~/Library/Caches/ms-playwright`).
 - Script: `integrations/browser/install.sh`. The router package stays stdlib-only and never imports it.
@@ -77,7 +78,9 @@ other host, no https, no password, no path or bypass), and the pinned binary is 
 install command); there is no boundary-less config. It writes two files, both 0600 (inside the 0700 task dir), and
 the child gets `--mcp-config <task_dir>/browser-mcp.json`:
 ```json
-{"mcpServers": {"browser": {"command": "<repo>/integrations/browser/run-mcp.sh", "args": ["<task_dir>", "<prefix>"]}}}
+{"mcpServers": {"browser": {"command": "<absolute python3>", "args": ["-I", "<repo>/integrations/browser/mcp_filter.py",
+  "--task", "<task_dir>", "--browsers-path", "<prefix>/browsers", "--", "<repo>/integrations/browser/run-mcp.sh",
+  "<task_dir>", "<prefix>"]}}}
 ```
 `<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag, plus the proxy):
 ```json
@@ -95,8 +98,8 @@ username and have no `bypass`; then it runs `cd <task>/browser && exec env -i PA
 HOME=<task>/browser/home TMPDIR=<task>/browser/tmp PLAYWRIGHT_BROWSERS_PATH=<prefix>/browsers
 <prefix>/node_modules/.bin/playwright-mcp --config <task>/browser/config.json --headless --isolated --sandbox
 --no-webmcp --ignore-roots --browser chromium --blocked-origins <list> --output-dir <task>/browser/out
---block-service-workers --timeout-navigation 30000 --timeout-action 10000`. With B1b the command becomes the stdio
-filter, which execs the wrapper. B6 confirms on the real build that the config-file proxy is what Chromium uses (a
+--block-service-workers --timeout-navigation 30000 --timeout-action 10000`. With B1b (built) the command is the stdio
+filter, which starts the wrapper as its child over pipes. B6 confirms on the real build that the config-file proxy is what Chromium uses (a
 page fetch shows up in the proxy log; with the proxy stopped, navigation fails).
 - `--ignore-roots`: the workspace (the server's file boundary) is the cwd `<task>/browser`, never the client's roots
   (item 7d). B1b's `<task>/browser/in` path check for upload/drop is then defence in depth, not the only line.
@@ -134,6 +137,32 @@ the installed server's list differs, so a version bump is a reviewed diff, never
      `notifications/cancelled`; anything else gets a JSON-RPC error (requests) or is dropped (notifications);
    - a top-level JSON array (batch), invalid JSON, a non-object message or a line over the size cap closes the session;
    - `tools/call` with missing `params`, non-object `params`, non-string `name` or non-object `arguments` is refused;
+   - `tools/call` with an argument key outside the tool's set in `args-0.0.84.json` is refused (-32005), `filename` is
+     refused on every tool (-32004: the server auto-names outputs under `--output-dir`), and upload/drop `paths` must be
+     absolute and resolve under `<task>/browser/in` (-32004);
+   - closing (bad input, stdin EOF, SIGTERM/SIGHUP) sends SIGTERM to the server's group, waits `EXIT_GRACE_S`, sends
+     SIGKILL, then kills every surviving descendant found by walking `ps` from the server pid (Playwright launches
+     Chromium detached, in its own group), every descendant recorded by a walk repeated every 2 s while running, and
+     every process of this user that is this task's browser: its kernel-reported executable (libproc `proc_pidpath`,
+     never argv[0], which a process can forge) is a Playwright Chromium / Chrome for Testing / headless-shell binary
+     under `--browsers-path` (the `PLAYWRIGHT_BROWSERS_PATH` run-mcp.sh sets, written by `install.sh config`) and its
+     kernel argv (`KERN_PROCARGS2`) has a whole `--user-data-dir=<path>` entry whose realpath is inside
+     `<task>/browser/tmp` (TMPDIR, so `--isolated` puts the profile there). That still finds a browser reparented
+     after the server exited on its own, and never a shell or other program that merely mentions the task dir; where
+     the kernel identity is unavailable (not macOS, call failed) nothing is killed by command line. The argv buffer is
+     parsed exactly (argv[0] at the 8-byte-aligned offset after the exec path, then exactly argc NUL-terminated
+     entries, never the environment that follows); an unterminated or empty entry, non-NUL padding or an out-of-range
+     argc makes the process "not ours".
+     Recorded pids carry their `ps` start time (`lstart`), re-checked right before every signal, so a pid recycled by
+     an unrelated process is skipped. The descendant walk starts only from the server pid with the start time recorded
+     at spawn, so a recycled server pid's children are never adopted; the server's group is signalled only while the
+     server is still an unreaped child, never after (its former members are signalled one by one, each verified). One
+     lock owns the server process: every poll/wait goes through it and the "unreaped? then signal the group" step runs
+     under it, so no other thread can reap the server in between. A failing `ps` (error or nonzero exit, in the
+     process listing and in each start-time check) is reported on stderr with its message, and means nothing is
+     signalled for that pid.
+     SIGTERM/SIGHUP handlers only write a byte to a self-pipe; a coordinator thread runs the close, so a signal
+     landing while the main thread holds the filter's state lock cannot deadlock;
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a
      JSON-RPC error and never forwarded to Claude Code; server notifications other than progress/log/`list_changed`
      are dropped, and a `tools/list_changed` makes the filter re-list and re-apply the allowlist. Default allowlist =

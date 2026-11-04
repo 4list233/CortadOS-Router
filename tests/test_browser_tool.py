@@ -108,8 +108,12 @@ class BrowserScriptsTests(unittest.TestCase):
             "launchOptions": {"headless": True, "chromiumSandbox": True, "proxy": px,
                 "args": ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]},
             "contextOptions": {"proxy": px}}})
+        server = json.loads(mcp.read_text())["mcpServers"]["browser"]
+        self.assertTrue(os.path.isabs(server["command"]) and os.access(server["command"], os.X_OK), server)
         self.assertEqual(json.loads(mcp.read_text()), {"mcpServers": {"browser": {
-            "command": str(RUN), "args": [str(self.task), str(self.prefix)]}}})
+            "command": server["command"], "args": ["-I", str(BROWSER / "mcp_filter.py"), "--task", str(self.task),
+                                           "--browsers-path", f"{self.prefix}/browsers", "--",
+                                           str(RUN), str(self.task), str(self.prefix)]}}})
         for f in (cfg, mcp):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)
         self.assertNotIn(TOKEN, mcp.read_text())
@@ -184,6 +188,15 @@ class BrowserScriptsTests(unittest.TestCase):
         r = self.sh(INSTALL, "tools")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "\n".join(sorted(TOOLS.split())) + "\n")
+
+    def test_args_listing_is_per_tool_schema_keys(self):
+        # The stub's tools carry no inputSchema, so every key set is empty; the format is args-0.0.84.json's.
+        self.stub()
+        r = self.sh(INSTALL, "args")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {n: [] for n in TOOLS.split()})
+        pinned = json.loads((BROWSER / "args-0.0.84.json").read_text())
+        self.assertEqual(sorted(pinned), sorted(TOOLS.split()))   # the committed allowlist covers every pinned tool
 
     def test_tool_listing_failure_shows_server_stderr(self):
         self.stub(mode="fail")
