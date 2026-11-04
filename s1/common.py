@@ -31,6 +31,10 @@ def read_jsonl(path: Path) -> list[dict]:
 # The tag at the head of every s1/label.py teacher message sent through the provider, so s1/dataset.py can tell the labeler's own router
 # rows from real requests (the provider logs the message text but keeps no run-id column). One definition for both sides.
 LABELER_MARKER = "[cortados-s1-label]"
+# The same mark for the S1 outcome loop's provider traffic (judge, generate and every ladder band run as a Claude Code
+# session): its user messages are synthesized tasks and the loop's own prompts, never a person's request, so the router
+# rows they leave must not be mined back into S1 training data (s1/dataset.py MACHINE_MARKERS).
+OUTCOME_MARKER = "[cortados-s1-outcome]"
 
 
 def is_claude_teacher(teacher) -> bool:

@@ -13,7 +13,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from common import DATA, LABELER_MARKER, clean_request, read_jsonl, split_of
+from common import DATA, LABELER_MARKER, OUTCOME_MARKER, clean_request, read_jsonl, split_of
 
 SHEET = Path(__file__).resolve().parent / "sources/labeling-sheet.csv"
 ROUTER_DB = Path.home() / ".cortados/router.db"
@@ -23,7 +23,9 @@ ROUTER_DB = Path.home() / ".cortados/router.db"
 #              OTHER requests already in the dataset: a duplicate, and a mis-shaped one.
 #   review   — cortados_router/reviews.py's templated review hand-offs ("[cortados-review:<ticket>:<role>] Review requested; …"): one fixed
 #              template that differs only by ticket, so it would add hundreds of near-identical rows.
-MACHINE_MARKERS = {"labeler": LABELER_MARKER, "review": "[cortados-review:"}
+#   outcome  — s1/outcome's judge, generate and ladder-run sessions through the provider (common.OUTCOME_MARKER heads the first user
+#              message): the loop's own prompts and synthesized tasks.
+MACHINE_MARKERS = {"labeler": LABELER_MARKER, "review": "[cortados-review:", "outcome": OUTCOME_MARKER}
 
 
 def _router_dbs() -> list[Path]:

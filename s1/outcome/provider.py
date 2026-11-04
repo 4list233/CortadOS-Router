@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import common
 import label
 from outcome import quota, store
 
@@ -36,12 +37,25 @@ MIN_LEFT_PCT = 100.0 - quota.STOP_PROJECTED_PCT
 # GET /resources is re-read at most once a minute: the door runs before every band and batch, while the readings
 # behind it change only on the sampler's ~20-minute cycle, so a minute's cache hides nothing and spares the provider.
 RESOURCES_TTL_S = 60
+# Output cap per judge/generate answer. The Messages API requires one; 16k tokens covers a judge verdict (a few hundred
+# tokens) and a full generate batch of BATCH specs with small fixtures (~1-2k each) with room to spare. A generate batch
+# that still hits it is split, not retried identically (generate.py); a single seed that hits it is refused.
 MAX_TOKENS = 16000
+# Head of every user message this loop sends through the provider: keeps its router rows out of S1 training data.
+TAG_NOTE = f"\n\nThe user message starts with a bookkeeping tag line ({common.OUTCOME_MARKER} …); ignore it."
 RUN_ID = f"s1-outcome-{time.strftime('%Y%m%d')}-{os.getpid()}"
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+class TruncatedError(ProviderError):
+    """The answer hit MAX_TOKENS: the same request would be truncated again."""
+
+
+def tag(run_id: str = RUN_ID) -> str:
+    return f"{common.OUTCOME_MARKER} run={run_id}"
 
 
 def enabled() -> bool:
@@ -78,9 +92,8 @@ def ask(lane: str, model: str, system: str, user: str, timeout_s: int = TIMEOUT_
     """One stateless call through the provider pinned to `sub/<model>`; records the revealed headroom of the lane that
     served it. Raises ProviderError on any non-200 or unreachable provider (the caller retries next pass)."""
     url, token = config()
-    body = {"model": f"sub/{model}", "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": user}]}
-    if system:
-        body["system"] = system
+    body = {"model": f"sub/{model}", "max_tokens": MAX_TOKENS, "system": (system or "") + TAG_NOTE,
+            "messages": [{"role": "user", "content": f"{tag()}\n{user}"}]}
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": token,
                "x-cortados-run-id": RUN_ID, "x-cortados-reveal": "1"}
     req = urllib.request.Request(url + "/v1/messages", data=json.dumps(body).encode(), headers=headers, method="POST")
@@ -98,7 +111,7 @@ def ask(lane: str, model: str, system: str, user: str, timeout_s: int = TIMEOUT_
     left = label.left_pct(served)
     _record(lane_of(served, lane), model, left, served)
     if out.get("stop_reason") == "max_tokens":
-        raise ProviderError("answer truncated (stop_reason max_tokens)")
+        raise TruncatedError("answer truncated (stop_reason max_tokens)")
     return "".join(b.get("text", "") for b in out.get("content") or [] if isinstance(b, dict) and b.get("type") == "text")
 
 

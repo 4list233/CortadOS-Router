@@ -187,6 +187,7 @@ FAKE_CLAUDE = textwrap.dedent("""\
     with open(os.environ["FAKE_ENV_DUMP"], "w") as f:
         json.dump({{"env": dict(os.environ), "argv": sys.argv, "cwd": os.getcwd()}}, f)
     prompt = sys.stdin.read()
+    open(os.environ["FAKE_ENV_DUMP"] + ".stdin", "w").write(prompt)
     if "create" in prompt.lower():
         open("solution.txt", "w").write("done\\n")
     msg = {{"content": [{{"type": "tool_use", "name": "Write"}}]}}
@@ -247,6 +248,9 @@ class RunTests(OutcomeCase):
         argv, env = d["argv"], d["env"]
         self.assertEqual(argv[argv.index("--model") + 1], "sub/gpt-6-astra")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://prov:8432")
+        import dataset
+        with open(self.dump + ".stdin") as f:                                   # tagged: never S1 training data
+            self.assertEqual(dataset.machine_kind(f.read()), "outcome")
         self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "ptok")
         self.assertNotIn("ANTHROPIC_API_KEY", env)                              # never API billing
         hdrs = env["ANTHROPIC_CUSTOM_HEADERS"].split("\n")
@@ -828,14 +832,59 @@ class ProviderBackendTests(OutcomeCase):
         self.assertFalse(self.p.admit("claude", "claude-fable-5-1")[0])
         self.assertTrue(self.p.admit("claude", "claude-opus-5-5")[0])
 
-    def test_judge_and_generate_default_to_the_provider(self):
+    def _seed_work(self):
+        store.append("seeds", {"id": "seed.2", "text": "Fix the flaky upload test", "tools": ["Bash"]})  # seed.1 already has task.1
+        store.append("tasks", _spec())
+        store.append("ladders", {"id": "task.1", "s1_band": "R2"})
+        store.append("runs", {"task_id": "task.1", "band": "R2", "route": {"lane": "claude", "provider": "claude-cli",
+                                                                          "model": "claude-x"}, "result": {}})
+
+    def test_judge_and_generate_default_to_the_provider_when_a_url_is_set(self):
+        self._seed_work()
+        _set_resources(self.p, _readings(claude=50, codex=50))
         from outcome import generate as gen
-        with mock.patch.object(self.p, "ask") as ask:
-            ask.return_value = "[]"
-            gen.generate(limit=1)       # no seeds: nothing called, but the default wiring must not touch the local reading
-            judge.judge(limit=1)
-        with mock.patch.object(quota, "admit", side_effect=AssertionError("local reading used")):
+        with mock.patch.object(self.p, "ask", return_value="[]") as ask, \
+                mock.patch.object(quota, "admit", side_effect=AssertionError("local reading used")), \
+                mock.patch.object(agents, "ask_claude", side_effect=AssertionError("local CLI used")), \
+                mock.patch.object(agents, "ask_codex", side_effect=AssertionError("local CLI used")):
             judge.judge(limit=1); gen.generate(limit=1)
+        lanes = [(c.args[0], c.args[1]) for c in ask.call_args_list]
+        self.assertIn(("claude", judge.TEACHER), lanes)
+        self.assertIn(("codex", gen.GENERATOR), lanes)
+
+    def test_judge_and_generate_default_to_the_local_backend_without_a_url(self):
+        self._seed_work()
+        from outcome import generate as gen
+        with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_URL": ""}), \
+                mock.patch.object(self.p, "ask", side_effect=AssertionError("provider used")), \
+                mock.patch.object(quota, "admit", return_value=(True, "ok")) as qa, \
+                mock.patch.object(agents, "ask_claude", return_value="{}") as ac, \
+                mock.patch.object(agents, "ask_codex", return_value="[]") as ax:
+            judge.judge(limit=1); gen.generate(limit=1)
+        self.assertTrue(ac.called); self.assertTrue(ax.called)
+        self.assertEqual({c.args[1] for c in qa.call_args_list}, {"claude", "codex"})
+
+    def test_every_provider_call_is_tagged_as_outcome_traffic(self):
+        import dataset
+        seen = []
+        self.p.ask("claude", "claude-fable-5-1", "sys", "judge this", urlopen=self._urlopen("claude-fable-5-1", "x", seen))
+        body = seen[0][1]
+        self.assertEqual(dataset.machine_kind(body["messages"][0]["content"]), "outcome")
+        self.assertIn("bookkeeping tag", body["system"])
+        self.assertIsNone(dataset.machine_kind("Fix the flaky upload test"))
+
+    def test_a_truncated_generate_batch_is_split_then_a_lone_seed_refused(self):
+        from outcome import generate as gen
+        for n in range(3):
+            store.append("seeds", {"id": f"seed.{n}", "text": f"req {n}", "tools": []})
+        calls = []
+        def ask(model, prompt, effort=None):
+            calls.append(prompt.count('"request"'))
+            raise self.p.TruncatedError("answer truncated")
+        counts = gen.generate(ask=ask, admit=lambda lane, model: (True, "ok"))
+        self.assertEqual(len(calls), 5)                                          # 3 -> 1 + 2 -> 1 + 1: halves, never the same batch
+        self.assertEqual(counts["refused"], 3)                                   # every seed ends refused, none retried
+        self.assertEqual(gen._pending_seeds(), [])
 
 
 class StoreTests(OutcomeCase):

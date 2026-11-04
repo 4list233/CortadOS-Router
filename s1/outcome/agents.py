@@ -130,8 +130,10 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
             # so the ladder still tests that exact model while the provider picks the account (claude, claude#b, codex).
             run_id = f"s1-outcome-run-{os.urandom(6).hex()}"
             extra = {"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch, **provider_env(run_id)}
+            # The session's first user message is what the provider logs as the request: tag it as outcome traffic.
+            tagged = f"{provider.tag(run_id)}\n(Bookkeeping tag line above; ignore it.)\n\n{prompt}"
             code, out, err, secs = _run(_claude_argv(f"sub/{model}", calls, outward_tools), cwd=workspace,
-                                        timeout=timeout_s, stdin=prompt, env=child_env(extra))
+                                        timeout=timeout_s, stdin=tagged, env=child_env(extra))
             trace = _claude_trace(out)
             served = trace.get("served_model") or ""
             trace.update(via="provider", run_id=run_id, requested_model=model,

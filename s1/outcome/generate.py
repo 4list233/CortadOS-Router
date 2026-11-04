@@ -61,8 +61,9 @@ def generate(limit: int = 0, ask=None, admit=None) -> dict:
     admit = admit or (provider.admit if via else (lambda lane, model: quota.admit(common.core, lane, model)))
     seeds = _pending_seeds()[: limit or None]
     counts = {"tasks": 0, "refused": 0, "batches": 0, "failed_batches": 0, "held": 0}
-    for k in range(0, len(seeds), BATCH):
-        batch = seeds[k:k + BATCH]
+    queue = [seeds[k:k + BATCH] for k in range(0, len(seeds), BATCH)]
+    while queue:
+        batch = queue.pop(0)
         ok, why = admit("codex", GENERATOR)
         if not ok:
             counts["held"] += 1
@@ -74,6 +75,17 @@ def generate(limit: int = 0, ask=None, admit=None) -> dict:
         try:
             reply = agents.json_payload(ask(GENERATOR, PROMPT.format(work_kinds=common.core.WORK_KINDS, requests=payload),
                                             effort=EFFORT))
+        except provider.TruncatedError as exc:
+            # The same batch would be truncated again: split it (halves go next), and refuse a lone seed outright.
+            counts["failed_batches"] += 1
+            if len(batch) > 1:
+                print(f"  ! generation batch of {len(batch)} truncated: splitting", flush=True)
+                queue[:0] = [batch[:len(batch) // 2], batch[len(batch) // 2:]]
+            else:
+                print(f"  ! generation for {batch[0]['id']} truncated: refused", flush=True)
+                store.append("generation_refusals", {"seed_id": batch[0]["id"], "why": str(exc)})
+                counts["refused"] += 1
+            continue
         except Exception as exc:                       # the batch is retried on the next pass: its seeds stay pending
             counts["failed_batches"] += 1
             print(f"  ! generation batch failed: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
