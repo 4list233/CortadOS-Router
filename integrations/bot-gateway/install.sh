@@ -7,7 +7,8 @@
 #   install.sh plist    write ~/Library/LaunchAgents/com.cortados.bot-gateway.plist (no secret values in it)
 #   install.sh load     (re)load the LaunchAgent
 #   install.sh unload   stop and unload it
-#   install.sh status   launchctl state + an unauthenticated POST /mcp (expected: 401); prints no token
+#   install.sh status   launchctl state, an unauthenticated POST /mcp (expected: 401), the log path and line count;
+#                       prints no token and no log contents
 # Secrets: this script never reads, prints or copies a token value. Of ~/.cortados/provider.env it checks only whether
 # a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output).
 set -eu
@@ -47,10 +48,19 @@ tailnet_ip() {
     elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then ts=/Applications/Tailscale.app/Contents/MacOS/Tailscale
     else die "no tailscale CLI found (set TAILSCALE=<path>)"; fi
   fi
-  ip="$("$ts" ip -4 2>/dev/null | head -n 1 | tr -d '[:space:]')" || true
-  # Exactly one dotted-quad: anything else (empty, an error text, IPv6) would bind the wrong thing or nothing.
-  printf '%s' "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || die "tailscale ip -4 gave no IPv4 address (is Tailscale up?)"
-  printf '%s' "$ip"
+  # The CLI's own exit status is checked (no pipe in between to mask it); a failing CLI is never read for an address.
+  out="$("$ts" ip -4 2>/dev/null)" || die "tailscale ip -4 failed (is Tailscale up?)"
+  # The complete output must be exactly one IPv4 address in 100.64.0.0/10, Tailscale's address range: more lines, a
+  # malformed address, 0.0.0.0 (every interface) or any address outside the tailnet would bind beyond the tailnet.
+  python3 -I -c '
+import ipaddress, sys
+s = sys.argv[1]
+try:
+    ok = s == str(ipaddress.IPv4Address(s)) and ipaddress.IPv4Address(s) in ipaddress.ip_network("100.64.0.0/10")
+except ValueError:
+    ok = False
+sys.exit(0 if ok else 1)' "$out" || die "tailscale ip -4 did not give exactly one tailnet (100.64.0.0/10) IPv4 address"
+  printf '%s' "$out"
 }
 
 cmd_token() {
@@ -93,10 +103,10 @@ cmd_plist() {
   chmod 700 "$WORKSPACE"
   [ -e "$LOG" ] || ( umask 077; : > "$LOG" )
   python3 -I - "$PLIST" "$LABEL" "$mode" "$ip" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$WORKSPACE" "$LOG" \
-    "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" <<'PY'
+    "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" "$HOME" <<'PY'
 import os, plistlib, shlex, sys
 (plist, label, mode, ip, port, repo, py, token_file, workspace, log,
- provider_env, provider_token_file, state_dir) = sys.argv[1:14]
+ provider_env, provider_token_file, state_dir, home) = sys.argv[1:15]
 url = f"http://{ip}:8432"
 gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", ip, "--port", port,
            "--token-file", token_file, "--workspace-root", workspace,
@@ -105,12 +115,20 @@ gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", ip, "--port"
            "--children-run-as-me"]
 env = {"CORTADOS_PROVIDER_URL": url, "CORTADOS_HOME": state_dir, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 if mode == "env":
-    # zsh -f: no startup files, so only provider.env is read. It is sourced WITHOUT set -a, then only the token is
-    # exported: the provider's other settings stay shell-local and never reach the gateway's environment. The plist's
-    # URL is restored after sourcing, in case provider.env exports one of its own (the provider's listen address).
-    # A provider.env that fails to source stops the start (exit 78, EX_CONFIG) instead of running without a token.
-    script = ('u="$CORTADOS_PROVIDER_URL"; . %s || exit 78; export CORTADOS_PROVIDER_TOKEN; '
-              'export CORTADOS_PROVIDER_URL="$u"; exec %s') % (shlex.quote(provider_env), " ".join(shlex.quote(a) for a in gateway))
+    # zsh -f: no startup files, so only provider.env is read. Sourcing alone is not a boundary (an `export X=` line in
+    # provider.env would reach the gateway), so after sourcing the token is copied into a shell-local variable, EVERY
+    # exported variable is unset, the result is checked (any survivor stops the start), and only this allowlist is
+    # exported: HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (the plist's, not provider.env's) and
+    # CORTADOS_PROVIDER_TOKEN. Not `env -i NAME=value ...`: that puts the token on env's argv, which ps shows to every
+    # local user. zsh itself adds only SHLVL and _ when it execs. No LANG: python 3.9 coerces the C locale to UTF-8. Exit 78 (EX_CONFIG) when provider.env fails to
+    # source or yields an empty token, instead of running without one.
+    q = shlex.quote
+    allow = {"HOME": home, "PATH": env["PATH"], "CORTADOS_HOME": state_dir, "CORTADOS_PROVIDER_URL": url}
+    script = (". " + q(provider_env) + " || exit 78; t=\"$CORTADOS_PROVIDER_TOKEN\"; [ -n \"$t\" ] || exit 78; "
+              "for n in ${(k)parameters[(R)*export*]}; do unset $n; done; "
+              "[ -z \"${(k)parameters[(R)*export*]}\" ] || exit 78; "
+              "export " + " ".join(f"{k}={q(v)}" for k, v in allow.items()) + " CORTADOS_PROVIDER_TOKEN=\"$t\"; "
+              "unset t; exec " + " ".join(q(a) for a in gateway))
     args = ["/bin/zsh", "-f", "-c", script]
 else:
     env["CORTADOS_PROVIDER_TOKEN_FILE"] = provider_token_file
@@ -157,8 +175,9 @@ cmd_status() {
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' \
           "http://$ip:$PORT/mcp" 2>/dev/null)" || true
   echo "== POST http://$ip:$PORT/mcp without a token: HTTP ${code:-none} (expected 401)"
-  echo "== last log lines ($LOG)"
-  tail -n 5 "$LOG" 2>/dev/null || echo "(no log yet)"
+  # Log contents are never printed: the access log records request paths, and a client that put its token in the
+  # path would have it echoed here. The owner reads the file himself.
+  if [ -f "$LOG" ]; then echo "== log: $LOG ($(wc -l < "$LOG" | tr -d ' ') lines; not shown)"; else echo "== log: $LOG (none yet)"; fi
   [ "${code:-}" = 401 ]
 }
 

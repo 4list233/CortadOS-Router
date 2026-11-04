@@ -10,7 +10,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "integrations" / "bot-gateway" / "install.sh"
-FAKE_IP = "192.0.2.77"                        # RFC 5737 documentation address: never a real machine
+FAKE_IP = "100.100.100.100"   # inside 100.64.0.0/10 but Tailscale's fixed service address (MagicDNS): never a node
 PROVIDER_SECRET = "provider-secret-value-0123456789abcdef"
 
 
@@ -119,24 +119,50 @@ class PlistTest(InstallerHarness):
         self.assertEqual(args[:3], ["/bin/zsh", "-f", "-c"])
         script = args[3]
         self.assertIn(f". {self.home / '.cortados' / 'provider.env'}", script)
-        self.assertIn("export CORTADOS_PROVIDER_TOKEN", script)
+        self.assertIn('CORTADOS_PROVIDER_TOKEN="$t"', script)
+        self.assertIn("unset $n", script)                    # every exported variable is dropped before the allowlist
         self.assertNotIn("set -a", script)                   # only the token is exported, not the whole file
         self.gateway_args(script)
 
-    def test_design_a_script_runs_with_only_the_token_exported(self):
-        """Run the plist's zsh line with the gateway swapped for `env`: the token arrives, OTHER does not."""
+    def test_design_a_script_runs_with_only_the_allowlist_exported(self):
+        """Run the plist's zsh line with the gateway swapped for `env`: only the allowlist reaches the child, even
+        for variables provider.env exports explicitly or the launching environment carries."""
         if not os.path.exists("/bin/zsh"):
             self.skipTest("no /bin/zsh")
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=leak\n"
-                          "CORTADOS_PROVIDER_URL=http://elsewhere:1\n")
+                          "export OTHER_SECRET=exported-secret-value\n"
+                          "export HTTPS_PROXY=http://proxy.invalid:3128\n"
+                          "export CORTADOS_PROVIDER_URL=http://elsewhere:1\n")
         r, tok = self.install()
         doc = self.check_common(r, tok)
         script = doc["ProgramArguments"][3].split("exec ")[0] + "exec /usr/bin/env"
-        out = subprocess.run(["/bin/zsh", "-f", "-c", script], env=dict(doc["EnvironmentVariables"]),
-                             capture_output=True, text=True, timeout=30).stdout
-        self.assertIn(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}", out)
-        self.assertIn(f"CORTADOS_PROVIDER_URL=http://{FAKE_IP}:8432", out)
-        self.assertNotIn("OTHER=", out)
+        launch_env = dict(doc["EnvironmentVariables"], PYTHONPATH="/nowhere", http_proxy="http://proxy.invalid:1")
+        p = subprocess.run(["/bin/zsh", "-f", "-c", script], env=launch_env, capture_output=True, text=True,
+                           timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        got = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
+        # zsh itself adds SHLVL and _ (the program being run) when it execs; neither comes from provider.env.
+        self.assertRegex(got.pop("SHLVL", "1"), r"^[0-9]+$")
+        self.assertEqual(got.pop("_", "/usr/bin/env"), "/usr/bin/env")
+        self.assertEqual(set(got), {"HOME", "PATH", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL",
+                                    "CORTADOS_PROVIDER_TOKEN"})
+        self.assertEqual(got["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)
+        self.assertEqual(got["CORTADOS_PROVIDER_URL"], f"http://{FAKE_IP}:8432")
+        self.assertEqual(got["HOME"], str(self.home))
+        self.assertEqual(got["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertNotIn("exported-secret-value", p.stdout)
+        self.assertNotIn("proxy.invalid", p.stdout)
+
+    def test_design_a_empty_token_stops_the_start(self):
+        if not os.path.exists("/bin/zsh"):
+            self.skipTest("no /bin/zsh")
+        self.provider_env("CORTADOS_PROVIDER_TOKEN=\n")
+        r, tok = self.install()
+        doc = self.check_common(r, tok)
+        script = doc["ProgramArguments"][3].split("exec ")[0] + "exec /usr/bin/env"
+        p = subprocess.run(["/bin/zsh", "-f", "-c", script], env=dict(doc["EnvironmentVariables"]),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 78)
 
     def test_design_b_provider_token_file(self):
         self.provider_env("CORTADOS_PROVIDER_CLAUDE_BIN=claude\n")       # no token variable
@@ -158,13 +184,38 @@ class PlistTest(InstallerHarness):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(self.plist().exists())
 
-    def test_no_tailnet_ip_refused(self):
+    def test_bad_tailnet_ip_refused(self):
+        cases = {
+            "nonzero exit": f"echo {FAKE_IP}; exit 1",
+            "stopped": "echo 'Tailscale is stopped.' >&2; exit 1",
+            "empty": "exit 0",
+            "two lines": f"echo {FAKE_IP}; echo 100.64.0.2",
+            "bad octet": "echo 100.64.0.300",
+            "wildcard": "echo 0.0.0.0",
+            "not CGNAT": "echo 192.0.2.10",
+            "loopback": "echo 127.0.0.1",
+            "padded": f"echo ' {FAKE_IP}'",
+            "leading zero": "echo 100.064.0.1",
+            "IPv6": "echo fd7a:115c:a1e0::1",
+        }
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
-        self._fake("tailscale", "echo 'Tailscale is stopped.' >&2; exit 1\n")
-        self.run_sh("token")
-        r = self.run_sh("plist")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertFalse(self.plist().exists())
+        self.assertEqual(self.run_sh("token").returncode, 0)
+        for name, body in cases.items():
+            with self.subTest(name):
+                self._fake("tailscale", body + "\n")
+                r = self.run_sh("plist")
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertFalse(self.plist().exists())
+
+    def test_cgnat_edges_accepted(self):
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        self.assertEqual(self.run_sh("token").returncode, 0)
+        for ip in ("100.64.0.1", "100.127.255.254"):
+            with self.subTest(ip):
+                self._fake("tailscale", f"echo {ip}\n")
+                r = self.run_sh("plist")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f"--host {ip} ", plistlib.loads(self.plist().read_bytes())["ProgramArguments"][3])
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
@@ -193,6 +244,17 @@ class LaunchctlTest(InstallerHarness):
         self.assertIn(f"bootstrap gui/{uid} {self.plist()}", calls)
         self.assertIn(f"print gui/{uid}/com.cortados.bot-gateway", calls)
         self.assertEqual(calls.count(f"bootout gui/{uid}/com.cortados.bot-gateway"), 2)   # load's reset + unload
+
+    def test_status_never_prints_log_contents(self):
+        log = self.home / ".cortados" / "bot-gateway.out"
+        log.parent.mkdir(parents=True)
+        leaked = "Bearer-synthetic-credential-ZZ9-in-a-path"
+        log.write_text(f"bot-gateway: listening\nbot-gateway: POST /{leaked}\nbot-gateway: POST /mcp\n")
+        s = self.run_sh("status")
+        self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+        self.assertNotIn(leaked, s.stdout + s.stderr)
+        self.assertNotIn("listening", s.stdout + s.stderr)
+        self.assertIn(f"{log} (3 lines; not shown)", s.stdout)
 
     def test_status_fails_without_401(self):
         self._fake("curl", "printf 000\n")

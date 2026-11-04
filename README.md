@@ -460,7 +460,7 @@ cd ~/cortados-router && git pull
 integrations/bot-gateway/install.sh token    # creates ~/.config/cortados/bot-gateway-token (0600); never prints it
 integrations/bot-gateway/install.sh plist    # writes ~/Library/LaunchAgents/com.cortados.bot-gateway.plist
 integrations/bot-gateway/install.sh load     # (re)loads it
-integrations/bot-gateway/install.sh status   # launchctl state + unauthenticated POST /mcp: expect HTTP 401
+integrations/bot-gateway/install.sh status   # launchctl state, unauthenticated POST /mcp (expect 401), log path + line count
 ```
 
 The owner views the bot token himself (`cat ~/.config/cortados/bot-gateway-token`) and pastes it into Grok Bot's
@@ -469,20 +469,23 @@ secret field. The system prompt is in `docs/BOT-INSTRUCTIONS.md`. `install.sh un
 The plist holds `RunAtLoad`, `KeepAlive` (it keeps retrying while Tailscale is not up yet), logs to
 `~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://<Air tailnet address>:8432`, and the gateway flags
 `--host <Air tailnet address> --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
-~/cortados-bot-workspace --children-run-as-me`. The address comes from `tailscale ip -4` at install time and is never
+~/cortados-bot-workspace --children-run-as-me`. The address comes from `tailscale ip -4` at install time and must be exactly one IPv4 address in 100.64.0.0/10 (anything else, including a failing CLI, multiple lines or 0.0.0.0, is refused); it is never
 stored in the repo. If it changes, rerun `plist` and `load`. There is no `--enable-start-task`. The plist passes
 `--children-run-as-me` because the gateway refuses any non-loopback `--host` without it. In phase 1 the gateway starts
 no child, so no task runs as the owner on a bot's behalf. The plist holds no secret values.
 
 **Provider token for route_task: design (a), sourced from `~/.cortados/provider.env`.** The provider's own
 LaunchAgent already loads its token from that file, and the gateway loads it the same way. The plist runs
-`/bin/zsh -f -c '. ~/.cortados/provider.env; export CORTADOS_PROVIDER_TOKEN; ...; exec python3 -m cortados_router.bot_gateway ...'`.
-The value never shows up in the plist, on a command line or in the installer's output, and there is no second copy of
-the secret to keep in step. The installer checks only that some line assigns the variable *name*
-`CORTADOS_PROVIDER_TOKEN` (`grep -q`); it never reads the value. This differs from the provider's `set -a` pattern in
-two ways. First, the file is sourced without `set -a` and only the token is exported, so the provider's other settings
-stay out of the gateway's environment. Second, the plist's `CORTADOS_PROVIDER_URL` is restored after sourcing.
-`zsh -f` skips the startup files.
+`/bin/zsh -f -c` with a script that sources `~/.cortados/provider.env`, copies the token into a shell-local
+variable, unsets every exported variable, and checks that none is left (if one is, the start stops with exit 78). It
+then exports only an allowlist: `HOME`, a fixed `PATH`, `CORTADOS_HOME`, the plist's `CORTADOS_PROVIDER_URL` and
+`CORTADOS_PROVIDER_TOKEN`. Then it execs the gateway. The value never shows up in the plist, on a command line or in
+the installer's output, and there is no second copy of the secret to keep in step. The installer checks only that some
+line assigns the variable *name* `CORTADOS_PROVIDER_TOKEN` (`grep -q`); it never reads the value. This differs from
+the provider's `set -a` pattern because nothing else in provider.env reaches the gateway, even an explicit `export`
+line or a proxy variable. The script does not use `env -i NAME=value`, because that would put the token on a command
+line that `ps` shows to every local user. `zsh -f` skips the startup files. An empty token, or a provider.env that
+fails to source, stops the start with exit 78.
 Fallback, design (b): if provider.env does not assign that name, `plist` uses a 0600 file the owner creates himself,
 `~/.config/cortados/bot-gateway-provider-token`, passed as `CORTADOS_PROVIDER_TOKEN_FILE`. If neither exists, `plist`
 refuses to run. Tests: `tests/test_bot_gateway_install.py` (temp HOME, fake `tailscale` / `launchctl` / `curl`).
