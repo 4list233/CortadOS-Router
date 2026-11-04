@@ -449,6 +449,44 @@ claude mcp add -s user cortados-route \
   -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
 ```
 
+## Bot gateway on the Air
+
+`integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`, phase 1: `route_task`
+only; design in `docs/GROKBOT-BRIDGE.md`) as the LaunchAgent `com.cortados.bot-gateway`, as the Air's normal user, on
+the Air's tailnet address, port 8434. Run these on the Air, from the checkout, in order:
+
+```bash
+cd ~/cortados-router && git pull
+integrations/bot-gateway/install.sh token    # creates ~/.config/cortados/bot-gateway-token (0600); never prints it
+integrations/bot-gateway/install.sh plist    # writes ~/Library/LaunchAgents/com.cortados.bot-gateway.plist
+integrations/bot-gateway/install.sh load     # (re)loads it
+integrations/bot-gateway/install.sh status   # launchctl state + unauthenticated POST /mcp: expect HTTP 401
+```
+
+The owner views the bot token himself (`cat ~/.config/cortados/bot-gateway-token`) and pastes it into Grok Bot's
+secret field. The system prompt is in `docs/BOT-INSTRUCTIONS.md`. `install.sh unload` stops the gateway.
+
+The plist holds `RunAtLoad`, `KeepAlive` (it keeps retrying while Tailscale is not up yet), logs to
+`~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://<Air tailnet address>:8432`, and the gateway flags
+`--host <Air tailnet address> --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
+~/cortados-bot-workspace --children-run-as-me`. The address comes from `tailscale ip -4` at install time and is never
+stored in the repo. If it changes, rerun `plist` and `load`. There is no `--enable-start-task`. The plist passes
+`--children-run-as-me` because the gateway refuses any non-loopback `--host` without it. In phase 1 the gateway starts
+no child, so no task runs as the owner on a bot's behalf. The plist holds no secret values.
+
+**Provider token for route_task: design (a), sourced from `~/.cortados/provider.env`.** The provider's own
+LaunchAgent already loads its token from that file, and the gateway loads it the same way. The plist runs
+`/bin/zsh -f -c '. ~/.cortados/provider.env; export CORTADOS_PROVIDER_TOKEN; ...; exec python3 -m cortados_router.bot_gateway ...'`.
+The value never shows up in the plist, on a command line or in the installer's output, and there is no second copy of
+the secret to keep in step. The installer checks only that some line assigns the variable *name*
+`CORTADOS_PROVIDER_TOKEN` (`grep -q`); it never reads the value. This differs from the provider's `set -a` pattern in
+two ways. First, the file is sourced without `set -a` and only the token is exported, so the provider's other settings
+stay out of the gateway's environment. Second, the plist's `CORTADOS_PROVIDER_URL` is restored after sourcing.
+`zsh -f` skips the startup files.
+Fallback, design (b): if provider.env does not assign that name, `plist` uses a 0600 file the owner creates himself,
+`~/.config/cortados/bot-gateway-provider-token`, passed as `CORTADOS_PROVIDER_TOKEN_FILE`. If neither exists, `plist`
+refuses to run. Tests: `tests/test_bot_gateway_install.py` (temp HOME, fake `tailscale` / `launchctl` / `curl`).
+
 ## The resource pool at a glance
 
 A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (reachable from any device on the tailnet; it asks for the token and never embeds it), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.
