@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -34,7 +35,9 @@ if open(os.path.join(os.path.dirname(sys.argv[1]), "mode")).read() == "notjson":
 for line in sys.stdin:
     m = json.loads(line)
     if m.get("id") is not None:
-        res = {"tools": [{"name": n} for n in names]} if m["method"] == "tools/list" else {}
+        bad = open(os.path.join(os.path.dirname(sys.argv[1]), "mode")).read() == "badschema"
+        res = ({"tools": [dict({"name": n}, **({"inputSchema": "x"} if bad else {})) for n in names]}
+               if m["method"] == "tools/list" else {})
         print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": res}), flush=True)
 '''
 
@@ -211,6 +214,19 @@ class BrowserScriptsTests(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertIn("malformed MCP protocol output", r.stderr)
         self.assertIn("NOT JSON", r.stderr)
+
+    def test_tool_listing_fails_on_non_object_input_schema(self):
+        # A non-object inputSchema is reported as malformed output at once (it used to kill the reader thread with an
+        # uncaught AttributeError, so the gate waited 30 s and blamed a missing answer).
+        self.stub(mode="badschema")
+        t0 = time.monotonic()
+        r = self.sh(INSTALL, "args")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("malformed MCP protocol output", r.stderr)
+        self.assertIn("inputSchema of", r.stderr)
+        self.assertNotIn("within 30 s", r.stderr)
+        self.assertLess(time.monotonic() - t0, 25)
 
 
 if __name__ == "__main__":

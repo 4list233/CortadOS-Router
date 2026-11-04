@@ -19,6 +19,7 @@ Stdlib only. Refusals are JSON-RPC errors with fixed reason text; nothing from a
 """
 import argparse
 import ctypes
+import errno
 import json
 import os
 import re
@@ -77,14 +78,32 @@ PS_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
 # which a process writes itself, so an executable path read from ps text proves nothing. Off macOS (or if either call is
 # unavailable) the identity is unknown and nothing is killed by command line.
 LIBPROC = "/usr/lib/libproc.dylib"
+# libproc.h's PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN): the buffer size proc_pidpath requires, so no executable path
+# is ever truncated (a truncated path could not be matched against the browsers path anyway; it would just fail).
 PROC_PIDPATHINFO_MAXSIZE = 4096
 CTL_KERN, KERN_PROCARGS2 = 1, 49
 # xnu pads the exec path in KERN_PROCARGS2 with NULs so argv[0] starts pointer-aligned (8 bytes on 64-bit macOS),
-# measured from the byte after argc. Knowing the exact start is what makes an empty argv[0] detectable (it would
-# otherwise look like more padding and shift every argv entry by one, into the environment).
+# measured from the byte after argc. Reading argv from that exact offset (not "after however many NULs follow") is
+# what keeps an empty argv[0] from being skipped as padding, which would shift every entry by one into the environment.
 PROCARGS_ALIGN = 8
 # Upper bound on argc accepted from the kernel buffer (far above any browser's argv; a bigger count is corrupt).
 PROCARGS_MAX_ARGC = 1 << 16
+# errno values of a kernel identity lookup for a pid that is gone (exited between the ps listing and the lookup): the
+# normal race, silent. Any other failure (library not loadable, EPERM, ...) silently disables the command-line kill, so
+# it is reported on stderr, once per filter process (_IDENTITY_REPORTED) to avoid one line per pid.
+GONE_ERRNOS = frozenset({errno.ESRCH, errno.EINVAL})
+_IDENTITY_REPORTED = False
+
+
+def _identity_failure(what, err=None):
+    global _IDENTITY_REPORTED
+    if err in GONE_ERRNOS or _IDENTITY_REPORTED:
+        return None
+    _IDENTITY_REPORTED = True
+    detail = f"errno {err} ({os.strerror(err)})" if isinstance(err, int) and err else str(err or "no errno")
+    sys.stderr.write(f"mcp_filter: kernel process identity unavailable ({what}: {detail}); browser processes are not "
+                     "killed by command line (reported once)\n")
+    return None
 # Executable names of the browsers Playwright installs under PLAYWRIGHT_BROWSERS_PATH (Chromium, Chrome for Testing, the
 # headless shell, old and new layouts) and their macOS helper apps ("Chromium Helper (Renderer)"). Ownership by command
 # line accepts only these, so a shell or any other program whose argv mentions the task dir is never killed.
@@ -147,8 +166,8 @@ def parse_procargs2(data):
     """argv from a KERN_PROCARGS2 buffer, or None when its boundaries are not exact (fail closed: not our process).
     Layout: int32 argc; exec path, NUL; NUL padding up to the next PROCARGS_ALIGN boundary; argc NUL-terminated argv
     strings; then the environment, which is never read. Refused: argc out of range, an unterminated string, padding
-    that is not all NULs, and any empty argv entry (argv[0] empty is indistinguishable from padding, so empties are
-    refused everywhere)."""
+    that is not all NULs, and an empty argv[0] (a NUL at the aligned offset; no browser runs with one, so it is
+    treated as not ours). Empty entries after argv[0] are kept: Chromium may be passed an empty argument."""
     if len(data) < 4:
         return None
     argc = int.from_bytes(data[:4], sys.byteorder)
@@ -161,11 +180,13 @@ def parse_procargs2(data):
     pos = -(-(end + 1) // PROCARGS_ALIGN) * PROCARGS_ALIGN
     if pos > len(body) or body[end:pos].strip(b"\0"):
         return None
+    if pos >= len(body) or body[pos] == 0:
+        return None                         # empty argv[0] (or no argv at all)
     argv = []
     for _ in range(argc):
         nul = body.find(b"\0", pos)
-        if nul < 0 or nul == pos:
-            return None                     # unterminated within the buffer, or empty
+        if nul < 0:
+            return None                     # unterminated within the buffer
         argv.append(body[pos:nul].decode("utf-8", "surrogateescape"))
         pos = nul + 1
     return argv
@@ -328,17 +349,19 @@ class Filter:
             buf = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
             n = libproc.proc_pidpath(ctypes.c_int(pid), buf, ctypes.c_uint32(PROC_PIDPATHINFO_MAXSIZE))
             if n <= 0:
-                return None
+                return _identity_failure("proc_pidpath", ctypes.get_errno())
             exe = buf.raw[:n].decode("utf-8", "surrogateescape")
             mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
             size = ctypes.c_size_t(0)
-            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0 or size.value < 4:
-                return None
+            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+                return _identity_failure("sysctl KERN_PROCARGS2 size", ctypes.get_errno())
+            if size.value < 4:
+                return _identity_failure("sysctl KERN_PROCARGS2 size", f"{size.value} bytes")
             raw = ctypes.create_string_buffer(size.value)
             if libc.sysctl(mib, 3, raw, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
-                return None
-        except (OSError, AttributeError, ValueError):
-            return None
+                return _identity_failure("sysctl KERN_PROCARGS2", ctypes.get_errno())
+        except (OSError, AttributeError, ValueError) as e:
+            return _identity_failure("libproc/sysctl", f"{e.__class__.__name__}: {e}")
         argv = parse_procargs2(raw.raw[:size.value])
         return None if argv is None else (exe, argv)
 
