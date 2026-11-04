@@ -51,6 +51,7 @@ The child starts with an empty MCP config (built-in tools only); the parent's MC
 | `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted. |
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. `Agent` and `route_task` (both delegation primitives) are always allowed regardless. |
 | `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
+| `mainSessionGuard` | `true` | Warn-only nudge when the **main session** does substantive work itself (see **Main-session guard**). Never blocks. `/cortados-guard on\|off` overrides it. |
 
 ## Orchestrator mode
 
@@ -71,6 +72,39 @@ subagents. This is **guidance, not a cage** by default:
 The result: the top model is the brain and work flows through routed subagents, while the brain can still handle the
 odd trivial thing itself unless you turn on strict enforcement. Turn the whole thing off with `orchestratorMode:
 false` (the mod then only routes subagents, without directing the main session at all).
+
+## Main-session guard (warn only)
+
+With `mainSessionGuard` on (the default), the mod watches the **main session's** `Edit`, `Write`, `NotebookEdit`
+and `Bash` calls and nudges it to delegate when one is substantive. It **never blocks, denies or rewrites a call**:
+every call runs unchanged, and a failure in the guard itself is swallowed. Subagents, teammates and engine forks
+(any call carrying an `agentId`) are never watched.
+
+A call is substantive when:
+
+- an `Edit`, `Write` or `NotebookEdit` carries new content (`new_string` / `content` / `new_source`) of **more than 40
+  lines or more than 2000 characters**. 40 lines is about one function or a screenful, so the directive's "trivial
+  touch" (a one-line fix, a config tweak) stays far under it; 2000 characters catches long-but-few-lines content
+  (minified JSON, prose) the line count would miss; or
+- a `Bash` command, in any `;`/`&&`/`|` segment and after leading `VAR=value` assignments, starts like a build or test
+  run: `python -m unittest` / `python -m pytest`, `pytest`, `make`, `npm`/`yarn`/`pnpm` `build` or `test` (with or
+  without `run`). A text heuristic, not a shell parse: `grep make Makefile` or `echo pytest` do not count.
+
+Each substantive call bumps a session counter shown on the mod's status line (`main did 3 big edits, 1 build/test
+run; delegate to routed subagents`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;
+a toast per edit would be noise). The counters and the throttle live in memory and start over when the mod reloads.
+
+While a routed subagent is running, the status line stays its own (`↗ routed subagent (...)`): the guard keeps
+counting and still toasts, and puts its counter back once the last routed child finishes. A guard step that fails
+(store read or write, clock, status, toast, registering `/cortados-guard`) is reported **once per kind** as a dim
+transcript notice naming only the step and the error class (no message text, no input), and the tool call still runs
+exactly once, unchanged. A failed `$.ui.status`/`$.ui.toast` underneath the host is dropped and reported by the host
+itself, since those calls are fire-and-forget.
+
+`/cortados-guard off` / `/cortados-guard on` turns it off or on and is kept in the mod's `$.store`, so it survives
+restarts and overrides `mainSessionGuard` (it takes effect at once, even if the first store read is still in flight;
+if saving fails it applies to this session only and says so); `/cortados-guard` with no argument reports the state. No model calls, no
+network.
 
 ## Independent reviews
 
