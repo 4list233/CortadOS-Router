@@ -185,30 +185,10 @@ class LedgerWrite(unittest.TestCase):
 
     def test_record_async_writes_row(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}):
-            t = usage_ledger.record_async("claude#b", "claude-sonnet-5", {"input_tokens": 4, "output_tokens": 1})
-            t.join(5)
-            self.assertFalse(t.is_alive())
+            self.assertTrue(usage_ledger.record_async("claude#b", "claude-sonnet-5", {"input_tokens": 4, "output_tokens": 1}))
+            self.assertTrue(usage_ledger.flush(5))
             rows = sqlite3.connect(Path(d) / "usage.db").execute("SELECT runtime, input_tokens, lane FROM usage").fetchall()
             self.assertEqual(rows, [("claude", 4, "claude#b")])
-
-    def test_record_async_writes_the_row_synchronously_when_the_thread_cannot_start(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
-                mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
-                self.assertLogs("cortados.usage_ledger", "WARNING"):
-            self.assertIsNone(usage_ledger.record_async("claude#b", "m", {"input_tokens": 3}, context="search lane, run -"))
-            rows = sqlite3.connect(Path(d) / "usage.db").execute("SELECT runtime, lane, input_tokens FROM usage").fetchall()
-        self.assertEqual(rows, [("claude", "claude#b", 3)])
-
-    def test_a_failed_synchronous_fallback_write_logs_error_with_lane_and_context(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
-                mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
-                self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
-            (Path(d) / "usage.db").mkdir()                  # a directory where the db must go: the fallback write fails
-            self.assertIsNone(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run search-run-0001"))
-        errors = [r.getMessage() for r in cm.records if r.levelname == "ERROR"]
-        self.assertEqual(len(errors), 1)
-        self.assertIn("lane claude#b", errors[0])
-        self.assertIn("search lane, run search-run-0001", errors[0])
 
     def _hold_migrate_lock(self, db):
         """Another process holding usage.db.migrate (as the reviewer did); returns it, killed at cleanup."""
@@ -231,27 +211,6 @@ class LedgerWrite(unittest.TestCase):
         c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
         c.commit()
         c.close()
-
-    def test_thread_start_failure_with_the_migrate_lock_held_returns_within_the_deadline_and_logs_error(self):
-        # The reviewer's case: no worker thread (the fallback runs on the request thread) and the migrate lock held by
-        # another process on a ledger that still needs its lane column. record must not block on the lock.
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
-                mock.patch.object(usage_ledger, "RETRY_S", 1.0):
-            db = Path(d) / "usage.db"
-            self._legacy(db)
-            self._hold_migrate_lock(db)
-            usage_ledger._consecutive_failures = 0
-            t0 = time.monotonic()
-            with mock.patch.object(usage_ledger.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
-                    self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
-                self.assertIsNone(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run search-run-0001"))
-            took = time.monotonic() - t0
-        self.assertLess(took, 1.0 + 0.75, "bounded by RETRY_S plus a small margin, not by the lock holder (60 s)")
-        errors = [r.getMessage() for r in cm.records if r.levelname == "ERROR"]
-        self.assertEqual(len(errors), 1)
-        self.assertIn("lane claude#b", errors[0])
-        self.assertIn("search lane, run search-run-0001", errors[0])
-        self.assertEqual(usage_ledger.consecutive_failures(), 1, "the failure is counted")
 
     def test_migrate_lock_held_but_schema_has_the_lane_the_row_is_still_written(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "RETRY_S", 0.5):
@@ -328,89 +287,123 @@ class LedgerWrite(unittest.TestCase):
             c.close()
             self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 9}, path=db))
 
-    def test_rows_written_while_a_long_background_build_holds_the_writer_lock_land_exactly_once(self):
-        # Review r11: the background CREATE INDEX holds SQLite's one writer lock longer than RETRY_S, on a populated
-        # ledger. Writes in that window cannot reach the db by their deadline: they are spooled, and the end of the
-        # migration replays them. Every row lands exactly once.
-        import threading as th
-        real_build = usage_ledger._build_index
-        building, release = th.Event(), th.Event()
+    def _lost(self):
+        return usage_ledger.stats()["lost"]
 
-        def build(c):
-            if th.current_thread().name != "cortados-usage-ledger-migrate":
-                c.execute("WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r").fetchone()
-                return                                          # never reached: interrupted at the foreground limit
-            c.execute("BEGIN IMMEDIATE")                        # the build's writer lock, held past every deadline
-            c.execute(usage_ledger._TS_INDEX)
-            building.set()
-            release.wait(10)
-            c.commit()
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_build_index", build), \
-                mock.patch.object(usage_ledger, "RETRY_S", 0.4), mock.patch.object(usage_ledger, "_BG_BACKOFF_S", 0.05), \
-                mock.patch.object(usage_ledger, "_bg_started", set()):
+    def test_a_locked_db_never_blocks_the_request_path_and_the_rows_land_once_it_frees(self):
+        # Review r12: the request thread only queues. Another connection holds SQLite's writer lock (as a long index
+        # build does); record_async still returns at once, the writer retries, and every row lands when it is released.
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "TIMEOUT_S", 0.05):
             db = Path(d) / "usage.db"
+            self.assertTrue(usage_ledger.record("codex", "gpt", {}, ts=1.0, path=db))     # migrated, WAL
+            holder = sqlite3.connect(db)
+            holder.execute("BEGIN IMMEDIATE")
+            lost0 = self._lost()
+            t0 = time.monotonic()
+            for i in range(50):
+                self.assertTrue(usage_ledger.record_async("claude#b", "m", {"input_tokens": i}, path=db,
+                                                          context="search lane, run -" if i == 0 else None))
+            self.assertLess(time.monotonic() - t0, 0.2, "queuing never waits on the db")
+            self.assertFalse(usage_ledger.flush(0.5), "the writer is waiting on the lock")
+            self.assertGreater(usage_ledger.stats()["queued"], 0)
+            holder.rollback()
+            holder.close()
+            self.assertTrue(usage_ledger.flush(10))
             c = sqlite3.connect(db)
-            c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
-            c.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?)",
-                          ((float(i), "claude", "old", 1, 1, 0, 0) for i in range(50000)))
-            c.commit()
+            self.assertEqual(c.execute("SELECT COUNT(*), SUM(input_tokens) FROM usage WHERE lane = 'claude#b'").fetchone(),
+                             (50, sum(range(50))))
             c.close()
-            # the triggering row: committed before the background build starts
-            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 1000}, ts=1e9, path=db))
-            self.assertTrue(building.wait(10), "the background build started")
+            self.assertEqual(self._lost(), lost0)
+            self.assertEqual(usage_ledger.stats()["queued"], 0)
+
+    def test_a_migrating_ledger_never_blocks_the_request_path(self):
+        # a legacy ledger (no lane column) whose migrate lock another process holds: the writer retries (MigrationBusy
+        # is busy), the request path is untouched, and the rows land once the lock is released
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "RETRY_S", 0.2):
+            db = Path(d) / "usage.db"
+            self._legacy(db)
+            proc = self._hold_migrate_lock(db)
+            lost0 = self._lost()
+            t0 = time.monotonic()
+            for i in range(5):
+                self.assertTrue(usage_ledger.record_async("claude#b", "m", {"input_tokens": i}, path=db))
+            self.assertLess(time.monotonic() - t0, 0.2)
+            self.assertFalse(usage_ledger.flush(0.6))
+            proc.kill()
+            proc.wait()
+            self.assertTrue(usage_ledger.flush(15))
+            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage WHERE lane = 'claude#b'").fetchone()[0], 5)
+            self.assertEqual(self._lost(), lost0)
+
+    def test_the_batched_drain_writes_every_row(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "BATCH_MAX", 7):
+            db = Path(d) / "usage.db"
+            batches = []
+            real = usage_ledger._write_rows
+
+            def spy(p, rows, deadline):
+                batches.append(len(rows))
+                return real(p, rows, deadline)
+            with mock.patch.object(usage_ledger, "_write_rows", spy):
+                for i in range(100):
+                    usage_ledger.record_async("codex", "gpt", {"input_tokens": 1}, path=db)
+                self.assertTrue(usage_ledger.flush(10))
+            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage").fetchone()[0], 100)
+            self.assertLessEqual(max(batches), 7)
+            self.assertEqual(sum(batches), 100)
+
+    def test_a_full_queue_counts_the_lost_rows_and_the_usage_api_reports_them(self):
+        from cortados_router.provider import usage as usage_view
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CORTADOS_HOME": d}), \
+                mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=2)), \
+                mock.patch.object(usage_ledger, "_ensure_writer"):              # no writer: the queue stays full
+            lost0 = self._lost()
             with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
-                for i in range(1, 4):                           # each outlasts RETRY_S behind the build: spooled
-                    self.assertFalse(usage_ledger.record("claude#b", "m", {"input_tokens": 1000 + i}, ts=1e9 + i, path=db,
-                                                         context="search lane, run -"))
-            self.assertEqual(sum("spooled" in m for m in cm.output), 3)
-            self.assertFalse(any("LOST" in m for m in cm.output))
-            release.set()
-            until = time.monotonic() + 10
-            got = []
-            while time.monotonic() < until:
-                c = sqlite3.connect(db)
-                try:
-                    got = c.execute("SELECT input_tokens FROM usage WHERE ts >= 1e9 ORDER BY ts").fetchall()
-                    done = usage_ledger._migrated(c)
-                finally:
-                    c.close()
-                if done and len(got) == 4:
-                    break
-                time.sleep(0.05)
-            self.assertEqual(got, [(1000,), (1001,), (1002,), (1003,)], "every row exactly once")
-            c = sqlite3.connect(db)
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 50000 + 4)
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage_spool_applied").fetchone()[0], 0)
-            c.close()
-            self.assertEqual(list(Path(d).glob("usage-spool.jsonl*.replay")), [])
-            # a later write replays nothing again: still exactly once
-            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 2000}, ts=2e9, path=db))
-            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage WHERE ts >= 1e9").fetchone()[0], 5)
+                results = [usage_ledger.record_async("codex", "gpt", {}) for _ in range(5)]
+            self.assertEqual(results, [True, True, False, False, False])
+            self.assertEqual(self._lost() - lost0, 3)
+            self.assertTrue(any("LOST" in m and "queue is full" in m for m in cm.output))
+            self.assertEqual(usage_ledger.stats()["queued"], 2)
+            out = usage_view.collect(state_dir=Path(d), scarcity_reader=lambda: {}, refusals=[],
+                                     s1_probe=lambda u: {"available": False}, now=time.time())
+            self.assertEqual(out["ledger"]["lost"], self._lost())
+            self.assertEqual(out["ledger"]["queued"], 2)
+            # drain the patched queue so the shutdown below does not count these rows
+            while not usage_ledger._queue.empty():
+                usage_ledger._queue.get_nowait()
+                usage_ledger._queue.task_done()
 
-    def test_a_replay_interrupted_after_its_insert_does_not_double_count(self):
-        # crash between the insert transaction and the pending file's removal: the next replay must insert nothing
-        with tempfile.TemporaryDirectory() as d:
-            db = Path(d) / "usage.db"
-            self.assertTrue(usage_ledger.record("claude", "m", {}, ts=1.0, path=db))
-            usage_ledger._spool(db, (5.0, "claude", "m", 7, 0, 0, 0, "claude#b"))
-            real_unlink = Path.unlink
-            with mock.patch.object(Path, "unlink", side_effect=OSError("crash")), self.assertRaises(OSError):
-                usage_ledger._replay_locked(db, None)
-            self.assertEqual(usage_ledger._replay_locked(db, None), 0, "the applied uid makes the second pass a no-op")
-            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage WHERE input_tokens = 7").fetchone()[0], 1)
-            self.assertEqual(list(Path(d).glob("usage-spool.jsonl*")), [])
-            del real_unlink
+    def test_a_full_queue_context_row_is_logged_at_error_with_lane_and_context(self):
+        with mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=1)), \
+                mock.patch.object(usage_ledger, "_ensure_writer"):
+            usage_ledger._queue.put_nowait(None)
+            with self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
+                self.assertFalse(usage_ledger.record_async("claude#b", "m", {}, context="search lane, run r1"))
+        self.assertIn("lane claude#b", cm.output[0])
+        self.assertIn("search lane, run r1", cm.output[0])
 
-    def test_a_row_whose_spool_append_fails_too_is_logged_lost(self):
-        with tempfile.TemporaryDirectory() as d:
-            bad = Path(d) / "dir-not-db"
-            bad.mkdir()
-            usage_ledger._consecutive_failures = 0
-            with mock.patch.object(usage_ledger, "_spool", side_effect=OSError("disk full")), \
-                    self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
-                self.assertFalse(usage_ledger.record("claude#b", "m", {}, path=bad, context="search lane, run r1"))
-            self.assertIn("LOST", cm.output[0])
-            self.assertIn("lane claude#b", cm.output[0])
+    def test_shutdown_counts_what_is_left_in_the_queue(self):
+        with mock.patch.object(usage_ledger, "_queue", usage_ledger.queue.Queue(maxsize=10)), \
+                mock.patch.object(usage_ledger, "_ensure_writer"):
+            for _ in range(4):
+                self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=Path("/nonexistent/usage.db")))
+            lost0 = self._lost()
+            with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+                self.assertEqual(usage_ledger.shutdown(timeout=0.05), 4)
+            self.assertEqual(self._lost() - lost0, 4)
+            self.assertIn("exited with rows still queued", cm.output[0])
+            self.assertEqual(usage_ledger.stats()["queued"], 0)
+
+    def test_a_non_busy_failure_counts_the_batch_lost_after_its_tries(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_WRITER_BACKOFF_S", 0.01):
+            bad = Path(d) / "usage.db"
+            bad.mkdir()                                     # a directory where the db must go
+            lost0 = self._lost()
+            with self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
+                usage_ledger.record_async("claude#b", "m", {}, path=bad, context="search lane, run r2")
+                self.assertTrue(usage_ledger.flush(5))
+            self.assertEqual(self._lost() - lost0, 1)
+            self.assertTrue(any("LOST" in m and "search lane, run r2" in m for m in cm.output))
 
     def test_background_migration_retries_with_backoff_until_it_succeeds(self):
         calls = {"n": 0}

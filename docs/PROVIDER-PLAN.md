@@ -523,9 +523,11 @@ passed as an explicit `CLAUDE_CONFIG_DIR`, overriding any the provider inherited
 inherited `CLAUDE_CONFIG_DIR` that matches no configured account (or a named account with no lane) fails with
 `no_claude_lane` before the CLI is launched, so no search spends quota the ledger cannot record. A completed search's
 ledger row is written after the fact like every other lane's (the ledger is accounting, not the quota gate); a failed
-write is logged at error level with the lane and run id. A row the ledger cannot take by its deadline is spooled
-(`usage-spool.jsonl` next to usage.db) and replayed idempotently later; only a failed spool append loses it (logged
-"LOST"). The request's policy headers bind the lane before launch, as on routed calls: `x-cortados-exclude-model`
+write is logged at error level with the lane and run id. The request thread only puts the row on a bounded in-process
+queue (`usage_ledger.QUEUE_MAX`); one writer thread commits it in batches and retries while usage.db is locked or
+migrating, so the request path never touches SQLite or a file lock. A row is lost only on a full queue, a batch that
+keeps failing with a non-busy error, or exit with rows still queued; each is counted and shown as `ledger.lost`
+(with `ledger.queued`) in /v1/cortados/usage, and logged "LOST". The request's policy headers bind the lane before launch, as on routed calls: `x-cortados-exclude-model`
 naming the search model is a 400, and `x-cortados-min-left-pct` is checked and reserved on the search account through
 `floor.reserve` (429 on refusal; a fixed-model endpoint or a failing check fails closed).
 Hooks are off (`--settings '{"disableAllHooks": true}'`) and every `ANTHROPIC_*` variable is stripped by prefix

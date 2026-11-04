@@ -2,34 +2,35 @@
 
 The old writer was the Hermes plugin; the provider is now the only thing that runs subscription turns, so it writes here.
 Schema is the one unitcost.learn reads, plus `lane` (the scarcity lane the turn drew on: claude, claude#b, codex), because two
-Claude accounts are two separate pools. A write never breaks or slows a turn: it runs off the request thread
-(record_async), retries a busy/locked db within one end-to-end RETRY_S deadline instead of dropping the row, and failures are never raised. Consecutive failures are counted (`consecutive_failures()`) and
-logged with their reason on the first and every LOG_EVERY-th one, so a ledger that keeps failing stays visible without flooding.
+Claude accounts are two separate pools.
 
-No row is dropped because the db could not take it in time: a row record() cannot write by its deadline, for any reason
-(SQLite admits one writer, so a long index build or any other writer can hold the db past every deadline), is appended
-to SPOOL next to usage.db and replayed into the db later (see _spool / _replay). A row is lost only if that append fails
-too, and that is logged as such."""
+A write never breaks or slows a turn. The request path only calls record_async, which puts the row on a bounded
+in-process queue and returns: a request thread never opens SQLite or takes a file lock. One background writer thread
+drains the queue in committed batches and retries while the db is locked or migrating, so the queue is the only buffer
+while a migration (lane column, ts index) holds the db. A row is lost only when the queue is full, when the db keeps
+failing with a non-busy error, or when the process exits with rows still queued; each loss is counted (`stats()`, shown
+in /v1/cortados/usage under `ledger.lost`) and logged, never silent. A usage row is accounting for unitcost, not quota
+enforcement: the floor reservations are separate and do not read this queue.
+
+record() is the synchronous single-row writer (tests, fixtures, tools); it is never called on a request thread."""
 from __future__ import annotations
 
+import atexit
 import fcntl
-import json
 import logging
-import os
+import queue
 import sqlite3
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("cortados.usage_ledger")
 TIMEOUT_S = 0.5          # one attempt's sqlite busy wait (capped by what is left of record()'s deadline)
 # Reason: a busy db (a migration building the index, a view scan, a racing writer) is transient; dropping the row there
-# lost turns, so record() retries. RETRY_S is ONE end-to-end deadline per record() call, from its start, over everything
-# it does: the migrate lock wait, every sqlite busy wait and statement, and the retries. Reason it covers all of it:
-# record_async's synchronous fallback runs on the request thread, and an unbounded step there (a blocking flock on
-# usage.db.migrate held by another process) held a reply indefinitely. Past the deadline it is a real fault.
+# lost turns, so record() retries. RETRY_S is ONE end-to-end deadline per record() call (and per writer-thread batch
+# attempt), over everything it does: the migrate lock wait, every sqlite busy wait and statement, and the retries, so
+# one attempt never hangs the writer on a stuck lock; the writer then retries the batch.
 RETRY_S = 5.0
 _RETRY_SLEEP_S = 0.05    # between retries and between non-blocking tries of the migrate lock
 _PROGRESS_OPS = 10_000   # sqlite VM steps between deadline checks (as provider/usage.py's LEDGER_QUERY_S guard)
@@ -47,15 +48,26 @@ INDEX_FOREGROUND_S = 1.0
 _BG_BACKOFF_S, _BG_BACKOFF_MAX_S = 1.0, 60.0
 _bg_lock = threading.Lock()
 _bg_started: set[str] = set()   # ledger paths whose background migration thread this process has started
-SPOOL = "usage-spool.jsonl"
-_SPOOL_MAX_LINE = 4096   # one os.write per row under PIPE_BUF-sized lines: an O_APPEND write this small is not interleaved
-# Replay idempotency: the uids of spooled rows already inserted, so a crash between the insert and the spool's removal
-# cannot count a row twice. A side table, not a column: main's usage schema stays as unitcost.learn and the usage view
-# read it, and no index has to be built on the (possibly huge) usage table for it.
-_APPLIED = "CREATE TABLE IF NOT EXISTS usage_spool_applied (uid TEXT PRIMARY KEY)"
 LOG_EVERY = 100          # a steady failure (full disk, read-only home) repeats every turn: one line per 100 turns stays readable
 _fail_lock = threading.Lock()
 _consecutive_failures = 0
+# Reason for the bound: a db that stays locked must not grow this process's memory without limit. A turn is one row
+# (~100 bytes), and even a busy provider completes far fewer than 10k turns during any migration or lock, so a full
+# queue means the writer is truly stuck; past it rows are counted lost and logged.
+QUEUE_MAX = 10_000
+BATCH_MAX = 500          # rows per committed batch: one short write transaction, never a long hold of the db
+_WRITER_BACKOFF_S, _WRITER_BACKOFF_MAX_S = 0.05, 5.0   # between retries of a busy batch: first wait, doubling, capped
+# A non-busy error (unopenable path, corrupt file, full disk) is not a lock to wait out: the batch is retried this many
+# times and then counted lost, so one bad batch cannot stop the rows behind it forever.
+NON_BUSY_TRIES = 3
+# At exit the writer gets this long to commit what is queued (a clean stop should not lose the last turn's row); exit
+# must not hang on a locked db, so what is still queued then is counted lost and logged.
+SHUTDOWN_DRAIN_S = 2.0
+_queue: "queue.Queue[tuple[Path, tuple, str | None]]" = queue.Queue(maxsize=QUEUE_MAX)
+_state_lock = threading.Lock()
+_lost = 0
+_inflight = 0            # rows the writer has taken off the queue and not yet committed or counted lost
+_writer: threading.Thread | None = None
 
 
 def db_path() -> Path:
@@ -153,9 +165,7 @@ def _background_migrate(p: Path) -> None:
                         _build_index(c)
                     if not _migrated(c):
                         raise sqlite3.OperationalError("still not migrated after a full pass")
-                    # the rows spooled while the build held the writer lock, still under the migrate lock
-                    n = _replay_locked(p, None)
-                logger.info("usage ledger: background migration of %s complete; %d spooled row(s) replayed", p, n)
+                logger.info("usage ledger: background migration of %s complete", p)
                 return
             finally:
                 c.close()
@@ -206,7 +216,7 @@ def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> bool:
                 # debug, not warning: while a long background build holds the lock this is every write, and expected
                 logger.debug("usage ledger: migration lock held elsewhere; migration skipped for this row")
                 return False
-            raise sqlite3.OperationalError("usage ledger: no lane column, and the migration lock is held elsewhere")
+            raise MigrationBusy("usage ledger: no lane column, and the migration lock is held elsewhere")
         if _migrated(c):
             return False
         wal = _ensure_wal(c)
@@ -229,9 +239,13 @@ def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> bool:
     return False
 
 
+class MigrationBusy(sqlite3.OperationalError):
+    """The row needs the lane column and another writer holds the migration: transient, retried like a lock."""
+
+
 def _busy(exc: Exception) -> bool:
     m = str(exc).lower()
-    return isinstance(exc, sqlite3.OperationalError) and ("locked" in m or "busy" in m)
+    return isinstance(exc, MigrationBusy) or (isinstance(exc, sqlite3.OperationalError) and ("locked" in m or "busy" in m))
 
 
 def _int(v: Any) -> int:
@@ -244,6 +258,11 @@ def _int(v: Any) -> int:
 def _write(p: Path, row: tuple, deadline: float) -> None:
     """One attempt, bounded by `deadline`: the busy wait is capped by the time left, and any statement still running at
     the deadline is interrupted (OperationalError "interrupted", not busy, so record() stops there)."""
+    _write_rows(p, [row], deadline)
+
+
+def _write_rows(p: Path, rows: list[tuple], deadline: float) -> None:
+    """_write for a batch: every row in one committed transaction, or none."""
     left = deadline - time.monotonic()
     if left <= 0:
         raise sqlite3.OperationalError("usage ledger: write deadline (RETRY_S) passed")
@@ -253,7 +272,7 @@ def _write(p: Path, row: tuple, deadline: float) -> None:
         c.execute(_SCHEMA)        # IF NOT EXISTS: a fresh file needs the table before _migrated() can read it
         c.commit()
         background = _migrate(c, p, deadline)
-        c.execute(_INSERT, row)
+        c.executemany(_INSERT, rows)
         c.commit()
     finally:
         c.close()
@@ -265,127 +284,46 @@ _INSERT = ("INSERT INTO usage (ts, runtime, model, input_tokens, output_tokens, 
            "VALUES (?,?,?,?,?,?,?,?)")
 
 
-def _spool_path(p: Path) -> Path:
-    return p.parent / SPOOL
+def _row(lane: str, model: str, usage: dict | None, ts: float | None) -> tuple:
+    u = usage or {}
+    runtime = (lane or "").split("#", 1)[0]
+    return (ts or time.time(), runtime, str(model or ""), _int(u.get("input_tokens")), _int(u.get("output_tokens")),
+            _int(u.get("cache_read_input_tokens") or u.get("cache_read_tokens")),
+            _int(u.get("cache_creation_input_tokens") or u.get("cache_write_tokens")), lane)
 
 
-def _spool(p: Path, row: tuple) -> None:
-    """Append one row to the spool: one JSON line, O_APPEND, a single write, under the spool's flock. Raises on failure.
-    The lock is held only for this write and for _replay's rename, never for sqlite work. After taking it the fd is
-    checked to still be the spool's path: a replay may have renamed the file this fd was opened on, and a line written
-    there after the replay read it would be lost."""
-    line = json.dumps({"uid": uuid.uuid4().hex, "row": list(row)}, separators=(",", ":")) + "\n"
-    if len(line.encode()) >= _SPOOL_MAX_LINE:       # only a pathological model name gets here: shortened, not dropped
-        r = list(row)
-        r[2] = str(r[2])[:200]
-        line = json.dumps({"uid": uuid.uuid4().hex, "row": r}, separators=(",", ":")) + "\n"
-    sp = _spool_path(p)
-    for _ in range(10):
-        fd = os.open(str(sp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                if os.fstat(fd).st_ino != os.stat(str(sp)).st_ino:
-                    continue                        # renamed by a replay since open: reopen the current spool
-            except FileNotFoundError:
-                continue
-            data = line.encode()
-            if os.write(fd, data) != len(data):
-                raise OSError("short write to the usage spool")
-            return
-        finally:
-            os.close(fd)                            # releases the flock
-    raise OSError("the usage spool kept being replaced under this write")
+def _failed(exc: Exception, n_rows: int, contexts: list[tuple[str, str]], fate: str) -> None:
+    """Count one failed write and log it: every context row at error level every time, else the first and every
+    LOG_EVERY-th failure (a steady failure repeats every turn)."""
+    global _consecutive_failures
+    with _fail_lock:
+        _consecutive_failures += 1
+        n = _consecutive_failures
+    for lane, context in contexts:
+        logger.error("usage ledger write failed for %s on lane %s (%s: %s); row %s", context, lane,
+                     type(exc).__name__, str(exc)[:120], fate)
+    if not contexts and (n == 1 or n % LOG_EVERY == 0 or fate.startswith("LOST")):
+        logger.warning("usage ledger write failed (%s: %s); %d row(s) %s; %d consecutive failures, logged on the first "
+                       "and every %d", type(exc).__name__, str(exc)[:120], n_rows, fate, n, LOG_EVERY)
 
 
-def _replay_locked(p: Path, deadline: float | None) -> int:
-    """Move every spooled row into the db; the caller holds the migrate lock (one replayer at a time). The spool is
-    renamed to a pending file first (under the spool's flock, so no append is lost), then each pending file's rows go
-    in with INSERT OR IGNORE on their uid in usage_spool_applied inside one transaction, then the pending file is
-    removed and its uids forgotten. A crash at any point leaves either the pending file (replayed again: the applied
-    uids make that a no-op) or nothing. Bounded by `deadline` when given. Returns the rows inserted."""
-    sp = _spool_path(p)
-    if sp.exists():
-        fd = os.open(str(sp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            if os.fstat(fd).st_size:
-                os.rename(str(sp), str(sp) + f".{uuid.uuid4().hex}.replay")
-        finally:
-            os.close(fd)
-    pending = sorted(p.parent.glob(SPOOL + ".*.replay"))
-    if not pending:
-        return 0
-    left = None if deadline is None else deadline - time.monotonic()
-    if left is not None and left <= 0:
-        return 0
-    c = sqlite3.connect(str(p), timeout=30.0 if left is None else min(TIMEOUT_S, left))
-    if deadline is not None:
-        c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)
-    inserted = 0
-    try:
-        c.execute(_APPLIED)
-        c.commit()
-        for f in pending:
-            entries = []
-            for raw in f.read_text().splitlines():
-                try:
-                    e = json.loads(raw)
-                except ValueError:
-                    logger.warning("usage ledger: a torn spool line in %s was skipped", f.name)
-                    continue
-                if isinstance(e, dict) and isinstance(e.get("uid"), str) and isinstance(e.get("row"), list) \
-                        and len(e["row"]) == 8:
-                    entries.append(e)
-            uids = [e["uid"] for e in entries]
-            with c:                                 # one transaction per pending file
-                for e in entries:
-                    if c.execute("INSERT OR IGNORE INTO usage_spool_applied (uid) VALUES (?)", (e["uid"],)).rowcount:
-                        c.execute(_INSERT, tuple(e["row"]))
-                        inserted += 1
-            f.unlink()
-            with c:                                 # the file is gone, so these uids can never come back
-                c.executemany("DELETE FROM usage_spool_applied WHERE uid = ?", ((u,) for u in uids))
-    finally:
-        c.close()
-    if inserted:
-        logger.info("usage ledger: %d spooled row(s) replayed into %s", inserted, p.name)
-    return inserted
-
-
-def _replay(p: Path, deadline: float) -> None:
-    """After a successful write: replay the spool if there is one and the migrate lock is free right now (a held lock
-    is a migration in progress, which replays when it ends). Never raises; a failed replay is logged and kept."""
-    sp = _spool_path(p)
-    if not sp.exists() and not any(p.parent.glob(SPOOL + ".*.replay")):
-        return
-    try:
-        with open(str(p) + ".migrate", "a") as lf:
-            if not _migrate_lock(lf, time.monotonic()):
-                return
-            _replay_locked(p, deadline)
-    except Exception as exc:
-        logger.warning("usage ledger: spool replay failed (%s: %s); kept for the next write", type(exc).__name__,
-                       str(exc)[:120])
+def _succeeded() -> None:
+    global _consecutive_failures
+    with _fail_lock:
+        if _consecutive_failures:
+            logger.info("usage ledger writes recovered after %d failures", _consecutive_failures)
+        _consecutive_failures = 0
 
 
 def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None, path: Path | None = None,
            context: str | None = None) -> bool:
-    """Append one turn. `lane` is the scarcity lane (claude, claude#b, codex); its base is the runtime. Returns False on failure.
-    `context` (e.g. "search lane, run <id>") marks a write whose loss must be seen every time: its failure is logged at error
-    level with the lane and that context on EVERY occurrence, besides counting toward consecutive_failures(). Logged
-    once, when the deadline (RETRY_S from the start of this call, covering every step) passes or on the first non-busy
-    error. A row that could not be written is spooled (returns False: not in the db yet, replayed later); the log says
-    "spooled", or "LOST" when the spool append failed too."""
-    global _consecutive_failures
+    """Write one turn synchronously (tests, fixtures, tools; the provider uses record_async). `lane` is the scarcity
+    lane (claude, claude#b, codex); its base is the runtime. Busy errors are retried until RETRY_S from the start of
+    this call. Returns False on failure, never raises. `context` (e.g. "search lane, run <id>") marks a write whose
+    failure is logged at error level with the lane and that context every time."""
     deadline = time.monotonic() + RETRY_S
-    p = row = None
     try:
-        u = usage or {}
-        runtime = (lane or "").split("#", 1)[0]
-        row = (ts or time.time(), runtime, str(model or ""), _int(u.get("input_tokens")), _int(u.get("output_tokens")),
-               _int(u.get("cache_read_input_tokens") or u.get("cache_read_tokens")),
-               _int(u.get("cache_creation_input_tokens") or u.get("cache_write_tokens")), lane)
+        row = _row(lane, model, usage, ts)
         p = path or db_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         while True:
@@ -397,44 +335,153 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
                     raise
                 time.sleep(_RETRY_SLEEP_S)
     except Exception as exc:                            # never raised: the turn already succeeded
-        with _fail_lock:
-            _consecutive_failures += 1
-            n = _consecutive_failures
-        fate = "LOST: it could not be spooled either"
-        if p is not None and row is not None:
-            try:
-                _spool(p, row)
-                fate = f"spooled to {SPOOL}, replayed into the db later"
-            except Exception as sexc:
-                fate = f"LOST: the spool append failed too ({type(sexc).__name__}: {str(sexc)[:120]})"
-        if context:
-            logger.error("usage ledger write failed for %s on lane %s (%s: %s); row %s", context, lane,
-                         type(exc).__name__, str(exc)[:120], fate)
-        elif fate.startswith("LOST") or n == 1 or n % LOG_EVERY == 0:
-            logger.warning("usage ledger write failed (%s: %s); row %s; %d consecutive failures, logged on the first and "
-                           "every %d", type(exc).__name__, str(exc)[:120], fate, n, LOG_EVERY)
+        _failed(exc, 1, [(lane, context)] if context else [], "not written")
         return False
-    _replay(p, deadline)
-    with _fail_lock:
-        if _consecutive_failures:
-            logger.info("usage ledger writes recovered after %d failures", _consecutive_failures)
-        _consecutive_failures = 0
+    _succeeded()
     return True
 
 
-def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None) -> threading.Thread | None:
-    """Off the request thread, so even the sqlite timeout never delays a reply. Returns the started thread (tests join it),
-    or None when the worker could not be started (RuntimeError "can't start new thread" under thread exhaustion) and the
-    row was written synchronously instead. Reason for the fallback: by now the quota is already spent, so losing the row
-    to a failed thread start is worse than holding this one reply for record()'s end-to-end deadline (RETRY_S). The
-    synchronous write keeps the same retries, failure counting and `context` ERROR logging, and never raises."""
+def stats() -> dict[str, int]:
+    """The async writer's counters for /v1/cortados/usage: `queued` rows not yet committed (on the queue or in the
+    batch being written) and `lost` rows since this process started."""
+    with _state_lock:
+        return {"queued": _queue.qsize() + _inflight, "lost": _lost}
+
+
+def _count_lost(n: int, why: str, contexts: list[tuple[str, str]]) -> None:
+    global _lost
+    with _state_lock:
+        _lost += n
+        total = _lost
+    for lane, context in contexts:
+        logger.error("usage ledger row LOST for %s on lane %s (%s); %d lost since start", context, lane, why, total)
+    if not contexts:
+        logger.warning("usage ledger: %d row(s) LOST (%s); %d lost since start", n, why, total)
+
+
+def _ensure_writer() -> None:
+    """Start the writer thread if it is not running. A failed start is logged; the row stays queued and the next
+    record_async tries again."""
+    global _writer
+    with _state_lock:
+        if _writer is not None and _writer.is_alive():
+            return
+        t = threading.Thread(target=_writer_loop, name="cortados-usage-ledger-writer", daemon=True)
+        try:
+            t.start()
+        except Exception as exc:
+            logger.warning("usage ledger: writer thread did not start (%s: %s); %d row(s) wait on the queue",
+                           type(exc).__name__, str(exc)[:120], _queue.qsize())
+            return
+        _writer = t
+
+
+def record_async(lane: str, model: str, usage: dict | None, *, context: str | None = None,
+                 path: Path | None = None) -> bool:
+    """Queue one turn for the writer thread and return at once; never touches SQLite or a lock, never raises. Returns
+    False when the row was not queued (queue full, or a bad row): it is then counted lost and logged."""
     try:
-        t = threading.Thread(target=record, args=(lane, model, usage), kwargs={"context": context},
-                             name="cortados-usage-ledger", daemon=True)
-        t.start()
+        item = (path or db_path(), _row(lane, model, usage, None), context)
+        _queue.put_nowait(item)
+    except queue.Full:
+        _count_lost(1, f"the ledger queue is full ({QUEUE_MAX} rows waiting)", [(lane, context)] if context else [])
+        return False
     except Exception as exc:
-        logger.warning("usage ledger: worker thread did not start (%s: %s); writing the row for lane %s%s synchronously",
-                       type(exc).__name__, str(exc)[:120], lane, f" ({context})" if context else "")
-        record(lane, model, usage, context=context)
-        return None
-    return t
+        _count_lost(1, f"{type(exc).__name__}: {str(exc)[:120]}", [(lane, context)] if context else [])
+        return False
+    _ensure_writer()
+    return True
+
+
+def _take_batch() -> list[tuple[Path, tuple, str | None]]:
+    global _inflight
+    batch = [_queue.get()]
+    while len(batch) < BATCH_MAX:
+        try:
+            batch.append(_queue.get_nowait())
+        except queue.Empty:
+            break
+    with _state_lock:
+        _inflight += len(batch)
+    return batch
+
+
+def _done(n: int) -> None:
+    global _inflight
+    with _state_lock:
+        _inflight -= n
+    for _ in range(n):
+        _queue.task_done()
+
+
+def _write_batch(p: Path, items: list[tuple[Path, tuple, str | None]]) -> None:
+    """Commit one path's rows, retrying while busy (locked, migrating) for as long as it takes, and a non-busy error
+    NON_BUSY_TRIES times before counting the rows lost."""
+    rows = [it[1] for it in items]
+    contexts = [(it[1][7], it[2]) for it in items if it[2]]
+    wait, tries = _WRITER_BACKOFF_S, 0
+    while True:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _write_rows(p, rows, time.monotonic() + RETRY_S)
+            _succeeded()
+            return
+        except Exception as exc:
+            if not _busy(exc):
+                tries += 1
+                if tries >= NON_BUSY_TRIES:
+                    _failed(exc, len(rows), [], "LOST")
+                    _count_lost(len(rows), f"{type(exc).__name__}: {str(exc)[:120]}", contexts)
+                    return
+            elif wait == _WRITER_BACKOFF_S:         # the first busy retry of this batch: once, not per retry
+                _failed(exc, len(rows), [], "queued, retried until the db is free")
+        time.sleep(wait)
+        wait = min(wait * 2, _WRITER_BACKOFF_MAX_S)
+
+
+def _writer_loop() -> None:
+    while True:
+        batch = _take_batch()
+        try:
+            by_path: dict[Path, list] = {}
+            for it in batch:
+                by_path.setdefault(it[0], []).append(it)
+            for p, items in by_path.items():
+                _write_batch(p, items)
+        except Exception:                           # a bug here must not kill the writer and strand the queue
+            logger.exception("usage ledger writer: unexpected error; %d row(s) counted lost", len(batch))
+            _count_lost(len(batch), "writer error", [])
+        finally:
+            _done(len(batch))
+
+
+def flush(timeout: float) -> bool:
+    """Wait up to `timeout` for every queued row to be committed or counted lost. True when the queue is drained."""
+    until = time.monotonic() + timeout
+    while _queue.unfinished_tasks:
+        if time.monotonic() >= until:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def shutdown(timeout: float | None = None) -> int:
+    """At process exit: give the writer SHUTDOWN_DRAIN_S to commit, then take what is still queued off the queue and
+    count it lost (with the batch in flight), logged in one line. Returns the rows counted lost here."""
+    flush(SHUTDOWN_DRAIN_S if timeout is None else timeout)
+    left = 0
+    while True:
+        try:
+            _queue.get_nowait()
+        except queue.Empty:
+            break
+        _queue.task_done()
+        left += 1
+    with _state_lock:
+        left += _inflight
+    if left:
+        _count_lost(left, "the process exited with rows still queued", [])
+    return left
+
+
+atexit.register(shutdown)
