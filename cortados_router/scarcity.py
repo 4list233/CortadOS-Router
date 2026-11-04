@@ -641,6 +641,11 @@ MAX_DISCOVERY_NOTES = 10        # a short list: enough to name the broken manife
 
 def _codex() -> dict[str, Any]:
     env = _cli_env()
+    # Resolve and freeze the login BEFORE the sampler starts, and run the sampler on exactly that directory: a CODEX_HOME
+    # symlink that moves A -> B mid-probe must not stamp A's usage as B's (Codex review fu1). Metadata only.
+    login = codex_login_identity(env)
+    if login:
+        env = {**env, "CODEX_HOME": login}
     searched: list[str] = []
     notes: list[str] = []
     binary, missing_bin = _codex_binary(env, searched=searched, notes=notes)
@@ -650,7 +655,7 @@ def _codex() -> dict[str, Any]:
         raise CodexNotFound(searched)
     notes = [n[:200] for n in notes[:MAX_DISCOVERY_NOTES]]
     try:
-        return _codex_probe(env, binary, missing_bin, notes)
+        return _codex_probe(env, binary, missing_bin, notes, login=login)
     except Exception as exc:
         # Discovery succeeded but the probe did not: keep which binary ran and what discovery tripped over, so a
         # fallback past a malformed manifest is visible next to the boot or parser failure it may explain.
@@ -661,7 +666,8 @@ def _codex() -> dict[str, Any]:
         raise
 
 
-def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str]) -> dict[str, Any]:
+def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, notes: list[str],
+                 login: str | None = None) -> dict[str, Any]:
     retries: list[dict] = []
     for attempt in range(2):
         diagnostic: dict = {}
@@ -683,10 +689,10 @@ def _codex_probe(env: dict[str, str], binary: str, missing_bin: str | None, note
         # without persisting boot screens, credentials or prompt contents.
         raise RuntimeError(f"Codex /status empty (attempts={1 + len(retries)}): " + ", ".join(f"{k}={v}" for k, v in diagnostic.items()))
     wins = parse_codex_status(text)       # an unreadable screen raises: the sample is then stale, never fresh-and-wrong
-    # `login`: the CODEX_HOME login this sampler's CLI ran on (metadata only), so a reading can be proven to belong to
-    # the login a consumer executes on (provider/floor.py), as Claude readings are.
+    # `login`: the canonical CODEX_HOME this sampler's CLI was started on, frozen by _codex before the launch (metadata
+    # only), so a reading can be proven to belong to the login a consumer executes on (provider/floor.py).
     return {"source": "codex /status (pty)", "windows": wins, "startup_retries": retries, "cli_version": codex_screen.version(text),
-            "login": codex_login_identity(env),
+            "login": login,
             "binary": binary, "discovery_notes": notes,
             **({"configured_binary_missing": missing_bin} if missing_bin else {})}
 

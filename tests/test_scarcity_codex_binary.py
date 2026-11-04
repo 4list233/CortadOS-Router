@@ -270,8 +270,29 @@ class CodexLoginStampTest(unittest.TestCase):
         with mock.patch.object(sc, "tui_capture", return_value="screen"), \
              mock.patch.object(sc, "parse_codex_status", return_value=[]), \
              mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
-            rec = sc._codex_probe({"CODEX_HOME": "/tmp"}, "/bin/codex", None, [])
+            rec = sc._codex_probe({"CODEX_HOME": "/tmp"}, "/bin/codex", None, [], login=os.path.realpath("/tmp"))
         self.assertEqual(rec["login"], os.path.realpath("/tmp"))
+
+    def test_a_symlink_rotated_mid_probe_stamps_the_home_the_sampler_ran_on(self):
+        root = Path(tempfile.mkdtemp(prefix="codex-homes-"))
+        (root / "A").mkdir(); (root / "B").mkdir()
+        link = root / "current"
+        link.symlink_to(root / "A")
+        child_homes = []
+
+        def capture(argv, cmd, pattern, env, **kw):
+            child_homes.append(env.get("CODEX_HOME"))
+            link.unlink(); link.symlink_to(root / "B")           # the home moves while the sampler runs
+            return "screen"
+        with mock.patch.object(sc, "_cli_env", return_value={"CODEX_HOME": str(link), "PATH": "/usr/bin"}), \
+             mock.patch.object(sc, "_codex_binary", return_value=("/bin/codex", None)), \
+             mock.patch.object(sc, "tui_capture", side_effect=capture), \
+             mock.patch.object(sc, "parse_codex_status", return_value=[]), \
+             mock.patch.object(sc.codex_screen, "version", return_value="0.163.0"):
+            rec = sc._codex()
+        a = os.path.realpath(root / "A")
+        self.assertEqual(child_homes, [a])                        # the child ran on the frozen canonical home
+        self.assertEqual(rec["login"], a)                         # and the reading is stamped with exactly that
 
     def test_the_provider_executing_login_matches_a_reading_of_its_own_home(self):
         from cortados_router.provider import floor

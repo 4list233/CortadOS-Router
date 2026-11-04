@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.error
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -856,6 +857,33 @@ class CodexEndpointTests(unittest.TestCase):
         self.assertEqual(events[0]["type"], "message_start")
         self.assertEqual(events[-1]["type"], "message_stop")
         self.assertEqual([e["content_block"]["type"] for e in events if e["type"] == "content_block_start"], ["tool_use"])
+
+
+class CodexHomeBindingTests(unittest.TestCase):
+    """A floor-checked Codex route carries the canonical home it was admitted on; the backend starts on exactly it."""
+
+    def test_the_route_home_reaches_the_codex_factory_and_absent_it_the_registry_home(self):
+        seen = []
+
+        class Fake:
+            def __init__(self, reg, **kw):
+                seen.append(kw.get("codex_home"))
+        reg = Registry(gateway_url="", token=TOKEN, codex_home="/provider/home",
+                       session_factories={"codex-cli": Fake})
+        turn = provider_server.ANTHROPIC.parse_request({"model": "cortados", "messages": [{"role": "user", "content": "hi"}]})
+        route = {"provider": "codex-cli", "model": "gpt-x", "route_id": "r1"}
+        reg.new(turn, keep=False, route=dict(route, codex_home="/canonical/A"))
+        reg.new(turn, keep=False, route=route)
+        self.assertEqual(seen, ["/canonical/A", None])         # None: _codex_session falls back to reg.codex_home
+
+    def test_codex_session_prefers_the_bound_home(self):
+        made = {}
+        with mock.patch.object(provider_server, "CodexSession", side_effect=lambda **kw: made.update(kw)):
+            reg = Registry(gateway_url="", token=TOKEN, codex_home="/provider/home")
+            provider_server._codex_session(reg, codex_home="/canonical/A", model="m")
+            self.assertEqual(made["codex_home"], "/canonical/A")
+            provider_server._codex_session(reg, model="m")
+            self.assertEqual(made["codex_home"], "/provider/home")
 
 
 class CodexSessionUnitTests(unittest.TestCase):

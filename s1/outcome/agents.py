@@ -183,12 +183,26 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
         if secret:
             # The whole trace, outward_calls included: an agent could relay the token through a mock outward call, and
             # that journal reaches runs.jsonl and the judge prompt too (Codex review r5 P3-2).
-            trace = json.loads(json.dumps(trace).replace(secret, "[redacted]"))
+            trace = redact(trace, secret)
         return trace
     finally:
         containment.sweep(claude_scratch)
         shutil.rmtree(claude_scratch, ignore_errors=True)
         shutil.rmtree(journal_dir, ignore_errors=True)
+
+
+def redact(value, secret: str):
+    """`value` with `secret` replaced in every decoded string, keys and values, recursively. Redacting the serialized
+    JSON instead would miss a token containing a quote or backslash, which json.dumps escapes (Codex review fu1)."""
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return value.replace(secret, "[redacted]")
+    if isinstance(value, dict):
+        return {redact(k, secret): redact(v, secret) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(v, secret) for v in value]
+    return value
 
 
 def _quota_refusal(out: str, err: str) -> bool:

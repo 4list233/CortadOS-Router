@@ -632,9 +632,29 @@ class MinLeftFloorTests(unittest.TestCase):
         r = self.pin("sub/gpt-6.1-sol", 5, codex_home="/homes/provider")
         self.assertEqual(r.get("provider"), "codex-cli", r)
         self.assertEqual(self.ledger()[-1]["lane"], "codex")
-        # the continuation proves the same home: a provider started on another home is refused
-        self.assertIsNone(routing.floor_turn(core, r, 5, "/homes/provider"))
+        self.assertEqual(r["codex_home"], "/homes/provider")               # the backend starts on the checked home
+        # a continuation is checked against the session's bound home, whatever the provider's home resolves to now
+        self.assertIsNone(routing.floor_turn(core, r, 5, "/homes/elsewhere"))
+        codex["login"] = "/homes/elsewhere"
         self.assertIn("not sampled from the login", routing.floor_turn(core, r, 5, "/homes/elsewhere"))
+
+    def test_codex_home_symlink_rotation_never_moves_the_checked_identity(self):
+        import os
+        root = Path(tempfile.mkdtemp(prefix="codex-homes-"))
+        (root / "A").mkdir(); (root / "B").mkdir()
+        link = root / "current"
+        link.symlink_to(root / "A")
+        a, b = os.path.realpath(root / "A"), os.path.realpath(root / "B")
+        codex = {"fetched_at": self.now - 60, "failed": False, "login": a, "windows": [self.win(10)]}
+        self.readings([self.win(10)], [self.win(10)], codex=codex)
+        r = self.pin("sub/gpt-6.1-sol", 5, codex_home=str(link))           # admitted on A, through the link
+        self.assertEqual((r.get("provider"), r.get("codex_home")), ("codex-cli", a))
+        link.unlink(); link.symlink_to(root / "B")                         # rotated after admission, before startup
+        self.assertEqual(r["codex_home"], a)                               # the backend still starts on A
+        codex["login"] = b                                                 # the sampler now follows the link to B
+        self.assertIn("not sampled from the login", routing.floor_turn(core, r, 5, str(link)))   # between turns
+        codex["login"] = a
+        self.assertIsNone(routing.floor_turn(core, r, 5, str(link)))
 
     def test_floor_only_tightens_a_spent_account_stays_out(self):
         self.readings([self.win(10)], [self.win(10)])

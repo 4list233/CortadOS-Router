@@ -268,6 +268,15 @@ class RunTests(OutcomeCase):
         self.assertEqual([r for r in store.read("runs") if r.get("result")], [])
         self.assertEqual(store.read("ladders"), [])
 
+    def test_redaction_covers_tokens_json_would_escape(self):
+        for secret in ('pt"ok', "pt\\ok", 'p\\"t'):
+            trace = {"final": f"x{secret}y", "outward_calls": [{"tool": "t", "args": {secret: [f"a {secret}"]}}]}
+            out = agents.redact(trace, secret)
+            self.assertNotIn(secret, json.dumps(out, ensure_ascii=False) + json.dumps(out))
+            self.assertNotIn(json.dumps(secret)[1:-1], json.dumps(out))      # nor its escaped spelling
+            self.assertEqual(out["final"], "x[redacted]y")
+            self.assertEqual(out["outward_calls"][0]["args"], {"[redacted]": ["a [redacted]"]})
+
     def test_provider_mode_redacts_the_provider_token_from_the_trace(self):
         self._provider_mode("claude-opus-5-5 · 60% left", FAKE_PRINT_TOKEN="1")
         relayed = [{"tool": "send_email", "args": {"body": "the token is ptok"}}]   # relayed through a mock outward call

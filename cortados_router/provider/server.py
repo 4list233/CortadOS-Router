@@ -498,10 +498,12 @@ def _claude_session(reg: "Registry", *, account: str | None = None, config_dir: 
                          config_dir=config_dir, **kw)
 
 
-def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None, **kw) -> CodexSession:
+def _codex_session(reg: "Registry", *, account: str | None = None, config_dir: str | None = None,
+                   codex_home: str | None = None, **kw) -> CodexSession:
     # Code mode must not yield to the model before the request's turn budget is spent (codex_isolation.EXEC_YIELD_KEY).
-    return CodexSession(codex_bin=reg.codex_bin, codex_home=reg.codex_home, exec_yield_ms=int(TURN_TIMEOUT_S * 1000),
-                        **kw)   # Codex multi-account is Phase B
+    # `codex_home`: the canonical home a floor-checked route was admitted on (routing._bind_codex); else the provider's.
+    return CodexSession(codex_bin=reg.codex_bin, codex_home=codex_home or reg.codex_home,
+                        exec_yield_ms=int(TURN_TIMEOUT_S * 1000), **kw)   # Codex multi-account is Phase B
 
 
 # Backend per route provider. Each factory takes the registry (for its binary and gateway settings, read at call time
@@ -583,6 +585,8 @@ class Registry:
                 raise UnservedProvider(f"routed to account {route['account']!r} on {route['provider']!r}, "
                                        f"which has no resolvable login (config_dir missing)")
             kw["account"], kw["config_dir"] = route["account"], cfg
+        if route and route.get("codex_home") and factory is self._factories.get("codex-cli"):
+            kw["codex_home"] = route["codex_home"]  # start on exactly the home the floor checked (routing._bind_codex)
         s = factory(self, **kw)
         s.route, s.route_logged, s.system = route, False, turn.system
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
