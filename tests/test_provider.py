@@ -733,6 +733,15 @@ class RoutedHarness(EndpointHarness):
         self.assertEqual(self.status_of(body), 400)
 
 
+class FixedModelFloorTests(EndpointHarness):
+    """A fixed-model endpoint (no router) cannot choose or reserve an account: a floor fails closed on the opening turn."""
+
+    def test_opening_turn_with_a_floor_is_refused_and_without_it_runs(self):
+        body = {"model": "cortados", "messages": [{"role": "user", "content": "hello"}]}
+        self.assertEqual(self.status_of(body, headers={"x-cortados-min-left-pct": "5"}), 429)
+        self.assertEqual(self.status_of(body), 200)
+
+
 class SubscriptionPinEndpointTests(EndpointHarness):
     """sub/ pins through the endpoint: GET /v1/models offers every pinnable model, and a Codex pin opens the codex-cli
     backend with the pinned model (the backend is a recording stand-in over the fake Claude CLI: no vendor CLI runs)."""

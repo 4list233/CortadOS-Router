@@ -39,6 +39,8 @@ CLAUDE_SETTINGS = {"disableAllHooks": True,
 CODEX_TASK_TOOL_FEATURES = ("shell_tool", "unified_exec", "unified_exec_tty")
 MOCK_SERVER = str(Path(__file__).with_name("mock_tools.py"))
 FINAL_TEXT_CHARS = 4000
+# A provider 429 as the Claude CLI reports it ("API Error: 429 ...", or a JSON status 429).
+QUOTA_429_RE = re.compile(r"(API Error:?\s*429|\"status\"\s*:\s*429|rate_limit_error)")
 
 
 def claude_bin() -> str:
@@ -50,7 +52,9 @@ def codex_bin() -> str:
 
 
 def child_env(extra: dict | None = None) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV}
+    # ANTHROPIC_CUSTOM_HEADERS is never inherited: the child gets exactly the loop's own headers (provider_env) or none,
+    # so an ambient header can neither loosen nor confuse the provider's floor and run attribution.
+    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV and k != "ANTHROPIC_CUSTOM_HEADERS"}
     env["PATH"] = f"{Path.home()}/.local/bin:/opt/homebrew/bin:" + env.get("PATH", "")
     env.update(extra or {})
     return env
@@ -96,6 +100,19 @@ def _run(argv, *, cwd, timeout, env, stdin=None) -> tuple[int | None, str, str, 
     return code, out, err, time.time() - t0
 
 
+def provider_env(run_id: str) -> dict:
+    """Provider mode (outcome/provider.py): the Claude CLI's own model calls go to the cortados provider, which serves the
+    `sub/<model>` pin on the account it picks (a Claude or Codex lane). Only the CLI process talks to the provider: Bash
+    and its children stay in Claude Code's sandbox with an EMPTY network allowlist (CLAUDE_SETTINGS), and run_group does
+    not sandbox the CLI process itself, so pointing it at another host widens nothing the agent's tools can reach.
+    ANTHROPIC_API_KEY stays scrubbed (no API billing)."""
+    from outcome import provider
+    url, token = provider.config()
+    return {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_CUSTOM_HEADERS": f"x-cortados-run-id: {run_id}\nx-cortados-reveal: 1\n"
+                                        f"{provider.MIN_LEFT_HEADER}: {provider.MIN_LEFT_HEADER_VALUE}"}
+
+
 def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: list, timeout_s: int) -> dict:
     """The agent carries out `prompt` in `workspace`. Returns a trace summary; never raises for a failed run.
 
@@ -110,16 +127,40 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
     # which TMPDIR does not move: left alone, every live Claude session's scratch is writable from the task (Codex
     # review 2026-10-24). Each run gets a private, short one (a long path makes the CLI fall back to /tmp).
     claude_scratch = tempfile.mkdtemp(prefix="oc-", dir="/tmp")
+    from outcome import provider
+    via = provider.enabled()
     try:
-        if lane == "claude":
-            mcp = {"mcpServers": {"mock": {"command": sys.executable, "args": [MOCK_SERVER, calls, *outward_tools]}}} \
-                if outward_tools else {"mcpServers": {}}
-            argv = [claude_bin(), "-p", "--model", model, "--output-format", "stream-json", "--verbose",
-                    "--tools", CLAUDE_TOOLS, "--permission-mode", "acceptEdits", "--permission-prompts", "none",
-                    *(["--allowedTools", *(f"mcp__mock__{t}" for t in outward_tools)] if outward_tools else []),
-                    "--strict-mcp-config", "--mcp-config", json.dumps(mcp), "--setting-sources", "",
-                    "--settings", json.dumps(CLAUDE_SETTINGS), "--no-session-persistence"]
-            code, out, err, secs = _run(argv, cwd=workspace, timeout=timeout_s, stdin=prompt,
+        if via and lane in ("claude", "codex"):
+            # Every band, Claude or Codex, runs as a Claude Code session against the provider, pinned to the band's model,
+            # so the ladder still tests that exact model while the provider picks the account (claude, claude#b, codex).
+            run_id = f"s1-outcome-run-{os.urandom(6).hex()}"
+            extra = {"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch, **provider_env(run_id)}
+            # The session's first user message is what the provider logs as the request: tag it as outcome traffic.
+            tagged = f"{provider.tag(run_id)}\n(Bookkeeping tag line above; ignore it.)\n\n{prompt}"
+            code, out, err, secs = _run(_claude_argv(f"sub/{model}", calls, outward_tools), cwd=workspace,
+                                        timeout=timeout_s, stdin=tagged, env=child_env(extra))
+            # The provider token is in the child's env (ANTHROPIC_AUTH_TOKEN), so the task's Bash can print it: it is
+            # redacted before any output reaches the trace, runs.jsonl or a judge prompt.
+            secret = extra.get("ANTHROPIC_AUTH_TOKEN") or ""
+            if secret:
+                out, err = out.replace(secret, "[redacted]"), err.replace(secret, "[redacted]")
+            trace = _claude_trace(out)
+            served = trace.get("served_model") or ""
+            trace.update(via="provider", run_id=run_id, requested_model=model,
+                         served_lane=provider.lane_of(served, lane))
+            if served:                                 # the serving lane's headroom feeds provider.admit for later bands
+                provider._record(trace["served_lane"], model, trace.get("left_pct"), served)
+            if (code != 0 or trace.get("is_error")) and _quota_refusal(out, err):
+                # A ladder run refused for quota (usage limit, quota exhausted, provider 429), whether or not an earlier
+                # turn revealed a model: a durable spent hold on the requested lane, so the next admission cannot pass
+                # on an older healthy reading (Codex review r3).
+                # The run never got to show what the model can do: run.py holds the band instead of storing a failure.
+                trace["quota_refused"] = True
+                why = f"ladder run refused for quota: {(err or out)[-200:]}"
+                for held in sorted({lane, trace["served_lane"]}):
+                    provider._record(held, model, None, why, spent=True)
+        elif lane == "claude":
+            code, out, err, secs = _run(_claude_argv(model, calls, outward_tools), cwd=workspace, timeout=timeout_s, stdin=prompt,
                                         env=child_env({"TMPDIR": private_tmp, "CLAUDE_CODE_TMPDIR": claude_scratch}))
             trace = _claude_trace(out)
         elif lane == "codex":
@@ -145,6 +186,23 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
         shutil.rmtree(journal_dir, ignore_errors=True)
 
 
+def _quota_refusal(out: str, err: str) -> bool:
+    """A failed run's output names a quota refusal (only failed runs are checked: a task's own text may say "quota")."""
+    import label
+    tail = f"{out[-4000:]}\n{err[-4000:]}"
+    return bool(label.QUOTA_RE.search(tail) or QUOTA_429_RE.search(tail))
+
+
+def _claude_argv(model: str, calls: str, outward_tools: list) -> list:
+    mcp = {"mcpServers": {"mock": {"command": sys.executable, "args": [MOCK_SERVER, calls, *outward_tools]}}} \
+        if outward_tools else {"mcpServers": {}}
+    return [claude_bin(), "-p", "--model", model, "--output-format", "stream-json", "--verbose",
+            "--tools", CLAUDE_TOOLS, "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+            *(["--allowedTools", *(f"mcp__mock__{t}" for t in outward_tools)] if outward_tools else []),
+            "--strict-mcp-config", "--mcp-config", json.dumps(mcp), "--setting-sources", "",
+            "--settings", json.dumps(CLAUDE_SETTINGS), "--no-session-persistence"]
+
+
 def _read_calls(path: str) -> list:
     if not os.path.exists(path):
         return []
@@ -160,18 +218,27 @@ def _read_calls(path: str) -> list:
 
 def _claude_trace(out: str) -> dict:
     tools, final, usage, turns, is_error = collections.Counter(), "", {}, None, None
+    revealed = None
     for line in out.splitlines():
         try:
             rec = json.loads(line)
         except ValueError:
             continue
         if rec.get("type") == "assistant":
+            m = (rec.get("message") or {}).get("model")
+            if isinstance(m, str) and m:
+                revealed = m                       # last turn wins: the provider's `<model> · <pct>% left` reveal
             for b in (rec.get("message") or {}).get("content") or []:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tools[b.get("name", "?")] += 1
         elif rec.get("type") == "result":
             final, usage, turns, is_error = rec.get("result") or "", rec.get("usage") or {}, rec.get("num_turns"), rec.get("is_error")
-    return {"tools": dict(tools), "final": final[-FINAL_TEXT_CHARS:], "usage": usage, "turns": turns, "is_error": is_error}
+    trace = {"tools": dict(tools), "final": final[-FINAL_TEXT_CHARS:], "usage": usage, "turns": turns, "is_error": is_error}
+    if revealed:
+        import label
+        trace["served_model"] = revealed.split(" · ")[0].strip()
+        trace["left_pct"] = label.left_pct(revealed)
+    return trace
 
 
 def _codex_trace(out: str) -> dict:

@@ -235,6 +235,24 @@ def _exclude_model_header(headers) -> tuple[str | None, bool]:
     return ",".join(items), valid
 
 
+# Request header carrying the client's own quota floor: a percentage of weekly headroom below which the provider must not
+# serve the request on an account (routing.min_left_block). It only tightens; absent, routing is exactly as before.
+MIN_LEFT_HEADER = "x-cortados-min-left-pct"
+_MIN_LEFT_BAD = "cortados: x-cortados-min-left-pct is not a number from 0 to 100"
+
+
+def _min_left_header(headers) -> tuple[float | None, bool]:
+    """(floor, valid) of the x-cortados-min-left-pct header; (None, True) when absent or empty."""
+    raw = (headers.get(MIN_LEFT_HEADER) or "").strip()
+    if not raw:
+        return None, True
+    try:
+        v = float(raw)
+    except ValueError:
+        return None, False
+    return (v, True) if 0.0 <= v <= 100.0 else (None, False)
+
+
 # Request header naming the client's run (the routed-subagents mod runs each subagent as a headless `claude -p`, whose
 # JSON output names only `cortados`): every routed request of the run is recorded under it, and
 # GET /v1/cortados/runs/<id> tells the client which model really ran (to label it, and to keep a later review off it).
@@ -519,6 +537,9 @@ class Registry:
         self.gateway_url, self.token, self.claude_bin, self.model = gateway_url, token, claude_bin, model
         self.codex_bin, self.codex_home = codex_bin, codex_home
         self.router, self.executed, self.log_outcome = router, executed, log_outcome
+        # floor_turn(route, min_left_pct) -> refusal or None: rechecks and reserves a continuation's executing account
+        # under the client's x-cortados-min-left-pct (routing.floor_turn). None: a floor on a continuation fails closed.
+        self.floor_turn: Callable[[dict | None, float], str | None] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
@@ -1215,6 +1236,11 @@ class Handler(BaseHTTPRequestHandler):
                                            "pin another model or use cortados", wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
+            # The client's quota floor is read on EVERY request, new or continuation: a bad value is refused before any
+            # routing or paid turn, and a continuation is rechecked under it below.
+            floor, floor_valid = _min_left_header(self.headers)
+            if not floor_valid:
+                return self._error(400, "invalid_request_error", _MIN_LEFT_BAD, wire)
             turn = wire.parse_request(body)
             server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
             if server_tools and not turn.tools:
@@ -1312,6 +1338,12 @@ class Handler(BaseHTTPRequestHandler):
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
             route = None
+            if floor is not None and not reg.router:
+                # A fixed-model endpoint has no router to choose and reserve an account: a floor cannot be honoured, so
+                # the opening turn fails closed, as its continuations do.
+                return self._error(429, "rate_limit_error",
+                                   "cortados: this endpoint runs a fixed model and cannot check x-cortados-min-left-pct",
+                                   wire, reason="the client's quota floor cannot be checked here")
             if reg.router:
                 # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
                 # the CLI session and its prompt cache.
@@ -1320,7 +1352,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
                 try:
                     route = reg.router(wire.routing_body(body), self._client(),
-                                       **({"exclude_model": exclude} if exclude else {}))
+                                       **({"exclude_model": exclude} if exclude else {}),
+                                       **({"min_left_pct": floor} if floor is not None else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
@@ -1330,6 +1363,9 @@ class Handler(BaseHTTPRequestHandler):
                         # It names the client's own pin or exclusion, request-derived: the record keeps the fixed reason.
                         return self._error(400, "invalid_request_error", f"cortados: {route['error']}", wire,
                                            reason="the pin or exclusion names no model this endpoint can serve")
+                    if route.get("quota_blocked"):      # the client's x-cortados-min-left-pct floor excluded every account
+                        return self._error(429, "rate_limit_error", f"cortados: {route['error']}", wire,
+                                           reason="no account is above the client's quota floor")
                     if route.get("fit_blocked"):        # too large for every account: retrying unchanged cannot succeed
                         return self._error(413, "request_too_large", f"cortados: {route['error']}", wire,
                                            reason="the request is larger than every eligible model's context")
@@ -1347,6 +1383,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
         if isinstance(session, LocalSession):           # a local pin: relayed to its node, never a CLI turn
             return self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+        if not created:
+            # A continuation's paid turn under the client's floor: the session keeps the tightest floor it was ever sent,
+            # and its executing account is rechecked and reserved before this turn (an opening turn was reserved when
+            # the route was chosen).
+            kept = getattr(session, "min_left_pct", None)
+            if kept is None:
+                kept = ((getattr(session, "route", None) or {}).get("min_left_pct"))
+            eff = max(v for v in (kept, floor) if v is not None) if (kept is not None or floor is not None) else None
+            if eff is not None:
+                session.min_left_pct = eff
+                why = (reg.floor_turn(getattr(session, "route", None), eff) if reg.floor_turn is not None else
+                       "this endpoint cannot check x-cortados-min-left-pct on a continuation")
+                if why:
+                    return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
+                                       reason="the conversation's account is below the client's quota floor")
         msg_id = wire.new_message_id()
         # The model this response names: what the client asked for, unless it asked to see the real route (the
         # routed-subagents mod does; the main session does not and keeps seeing `cortados`).
@@ -1654,9 +1705,9 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client, exclude_model=None):
+        def router(body, client, exclude_model=None, min_left_pct=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
-                                  codex_bin=codex_bin, exclude_model=exclude_model)
+                                  codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])
@@ -1667,6 +1718,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
     registry = Registry(gateway_url=f"http://{host}:{port}", token=token, claude_bin=claude_bin, codex_bin=codex_bin,
                         codex_home=codex_home, model=fixed_model, router=router, executed=executed,
                         log_outcome=log_turn_outcome)
+    if not fixed_model:
+        registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():

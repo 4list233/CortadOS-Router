@@ -14,7 +14,7 @@ from pathlib import Path
 
 import common
 from cortados_router.provider import routing as provider_routing
-from outcome import generate, judge, mine, quota, run, store
+from outcome import generate, judge, mine, provider, quota, run, store
 
 core = common.core
 # Two ladders at a time: each is a full agent session on a subscription CLI. One leaves the night's quota unused;
@@ -39,7 +39,8 @@ def step(homes: list[tuple[Path, str | None]], state: dict) -> bool:
         for home, host in homes:
             print(json.dumps({"mine": str(home), **mine.mine(home, host)}), flush=True)
         state["mined_at"] = time.time()
-    print(json.dumps({"quota": quota.status(core)}), flush=True)
+    print(json.dumps({"quota": provider.status() if provider.enabled() else quota.status(core),
+                      "backend": "provider" if provider.enabled() else "local"}), flush=True)
     backlog = len(run.pending())
     if backlog < TASK_BACKLOG and not _stopped():      # every generation call passes quota.admit itself
         counts = generate.generate(limit=TASK_BACKLOG - backlog)

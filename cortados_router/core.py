@@ -565,6 +565,31 @@ def lane_health(*, refresh: bool = True) -> dict[str, dict[str, Any]]:
     return out
 
 
+def subscription_readings() -> dict[str, dict[str, Any]]:
+    """Each lane's cached usage reading, window by window, for a remote door that must apply its OWN stop rule (the S1
+    outcome loop's 95 % rule via the provider's GET /resources): lane_health only carries the pacing-tightest general
+    window and drops freshness, which cannot show a weekly window at 3 % left. Cache-only (refresh=False: never opens a
+    vendor CLI). `fetched_at` is the reading's sample time and `failed` scarcity.reading_freshness's "last try failed"
+    flag, so the caller judges freshness by its own age limit against the snapshot's generated_at."""
+    sc = _scarcity_module()
+    out: dict[str, dict[str, Any]] = {}
+    for lane, v in (sc.current(refresh=False).get("lanes") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        _, failed = sc.reading_freshness(lane, v)
+        out[lane] = {"fetched_at": v.get("fetched_at"), "failed": failed,
+                     "windows": [{k: w.get(k) for k in ("window", "pool", "used_pct", "headroom_pct", "reset_epoch", "stale")}
+                                 for w in (v.get("windows") or []) if isinstance(w, dict)]}
+        if "config_dir" in v:
+            # The login the reading was sampled from (scarcity stamps Claude readings): provider/floor.py requires it to
+            # match the executing account, and holds when it is absent.
+            out[lane]["config_dir"] = v.get("config_dir")
+        if "login" in v:
+            # The login the sampler's CLI effectively ran on: the floor's identity proof (provider/floor.py).
+            out[lane]["login"] = v.get("login")
+    return out
+
+
 def _health_row(s, w, expiring, spent) -> dict[str, Any]:
     w = w or {}
     spent = bool(spent) or (s is not None and s >= 1.0)

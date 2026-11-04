@@ -20,20 +20,10 @@ from outcome import store
 # Forest 2026-10-21: surplus quota may be spent up to 95 % projected. Lower leaves allowance to expire unused;
 # higher risks Forest's own work hitting the cap before the reset.
 STOP_PROJECTED_PCT = 95.0
-# Forest 2026-10-21: never in the last hour before a reset, so a late burst cannot spill the next window's start.
-STOP_HOURS_BEFORE_RESET = 1.0
-# The sampler refreshes every ~20 minutes; routing tolerates 6-hour-old readings, but a loop that spends steadily
-# must not act on a reading older than an hour.
-MAX_READING_AGE_S = 3600
-# Assumed share of a window one admitted call consumes until the next sample shows the real figure. Not yet measured
-# (ENG-10: recorded as an assumption): an agent run on a fixture task is a few hundred thousand tokens at most, about
-# 1 % of a weekly window on the plans seen so far. Too small: workers overshoot 95 % between samples. Too large: the
-# loop stalls until each new sample although room is left.
-ASSUMED_PCT_PER_CALL = 1.0
-# How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
-# timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and the loop overshoots.
-# Longer: finished work is counted twice and the loop pauses early.
-IN_FLIGHT_S = 900 + 1200
+# The stop rules shared with the provider's floor (one canonical copy, with their reasons): never in the last hour
+# before a reset, no reading older than an hour, 1 % assumed per call, in-flight horizon, Fable pool cost 2x.
+from cortados_router.provider.floor import (ASSUMED_PCT_PER_CALL, IN_FLIGHT_S, MAX_READING_AGE_S,  # noqa: E402
+                                            POOL_CAP_SCALE, STOP_HOURS_BEFORE_RESET)
 LANES = ("claude", "codex")
 
 _thread_lock = threading.Lock()
@@ -77,7 +67,12 @@ CLAUDE_SHARED_MODELS = ("haiku", "sonnet", "opus")
 # Claude's are the rolling session and the weekly all-models window; both must be in hand before any Claude call, even
 # before either has been observed on a fresh home (Codex review 2026-10-25: a partial capture with only the session
 # window otherwise admitted a shared model against an unseen, possibly exhausted weekly limit).
-REQUIRED_GENERAL = {"claude": ("5-hour", "week")}
+REQUIRED_GENERAL = {"claude": ("week",)}
+# General windows the vendor has DROPPED from its usage screen (Forest 2026-11-03: Claude accounts now show only the weekly
+# windows, "week (all models)" / "week (Fable)", no 5-hour session panel). Absent, such a window is treated as gone — not
+# as an incomplete capture — so long as every REQUIRED_GENERAL window is in hand; present, it is checked like any other.
+# Without this every Claude call was held forever ("required general window(s) ['5-hour'] ... incomplete capture").
+DROPPABLE_GENERAL = {"claude": ("5-hour",)}
 
 
 def _panel_unavailable(raw: dict) -> bool:
@@ -100,7 +95,6 @@ FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
 # 1 % of the weekly budget (ASSUMED_PCT_PER_CALL); Fable's cap is HALF that budget, so the same call is ~2 % of Fable's
 # cap. Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
 # scale, so pending calls are not under-counted when the panel recovers before they appear in a sample (Codex review).
-POOL_CAP_SCALE = {"fable": 2.0}
 
 
 def _derive_fable_pool(lane: str, owner: str, windows: list[dict]) -> dict | None:
@@ -145,7 +139,9 @@ def _windows(sc, lane: str, model: str | None):
     required = [r for r in REQUIRED_GENERAL.get(lane, ()) if not any(r in (w or "").lower() for w in general_now)]
     if required:
         return None, f"{lane} required general window(s) {required} not in the current reading (incomplete capture)"
-    missing = sorted(set(known_general) - general_now)
+    droppable = DROPPABLE_GENERAL.get(lane, ())
+    missing = sorted(w for w in set(known_general) - general_now
+                     if not any(d in (w or "").lower() for d in droppable))
     if missing:
         return None, f"{lane} general window(s) {missing} missing from the current reading"
     if model:
@@ -164,7 +160,12 @@ def _windows(sc, lane: str, model: str | None):
                 carried = any(w.get("pool") == owner and w.get("stale") for w in windows)
                 return None, (f"{lane} pool {owner} for {model} is "
                               + ("a carried-forward reading" if carried else "missing from the current reading"))
-        if owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model):
+        # Forest 2026-11-03: a model of unknown ownership while the per-model panel is down no longer holds forever (the
+        # panel has been unavailable for days and the loop sat idle). It falls back to the general weekly window(s), which
+        # are its cap if it has no pool of its own, with the 95 % / last-hour stop rule intact. Set
+        # CORTADOS_OUTCOME_STRICT_PANEL=1 to restore the old refusal.
+        if (owner is None and _panel_unavailable(raw) and not _confirmed_shared(lane, model)
+                and os.environ.get("CORTADOS_OUTCOME_STRICT_PANEL") == "1"):
             return None, (f"{lane} per-model panel unavailable ({raw.get('per_model')}); {model}'s ownership is "
                           "unknown and it may have an unobserved cap")
     pool = sc.pool_for(lane, model or "", sorted(pools_now)) if (model and pools_now) else None

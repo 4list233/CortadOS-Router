@@ -13,7 +13,7 @@ import json
 import os
 
 import common
-from outcome import agents, quota, store
+from outcome import agents, provider, quota, store
 
 core = common.core
 # D5: the holdout judge and trace teacher is Claude Fable 5.1. D6: no second teacher counts before it clears the
@@ -72,8 +72,11 @@ def judge_task(spec: dict, runs: list[dict], ask=agents.ask_claude) -> dict:
     return {"verdicts": verdicts, "labels": {q: labels[q] for q in common.QUESTIONS}, "outcome_band": outcome_band(verdicts, runs)}
 
 
-def judge(limit: int = 0, ask=agents.ask_claude, admit=None) -> dict:
-    admit = admit or (lambda lane, model: quota.admit(core, lane, model))
+def judge(limit: int = 0, ask=None, admit=None) -> dict:
+    # Provider backend (default when CORTADOS_PROVIDER_URL is set): the judge runs on the router's pool, pinned sub/<TEACHER>.
+    via = provider.enabled()
+    ask = ask or (provider.ask_claude if via else agents.ask_claude)
+    admit = admit or (provider.admit if via else (lambda lane, model: quota.admit(core, lane, model)))
     specs = {t["id"]: t for t in store.read("tasks")}
     done = store.ids("outcomes", key="task_id")
     runs_by_task: dict[str, list] = {}
@@ -93,6 +96,8 @@ def judge(limit: int = 0, ask=agents.ask_claude, admit=None) -> dict:
         except Exception as exc:                       # retried next pass; the ladder stays unjudged
             counts["failed"] += 1
             print(f"  ! judge {lad['id']}: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+            if isinstance(exc, provider.ProviderError):
+                break                                  # a provider-side failure (401, 503, down) fails every ladder alike
             continue
         store.append("outcomes", {"id": store.digest_id("outcome", lad["id"]), "task_id": lad["id"],
                                   "split": common.split_of(lad["id"]), "teacher": TEACHER, "s1_band": lad["s1_band"],
