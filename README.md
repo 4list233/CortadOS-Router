@@ -476,27 +476,38 @@ no child, so no task runs as the owner on a bot's behalf. The plist holds no sec
 
 **Provider token for route_task: design (a), read from `~/.cortados/provider.env` as data.** The provider's own
 LaunchAgent already keeps its token in that file, so the gateway uses the same file and there is no second copy of the
-secret to keep in step. The plist runs `/usr/bin/python3 -I integrations/bot-gateway/launch.py --provider-env
-~/.cortados/provider.env --python /usr/bin/python3 -- <gateway flags>`. The launcher (stdlib):
+secret to keep in step. Fallback, design (b): if provider.env does not assign the name, `plist` uses a 0600 file the
+owner creates himself, `~/.config/cortados/bot-gateway-provider-token`, holding the token alone. If neither exists,
+`plist` refuses to run. The installer only checks that a line assigns the variable *name* `CORTADOS_PROVIDER_TOKEN`
+(`grep -q`); it never reads the value.
 
-- never executes provider.env. It accepts only blank lines, `#` comments and `[export ]NAME=value`, with the value
-  unquoted, single-quoted or double-quoted, and expands nothing;
-- refuses the whole file, with exit 78 (EX_CONFIG) and a message naming the line number only, for any other line: a
-  `$`, a backtick, a backslash, `set -x`, a trap, a command, `readonly`. It also exits 78 for an empty, missing,
-  duplicated or non-ASCII token, a file that is a symlink or writable by others, or a missing `HOME`,
-  `CORTADOS_HOME` or `CORTADOS_PROVIDER_URL`;
-- takes only `CORTADOS_PROVIDER_TOKEN` and `os.execve`s `python3 -B -m cortados_router.bot_gateway` with an explicit
-  environment. That environment is exactly `HOME`, a fixed `PATH`, `CORTADOS_HOME` and `CORTADOS_PROVIDER_URL` (all
-  from the plist) plus the token. Nothing else is inherited, and the token is never on a command line or printed.
+Both designs run the same stdlib launcher: `/usr/bin/python3 -I integrations/bot-gateway/launch.py
+(--provider-env F | --provider-token-file F) --python /usr/bin/python3 -- <gateway flags>`. It:
 
-The design does not source the file as shell code (review r2). Sourcing would let anything in the file print the
-token (`set -x`, traps), hand it to another program, or put variables into the gateway's environment. The installer
-itself only checks that a line assigns the variable *name* `CORTADOS_PROVIDER_TOKEN` (`grep -q`); it never reads the
-value. Python adds `LC_CTYPE` when it starts in the C locale, and `/usr/bin/python3` (Apple's shim) adds its
-developer-tools variables; neither carries anything from provider.env.
-Fallback, design (b): if provider.env does not assign that name, `plist` uses a 0600 file the owner creates himself,
-`~/.config/cortados/bot-gateway-provider-token`, passed as `CORTADOS_PROVIDER_TOKEN_FILE`. If neither exists, `plist`
-refuses to run. Tests: `tests/test_bot_gateway_install.py` (temp HOME, fake `tailscale` / `launchctl` / `curl`).
+- never executes provider.env. Lines are split on LF only (CRLF accepted), and only spaces and tabs are trimmed. It
+  accepts only blank lines, `#` comments and `[export ]NAME=value`, with the value unquoted, single-quoted or
+  double-quoted, and expands nothing;
+- refuses the whole file, with exit 78 (EX_CONFIG) and a message naming the line number only (never a name or a
+  value), for any other line: a control character (NUL, U+001C, a stray CR), a Unicode line separator, `$`, a
+  backtick, a backslash, `set -x`, a trap, a command, `readonly`, or a repeated name;
+- reads the token file (design b) as the token plus at most one trailing LF or CRLF, nothing else trimmed. The file
+  must be 0600;
+- requires the token to be non-empty printable ASCII with no spaces. A symlink, a file owned by someone else, a file
+  that others may write (or, for the token file, read), or a missing `HOME`, `CORTADOS_HOME` or
+  `CORTADOS_PROVIDER_URL` also exits 78;
+- passes gateway flags only if each is an exact phase-1 spelling (`--host`, `--port`, `--token-file`,
+  `--workspace-root`, `--children-run-as-me`). So no abbreviation of `--enable-start-task` gets through, and the
+  gateway's own argparse no longer expands abbreviations either (`allow_abbrev=False`);
+- `os.execve`s `python3 -B -m cortados_router.bot_gateway` with an explicit environment: exactly `HOME`, a fixed
+  `PATH`, `CORTADOS_HOME` and `CORTADOS_PROVIDER_URL` (all from the plist) plus the token. launchd's own environment
+  (a `PYTHONPATH`, proxies, an ambient `CORTADOS_PROVIDER_TOKEN`) never reaches the gateway. The token is never on a
+  command line and never printed.
+
+The design does not source provider.env as shell code (review r2). Sourcing would let anything in the file print the
+token (`set -x`, traps), hand it to another program, or put variables into the gateway's environment. Python adds
+`LC_CTYPE` when it starts in the C locale, and `/usr/bin/python3` (Apple's shim) adds its developer-tools variables;
+neither carries anything from provider.env. Tests: `tests/test_bot_gateway_install.py` (temp HOME, fake `tailscale` /
+`launchctl` / `curl`, a fake `execve`).
 
 ## The resource pool at a glance
 

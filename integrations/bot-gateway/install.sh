@@ -115,15 +115,13 @@ gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", ip, "--port"
            # starts no child (route_task only; no --enable-start-task), so nothing runs as the owner on a bot's behalf.
            "--children-run-as-me"]
 env = {"CORTADOS_PROVIDER_URL": url, "CORTADOS_HOME": state_dir, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
-if mode == "env":
-    # launch.py reads provider.env as DATA (never executes it), takes only CORTADOS_PROVIDER_TOKEN, and execs the
-    # gateway with exactly HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (both from this plist) and the token.
-    # python3 -I: no PYTHON* variable and no user site directory affect the launcher. Why not sourcing: README.md.
-    args = [py, "-I", os.path.join(repo, "integrations", "bot-gateway", "launch.py"),
-            "--provider-env", provider_env, "--python", py, "--"] + gateway[4:]
-else:
-    env["CORTADOS_PROVIDER_TOKEN_FILE"] = provider_token_file
-    args = gateway
+# Both designs go through launch.py (python3 -I: no PYTHON* variable and no user site directory affect it). It reads
+# the one chosen credential source as data, never executes it, and execs the gateway with exactly HOME, a fixed PATH,
+# CORTADOS_HOME, CORTADOS_PROVIDER_URL (both from this plist) and the token: launchd's own environment (PYTHONPATH,
+# proxies, an ambient CORTADOS_PROVIDER_TOKEN) never reaches the gateway. Why not sourcing provider.env: README.md.
+source = ["--provider-env", provider_env] if mode == "env" else ["--provider-token-file", provider_token_file]
+args = ([py, "-I", os.path.join(repo, "integrations", "bot-gateway", "launch.py")] + source
+        + ["--python", py, "--"] + gateway[4:])
 doc = {"Label": label, "ProgramArguments": args, "EnvironmentVariables": env, "WorkingDirectory": repo,
        "RunAtLoad": True,
        # Restart after a crash, and keep retrying while Tailscale is not up yet (the bind fails until it is).

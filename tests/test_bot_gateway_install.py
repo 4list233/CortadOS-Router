@@ -202,18 +202,47 @@ class PlistTest(InstallerHarness):
                 self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
                 self.assertNotIn(bad.strip(), p.stderr)          # the line number is named, never the content
 
-    def test_design_b_provider_token_file(self):
+    def design_b(self):
         self.provider_env("CORTADOS_PROVIDER_CLAUDE_BIN=claude\n")       # no token variable
         r = self.run_sh("token")
         self.assertEqual(r.returncode, 0, r.stderr)
         ptf = self.token_path().parent / "bot-gateway-provider-token"
-        ptf.write_text(PROVIDER_SECRET)
+        ptf.write_text(PROVIDER_SECRET + "\n")
         os.chmod(ptf, 0o600)
         r = self.run_sh("plist")
-        doc = self.check_common(r, self.token_path().read_text())
-        self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_TOKEN_FILE"], str(ptf))
-        self.assertEqual(doc["ProgramArguments"][0], "/usr/bin/python3")
-        self.gateway_args(" ".join(doc["ProgramArguments"]))
+        return ptf, self.check_common(r, self.token_path().read_text())
+
+    def test_design_b_provider_token_file(self):
+        ptf, doc = self.design_b()
+        args = doc["ProgramArguments"]
+        self.assertEqual(args[:3], ["/usr/bin/python3", "-I", str(REPO / "integrations" / "bot-gateway" / "launch.py")])
+        self.assertEqual(args[3:8], ["--provider-token-file", str(ptf), "--python", "/usr/bin/python3", "--"])
+        self.assertNotIn("CORTADOS_PROVIDER_TOKEN_FILE", doc["EnvironmentVariables"])
+        self.gateway_args(" ".join(args[8:]) + " -m cortados_router.bot_gateway")
+
+    def test_design_b_child_environment_not_contaminated(self):
+        """Fallback mode goes through the same launcher: an inherited PYTHONPATH (with a sitecustomize.py), proxies
+        and an ambient CORTADOS_PROVIDER_TOKEN reach neither the launcher nor the gateway; the file's token wins."""
+        ptf, doc = self.design_b()
+        site = Path(self.tmp.name) / "site"
+        site.mkdir()
+        marker = Path(self.tmp.name) / "sitecustomize-ran"
+        (site / "sitecustomize.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+        p, argv, got = self.run_plist_launcher(doc, {"PYTHONPATH": str(site), "HTTPS_PROXY": "http://proxy.invalid:1",
+                                                     "CORTADOS_PROVIDER_TOKEN": "ambient-token-0123456789",
+                                                     "CORTADOS_PROVIDER_TOKEN_FILE": "/nowhere"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(marker.exists())
+        for k in ("SDKROOT", "CPATH", "LIBRARY_PATH", "MANPATH", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"):
+            got.pop(k, None)                      # added by Apple's /usr/bin/python3 shim and Python itself
+        self.assertEqual(set(got), {"HOME", "PATH", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL",
+                                    "CORTADOS_PROVIDER_TOKEN"})
+        self.assertEqual(got["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)
+        self.assertFalse(any(PROVIDER_SECRET in a for a in argv))
+        self.assertNotIn(PROVIDER_SECRET, p.stdout + p.stderr)
+        dump = (Path(self.tmp.name) / "rec" / "env").read_text()
+        for leaked in ("proxy.invalid", "ambient-token", str(site), "/nowhere"):
+            self.assertNotIn(leaked, dump)
 
     def test_no_provider_token_refused(self):
         self.provider_env("CORTADOS_PROVIDER_CLAUDE_BIN=claude\n")
@@ -305,8 +334,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class LauncherTest(unittest.TestCase):
-    """launch.py directly, with a fake execve: what it would exec, and exit 78 for every config failure."""
+class LauncherBase(unittest.TestCase):
+    """launch.py loaded as a module, with a fake execve recording what it would exec."""
 
     @classmethod
     def setUpClass(cls):
@@ -337,6 +366,10 @@ class LauncherTest(unittest.TestCase):
             rc = self.launch.main(["--provider-env", str(self.envfile), "--python", "/usr/bin/python3", "--", *flags],
                                   environ=self.environ, execve=lambda *a: self.calls.append(a))
         return rc, err.getvalue()
+
+
+class LauncherTest(LauncherBase):
+    """launch.py directly: what it would exec, and exit 78 for every config failure."""
 
     def test_quoted_values(self):
         p = self.launch.parse_env("A=plain-1.2:x@y\nexport B='single # kept'\nC=\"double 'q' #\"\n"
@@ -403,4 +436,124 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(self.run_main()[0], 78)
         self.envfile.unlink()
         self.assertEqual(self.run_main()[0], 78)
+        self.assertEqual(self.calls, [])
+
+
+class LauncherRound3Test(LauncherBase):
+    """Review r3: no names in errors, exact flag allowlist, no Unicode normalization, token file source."""
+
+    def test_errors_name_no_assignment_or_token(self):
+        cases = [f"{PROVIDER_SECRET}=1\n{PROVIDER_SECRET}=2\n",                    # token used as a name, twice
+                 f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nCORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n",
+                 f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n{PROVIDER_SECRET} junk\n",
+                 f"CORTADOS_PROVIDER_TOKEN='{PROVIDER_SECRET}\n",
+                 f"SOMENAME=a;{PROVIDER_SECRET}\n"]
+        for text in cases:
+            with self.subTest(text[:20]):
+                self.write(text)
+                rc, err = self.run_main()
+                self.assertEqual(rc, 78, err)
+                self.assertNotIn(PROVIDER_SECRET, err)
+                self.assertNotIn("SOMENAME", err)
+        name_token = "TokenShapedLikeAName_0123456789abcdef"     # a token that is also a valid assignment name
+        self.write(f"{name_token}=1\n{name_token}=2\n")
+        rc, err = self.run_main()
+        self.assertEqual(rc, 78)
+        self.assertIn("line 2: duplicate assignment", err)
+        self.assertNotIn(name_token, err)
+
+    def test_flag_allowlist_refuses_abbreviations_and_unknowns(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        bad = [("--enable-start-task",), ("--enable-start-t",), ("--enable",), ("--en",), ("--children-run-as-m",),
+               ("--hos", FAKE_IP), ("--host=" + FAKE_IP,), ("--host",), ("--host", "--port"),
+               ("--max-concurrent", "9"), ("-h",), ("positional",)]
+        for flags in bad:
+            with self.subTest(flags):
+                self.calls.clear()
+                rc, err = self.run_main(flags)
+                self.assertEqual(rc, 78, err)
+                self.assertEqual(self.calls, [])
+        rc, err = self.run_main(("--host", FAKE_IP, "--port", "8434", "--token-file", "/t", "--workspace-root", "/w",
+                                 "--children-run-as-me"))
+        self.assertEqual(rc, 0, err)
+
+    def test_gateway_parser_takes_no_abbreviations(self):
+        import contextlib, io
+        from cortados_router import bot_gateway
+        for flag in ("--enable-start-t", "--enable", "--children-run"):
+            with self.subTest(flag), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    bot_gateway.main([flag])
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_unicode_and_control_characters_refused(self):
+        cases = {
+            "U+001C splits nothing": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\x1cOTHER=1\n",
+            "trailing NBSP": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\u00a0\n",
+            "NBSP in quotes": f"CORTADOS_PROVIDER_TOKEN='{PROVIDER_SECRET}\u00a0'\n",
+            "NUL in other value": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\nOTHER=a\x00b\n",
+            "lone CR": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\rOTHER=1\n",
+            "line separator": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\u2028OTHER=1\n",
+            "vertical tab": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\x0b\n",
+            "DEL": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\x7f\n",
+            "C1": f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\x85\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.calls.clear()
+                self.write(text)
+                rc, err = self.run_main()
+                self.assertEqual(rc, 78, err)
+                self.assertEqual(self.calls, [])
+                self.assertNotIn(PROVIDER_SECRET, err)
+
+    def test_crlf_and_space_tab_trim_accepted(self):
+        self.write(f"# c\r\n \tCORTADOS_PROVIDER_TOKEN='{PROVIDER_SECRET}'\t \r\nOTHER=1\r\n")
+        rc, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls[0][2]["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)
+
+    def run_file(self, content, mode=0o600):
+        f = Path(self.tmp.name) / "ptoken"
+        f.write_bytes(content)
+        os.chmod(f, mode)
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.launch.main(["--provider-token-file", str(f), "--", "--host", FAKE_IP],
+                                  environ=dict(self.environ, CORTADOS_PROVIDER_TOKEN="ambient-token-0123456789"),
+                                  execve=lambda *a: self.calls.append(a))
+        return rc, err.getvalue()
+
+    def test_token_file_source(self):
+        for content in (PROVIDER_SECRET.encode(), (PROVIDER_SECRET + "\n").encode(),
+                        (PROVIDER_SECRET + "\r\n").encode()):
+            with self.subTest(content[-2:]):
+                self.calls.clear()
+                rc, err = self.run_file(content)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(self.calls[0][2]["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)   # not the ambient one
+                self.assertFalse(any(PROVIDER_SECRET in a for a in self.calls[0][1]))
+        bad = {"two newlines": ((PROVIDER_SECRET + "\n\n").encode(), 0o600),
+               "leading space": ((" " + PROVIDER_SECRET).encode(), 0o600),
+               "NBSP": ((PROVIDER_SECRET + "\u00a0").encode(), 0o600),
+               "NUL": ((PROVIDER_SECRET + "\x00").encode(), 0o600),
+               "empty": (b"", 0o600),
+               "group readable": (PROVIDER_SECRET.encode(), 0o640),
+               "not UTF-8": (b"\xff\xfe", 0o600)}
+        for name, (content, mode) in bad.items():
+            with self.subTest(name):
+                self.calls.clear()
+                rc, err = self.run_file(content, mode)
+                self.assertEqual(rc, 78, err)
+                self.assertEqual(self.calls, [])
+                self.assertNotIn(PROVIDER_SECRET, err)
+
+    def test_both_or_neither_source_refused(self):
+        import contextlib, io
+        for argv in (["--", "--host", FAKE_IP],
+                     ["--provider-env", "/a", "--provider-token-file", "/b", "--", "--host", FAKE_IP]):
+            with self.subTest(argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.launch.main(argv, environ=self.environ, execve=lambda *a: self.calls.append(a))
         self.assertEqual(self.calls, [])
