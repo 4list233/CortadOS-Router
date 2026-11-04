@@ -23,10 +23,12 @@ STOP_HOURS_BEFORE_RESET = 1.0
 # The sampler refreshes every ~20 minutes; routing tolerates 6-hour-old readings, but a client that spends steadily
 # must not act on a reading older than an hour.
 MAX_READING_AGE_S = 3600
-# Assumed share of a window one admitted call consumes until the next sample shows the real figure. Not yet measured
-# (ENG-10: recorded as an assumption): an agent run on a fixture task is a few hundred thousand tokens at most, about
-# 1 % of a weekly window on the plans seen so far. Too small: spending overshoots the floor between samples. Too large:
-# work stalls until each new sample although room is left.
+# Assumed share of a window one admitted call consumes until the next sample shows the real figure. A "call" is one
+# RUN: a whole conversation (an agent run with all its tool turns, or one judge/generate request), never one turn. Not
+# yet measured (ENG-10: recorded as an assumption): an agent run on a fixture task is a few hundred thousand tokens at
+# most, about 1 % of a weekly window on the plans seen so far. The provider charges it once per conversation (reserve's
+# `conv`, the route_id), so a long ladder run is not refused mid-run by its own turn count (Codex review r4). Too small:
+# spending overshoots the floor between samples. Too large: work stalls until each new sample although room is left.
 ASSUMED_PCT_PER_CALL = 1.0
 # How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
 # timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and spending overshoots.
@@ -52,22 +54,35 @@ def _key(lane: str, w: dict) -> str:
     return f"{lane}|pool|{pool}" if pool != "all" else f"{lane}|win|{w.get('window')}"
 
 
+def executing_login(cand: dict[str, Any]) -> str | None:
+    """The login a Claude CLI for this candidate EXECUTES on: the effective login of the env the bridge starts it with
+    (bridge.claude_env), so an inherited CLAUDE_CONFIG_DIR or OAuth token is never mistaken for the sampler's login.
+    The same expression as server._route_pct_left (the reveal)."""
+    from cortados_router import core
+    from cortados_router.provider.bridge import claude_env
+    # Registry.new applies a config_dir only when the route names an account; otherwise the default login runs.
+    return core.claude_login_identity(claude_env(cand.get("config_dir") if cand.get("account") else None))
+
+
 def _identity_unproven(cand: dict[str, Any], reading: dict[str, Any]) -> str | None:
     """Why the reading cannot be shown to come from the login this candidate executes on, or None.
     Codex: readings carry no identity of the login that sampled them, and the provider executes on its own
     --codex-home login, so a reading for account A could authorize spending on login B (Codex review r3): held.
-    Claude: the reading must name the candidate's config_dir (scarcity stamps it; core._reading_for_other_login's rule,
-    strict here: a reading without the stamp is unproven, not trusted)."""
+    Claude: the reading's `login` stamp (scarcity: the login its sampler CLI effectively ran on) must equal the login
+    this provider's CLI would execute on; config_dir alone is not proof (None == None says nothing about the inherited
+    env). A reading without the stamp, or an executing login that cannot be stated, holds."""
     if str(cand.get("provider") or "").split("#", 1)[0] != "claude-cli":
         return "usage reading is not bound to the login this provider executes on"
-    if "config_dir" not in reading or reading.get("config_dir") != cand.get("config_dir"):
-        return "usage reading was not sampled from this account's login"
+    login = reading.get("login")
+    if not (isinstance(login, str) and login) or login != executing_login(cand):
+        return "usage reading was not sampled from the login this account executes on"
     return None
 
 
 def block(core, cand: dict[str, Any], model: str, floor: float, readings: dict | None = None,
-          reserved: dict | None = None, now: float | None = None) -> tuple[str | None, list]:
-    """(why the account may not take one more turn under `floor`, or None; the reservation keys of that turn)."""
+          reserved: dict | None = None, now: float | None = None, extra: int = 1) -> tuple[str | None, list]:
+    """(why the account may not take one more run under `floor`, or None; the reservation keys of that run).
+    `extra`: runs this check adds on top of `reserved` (0 when the conversation's own run is already counted)."""
     now = time.time() if now is None else now
     reserved = reserved or {}
     lane = cand.get("lane") or ""
@@ -84,7 +99,9 @@ def block(core, cand: dict[str, Any], model: str, floor: float, readings: dict |
         return f"usage reading older than {MAX_READING_AGE_S // 60} min; held under {tag}", []
     weekly = [w for w in reading.get("windows") or [] if str(w.get("window") or "").startswith("week")]
     pools = sorted({w.get("pool") for w in weekly if w.get("pool") not in (None, "all")})
-    pool = core._scarcity_module().pool_for(lane, model or "", pools) if pools else None
+    # pool_for names a model's pool even when no window of it is observed this read (Fable's panel rate-limited), so
+    # the pool's key is always reserved: runs admitted while the panel is missing still count when it comes back.
+    pool = core._scarcity_module().pool_for(lane, model or "", pools)
     relevant = [w for w in weekly if (w.get("pool") or "all") == "all" or (pool and w.get("pool") == pool)]
     current = [w for w in relevant if not w.get("stale")]
     if not [w for w in current if (w.get("pool") or "all") == "all"]:
@@ -101,15 +118,18 @@ def block(core, cand: dict[str, Any], model: str, floor: float, readings: dict |
             return f"{w.get('window')}: no usage figure to check {tag}", []
         per_call = ASSUMED_PCT_PER_CALL * POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
         n = reserved.get(_key(lane, w), 0)
-        if left - (n + 1) * per_call < floor:
-            return (f"{w.get('window')}: {left:.0f}% left, {n} turn(s) outstanding; one more ({per_call:g}%) would pass "
+        if left - (n + extra) * per_call < floor:
+            return (f"{w.get('window')}: {left:.0f}% left, {n} run(s) outstanding; one more ({per_call:g}%) would pass "
                     f"the client's floor {tag}"), []
         reset = w.get("reset_epoch")
         if not isinstance(reset, (int, float)):
             return f"{w.get('window')}: reset time unknown; held under {tag}", []
         if reset - now < STOP_HOURS_BEFORE_RESET * 3600:
             return f"{w.get('window')}: resets within {STOP_HOURS_BEFORE_RESET:g} h; held under {tag}", []
-    return None, sorted(_key(lane, w) for w in current)
+    keys = {_key(lane, w) for w in current}
+    if pool:
+        keys.add(f"{lane}|pool|{pool}")
+    return None, sorted(keys)
 
 
 def _ledger(core):
@@ -150,9 +170,12 @@ def check(core, cand: dict[str, Any], model: str, floor: float, readings: dict |
 
 
 def reserve(core, cand: dict[str, Any], model: str, floor: float, readings: dict | None = None,
-            now: float | None = None) -> str | None:
-    """Check `cand` under `floor`, counting outstanding reservations, and on yes reserve one turn on it: atomically
-    (thread lock + flock on the ledger), durably. Returns why it was refused, or None when reserved."""
+            now: float | None = None, conv: str | None = None) -> str | None:
+    """Check `cand` under `floor`, counting outstanding reservations, and on yes reserve one run on it: atomically
+    (thread lock + flock on the ledger), durably. `conv` (the route_id) makes it idempotent per conversation: while the
+    conversation's own reservation still counts, a continuation is rechecked without being charged again; once it has
+    aged out of the counting window (the usage reading now shows the work), the next turn reserves afresh.
+    Returns why it was refused, or None when reserved."""
     now = time.time() if now is None else now
     readings = core.subscription_readings() if readings is None else readings
     path = _ledger(core)
@@ -162,12 +185,16 @@ def reserve(core, cand: dict[str, Any], model: str, floor: float, readings: dict
         rows = _rows(path)
         reading = (readings or {}).get(cand.get("lane")) or {}
         mine = [r for r in rows if r.get("lane") == cand.get("lane")]
-        why, keys = block(core, cand, model, floor, readings, _reserved(mine, reading), now)
+        since = float(reading.get("fetched_at") or 0) - IN_FLIGHT_S
+        counted = bool(conv) and any(r.get("conv") == conv and float(r.get("ts", 0)) >= since for r in mine)
+        why, keys = block(core, cand, model, floor, readings, _reserved(mine, reading), now, extra=0 if counted else 1)
         if why:
             return why
+        if counted:
+            return None
         horizon = now - MAX_READING_AGE_S - IN_FLIGHT_S     # rows older than this can no longer count
         keep = [r for r in rows if float(r.get("ts", 0)) >= horizon]
-        keep.append({"ts": now, "lane": cand.get("lane"), "model": model, "keys": keys})
+        keep.append({"ts": now, "lane": cand.get("lane"), "model": model, "keys": keys, "conv": conv})
         tmp = path.with_suffix(".tmp")
         tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in keep))
         tmp.replace(path)

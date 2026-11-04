@@ -134,10 +134,16 @@ def _run_claimed(spec: dict, served, admit) -> dict:
         store.append("attempts", {"id": row["id"] + "." + str(time.time()), "run_id": row["id"], "task_id": spec["id"],
                                   "band": rung["band"], "route": rung["route"], "started": time.time()})
         result = run_one(spec, rung)
+        if (result.get("trace") or {}).get("quota_refused"):
+            # Refused for quota (usage limit, provider 429): not the model's outcome. Held like a closed door, so no
+            # runs row (and no ladders row) is written and the band is retried once the lane has room.
+            counts["held"] += 1
+            print(f"  · {spec['id']} {rung['band']} held: run refused for quota", flush=True)
+            continue
         by_route[key] = result
-        served = (result.get("trace") or {}).get("served_model")
-        if served:                                     # provider mode: the model that actually served this band
-            row["served"] = {"model": served, "lane": result["trace"].get("served_lane"),
+        served_model = (result.get("trace") or {}).get("served_model")
+        if served_model:                               # provider mode: the model that actually served this band
+            row["served"] = {"model": served_model, "lane": result["trace"].get("served_lane"),
                              "left_pct": result["trace"].get("left_pct")}
         store.append("runs", {**row, "result": result})
         counts["ran"] += 1

@@ -1310,6 +1310,12 @@ class Handler(BaseHTTPRequestHandler):
         created = session is None                       # this request opens the conversation (or is a one-shot)
         if session is None:
             route = None
+            if floor is not None and not reg.router:
+                # A fixed-model endpoint has no router to choose and reserve an account: a floor cannot be honoured, so
+                # the opening turn fails closed, as its continuations do.
+                return self._error(429, "rate_limit_error",
+                                   "cortados: this endpoint runs a fixed model and cannot check x-cortados-min-left-pct",
+                                   wire, reason="the client's quota floor cannot be checked here")
             if reg.router:
                 # The route is chosen once, for the whole conversation: switching models mid-conversation would lose
                 # the CLI session and its prompt cache.

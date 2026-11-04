@@ -194,6 +194,9 @@ FAKE_CLAUDE = textwrap.dedent("""\
     if os.environ.get("FAKE_REVEAL"):
         msg["model"] = os.environ["FAKE_REVEAL"]
     print(json.dumps({{"type": "assistant", "message": msg}}))
+    if os.environ.get("FAKE_PRINT_TOKEN"):
+        print(json.dumps({{"type": "result", "result": "token=" + os.environ.get("ANTHROPIC_AUTH_TOKEN", ""), "num_turns": 1}}))
+        sys.exit(0)
     if os.environ.get("FAKE_QUOTA"):
         print(json.dumps({{"type": "result", "result": "Usage limit reached; quota exhausted", "is_error": True}}))
         sys.exit(1)
@@ -254,6 +257,23 @@ class RunTests(OutcomeCase):
                          ["x-cortados-min-left-pct", "x-cortados-reveal", "x-cortados-run-id"])
         self.assertIn("x-cortados-min-left-pct: 5", hdrs)
 
+    def test_provider_mode_quota_refused_run_is_held_not_stored(self):
+        self._provider_mode("claude-opus-5-5 · 60% left", FAKE_QUOTA="1")
+        spec = _spec()
+        store.append("scores", {"id": "s", "task_id": spec["id"], "band": "R1", "answers": {}, "engine": "s1", "D": 1})
+        with mock.patch.object(run, "ladder", return_value=[self._rung("R1")]):
+            counts = run.run_task(spec, (), admit=lambda lane, model: (True, "ok"))
+        self.assertEqual((counts["held"], counts["ran"]), (1, 0))
+        self.assertTrue(any(r.get("spent") for r in store.read("provider_headroom")))
+        self.assertEqual([r for r in store.read("runs") if r.get("result")], [])
+        self.assertEqual(store.read("ladders"), [])
+
+    def test_provider_mode_redacts_the_provider_token_from_the_trace(self):
+        self._provider_mode("claude-opus-5-5 · 60% left", FAKE_PRINT_TOKEN="1")
+        result = run.run_one(_spec(), self._rung())
+        self.assertNotIn("ptok", json.dumps(result))
+        self.assertIn("[redacted]", result["trace"]["final"])
+
     def test_provider_mode_reveal_then_429_still_writes_a_spent_hold(self):
         self._provider_mode("claude-opus-5-5 · 60% left", FAKE_QUOTA="1")
         from outcome import provider, store
@@ -296,7 +316,8 @@ class RunTests(OutcomeCase):
         self.assertEqual((t["served_model"], t["served_lane"], t["left_pct"], t["via"]), ("gpt-6-astra", "codex", 48.0, "provider"))
         from outcome import provider
         _set_resources(provider, _readings(codex=48))
-        ok, why = provider.admit("codex"); self.assertTrue(ok); self.assertIn("48%", why)   # /resources decides
+        ok, why = provider.admit("codex"); self.assertFalse(ok)              # Codex is held up front in provider mode
+        self.assertIn("codex readings not bound to a login", why)
 
     def test_provider_mode_low_headroom_on_the_serving_lane_holds_later_bands(self):
         self._provider_mode("claude-opus-5-5 · 2% left")
@@ -306,7 +327,6 @@ class RunTests(OutcomeCase):
         run.run_one(_spec(), self._rung())
         _set_resources(provider, snap)                    # readings sampled BEFORE the 2% reveal: they cannot clear it
         self.assertFalse(provider.admit("claude")[0])
-        self.assertTrue(provider.admit("codex")[0])
         for r in snap["readings"].values():               # a reading sampled after the reveal, above the floor, clears it
             r["fetched_at"] = snap["generated_at"] = _t.time() + 5
         _set_resources(provider, snap)
@@ -850,8 +870,9 @@ class ProviderBackendTests(OutcomeCase):
             class R(io.BytesIO):
                 def __enter__(s): return s
                 def __exit__(s, *a): return False
-            return R(_j.dumps(_readings(claude=61, codex=3)).encode())
-        ok, why = self.p.admit("codex", "gpt-6-astra", urlopen=res); self.assertFalse(ok); self.assertIn("3%", why)   # 95 % rule
+            return R(_j.dumps(_readings(claude=3, claude_b=61)).encode())
+        ok, why = self.p.admit("claude", "claude-opus-5-5", urlopen=res); self.assertTrue(ok)
+        self.assertIn("claude#b 61%", why)                                   # the 3%-left account fails the 95 % rule
         self.assertTrue(got[0][0].endswith("/resources")); self.assertEqual(got[0][1].get("X-api-key"), "tok")
         self.assertTrue(self.p.admit("claude", "claude-fable-5-1", urlopen=res)[0])
         self.assertEqual(len(got), 1)                                      # cached for RESOURCES_TTL_S
@@ -860,7 +881,7 @@ class ProviderBackendTests(OutcomeCase):
         import urllib.error
         def down(req, timeout):
             raise urllib.error.URLError("refused")
-        ok, why = self.p.admit("codex", urlopen=down)
+        ok, why = self.p.admit("claude", urlopen=down)
         self.assertFalse(ok); self.assertIn("/resources unreadable", why)
 
     def test_an_old_provider_without_readings_holds(self):
@@ -906,9 +927,9 @@ class ProviderBackendTests(OutcomeCase):
 
     def test_last_hour_before_a_weekly_reset_holds(self):
         import time as _t
-        snap = _readings(codex=50); snap["readings"]["codex"]["windows"][0]["reset_epoch"] = _t.time() + 1800
+        snap = _readings(claude=50); snap["readings"]["claude"]["windows"][0]["reset_epoch"] = _t.time() + 1800
         _set_resources(self.p, snap)
-        ok, why = self.p.admit("codex"); self.assertFalse(ok); self.assertIn("resets within", why)
+        ok, why = self.p.admit("claude"); self.assertFalse(ok); self.assertIn("resets within", why)
 
     def test_fable_uses_its_own_pool_window_when_present(self):
         import time as _t
@@ -937,7 +958,8 @@ class ProviderBackendTests(OutcomeCase):
             judge.judge(limit=1); gen.generate(limit=1)
         lanes = [(c.args[0], c.args[1]) for c in ask.call_args_list]
         self.assertIn(("claude", judge.TEACHER), lanes)
-        self.assertIn(("codex", gen.GENERATOR), lanes)
+        # Generation runs on Codex, which provider mode holds up front (Codex readings carry no login): no call at all.
+        self.assertNotIn(("codex", gen.GENERATOR), lanes)
 
     def test_judge_and_generate_default_to_the_local_backend_without_a_url(self):
         self._seed_work()

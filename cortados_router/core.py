@@ -584,6 +584,9 @@ def subscription_readings() -> dict[str, dict[str, Any]]:
             # The login the reading was sampled from (scarcity stamps Claude readings): provider/floor.py requires it to
             # match the executing account, and holds when it is absent.
             out[lane]["config_dir"] = v.get("config_dir")
+        if "login" in v:
+            # The login the sampler's CLI effectively ran on: the floor's identity proof (provider/floor.py).
+            out[lane]["login"] = v.get("login")
     return out
 
 

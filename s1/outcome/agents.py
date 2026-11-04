@@ -139,6 +139,11 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
             tagged = f"{provider.tag(run_id)}\n(Bookkeeping tag line above; ignore it.)\n\n{prompt}"
             code, out, err, secs = _run(_claude_argv(f"sub/{model}", calls, outward_tools), cwd=workspace,
                                         timeout=timeout_s, stdin=tagged, env=child_env(extra))
+            # The provider token is in the child's env (ANTHROPIC_AUTH_TOKEN), so the task's Bash can print it: it is
+            # redacted before any output reaches the trace, runs.jsonl or a judge prompt.
+            secret = extra.get("ANTHROPIC_AUTH_TOKEN") or ""
+            if secret:
+                out, err = out.replace(secret, "[redacted]"), err.replace(secret, "[redacted]")
             trace = _claude_trace(out)
             served = trace.get("served_model") or ""
             trace.update(via="provider", run_id=run_id, requested_model=model,
@@ -149,6 +154,8 @@ def run_task(lane: str, model: str, prompt: str, workspace: str, outward_tools: 
                 # A ladder run refused for quota (usage limit, quota exhausted, provider 429), whether or not an earlier
                 # turn revealed a model: a durable spent hold on the requested lane, so the next admission cannot pass
                 # on an older healthy reading (Codex review r3).
+                # The run never got to show what the model can do: run.py holds the band instead of storing a failure.
+                trace["quota_refused"] = True
                 why = f"ladder run refused for quota: {(err or out)[-200:]}"
                 for held in sorted({lane, trace["served_lane"]}):
                     provider._record(held, model, None, why, spent=True)

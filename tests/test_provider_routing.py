@@ -484,8 +484,11 @@ class MinLeftFloorTests(unittest.TestCase):
     def setUp(self):
         import time as _t
         self.now = _t.time()
-        self._keep = (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings)
+        self._keep = (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings,
+                      core.claude_login_identity)
         core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-floor-"))
+        # The effective login of the env the bridge would start the CLI with: its CLAUDE_CONFIG_DIR, else ~/.claude.
+        core.claude_login_identity = lambda env: env.get("CLAUDE_CONFIG_DIR") or "~/.claude"
         core.lane_health = lambda: {}
         core.decide = lambda text, ctx=None: (_ for _ in ()).throw(AssertionError("pin must not be scored"))
         core._vendor_accounts = lambda *a: [
@@ -493,7 +496,8 @@ class MinLeftFloorTests(unittest.TestCase):
             {"lane": "claude#b", "provider": "claude-cli#b", "account": "b", "reserve": True, "config_dir": "/x/b"}]
 
     def tearDown(self):
-        (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings) = self._keep
+        (core.STATE, core.lane_health, core.decide, core._vendor_accounts, core.subscription_readings,
+         core.claude_login_identity) = self._keep
 
     def win(self, used, pool="all", stale=False, reset=None, name=None):
         return {"window": name or ("week" if pool == "all" else f"week ({pool})"), "pool": pool, "used_pct": used,
@@ -501,8 +505,8 @@ class MinLeftFloorTests(unittest.TestCase):
                 "reset_epoch": None if reset == "unknown" else (self.now + 86400 if reset is None else reset)}
 
     def readings(self, a, b, **extra):
-        rd = {"claude": {"fetched_at": self.now - 60, "failed": False, "config_dir": "/x/a", "windows": a},
-              "claude#b": {"fetched_at": self.now - 60, "failed": False, "config_dir": "/x/b", "windows": b}}
+        rd = {"claude": {"fetched_at": self.now - 60, "failed": False, "config_dir": "/x/a", "login": "/x/a", "windows": a},
+              "claude#b": {"fetched_at": self.now - 60, "failed": False, "config_dir": "/x/b", "login": "/x/b", "windows": b}}
         rd.update(extra)
         core.subscription_readings = lambda: rd
         return rd
@@ -562,12 +566,46 @@ class MinLeftFloorTests(unittest.TestCase):
         r = self.pin("sub/opus", 5)
         self.assertTrue(r.get("quota_blocked"))
         self.assertIn("resets within", r["error"]); self.assertIn("reset time unknown", r["error"])
-        rd["claude"] = {"fetched_at": self.now - 4000, "failed": False, "config_dir": "/x/a", "windows": [self.win(10)]}
-        rd["claude#b"] = {"fetched_at": self.now - 60, "failed": False, "config_dir": "/x/other", "windows": [self.win(10)]}
+        rd["claude"] = {"fetched_at": self.now - 4000, "failed": False, "login": "/x/a", "windows": [self.win(10)]}
+        rd["claude#b"] = {"fetched_at": self.now - 60, "failed": False, "login": "/x/other", "windows": [self.win(10)]}
         r = self.pin("sub/opus", 5)
-        self.assertIn("older than", r["error"]); self.assertIn("not sampled from this account", r["error"])
-        del rd["claude#b"]["config_dir"]                                  # no identity stamp: unproven, held
+        self.assertIn("older than", r["error"]); self.assertIn("not sampled from the login", r["error"])
+        del rd["claude#b"]["login"]                                       # no identity stamp: unproven, held
         self.assertTrue(self.pin("sub/opus", 5).get("quota_blocked"))
+
+    def test_default_login_is_proven_by_login_not_config_dir(self):
+        import os
+        from unittest import mock
+        core._vendor_accounts = lambda *a: [
+            {"lane": "claude", "provider": "claude-cli", "account": None, "reserve": False, "config_dir": None}]
+        rd = {"claude": {"fetched_at": self.now - 60, "failed": False, "config_dir": None, "login": "/a",
+                         "windows": [self.win(10)]}}
+        core.subscription_readings = lambda: rd
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/b"}):       # the provider inherited another login
+            r = self.pin("sub/opus", 5)
+            self.assertTrue(r.get("quota_blocked"), r)
+            self.assertIn("not sampled from the login", r["error"])
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/a"}):       # same login as the sampler: admitted
+            self.assertEqual(self.pin("sub/opus", 5).get("provider"), "claude-cli")
+
+    def test_one_conversation_is_charged_once_not_per_turn(self):
+        self.readings([self.win(92)], [self.win(10)])                     # 8% left: three runs fit
+        route = self.pin("sub/opus", 5)
+        for _ in range(20):                                               # 20 continuations of the same run
+            self.assertIsNone(routing.floor_turn(core, route, 5))
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual([self.pin("sub/opus", 5).get("provider") for _ in range(2)], ["claude-cli"] * 2)
+        self.assertNotEqual(self.pin("sub/opus", 5).get("provider"), "claude-cli")   # 4th RUN does not fit
+
+    def test_fable_runs_admitted_without_a_pool_window_count_when_it_returns(self):
+        self.readings([self.win(10)], [self.win(10)])                     # Fable panel missing
+        for _ in range(2):
+            self.assertEqual(self.pin("sub/fable", 5).get("provider"), "claude-cli")
+        self.assertTrue(all("claude|pool|fable" in row["keys"] for row in self.ledger()))
+        self.readings([self.win(10), self.win(90, "fable")], [self.win(10), self.win(99, "fable")])
+        r = self.pin("sub/fable", 5)                                      # 10% - (2 outstanding + 1) x 2% = 4% < 5%
+        self.assertTrue(r.get("quota_blocked"), r)
+        self.assertIn("2 run(s) outstanding", r["error"])
 
     def test_codex_pin_under_a_floor_holds_its_reading_is_not_bound_to_the_login(self):
         self.readings([self.win(10)], [self.win(10)], codex={"fetched_at": self.now - 60, "failed": False,
@@ -581,16 +619,18 @@ class MinLeftFloorTests(unittest.TestCase):
         core.lane_health = lambda: {"claude": {"ok": False, "why": "spent", "pools": {}, "config_dir": "/x/a"}}
         self.assertEqual(self.pin("sub/opus", 0)["provider"], "claude-cli#b")
 
-    def test_continuation_turn_rechecks_and_reserves_the_sessions_account(self):
-        self.readings([self.win(92)], [self.win(10)])
+    def test_continuation_turn_rechecks_the_sessions_account(self):
+        rd = self.readings([self.win(92)], [self.win(10)])
         route = self.pin("sub/opus", 5)
         self.assertEqual(route["provider"], "claude-cli")                  # 8% left: this opening turn reserved
-        self.assertIsNone(routing.floor_turn(core, route, 5))              # 2nd turn: 8 - 2 = 6 >= 5
-        self.assertIsNone(routing.floor_turn(core, route, 5))              # 3rd: 8 - 3 = 5
-        why = routing.floor_turn(core, route, 5)                           # 4th would pass the floor: refused, never
-        self.assertIn("outstanding", why)                                  # moved to the healthy sibling
+        self.assertIsNone(routing.floor_turn(core, route, 5))
+        rd["claude"]["windows"] = [self.win(96)]                           # the account drops below the floor mid-run
+        why = routing.floor_turn(core, route, 5)                           # refused, never moved to the healthy sibling
+        self.assertIn("would pass", why)
         self.assertEqual({row["lane"] for row in self.ledger()}, {"claude"})
         self.assertIn("unknown", routing.floor_turn(core, None, 5))
+        local = {"model": "m", "route": {"chosen": {"lane": "local"}}}
+        self.assertIsNone(routing.floor_turn(core, local, 5))              # a local node has no subscription floor
 
 
 class ExcludeModelTests(unittest.TestCase):

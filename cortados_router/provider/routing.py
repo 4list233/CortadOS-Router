@@ -376,11 +376,13 @@ def choose_pinned(core, body: dict[str, Any], model: str, *, client: str, conver
     if min_left_pct is not None:
         # Reserve the turn on the account that will execute it, atomically with its floor recheck (floor.reserve): a
         # concurrent request may have taken the last room since the filter above, so a refusal here is a quota refusal.
-        why = floor.reserve(core, chosen, model, min_left_pct, readings)
+        route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+        why = floor.reserve(core, chosen, model, min_left_pct, readings, conv=route_id)
         if why:
             return {"router": execution_routing.ROUTER, "quota_blocked": True,
                     "error": f"sub/{model}: {chosen['provider']}: {why}"}
-    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+    if min_left_pct is None:
+        route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
     # skipped has core.resolve's shape ({lane, model, pool, why}): core.footer and s1/outcome/run.py read it as dicts.
     skipped = [{"lane": c["lane"], "model": model, "pool": ch_of[id(c)].get("pool"), "why": why_of(c)} for c in excluded]
     route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
@@ -572,8 +574,10 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
         # chosen account below the client's floor is refused like a spent one, never swapped for an unscored sibling.
         chosen = (r.get("route") or {}).get("chosen") or {}
         lane = chosen.get("lane")
-        why = floor.reserve(core, floor_candidate(r), r.get("model") or "", min_left_pct) if lane else \
-            "routed account unknown; cannot check x-cortados-min-left-pct"
+        if lane and _floor_exempt(lane):
+            return r                               # a local node spends no subscription quota: the floor does not apply
+        why = floor.reserve(core, floor_candidate(r), r.get("model") or "", min_left_pct, conv=r.get("route_id")) \
+            if lane else "routed account unknown; cannot check x-cortados-min-left-pct"
         if why:
             return {"router": execution_routing.ROUTER, "quota_blocked": True,
                     "error": f"routed to {r.get('provider')}/{r.get('model')} on {lane}: {why}"}
@@ -581,10 +585,16 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     return r
 
 
+def _floor_exempt(lane: str) -> bool:
+    """Lanes with no subscription quota (a local node): the client's floor is about subscription headroom only."""
+    return lane.split("#", 1)[0] == "local"
+
+
 def floor_candidate(route: dict[str, Any]) -> dict[str, Any]:
-    """The executing account of a chosen route, in the shape floor.block reads (lane, provider, config_dir)."""
+    """The executing account of a chosen route, in the shape floor.block reads (lane, provider, account, config_dir)."""
     chosen = (route.get("route") or {}).get("chosen") or {}
     return {"lane": chosen.get("lane"), "provider": route.get("provider") or chosen.get("provider"),
+            "account": route.get("account", chosen.get("account")),
             "config_dir": route["config_dir"] if "config_dir" in route else chosen.get("config_dir")}
 
 
@@ -593,4 +603,7 @@ def floor_turn(core, route: dict[str, Any] | None, min_left_pct: float) -> str |
     account this conversation runs on), before the turn is sent to the backend."""
     if not route or not ((route.get("route") or {}).get("chosen") or {}).get("lane"):
         return "the conversation's executing account is unknown; cannot check x-cortados-min-left-pct"
-    return floor.reserve(core, floor_candidate(route), route.get("model") or "", min_left_pct)
+    if _floor_exempt(route["route"]["chosen"]["lane"]):
+        return None
+    return floor.reserve(core, floor_candidate(route), route.get("model") or "", min_left_pct,
+                         conv=route.get("route_id"))
