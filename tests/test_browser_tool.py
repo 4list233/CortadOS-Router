@@ -111,7 +111,8 @@ class BrowserScriptsTests(unittest.TestCase):
         server = json.loads(mcp.read_text())["mcpServers"]["browser"]
         self.assertTrue(os.path.isabs(server["command"]) and os.access(server["command"], os.X_OK), server)
         self.assertEqual(json.loads(mcp.read_text()), {"mcpServers": {"browser": {
-            "command": server["command"], "args": ["-I", str(BROWSER / "mcp_filter.py"), "--task", str(self.task), "--",
+            "command": server["command"], "args": ["-I", str(BROWSER / "mcp_filter.py"), "--task", str(self.task),
+                                           "--browsers-path", f"{self.prefix}/browsers", "--",
                                            str(RUN), str(self.task), str(self.prefix)]}}})
         for f in (cfg, mcp):
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f)

@@ -59,13 +59,17 @@ for line in sys.stdin:
         elif trig == "exit":
             sys.exit(3)                                # the server dies on its own, no answer
         elif trig == "spawn_exit":
-            # Chromium-like grandchild named by the task's browser dir (its --user-data-dir lives under TMPDIR), made an
-            # orphan at once (double fork) so no descendant walk can ever see it; then the server dies abruptly.
+            # Chromium-like grandchild: argv[0] is a headless-shell path under the browsers path and its --user-data-dir
+            # is under the task's TMPDIR (a /bin/sh running sleep, so ps shows exactly that argv), made an orphan at once
+            # (double fork) so no descendant walk can ever see it; then the server dies abruptly.
+            # argv[0] comes from <log>.exe, so a test can point it outside the browsers path (a decoy that must survive).
             prof = open(sys.argv[2] + ".task").read() + "/browser/tmp/playwright_chromiumdev_profile-x"
-            code = ("import subprocess, sys; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', "
-                    "'--user-data-dir=' + sys.argv[1]], start_new_session=True, stdin=subprocess.DEVNULL, "
-                    "stdout=subprocess.DEVNULL); open(sys.argv[2], 'w').write(str(g.pid))")
-            subprocess.run([sys.executable, "-c", code, prof, sys.argv[2] + ".pid"], stdin=subprocess.DEVNULL,
+            exe = open(sys.argv[2] + ".exe").read()
+            code = ("import subprocess, sys; g = subprocess.Popen([sys.argv[3], '-c', 'sleep 120; :', 'x', "
+                    "'--user-data-dir=' + sys.argv[1]], executable='/bin/sh', start_new_session=True, "
+                    "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                    "open(sys.argv[2], 'w').write(str(g.pid))")
+            subprocess.run([sys.executable, "-c", code, prof, sys.argv[2] + ".pid", exe], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL)
             sys.exit(3)
     send({"jsonrpc": "2.0", "id": m["id"], "result": {"ok": meth}})
@@ -87,6 +91,9 @@ class FilterTests(unittest.TestCase):
         self.log = self.tmp / "server.log"
         self.log.write_text("")
         Path(str(self.log) + ".task").write_text(str(self.task))
+        self.browsers = self.tmp / "browsers"
+        self.fake_exe = self.browsers / "chromium_headless_shell-1" / "chrome-mac" / "headless_shell"
+        Path(str(self.log) + ".exe").write_text(str(self.fake_exe))
         self.p = None
 
     def tearDown(self):
@@ -101,7 +108,8 @@ class FilterTests(unittest.TestCase):
     def start(self, *extra, args_file=True):
         af = ["--args-file", str(self.tmp / "args.json")] if args_file else []
         self.p = subprocess.Popen(
-            [sys.executable, "-I", str(FILTER), "--task", str(self.task), *af, *extra, "--",
+            [sys.executable, "-I", str(FILTER), "--task", str(self.task), "--browsers-path", str(self.browsers),
+             *af, *extra, "--",
              sys.executable, "-I", str(self.tmp / "stub.py"), str(self.tmp / "tools"), str(self.log)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.buf = b""
@@ -433,22 +441,88 @@ class FilterTests(unittest.TestCase):
         self._assert_dead(pid)
         self.assertIn(b"closing session: server closed its output", self._stderr_eof())
 
-    def test_owned_by_task_matches_path_component_only(self):
+    def _bare_filter(self, browsers_path=True):
         sys.path.insert(0, str(FILTER.parent))
         try:
             import mcp_filter
         finally:
             sys.path.remove(str(FILTER.parent))
         f = mcp_filter.Filter.__new__(mcp_filter.Filter)
-        f.markers = ["/t/task1/browser"]
+        f.browsers_root = os.path.realpath(self.browsers) if browsers_path else None
+        f.task_tmp = os.path.realpath(self.task / "browser" / "tmp")
+        return mcp_filter, f
+
+    def test_server_exit_spares_non_browser_with_task_profile_flag(self):
+        # P2 round 3: an orphan whose --user-data-dir is the task's, but whose executable is not under the browsers
+        # path, is not the task's browser and survives the close.
+        Path(str(self.log) + ".exe").write_text(str(self.tmp / "elsewhere" / "headless_shell"))
+        self.start()
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "browser_snapshot", "arguments": {"trigger": "spawn_exit"}}})
+        self.p.wait(timeout=20)
+        pid = int(Path(str(self.log) + ".pid").read_text())
+        try:
+            os.kill(pid, 0)   # still alive
+        finally:
+            try:
+                os.killpg(pid, 9)
+            except ProcessLookupError:
+                pass
+
+    def test_owned_by_task_needs_browser_exe_and_profile_token(self):
+        _, f = self._bare_filter()
         uid = os.getuid()
-        rows = [(10, 10, 1, uid, "chrome --user-data-dir=/t/task1/browser/tmp/p"),
-                (11, 10, 10, uid, "x /t/task1/browser"),
-                (12, 12, 1, uid, "chrome --user-data-dir=/t/task1/browserX/tmp"),
-                (13, 13, 1, uid, "chrome --user-data-dir=/t/task10/browser/tmp"),
-                (14, 14, 1, uid + 1, "chrome /t/task1/browser/tmp"),
-                (os.getpid(), 1, 1, uid, "self /t/task1/browser/tmp")]
-        self.assertEqual(f.owned_by_task(rows), {10: 10, 11: 10})
+        B, T = str(self.browsers), str(self.task)
+        prof = f"--user-data-dir={T}/browser/tmp/playwright_chromiumdev_profile-x"
+        shell = f"{B}/chromium_headless_shell-1/chrome-mac/headless_shell"
+        helper = (f"{B}/chromium-1/chrome-mac/Chromium.app/Contents/Frameworks/Chromium Framework.framework/Helpers/"
+                  "Chromium Helper (Renderer).app/Contents/MacOS/Chromium Helper (Renderer)")
+        st = "Tue Nov  3 10:00:00 2026"
+        rows = [(10, 10, 1, uid, st, f"{shell} --headless {prof}"),                                  # yes
+                (11, 10, 10, uid, st, f"{helper} --type=renderer {prof}"),                           # yes (helper)
+                (20, 20, 1, uid, st, f"/bin/zsh -c ls {T}/browser/tmp/p {prof}"),                    # a shell
+                (21, 21, 1, uid, st, f"{shell} --user-data-dir=/x https://e.test{T}/browser/tmp/p"),  # URL only
+                (22, 22, 1, uid, st, f"{shell} --app=https://e.test/?{prof}"),                       # flag in a URL
+                (23, 23, 1, uid, st, f"{shell} --user-data-dir=/backup{T}/browser/tmp/p"),           # leading path
+                (24, 24, 1, uid, st, f"{self.tmp}/elsewhere/headless_shell {prof}"),                 # not under B
+                (25, 25, 1, uid, st, f"{B}/node-1/bin/node {prof}"),                                 # not a browser
+                (26, 26, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmpX/p"),                 # sibling dir
+                (27, 27, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmp/../../../etc"),       # traversal
+                (28, 28, 1, uid, st, f"{shell} --user-data-dir={T}/browser/tmp"),                    # tmp itself
+                (29, 29, 1, uid, st, f"/backup{shell} {prof}"),                                      # exe collision
+                (30, 30, 1, uid + 1, st, f"{shell} {prof}"),                                         # other user
+                (os.getpid(), 1, 1, uid, st, f"{shell} {prof}")]                                     # self
+        self.assertEqual(f.owned_by_task(rows), {10: (10, st), 11: (10, st)})
+        _, off = self._bare_filter(browsers_path=False)
+        self.assertEqual(off.owned_by_task(rows), {})   # no --browsers-path: nothing is owned by command line
+
+    def test_recycled_pid_not_signalled(self):
+        # P2 round 3: a recorded pid whose start time changed belongs to another process now; neither it nor the
+        # group it leads is signalled. Same for an owned-by-command-line pid that changed between ps and kill, and for
+        # the server's group once the server is reaped with no member left.
+        m, f = self._bare_filter()
+        old, new = "Tue Nov  3 10:00:00 2026", "Tue Nov  3 11:00:00 2026"
+        f.state_lock = threading.Lock()
+        f.known_tree = {500: old, 501: old}
+
+        class Proc:
+            pid = 400
+            def poll(self): return 0
+            def wait(self, timeout=None): return 0
+        f.proc = Proc()
+        f.descendants = lambda: {}
+        f._ps_full = lambda: [(500, 500, 1, os.getuid(), new, "x"), (501, 777, 1, os.getuid(), old, "y")]
+        f._start_of = lambda pid: {500: new, 501: old, 600: new}.get(pid)
+        f.owned_by_task = lambda rows=None: {600: (600, old)}
+        sent = []
+        orig = (m.os.kill, m.os.killpg)
+        m.os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
+        m.os.killpg = lambda pid, sig: sent.append(("killpg", pid, sig))
+        try:
+            f.kill_tree()
+        finally:
+            m.os.kill, m.os.killpg = orig
+        self.assertEqual(sent, [("kill", 501, 9)])
 
     def test_sigterm_while_main_thread_holds_state_lock(self):
         # P2-2: the signal lands while the main thread holds state_lock; the handler must not take it.

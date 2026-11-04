@@ -1,6 +1,7 @@
 """Stdio allowlist filter between `claude` and the pinned playwright-mcp (docs/BROWSER-TOOL.md, ticket B1b).
 
-    python3 -I mcp_filter.py --task <task_dir> [--grant browser_js] [--grant browser_upload] [--max-pages N]
+    python3 -I mcp_filter.py --task <task_dir> [--browsers-path <prefix>/browsers] [--grant browser_js]
+        [--grant browser_upload] [--max-pages N]
         [--tools-file F] [--args-file F] [--client-line-max N] [--server-line-max N] -- <server command...>          (normally: run-mcp.sh <task_dir> <prefix>)
 
 The filter starts the server as a child over pipes and is the only thing Claude Code talks to. It is the server-side
@@ -19,6 +20,7 @@ Stdlib only. Refusals are JSON-RPC errors with fixed reason text; nothing from a
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -68,6 +70,13 @@ SERVER_LINE_MAX = 64 << 20
 EXIT_GRACE_S = 5
 # Absolute, so a PATH entry cannot substitute the process lister the kill walk trusts.
 PS = "/bin/ps"
+# ps runs in the C locale so `lstart` is always five whitespace-separated fields ("Tue Nov  3 20:12:42 2026").
+PS_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+# Executable names of the browsers Playwright installs under PLAYWRIGHT_BROWSERS_PATH (Chromium, Chrome for Testing, the
+# headless shell, old and new layouts) and their macOS helper apps ("Chromium Helper (Renderer)"). Ownership by command
+# line accepts only these, so a shell or any other program whose argv mentions the task dir is never killed.
+BROWSER_EXE = re.compile(r"(headless_shell|chrome-headless-shell|chrome|Chromium|Google Chrome for Testing)"
+                         r"( Helper( \([A-Za-z ]+\))?)?\Z")
 # The filter's own request ids (re-list after list_changed) carry this prefix; client ids with it are refused so the
 # two can never collide.
 OWN_ID_PREFIX = "cortados-filter-"
@@ -144,7 +153,7 @@ def url_ok(url):
 
 class Filter:
     def __init__(self, server_cmd, task_dir, allowed, max_pages, args=None, out=None,
-                 client_line_max=CLIENT_LINE_MAX, server_line_max=SERVER_LINE_MAX):
+                 client_line_max=CLIENT_LINE_MAX, server_line_max=SERVER_LINE_MAX, browsers_path=None):
         self.allowed = allowed
         self.args = args if args is not None else pinned_args(allowed | NEVER | DEFAULT_OFF)
         self.client_line_max = client_line_max
@@ -159,12 +168,16 @@ class Filter:
         self.pending = {}          # forwarded client request id (json key) -> method
         self.own_seq = 0
         self.closer = None         # ident of the thread running close(); set once
-        self.known_tree = set()    # descendants seen while running (poll) or at stdin EOF, for kill_tree
+        # {pid: lstart} of descendants seen while running (poll) or at stdin EOF, for kill_tree. The start time is kept
+        # with the pid and re-checked before every signal, so a pid recycled after the process exited is never hit.
+        self.known_tree = {}
         # Ownership that survives reparenting: run-mcp.sh points TMPDIR at <task>/browser/tmp and --isolated puts
-        # Chromium's --user-data-dir under it, so every browser process carries this task's unique browser dir in its
-        # command line. Both spellings, since TMPDIR is built from the --task string (which may not be the realpath).
-        self.markers = sorted({os.path.join(os.path.abspath(task_dir), "browser"),
-                               os.path.join(os.path.realpath(task_dir), "browser")})
+        # Chromium's --user-data-dir under it. A process is this task's browser only if its executable is a Playwright
+        # browser under the pinned PLAYWRIGHT_BROWSERS_PATH (passed as --browsers-path, the value run-mcp.sh sets) AND it
+        # has a --user-data-dir= argument resolving inside <task>/browser/tmp. Without --browsers-path the match is off
+        # (nothing is killed by command line): guessing the install location could only widen what gets killed.
+        self.browsers_root = os.path.realpath(browsers_path) if browsers_path else None
+        self.task_tmp = os.path.realpath(os.path.join(task_dir, "browser", "tmp"))
         # Self-pipe for SIGTERM/SIGHUP: the handler only writes a byte (no locks); a coordinator thread runs close().
         self.sig_r, self.sig_w = os.pipe()
         os.set_blocking(self.sig_w, False)
@@ -205,58 +218,89 @@ class Filter:
 
     @staticmethod
     def _ps_full():
-        """[(pid, pgid, ppid, uid, command)] of every process; [] if ps fails (reported, the group kill still ran).
-        -ww: unlimited width, so a long Chromium command line is never truncated before the task's browser dir."""
+        """[(pid, pgid, ppid, uid, lstart, command)] of every process; [] if ps fails (reported, the group kill still
+        ran). -ww: unlimited width, so a long Chromium command line is never truncated before its --user-data-dir."""
         try:
-            out = subprocess.run([PS, "-ww", "-axo", "pid=,pgid=,ppid=,uid=,command="], capture_output=True,
-                                 text=True, errors="replace", timeout=5).stdout
+            out = subprocess.run([PS, "-ww", "-axo", "pid=,pgid=,ppid=,uid=,lstart=,command="], capture_output=True,
+                                 text=True, errors="replace", timeout=5, env=PS_ENV).stdout
         except (OSError, subprocess.SubprocessError) as e:
             sys.stderr.write(f"mcp_filter: ps failed, descendants not walked: {e}\n")
             return []
         rows = []
         for line in out.splitlines():
-            parts = line.split(None, 4)
-            if len(parts) >= 4 and all(p.isdigit() for p in parts[:4]):
-                rows.append((*(int(p) for p in parts[:4]), parts[4] if len(parts) == 5 else ""))
+            parts = line.split(None, 9)
+            if len(parts) >= 9 and all(p.isdigit() for p in parts[:4]):
+                rows.append((*(int(p) for p in parts[:4]), " ".join(parts[4:9]), parts[9] if len(parts) == 10 else ""))
         return rows
 
-    def _ps(self):
-        """[(pid, pgid, ppid)] of every process."""
-        return [r[:3] for r in self._ps_full()]
+    @staticmethod
+    def _start_of(pid):
+        """lstart of pid now, or None if it is gone (or ps fails: then nothing is signalled)."""
+        try:
+            out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                 errors="replace", timeout=5, env=PS_ENV).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"mcp_filter: ps failed, pid {pid} not signalled: {e}\n")
+            return None
+        return " ".join(out.split()) or None
+
+    def _signal(self, pid, start, sig, group):
+        """Send sig to pid (or the group it leads) only if pid still has the start time it was recorded with: a pid
+        reused by an unrelated process since the sample is skipped. The ps-to-kill window left is one ps call."""
+        if start is None or self._start_of(pid) != start:
+            return False
+        try:
+            if group:
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return False  # exited since the check (EPERM: a zombie-only group on macOS)
+        return True
+
+    def is_task_browser(self, cmd):
+        """True if cmd (a ps command line) is a Playwright browser under the pinned browsers path running with a
+        --user-data-dir inside <task>/browser/tmp. Tokens, not substrings: the executable is everything before the first
+        " -" (Chromium's argv[0] may contain spaces, its flags never start without "--"); the profile flag must be one
+        whole token. A path with spaces in it does not match (fails safe: nothing is killed by command line)."""
+        if self.browsers_root is None:
+            return False
+        exe, sep, rest = cmd.partition(" -")
+        if not os.path.isabs(exe) or not BROWSER_EXE.match(os.path.basename(exe)):
+            return False
+        if not os.path.realpath(exe).startswith(self.browsers_root + os.sep):
+            return False
+        for tok in ("-" + rest).split() if sep else ():
+            if tok.startswith("--user-data-dir="):
+                d = tok[len("--user-data-dir="):]
+                if os.path.isabs(d) and os.path.realpath(d).startswith(self.task_tmp + os.sep):
+                    return True
+        return False
 
     def owned_by_task(self, rows=None):
-        """{pid: pgid} of this user's processes whose command line names this task's browser dir (a path component
-        boundary, so task1 never matches task10). Never the filter itself or its parent (the child's claude), whatever
-        their argv says. A child shell command that names <task>/browser at close time is killed too: the session is
-        ending and that dir is the browser's."""
+        """{pid: (pgid, lstart)} of this user's processes that are this task's browser (is_task_browser). Never the
+        filter itself or its parent (the child's claude), whatever their argv says."""
         me, parent, uid = os.getpid(), os.getppid(), os.getuid()
         found = {}
-        for pid, pgid, _, puid, cmd in (self._ps_full() if rows is None else rows):
+        for pid, pgid, _, puid, start, cmd in (self._ps_full() if rows is None else rows):
             if pid in (me, parent) or puid != uid:
                 continue
-            for m in self.markers:
-                i = cmd.find(m)
-                while i != -1:
-                    end = i + len(m)
-                    if end == len(cmd) or cmd[end] in "/ ":
-                        found[pid] = pgid
-                        break
-                    i = cmd.find(m, i + 1)
-                if pid in found:
-                    break
+            if self.is_task_browser(cmd):
+                found[pid] = (pgid, start)
         return found
 
     def descendants(self):
-        """PIDs below the server process (Chromium included: its group differs, its parent chain does not)."""
-        rows = self._ps()
-        kids = {}
-        for pid, _, ppid in rows:
+        """{pid: lstart} below the server process (Chromium included: its group differs, its parent chain does not)."""
+        rows = self._ps_full()
+        kids, starts = {}, {}
+        for pid, _, ppid, _, start, _ in rows:
             kids.setdefault(ppid, []).append(pid)
-        found, todo = set(), [self.proc.pid]
+            starts[pid] = start
+        found, todo = {}, [self.proc.pid]
         while todo:
             for c in kids.get(todo.pop(), []):
                 if c not in found:
-                    found.add(c)
+                    found[c] = starts[c]
                     todo.append(c)
         return found
 
@@ -266,33 +310,20 @@ class Filter:
         once node is gone its children are reparented and unreachable; the periodic poll (known_tree) and the
         command-line match cover a server that already exited on its own before close()."""
         with self.state_lock:
-            tree = set(self.known_tree)
-        tree |= self.descendants()
-        try:
-            os.killpg(self.proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            # Gone, or (macOS) EPERM for a group left with only the unreaped server zombie: nothing to signal there;
-            # descendants are handled below.
-            pass
+            tree = dict(self.known_tree)
+        tree.update(self.descendants())
+        self._kill_server_group(signal.SIGTERM)
         try:
             self.proc.wait(timeout=EXIT_GRACE_S)
         except subprocess.TimeoutExpired:
             sys.stderr.write("mcp_filter: server ignored SIGTERM; killing\n")
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass  # exited on SIGTERM (EPERM as above)
-        alive = {pid: pgid for pid, pgid, _ in self._ps()}
-        for pid in tree:
-            if pid not in alive:
-                continue
-            try:
-                if alive[pid] == pid:
-                    os.killpg(pid, signal.SIGKILL)   # a detached leader (Chromium): its renderers share its group
-                else:
-                    os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass  # exited between the ps and the kill (EPERM: a zombie-only group on macOS, or a reused pid)
+        self._kill_server_group(signal.SIGKILL)
+        alive = {r[0]: r[1] for r in self._ps_full()}
+        for pid, start in tree.items():
+            if pid in alive:
+                # A detached leader (Chromium) is killed with its group: its renderers share it. _signal re-checks the
+                # recorded start time, so a recycled pid (and the group it may lead) is skipped.
+                self._signal(pid, start, signal.SIGKILL, group=alive[pid] == pid)
         # Ownership by command line survives reparenting. Repeated (bounded) because a dying browser can still be
         # forking helpers between one ps and the kill.
         me_pgid = os.getpgid(0)
@@ -300,22 +331,30 @@ class Filter:
             owned = self.owned_by_task()
             if not owned:
                 break
-            for pid, pgid in owned.items():
-                try:
-                    if pgid == pid and pgid != me_pgid:
-                        os.killpg(pid, signal.SIGKILL)
-                    else:
-                        os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass  # exited between the ps and the kill (or not ours after all: never retried as root)
+            for pid, (pgid, start) in owned.items():
+                self._signal(pid, start, signal.SIGKILL, group=pgid == pid and pgid != me_pgid)
             time.sleep(0.1)
+
+    def _kill_server_group(self, sig):
+        """Signal the server's group. Before the server is reaped its pid cannot be reused, so the group is ours. After
+        it is reaped the group id is still ours only while another member is alive (POSIX never hands out a pid that is
+        a live group's id); with no member left, the pid may now belong to an unrelated process: skipped."""
+        if self.proc.poll() is not None:
+            if not any(pgid == self.proc.pid and pid != self.proc.pid for pid, pgid, *_ in self._ps_full()):
+                return
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # Gone, or (macOS) EPERM for a group left with only the unreaped server zombie: nothing to signal there;
+            # descendants are handled by the caller.
+            pass
 
     def poll_tree(self):
         """Record the server's descendants every TREE_POLL_S while it runs (see TREE_POLL_S)."""
         while self.closer is None and self.proc.poll() is None:
             tree = self.descendants()
             with self.state_lock:
-                self.known_tree |= tree
+                self.known_tree.update(tree)
             time.sleep(TREE_POLL_S)
 
     def on_signal(self, signum, frame):
@@ -520,7 +559,7 @@ class Filter:
         # Stored, not passed: the server loop may be the one that closes (on the server's EOF).
         tree = self.descendants()
         with self.state_lock:
-            self.known_tree |= tree
+            self.known_tree.update(tree)
         try:
             self.proc.stdin.close()
         except OSError as e:
@@ -541,6 +580,9 @@ def _no_constant(name):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="mcp_filter.py")
     p.add_argument("--task", required=True)
+    # The PLAYWRIGHT_BROWSERS_PATH run-mcp.sh sets (<prefix>/browsers), written by install.sh config: only browser
+    # executables under it can be killed by command-line ownership (see Filter.is_task_browser).
+    p.add_argument("--browsers-path")
     p.add_argument("--grant", action="append", default=[], choices=sorted(GRANTS))
     p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
     p.add_argument("--tools-file", default=TOOLS_FILE)
@@ -558,7 +600,7 @@ def main(argv=None):
         p.error("line caps must be >= 1")
     pinned = pinned_tools(a.tools_file)
     Filter(cmd, a.task, allowed_tools(pinned, a.grant), a.max_pages, args=pinned_args(pinned, a.args_file),
-           client_line_max=a.client_line_max, server_line_max=a.server_line_max).run()
+           client_line_max=a.client_line_max, server_line_max=a.server_line_max, browsers_path=a.browsers_path).run()
 
 
 if __name__ == "__main__":

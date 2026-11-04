@@ -52,7 +52,10 @@ filt = os.path.join(os.path.dirname(wrapper), "mcp_filter.py")
 # The interpreter is recorded as an absolute path (the interpreter running this writer), so the PATH claude runs with cannot swap the
 # python that runs the filter.
 write(f"{task}/browser-mcp.json", {"mcpServers": {"browser": {"command": sys.executable,
-    "args": ["-I", filt, "--task", task, "--", wrapper, task, prefix]}}})
+    # --browsers-path: the PLAYWRIGHT_BROWSERS_PATH run-mcp.sh sets; the filter kills by command line only browser
+    # executables under it.
+    "args": ["-I", filt, "--task", task, "--browsers-path", os.path.join(prefix, "browsers"), "--",
+             wrapper, task, prefix]}}})
 print(f"{task}/browser-mcp.json")
 PY
 )"

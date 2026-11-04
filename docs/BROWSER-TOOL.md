@@ -79,7 +79,8 @@ install command); there is no boundary-less config. It writes two files, both 06
 the child gets `--mcp-config <task_dir>/browser-mcp.json`:
 ```json
 {"mcpServers": {"browser": {"command": "<absolute python3>", "args": ["-I", "<repo>/integrations/browser/mcp_filter.py",
-  "--task", "<task_dir>", "--", "<repo>/integrations/browser/run-mcp.sh", "<task_dir>", "<prefix>"]}}}
+  "--task", "<task_dir>", "--browsers-path", "<prefix>/browsers", "--", "<repo>/integrations/browser/run-mcp.sh",
+  "<task_dir>", "<prefix>"]}}}
 ```
 `<task_dir>/browser/config.json` (Playwright config; only what has no safe CLI flag, plus the proxy):
 ```json
@@ -142,8 +143,14 @@ the installed server's list differs, so a version bump is a reviewed diff, never
    - closing (bad input, stdin EOF, SIGTERM/SIGHUP) sends SIGTERM to the server's group, waits `EXIT_GRACE_S`, sends
      SIGKILL, then kills every surviving descendant found by walking `ps` from the server pid (Playwright launches
      Chromium detached, in its own group), every descendant recorded by a walk repeated every 2 s while running, and
-     every process of this user whose command line names `<task>/browser` (TMPDIR and so Chromium's
-     `--user-data-dir` live there), which still finds a browser reparented after the server exited on its own.
+     every process of this user that is this task's browser: its executable is a Playwright Chromium / Chrome for
+     Testing / headless-shell binary under `--browsers-path` (the `PLAYWRIGHT_BROWSERS_PATH` run-mcp.sh sets, written by
+     `install.sh config`) and it has a whole `--user-data-dir=<path>` argument whose realpath is inside
+     `<task>/browser/tmp` (TMPDIR, so `--isolated` puts the profile there). That still finds a browser reparented
+     after the server exited on its own, and never a shell or other program that merely mentions the task dir.
+     Recorded pids carry their `ps` start time (`lstart`), re-checked right before every signal, so a pid recycled by
+     an unrelated process is skipped; the server's own group is signalled after it is reaped only while another
+     member of it is still alive.
      SIGTERM/SIGHUP handlers only write a byte to a self-pipe; a coordinator thread runs the close, so a signal
      landing while the main thread holds the filter's state lock cannot deadlock;
    - server->client requests (`roots/list`, `sampling/*`, `elicitation/*`, any other) are answered by the filter with a
