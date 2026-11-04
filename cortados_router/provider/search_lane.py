@@ -308,6 +308,16 @@ class Login:
     cannot be tied to one fails in login() before launch (charging it to `claude` would be a guess)."""
     config_dir: str | None
     ledger_lane: str
+    account: str | None = None                  # the accounts.json id the login belongs to (None: the default login)
+
+    def floor_candidate(self) -> dict[str, Any]:
+        """This login as the executing account floor.reserve checks (routing.floor_candidate's shape). The CLI runs on
+        bridge.claude_env(config_dir) whether or not an account id is known, and floor.executing_login applies the
+        config_dir only for a named account, so a config_dir always comes with one."""
+        account = self.account or (self.ledger_lane if self.config_dir else None)
+        suffix = self.ledger_lane.partition("#")[2]
+        return {"lane": self.ledger_lane, "provider": "claude-cli" + (f"#{suffix}" if suffix else ""),
+                "account": account, "config_dir": self.config_dir}
 
 
 def login() -> Login:
@@ -337,10 +347,10 @@ def login() -> Login:
         lane = row.get("lane")
         if not lane:                                # same rule as below: never spend quota no ledger row can record
             raise SearchFailed("no_claude_lane", f"account {account!r} has no lane in tables/accounts.json")
-        return Login(cfg, lane)
+        return Login(cfg, lane, row.get("account") or account)
     first = accounts[0]
     if first.get("config_dir"):
-        return Login(first["config_dir"], first.get("lane") or "claude")
+        return Login(first["config_dir"], first.get("lane") or "claude", first.get("account"))
     inherited = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     if inherited:
         # A search spends quota; one that could not be charged to any lane is refused before launch, not run

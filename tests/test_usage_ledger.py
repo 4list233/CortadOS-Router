@@ -328,6 +328,90 @@ class LedgerWrite(unittest.TestCase):
             c.close()
             self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 9}, path=db))
 
+    def test_rows_written_while_a_long_background_build_holds_the_writer_lock_land_exactly_once(self):
+        # Review r11: the background CREATE INDEX holds SQLite's one writer lock longer than RETRY_S, on a populated
+        # ledger. Writes in that window cannot reach the db by their deadline: they are spooled, and the end of the
+        # migration replays them. Every row lands exactly once.
+        import threading as th
+        real_build = usage_ledger._build_index
+        building, release = th.Event(), th.Event()
+
+        def build(c):
+            if th.current_thread().name != "cortados-usage-ledger-migrate":
+                c.execute("WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r").fetchone()
+                return                                          # never reached: interrupted at the foreground limit
+            c.execute("BEGIN IMMEDIATE")                        # the build's writer lock, held past every deadline
+            c.execute(usage_ledger._TS_INDEX)
+            building.set()
+            release.wait(10)
+            c.commit()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(usage_ledger, "_build_index", build), \
+                mock.patch.object(usage_ledger, "RETRY_S", 0.4), mock.patch.object(usage_ledger, "_BG_BACKOFF_S", 0.05), \
+                mock.patch.object(usage_ledger, "_bg_started", set()):
+            db = Path(d) / "usage.db"
+            c = sqlite3.connect(db)
+            c.execute("CREATE TABLE usage (ts REAL, runtime TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)")
+            c.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?)",
+                          ((float(i), "claude", "old", 1, 1, 0, 0) for i in range(50000)))
+            c.commit()
+            c.close()
+            # the triggering row: committed before the background build starts
+            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 1000}, ts=1e9, path=db))
+            self.assertTrue(building.wait(10), "the background build started")
+            with self.assertLogs("cortados.usage_ledger", "WARNING") as cm:
+                for i in range(1, 4):                           # each outlasts RETRY_S behind the build: spooled
+                    self.assertFalse(usage_ledger.record("claude#b", "m", {"input_tokens": 1000 + i}, ts=1e9 + i, path=db,
+                                                         context="search lane, run -"))
+            self.assertEqual(sum("spooled" in m for m in cm.output), 3)
+            self.assertFalse(any("LOST" in m for m in cm.output))
+            release.set()
+            until = time.monotonic() + 10
+            got = []
+            while time.monotonic() < until:
+                c = sqlite3.connect(db)
+                try:
+                    got = c.execute("SELECT input_tokens FROM usage WHERE ts >= 1e9 ORDER BY ts").fetchall()
+                    done = usage_ledger._migrated(c)
+                finally:
+                    c.close()
+                if done and len(got) == 4:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(got, [(1000,), (1001,), (1002,), (1003,)], "every row exactly once")
+            c = sqlite3.connect(db)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 50000 + 4)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM usage_spool_applied").fetchone()[0], 0)
+            c.close()
+            self.assertEqual(list(Path(d).glob("usage-spool.jsonl*.replay")), [])
+            # a later write replays nothing again: still exactly once
+            self.assertTrue(usage_ledger.record("claude#b", "m", {"input_tokens": 2000}, ts=2e9, path=db))
+            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage WHERE ts >= 1e9").fetchone()[0], 5)
+
+    def test_a_replay_interrupted_after_its_insert_does_not_double_count(self):
+        # crash between the insert transaction and the pending file's removal: the next replay must insert nothing
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "usage.db"
+            self.assertTrue(usage_ledger.record("claude", "m", {}, ts=1.0, path=db))
+            usage_ledger._spool(db, (5.0, "claude", "m", 7, 0, 0, 0, "claude#b"))
+            real_unlink = Path.unlink
+            with mock.patch.object(Path, "unlink", side_effect=OSError("crash")), self.assertRaises(OSError):
+                usage_ledger._replay_locked(db, None)
+            self.assertEqual(usage_ledger._replay_locked(db, None), 0, "the applied uid makes the second pass a no-op")
+            self.assertEqual(sqlite3.connect(db).execute("SELECT COUNT(*) FROM usage WHERE input_tokens = 7").fetchone()[0], 1)
+            self.assertEqual(list(Path(d).glob("usage-spool.jsonl*")), [])
+            del real_unlink
+
+    def test_a_row_whose_spool_append_fails_too_is_logged_lost(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "dir-not-db"
+            bad.mkdir()
+            usage_ledger._consecutive_failures = 0
+            with mock.patch.object(usage_ledger, "_spool", side_effect=OSError("disk full")), \
+                    self.assertLogs("cortados.usage_ledger", "ERROR") as cm:
+                self.assertFalse(usage_ledger.record("claude#b", "m", {}, path=bad, context="search lane, run r1"))
+            self.assertIn("LOST", cm.output[0])
+            self.assertIn("lane claude#b", cm.output[0])
+
     def test_background_migration_retries_with_backoff_until_it_succeeds(self):
         calls = {"n": 0}
         real = usage_ledger._ensure_lane_column

@@ -2333,6 +2333,68 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         self.assertIn("lane claude", msg)
         self.assertIn("search lane, run search-run-0001", msg)
 
+    def _refused(self, headers):
+        """POST the search under `headers`; (status, error message). The CLI must never have been invoked."""
+        try:
+            self.post(self.SEARCH, headers=headers)
+            return 200, ""
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())["error"]["message"]
+
+    def test_an_excluded_search_model_is_refused_before_launch(self):
+        code, msg = self._refused({server.EXCLUDE_MODEL_HEADER: search_lane.SEARCH_MODEL})
+        self.assertEqual(code, 400)
+        self.assertIn("excluded model", msg)
+        self.assertEqual(self.search_calls(), [], "the CLI is never invoked")
+        code, _ = self._refused({server.EXCLUDE_MODEL_HEADER: "sub/"})     # an item naming no model: refused too
+        self.assertEqual(code, 400)
+        self.assertEqual(self.search_calls(), [])
+        self.post(self.SEARCH, headers={server.EXCLUDE_MODEL_HEADER: "gpt-5.5"})   # another model: searched
+        self.assertEqual(len(self.search_calls()), 1)
+
+    def test_a_floor_with_no_enforcer_fails_closed_before_launch(self):
+        self.reg.floor_search = None
+        code, msg = self._refused({server.MIN_LEFT_HEADER: "50"})
+        self.assertEqual(code, 429)
+        self.assertIn("x-cortados-min-left-pct", msg)
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(self.ledger, [])
+
+    def test_a_floor_refusal_on_the_search_account_is_429_before_launch(self):
+        seen = []
+        self.reg.floor_search = lambda cand, floor: seen.append((cand, floor)) or "week: 3% left"
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
+            code, msg = self._refused({server.MIN_LEFT_HEADER: "50"})
+        self.assertEqual(code, 429)
+        self.assertIn("week: 3% left", msg)
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(seen, [({"lane": "claude#b", "provider": "claude-cli#b", "account": "b", "config_dir": "/cfg/b"},
+                                 50.0)], "the floor is checked on the account the search executes on")
+
+    def test_a_failing_floor_check_fails_closed_before_launch(self):
+        def boom(cand, floor):
+            raise RuntimeError("ledger unreadable")
+        self.reg.floor_search = boom
+        code, msg = self._refused({server.MIN_LEFT_HEADER: "5"})
+        self.assertEqual(code, 429)
+        self.assertIn("RuntimeError", msg)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_a_floor_the_search_account_clears_runs_the_search(self):
+        self.reg.floor_search = lambda cand, floor: None
+        r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(len(self.search_calls()), 1)
+
+    def test_floor_search_reserves_through_floor_reserve(self):
+        # the production wiring: floor.reserve on the search model; no usage reading -> held, nothing reserved
+        state = Path(self.scratch) / "state"
+        core_stub = mock.Mock(STATE=state, subscription_readings=mock.Mock(return_value={}))
+        why = server._floor_search(core_stub, {"lane": "claude", "provider": "claude-cli", "account": None,
+                                               "config_dir": None}, 5.0)
+        self.assertIn("no current usage reading", why)
+        self.assertFalse((state / "floor-reservations.jsonl").exists())
+
     def test_the_group_is_signalled_before_the_child_is_reaped(self):
         # A reaped child's pid may be reused at once; signalling it as a group after the reap could kill a stranger.
         calls = []

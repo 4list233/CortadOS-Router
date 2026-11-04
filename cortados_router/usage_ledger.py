@@ -4,14 +4,22 @@ The old writer was the Hermes plugin; the provider is now the only thing that ru
 Schema is the one unitcost.learn reads, plus `lane` (the scarcity lane the turn drew on: claude, claude#b, codex), because two
 Claude accounts are two separate pools. A write never breaks or slows a turn: it runs off the request thread
 (record_async), retries a busy/locked db within one end-to-end RETRY_S deadline instead of dropping the row, and failures are never raised. Consecutive failures are counted (`consecutive_failures()`) and
-logged with their reason on the first and every LOG_EVERY-th one, so a ledger that keeps failing stays visible without flooding."""
+logged with their reason on the first and every LOG_EVERY-th one, so a ledger that keeps failing stays visible without flooding.
+
+No row is dropped because the db could not take it in time: a row record() cannot write by its deadline, for any reason
+(SQLite admits one writer, so a long index build or any other writer can hold the db past every deadline), is appended
+to SPOOL next to usage.db and replayed into the db later (see _spool / _replay). A row is lost only if that append fails
+too, and that is logged as such."""
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
+import os
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +47,12 @@ INDEX_FOREGROUND_S = 1.0
 _BG_BACKOFF_S, _BG_BACKOFF_MAX_S = 1.0, 60.0
 _bg_lock = threading.Lock()
 _bg_started: set[str] = set()   # ledger paths whose background migration thread this process has started
+SPOOL = "usage-spool.jsonl"
+_SPOOL_MAX_LINE = 4096   # one os.write per row under PIPE_BUF-sized lines: an O_APPEND write this small is not interleaved
+# Replay idempotency: the uids of spooled rows already inserted, so a crash between the insert and the spool's removal
+# cannot count a row twice. A side table, not a column: main's usage schema stays as unitcost.learn and the usage view
+# read it, and no index has to be built on the (possibly huge) usage table for it.
+_APPLIED = "CREATE TABLE IF NOT EXISTS usage_spool_applied (uid TEXT PRIMARY KEY)"
 LOG_EVERY = 100          # a steady failure (full disk, read-only home) repeats every turn: one line per 100 turns stays readable
 _fail_lock = threading.Lock()
 _consecutive_failures = 0
@@ -137,10 +151,12 @@ def _background_migrate(p: Path) -> None:
                             raise sqlite3.OperationalError("WAL switch deferred")
                         _ensure_lane_column(c)
                         _build_index(c)
-                if _migrated(c):
-                    logger.info("usage ledger: background migration of %s complete", p)
-                    return
-                raise sqlite3.OperationalError("still not migrated after a full pass")
+                    if not _migrated(c):
+                        raise sqlite3.OperationalError("still not migrated after a full pass")
+                    # the rows spooled while the build held the writer lock, still under the migrate lock
+                    n = _replay_locked(p, None)
+                logger.info("usage ledger: background migration of %s complete; %d spooled row(s) replayed", p, n)
+                return
             finally:
                 c.close()
         except Exception as exc:
@@ -168,7 +184,7 @@ def _start_background_migration(p: Path) -> None:
                        type(exc).__name__, str(exc)[:120])
 
 
-def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> None:
+def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> bool:
     """One-time setup: WAL first, then the lane column, then the ts index. Order matters: building the index
     on a large rollback-journal ledger held the write lock for the whole build and concurrent records failed; in WAL
     they only queue behind it. The lane column (a fast ALTER, and the only step the row itself needs) comes before the
@@ -178,19 +194,21 @@ def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> None:
     others wait, then see it done (re-checked under the lock). The wait is bounded by record()'s deadline: a lock still
     held then skips the migration for this row, which is still written if the table already has the lane column (WAL
     and the index are optimisations; the lane is the schema), and fails otherwise. With the lane already there, the lock
-    is tried once, not waited for: only optimisations remain, and the holder may be a long background build."""
+    is tried once, not waited for: only optimisations remain, and the holder may be a long background build.
+    Returns True when the index build must go to the background: the caller starts it only after its row is committed,
+    so the background build (which holds the writer lock) cannot hold up the very row that triggered it."""
     if _migrated(c):
-        return
+        return False
     has_lane = "lane" in {r[1] for r in c.execute("PRAGMA table_info(usage)")}
     with open(str(p) + ".migrate", "a") as lf:
         if not _migrate_lock(lf, time.monotonic() if has_lane else deadline):   # released on close
             if has_lane:
                 # debug, not warning: while a long background build holds the lock this is every write, and expected
                 logger.debug("usage ledger: migration lock held elsewhere; migration skipped for this row")
-                return
+                return False
             raise sqlite3.OperationalError("usage ledger: no lane column, and the migration lock is held elsewhere")
         if _migrated(c):
-            return
+            return False
         wal = _ensure_wal(c)
         _ensure_lane_column(c)
         with _bg_lock:
@@ -205,9 +223,10 @@ def _migrate(c: sqlite3.Connection, p: Path, deadline: float) -> None:
                 if "interrupt" not in str(exc).lower():
                     raise
                 c.rollback()
-                _start_background_migration(p)
+                return True
             finally:
                 c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)
+    return False
 
 
 def _busy(exc: Exception) -> bool:
@@ -233,12 +252,121 @@ def _write(p: Path, row: tuple, deadline: float) -> None:
     try:
         c.execute(_SCHEMA)        # IF NOT EXISTS: a fresh file needs the table before _migrated() can read it
         c.commit()
-        _migrate(c, p, deadline)
-        c.execute("INSERT INTO usage (ts, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, lane) "
-                  "VALUES (?,?,?,?,?,?,?,?)", row)
+        background = _migrate(c, p, deadline)
+        c.execute(_INSERT, row)
         c.commit()
     finally:
         c.close()
+    if background:                                  # after this row's commit, never before (Codex review r11)
+        _start_background_migration(p)
+
+
+_INSERT = ("INSERT INTO usage (ts, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, lane) "
+           "VALUES (?,?,?,?,?,?,?,?)")
+
+
+def _spool_path(p: Path) -> Path:
+    return p.parent / SPOOL
+
+
+def _spool(p: Path, row: tuple) -> None:
+    """Append one row to the spool: one JSON line, O_APPEND, a single write, under the spool's flock. Raises on failure.
+    The lock is held only for this write and for _replay's rename, never for sqlite work. After taking it the fd is
+    checked to still be the spool's path: a replay may have renamed the file this fd was opened on, and a line written
+    there after the replay read it would be lost."""
+    line = json.dumps({"uid": uuid.uuid4().hex, "row": list(row)}, separators=(",", ":")) + "\n"
+    if len(line.encode()) >= _SPOOL_MAX_LINE:       # only a pathological model name gets here: shortened, not dropped
+        r = list(row)
+        r[2] = str(r[2])[:200]
+        line = json.dumps({"uid": uuid.uuid4().hex, "row": r}, separators=(",", ":")) + "\n"
+    sp = _spool_path(p)
+    for _ in range(10):
+        fd = os.open(str(sp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                if os.fstat(fd).st_ino != os.stat(str(sp)).st_ino:
+                    continue                        # renamed by a replay since open: reopen the current spool
+            except FileNotFoundError:
+                continue
+            data = line.encode()
+            if os.write(fd, data) != len(data):
+                raise OSError("short write to the usage spool")
+            return
+        finally:
+            os.close(fd)                            # releases the flock
+    raise OSError("the usage spool kept being replaced under this write")
+
+
+def _replay_locked(p: Path, deadline: float | None) -> int:
+    """Move every spooled row into the db; the caller holds the migrate lock (one replayer at a time). The spool is
+    renamed to a pending file first (under the spool's flock, so no append is lost), then each pending file's rows go
+    in with INSERT OR IGNORE on their uid in usage_spool_applied inside one transaction, then the pending file is
+    removed and its uids forgotten. A crash at any point leaves either the pending file (replayed again: the applied
+    uids make that a no-op) or nothing. Bounded by `deadline` when given. Returns the rows inserted."""
+    sp = _spool_path(p)
+    if sp.exists():
+        fd = os.open(str(sp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_size:
+                os.rename(str(sp), str(sp) + f".{uuid.uuid4().hex}.replay")
+        finally:
+            os.close(fd)
+    pending = sorted(p.parent.glob(SPOOL + ".*.replay"))
+    if not pending:
+        return 0
+    left = None if deadline is None else deadline - time.monotonic()
+    if left is not None and left <= 0:
+        return 0
+    c = sqlite3.connect(str(p), timeout=30.0 if left is None else min(TIMEOUT_S, left))
+    if deadline is not None:
+        c.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS)
+    inserted = 0
+    try:
+        c.execute(_APPLIED)
+        c.commit()
+        for f in pending:
+            entries = []
+            for raw in f.read_text().splitlines():
+                try:
+                    e = json.loads(raw)
+                except ValueError:
+                    logger.warning("usage ledger: a torn spool line in %s was skipped", f.name)
+                    continue
+                if isinstance(e, dict) and isinstance(e.get("uid"), str) and isinstance(e.get("row"), list) \
+                        and len(e["row"]) == 8:
+                    entries.append(e)
+            uids = [e["uid"] for e in entries]
+            with c:                                 # one transaction per pending file
+                for e in entries:
+                    if c.execute("INSERT OR IGNORE INTO usage_spool_applied (uid) VALUES (?)", (e["uid"],)).rowcount:
+                        c.execute(_INSERT, tuple(e["row"]))
+                        inserted += 1
+            f.unlink()
+            with c:                                 # the file is gone, so these uids can never come back
+                c.executemany("DELETE FROM usage_spool_applied WHERE uid = ?", ((u,) for u in uids))
+    finally:
+        c.close()
+    if inserted:
+        logger.info("usage ledger: %d spooled row(s) replayed into %s", inserted, p.name)
+    return inserted
+
+
+def _replay(p: Path, deadline: float) -> None:
+    """After a successful write: replay the spool if there is one and the migrate lock is free right now (a held lock
+    is a migration in progress, which replays when it ends). Never raises; a failed replay is logged and kept."""
+    sp = _spool_path(p)
+    if not sp.exists() and not any(p.parent.glob(SPOOL + ".*.replay")):
+        return
+    try:
+        with open(str(p) + ".migrate", "a") as lf:
+            if not _migrate_lock(lf, time.monotonic()):
+                return
+            _replay_locked(p, deadline)
+    except Exception as exc:
+        logger.warning("usage ledger: spool replay failed (%s: %s); kept for the next write", type(exc).__name__,
+                       str(exc)[:120])
 
 
 def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None, path: Path | None = None,
@@ -247,9 +375,11 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
     `context` (e.g. "search lane, run <id>") marks a write whose loss must be seen every time: its failure is logged at error
     level with the lane and that context on EVERY occurrence, besides counting toward consecutive_failures(). Logged
     once, when the deadline (RETRY_S from the start of this call, covering every step) passes or on the first non-busy
-    error."""
+    error. A row that could not be written is spooled (returns False: not in the db yet, replayed later); the log says
+    "spooled", or "LOST" when the spool append failed too."""
     global _consecutive_failures
     deadline = time.monotonic() + RETRY_S
+    p = row = None
     try:
         u = usage or {}
         runtime = (lane or "").split("#", 1)[0]
@@ -270,13 +400,21 @@ def record(lane: str, model: str, usage: dict | None, *, ts: float | None = None
         with _fail_lock:
             _consecutive_failures += 1
             n = _consecutive_failures
+        fate = "LOST: it could not be spooled either"
+        if p is not None and row is not None:
+            try:
+                _spool(p, row)
+                fate = f"spooled to {SPOOL}, replayed into the db later"
+            except Exception as sexc:
+                fate = f"LOST: the spool append failed too ({type(sexc).__name__}: {str(sexc)[:120]})"
         if context:
-            logger.error("usage ledger write failed for %s on lane %s (%s: %s); this spend is not recorded", context, lane,
-                         type(exc).__name__, str(exc)[:120])
-        elif n == 1 or n % LOG_EVERY == 0:
-            logger.warning("usage ledger write failed (%s: %s); %d consecutive failures, logged on the first and every %d",
-                           type(exc).__name__, str(exc)[:120], n, LOG_EVERY)
+            logger.error("usage ledger write failed for %s on lane %s (%s: %s); row %s", context, lane,
+                         type(exc).__name__, str(exc)[:120], fate)
+        elif fate.startswith("LOST") or n == 1 or n % LOG_EVERY == 0:
+            logger.warning("usage ledger write failed (%s: %s); row %s; %d consecutive failures, logged on the first and "
+                           "every %d", type(exc).__name__, str(exc)[:120], fate, n, LOG_EVERY)
         return False
+    _replay(p, deadline)
     with _fail_lock:
         if _consecutive_failures:
             logger.info("usage ledger writes recovered after %d failures", _consecutive_failures)
