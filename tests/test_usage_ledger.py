@@ -316,6 +316,155 @@ class LedgerWrite(unittest.TestCase):
             w.writer.join(5)
             self.assertFalse(w.writer.is_alive())
 
+    def test_recovery_logging_exception_never_replays_a_committed_batch(self):
+        # r15-1: recovery logging used to sit inside the retry block, duplicating a committed row.
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "usage.db"
+            w = self._fresh(start=False)
+            with mock.patch.object(usage_ledger, "_consecutive_failures", 1), \
+                    mock.patch.object(usage_ledger.logger, "info", side_effect=[RuntimeError("post-commit log"), None]), \
+                    mock.patch.object(usage_ledger.logger, "exception") as diagnostic, \
+                    mock.patch.object(usage_ledger, "_write_rows", wraps=usage_ledger._write_rows) as write:
+                self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=db))
+                self.assertTrue(w.start())
+                try:
+                    self.assertTrue(w.flush(5))
+                finally:
+                    self._join_writer(w)
+                self.assertEqual(write.call_count, 1)
+                diagnostic.assert_called_once()
+            with sqlite3.connect(db) as c:
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 1)
+            self.assertEqual(w.stats(), {"queued": 0, "lost": 0})
+            self.assertEqual(w.q.unfinished_tasks, 0)
+
+    def test_write_cleanup_exception_never_replays_a_committed_batch(self):
+        # The write helper can itself raise after commit (close/background migration), including a busy error.
+        for error in (RuntimeError("post-commit cleanup"), sqlite3.OperationalError("database is locked")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as d:
+                db = Path(d) / "usage.db"
+                w = self._fresh(start=False)
+                real_write = usage_ledger._write_rows
+
+                def committed_then_failed(*args):
+                    real_write(*args)
+                    raise error
+
+                self.assertTrue(usage_ledger.record_async("codex", "gpt", {}, path=db))
+                batches = w._take()
+                with mock.patch.object(usage_ledger, "_write_rows", side_effect=committed_then_failed) as write:
+                    with self.assertRaises(type(error)):
+                        w._handle(batches)
+                    self.assertEqual(write.call_count, 1)
+                    # A repeated dispatch of an already committed batch is also a no-op.
+                    self.assertIsNone(w._write_batch(batches[0]))
+                    self.assertEqual(write.call_count, 1)
+                with sqlite3.connect(db) as c:
+                    self.assertEqual(c.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 1)
+                self.assertEqual(w.stats(), {"queued": 0, "lost": 0})
+                self.assertEqual(w.q.unfinished_tasks, 0)
+
+    def test_rejection_details_are_bounded_with_exact_concurrent_loss_counts(self):
+        # r15-2: a stalled supervisor must not turn 100,000 rejections into 100,000 retained records.
+        w = self._fresh(maxsize=1, start=False)
+        item = (Path("/nonexistent/usage.db"), usage_ledger._row("codex", "gpt", {}, None), None)
+        self.assertTrue(w.put(item, "codex", None))
+
+        def reject_many():
+            for i in range(25000):
+                if i % 2:
+                    w.reject("codex", f"bad-{i}", "bad input")
+                else:
+                    w.put(item, "codex", f"full-{i}")
+
+        producers = [threading.Thread(target=reject_many) for _ in range(4)]
+        for producer in producers:
+            producer.start()
+        for producer in producers:
+            producer.join(5)
+            self.assertFalse(producer.is_alive())
+        self.assertEqual(w.lost, 100000)
+        self.assertEqual(len(w.drops), usage_ledger.DROP_DETAIL_MAX)
+        self.assertEqual(w.drops_omitted, 100000 - usage_ledger.DROP_DETAIL_MAX)
+        with self.assertLogs("cortados.usage_ledger", "WARNING") as logs:
+            self.assertEqual(w.stats(), {"queued": 1, "lost": 100000})
+        self.assertTrue(any("100000 row(s) LOST" in msg for msg in logs.output))
+        self.assertTrue(any(f"{100000 - usage_ledger.DROP_DETAIL_MAX} rejected-row diagnostic detail(s) omitted"
+                            in msg for msg in logs.output))
+        self.assertEqual(len(w.drops), 0)
+        self.assertEqual(w.drops_omitted, 0)
+        # Detaching a diagnostic batch must not discard the bound or carry its omission count into the next batch.
+        w.reject("codex", "next", "bad input")
+        with mock.patch.object(w, "_log_lost") as log, mock.patch.object(usage_ledger.logger, "warning") as warning:
+            w.fold_drops()
+        log.assert_called_once_with(1, "bad input", [("codex", "next")], 100001)
+        warning.assert_not_called()
+        self.assertEqual(w.drops.maxlen, usage_ledger.DROP_DETAIL_MAX)
+        with mock.patch.object(w, "_log_lost"):
+            self.assertEqual(w.shutdown(0), 1)
+        self.assertEqual(w.lost, 100002)
+
+    def test_rejections_during_a_paused_drain_keep_separate_omission_counts(self):
+        with mock.patch.object(usage_ledger, "DROP_DETAIL_MAX", 3):
+            w = self._fresh(start=False)
+            entered, release = threading.Event(), threading.Event()
+            drained = []
+
+            def pause_log(n, why, contexts, total):
+                drained.append((n, total))
+                entered.set()
+                release.wait(5)
+
+            for _ in range(5):
+                w.reject("codex", None, "bad input")
+            with mock.patch.object(w, "_log_lost", pause_log), \
+                    self.assertLogs("cortados.usage_ledger", "WARNING") as logs:
+                drainer = threading.Thread(target=w.fold_drops)
+                drainer.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    for _ in range(7):
+                        w.reject("codex", None, "bad input")
+                    self.assertEqual((len(w.drops), w.drops_omitted, w.lost), (3, 4, 12))
+                finally:
+                    release.set()
+                    drainer.join(5)
+                self.assertFalse(drainer.is_alive())
+                w.fold_drops()
+            self.assertEqual(drained, [(5, 5), (7, 12)])
+            self.assertTrue(any("2 rejected-row diagnostic detail(s) omitted" in msg for msg in logs.output))
+            self.assertTrue(any("4 rejected-row diagnostic detail(s) omitted" in msg for msg in logs.output))
+            self.assertEqual(w.stats(), {"queued": 0, "lost": 12})
+            self.assertEqual(w.drops_omitted, 0)
+
+    def test_closed_writer_rejection_details_remain_bounded(self):
+        w = self._fresh(start=False)
+        self.assertEqual(w.shutdown(0), 0)
+        item = (Path("/nonexistent/usage.db"), usage_ledger._row("codex", "gpt", {}, None), None)
+        for _ in range(usage_ledger.DROP_DETAIL_MAX + 5):
+            self.assertFalse(w.put(item, "codex", None))
+        self.assertEqual(len(w.drops), usage_ledger.DROP_DETAIL_MAX)
+        self.assertEqual(w.drops_omitted, 5)
+        with self.assertLogs("cortados.usage_ledger", "WARNING") as logs:
+            self.assertEqual(w.stats(), {"queued": 0, "lost": usage_ledger.DROP_DETAIL_MAX + 5})
+        self.assertTrue(any("5 rejected-row diagnostic detail(s) omitted" in msg for msg in logs.output))
+
+    def test_supervisor_start_failure_aborts_provider_startup(self):
+        from cortados_router.provider.server import ProviderServer, ThreadingHTTPServer
+        w = self._fresh(start=False)
+        failure = RuntimeError("can't start new thread")
+        # No listening socket or real provider: retain the real constructor's ledger startup wiring.
+        with mock.patch.object(ThreadingHTTPServer, "__init__", return_value=None), \
+                mock.patch.object(threading.Thread, "start", side_effect=failure):
+            with self.assertRaisesRegex(RuntimeError, "supervisor thread did not start") as raised:
+                ProviderServer(("127.0.0.1", 0), None)
+        self.assertIs(raised.exception.__cause__, failure)
+        self.assertIsNone(w.supervisor)
+        self.assertIsNone(w.writer)
+        # A caller may explicitly retry startup; the failed attempt did not publish a phantom supervisor.
+        self.assertTrue(w.start())
+        self._join_writer(w)
+
     def test_a_locked_db_never_blocks_the_request_path_and_the_rows_land_once_it_frees(self):
         self._fresh()
         # Review r12: the request thread only queues. Another connection holds SQLite's writer lock (as a long index

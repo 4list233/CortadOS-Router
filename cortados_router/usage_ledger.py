@@ -60,6 +60,9 @@ _consecutive_failures = 0
 # (~100 bytes), and even a busy provider completes far fewer than 10k turns during any migration or lock, so a full
 # queue means the writer is truly stuck; past it rows are counted lost and logged.
 QUEUE_MAX = 10_000
+# Rejections must not become a second, unbounded queue when the supervisor is stalled. Keep a small diagnostic
+# sample, plus exact counters for every loss and every omitted detail; accounting never depends on this sample.
+DROP_DETAIL_MAX = 100
 BATCH_MAX = 500          # rows per committed batch: one short write transaction, never a long hold of the db
 _WRITER_BACKOFF_S, _WRITER_BACKOFF_MAX_S = 0.05, 5.0   # between retries of a busy batch: first wait, doubling, capped
 # A non-busy error (unopenable path, corrupt file, full disk) is not a lock to wait out: the batch is retried this many
@@ -376,7 +379,8 @@ class Writer:
 
     def __init__(self, maxsize: int = QUEUE_MAX):
         self.q: "queue.Queue[tuple[Path, tuple, str | None]]" = queue.Queue(maxsize=maxsize)
-        self.drops: "deque[tuple[str, str | None, str]]" = deque()
+        self.drops: "deque[tuple[str, str | None, str]]" = deque(maxlen=DROP_DETAIL_MAX)
+        self.drops_omitted = 0                     # protected by q.mutex, like drops and lost
         self.lock = threading.Lock()
         self.lost = 0                              # protected by q.mutex, including request-path rejections
         self.claimed: list[_Batch] = []
@@ -400,20 +404,25 @@ class Writer:
                 self.q.unfinished_tasks += 1
                 self.q.not_empty.notify()
                 return True
-            self.lost += 1
-            self.drops.append((lane, context, why))
+            self._reject(lane, context, why)
             return False
 
     def reject(self, lane: str, context: str | None, why: str) -> None:
         """Bad input never reaches put; count it now, not after a potentially paused deferred logger."""
         with self.q.mutex:
-            self.lost += 1
+            self._reject(lane, context, why)
+
+    def _reject(self, lane: str, context: str | None, why: str) -> None:
+        """Queue mutex held: count every loss, retaining only the first bounded sample of details."""
+        self.lost += 1
+        if len(self.drops) < self.drops.maxlen:
             self.drops.append((lane, context, why))
+        else:
+            self.drops_omitted += 1
 
     # -- lifecycle ---------------------------------------------------------------------------------------------
     def start(self) -> bool:
-        """Start the supervisor (it starts the writer). Called at provider startup; idempotent. False if it could
-        not start (logged; the next start() tries again)."""
+        """Start the supervisor at provider startup; idempotent. False if closed; raises if startup fails."""
         with self.lock:
             if self.closed or (self.supervisor is not None and self.supervisor.is_alive()):
                 return not self.closed
@@ -425,9 +434,9 @@ class Writer:
             else:
                 self.supervisor = t
                 return True
-        logger.error("usage ledger: supervisor thread did not start (%s: %s); rows wait on the queue",
-                     type(err).__name__, str(err)[:120])
-        return False
+        # Fail provider startup: without the supervisor there is no lifecycle owner to retry the writer or drain
+        # diagnostics. Serving anyway would strand admitted rows; request threads must never perform these retries.
+        raise RuntimeError("usage ledger: supervisor thread did not start; provider startup aborted") from err
 
     def _start_writer_thread(self) -> threading.Thread:
         t = threading.Thread(target=self._write_loop, name="cortados-usage-ledger-writer", daemon=True)
@@ -456,10 +465,14 @@ class Writer:
     def fold_drops(self) -> None:
         """Log already-counted request-path losses; detaching or pausing these logs cannot hide a disposition."""
         with self.q.mutex:
-            got, self.drops = self.drops, deque()
+            got, self.drops = self.drops, deque(maxlen=DROP_DETAIL_MAX)
+            omitted, self.drops_omitted = self.drops_omitted, 0
             total = self.lost
         if got:
-            self._log_lost(len(got), got[0][2], [(lane, ctx) for lane, ctx, _ in got if ctx], total)
+            self._log_lost(len(got) + omitted, got[0][2], [(lane, ctx) for lane, ctx, _ in got if ctx], total)
+        if omitted:
+            logger.warning("usage ledger: %d rejected-row diagnostic detail(s) omitted (bounded buffer); "
+                           "%d lost since start", omitted, total)
 
     def _log_lost(self, n: int, why: str, contexts: list, total: int) -> None:
         for lane, context in contexts:
@@ -553,16 +566,20 @@ class Writer:
         wait, tries = _WRITER_BACKOFF_S, 0
         while True:
             with self.lock:
-                if b.revoked:
+                if b.done or b.revoked:
                     return None
             try:
                 b.path.parent.mkdir(parents=True, exist_ok=True)
                 _write_rows(b.path, rows, time.monotonic() + RETRY_S, lambda: self._commit_guard(b))
-                _succeeded()
-                return None
+                break
             except _Revoked:
                 return None
             except Exception as exc:
+                # Connection cleanup or background migration can also raise AFTER the guarded commit. Let the
+                # writer report that error and retire the committed batch, never replay it or mark it lost.
+                with self.lock:
+                    if b.done:
+                        raise
                 if not _busy(exc):
                     tries += 1
                     if tries >= NON_BUSY_TRIES:
@@ -573,6 +590,9 @@ class Writer:
             if self.stop.wait(wait):
                 return "the process exited while the db was still busy"
             wait = min(wait * 2, _WRITER_BACKOFF_MAX_S)
+        # Recovery logging is post-commit bookkeeping, not part of the retryable write operation.
+        _succeeded()
+        return None
 
     # -- views -------------------------------------------------------------------------------------------------
     def stats(self) -> dict[str, int]:
