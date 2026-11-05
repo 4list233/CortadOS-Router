@@ -1,4 +1,5 @@
-# Real macOS /bin/sh watchdog regression. Run: python3 -I launcher_test.py timeout (or early).
+# Real macOS /bin/sh watchdog regressions. Run: python3 -I launcher_test.py MODE
+# MODE: timeout, early, capture, identity.
 # Only stdlib, fake children and throwaway state; never launches a provider.
 
 import json, os, pathlib, signal, subprocess, sys, tempfile, time
@@ -7,7 +8,7 @@ source = pathlib.Path(__file__).with_name('register.ts').read_text()
 cleanup = source.split('export const BG_CLEANUP_SH = `', 1)[1].split('\n`\n', 1)[0]
 def expand(text):
     text = text.replace('${shQuote(BG_CLEANUP_SH)}', shlex.quote(cleanup))
-    text = re.sub(r'\$\{shQuote\(`([\s\S]*?)`\)\}', lambda m: shlex.quote(m[1]), text)
+    text = re.sub(r'\$\{shQuote\(`([\s\S]*?)`\)\}', lambda m: shlex.quote(m[1].replace(r'\\', '\\')), text)
     return text.replace('${BG_CAPTURE_BYTES}', '1048576').replace(r'\${', '${')
 supervisor = expand(source.split('const BG_SUPERVISE_SH = `', 1)[1].split('\n`\n', 1)[0])
 reaper = expand(source.split('export const BG_REAP_SH = `', 1)[1].split('\n`\n', 1)[0])
@@ -15,18 +16,43 @@ launcher = source.split('export const BG_LAUNCH_SH = `', 1)[1].split('`\n', 1)[0
 launcher = launcher.replace('${BG_REAP_SH}', reaper).replace('${shQuote(BG_SUPERVISE_SH)}', shlex.quote(supervisor))
 launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n')
 mode = sys.argv[1]
-assert mode in ('timeout', 'early', 'capture')
+assert mode in ('timeout', 'early', 'capture', 'identity')
+if mode == 'identity':
+    # Exercise the actual watchdog helper against a live, unrelated process in its own group.
+    # A ledger entry for its pid with a different start time must not adopt or signal it.
+    tracker = 'track() {' + supervisor.split('track() {', 1)[1].split('\n}\nend=', 1)[0] + '\n}\n'
+    with tempfile.TemporaryDirectory(prefix='route-bg-identity-') as tmp:
+        sleeper = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)'],
+                                   start_new_session=True)
+        try:
+            ledger = pathlib.Path(tmp) / 'processes'
+            ledger.write_text(str(sleeper.pid) + '\t' + str(sleeper.pid) + '\tSTALE IDENTITY\n')
+            command = 'D=$1; c=$2\n' + tracker + '\ntrack scan && track TERM && track KILL'
+            subprocess.run(['/bin/sh', '-c', command, 'sh', tmp, str(sleeper.pid)], check=True)
+            assert sleeper.poll() is None, 'stale pid identity was signaled'
+            assert 'STALE IDENTITY' in ledger.read_text(), 'stale pid was readopted'
+            # With a matching identity, the same helper must signal it.
+            start = subprocess.check_output(['ps', '-p', str(sleeper.pid), '-o', 'lstart='], text=True).strip()
+            ledger.write_text(str(sleeper.pid) + '\t' + str(sleeper.pid) + '\t' + start + '\n')
+            subprocess.run(['/bin/sh', '-c', command, 'sh', tmp, str(sleeper.pid)], check=True)
+            sleeper.wait(timeout=3)
+            assert sleeper.returncode < 0
+        finally:
+            if sleeper.poll() is None: sleeper.kill()
+            sleeper.wait()
+    print('stale identity ignored; matching identity terminated')
+    sys.exit(0)
 if mode == 'capture':
     with tempfile.TemporaryDirectory(prefix='route-bg-capture-') as tmp:
         env = {'PATH': '/usr/bin:/bin', 'TMPDIR': tmp}
         # Shorten only the raw-retention timer, not the watchdog or byte limit.
-        quick = launcher.replace('+ 3600', '+ 1').replace('sleep 60;', 'sleep 1;')
+        quick = launcher.replace('+ 3600', '+ 2').replace('sleep 60;', 'sleep 1;')
         d = pathlib.Path(subprocess.check_output(
             ['/bin/sh', '-c', quick, 'sh', '30', sys.executable, '-I', '-c',
              'import os; os.write(1,b"x"*2097152); os.write(2,b"y"*2097152)'],
             env=env, text=True, timeout=3).strip())
         try:
-            deadline = time.monotonic() + 18
+            deadline = time.monotonic() + 22
             while not (d / 'exit').exists() and time.monotonic() < deadline: time.sleep(.02)
             assert (d / 'exit').exists(), 'overflow run never finished'
             assert (d / 'overflow').exists(), 'overflow was not reported'
@@ -68,9 +94,15 @@ def finish(*args):
     sys.exit(0)
 signal.signal(signal.SIGTERM, finish)
 pathlib.Path(sys.argv[1] + '.group').write_text(str(os.getpgrp()))
-subprocess.Popen([sys.executable, '-I', '-c', sys.argv[3], sys.argv[1]])
+subprocess.Popen([sys.executable, '-I', '-c', sys.argv[3], sys.argv[1]], start_new_session=True)
 while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)
-if sys.argv[2] == 'early': finish()
+if sys.argv[2] == 'early':
+    # Let the periodic census observe the detached tool before deliberately orphaning it.
+    ledger = pathlib.Path(os.environ['D']) / 'processes'
+    pid = pathlib.Path(sys.argv[1]).read_text()
+    while not ledger.exists() or not any(line.split()[0] == pid for line in ledger.read_text().splitlines()):
+        time.sleep(.01)
+    finish()
 while True: time.sleep(1)
 """
 def gone(pid):
@@ -90,8 +122,10 @@ with tempfile.TemporaryDirectory(prefix='route-bg-test-') as tmp:
         assert (d / 'exit').exists(), 'launcher never published exit'
         assert pidfile.exists(), 'fake grandchild never started'
         pid = int(pidfile.read_text())
+        assert pid != int(groupfile.read_text()), 'probe did not detach from child group'
+        assert any(line.split()[0] == str(pid) for line in (d / 'processes').read_text().splitlines()), 'detached tool was not tracked'
         while not gone(pid) and time.monotonic() < deadline: time.sleep(.05)
-        assert gone(pid), 'TERM-resistant grandchild survived group cleanup'
+        assert gone(pid), 'TERM-resistant detached grandchild survived descendant cleanup'
         assert (d / 'timedout').exists() == (mode == 'timeout')
         assert (d / 'exit').read_text() == '0', (d / 'exit').read_text()
         assert json.loads((d / 'stdout').read_text())['result'] == 'partial result'

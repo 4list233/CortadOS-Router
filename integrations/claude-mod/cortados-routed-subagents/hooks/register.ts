@@ -557,7 +557,7 @@ const shQuote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'"
 export const BG_CLEANUP_SH = `
 d=$1
 [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$d/owner-v1" ] && [ ! -L "$d/owner-v1" ] || exit 1
-rm -f "$d/stdout" "$d/stderr" "$d/out.pipe" "$d/err.pipe" "$d/child-exit" "$d/child-exit.tmp"
+rm -f "$d/stdout" "$d/stderr" "$d/out.pipe" "$d/err.pipe" "$d/child-exit" "$d/child-exit.tmp" "$d/processes"
 `
 
 // A killed supervisor cannot run its own expiry. On the next launch reclaim only this user's marked directories
@@ -574,9 +574,11 @@ find "\${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cortados-bg.*' -user "$(id -u
 `)} sh {} +
 `
 
-/** The supervisor is the watchdog: one owner decides timeout and ALWAYS finishes group cleanup before publishing
- * exit. Perl setpgrp gives the asynchronous workload its OWN process group, separate from helpers. The workload shell has job control off, so ordinary descendants inherit its group. This is lifecycle
- * containment, not a sandbox against a child deliberately calling setsid/setpgid. No external setsid binary needed.
+/** The supervisor is the watchdog: one owner decides timeout and finishes descendant cleanup before publishing
+ * exit. Perl setpgrp separates the workload from helpers. A one-second ps census records descendants including
+ * Bash tools in separate sessions/groups, and retains their identity after reparenting. Signals require a matching
+ * start time; groups come from the current matching process, never just a recycled pid. Polling is lifecycle cleanup,
+ * not an adversarial sandbox: a process that forks and reparents entirely between censuses can escape. No external setsid binary needed.
  * FIFO readers drain excess bytes without storing them and signal overflow. Exit is published only after readers
  * finish. Raw files expire after 1 h even if the mod disappears; successful processing removes them immediately.
  * All dynamic values remain positional arguments/environment, never shell source. */
@@ -598,19 +600,77 @@ perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV; die "exec: $!"' sh -c $
   printf %s "$ec" > "$D/child-exit.tmp" && mv "$D/child-exit.tmp" "$D/child-exit"
 `)} sh "$@" > "$D/out.pipe" 2> "$D/err.pipe" < /dev/null &
 c=$!
+# Persist observed identities: pid, pgid, lstart. One ps snapshot keeps ancestry and identity coherent.
+# Retained live descendants seed later walks, so reparenting does not sever the tracked tree.
+track() {
+  perl -e ${shQuote(`
+    use strict;
+    use warnings;
+    my ($root, $file, $mode) = @ARGV;
+    my (%known, %now);
+    if (-e $file) {
+      open my $in, "<", $file or die "read process ledger: $!";
+      while (<$in>) {
+        chomp;
+        my ($pid, $group, $start) = split /\\t/, $_, 3;
+        $known{$pid} = [$group, $start];
+      }
+      close $in;
+    }
+    open my $ps, "-|", "ps", "-axo", "pid=,ppid=,pgid=,lstart=" or die "ps: $!";
+    while (<$ps>) {
+      if (/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(.+?)\\s*$/) {
+        $now{$1} = [$2, $3, $4];
+      }
+    }
+    close $ps or die "ps failed";
+    my %live = map {
+      my $p = $_;
+      exists $now{$p} && $now{$p}[2] eq $known{$p}[1]
+        ? ($p => 1) : ()
+    } keys %known;
+    if ($mode eq "scan") {
+      $live{$root} = 1 if exists $now{$root} && !exists $known{$root};
+      my $changed = 1;
+      while ($changed) {
+        $changed = 0;
+        for my $p (keys %now) {
+          if (!$live{$p} && $live{$now{$p}[0]}) { $live{$p} = 1; $changed = 1; }
+        }
+      }
+      for my $p (keys %live) { $known{$p} = [$now{$p}[1], $now{$p}[2]]; }
+      open my $out, ">", $file or die "write process ledger: $!";
+      for my $p (keys %known) { print $out join("\\t", $p, @{$known{$p}}), "\\n"; }
+      close $out or die "close process ledger: $!";
+    } else {
+      my %groups;
+      for my $p (keys %live) {
+        my $group = $now{$p}[1];
+        # Never signal the supervisor/helpers own group, even if a child joins it.
+        if ($group > 1 && $group != getpgrp() && !$groups{$group}++) { kill $mode, -$group; }
+        kill $mode, $p;
+      }
+    }
+  `)} "$c" "$D/processes" "$1"
+}
 end=$(( $(date +%s) + S ))
-while [ ! -f "$D/child-exit" ]; do
+while :; do
+  track scan || exit 1
+  [ ! -f "$D/child-exit" ] || break
   if [ "$(date +%s)" -ge "$end" ]; then : > "$D/timedout"; break; fi
   [ ! -f "$D/overflow" ] || break
   kill -0 "$c" 2>/dev/null || break
   sleep 1
 done
-# Even a normal early exit may leave descendants. Never cancel cleanup when the leader exits on TERM.
-kill -TERM -- "-$c" 2>/dev/null || :
-if kill -0 -- "-$c" 2>/dev/null; then
-  sleep 10
-  kill -KILL -- "-$c" 2>/dev/null || :
-fi
+# Even a normal early exit may leave detached descendants. Re-scan throughout the TERM grace
+# to catch shutdown-time children; each census keeps already observed orphans in the boundary.
+track TERM || exit 1
+grace=$(( $(date +%s) + 10 ))
+while [ "$(date +%s)" -lt "$grace" ]; do
+  sleep 1
+  track scan && track TERM || exit 1
+done
+track KILL || exit 1
 wait "$c"; ec=$?
 # A TERM handler may have returned valid JSON and exit 0. Preserve that code AND the independent timeout marker.
 if [ -f "$D/child-exit" ]; then ec=$(cat "$D/child-exit"); fi
@@ -980,9 +1040,16 @@ export const register: Register = (on, options) => {
         let stderr = ''
         try { stderr = String(await $.fs.read(`${dir}/stderr`)) } catch { /* optional */ }
         let timedOut = exitText === null
-        try { await $.fs.read(`${dir}/timedout`); timedOut = true } catch { /* not timed out */ }
-        let overflow = false
-        try { await $.fs.read(`${dir}/overflow`); overflow = true } catch { /* no overflow marker */ }
+        const marker = async (name: string): Promise<boolean> => {
+          try { await $.fs.read(`${dir}/${name}`); return true } catch (err) {
+            // Only ENOENT proves absence. Permission/I/O errors must never turn partial output into success.
+            if ((err as any)?.code === 'ENOENT' ||
+                ((err as any)?.code == null && /^ENOENT(?:$|[:,\s])/.test(String((err as any)?.message ?? err)))) return false
+            throw new Error(`unreadable completion metadata (${name}): ${err}`)
+          }
+        }
+        timedOut = await marker('timedout') || timedOut
+        const overflow = await marker('overflow')
         const code = exitText === null ? -1 : Number.parseInt(exitText.trim(), 10)
         // A terminal run no longer needs raw (possibly credential-bearing) artifacts, retries included. If the
         // supervisor vanished, its bounded expiry/recovery owns cleanup; do not unlink files still being written.
@@ -1062,7 +1129,10 @@ export const register: Register = (on, options) => {
         try {
           // 2.1.314 types: no callable task-notification/tool-result door. prompt.submit stamps plugin origin;
           // NEVER set asUser. session.append permits user text only, and ui.notify is not model-visible.
-          await $.prompt.submit({ text: scrubToken(backgroundData(notification, token), token) })
+          const delivery = await $.prompt.submit({ text: scrubToken(backgroundData(notification, token), token) })
+          if (delivery && typeof delivery === 'object' && 'drop' in delivery) {
+            throw new Error('background result delivery dropped')
+          }
         } catch {
           try { $.ui.toast(`routed-subagents: could not deliver the background result of "${description}"; ${saved ? `it is in ${outputFile}` : 'it could not be saved either'}`) } catch { /* nowhere left */ }
         }

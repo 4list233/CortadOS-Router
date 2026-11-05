@@ -888,7 +888,7 @@ function agentHandlerFor(opts: any): any {
 const BG_DIR = '/var/folders/x/T/cortados-bg.Ab12Cd'
 
 /** A $ for a background run: the launcher prints BG_DIR; the exit file appears after `pollsBeforeExit` polls. */
-function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; timedOut?: boolean; overflow?: boolean; failWrites?: number[]; launch?: () => any } = {}) {
+function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; timedOut?: boolean; overflow?: boolean; markerError?: { name: string; code: string }; drop?: string; failWrites?: number[]; launch?: () => any } = {}) {
   const seen: any = { argv: null as string[] | null, env: null as any, runOpts: null as any, writes: [] as Array<[string, string]>, sleeps: 0, submitted: [] as string[], fgRuns: 0 }
   let resolveDone: (t: string) => void = () => {}
   const done = new Promise<string>((r) => { resolveDone = r })
@@ -922,8 +922,9 @@ function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; t
           if (seen.sleeps < (o.pollsBeforeExit ?? 2)) throw new Error('ENOENT')
           return o.exit ?? '0'
         }
+        if (path === `${BG_DIR}/${o.markerError?.name}`) throw Object.assign(new Error(o.markerError!.code), { code: o.markerError!.code })
         if (path in files) return files[path]
-        throw new Error('ENOENT')
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
       },
       write: async (path: string, text: string) => {
         seen.writes.push([path, text])
@@ -931,7 +932,7 @@ function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; t
       },
     },
     clock: { sleep: async () => { seen.sleeps += 1 } },
-    prompt: { submit: async (a: any) => { seen.submitted.push(a.text); resolveDone(a.text) } },
+    prompt: { submit: async (a: any) => { seen.submitted.push(a.text); resolveDone(a.text); return o.drop ? { drop: o.drop } : undefined } },
     ui: { status() {}, toast(text: string) { seen.toasts.push(text) } },
   }
   return { $, seen, done }
@@ -1143,6 +1144,31 @@ test('overflow is a failure even with valid JSON and exit zero; raw artifacts ar
   expect(reportOf(text).status).toBe('FAILED')
   expect(text).toContain('capture overflow')
   expect(seen.cleaned).toEqual([BG_DIR])
+})
+
+for (const name of ['timedout', 'overflow']) {
+  for (const code of ['EACCES', 'EIO']) {
+    test(`unreadable ${name} marker (${code}) fails closed despite exit zero and valid JSON`, async () => {
+      const { $, done } = bgHost({ markerError: { name, code } })
+      await agentHandlerFor({})($, bgEvent, async () => 'native')
+      const report = reportOf(await done)
+      expect(report.status).toBe('FAILED')
+      expect(report.result).toContain('unreadable completion metadata')
+      expect(report.result).toContain(name)
+      expect(report.result).toContain(code)
+    })
+  }
+}
+
+test('a resolved notification drop warns with the saved result location', async () => {
+  const { $, seen, done } = bgHost({ drop: 'session busy' })
+  await agentHandlerFor({})($, bgEvent, async () => 'native')
+  await done
+  // submit resolves before finish handles the returned outcome.
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(seen.toasts.join('\n')).toContain('could not deliver the background result')
+  expect(seen.toasts.join('\n')).toContain(`${BG_DIR}/output.md`)
 })
 
 test('both original and retry raw captures are cleaned', async () => {
