@@ -1423,7 +1423,8 @@ class ChildTaskTests(unittest.TestCase):
                            "CORTADOS_PROVIDER_TOKEN": "tok-test-000000002", "CORTADOS_PROVIDER_URL": "http://p.invalid",
                            "CORTADOS_PROVIDER_TOKEN_FILE": "/t", "ANTHROPIC_SMALL_FAST_MODEL": "m",
                            "ANTHROPIC_MODEL": "m", "ANTHROPIC_DEFAULT_OPUS_MODEL": "m", "CLAUDE_CONFIG_DIR": "/c"})
-        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True)
+        self.cfg = {**self.cfg, "session_tag": "3f9a1c2e9b7d4a10"}
+        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True, title="browser task")
         self.assertEqual(out["lane"], ct.LOGIN_LANE)
         self.assertEqual(out["model"], "claude-sonnet-5-5")
         d = ct.task_path(out["task_id"])
@@ -1432,6 +1433,10 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("login mode", st["router_run"]["note"])
         meta = _load(os.path.join(d, "meta.json"))
         self.assertEqual((meta["lane"], meta["model"]), (ct.LOGIN_LANE, "claude-sonnet-5-5"))
+        self.assertNotIn("office", meta)
+        cmd = _load(os.path.join(d, "cmd.json"))
+        self.assertNotIn("session", cmd["event"])
+        self.assertNotIn("title", cmd["event"])
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         a = seen["argv"]
         for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
@@ -1476,7 +1481,11 @@ class ChildTaskTests(unittest.TestCase):
             self.assertNotIn("CORTADOS_PROVIDER_TOKEN", ct.login_env(os.environ))
             self.assertNotIn("ANTHROPIC_MODEL", ct.login_env(os.environ))
         with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
-            self.assertIn(ct.LOGIN_LANE, f.read())
+            log = f.read()
+        self.assertIn(ct.LOGIN_LANE, log)
+        for event in map(json.loads, log.splitlines()):
+            self.assertNotIn("session", event)
+            self.assertNotIn("title", event)
 
     def test_chrome_model_mapping_and_refusals(self):
         self.assertEqual(ct.login_model("cortados"), "claude-sonnet-5-5")

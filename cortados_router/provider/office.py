@@ -23,6 +23,7 @@ routed request is never refused over one, because routing must not depend on a c
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -257,6 +258,7 @@ class OfficeBoard:
             w["started_at"] = c["started_at"] if c.get("started_at") is not None else w.get("started_at")
             if c.get("final"):
                 w["status"], w["tool"], w["ended_at"] = c["final"], None, c["ts"]
+            w["updated"] = max(w["updated"], c["ts"])
             workers[key] = w
             s = c.get("session")
             if s and (c.get("final") is None or now - c["ts"] <= FLOOR_TTL_S):
@@ -266,7 +268,13 @@ class OfficeBoard:
                 f["device"] = f.get("device") or c.get("device")
                 f["last"] = max(f.get("last") or 0, c["ts"])
                 floors[s] = f
-        by_floor: dict[str | None, list[dict[str, Any]]] = {}
+        # Global caps cover the merged log AND live state. Keep the most recently active floors/workers; the log
+        # tail may hold thousands of unique keys even though live state was already bounded.
+        recent_floors = sorted(floors, key=lambda s: (-floors[s]["last"], s))[:MAX_FLOORS]
+        floors_hidden = len(floors) - len(recent_floors)
+        hidden_sessions = set(floors) - set(recent_floors)
+        floors = {s: floors[s] for s in recent_floors}
+        eligible = []
         for w in workers.values():
             st = w.get("status")
             if st == "idle" and now - (w.get("updated") or now) > DONE_AFTER_S:
@@ -274,6 +282,12 @@ class OfficeBoard:
                 w["ended_at"] = w.get("ended_at") or w.get("updated")
             if w["status"] in ("done", "error") and now - (w.get("ended_at") or now) > WORKER_KEEP_S:
                 continue
+            eligible.append(w)
+        visible = [w for w in eligible if w.get("session") not in hidden_sessions]
+        visible.sort(key=lambda w: (-(w.get("updated") or 0), w.get("run_id") or ""))
+        workers_hidden = len(eligible) - min(len(visible), MAX_WORKERS)
+        by_floor: dict[str | None, list[dict[str, Any]]] = {}
+        for w in visible[:MAX_WORKERS]:
             s = w.get("session") if w.get("session") in floors else None
             by_floor.setdefault(s, []).append(_pub_worker(w))
         out_floors = []
@@ -285,6 +299,7 @@ class OfficeBoard:
                                "workers": ws["items"], "workers_hidden": ws["hidden"]})
         lobby = _cap(by_floor.get(None, []), MAX_LOBBY)
         return {"version": VERSION, "ts": _ts(now), "floors": out_floors,
+                "floors_hidden": floors_hidden, "workers_hidden": workers_hidden,
                 "lobby": {"workers": lobby["items"], "workers_hidden": lobby["hidden"]},
                 "dropped_headers": dropped, "errors": list(errors or [])}
 
@@ -344,9 +359,14 @@ def read_child_events(path: Path, now: float) -> list[dict[str, Any]]:
             rec = json.loads(ln)
         except ValueError:
             continue                                # counted by the usage view; the office shows only good records
-        if isinstance(rec, dict) and isinstance(rec.get("ts"), (int, float)) and now - rec["ts"] <= CHILD_WINDOW_S:
+        if isinstance(rec, dict) and _child_timestamp(rec.get("ts"), now):
             out.append(rec)
     return out
+
+
+def _child_timestamp(ts: Any, now: float) -> bool:
+    # The log is local: future events are not real activity. Bound both sides before converting even huge integers.
+    return (type(ts) in (int, float) and now - CHILD_WINDOW_S <= ts <= now and math.isfinite(ts))
 
 
 def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:
@@ -354,6 +374,8 @@ def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, A
     (the log is a file: it is read as untrusted)."""
     out: dict[str, dict[str, Any]] = {}
     for e in events:
+        if not isinstance(e, dict) or not _child_timestamp(e.get("ts"), now) or e.get("chrome") is True:
+            continue                              # also ignore historical login-mode records that carried Office tags
         tid = clean(e.get("task_id"), _RUN_ID_RE)
         ev = e.get("event")
         if tid is None or ev not in ("started", "finished", "cancelled"):

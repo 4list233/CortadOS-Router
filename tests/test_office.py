@@ -81,9 +81,14 @@ class ScopeTests(OfficeHarness):
             body = {"model": "cortados", "messages": [{"role": "user", "content": "hi"}]}
             code, raw = self.request("POST", p, OFFICE_TOKEN, body=body)
             self.assertEqual(code, 403, (p, raw))
-        for m in ("PUT", "DELETE", "PATCH"):     # not served at all: http.server's 501, never a 2xx
-            code, _ = self.request(m, "/v1/cortados/office", OFFICE_TOKEN)
-            self.assertNotEqual(code // 100, 2)
+        # Review r1 corrects the old weak "not 2xx" expectation: every unsupported method must hit the scope gate.
+        for m in ("HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            for path in ("/v1/cortados/office", "/health", "/nope"):
+                with self.subTest(method=m, path=path):
+                    code, raw = self.request(m, path, OFFICE_TOKEN)
+                    self.assertEqual(code, 403, raw)
+                    for tok in (TOKEN, None, "unknown-token-000000"):
+                        self.assertEqual(self.request(m, path, tok)[0], 501)
         self.assertEqual(self.reg.sessions, {})   # nothing was routed with the office token
         self.assertIsNone(self.reg.runs.summary("abcdefgh12"))
 
@@ -120,6 +125,42 @@ class ScopeTests(OfficeHarness):
         write_clients(self.clients_file, [])
         os.utime(self.clients_file, (time.time() + 5, time.time() + 5))
         self.assertEqual(self.request("GET", "/v1/cortados/office", OFFICE_TOKEN)[0], 401)
+
+
+class ClientReadLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "clients.json"
+        write_clients(self.path, [{"name": "office", "token_sha256": clients.token_digest(OFFICE_TOKEN),
+                                   "scopes": ["office:read"]}])
+        self.tokens = clients.ClientTokens(path=self.path)
+
+    def test_oversized_stat_revokes_cached_clients_without_opening(self):
+        self.assertIsNotNone(self.tokens.match(OFFICE_TOKEN))
+        self.path.write_bytes(b" " * (clients.MAX_CLIENTS_BYTES + 1))
+        with mock.patch.object(Path, "open", side_effect=AssertionError("must reject before open")):
+            with self.assertLogs("cortados_router.provider.clients", "ERROR"):
+                self.assertIsNone(self.tokens.match(OFFICE_TOKEN))
+        self.assertIn("limit", self.tokens.error)
+
+    def test_growth_after_stat_is_bounded_and_fails_closed(self):
+        reader = mock.MagicMock()
+        reader.__enter__.return_value.read.return_value = b" " * (clients.MAX_CLIENTS_BYTES + 1)
+        with mock.patch.object(Path, "open", return_value=reader):
+            with self.assertLogs("cortados_router.provider.clients", "ERROR"):
+                self.assertIsNone(self.tokens.match(OFFICE_TOKEN))
+        reader.__enter__.return_value.read.assert_called_once_with(clients.MAX_CLIENTS_BYTES + 1)
+        self.assertIn("limit", self.tokens.error)
+
+    def test_exact_limit_valid_file_and_invalid_utf8(self):
+        raw = self.path.read_bytes()
+        self.path.write_bytes(raw + b" " * (clients.MAX_CLIENTS_BYTES - len(raw)))
+        self.assertIsNotNone(self.tokens.match(OFFICE_TOKEN))
+        self.path.write_bytes(b"\xff")
+        with self.assertLogs("cortados_router.provider.clients", "ERROR"):
+            self.assertIsNone(self.tokens.match(OFFICE_TOKEN))
+        self.assertIn("UTF-8", self.tokens.error)
 
 
 class ClientsCliTests(unittest.TestCase):
@@ -332,6 +373,69 @@ class ChildTaskViewTests(OfficeHarness):
         w = self.view()[0]["floors"][0]["workers"][0]
         self.assertEqual((w["status"], w["tool"]), ("error", None))
         self.assertIsNotNone(w["ended_at"])
+
+    def test_malformed_child_timestamps_never_break_the_http_view(self):
+        now = time.time()
+        record = {"event": "started", "task_id": "run-valid-0001", "session": SESSION, "ts": now}
+        bad = [None, True, False, "123", {}, [], float("nan"), float("inf"), -float("inf"),
+               now + 3600, now - office.CHILD_WINDOW_S - 1, 10 ** 1000, -(10 ** 1000)]
+        path = Path(os.environ["CORTADOS_HOME"]) / office.CHILD_EVENT_LOG
+        rows = [{**record, "ts": ts, "task_id": f"run-bad-{i:04d}"} for i, ts in enumerate(bad)]
+        rows += [{k: v for k, v in record.items() if k != "ts"}, record]
+        # Include an exponent overflow (valid JSON numeric syntax, not just Python's Infinity extension).
+        path.write_text("\n".join(json.dumps(row) for row in rows) +
+                        '\n{"event":"started","task_id":"run-overflow","ts":1e400}\nnot json\n[]\n')
+        self.assertEqual(office.read_child_events(path, now), [record])
+        # Defense in depth: direct callers must not trust the reader.
+        self.assertEqual(set(office._children(rows + [None, [], {"ts": now}], now)), {"run-valid-0001"})
+        v, raw = self.view()
+        self.assertEqual([w["run_id"] for w in v["floors"][0]["workers"]], ["run-valid-0001"])
+        self.assertNotIn("Infinity", raw)
+        self.assertNotIn("NaN", raw)
+
+    def test_child_timestamp_window_is_two_sided_and_inclusive(self):
+        now = 100_000.0
+        make = lambda ts: {"event": "started", "task_id": "run-window-001", "ts": ts}
+        for ts in (now, now - office.CHILD_WINDOW_S):
+            self.assertEqual(set(office._children([make(ts)], now)), {"run-window-001"})
+        for ts in (now + .001, now - office.CHILD_WINDOW_S - .001):
+            self.assertEqual(office._children([make(ts)], now), {})
+
+    def test_login_mode_events_do_not_create_floors_or_lobby_workers(self):
+        child_tasks.log_event("started", task_id="run-login-001", chrome=True, session=SESSION,
+                              project="CortadOS-Router", title="browser task", lane=child_tasks.LOGIN_LANE)
+        v, _ = self.view()
+        self.assertEqual(v["floors"], [])
+        self.assertEqual(v["lobby"]["workers"], [])
+
+    def test_global_caps_apply_after_merging_live_and_log_workers(self):
+        now = 100_000.0
+        b = office.OfficeBoard()
+        b.turn_start("r:run-live-0001", {"session": SESSION}, run_id="run-live-0001",
+                     provider="codex", lane="codex", model="gpt-6.1-sol", now=now)
+        events = [{"event": "started", "task_id": f"run-child-{i:04d}", "ts": now - i - 1,
+                   "session": f"{i + 1:016x}"} for i in range(6)]
+        # Small caps exercise the real merge boundary and prove recent live state beats older log entries.
+        with mock.patch.multiple(office, MAX_FLOORS=3, MAX_WORKERS=2):
+            v = b.view(events, now=now)
+        self.assertEqual([f["session"] for f in v["floors"]], [SESSION, "0000000000000001", "0000000000000002"])
+        self.assertEqual(v["floors_hidden"], 4)
+        self.assertEqual(v["workers_hidden"], 5)
+        self.assertEqual([w["run_id"] for f in v["floors"] for w in f["workers"]],
+                         ["run-live-0001", "run-child-0000"])
+        self.assertEqual(v["lobby"]["workers"], [])  # hidden floors never spill into the lobby
+
+    def test_global_worker_cap_precedes_per_floor_and_lobby_caps(self):
+        now = 100_000.0
+        events = [{"event": "started", "task_id": f"run-child-{i:04d}", "ts": now - i,
+                   **({"session": SESSION} if i % 2 else {})} for i in range(10)]
+        with mock.patch.multiple(office, MAX_WORKERS=6, MAX_WORKERS_PER_FLOOR=2, MAX_LOBBY=2):
+            v = office.OfficeBoard().view(events, now=now)
+        self.assertEqual(v["workers_hidden"], 4)
+        self.assertEqual(v["floors_hidden"], 0)
+        self.assertEqual(v["floors"][0]["workers_hidden"], 1)
+        self.assertEqual(v["lobby"]["workers_hidden"], 1)
+        self.assertEqual([w["run_id"] for w in v["lobby"]["workers"]], ["run-child-0000", "run-child-0002"])
 
     def test_an_unreadable_child_log_is_an_error_not_silence(self):
         d = Path(os.environ["CORTADOS_HOME"])

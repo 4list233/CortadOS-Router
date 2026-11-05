@@ -1024,7 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
     def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None) -> None:
         """Answer an error in the wire's shape. `message` goes to the client only; the log line and the run record get
@@ -1065,6 +1066,14 @@ class Handler(BaseHTTPRequestHandler):
             logger.warning("refusal bookkeeping failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------ routes
+    def _unsupported_method(self):
+        self._authed = False
+        if not self._scope_gate(self.command):
+            # Preserve BaseHTTPRequestHandler's unsupported-method response for owner/unknown credentials.
+            self.send_error(501, "Unsupported method (%r)" % self.command)
+
+    do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _unsupported_method
+
     def do_GET(self):
         self._authed = False
         if self._scope_gate("GET"):

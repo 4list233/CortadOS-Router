@@ -49,6 +49,8 @@ _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 # Few clients exist (one today, two planned); a file listing more is not a reviewed list.
 MAX_CLIENTS = 32
+# 32 entries need under 8 KiB in the CLI's format; 64 KiB leaves ample formatting headroom while bounding auth reads.
+MAX_CLIENTS_BYTES = 64 * 1024
 # Same floor as the owner-token tooling (child_tasks.MIN_TOKEN_LEN is 8); minted tokens are 32 bytes of randomness.
 MIN_TOKEN_LEN = 16
 
@@ -110,6 +112,20 @@ def parse(raw: str) -> list[tuple[str, Client]]:
     return out
 
 
+def _read_clients(p: Path) -> str:
+    """Bound both the initial size and the read: a file can grow after stat (fail closed in either case)."""
+    if p.stat().st_size > MAX_CLIENTS_BYTES:
+        raise ClientsError("the clients file exceeds the 64 KiB limit")
+    with p.open("rb") as f:
+        raw = f.read(MAX_CLIENTS_BYTES + 1)
+    if len(raw) > MAX_CLIENTS_BYTES:
+        raise ClientsError("the clients file exceeds the 64 KiB limit")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeError:
+        raise ClientsError("the clients file is not UTF-8") from None
+
+
 class ClientTokens:
     """The loaded clients, re-read when the file changes. `match(token)` -> the Client the token belongs to, or None.
     A missing file means no clients (the ordinary state of a provider without readers); a bad file means no clients
@@ -143,7 +159,7 @@ class ClientTokens:
         if sig[1] is None:
             return
         try:
-            entries = parse(p.read_text(encoding="utf-8"))
+            entries = parse(_read_clients(p))
             if self._owner_digest and any(d == self._owner_digest for d, _ in entries):
                 # A client entry holding the owner token would make the owner a scoped client on paper; refuse the file.
                 raise ClientsError("a client's token is the owner token")
@@ -172,7 +188,7 @@ class ClientTokens:
 def _load_doc(p: Path) -> dict:
     if not p.exists():
         return {"version": 1, "clients": []}
-    raw = p.read_text(encoding="utf-8")
+    raw = _read_clients(p)
     parse(raw)                                      # refuse to edit a file the provider would refuse
     return json.loads(raw)
 

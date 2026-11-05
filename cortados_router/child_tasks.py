@@ -755,8 +755,8 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
             "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
-            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:],
-            **({"office": office} if office else {})}
+            # Login-mode children never route through CortadOS, so carry no Office identity into lifecycle events.
+            "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:]}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
                                               "event": _event_fields(meta), "started_at": meta["started_at"]})
     _write_json(os.path.join(d, "meta.json"), meta)

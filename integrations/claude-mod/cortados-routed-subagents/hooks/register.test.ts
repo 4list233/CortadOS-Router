@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -1001,6 +1001,110 @@ test('heartbeats: tool names on the main loop, throttled, idle on turn end, ende
   expect(h.beats[3].body.tool).toBe(null)
   await h.handlers['session.end'](h.$, { reason: 'other', sessionId: 'raw-session-id-123' }, next)
   expect(h.beats[4].body.status).toBe('ended')
+})
+
+test('a single throttled working change is sent later without another event', async () => {
+  const h = officeHarness()
+  const next = async (e: any) => e
+  await h.handlers['turn.complete'](h.$, {}, next)
+  await h.settle()
+  expect(h.beats.length).toBe(1)
+  expect(h.beats[0].body.status).toBe('idle')
+  await h.handlers['tool.call'](h.$, { tool: 'Bash', command: 'private command text' }, next)
+  await h.settle()
+  expect(h.beats.length).toBe(1)
+  await new Promise((r) => setTimeout(r, OFFICE_BEAT_MIN_MS + 30))
+  expect(h.beats.length).toBe(2)
+  expect(h.beats[1].body.status).toBe('working')
+  expect(h.beats[1].body.tool).toBe('Bash')
+  expect(JSON.stringify(h.beats)).not.toContain('private command text')
+  await h.handlers['session.end'](h.$, {}, next)
+})
+
+test('a burst coalesces to its latest state and ended cancels the trailing timer', async () => {
+  const h = officeHarness()
+  const next = async (e: any) => e
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, next)
+  await h.settle()
+  for (const tool of ['Read', 'Grep', 'Edit']) {
+    await h.handlers['tool.call'](h.$, { tool }, next)
+    await h.settle()
+  }
+  expect(h.beats.length).toBe(1)
+  await new Promise((r) => setTimeout(r, OFFICE_BEAT_MIN_MS + 30))
+  expect(h.beats.map((b) => b.body.tool)).toEqual(['Bash', 'Edit'])
+  await h.handlers['tool.call'](h.$, { tool: 'Read' }, next)
+  await h.settle()
+  await h.handlers['session.end'](h.$, {}, next)
+  expect(h.beats.map((b) => b.body.status)).toEqual(['working', 'working', 'ended'])
+  await new Promise((r) => setTimeout(r, OFFICE_BEAT_MIN_MS + 30))
+  expect(h.beats.length).toBe(3) // the cancelled timer must not resurrect Read after ended
+})
+
+/** Fetch completions are deliberately controlled: if two requests overlap, a newer one could apply first. */
+function delayedOfficeHarness() {
+  const h = officeHarness()
+  const applied: string[] = []
+  const release: Array<() => void> = []
+  let active = 0
+  let maxActive = 0
+  h.$.http.fetch = async (url: string, init: any) => {
+    const body = JSON.parse(init.body)
+    h.beats.push({ url, init, body })
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await new Promise<void>((resolve) => { release.push(resolve) })
+    applied.push(body.status)
+    active -= 1
+    return { status: 200, ok: true, headers: {}, text: '{}' }
+  }
+  return { ...h, applied, release, maxActive: () => maxActive }
+}
+
+test('delayed fetches cannot complete out of order and pending beats coalesce to idle', async () => {
+  const h = delayedOfficeHarness()
+  const next = async (e: any) => e
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, next)
+  await h.settle()
+  await h.handlers['tool.call'](h.$, { tool: 'Read' }, next)
+  await h.handlers['turn.complete'](h.$, {}, next)
+  await h.settle()
+  expect(h.beats.map((b) => b.body.status)).toEqual(['working'])
+  // Try completing a newer request first: it cannot exist until the older one has settled.
+  expect(h.release[1]).toBe(undefined)
+  h.release[0]()
+  await h.settle()
+  expect(h.beats.map((b) => b.body.status)).toEqual(['working', 'idle'])
+  h.release[1]()
+  await h.settle()
+  expect(h.applied).toEqual(['working', 'idle'])
+  expect(h.maxActive()).toBe(1)
+})
+
+test('ended waits for a slow uncancellable fetch, flushes last, and never resurrects working', async () => {
+  const h = delayedOfficeHarness()
+  const next = async (e: any) => e
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, next)
+  await h.settle()
+  let ended = false
+  const done = h.handlers['session.end'](h.$, {}, next).then(() => { ended = true })
+  await new Promise((r) => setTimeout(r, OFFICE_BEAT_TIMEOUT_MS + 30))
+  expect(ended).toBe(false)
+  expect(h.release.length).toBe(1) // even a local timeout must not release the serialization lock
+  expect(h.logs.length).toBe(1)
+  expect(h.logs[0]).toContain('office heartbeat failed')
+  h.release[0]()
+  await h.settle()
+  expect(h.beats.map((b) => b.body.status)).toEqual(['working', 'ended'])
+  expect(ended).toBe(false)
+  h.release[1]()
+  await done
+  expect(ended).toBe(true)
+  expect(h.applied).toEqual(['working', 'ended'])
+  expect(h.maxActive()).toBe(1)
+  await h.handlers['tool.call'](h.$, { tool: 'Read' }, next)
+  await h.settle()
+  expect(h.release.length).toBe(2)
 })
 
 test('a failing heartbeat is reported once and never breaks the tool call', async () => {

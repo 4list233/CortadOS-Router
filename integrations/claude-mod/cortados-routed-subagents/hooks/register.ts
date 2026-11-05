@@ -668,7 +668,7 @@ export const OFFICE_TITLE_MAX = 80
 const OFFICE_NAME_MAX = 64
 /** Heartbeats: on a change of status or tool, at most one per 2 s (a burst of tool calls is one beat, not fifty), and a
  * refresh at most every 30 s while nothing changes, so a `working` floor stays fresh within the provider's 120 s TTL.
- * Each send waits at most 2 s: it is fire-and-forget and must never slow a tool call. */
+ * Sends never block tool calls. A slow fetch is reported after 2 s; session.end awaits the serialized final send. */
 export const OFFICE_BEAT_MIN_MS = 2_000
 export const OFFICE_BEAT_REFRESH_MS = 30_000
 export const OFFICE_BEAT_TIMEOUT_MS = 2_000
@@ -712,6 +712,8 @@ export function officeHeaderLines(o: { session?: string | null; project?: string
   return out
 }
 
+type OfficeBeat = { status: 'working' | 'idle' | 'ended'; tool: string | null; force: boolean }
+
 type OfficeState = {
   salt: string | null
   device: string | null
@@ -719,10 +721,15 @@ type OfficeState = {
   reported: Set<string>
   last: { status: string; tool: string | null; at: number } | null
   failures: number
+  pending: OfficeBeat | null
+  running: Promise<void> | null
+  wake: (() => void) | null
+  ended: boolean
 }
 
 export function newOfficeState(): OfficeState {
-  return { salt: null, device: null, project: null, reported: new Set(), last: null, failures: 0 }
+  return { salt: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
+    pending: null, running: null, wake: null, ended: false }
 }
 
 /** Report one Office failure ONCE per kind as a dim transcript notice ($.ui.log is not sent to the model), with its
@@ -789,18 +796,59 @@ async function officeIdentity($: any, office: OfficeState): Promise<{ session: s
   return { session, project: office.project || null, device: office.device || null }
 }
 
-/** One heartbeat to POST /v1/cortados/office/heartbeat, throttled (OFFICE_BEAT_*); `force` skips the throttle (session
- * start/end, turn end). Fire-and-forget with a 2 s cap; a failure is reported once. Never throws. */
-async function officeBeat($: any, cfg: Cfg, office: OfficeState, status: 'working' | 'idle' | 'ended', tool: string | null, force = false): Promise<void> {
-  let timer: any
-  try {
+/** One in-flight request and one latest pending state. Changes inside the throttle get a trailing send even if
+ * no further hook fires. Force wakes the delay; ended supersedes pending work and waits for the serialized send.
+ * The host's $.http.fetch has no cancellation option: a slow request is reported at 2 s, but we MUST retain the
+ * serialization lock until it settles (Promise.race would let an older write land after idle/ended). */
+function officeBeat($: any, cfg: Cfg, office: OfficeState, status: 'working' | 'idle' | 'ended', tool: string | null, force = false): Promise<void> {
+  if (office.ended && status !== 'ended') return office.running ?? Promise.resolve()
+  if (status === 'ended') office.ended = true
+  office.pending = { status, tool, force }
+  office.wake?.()
+  if (!office.running) {
+    office.running = officeDrain($, cfg, office).finally(() => {
+      office.running = null
+      // An enqueue can race the drain's last await/return; keep that last state attached to this flush promise.
+      const p = office.pending
+      if (p) return officeBeat($, cfg, office, p.status, p.tool, p.force)
+    })
+  }
+  return office.running
+}
+
+async function officeDrain($: any, cfg: Cfg, office: OfficeState): Promise<void> {
+  while (office.pending) {
     let now = NaN
     try { now = Number(await $.clock.now()) } catch { now = Date.now() }
     if (!Number.isFinite(now)) now = Date.now()
+    const p = office.pending!
     const last = office.last
-    const changed = !last || last.status !== status || last.tool !== tool
-    if (!force && last && !(changed ? now - last.at >= OFFICE_BEAT_MIN_MS : now - last.at >= OFFICE_BEAT_REFRESH_MS)) return
-    office.last = { status, tool, at: now }
+    const changed = !last || last.status !== p.status || last.tool !== p.tool
+    if (!p.force && last) {
+      if (!changed && now - last.at < OFFICE_BEAT_REFRESH_MS) {
+        office.pending = null                  // duplicate, not a lost state transition
+        continue
+      }
+      const delay = OFFICE_BEAT_MIN_MS - (now - last.at)
+      if (changed && delay > 0) {
+        const due = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => { office.wake = null; resolve(true) }, delay)
+          office.wake = () => { clearTimeout(timer); office.wake = null; resolve(false) }
+        })
+        if (!due) continue                     // latest state or clock changed: recompute its throttle
+        now += delay
+      }
+    }
+    const beat = office.pending!
+    office.pending = null
+    office.last = { status: beat.status, tool: beat.tool, at: now }
+    await officeSend($, cfg, office, beat)
+  }
+}
+
+async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool }: OfficeBeat): Promise<void> {
+  let timer: any
+  try {
     const id = await officeIdentity($, office)
     if (!id.session) return                     // reported by officeIdentity; nothing can name this session's floor
     const token = await resolveToken($, cfg)
@@ -810,12 +858,9 @@ async function officeBeat($: any, cfg: Cfg, office: OfficeState, status: 'workin
     const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
                                   tool: tool && validToolName(tool) ? tool : null })
     const url = String(cfg.providerUrl).replace(/\/+$/, '') + '/v1/cortados/office/heartbeat'
-    const req = Promise.resolve($.http.fetch(url, { method: 'POST', body,
-      headers: { 'content-type': 'application/json', 'x-api-key': token, Authorization: `Bearer ${token}` } }))
-    req.catch(() => {})
-    const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), OFFICE_BEAT_TIMEOUT_MS) })
-    const res: any = await Promise.race([req, timeout])
-    if (!res) throw new Error('timeout')
+    timer = setTimeout(() => officeReport($, office, 'heartbeat', new Error('timeout')), OFFICE_BEAT_TIMEOUT_MS)
+    const res: any = await $.http.fetch(url, { method: 'POST', body,
+      headers: { 'content-type': 'application/json', 'x-api-key': token, Authorization: `Bearer ${token}` } })
     if (!res.ok) throw new Error(`HTTP ${Number(res.status) || 0}`)
   } catch (err) {
     officeReport($, office, 'heartbeat', err)
@@ -1119,7 +1164,7 @@ export const register: Register = (on, options) => {
       return next(e)
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
     on('session.end', async ($: any, e: any, next: any) => {
-      await officeBeat($, cfg, office, 'ended', null, true)   // awaited (2 s cap): the process may exit right after
+      await officeBeat($, cfg, office, 'ended', null, true)   // flush in order: the process may exit right after
       return next(e)
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
   }
