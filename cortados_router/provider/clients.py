@@ -20,6 +20,7 @@ CLI (never prints a token):
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import hmac
 import json
@@ -215,10 +216,20 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     p = clients_path()
     try:
-        doc = _load_doc(p)
+        # Lock the stable sibling, not clients.json: replacement changes that file's inode.
+        # Keep load, candidate validation and replacement in one critical section to preserve revocations.
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(p.with_name(p.name + ".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return _locked_main(args, p)
     except (OSError, ClientsError) as exc:
         print(f"clients: {p}: {exc}", file=sys.stderr)
         return 1
+
+
+def _locked_main(args, p: Path) -> int:
+    doc = _load_doc(p)
     if args.cmd == "list":
         for e in doc["clients"]:
             print(f"{e['name']}: {', '.join(e['scopes'])}")
@@ -229,13 +240,20 @@ def main(argv=None) -> int:
             print(f"clients: no client named {args.name}", file=sys.stderr)
             return 1
         doc["clients"] = kept
-        _write_private(p, json.dumps(doc, indent=1) + "\n")
+        candidate = json.dumps(doc, indent=1) + "\n"
+        parse(candidate)
+        _write_private(p, candidate)
         print(f"clients: removed {args.name}")
         return 0
     if not _NAME_RE.fullmatch(args.name) or any(e["name"] == args.name for e in doc["clients"]):
         print(f"clients: {args.name!r} is not a valid new client name", file=sys.stderr)
         return 1
+    if len(doc["clients"]) >= MAX_CLIENTS:
+        raise ClientsError(f"cannot add more than {MAX_CLIENTS} clients")
     token = secrets.token_urlsafe(32)
+    doc["clients"].append({"name": args.name, "token_sha256": token_digest(token), "scopes": sorted(set(args.scope))})
+    candidate = json.dumps(doc, indent=1) + "\n"
+    parse(candidate)                                # reject the full candidate BEFORE creating the token file
     tf = Path(os.path.expanduser(args.token_file))
     tf.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -245,8 +263,7 @@ def main(argv=None) -> int:
         return 1
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(token + "\n")
-    doc["clients"].append({"name": args.name, "token_sha256": token_digest(token), "scopes": sorted(set(args.scope))})
-    _write_private(p, json.dumps(doc, indent=1) + "\n")
+    _write_private(p, candidate)
     print(f"clients: added {args.name} ({', '.join(sorted(set(args.scope)))}); token written to {tf}")
     return 0
 

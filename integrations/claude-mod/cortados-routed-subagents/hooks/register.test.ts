@@ -1107,6 +1107,37 @@ test('ended waits for a slow uncancellable fetch, flushes last, and never resurr
   expect(h.release.length).toBe(2)
 })
 
+test('clock failures and invalid readings are reported while heartbeats still send', async () => {
+  for (const invalid of [false, true]) {
+    const h = officeHarness()
+    h.$.clock.now = async () => { if (invalid) return NaN; throw new Error('private clock details tok') }
+    const next = async (e: any) => e
+    await h.handlers['turn.complete'](h.$, {}, next)
+    await h.settle()
+    await h.handlers['session.end'](h.$, {}, next)
+    expect(h.beats.map((b) => b.body.status)).toEqual(['idle', 'ended'])
+    expect(h.logs.length).toBe(1)
+    expect(h.logs[0]).toContain('office clock failed')
+    expect(h.logs[0]).not.toContain('private clock')
+    expect(h.logs[0]).not.toContain('tok')
+  }
+})
+
+test('model read failures are reported and send null metadata without losing lifecycle', async () => {
+  const h = officeHarness()
+  h.$.session.model = async () => { throw new Error('private model details tok') }
+  const next = async (e: any) => e
+  await h.handlers['turn.complete'](h.$, {}, next)
+  await h.settle()
+  await h.handlers['session.end'](h.$, {}, next)
+  expect(h.beats.map((b) => b.body.status)).toEqual(['idle', 'ended'])
+  expect(h.beats.every((b) => b.body.model === null)).toBe(true)
+  expect(h.logs.length).toBe(1)
+  expect(h.logs[0]).toContain('office model failed')
+  expect(h.logs[0]).not.toContain('private model')
+  expect(h.logs[0]).not.toContain('tok')
+})
+
 test('a failing heartbeat is reported once and never breaks the tool call', async () => {
   const h = officeHarness()
   ;(h.$ as any).http.fetch = async () => { throw new Error('ECONNREFUSED tok') }
@@ -1120,4 +1151,3 @@ test('a failing heartbeat is reported once and never breaks the tool call', asyn
   expect(h.logs[0]).toContain('office heartbeat failed')
   expect(h.logs[0]).not.toContain('tok')
 })
-

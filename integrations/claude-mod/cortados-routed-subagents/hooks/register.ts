@@ -819,8 +819,13 @@ function officeBeat($: any, cfg: Cfg, office: OfficeState, status: 'working' | '
 async function officeDrain($: any, cfg: Cfg, office: OfficeState): Promise<void> {
   while (office.pending) {
     let now = NaN
-    try { now = Number(await $.clock.now()) } catch { now = Date.now() }
-    if (!Number.isFinite(now)) now = Date.now()
+    try {
+      now = Number(await $.clock.now())
+      if (!Number.isFinite(now)) throw new Error('invalid clock')
+    } catch (err) {
+      officeReport($, office, 'clock', err)
+      now = Date.now() // Keep metadata delivery/throttling alive when the host clock is unavailable; reported above.
+    }
     const p = office.pending!
     const last = office.last
     const changed = !last || last.status !== p.status || last.tool !== p.tool
@@ -854,7 +859,15 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
     const token = await resolveToken($, cfg)
     if (!token) throw new Error('no provider token')
     let model: string | null = null
-    try { const m = await $.session.model(); model = headerSafeModel(m) ? String(m) : null } catch { model = null }
+    try {
+      const m = await $.session.model()
+      if (!headerSafeModel(m)) throw new Error('invalid model')
+      model = String(m)
+    } catch (err) {
+      officeReport($, office, 'model', err)
+      // Model is optional metadata: send the lifecycle state with null instead of inventing a model or losing it.
+      model = null
+    }
     const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
                                   tool: tool && validToolName(tool) ? tool : null })
     const url = String(cfg.providerUrl).replace(/\/+$/, '') + '/v1/cortados/office/heartbeat'

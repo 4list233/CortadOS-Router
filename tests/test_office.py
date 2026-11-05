@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import time
@@ -82,7 +83,7 @@ class ScopeTests(OfficeHarness):
             code, raw = self.request("POST", p, OFFICE_TOKEN, body=body)
             self.assertEqual(code, 403, (p, raw))
         # Review r1 corrects the old weak "not 2xx" expectation: every unsupported method must hit the scope gate.
-        for m in ("HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"):
+        for m in ("HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT", "PROPFIND", "CUSTOM", "X-ARBITRARY"):
             for path in ("/v1/cortados/office", "/health", "/nope"):
                 with self.subTest(method=m, path=path):
                     code, raw = self.request(m, path, OFFICE_TOKEN)
@@ -164,6 +165,76 @@ class ClientReadLimitTests(unittest.TestCase):
 
 
 class ClientsCliTests(unittest.TestCase):
+    def test_concurrent_revocations_are_serialized(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "clients.json"
+            tokens = ["client-token-00000001", "client-token-00000002"]
+            write_clients(path, [{"name": name, "token_sha256": clients.token_digest(token),
+                                  "scopes": ["office:read"]} for name, token in zip(("one", "two"), tokens)])
+            cache = clients.ClientTokens(path=path)
+            self.assertTrue(all(cache.match(t) for t in tokens))
+            first_loaded, release, second_loaded = threading.Event(), threading.Event(), threading.Event()
+            load = clients._load_doc
+            results = []
+            def held_load(p):
+                doc = load(p)
+                if threading.current_thread().name == "first":
+                    first_loaded.set()
+                    if not release.wait(3):
+                        raise AssertionError("first revocation timed out")
+                else:
+                    second_loaded.set()
+                return doc
+            def remove(name):
+                results.append(clients.main(["remove", name]))
+            with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_CLIENTS": str(path)}), \
+                    mock.patch.object(clients, "_load_doc", side_effect=held_load), redirect_stdout(io.StringIO()):
+                first = threading.Thread(target=remove, args=("one",), name="first")
+                second = threading.Thread(target=remove, args=("two",), name="second")
+                first.start()
+                try:
+                    self.assertTrue(first_loaded.wait(2))
+                    second.start()
+                    self.assertFalse(second_loaded.wait(.15), "second edit loaded before the first committed")
+                finally:
+                    release.set()
+                    first.join(3)
+                    if second.ident is not None:
+                        second.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(sorted(results), [0, 0])
+            self.assertEqual(json.loads(path.read_text())["clients"], [])
+            self.assertTrue(all(cache.match(t) is None for t in tokens))
+
+    def test_capacity_rejection_preserves_every_existing_credential(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, tf = Path(d) / "clients.json", Path(d) / "overflow-token"
+            tokens = [f"existing-token-{i:016d}" for i in range(clients.MAX_CLIENTS)]
+            write_clients(path, [{"name": f"client-{i}", "token_sha256": clients.token_digest(t),
+                                  "scopes": ["office:read"]} for i, t in enumerate(tokens)])
+            before = path.read_bytes()
+            cache = clients.ClientTokens(path=path)
+            with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_CLIENTS": str(path)}):
+                self.assertEqual(clients.main(["add", "overflow", "--scope", "office:read",
+                                               "--token-file", str(tf)]), 1)
+            self.assertFalse(tf.exists())
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(all(cache.match(t).allows("GET", clients.OFFICE_PATH) for t in tokens))
+
+    def test_invalid_candidate_is_rejected_before_token_creation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, tf = Path(d) / "clients.json", Path(d) / "new-token"
+            write_clients(path, [{"name": "existing", "token_sha256": clients.token_digest(OFFICE_TOKEN),
+                                  "scopes": ["office:read"]}])
+            before = path.read_bytes()
+            with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_CLIENTS": str(path)}), \
+                    mock.patch.object(clients.secrets, "token_urlsafe", return_value=OFFICE_TOKEN):
+                self.assertEqual(clients.main(["add", "duplicate", "--scope", "office:read",
+                                               "--token-file", str(tf)]), 1)
+            self.assertFalse(tf.exists())
+            self.assertEqual(path.read_bytes(), before)
+
     def test_add_list_remove_never_prints_the_token(self):
         d = tempfile.mkdtemp()
         cf, tf = os.path.join(d, "clients.json"), os.path.join(d, "sub", "office-token")
@@ -424,6 +495,25 @@ class ChildTaskViewTests(OfficeHarness):
         self.assertEqual([w["run_id"] for f in v["floors"] for w in f["workers"]],
                          ["run-live-0001", "run-child-0000"])
         self.assertEqual(v["lobby"]["workers"], [])  # hidden floors never spill into the lobby
+
+    def test_resumed_old_worker_survives_floor_and_lobby_caps(self):
+        now = 100_000.0
+        for session, cap in ((SESSION, office.MAX_WORKERS_PER_FLOOR), (None, office.MAX_LOBBY)):
+            with self.subTest(session=session):
+                b = office.OfficeBoard()
+                tags = {"session": session} if session else {}
+                for i in range(cap + 1):
+                    b.turn_start(f"r:run-cap-{i:04d}", tags, run_id=f"run-cap-{i:04d}",
+                                 provider="codex", lane="codex", model="gpt-6.1-sol", now=now - 100 + i)
+                # Oldest start, newest activity: it must be selected before all the newer-started workers.
+                b.turn_end("r:run-cap-0000", tags, status="working", now=now)
+                v = b.view([], now=now)
+                group = v["floors"][0] if session else v["lobby"]
+                self.assertEqual(len(group["workers"]), cap)
+                self.assertEqual(group["workers_hidden"], 1)
+                self.assertEqual(group["workers"][0]["run_id"], "run-cap-0000")
+                self.assertNotIn(f"run-cap-{1:04d}", [w["run_id"] for w in group["workers"]])
+                self.assertTrue(all("updated" not in w for w in group["workers"]))
 
     def test_global_worker_cap_precedes_per_floor_and_lobby_caps(self):
         now = 100_000.0

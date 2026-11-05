@@ -289,7 +289,7 @@ class OfficeBoard:
         by_floor: dict[str | None, list[dict[str, Any]]] = {}
         for w in visible[:MAX_WORKERS]:
             s = w.get("session") if w.get("session") in floors else None
-            by_floor.setdefault(s, []).append(_pub_worker(w))
+            by_floor.setdefault(s, []).append(w)  # retain private activity until per-floor/lobby selection
         out_floors = []
         for s, f in sorted(floors.items(), key=lambda kv: -(kv[1].get("last") or 0)):
             ws = _cap(by_floor.get(s, []), MAX_WORKERS_PER_FLOOR)
@@ -418,8 +418,8 @@ def _pub_worker(w: dict[str, Any]) -> dict[str, Any]:
 def _cap(items: list[dict[str, Any]], n: int) -> dict[str, Any]:
     """The n most relevant workers (working first, then the most recent), and how many were left out."""
     rank = {"working": 0, "idle": 1, "error": 2, "done": 3}
-    items = sorted(items, key=lambda w: (rank.get(w["status"], 4), -(w.get("started_at") or 0)))
-    return {"items": items[:n], "hidden": max(0, len(items) - n)}
+    items = sorted(items, key=lambda w: (rank.get(w["status"], 4), -(w.get("updated") or 0)))
+    return {"items": [_pub_worker(w) for w in items[:n]], "hidden": max(0, len(items) - n)}
 
 
 def _ts(x: Any) -> float | None:

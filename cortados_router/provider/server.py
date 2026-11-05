@@ -1072,7 +1072,12 @@ class Handler(BaseHTTPRequestHandler):
             # Preserve BaseHTTPRequestHandler's unsupported-method response for owner/unknown credentials.
             self.send_error(501, "Unsupported method (%r)" % self.command)
 
-    do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _unsupported_method
+    def __getattr__(self, name):
+        # BaseHTTPRequestHandler dispatches via do_<method>. Cover EVERY unsupported method, including extension
+        # methods, rather than an allowlist that silently leaves gaps in the scoped-token 403 contract.
+        if name.startswith("do_"):
+            return self._unsupported_method
+        raise AttributeError(name)
 
     def do_GET(self):
         self._authed = False

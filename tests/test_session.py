@@ -354,4 +354,3 @@ class OfficeHeaderTests(unittest.TestCase):
                     "x-cortados-device", "x-cortados-task-title: " + "x" * 81):
             with self.assertRaises(sess.SessionError, msg=bad):
                 sess.custom_headers(None, [bad])
-
