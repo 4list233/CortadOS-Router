@@ -14,8 +14,15 @@
  *   - isolation (worktree/remote): the native runner owns the worktree/remote semantics; routing locally would
  *     silently drop them and let parallel isolated agents clobber one another.
  *   - a named agent: the parent registers it for SendMessage; a subprocess cannot join that registry.
- *   - background (run_in_background): can outlive the subprocess timeout (subagentTimeoutMs), unless routeBackground is on.
  *   - no provider token available: better a working native subagent than a failed call.
+ *
+ * Background subagents (run_in_background) are routed too (routeBackground, on by default; owner decision 2026-11-04:
+ * every subagent goes through S1). $.process.run cannot hold one: it caps a child at ten minutes and real background
+ * builders run 30-60+ minutes. So a background child is started DETACHED by a fixed shell launcher (BG_LAUNCH_SH)
+ * with its own watchdog at backgroundTimeoutMs (2 h default, 3 h max), and the hook answers at once with the Agent
+ * tool's own `async_launched` record. A poll loop then waits for the child's exit file and delivers the result as a
+ * notification through $.prompt.submit (a turn of its own once the session is idle), and writes it to the record's
+ * outputFile, which the parent can Read at any time. routeBackground off hands background work back to native.
  *
  * Once the child has been launched it has already acted, so the hook NEVER falls back to native after that point
  * (that would re-run non-idempotent work). Any failure past the launch becomes a clean `deny`, not a re-dispatch.
@@ -35,6 +42,7 @@ type Cfg = {
   orchestratorEnforce: boolean
   orchestratorAllowedTools: string
   subagentTimeoutMs: number
+  backgroundTimeoutMs: number
   maxTurns: number
   excludeBuilderOnReview: boolean
   mainSessionGuard: boolean
@@ -48,7 +56,9 @@ const FALLBACK: Cfg = {
   permissionMode: 'bypassPermissions',
   allowedTools: 'Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit',
   claudeBin: 'claude',
-  routeBackground: false,
+  // Owner decision 2026-11-04: every subagent goes through S1, background ones included. They run detached under
+  // their own, longer limit (backgroundTimeoutMs), so the foreground 10-minute cap no longer argues for native.
+  routeBackground: true,
   // Orchestrator mode: the main session (the "brain") is DIRECTED to plan and delegate work to routed subagents,
   // via a standing system-prompt directive. By default this is GUIDANCE, not a cage: the brain keeps its tools and
   // may act directly when that is clearly the sensible choice (a trivial edit, its own bookkeeping) — delegation is
@@ -63,8 +73,12 @@ const FALLBACK: Cfg = {
   orchestratorAllowedTools: 'Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch',
   // How long a routed subagent subprocess may run before it is aborted. The default is the host's own ceiling
   // (MAX_SUBAGENT_TIMEOUT_MS): a larger value is rejected by $.process.run and the subagent never launches.
-  // Background routed work is separate.
+  // Background routed work is separate (backgroundTimeoutMs).
   subagentTimeoutMs: 600_000,
+  // How long a routed BACKGROUND subagent may run before its watchdog stops it. 2 h: real background builders run
+  // 30-60+ minutes, so the foreground 10-minute cap would kill them, and twice their usual length still bounds a
+  // runaway's quota burn. Capped at MAX_BACKGROUND_TIMEOUT_MS.
+  backgroundTimeoutMs: 7_200_000,
   // `claude -p --max-turns N`: the child stops after N agentic turns instead of looping until the timeout kills it
   // (incident 2026-11-03: a research child made 70 tool calls against a broken WebSearch, ran 600 s, cost $1.57 and
   // returned nothing). OPT-IN (0 = off): there is no evidence yet that any blanket budget is safe for builders, whose
@@ -86,6 +100,19 @@ const MIN_SUBAGENT_TIMEOUT_MS = 1
 // A retry with less than this left cannot start `claude -p` and finish a turn; it would only fail on its own timeout.
 const MIN_RETRY_MS = 30_000
 const MAX_SUBAGENT_TIMEOUT_MS = 600_000
+// A background child runs detached (BG_LAUNCH_SH), outside $.process.run's ten-minute limit, so its ceiling is ours:
+// 3 h, the same as a CortadOS child task's (child_tasks.CHILD_MAX_S_DEFAULT), because an unattended child that never
+// ends burns quota. resolveBackgroundTimeoutMs clamps into 1..this.
+const MAX_BACKGROUND_TIMEOUT_MS = 10_800_000
+// How often the poll loop looks for a background child's exit file: a 5 s delay on a 30-60 minute run is nothing,
+// and one small file read per 5 s costs nothing either.
+export const BG_POLL_MS = 5_000
+// After the watchdog fires it allows the child 10 s to stop on TERM before KILL, then the launcher writes the exit
+// file; a minute past the limit with no exit file means the launcher itself is gone, and the poll loop stops waiting.
+const BG_GRACE_MS = 60_000
+// A notification is a user turn of its own; past this many characters the model reads the head and the outputFile
+// path instead of a wall of text (the whole result is always in outputFile).
+const BG_NOTIFY_MAX_CHARS = 50_000
 
 // Delegation must never be gated off, whatever the allowlist config says, or the brain could not delegate at all.
 // Both the Agent tool and the route_task MCP tool are delegation primitives.
@@ -511,6 +538,51 @@ export function resolveTimeoutMs(v: unknown): number {
   return Math.min(MAX_SUBAGENT_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
 }
 
+/** The background timeout from config as an integer in 1..MAX_BACKGROUND_TIMEOUT_MS, with resolveTimeoutMs's rules:
+ * an invalid or non-positive value falls back to the default (a typo never removes the limit), a fraction is floored,
+ * anything above the cap is clamped to it. */
+export function resolveBackgroundTimeoutMs(v: unknown): number {
+  const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN
+  if (Number.isNaN(n) || n <= 0) return FALLBACK.backgroundTimeoutMs
+  return Math.min(MAX_BACKGROUND_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
+}
+
+/** The fixed launcher of a background child. Arguments, never spliced into the script: $1 the limit in whole seconds,
+ * the rest the child's argv. It makes a private (mktemp -d, 0700) run directory, starts the child there detached
+ * (nohup, its own process group via set -m, stdin/stdout/stderr on files, so $.process.run returns at once and the
+ * child outlives the hook, the turn and a mod reload), and prints the directory. The detached wrapper runs a watchdog
+ * that, at the limit, touches `timedout`, sends TERM and 10 s later KILL; when the child ends it stops the watchdog and
+ * writes the exit code to `exit` atomically (exit.tmp, then mv), so a reader never sees a half-written code. */
+export const BG_LAUNCH_SH = [
+  'set -m',
+  'secs=$1; shift',
+  'd=$(mktemp -d "${TMPDIR:-/tmp}/cortados-bg.XXXXXX") || exit 1',
+  `D="$d" S="$secs" nohup sh -c '`,
+  '"$@" > "$D/stdout" 2> "$D/stderr" < /dev/null &',
+  'c=$!',
+  '(',
+  `  trap '"'"'kill "$sp" 2>/dev/null; exit 0'"'"' TERM`,
+  '  sleep "$S" & sp=$!',
+  '  wait "$sp"',
+  '  : > "$D/timedout"',
+  '  kill -TERM "$c" 2>/dev/null',
+  '  sleep 10',
+  '  kill -KILL "$c" 2>/dev/null',
+  ') &',
+  'w=$!',
+  'wait "$c"',
+  'ec=$?',
+  'kill -TERM "$w" 2>/dev/null',
+  'printf %s "$ec" > "$D/exit.tmp" && mv "$D/exit.tmp" "$D/exit"',
+  `' sh "$@" > /dev/null 2>&1 < /dev/null &`,
+  'printf "%s\\n" "$d"',
+].join('\n')
+
+/** A run directory exactly as BG_LAUNCH_SH's mktemp names it: an absolute path ending in cortados-bg.<random>. */
+export function isBgDir(s: unknown): s is string {
+  return typeof s === 'string' && /^\/[^\n\0]*\/cortados-bg\.[A-Za-z0-9]+$/.test(s)
+}
+
 // ---- Main-session guard (WARN ONLY) ------------------------------------------------------------------------------
 // The owner runs the main session on direct Claude and routes every subagent; the guard nudges the main session when
 // it does substantive work itself. It NEVER blocks, denies or rewrites a call (the owner chose "warn only"): every
@@ -653,6 +725,7 @@ function guardPublish($: any, guard: GuardState, text: string | undefined): void
 export const register: Register = (on, options) => {
   const cfg: Cfg = { ...FALLBACK, ...(options as Partial<Cfg>) }
   const subagentTimeoutMs = resolveTimeoutMs(cfg.subagentTimeoutMs)
+  const backgroundTimeoutMs = resolveBackgroundTimeoutMs(cfg.backgroundTimeoutMs)
 
   // Guard state for this session. Closure variables, so a mod reload (or Claude Code restart) starts the counters and
   // the toast throttle over; the on/off override lives in $.store and survives both.
@@ -735,49 +808,45 @@ export const register: Register = (on, options) => {
     // Each run also gets a session id we choose, so on a timeout (when $.process.run rejects and its output is gone)
     // the child's own transcript can still be read for how far it got.
     let sessionId = ''
+    /** The child's launch environment for one run (the run id must already be set). */
+    const childEnv = (headers: string): Record<string, string> => ({
+      // The child inherits the parent's environment and credentials. Two things there can make it send the
+      // wrong token to the provider and get a 401:
+      //   1. Under the desktop app, CLAUDE_CODE_ENTRYPOINT=claude-desktop makes the CLI authenticate with the
+      //      host's claude.ai OAuth session and ignore the env token (found 2026-10-28 with a header sniffer).
+      //      Forcing the entrypoint to `cli` stops that.
+      //   2. The CLI resolves credentials over BOTH channels — x-api-key (ANTHROPIC_API_KEY, a saved Console
+      //      key, or apiKeyHelper output) and bearer (ANTHROPIC_AUTH_TOKEN). An empty ANTHROPIC_API_KEY still
+      //      lets a saved key / apiKeyHelper load and be sent (Codex review, 2026-10-28). So set BOTH channels
+      //      to the provider token: whichever the CLI selects, it is the provider token, and no inherited key
+      //      leaks. The child only ever contacts the provider (ANTHROPIC_BASE_URL pins it), never the real API.
+      // Neutralize inherited vars that could override or redirect the child regardless of the above: a custom
+      // x-api-key header (ANTHROPIC_CUSTOM_HEADERS) is merged after the SDK credentials and would replace the
+      // provider key, and the Bedrock/Vertex selectors would send the turn to another transport entirely
+      // (Codex review, 2026-10-28). $.process.run only ADDS over the host env, so blanking is how these are cleared.
+      // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
+      // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
+      // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
+      // For a review it also carries `x-cortados-exclude-model: <models>` (newline-separated line, comma-separated
+      // ids): the main session's model and the tracked worker models (see modelsToExclude). Every run also
+      // carries `x-cortados-run-id: <id>`, used to fetch the run's record (the real routed model) afterwards.
+      ANTHROPIC_BASE_URL: String(cfg.providerUrl),
+      ANTHROPIC_API_KEY: token,
+      ANTHROPIC_AUTH_TOKEN: token,
+      CLAUDE_CODE_ENTRYPOINT: 'cli',
+      ANTHROPIC_CUSTOM_HEADERS: headers + '\nx-cortados-run-id: ' + runId,
+      ANTHROPIC_UNIX_SOCKET: '',
+      CLAUDE_CODE_USE_BEDROCK: '',
+      CLAUDE_CODE_USE_VERTEX: '',
+      CLAUDE_CODE_USE_FOUNDRY: '',
+      CLAUDE_CODE_USE_MANTLE: '',
+      CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+      CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
+    })
     const runChild = (headers: string, timeoutMs: number): Promise<RunRes> => {
       runId = newRunId()
       sessionId = newSessionId()
-      return $.process.run(
-        [String(cfg.claudeBin), ...args, '--session-id', sessionId],
-        {
-          // The child inherits the parent's environment and credentials. Two things there can make it send the
-          // wrong token to the provider and get a 401:
-          //   1. Under the desktop app, CLAUDE_CODE_ENTRYPOINT=claude-desktop makes the CLI authenticate with the
-          //      host's claude.ai OAuth session and ignore the env token (found 2026-10-28 with a header sniffer).
-          //      Forcing the entrypoint to `cli` stops that.
-          //   2. The CLI resolves credentials over BOTH channels — x-api-key (ANTHROPIC_API_KEY, a saved Console
-          //      key, or apiKeyHelper output) and bearer (ANTHROPIC_AUTH_TOKEN). An empty ANTHROPIC_API_KEY still
-          //      lets a saved key / apiKeyHelper load and be sent (Codex review, 2026-10-28). So set BOTH channels
-          //      to the provider token: whichever the CLI selects, it is the provider token, and no inherited key
-          //      leaks. The child only ever contacts the provider (ANTHROPIC_BASE_URL pins it), never the real API.
-          // Neutralize inherited vars that could override or redirect the child regardless of the above: a custom
-          // x-api-key header (ANTHROPIC_CUSTOM_HEADERS) is merged after the SDK credentials and would replace the
-          // provider key, and the Bedrock/Vertex selectors would send the turn to another transport entirely
-          // (Codex review, 2026-10-28). $.process.run only ADDS over the host env, so blanking is how these are cleared.
-          // ANTHROPIC_CUSTOM_HEADERS is set rather than blanked: it carries only `x-cortados-reveal: 1`, which asks the
-          // provider to name the real routed model and its lane's remaining % in `model` (the label below), and as
-          // the whole value it still replaces any inherited custom headers, so no x-api-key override survives.
-          // For a review it also carries `x-cortados-exclude-model: <models>` (newline-separated line, comma-separated
-          // ids): the main session's model and the tracked worker models (see modelsToExclude). Every run also
-          // carries `x-cortados-run-id: <id>`, used to fetch the run's record (the real routed model) afterwards.
-          env: {
-            ANTHROPIC_BASE_URL: String(cfg.providerUrl),
-            ANTHROPIC_API_KEY: token,
-            ANTHROPIC_AUTH_TOKEN: token,
-            CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: headers + '\nx-cortados-run-id: ' + runId,
-            ANTHROPIC_UNIX_SOCKET: '',
-            CLAUDE_CODE_USE_BEDROCK: '',
-            CLAUDE_CODE_USE_VERTEX: '',
-            CLAUDE_CODE_USE_FOUNDRY: '',
-            CLAUDE_CODE_USE_MANTLE: '',
-            CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
-            CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: '',
-          },
-          timeoutMs,
-        },
-      )
+      return $.process.run([String(cfg.claudeBin), ...args, '--session-id', sessionId], { env: childEnv(headers), timeoutMs })
     }
     /** The provider's record of the last run, or null; tracks a non-review run's models. Never throws. */
     const recordLastRun = async (): Promise<RunRecord | null> => {
@@ -810,6 +879,126 @@ export const register: Register = (on, options) => {
         return `[${elapsed}; ${where}; transcript unreadable: ${scrubToken(String(err), token).slice(0, 200)}]`
       }
     }
+    if (background) {
+      // ---- Background: launch detached, answer `async_launched` now, deliver the result when the child ends. ----
+      /** Start one detached run (fresh run id and session id) under BG_LAUNCH_SH; resolves its run directory. */
+      const launchDetached = async (headers: string, timeoutMs: number): Promise<string> => {
+        runId = newRunId()
+        sessionId = newSessionId()
+        const argv = ['sh', '-c', BG_LAUNCH_SH, 'sh', String(Math.max(1, Math.ceil(timeoutMs / 1000))), String(cfg.claudeBin), ...args, '--session-id', sessionId]
+        const r = await $.process.run(argv, { env: childEnv(headers) })
+        const dir = String(r?.stdout ?? '').split('\n')[0].trim()
+        if (r?.exitCode !== 0 || !isBgDir(dir)) throw new Error(`background launcher failed (exit ${r?.exitCode})`)
+        return dir
+      }
+      /** Wait for a detached run's exit file, then read what it left. Never throws for a missing file; a run whose
+       * launcher vanished (no exit file a grace past the limit) comes back as exit -1. */
+      const waitDetached = async (dir: string, timeoutMs: number): Promise<RunRes & { timedOut: boolean }> => {
+        const giveUpAt = Date.now() + timeoutMs + BG_GRACE_MS
+        let exitText: string | null = null
+        for (;;) {
+          try { exitText = String(await $.fs.read(`${dir}/exit`)) } catch { exitText = null }
+          if (exitText !== null || Date.now() > giveUpAt) break
+          await $.clock.sleep(BG_POLL_MS)
+        }
+        let stdout = ''
+        let isStdoutTruncated = false
+        // $.fs.read rejects past 4 MiB: an unreadable stdout is treated like a truncated one (refused, never trusted).
+        try { stdout = String(await $.fs.read(`${dir}/stdout`)) } catch { isStdoutTruncated = exitText !== null }
+        let stderr = ''
+        try { stderr = String(await $.fs.read(`${dir}/stderr`)) } catch { /* optional */ }
+        let timedOut = exitText === null
+        try { await $.fs.read(`${dir}/timedout`); timedOut = true } catch { /* not timed out */ }
+        const code = exitText === null ? -1 : Number.parseInt(exitText.trim(), 10)
+        return { exitCode: Number.isFinite(code) ? code : -1, stdout, stderr, isStdoutTruncated, timedOut }
+      }
+
+      let firstDir: string
+      try {
+        firstDir = await launchDetached(customHeaders, backgroundTimeoutMs)
+      } catch (err) {
+        // The launcher may have started the child before failing: refuse, never re-dispatch natively.
+        return { deny: scrubToken(`routed background subagent failed to launch: ${err}`, token) }
+      }
+      const outputFile = `${firstDir}/output.md`
+      const agentId = `routed-bg-${sessionId}`
+      const writeOutput = async (text: string): Promise<boolean> => {
+        try { await $.fs.write(outputFile, text); return true } catch { return false }
+      }
+      await writeOutput(`Routed background subagent "${description}" is running (agentId ${agentId}, session ${sessionId}, limit ${fmtSecs(backgroundTimeoutMs)}).\nThis file is replaced by its result when it finishes.\n`)
+      guard.routedActive += 1
+      guardTry($, guard, 'status', () => $.ui.status(`↗ routed background subagent (${description})`))
+
+      const finish = async (): Promise<void> => {
+        let body: string
+        let ok = false
+        try {
+          let res = await waitDetached(firstDir, backgroundTimeoutMs)
+          let p = parseResult(res.stdout)
+          let note = ''
+          // As in the foreground: an exclude header the router refused is retried ONCE without it, in what is left
+          // of the one overall budget.
+          if (excluded.length && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+            const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
+            const remainingMs = Math.floor(backgroundTimeoutMs - (Date.now() - startedAt))
+            if (reason && remainingMs >= MIN_RETRY_MS) {
+              $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
+              note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
+              const dir = await launchDetached('x-cortados-reveal: 1', remainingMs)
+              res = await waitDetached(dir, remainingMs)
+              p = parseResult(res.stdout)
+            }
+          }
+          const record = await recordLastRun()
+          if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+            const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}${res.timedOut ? `, timeout ${fmtSecs(backgroundTimeoutMs)}` : ''}`
+            const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
+            body = `${note}routed background subagent did not complete cleanly (${why}): ${detail}\n${await partialNote()}`
+          } else {
+            if (review && !note) untrackWorkerModels(excluded, excludedUpToSeq)
+            const routedTo = record?.label || record?.model || p.model
+            body = note + (routedTo ? `[routed via CortadOS → ${routedTo}]\n\n` : note ? '\n' : '') + (p.text as string)
+            ok = true
+          }
+        } catch (err) {
+          body = `routed background subagent failed: ${err}\n${await partialNote()}`
+        }
+        body = scrubToken(body, token)
+        const saved = await writeOutput(body + '\n')
+        const head = `Routed background subagent "${description}" (agentId ${agentId}) ${ok ? 'completed' : 'FAILED'}.`
+        const shown = body.length > BG_NOTIFY_MAX_CHARS
+          ? `${body.slice(0, BG_NOTIFY_MAX_CHARS)}\n[cut at ${BG_NOTIFY_MAX_CHARS} characters; the whole result is in ${outputFile}]`
+          : body
+        try {
+          await $.prompt.submit({ text: scrubToken(`${head}\n\n${shown}`, token) })
+        } catch {
+          try { $.ui.toast(`routed-subagents: could not deliver the background result of "${description}"; ${saved ? `it is in ${outputFile}` : 'it could not be saved either'}`) } catch { /* nowhere left */ }
+        }
+      }
+      // Detached on purpose: the hook answers now. The loop ends with the child (or a grace past its limit), and the
+      // finally always gives the status line back.
+      void finish()
+        .catch(() => { /* finish reports its own failures */ })
+        .finally(() => {
+          guard.routedActive = Math.max(0, guard.routedActive - 1)
+          guardPublish($, guard, restingStatus())
+        })
+      // The Agent tool's own record for a background launch, so the parent reads it as one; the notification above is
+      // its completion. canContinueAgent false: no SendMessage registry entry (see the named-agent pass-through).
+      return {
+        result: {
+          status: 'async_launched',
+          isAsync: true,
+          agentId,
+          description,
+          prompt,
+          outputFile,
+          canReadOutputFile: true,
+          canContinueAgent: false,
+        },
+      }
+    }
+
     // Counted inside the try, so the finally below always takes it back off, whatever throws. While any child runs
     // the status line is its own; the guard holds its counter until none is active.
     let counted = false

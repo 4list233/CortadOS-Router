@@ -41,8 +41,9 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `permissionMode` | `bypassPermissions` | Headless permission mode for each routed subagent (see **Blast radius**). |
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
-| `routeBackground` | `false` | Whether to route background subagents too (off because a routed subagent runs under the `subagentTimeoutMs` ceiling). |
+| `routeBackground` | `true` | Route background (`run_in_background`) subagents too (owner decision 2026-11-04: every subagent goes through S1). They run detached under `backgroundTimeoutMs`, not the foreground cap; see **Background subagents**. `false` hands them back to the native runner. |
 | `subagentTimeoutMs` | `600000` (10 min) | How long a routed subagent subprocess may run before it is aborted. The max is `600000` (10 min): that is the host's own cap (Claude Code validates `$.process.run`'s `timeoutMs` as an integer from 1 to 600000), so a larger value is clamped to it and a fractional one is rounded down. Lower it to fail fast; a non-positive/invalid value falls back to the default. |
+| `backgroundTimeoutMs` | `7200000` (2 h) | How long a routed **background** subagent may run before its watchdog stops it (TERM, then KILL 10 s later). Real background builders run 30-60+ minutes, so the foreground 10-minute cap would kill them. The max is `10800000` (3 h, the same as a CortadOS child task's limit): an unattended child that never ends burns quota. Larger values are clamped, fractions rounded down, invalid or non-positive values use the default. Foreground subagents keep `subagentTimeoutMs`. |
 | `maxTurns` | `0` (off) | Opt-in. When positive, passed as `claude -p --max-turns N`: the child stops after N agentic turns instead of looping until the timeout kills it. Off by default because there is no evidence yet that a blanket turn budget is safe for builders: a legitimate build can need many turns, and a builder stopped mid-way has acted without finishing. The runaway case that prompted it (incident 2026-11-03) is covered without it by the partial-result handback and the stop-on-dead-tool prompt line. `0` (or any non-positive/invalid value) leaves the flag off. A stopped child is reported like any other failure, with its partial result (see **When a routed subagent fails**). |
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
@@ -166,13 +167,37 @@ These pass through to a normal in-process subagent on your direct model:
   routing locally would silently drop them and let parallel isolated agents clobber each other.
 - **named agents** (`Agent({ name })`, including teammates) — the parent registers the name for `SendMessage`; a
   subprocess can't join that registry, so it would lose its messaging lifecycle.
-- **background subagents** — unless `routeBackground` is on, because the routed subprocess runs under a
-  10-minute ceiling.
+- **background subagents, only when `routeBackground` is off** (it is on by default).
 - **when no provider token is available** — better a working native subagent than a failed call.
 
 Once a routed subagent has been launched it has already acted, so if it does not finish cleanly (nonzero exit, a
 terminal error, truncated output, or a result the Agent schema would reject) the mod returns a **refusal** with the
 reason — it never silently re-runs the task as a native subagent, which would duplicate any non-idempotent work.
+
+## Background subagents
+
+A background Agent call (`run_in_background: true`) is routed like any other, but answered the way Claude Code
+answers its own background agents:
+
+1. The child is started **detached** by a fixed shell launcher (its arguments are passed as positional parameters,
+   never spliced into the script): a private run directory (`mktemp -d`, `$TMPDIR/cortados-bg.XXXXXX`), stdout and
+   stderr on files there, its own process group, and a watchdog that stops it at `backgroundTimeoutMs`. It does not
+   go through `$.process.run`, which caps a child at ten minutes, and it survives the turn ending, an interrupt and a
+   mod reload.
+2. The Agent call returns at once with the tool's own `async_launched` record: an `agentId` (`routed-bg-<session
+   uuid>`, not addressable by `SendMessage`) and an `outputFile` (`<run dir>/output.md`) that holds a "running" note
+   and is replaced by the result when the child ends. The parent can `Read` it at any time.
+3. The mod polls the run directory every 5 s for the child's exit file. When it appears the result is checked exactly
+   as in the foreground (clean exit, no error, real text; the review-exclusion retry; the provider's run record for
+   the routed model) and delivered as a **notification**: a message from this plugin (`$.prompt.submit`), which runs
+   as a turn of its own once the session is idle, headed `Routed background subagent "<description>" (agentId ...)
+   completed.` or `FAILED.`. A result over 50,000 characters is cut in the notification; the whole of it is in the
+   output file. Everything is scrubbed of the provider token.
+
+If the mod is reloaded or Claude Code exits while a background child runs, the child still finishes (or is stopped by
+its watchdog) and its raw output stays in the run directory, but no notification is sent. A launch that fails is a
+refusal; a child that fails is a `FAILED` notification with the same partial-result note as the foreground. Neither is
+ever re-run natively.
 
 ## When a routed subagent fails
 

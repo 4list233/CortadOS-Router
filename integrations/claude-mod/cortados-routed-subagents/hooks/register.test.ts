@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL } from './register'
+import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, isBgDir } from './register'
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -871,3 +871,200 @@ for (const readable of [true, false]) {
     expect(out.deny).toContain(readable ? 'partial ***' : 'transcript unreadable')
   })
 }
+
+// ---- Background subagents (routeBackground, on by default) ----------------------------------------------------------
+
+/** Register with `opts` and return the Agent tool.call handler. */
+function agentHandlerFor(opts: any): any {
+  let h: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') h = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, ...opts })
+  return h
+}
+
+const BG_DIR = '/var/folders/x/T/cortados-bg.Ab12Cd'
+
+/** A $ for a background run: the launcher prints BG_DIR; the exit file appears after `pollsBeforeExit` polls. */
+function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; timedOut?: boolean; launch?: () => any } = {}) {
+  const seen: any = { argv: null as string[] | null, env: null as any, runOpts: null as any, writes: [] as Array<[string, string]>, sleeps: 0, submitted: [] as string[], fgRuns: 0 }
+  let resolveDone: (t: string) => void = () => {}
+  const done = new Promise<string>((r) => { resolveDone = r })
+  const files: Record<string, string> = {
+    [`${BG_DIR}/stdout`]: o.stdout ?? JSON.stringify({ result: 'built it', model: 'cortados', session_id: 's1' }),
+    [`${BG_DIR}/stderr`]: '',
+  }
+  if (o.timedOut) files[`${BG_DIR}/timedout`] = ''
+  const $ = {
+    process: {
+      run: async (argv: string[], opts: any) => {
+        if (argv[0] === 'sh' && argv[2] === BG_LAUNCH_SH) {
+          seen.argv = argv
+          seen.env = opts?.env
+          seen.runOpts = opts
+          if (o.launch) return o.launch()
+          return { exitCode: 0, stdout: BG_DIR + '\n', stderr: '', isStdoutTruncated: false }
+        }
+        if (argv[0] === 'sh') return { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } // transcript find
+        seen.fgRuns += 1
+        return { exitCode: 0, stdout: JSON.stringify({ result: 'fg', model: 'm' }), stderr: '', isStdoutTruncated: false }
+      },
+    },
+    fs: {
+      read: async (path: string) => {
+        if (path === `${BG_DIR}/exit`) {
+          if (seen.sleeps < (o.pollsBeforeExit ?? 2)) throw new Error('ENOENT')
+          return o.exit ?? '0'
+        }
+        if (path in files) return files[path]
+        throw new Error('ENOENT')
+      },
+      write: async (path: string, text: string) => { seen.writes.push([path, text]) },
+    },
+    clock: { sleep: async () => { seen.sleeps += 1 } },
+    prompt: { submit: async (a: any) => { seen.submitted.push(a.text); resolveDone(a.text) } },
+    ui: { status() {}, toast() {} },
+  }
+  return { $, seen, done }
+}
+
+test('a background subagent is routed by default: async_launched now, the result delivered when the child ends', async () => {
+  const h = agentHandlerFor({})
+  const { $, seen, done } = bgHost()
+  let nativeCalled = false
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'build it', description: 'bg build', run_in_background: true }, async () => { nativeCalled = true; return 'native' })
+  expect(nativeCalled).toBe(false)
+  expect(out.result.status).toBe('async_launched')
+  expect(out.result.outputFile).toBe(`${BG_DIR}/output.md`)
+  expect(out.result.description).toBe('bg build')
+  expect(out.result.prompt).toBe('build it')
+  expect(out.result.canContinueAgent).toBe(false)
+  expect(/^routed-bg-[0-9a-f-]{36}$/.test(out.result.agentId)).toBe(true)
+  // The child goes through the fixed launcher, never $.process.run's ten-minute timeoutMs.
+  expect(seen.runOpts.timeoutMs).toBe(undefined)
+  expect(seen.argv[3]).toBe('sh')
+  expect(seen.argv[4]).toBe('7200') // 2 h default, in seconds
+  expect(seen.argv[5]).toBe('claude')
+  expect(seen.argv).toContain('--session-id')
+  expect(seen.env.ANTHROPIC_BASE_URL).toBe('http://provider.test:8432')
+  expect(seen.env.CLAUDE_CODE_ENTRYPOINT).toBe('cli')
+  splitRunId(seen.env.ANTHROPIC_CUSTOM_HEADERS)
+  const text = await done
+  expect(seen.sleeps).toBe(2)
+  expect(text.startsWith(`Routed background subagent "bg build" (agentId ${out.result.agentId}) completed.`)).toBe(true)
+  expect(text).toContain('built it')
+  // outputFile holds a running note at launch, then the result.
+  expect(seen.writes[0][0]).toBe(`${BG_DIR}/output.md`)
+  expect(seen.writes[0][1]).toContain('is running')
+  expect(seen.writes[seen.writes.length - 1][1]).toContain('built it')
+})
+
+test('routeBackground off still hands a background subagent to native', async () => {
+  const h = agentHandlerFor({ routeBackground: false })
+  const { $, seen } = bgHost()
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'build it', description: 'd', run_in_background: true }, async () => 'native')
+  expect(out).toBe('native')
+  expect(seen.argv).toBe(null)
+})
+
+test('the other pass-through rules still apply to background calls', async () => {
+  const h = agentHandlerFor({})
+  for (const extra of [{ subagent_type: 'fork' }, { isolation: 'worktree' }, { isolation: 'remote' }, { name: 'builder' }]) {
+    const { $, seen } = bgHost()
+    const out = await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'd', run_in_background: true, ...extra }, async () => 'native')
+    expect(out).toBe('native')
+    expect(seen.argv).toBe(null)
+  }
+  // no token -> native
+  const noTok = agentHandlerFor({ providerToken: '', providerTokenFile: '/nonexistent' })
+  const { $ } = bgHost()
+  ;($ as any).fs.read = async () => { throw new Error('ENOENT') }
+  expect(await noTok($, { subagent_type: 'general-purpose', prompt: 'p', description: 'd', run_in_background: true }, async () => 'native')).toBe('native')
+})
+
+test('resolveBackgroundTimeoutMs: 2 h default, integer, capped at 3 h', async () => {
+  expect(resolveBackgroundTimeoutMs(undefined)).toBe(7_200_000)
+  expect(resolveBackgroundTimeoutMs(1_800_000)).toBe(1_800_000)
+  expect(resolveBackgroundTimeoutMs('3600000')).toBe(3_600_000)
+  expect(resolveBackgroundTimeoutMs(10_800_000)).toBe(10_800_000)
+  expect(resolveBackgroundTimeoutMs(99_999_999)).toBe(10_800_000)
+  expect(resolveBackgroundTimeoutMs(Infinity)).toBe(10_800_000)
+  expect(resolveBackgroundTimeoutMs(1234.9)).toBe(1234)
+  for (const bad of [0, -5, NaN, null, 'soon', '', {}, true]) expect(resolveBackgroundTimeoutMs(bad)).toBe(7_200_000)
+})
+
+for (const [label, timeout, secs] of [
+  ['a configured 30 min', 1_800_000, '1800'],
+  ['an over-cap value (clamped to 3 h)', 99_999_999, '10800'],
+  ['a sub-second value (at least 1 s)', 200, '1'],
+] as const) {
+  test(`the background limit reaches the launcher's watchdog: ${label}`, async () => {
+    const h = agentHandlerFor({ backgroundTimeoutMs: timeout })
+    const { $, seen, done } = bgHost()
+    await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'd', run_in_background: true }, async () => 'native')
+    expect(seen.argv[4]).toBe(secs)
+    await done
+  })
+}
+
+test('the foreground timeout is unchanged by backgroundTimeoutMs', async () => {
+  const h = agentHandlerFor({ backgroundTimeoutMs: 10_800_000 })
+  const seen: { timeoutMs?: unknown } = {}
+  const $ = { process: hostLikeProcess(seen), fs: { read: async () => 'unused' }, ui: { status() {}, toast() {} } }
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(out.result.status).toBe('completed')
+  expect(seen.timeoutMs).toBe(600_000)
+  const capped = agentHandlerFor({ subagentTimeoutMs: 7_200_000 })
+  await capped($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, async () => 'native')
+  expect(seen.timeoutMs).toBe(600_000) // still the host's 10-minute cap
+})
+
+test('a background child that fails or times out is delivered as FAILED with its partial note, never re-run natively', async () => {
+  const h = agentHandlerFor({ backgroundTimeoutMs: 1_800_000 })
+  const { $, seen, done } = bgHost({ exit: '143', stdout: '', timedOut: true })
+  let nativeCalled = false
+  const out = await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'slow', run_in_background: true }, async () => { nativeCalled = true; return 'native' })
+  expect(out.result.status).toBe('async_launched')
+  const text = await done
+  expect(nativeCalled).toBe(false)
+  expect(text).toContain('FAILED')
+  expect(text).toContain('exit 143')
+  expect(text).toContain('timeout 1800 s')
+  expect(/session [0-9a-f-]{36}/.test(text)).toBe(true)
+  expect(seen.writes[seen.writes.length - 1][1]).toContain('did not complete cleanly')
+})
+
+test('a launcher failure is a deny, never a native re-dispatch', async () => {
+  const h = agentHandlerFor({})
+  for (const launch of [
+    () => { throw new Error('spawn failed') },
+    () => ({ exitCode: 1, stdout: '', stderr: 'mktemp failed', isStdoutTruncated: false }),
+    () => ({ exitCode: 0, stdout: '/etc/passwd\n', stderr: '', isStdoutTruncated: false }),
+  ]) {
+    const { $ } = bgHost({ launch })
+    let nativeCalled = false
+    const out = await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'd', run_in_background: true }, async () => { nativeCalled = true; return 'native' })
+    expect(nativeCalled).toBe(false)
+    expect(String(out.deny)).toContain('failed to launch')
+  }
+})
+
+test('the background result is token-scrubbed in the notification and the output file', async () => {
+  const h = agentHandlerFor({})
+  const { $, seen, done } = bgHost({ stdout: JSON.stringify({ result: 'leaked tok here', model: 'cortados' }) })
+  await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'd', run_in_background: true }, async () => 'native')
+  const text = await done
+  expect(text.includes('tok ')).toBe(false)
+  expect(text).toContain('leaked *** here')
+  expect(seen.writes[seen.writes.length - 1][1].includes('tok ')).toBe(false)
+})
+
+test('isBgDir accepts only an absolute cortados-bg.<random> directory', async () => {
+  expect(isBgDir(BG_DIR)).toBe(true)
+  expect(isBgDir('/tmp/cortados-bg.XyZ123')).toBe(true)
+  for (const bad of ['', 'cortados-bg.abc', '/tmp/cortados-bg.', '/etc/passwd', '/tmp/cortados-bg.a/../x', '/tmp/x\n/cortados-bg.a', null]) {
+    expect(isBgDir(bad)).toBe(false)
+  }
+})
