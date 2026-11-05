@@ -181,21 +181,19 @@ answers its own background agents:
 
 1. The child is started **detached** by a fixed shell launcher (its arguments are passed as positional parameters,
    never spliced into the script): a private run directory (`mktemp -d`, `$TMPDIR/cortados-bg.XXXXXX`), stdout and
-   stderr on files there, its own process group, and a watchdog that stops it at `backgroundTimeoutMs`. It does not
+   stderr captured through FIFOs (at most 1 MiB each), its own process group, and a watchdog that stops it at `backgroundTimeoutMs`. Capture overflow stops the workload and reports failure. It does not
    go through `$.process.run`, which caps a child at ten minutes, and it survives the turn ending, an interrupt and a
    mod reload.
 2. The Agent call returns at once with the tool's own `async_launched` record: an `agentId` (`routed-bg-<session
    uuid>`, not addressable by `SendMessage`) and an `outputFile` (`<run dir>/output.md`) that holds a "running" note
-   and is replaced by the result when the child ends. The parent can `Read` it at any time.
+   and is replaced by the result when the child ends. `canReadOutputFile` reflects whether that initial write succeeded; persistence failures are reported independently of notification delivery.
 3. The mod polls the run directory every 5 s for the child's exit file. When it appears the result is checked exactly
    as in the foreground (clean exit, no error, real text; the review-exclusion retry; the provider's run record for
    the routed model) and delivered as a **notification**: a message from this plugin (`$.prompt.submit`), which runs
-   as a turn of its own once the session is idle, headed `Routed background subagent "<description>" (agentId ...)
-   completed.` or `FAILED.`. A result over 50,000 characters is cut in the notification; the whole of it is in the
-   output file. Everything is scrubbed of the provider token.
+   as a turn of its own once the session is idle, without `asUser`. The available 2.1.314 plugin types expose no callable tool/task-result delivery channel. Both the notification and output file explicitly frame JSON-encoded fields as **UNTRUSTED SUBAGENT DATA**, never user instructions or authorization; an always-on system directive reinforces this boundary. Newlines and markup in child text cannot close the frame. A result over 50,000 characters is cut only if the complete result was saved successfully. Otherwise the whole capture-bounded result is delivered, with a persistence failure and no stale-file pointer. Fields are scrubbed of the provider token before encoding.
 
 If the mod is reloaded or Claude Code exits while a background child runs, the child still finishes (or is stopped by
-its watchdog) and its raw output stays in the run directory, but no notification is sent. A launch that fails is a
+its watchdog), but no notification is sent. Raw captures are removed immediately after processing (including retries), or expire one hour after completion if the mod disappears. Each new launch also recovers marked directories older than four hours (maximum workload plus retention); sanitized `output.md` results are preserved. These are lifecycle bounds, not a sandbox against a child deliberately detaching. A launch that fails is a
 refusal; a child that fails is a `FAILED` notification with the same partial-result note as the foreground. Neither is
 ever re-run natively.
 
