@@ -547,36 +547,43 @@ export function resolveBackgroundTimeoutMs(v: unknown): number {
   return Math.min(MAX_BACKGROUND_TIMEOUT_MS, Math.max(MIN_SUBAGENT_TIMEOUT_MS, Math.floor(n)))
 }
 
-/** The fixed launcher of a background child. Arguments, never spliced into the script: $1 the limit in whole seconds,
- * the rest the child's argv. It makes a private (mktemp -d, 0700) run directory, starts the child there detached
- * (nohup, its own process group via set -m, stdin/stdout/stderr on files, so $.process.run returns at once and the
- * child outlives the hook, the turn and a mod reload), and prints the directory. The detached wrapper runs a watchdog
- * that, at the limit, touches `timedout`, sends TERM and 10 s later KILL; when the child ends it stops the watchdog and
- * writes the exit code to `exit` atomically (exit.tmp, then mv), so a reader never sees a half-written code. */
-export const BG_LAUNCH_SH = [
-  'set -m',
-  'secs=$1; shift',
-  'd=$(mktemp -d "${TMPDIR:-/tmp}/cortados-bg.XXXXXX") || exit 1',
-  `D="$d" S="$secs" nohup sh -c '`,
-  '"$@" > "$D/stdout" 2> "$D/stderr" < /dev/null &',
-  'c=$!',
-  '(',
-  `  trap '"'"'kill "$sp" 2>/dev/null; exit 0'"'"' TERM`,
-  '  sleep "$S" & sp=$!',
-  '  wait "$sp"',
-  '  : > "$D/timedout"',
-  '  kill -TERM "$c" 2>/dev/null',
-  '  sleep 10',
-  '  kill -KILL "$c" 2>/dev/null',
-  ') &',
-  'w=$!',
-  'wait "$c"',
-  'ec=$?',
-  'kill -TERM "$w" 2>/dev/null',
-  'printf %s "$ec" > "$D/exit.tmp" && mv "$D/exit.tmp" "$D/exit"',
-  `' sh "$@" > /dev/null 2>&1 < /dev/null &`,
-  'printf "%s\\n" "$d"',
-].join('\n')
+const shQuote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'"
+
+/** One supervisor owns timeout and cleanup. Perl creates a workload-only process group on macOS (no setsid
+ * binary required); descendants inherit it unless they deliberately detach. Never cancel group cleanup just
+ * because the immediate child exits. Publish exit only after TERM's 10-second grace and group KILL complete.
+ * All dynamic input remains argv/environment, never shell source. */
+const BG_SUPERVISE_SH = `
+umask 077
+perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV; die "exec: $!"' sh -c ${shQuote(`
+  trap ':' TERM
+  "$@"
+  ec=$?
+  printf %s "$ec" > "$D/child-exit.tmp" && mv "$D/child-exit.tmp" "$D/child-exit"
+`)} sh "$@" > "$D/stdout" 2> "$D/stderr" < /dev/null &
+c=$!
+end=$(( $(date +%s) + S ))
+while [ ! -f "$D/child-exit" ]; do
+  kill -0 "$c" 2>/dev/null || break
+  if [ "$(date +%s)" -ge "$end" ]; then : > "$D/timedout"; break; fi
+  sleep 1
+done
+kill -TERM -- "-$c" 2>/dev/null || :
+if kill -0 -- "-$c" 2>/dev/null; then
+  sleep 10
+  kill -KILL -- "-$c" 2>/dev/null || :
+fi
+wait "$c"; ec=$?
+if [ -f "$D/child-exit" ]; then ec=$(cat "$D/child-exit"); fi
+printf %s "$ec" > "$D/exit.tmp" && mv "$D/exit.tmp" "$D/exit"
+`
+
+export const BG_LAUNCH_SH = `
+umask 077
+secs=$1; shift
+d=$(mktemp -d "\${TMPDIR:-/tmp}/cortados-bg.XXXXXX") || exit 1
+D="$d" S="$secs" nohup sh -c ${shQuote(BG_SUPERVISE_SH)} sh "$@" > /dev/null 2>&1 < /dev/null &
+printf '%s\\n' "$d"`
 
 /** A run directory exactly as BG_LAUNCH_SH's mktemp names it: an absolute path ending in cortados-bg.<random>. */
 export function isBgDir(s: unknown): s is string {
@@ -938,7 +945,7 @@ export const register: Register = (on, options) => {
           let note = ''
           // As in the foreground: an exclude header the router refused is retried ONCE without it, in what is left
           // of the one overall budget.
-          if (excluded.length && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+          if (excluded.length && !res.timedOut && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
             const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
             const remainingMs = Math.floor(backgroundTimeoutMs - (Date.now() - startedAt))
             if (reason && remainingMs >= MIN_RETRY_MS) {
@@ -950,7 +957,7 @@ export const register: Register = (on, options) => {
             }
           }
           const record = await recordLastRun()
-          if (!cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+          if (res.timedOut || !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
             const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}${res.timedOut ? `, timeout ${fmtSecs(backgroundTimeoutMs)}` : ''}`
             const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
             body = `${note}routed background subagent did not complete cleanly (${why}): ${detail}\n${await partialNote()}`

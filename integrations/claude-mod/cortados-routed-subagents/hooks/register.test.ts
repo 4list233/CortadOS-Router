@@ -1061,6 +1061,17 @@ test('the background result is token-scrubbed in the notification and the output
   expect(seen.writes[seen.writes.length - 1][1].includes('tok ')).toBe(false)
 })
 
+test('timeout plus exit zero and valid JSON is FAILED, with partial output', async () => {
+  const h = agentHandlerFor({ backgroundTimeoutMs: 1000 })
+  const { $, done } = bgHost({ exit: '0', timedOut: true, stdout: JSON.stringify({ result: 'partial result' }) })
+  await h($, { subagent_type: 'general-purpose', prompt: 'p', description: 'slow', run_in_background: true }, async () => 'native')
+  const text = await done
+  expect(text).toContain('FAILED')
+  expect(text).toContain('exit 0')
+  expect(text).toContain('timeout 1 s')
+  expect(text).toContain('partial result')
+})
+
 test('isBgDir accepts only an absolute cortados-bg.<random> directory', async () => {
   expect(isBgDir(BG_DIR)).toBe(true)
   expect(isBgDir('/tmp/cortados-bg.XyZ123')).toBe(true)
