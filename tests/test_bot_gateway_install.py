@@ -35,8 +35,8 @@ class InstallerHarness(unittest.TestCase):
         p.write_text("#!/bin/sh\n" + body)
         p.chmod(0o755)
 
-    def run_sh(self, *args):
-        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin"}
+    def run_sh(self, *args, extra_env=None):
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin", **(extra_env or {})}
         return subprocess.run(["sh", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
 
     def provider_env(self, text):
@@ -106,7 +106,7 @@ class PlistTest(InstallerHarness):
         return doc
 
     def gateway_args(self, cmdline):
-        self.assertIn(f"--host {FAKE_IP} --port 8434", cmdline)
+        self.assertIn("--host 127.0.0.1 --port 8434", cmdline)
         self.assertIn(f"--token-file {self.token_path()}", cmdline)
         self.assertIn(f"--workspace-root {self.home / 'cortados-bot-workspace'}", cmdline)
 
@@ -306,7 +306,27 @@ class PlistTest(InstallerHarness):
                 self._fake("tailscale", f"echo {ip}\n")
                 r = self.run_sh("plist")
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn(f"--host {ip} ", " ".join(plistlib.loads(self.plist().read_bytes())["ProgramArguments"]))
+                doc = plistlib.loads(self.plist().read_bytes())
+                self.assertIn("--host 127.0.0.1 ", " ".join(doc["ProgramArguments"]))
+                self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], f"http://{ip}:8432")
+
+    def test_allowed_host_is_read_from_environment_into_plist(self):
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        self.assertEqual(self.run_sh("token").returncode, 0)
+        r = self.run_sh("plist", extra_env={"CORTADOS_BOT_ALLOWED_HOST": "gateway.example.test"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = plistlib.loads(self.plist().read_bytes())
+        self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_BOT_ALLOWED_HOST"], "gateway.example.test")
+
+    def test_funnel_commands_change_only_mcp_handler(self):
+        calls = Path(self.tmp.name) / "tailscale.calls"
+        self._fake("tailscale", f'echo "$*" >> {calls}\n')
+        self.assertEqual(self.run_sh("funnel-on").returncode, 0)
+        self.assertEqual(self.run_sh("funnel-off").returncode, 0)
+        self.assertEqual(calls.read_text().splitlines(), [
+            "funnel --bg --set-path /mcp http://127.0.0.1:8434/mcp",
+            "funnel --set-path /mcp off",
+        ])
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")

@@ -510,6 +510,35 @@ class TokenFileTest(unittest.TestCase):
         self.assertNotIn(TOKEN, err.getvalue())
 
 
+class AuthThrottleTest(unittest.TestCase):
+    def test_fake_clock_cooldown_doubles_and_caps(self):
+        now = [1000.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        for expected in (60, 120, 240, 480, 960, 1920, 3600, 3600):
+            for _ in range(bg.AUTH_FAILURES):
+                self.assertIsNone(throttle.failed("198.51.100.7"))
+            self.assertEqual(throttle.blocked("198.51.100.7"), expected)
+            now[0] += expected + .1
+
+    def test_window_global_cap_and_bounded_state(self):
+        now = [0.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        with mock.patch.object(bg, "MAX_AUTH_CLIENTS", 2):
+            throttle.failed("198.51.100.1")
+            throttle.failed("198.51.100.2")
+            throttle.failed("198.51.100.3")
+        self.assertEqual(list(throttle.clients), ["198.51.100.2", "198.51.100.3"])
+        now[0] += bg.AUTH_WINDOW_S + 1
+        for i in range(bg.GLOBAL_AUTH_FAILURES):
+            self.assertIsNone(throttle.failed(f"203.0.113.{i}"))
+        self.assertEqual(throttle.failed("203.0.113.250"), 60)
+
+    def test_xff_only_from_loopback_and_last_hop(self):
+        self.assertEqual(bg.client_address("127.0.0.1", "192.0.2.1, 198.51.100.2"), "198.51.100.2")
+        self.assertEqual(bg.client_address("203.0.113.8", "198.51.100.2"), "203.0.113.8")
+        self.assertEqual(bg.client_address("127.0.0.1", "not-an-address"), "127.0.0.1")
+
+
 class HttpTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -530,8 +559,8 @@ class HttpTest(unittest.TestCase):
         self.red.__exit__(None, None, None)
         self.env.stop()
 
-    def post(self, obj, token=TOKEN):
-        h = {"content-type": "application/json"}
+    def post(self, obj, token=TOKEN, headers=None):
+        h = {"content-type": "application/json", **(headers or {})}
         if token is not None:
             h["authorization"] = f"Bearer {token}"
         req = urllib.request.Request(self.url, data=json.dumps(obj).encode(), headers=h, method="POST")
@@ -551,6 +580,33 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         self.assertNotIn(TOKEN, self.err.getvalue())
         self.assertIn("POST /mcp", self.err.getvalue())
+
+    def test_per_address_throttle_and_valid_other_address(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        bad = {"X-Forwarded-For": "198.51.100.11"}
+        for _ in range(bg.AUTH_FAILURES):
+            self.assertEqual(self.post(msg, "wrong-token-0000000000", bad)[0], 401)
+        self.assertEqual(self.post(msg, TOKEN, bad)[0], 429)  # cooldown is checked before this token
+        self.assertEqual(self.post(msg, TOKEN, {"X-Forwarded-For": "198.51.100.12"})[0], 200)
+        log = self.err.getvalue()
+        self.assertIn("POST /mcp 429 198.51.100.11", log)
+        self.assertIn("POST /mcp 200 198.51.100.12", log)
+        self.assertNotIn(TOKEN, log)
+
+    def test_allowed_host_returns_421_before_auth(self):
+        srv = bg.build_server(self.gw, "127.0.0.1", 0, ["gateway.example.test"])
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        old_url = self.url
+        try:
+            self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+            msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+            self.assertEqual(self.post(msg, None)[0], 421)
+            self.assertEqual(self.post(msg, TOKEN, {"Host": "gateway.example.test"})[0], 200)
+        finally:
+            self.url = old_url
+            srv.shutdown()
+            srv.server_close()
 
     def test_batch_cap_and_timeout(self):
         one = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
