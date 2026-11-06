@@ -30,7 +30,7 @@
 #                               start (2026-11-03: training ended 06:19) is always killed and wastes the night. 0 disables the check.
 #   CORTADOS_S1_DEADLINE        HHMM local (overnight.py sets TZ=America/Toronto) when overnight.py stops the run (default 0700).
 #                               CORTADOS_S1_EVAL_MINUTES within 30 min of the 01:30-to-deadline window can never fit and falls back to 110.
-#   CORTADOS_S1_NOW             HHMM that replaces the clock for the deadline check (tests); not HHMM → logged, the clock is used
+#   CORTADOS_S1_NOW             HHMM that replaces the clock for deadline checks, including Laya (tests); not HHMM → logged, the clock is used
 #   nightly.sh --minutes-left [HHMM]   prints the minutes from HHMM (or now) to the deadline plus any settings notes and exits;
 #                               no pid file, stop flag or overnight.py (diagnostic / tests). An invalid HHMM exits 2.
 # Continuous mode (Forest 2026-11-03; window mode stays the default until the launchd job is switched): a launchd KeepAlive job runs
@@ -83,9 +83,11 @@ if [ "$EVAL_MINUTES" -gt 0 ] && [ "$EVAL_MINUTES" -ge $((window - 30)) ]; then
 fi
 }
 hhmm() { [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]; }   # 0000-2359
+# Share the validated test clock: a watcher using date directly would still depend on the time of day.
+clock_hhmm() { printf '%s\n' "${CORTADOS_S1_NOW:-$(date +%H%M)}"; }
 minutes_left() {   # minutes_left [HHMM]: minutes from now (or HHMM) to the next $DEADLINE (wraps: a 01:30 start has 330 min to 07:00)
   # CORTADOS_S1_NOW (HHMM, validated in deadline_settings) overrides the clock so tests can pin the time of night
-  local now dl; now=${1:-${CORTADOS_S1_NOW:-$(date +%H%M)}}; now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
+  local now dl; now=${1:-$(clock_hhmm)}; now=$((10#${now:0:2} * 60 + 10#${now:2:2})); dl=$((10#${DEADLINE:0:2} * 60 + 10#${DEADLINE:2:2}))
   echo $(( (dl - now + 1440) % 1440 ))
 }
 # diagnostic / test hook, handled BEFORE any side effect (pid file, stop flag, overnight.py re-exec, which unloads the scorer):
@@ -330,7 +332,16 @@ eval_fingerprint() {   # effective holdout labels + inference settings (evaluate
   echo "${hk}-${inc}"
 }
 report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['promote'] else 1)" "$1/report.json"; }
-cleanup() { pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
+deadline=""
+stop_deadline() {
+  # Own and reap the watcher on every exit, not just successful training; otherwise it can set a stale stop flag later.
+  if [ -n "$deadline" ]; then
+    kill -TERM "$deadline" 2>/dev/null
+    wait "$deadline" 2>/dev/null
+    deadline=""
+  fi
+}
+cleanup() { stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
 trap cleanup EXIT
 # Continuous mode: the stop flag means "the operator ran nightly.sh --stop" (only --stop creates it) and overnight.py will not
 # relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
@@ -567,13 +578,25 @@ if [ -f data/laya-tonight ]; then
   gpu_alone
   echo "=== $(date) laya night: training into $LRUN (cap ${LAYA_MAX_STEPS:-2000} steps, stop file at ${LAYA_STOP_AT:-0645})"
   LAYA_STOP_AT="${LAYA_STOP_AT:-0645}"; [[ "$LAYA_STOP_AT" =~ ^[0-9]{4}$ ]] || { echo "LAYA_STOP_AT=$LAYA_STOP_AT is not HHMM; using 0645"; LAYA_STOP_AT=0645; }
-  ( while [ "$((10#$(date +%H%M)))" -lt "$((10#$LAYA_STOP_AT))" ] || [ "$(date +%H%M)" -gt 1200 ]; do sleep 60; [ -f "$LRUN/train-meta.json" ] && exit 0; done; touch "$LRUN/stop"; echo "laya: deadline reached, stop file set" ) &
+  (
+    sleeper=""
+    # Wait on an asynchronous sleep so TERM runs immediately, rather than after the 60-second foreground sleep.
+    trap 'exit 0' TERM INT
+    # The sleep belongs to this watcher: reap it too so exiting nightly leaves no orphan timer.
+    trap '[ -z "$sleeper" ] || { kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; }' EXIT
+    while now=$(clock_hhmm); [ "$((10#$now))" -lt "$((10#$LAYA_STOP_AT))" ] || [ "$((10#$now))" -gt 1200 ]; do
+      sleep 60 & sleeper=$!
+      wait "$sleeper"; sleeper=""
+      [ -f "$LRUN/train-meta.json" ] && exit 0
+    done
+    touch "$LRUN/stop"; echo "laya: deadline reached, stop file set"
+  ) </dev/null >> "$RUN/nightly.log" 2>&1 &  # Explicitly detach caller pipes, even if the parent's logging changes.
   deadline=$!
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
   init=""; [ -f data/laya-init ] && init="$(cat data/laya-init)" && rm -f data/laya-init && [ -d "$init" ] && echo "laya: warm start from $init"
   ( cd laya && ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" ./train.sh ) ; lrc=$?
-  kill "$deadline" 2>/dev/null
+  stop_deadline
   gpu_share; sleep 20
   if [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
     HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN" \
