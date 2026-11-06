@@ -8,6 +8,18 @@ It works in three steps:
 2. **Turn the answers into a requirement.** Hard rules and a band table turn the answers into a capability requirement: a required benchmark index for that kind of work, a band (R0–R4), and a sub-agent count.
 3. **Pick the cheapest capable route.** Every model reachable through a subscription qualifies if its use-case index clears the requirement. The winner is the cheapest, where cost comes from the model's burn on its quota pool and that pool's live scarcity.
 
+## Provider URL
+
+Keep one provider base URL per machine in `~/.config/cortados/provider-url`
+(for example `https://provider.example:8443`). Python clients resolve a non-empty
+`CORTADOS_PROVIDER_URL` first, then `CORTADOS_PROVIDER_URL_FILE`, then that default
+file. Whitespace and trailing slashes are stripped; missing, unreadable or invalid
+selected files fail clearly. Only HTTP(S) URLs with a host are accepted.
+Remove old per-client URL overrides to make moving the provider a one-file edit.
+The session's `--provider-url` and the Claude mod's explicit `providerUrl` remain
+overrides; leave them unset to use the shared file. Restart long-running clients
+after editing it. HTTPS uses each client's normal certificate verification.
+
 ## Two ways to use it
 
 **As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. A client can instead pin a model (`sub/<model>`, `api/<model>`; see the table below) and skip S1 entirely. See `docs/PROVIDER-PLAN.md`.

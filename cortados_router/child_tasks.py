@@ -542,7 +542,10 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
     selected = select_connectors(None if chrome else connectors)
     if not provider_url and not chrome:
-        raise TaskError("start_task is not configured: set CORTADOS_PROVIDER_URL for the cortados-route MCP server")
+        try:
+            provider_url = session.resolve_provider_url()
+        except session.ProviderURLError as exc:
+            raise TaskError(f"start_task is not configured: {exc}") from None
     max_s = _max_s()
     exe = claude_bin()
     root = _private_root()

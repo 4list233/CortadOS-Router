@@ -41,7 +41,7 @@ type Cfg = {
 }
 
 const FALLBACK: Cfg = {
-  providerUrl: 'http://127.0.0.1:8432',
+  providerUrl: '',
   providerTokenFile: '~/.config/cortados/provider-token',
   providerToken: '',
   model: 'cortados',
@@ -491,6 +491,32 @@ const RUN_RECORD_TIMEOUT_MS = 3_000
 
 let routedSeq = 0
 
+/** Explicit plugin config stays an override; otherwise env > selected file > per-machine file. */
+export async function resolveProviderUrl($: any, configured = ''): Promise<string> {
+  let source = 'providerUrl config'
+  let value = String(configured).trim()
+  if (!value) {
+    const result = await $.process.run(['sh', '-c',
+      'printf "%s\\0%s\\0%s" "$CORTADOS_PROVIDER_URL" "$CORTADOS_PROVIDER_URL_FILE" "$HOME"'])
+    if (result.exitCode !== 0) throw new Error('provider URL environment could not be read')
+    const [envUrl, envFile, home] = String(result.stdout).split('\0')
+    value = (envUrl || '').trim()
+    source = 'CORTADOS_PROVIDER_URL'
+    if (!value) {
+      let path = envFile || '~/.config/cortados/provider-url'
+      if (path.startsWith('~/')) path = home + path.slice(1)
+      source = 'provider URL file ' + path
+      try { value = String(await $.fs.read(path)).trim() }
+      catch { throw new Error(source + ': cannot read URL') }
+    }
+  }
+  try {
+    const parsed = new URL(value)
+    if (!/^https?:\/\//.test(value) || !parsed.hostname || /[\s\x00-\x1f\x7f]/.test(value)) throw new Error()
+  } catch { throw new Error(source + ': expected one http:// or https:// URL with a host') }
+  return value.replace(/\/+$/, '')
+}
+
 /** Read the provider token: the inline override if set, otherwise the token file (with ~ expanded to $HOME). */
 async function resolveToken($: any, cfg: Cfg): Promise<string> {
   if (cfg.providerToken && String(cfg.providerToken).trim()) return String(cfg.providerToken).trim()
@@ -675,6 +701,11 @@ export const register: Register = (on, options) => {
     if (e.isolation) return next(e) // worktree/remote: let the native runner own isolation
     if (e.name) return next(e) // a named agent stays addressable by SendMessage only if the parent spawns it
 
+    // Per-call copy: concurrent agents must use the same resolved URL for launch and run-record lookup.
+    let resolvedUrl: string
+    try { resolvedUrl = await resolveProviderUrl($, cfg.providerUrl) }
+    catch (err) { return { deny: String(err) } }
+    const runCfg = { ...cfg, providerUrl: resolvedUrl }
     let token: string
     try {
       token = await resolveToken($, cfg)
@@ -762,7 +793,7 @@ export const register: Register = (on, options) => {
           // ids): the main session's model and the tracked worker models (see modelsToExclude). Every run also
           // carries `x-cortados-run-id: <id>`, used to fetch the run's record (the real routed model) afterwards.
           env: {
-            ANTHROPIC_BASE_URL: String(cfg.providerUrl),
+            ANTHROPIC_BASE_URL: resolvedUrl,
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
@@ -782,7 +813,7 @@ export const register: Register = (on, options) => {
     /** The provider's record of the last run, or null; tracks a non-review run's models. Never throws. */
     const recordLastRun = async (): Promise<RunRecord | null> => {
       if (!runId) return null
-      const record = await fetchRunRecord($, cfg, token, runId)
+      const record = await fetchRunRecord($, runCfg, token, runId)
       try {
         if (record && !review) trackWorkerModels(builderModelsOf(record))
       } catch { /* never fail the subagent over bookkeeping */ }

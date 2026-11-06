@@ -30,6 +30,7 @@ from pathlib import Path
 
 import common
 import label
+from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 from outcome import quota, store
 
 TOKEN_FILE_DEFAULT = Path.home() / ".config/cortados/provider-token"
@@ -66,14 +67,19 @@ def tag(run_id: str = RUN_ID) -> str:
 
 
 def enabled() -> bool:
-    return bool((os.environ.get("CORTADOS_PROVIDER_URL") or "").strip()) and \
-        os.environ.get("CORTADOS_OUTCOME_BACKEND", "provider") != "local"
+    if os.environ.get("CORTADOS_OUTCOME_BACKEND", "provider") == "local":
+        return False
+    try:
+        return bool(resolve_provider_url(required=False))
+    except ProviderURLError as exc:
+        raise ProviderError(str(exc)) from None
 
 
 def config() -> tuple[str, str]:
-    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip().rstrip("/")
-    if not url:
-        raise ProviderError("CORTADOS_PROVIDER_URL is not set")
+    try:
+        url = resolve_provider_url()
+    except ProviderURLError as exc:
+        raise ProviderError(str(exc)) from None
     token = (os.environ.get("CORTADOS_PROVIDER_TOKEN") or "").strip()
     if not token:
         tf = Path(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or TOKEN_FILE_DEFAULT).expanduser()

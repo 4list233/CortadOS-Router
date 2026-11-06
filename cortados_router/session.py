@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from cortados_router.provider import routing
+from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 
 # Short names map to the ids the provider itself serves (routing.SUB_ALIASES is the provider's alias table, checked
 # against the tables' claude-cli models), so the launcher can never pin a model the provider would refuse.
@@ -300,9 +301,10 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     check_passthrough(extra)
     if args.delegate_budget < 0:
         raise SessionError("--delegate-budget must be nonnegative")
-    url = (args.provider_url or base_env.get("CORTADOS_PROVIDER_URL") or "").strip()
-    if not url:
-        raise SessionError("no provider URL: pass --provider-url or set CORTADOS_PROVIDER_URL")
+    try:
+        url = resolve_provider_url({**base_env, **({"CORTADOS_PROVIDER_URL": args.provider_url} if args.provider_url else {})})
+    except ProviderURLError as exc:
+        raise SessionError(str(exc)) from None
     model = resolve_model(args.orchestrator)
     token = read_token(args.token_file)
     directive = None

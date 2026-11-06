@@ -1,5 +1,31 @@
 import { test, expect } from 'claude-code/testing'
+import { resolveProviderUrl } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL } from './register'
+
+test('provider URL resolves HTTPS config, env and files without silent fallback', async () => {
+  let path = ''
+  let contents = ' https://file.example:8443/\n'
+  let env = '\0\0/tmp/test-home'
+  const $ = {
+    process: { run: async () => ({ exitCode: 0, stdout: env }) },
+    fs: { read: async (p: string) => { path = p; return contents } },
+  }
+  expect(await resolveProviderUrl($)).toBe('https://file.example:8443')
+  expect(path).toBe('/tmp/test-home/.config/cortados/provider-url')
+  env = '\0/tmp/selected-url\0/tmp/test-home'
+  expect(await resolveProviderUrl($)).toBe('https://file.example:8443')
+  expect(path).toBe('/tmp/selected-url')
+  env = ' https://env.example/ \0/missing\0/tmp/test-home'
+  expect(await resolveProviderUrl($)).toBe('https://env.example')
+  expect(await resolveProviderUrl($, 'https://config.example/')).toBe('https://config.example')
+  env = '\0\0/tmp/test-home'
+  for (const bad of ['', 'ftp://host', 'https://', 'https://host\nhttps://other']) {
+    contents = bad
+    let error = ''
+    try { await resolveProviderUrl($) } catch (e) { error = String(e) }
+    expect(error.includes('provider URL file')).toBe(true)
+  }
+})
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 

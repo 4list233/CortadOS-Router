@@ -27,6 +27,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+import urllib.parse
 
 PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
@@ -362,12 +363,48 @@ def _resolve_token() -> str:
         return ""                                       # never crash the stdio server; route_task reports 'not configured'
 
 
+class ProviderURLError(ValueError):
+    """Invalid endpoint configuration; messages name the source, never its contents."""
+
+
+def resolve_provider_url(environ=None, *, required=True) -> str:
+    """Resolve env > explicit file > per-machine file (stdlib, standalone-safe).
+
+    Only an absent DEFAULT file may mean unconfigured for optional clients. An
+    explicitly selected file or malformed value must never silently fall back.
+    """
+    env = os.environ if environ is None else environ
+    source = "CORTADOS_PROVIDER_URL"
+    url = (env.get(source) or "").strip()
+    if not url:
+        selected = env.get("CORTADOS_PROVIDER_URL_FILE")
+        path = selected or "~/.config/cortados/provider-url"
+        if path.startswith("~/"):
+            path = os.path.join(env.get("HOME") or os.path.expanduser("~"), path[2:])
+        source = f"provider URL file {path}"
+        try:
+            with open(path, encoding="utf-8") as f:
+                url = f.read().strip()
+        except FileNotFoundError:
+            if not selected and not required:
+                return ""
+            raise ProviderURLError(f"{source}: not found") from None
+        except (OSError, UnicodeError, ValueError):
+            raise ProviderURLError(f"{source}: cannot read URL") from None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        valid = (url.startswith(("http://", "https://")) and bool(parsed.hostname)
+                 and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url))
+        parsed.port  # malformed ports must fail before any request
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ProviderURLError(f"{source}: expected one http:// or https:// URL with a host")
+    return url.rstrip("/")
+
+
 def _resolve_url() -> str:
-    """The provider URL, or "" when it is unset or still an unexpanded ${VAR} placeholder (a shell that did not export
-    the var leaves the literal, which would otherwise become an 'unknown url type' error instead of a clear 'not
-    configured' one)."""
-    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip()
-    return "" if url.startswith("${") else url
+    return resolve_provider_url()
 
 
 def main() -> None:

@@ -805,6 +805,16 @@ class ProviderBackendTests(OutcomeCase):
             return R(_j.dumps({"model": served, "content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}).encode())
         return op
 
+    def test_provider_https_file_config_and_request(self):
+        endpoint = Path(os.environ["HOME"]) / "outcome-provider-url"
+        endpoint.write_text("https://provider.example:8443/\n")
+        with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_URL": "", "CORTADOS_PROVIDER_URL_FILE": str(endpoint)}):
+            self.assertTrue(self.p.enabled())
+            seen = []
+            self.p.ask("claude", "claude-fable-5-1", "sys", "u",
+                       urlopen=self._urlopen("claude-fable-5-1", "hi", seen))
+            self.assertEqual(seen[0][0], "https://provider.example:8443/v1/messages")
+
     def test_every_call_carries_the_min_left_header(self):
         seen = []
         self.p.ask("claude", "claude-fable-5-1", "sys", "u", urlopen=self._urlopen("claude-fable-5-1 · 61% left", "hi", seen))

@@ -296,8 +296,8 @@ class ProviderTeacherTests(unittest.TestCase):
                 label.provider_config()
             self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
             tf = self.tmp / "tok"; tf.write_text("secret-x\n")
-            os.environ.update(CORTADOS_PROVIDER_URL="http://h:8432/", CORTADOS_PROVIDER_TOKEN_FILE=str(tf))
-            self.assertEqual(label.provider_config(), ("http://h:8432", "secret-x"))
+            os.environ.update(CORTADOS_PROVIDER_URL="https://teacher.example:8443/", CORTADOS_PROVIDER_TOKEN_FILE=str(tf))
+            self.assertEqual(label.provider_config(), ("https://teacher.example:8443", "secret-x"))
             os.environ["CORTADOS_PROVIDER_TOKEN_FILE"] = str(self.tmp / "missing")
             with redirect_stderr(io.StringIO()) as e, self.assertRaises(SystemExit) as cm:
                 label.provider_config()

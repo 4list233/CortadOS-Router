@@ -415,6 +415,16 @@ class LauncherTest(LauncherBase):
                                "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432"})
         self.assertNotIn(PROVIDER_SECRET, err)
 
+    def test_https_file_fallback(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        endpoint = Path(self.tmp.name) / ".config/cortados/provider-url"
+        endpoint.parent.mkdir(parents=True)
+        endpoint.write_text(" https://provider.example:8443/\n")
+        self.environ.pop("CORTADOS_PROVIDER_URL")
+        rc, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls[0][2]["CORTADOS_PROVIDER_URL"], "https://provider.example:8443")
+
     def test_every_config_failure_exits_78(self):
         good = f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n"
         cases = {
@@ -430,7 +440,7 @@ class LauncherTest(LauncherBase):
             "group writable": (good, {"mode": 0o620}, None),
             "missing HOME": (good, {"unset": "HOME"}, None),
             "missing URL": (good, {"unset": "CORTADOS_PROVIDER_URL"}, None),
-            "https URL": (good, {"url": "https://x:1"}, None),
+            "invalid URL": (good, {"url": "ftp://invalid.example"}, None),
             "start_task flag": (good, {}, ("--enable-start-task",)),
             "not UTF-8": (None, {}, None),
         }

@@ -425,15 +425,15 @@ class EmbeddedNewlineTokenTests(unittest.TestCase):
 
 
 class ConfigResolutionTests(unittest.TestCase):
-    """How main() resolves the provider URL and token: env first, then the token file; an unexpanded ${VAR} URL is
-    treated as unconfigured (a clear 'not configured' error rather than 'unknown url type')."""
+    """Env overrides files; an unexpanded URL placeholder is a source-named configuration error."""
     import os as _os
     import tempfile as _tempfile
     from unittest import mock as _mock
 
     def test_url_drops_unexpanded_placeholder(self):
         with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "${CORTADOS_PROVIDER_URL}"}):
-            self.assertEqual(m._resolve_url(), "")                     # literal placeholder -> unconfigured
+            with self.assertRaisesRegex(m.ProviderURLError, "CORTADOS_PROVIDER_URL"):
+                m._resolve_url()
         with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "  http://host:8432 "}):
             self.assertEqual(m._resolve_url(), "http://host:8432")     # stripped
 
