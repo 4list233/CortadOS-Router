@@ -209,6 +209,21 @@ class RunnerTests(unittest.TestCase):
         self.advance(5)
         self.assertEqual(len([p for _, p in self.calls if p]), before + 1)
         self.assertNotIn(-1, leases)
+        # Renewals keep the 8K context, not just the first load.
+        renewals = [p for _, p in self.calls if p and p["keep_alive"]]
+        self.assertGreater(len(renewals), 1)
+        for payload in renewals:
+            self.assertEqual(payload["options"], {"num_ctx": c.CONTEXT})
+
+    def test_startup_with_training_sheds_before_residency_query(self):
+        # Unknown residency at startup must shed like loaded.
+        self.loaded = True
+        self.inputs["training_active"] = True
+        self.runner.tick()
+        self.assertEqual(self.calls[0], ("/api/generate",
+                         {"model": c.MODEL, "stream": False, "keep_alive": 0}))
+        self.assertEqual(self.calls[1][0], "/api/ps")
+        self.assertFalse(self.loaded)
 
     def test_training_sheds_before_residency_query(self):
         self.runner.tick()
@@ -233,6 +248,28 @@ class RunnerTests(unittest.TestCase):
                 c.serve(self.runner, path, sleep=sigterm)
             self.assertFalse(self.loaded)
             self.assertFalse(json.loads(path.read_text())["available"])
+
+    def test_shutdown_unload_failure_reported(self):
+        self.runner.tick()
+        self.advance(120)
+        self.assertTrue(self.loaded)
+        def down(path, payload=None):
+            raise OSError("Ollama down")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"capacity.json"
+            def sigterm(_):
+                self.runner.api = down
+                raise SystemExit(143)
+            with patch("sys.stderr") as err:
+                with self.assertRaises(SystemExit):
+                    c.serve(self.runner, path, sleep=sigterm)
+            logged = "".join(call.args[0] for call in err.write.call_args_list)
+            self.assertIn("shutdown unload failed: OSError", logged)
+            final = json.loads(path.read_text())
+            self.assertFalse(final["available"])
+            self.assertIsNone(final["model_loaded"])
+            self.assertEqual(final["unload_error"], "OSError")
+            self.assertIsNone(self.runner.maybe_loaded)
 
     def test_status_write_failure_unloads(self):
         self.runner.tick()

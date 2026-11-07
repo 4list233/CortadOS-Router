@@ -267,7 +267,9 @@ class Runner:
             if not safe:
                 # Mandatory shedding first: never wait on a residency query.
                 self.eligible_since = None
-                if self.maybe_loaded and not self.shed(result):
+                # Unknown residency (None) sheds like loaded: only a confirmed
+                # absence may skip the unload.
+                if self.maybe_loaded is not False and not self.shed(result):
                     raise RuntimeError("unload failed")
             loaded = resident(self.api, self.model)
             self.maybe_loaded = loaded
@@ -288,9 +290,10 @@ class Runner:
                 if not self.shed(result):
                     raise RuntimeError("unload failed")
             elif renew:
-                payload = {"model": self.model, "stream": False, "keep_alive": LEASE_SECONDS}
-                if decision.action == "load":
-                    payload["options"] = {"num_ctx": CONTEXT}
+                # Every load and renewal pins num_ctx: a renewal without it
+                # resolves Ollama's defaults and may reload at a larger context.
+                payload = {"model": self.model, "stream": False, "keep_alive": LEASE_SECONDS,
+                           "options": {"num_ctx": CONTEXT}}
                 self.maybe_loaded = True
                 self.api("/api/generate", payload)
             if decision.action != "hold":
@@ -325,13 +328,18 @@ def serve(runner, status_path, sleep=time.sleep, polls=None):
             count += 1
             sleep(POLL_SECONDS)
     finally:
-        if runner.maybe_loaded is not False:
-            runner.shed()
+        final = dict(version=1, model=runner.model, available=False, model_loaded=False,
+                     action="unload", reason="controller stopped")
+        if runner.maybe_loaded is not False and not runner.shed(final):
+            # Residency may persist until the lease expires: say so, never
+            # claim model_loaded=False after a failed unload.
+            runner.maybe_loaded = None
+            final.update(model_loaded=None, reason="controller stopped; unload failed")
+            print("studio_capacity: shutdown unload failed: " + final.get("unload_error", "unknown"),
+                  file=sys.stderr)
         try:
-            write_status(status_path, dict(version=1, sampled_at=runner.clock(),
-                                           expires_at=runner.clock(), model=runner.model,
-                                           available=False, model_loaded=False,
-                                           action="unload", reason="controller stopped"))
+            final.update(sampled_at=runner.clock(), expires_at=runner.clock())
+            write_status(status_path, final)
         except Exception as exc:
             print("studio_capacity: final status write failed: " + type(exc).__name__,
                   file=sys.stderr)
