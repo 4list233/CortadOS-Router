@@ -1172,14 +1172,19 @@ class Handler(BaseHTTPRequestHandler):
         s = self.server.registry.get(body.get("session", ""))
         if s is None or not hasattr(s, "wait_result"):   # only the Claude bridge's MCP shim calls back over HTTP
             return self._json(200, {"result": {"content": [{"type": "text", "text": "cortados: session closed"}], "isError": True}})
+        if body.get("abort") is True:
+            # The shim's outer transport expired. Close without taking the turn lock: a continuation may own it,
+            # but BridgeSession's _cv terminal transition makes a concurrent delivery lose atomically.
+            if self.server.registry.get(s.id) is s:
+                self.server.registry.drop(s, "bridge_transport_expired")
+            return self._json(200, {"closed": True})
         try:
             result = s.wait_result(body["tool_use_id"], timeout=TOOL_WAIT_S)
         except ToolWaitExpired as exc:
             # End the CLI before answering the shim. Never convert expiry into an error tool_result that lets the
             # unattended model take another paid turn; a late client continuation now sees a closed conversation.
-            with s.lock:
-                if self.server.registry.get(s.id) is s:
-                    self.server.registry.drop(s, "tool_result_expired")
+            if self.server.registry.get(s.id) is s:
+                self.server.registry.drop(s, "tool_result_expired")
             return self._error(410, "invalid_request_error", f"cortados: {exc}")
         except BridgeError as exc:
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}

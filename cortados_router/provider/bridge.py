@@ -130,6 +130,7 @@ class BridgeSession:
         # Armed only after the complete tool_use reply is ready. A shim call commonly arrives while the CLI is still
         # producing that reply, and must not silently consume part of the client's tool-result window.
         self._tool_result_deadline: float | None = None
+        self._tool_result_expired = False
         self._cv = threading.Condition()
         self._closed = False
         self._events: queue.Queue = queue.Queue()
@@ -207,6 +208,8 @@ class BridgeSession:
                     if remaining <= 0 or not self._cv.wait(timeout=remaining):
                         if tool_use_id not in self._results:
                             self._waiting.discard(tool_use_id)
+                            # This transition shares _cv with deliver(): exactly one of expiry or delivery wins.
+                            self._tool_result_expired = True
                             raise ToolWaitExpired(f"no result for {tool_use_id} before the tool-result deadline")
                 if self._closed and tool_use_id not in self._results:
                     raise BridgeError("the session was closed")
@@ -227,6 +230,8 @@ class BridgeSession:
             raise BridgeError(f"tool results for ids this session never issued: {unknown}")
         self.last_used = time.time()
         with self._cv:
+            if getattr(self, "_tool_result_expired", False) or self._closed:
+                raise BridgeError("the session was closed")
             self._results.update(results)
             # A later shim call belongs to the next reply and waits for that reply's own deadline.
             self._tool_result_deadline = None

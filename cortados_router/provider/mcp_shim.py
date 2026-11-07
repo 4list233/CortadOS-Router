@@ -18,8 +18,28 @@ PROTOCOL = "2025-06-18"
 TOOL_WAIT_S = float(os.environ.get("CORTADOS_PROVIDER_TOOL_WAIT_S") or 10800)
 if not 0 < TOOL_WAIT_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_TOOL_WAIT_S must be positive and finite")
-# Transport slack lets the server return its timeout diagnostic before the shim/CLI abandon the call.
-CALL_TIMEOUT_S = TOOL_WAIT_S + 120
+# A shim call can arrive while the backend is still producing the assistant reply. The server deliberately starts
+# TOOL_WAIT_S only once that reply is complete, so the outer transports must cover the preceding turn budget.
+TURN_TIMEOUT_S = float(os.environ.get("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
+if not 0 < TURN_TIMEOUT_S < float("inf"):
+    raise ValueError("CORTADOS_PROVIDER_TURN_TIMEOUT_S must be positive and finite")
+# Slack lets the server return its timeout diagnostic and close the backend before the shim/CLI abandon the call.
+CALL_SLACK_S = float(os.environ.get("CORTADOS_PROVIDER_CALL_SLACK_S") or 120)
+if not 0 < CALL_SLACK_S < float("inf"):
+    raise ValueError("CORTADOS_PROVIDER_CALL_SLACK_S must be positive and finite")
+CALL_TIMEOUT_S = TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S
+
+
+def _abort(gateway, session, token):
+    """Best-effort fail-closed notification after the call transport itself has expired."""
+    body = json.dumps({"session": session, "abort": True}).encode()
+    req = urllib.request.Request(gateway.rstrip("/") + "/bridge/call", data=body, method="POST",
+                                 headers={"content-type": "application/json", "x-cortados-token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError):
+        pass
 
 
 def _reply(mid, result=None, error=None):
@@ -42,6 +62,7 @@ def _forward(gateway, session, token, params):
         with urllib.request.urlopen(req, timeout=CALL_TIMEOUT_S) as resp:
             return json.loads(resp.read())["result"]
     except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+        _abort(gateway, session, token)
         return {"content": [{"type": "text", "text": f"cortados bridge: tool call failed: {exc}"}], "isError": True}
 
 

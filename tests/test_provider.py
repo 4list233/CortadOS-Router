@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import anthropic_wire as wire, bridge
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
 from cortados_router.provider import server
@@ -366,6 +366,52 @@ class EndpointTests(EndpointHarness):
         late = self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
         self.assertTrue(late["result"]["isError"])
         self.assertIn("session closed", late["result"]["content"][0]["text"])
+
+    def test_expiry_wins_against_delivery_holding_turn_lock(self):
+        s = BridgeSession.__new__(BridgeSession)
+        s.id, s.lock, s.history, s.last_used = uuid.uuid4().hex, threading.Lock(), ["reply"], time.time()
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed = mock.Mock(), False
+        s._tool_result_deadline, s._tool_result_expired = time.time() - 1, False
+        s.emitted, s.close = {"t"}, mock.Mock()
+        self.reg.sessions[s.id] = s
+        holding, release, rejected = threading.Event(), threading.Event(), []
+
+        def continuation():
+            with s.lock:
+                holding.set()
+                release.wait(2)
+                try:
+                    s.deliver({"t": {"content": "late"}})
+                except BridgeError as exc:
+                    rejected.append(str(exc))
+
+        thread = threading.Thread(target=continuation)
+        thread.start()
+        self.assertTrue(holding.wait(1))
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertEqual(cm.exception.code, 410)
+        self.assertIsNone(self.reg.get(s.id))       # expiry did not wait behind the held turn lock
+        s.close.assert_called_once()
+        release.set()
+        thread.join(1)
+        self.assertEqual(rejected, ["the session was closed"])
+        self.assertEqual(s._results, {})
+
+    def test_real_shim_transport_covers_delayed_reply_then_server_expires_closed(self):
+        # The real shim starts its HTTP timer before run_turn finishes the tool_use reply. Scale every budget down:
+        # the .12s completion delay exceeds the old .10s transport (.05 tool + .05 slack), but fits the new
+        # .30s transport (.20 turn + .05 tool + .05 slack).
+        env = {"CORTADOS_PROVIDER_TURN_TIMEOUT_S": "0.20", "CORTADOS_PROVIDER_CALL_SLACK_S": "0.05"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(server, "TOOL_WAIT_S", 0.05), \
+             mock.patch.object(bridge, "TOOL_WAIT_S", 0.05), mock.patch.object(bridge, "SETTLE_S", 0.12):
+            first = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
+        self.assertEqual(first["stop_reason"], "tool_use")
+        deadline = time.time() + 2
+        while self.reg.sessions and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.reg.sessions, {})     # server expiry ended the backend; no synthetic unattended turn
 
     def test_stream_sends_pings_while_backend_turn_is_running(self):
         original = BridgeSession.run_turn
