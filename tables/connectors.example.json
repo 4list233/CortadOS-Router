@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "gmail-example",
+      "kind": "claude_ai",
+      "tools": [
+        {
+          "name": "search_messages",
+          "class": "read"
+        },
+        {
+          "name": "draft_message",
+          "class": "write"
+        },
+        {
+          "name": "send_message",
+          "class": "outward"
+        },
+        {
+          "name": "delete_message",
+          "class": "outward"
+        }
+      ]
+    },
+    {
+      "name": "test-files",
+      "kind": "mcp_stdio",
+      "tools": [
+        {
+          "name": "read_document",
+          "class": "read"
+        },
+        {
+          "name": "update_document",
+          "class": "write"
+        },
+        {
+          "name": "share_document",
+          "class": "outward"
+        }
+      ]
+    },
+    {
+      "name": "vercel-example",
+      "kind": "mcp_http",
+      "url": "https://example.invalid/mcp",
+      "tools": [
+        {
+          "name": "list_projects",
+          "class": "read"
+        },
+        {
+          "name": "deploy_project",
+          "class": "outward"
+        }
+      ]
+    }
+  ]
+}
