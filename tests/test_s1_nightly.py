@@ -161,6 +161,9 @@ class NightlyEndToEnd(unittest.TestCase):
         self.env = {**keep, "HOME": str(home), "CORTADOS_NIGHTLY_SUPERVISED": "1", "CORTADOS_S1_PY": str(self.tmp / "fake-py"),
                     "CORTADOS_S1_GPU_SETTLE": "0", "CORTADOS_S1_EVAL_SETTLE": "0", "CORTADOS_ROUTER_REPO": str(self.tmp / "no-repo"),
                     "CORTADOS_HOME": str(self.tmp / "cortados-home"),
+                    # studio gate: no 30 s ack wait per gated step, and a closed loopback port as "Ollama not running"
+                    # so the harness never queries or unloads the developer's real Ollama
+                    "CORTADOS_STUDIO_ACK_WAIT": "0", "CORTADOS_STUDIO_OLLAMA_PORT": "1",
                     "CORTADOS_S1_EVAL_MINUTES": "0"}   # no wall-clock dependence; the deadline tests set it
         self.night = 0
 

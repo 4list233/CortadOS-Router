@@ -287,11 +287,16 @@ state() { python3 -B ./nightly_state.py "$@"; }
 # Studio capacity handshake: each training/eval step runs under a training intent, so the capacity daemon unloads the
 # local Ollama model (confirmed via /api/ps) BEFORE the step starts. Bounded 30 s wait; never proceeds silently.
 GATE_ROOT="$(cd .. && pwd)"   # repo root, fixed here: gated also runs from inside s1/laya
-gated() { PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -B -m cortados_router.studio_capacity gate -- "$@"; }
+# The gate interpreter is resolved to an absolute path HERE (cwd s1/): $PY defaults to ../.venv-mlx/bin/python, which
+# would resolve to s1/.venv-mlx after the laya branch's `cd laya`. A bare name (python3) stays a PATH lookup.
+case "$PY" in /*) GATE_PY="$PY" ;; */*) GATE_PY="$(cd "$(dirname "$PY")" 2>/dev/null && pwd)/$(basename "$PY")" || GATE_PY="$PY" ;; *) GATE_PY="$PY" ;; esac
+# Test-only: CORTADOS_STUDIO_ACK_WAIT / CORTADOS_STUDIO_OLLAMA_PORT (see studio_capacity.py) pass through the environment.
+# Exit 75 = the gate refused (model residency could not be confirmed absent); the command did not run.
+gated() { PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"; }
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
-    gated $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
+    gated "$PY" evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
 }
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
@@ -606,18 +611,21 @@ if [ -f data/laya-tonight ]; then
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
   init=""; [ -f data/laya-init ] && init="$(cat data/laya-init)" && rm -f data/laya-init && [ -d "$init" ] && echo "laya: warm start from $init"
-  ( cd laya && ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ) ; lrc=$?
+  ( cd laya && gated ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ) ; lrc=$?
   stop_deadline
   gpu_share; sleep 20
   if [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
-    HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN" \
+    HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" gated .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN" \
       && python3 -c "import json;r=json.load(open('$LRUN/report.json'));c=r['candidate'];print('laya holdout: band',c['band_accuracy'],'under',c['under_routed'],'over',c['over_routed'],'outward',c['outward_recall'],'| would promote:',r['promote'])"
   else
     echo "laya training failed (rc $lrc); see $LRUN/train.log"
   fi
   echo "laya night: Qwen resume skipped tonight"; echo "=== $(date) nightly end"; exit 0
 fi
-if ! HF_HUB_OFFLINE=1 $PY -c "from mlx_lm import load; load('$BASE')" >/dev/null 2>&1; then
+HF_HUB_OFFLINE=1 gated "$PY" -c "from mlx_lm import load; load('$BASE')" >/dev/null 2>&1; prc=$?   # loads the base: gated
+if [ "$prc" -eq 75 ]; then
+  echo "studio gate refused (local model residency unconfirmed): training skipped"; exit 1
+elif [ "$prc" -ne 0 ]; then
   echo "base model $BASE is not on disk: training skipped (download needs Forest's OK)"; exit 2
 fi
 n=$(wc -l < data/sft/train.jsonl | tr -d ' '); [[ "$n" =~ ^[0-9]{1,9}$ ]] || { echo "data/sft/train.jsonl line count unreadable: training skipped"; exit 1; }
@@ -687,7 +695,7 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
-  HF_HUB_OFFLINE=1 gated $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
+  HF_HUB_OFFLINE=1 gated "$PY" -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
     --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
   attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1

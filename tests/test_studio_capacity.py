@@ -4,9 +4,13 @@ import time
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from cortados_router import studio_capacity as c
+
+
+N1 = "0000000000000000000000000000000a"  # canonical nonce (uuid4().hex shape)
 
 
 class PolicyTests(unittest.TestCase):
@@ -338,10 +342,10 @@ class HandshakeTests(unittest.TestCase):
         self.loaded = payload["keep_alive"] != 0
         return {}
 
-    def intent(self, pid=4242, nonce="n1", expires=None):
+    def intent(self, pid=4242, nonce=N1, expires=None):
         self.gate.mkdir(parents=True, exist_ok=True)
         c.write_status(self.gate / ("intent-%d-%s.json" % (pid, nonce)),
-                       dict(version=1, pid=pid, nonce=nonce, created_at=self.now,
+                       dict(version=1, pid=pid, nonce=nonce, created_at=(self.now if expires is None else expires - 300),
                             expires_at=self.now + 300 if expires is None else expires))
 
     def test_intent_sheds_and_acks(self):
@@ -352,8 +356,8 @@ class HandshakeTests(unittest.TestCase):
         # Shed precedes the residency query, so the decision itself is hold.
         self.assertIn(("/api/generate", {"model": c.MODEL, "stream": False, "keep_alive": 0}), self.calls)
         self.assertEqual(result["training_intents"], 1)
-        ack = json.loads((self.gate / "ack-n1.json").read_text())
-        self.assertEqual((ack["nonce"], ack["model_loaded"]), ("n1", False))
+        ack = json.loads((self.gate / ("ack-%s.json" % N1)).read_text())
+        self.assertEqual((ack["nonce"], ack["model_loaded"]), (N1, False))
 
     def test_no_load_or_renew_while_intent_live(self):
         self.loaded = False
@@ -374,9 +378,36 @@ class HandshakeTests(unittest.TestCase):
     def test_dead_trainer_intent_cleaned(self):
         self.dead.add(4242)
         self.intent()
-        (self.gate / "ack-n1.json").write_text("{}")
+        (self.gate / ("ack-%s.json" % N1)).write_text("{}")
         self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: p not in self.dead), [])
         self.assertFalse(list(self.gate.iterdir()))
+
+    def test_invalid_intent_schema_takes_malformed_path(self):
+        good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
+        bad = [dict(expires_at=float("nan")), dict(expires_at=float("inf")), dict(created_at=float("-inf")),
+               dict(pid=0), dict(pid=-5), dict(pid=True), dict(pid="4242"), dict(nonce="n1"),
+               dict(nonce=N1.upper()), dict(version=2), dict(expires_at=self.now + 10**6),
+               dict(created_at=self.now - 10**6), dict(expires_at="1e999")]
+        for i, override in enumerate(bad):
+            with self.subTest(override=override):
+                self.gate.mkdir(parents=True, exist_ok=True)
+                path = self.gate / ("intent-%d.json" % i)
+                path.write_text(json.dumps({**good, **override}))  # allow_nan: writes NaN/Infinity
+                self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: True),
+                                 [dict(pid=None, nonce=None, expires_at=None)])
+                # bounded: discarded once older than one TTL by mtime
+                self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1,
+                                                alive=lambda p: True), [])
+                self.assertFalse(path.exists())
+        # raw JSON spellings the decoder turns into non-finite floats
+        for i, raw in enumerate(('NaN', 'Infinity', '1e999')):
+            with self.subTest(raw=raw):
+                path = self.gate / ("intent-raw-%d.json" % i)
+                path.write_text('{"version": 1, "pid": 4242, "nonce": "%s", "created_at": %s, "expires_at": %s}'
+                                % (N1, self.now, raw))
+                self.assertEqual(len(c.live_intents(self.gate, self.now, alive=lambda p: True)), 1)
+                c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1, alive=lambda p: True)
+                self.assertFalse(path.exists())
 
     def test_malformed_intent_fails_closed_until_ttl(self):
         self.gate.mkdir(parents=True)
@@ -408,13 +439,42 @@ class HandshakeTests(unittest.TestCase):
         self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
         self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
 
-    def test_daemon_dead_proceeds_with_log(self):
+    def test_daemon_dead_model_resident_trainer_unloads(self):
+        # A daemon killed right after a renewal leaves the model resident for a
+        # lease: stale status must not let training start beside it.
+        self.loaded = True
         ctx, clock = self.gate_ctx()
         with ctx:
-            pass
+            self.assertFalse(self.loaded)
         self.assertGreaterEqual(clock[0], c.ACK_WAIT_SECONDS)
-        self.assertIn("not running", self.logs[-1])
-        self.assertTrue(self.loaded)  # proceeds; nothing under daemon control
+        self.assertTrue(any("not running" in line for line in self.logs))
+        self.assertIn("confirmed", self.logs[-1])
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_daemon_dead_unload_unconfirmed_refuses(self):
+        def stuck(path, payload=None):
+            return {"models": [{"name": c.MODEL}]} if path == "/api/ps" else {}
+        ctx, _ = self.gate_ctx(api=stuck)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_ollama_not_running_proceeds_with_log(self):
+        def refused(path, payload=None):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+        ctx, _ = self.gate_ctx(api=refused)
+        with ctx:
+            pass
+        self.assertIn("connection refused", self.logs[-1])
+
+    def test_ollama_error_refuses(self):
+        def broken(path, payload=None):
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        ctx, _ = self.gate_ctx(api=broken)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
         self.assertFalse(list(self.gate.iterdir()))
 
     def test_live_daemon_without_ack_trainer_unloads_itself(self):
