@@ -72,7 +72,16 @@ def pro_local_allowed():
     except OSError as exc:
         return False, "local disabled: switch unreadable (" + type(exc).__name__ + ")"
     allowed, reason = _ac_power()
-    return (True, "local enabled: AC power + manual switch on") if allowed else (False, reason)
+    if not allowed:
+        return False, reason
+    # The power probe may block on pmset while the owner turns the lane off. Never
+    # let that stale pre-check admit a request after the manual switch is removed.
+    try:
+        if not local_switch_path().is_file():
+            return False, "local switch off"
+    except OSError as exc:
+        return False, "local disabled: switch unreadable (" + type(exc).__name__ + ")"
+    return True, "local enabled: AC power + manual switch on"
 
 
 def mac_memory(text):

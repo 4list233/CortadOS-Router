@@ -304,6 +304,25 @@ class ProLocalPolicy(unittest.TestCase):
             self.assertFalse(resources.pro_local_allowed()[0])
             self.assertEqual(cmd.call_count, 2)
 
+    def test_switch_removed_while_power_check_is_blocked_wins(self):
+        entered, release = threading.Event(), threading.Event()
+        result = []
+
+        def blocked_power(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return b"Now drawing from 'AC Power'\n"
+
+        with patch.object(resources, "command", side_effect=blocked_power):
+            worker = threading.Thread(target=lambda: result.append(resources.pro_local_allowed()))
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            self.flag.unlink()
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [(False, "local switch off")])
+
     def test_pro_telemetry_enforces_policy_beside_fit_and_exclusions(self):
         with patch.object(resources, "collect_node", return_value={"sampled_at": 1000}), \
              patch.object(resources, "pro_local_allowed", return_value=(False, "local switch off")):
