@@ -673,7 +673,20 @@ class Registry:
             with self._lock:
                 self.sessions[s.id] = s
                 self._opening -= 1
+            if hasattr(s, "set_exit_handler"):
+                s.set_exit_handler(self._backend_exited)
         return s
+
+    def _backend_exited(self, s) -> None:
+        """The backend process died on its own (e.g. the shim killed its CLI on a tool deadline): remove the
+        conversation terminally and end the backend, without relying on the shim's abort ever arriving."""
+        with self._lock:
+            if self.sessions.get(s.id) is not s:
+                return
+            del self.sessions[s.id]
+        logger.warning("conversation %s: backend exited; removed", str(s.id)[:8])
+        self.note_closed(s, "exited")
+        s.close()
 
     def reserve_opening(self) -> None:
         """Reserve conversation capacity before routing can reserve any quota."""

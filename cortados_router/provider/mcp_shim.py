@@ -5,6 +5,18 @@ until the client has run the tool and sent the result back. Stdlib only, no pack
 file directly.
 
 Usage: mcp_shim.py <gateway url> <session id> <tools.json>; the endpoint token comes in CORTADOS_PROVIDER_TOKEN.
+
+The invariant: the CLI must never generate its OWN synthetic tool error (its MCP tool timeout) and continue a paid turn
+unattended. A real tool result written by this shim is never a violation, even one written close to the deadline.
+(a) The shim's per-call deadline (CALL_TIMEOUT_S, passed in by the provider as CORTADOS_PROVIDER_CALL_TIMEOUT_S) is
+    strictly earlier than the CLI's MCP_TOOL_TIMEOUT by a documented margin (timeouts.CLI_MARGIN_S, floor 30 s); both
+    come from one constant in cortados_router/provider/timeouts.py. A write that passes the pre-write check (failed
+    flag + deadline, under the dispatcher lock) is a one-line pipe write that completes long before the CLI could time
+    out, so it is allowed to finish; stdout writes are deliberately not made cancellable.
+(b) Once a deadline passes, the shim publishes nothing new: it SIGKILLs the owning CLI under the lock every writer
+    checks, then asks the provider to close the backend. A flush that returns after the deadline also fails closed.
+Cleanup survives owner death: on stdin EOF (the killed CLI closes our stdin) main() joins the abort for a bounded time
+and reports an unconfirmed abort on stderr; independently, the provider removes a conversation whose CLI exited.
 """
 import collections
 import heapq
@@ -32,7 +44,9 @@ if not 0 < TURN_TIMEOUT_S < float("inf"):
 CALL_SLACK_S = float(os.environ.get("CORTADOS_PROVIDER_CALL_SLACK_S") or 120)
 if not 0 < CALL_SLACK_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_CALL_SLACK_S must be positive and finite")
-CALL_TIMEOUT_S = TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S
+CALL_TIMEOUT_S = float(os.environ.get("CORTADOS_PROVIDER_CALL_TIMEOUT_S") or (TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S))
+if not 0 < CALL_TIMEOUT_S < float("inf"):
+    raise ValueError("CORTADOS_PROVIDER_CALL_TIMEOUT_S must be positive and finite")
 # The provider resolves compatibility aliases and supplies all budgets explicitly to this standalone process.
 ABORT_TIMEOUT_S = float(os.environ.get("CORTADOS_PROVIDER_ABORT_TIMEOUT_S") or 120)
 if not 0 < ABORT_TIMEOUT_S < float("inf"):
@@ -134,6 +148,8 @@ class _Dispatcher:
         self._clock = clock
         self._cond = threading.Condition()
         self._heap = []                     # (deadline, seq); entries whose seq left _live are dead
+        self.cleanup_done = threading.Event()   # set once the fail-closed abort has returned (either way)
+        self.abort_confirmed = False
         self._live = {}                     # seq -> call, for calls not yet answered
         self._queue = collections.deque()
         self._seq = 0
@@ -230,7 +246,25 @@ class _Dispatcher:
             _kill_owner()
             self._failed = True
             self._cond.notify_all()
-        _abort(self._gateway, self._session, self._token)   # backend cleanup; the owner is already dead
+        ok = False
+        try:
+            ok = _abort(self._gateway, self._session, self._token)   # backend cleanup; the owner is already dead
+        finally:
+            self.abort_confirmed = ok
+            self.cleanup_done.set()
+
+    def finish(self, timeout):
+        """On stdin EOF: wait (bounded) for a started fail-closed cleanup; report it on stderr if unconfirmed."""
+        with self._cond:
+            failed = self._failed
+        if not failed:
+            return True
+        if not self.cleanup_done.wait(timeout) or not self.abort_confirmed:
+            sys.stderr.write(f"cortados-bridge: backend abort for session {self._session} unconfirmed; "
+                             "the provider removes the conversation when its CLI exits\n")
+            sys.stderr.flush()
+            return False
+        return True
 
 
 def main(argv):
@@ -258,6 +292,9 @@ def main(argv):
             _reply(mid, {})
         else:
             _reply(mid, error={"code": -32601, "message": f"method not found: {method}"})
+    # stdin EOF: the owner is gone (possibly killed by our own fail-closed path). Do not let interpreter exit cut the
+    # daemon-thread abort short: join it for its own bound plus a little.
+    dispatcher.finish(ABORT_TIMEOUT_S + 5)
 
 
 if __name__ == "__main__":

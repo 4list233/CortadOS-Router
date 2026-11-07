@@ -22,5 +22,15 @@ def effective_tool_wait(idle_s, tool_wait_s):
     return max(idle_s, tool_wait_s)
 
 
+# The ONE place both budgets come from. CALL_TIMEOUT_S is the shim's per-call deadline (handed to the shim verbatim as
+# CORTADOS_PROVIDER_CALL_TIMEOUT_S); CLI_TOOL_TIMEOUT_S is the CLI's MCP_TOOL_TIMEOUT. The CLI must never reach its own
+# timeout first: that timeout makes the CLI write a synthetic tool error and continue a paid turn unattended. The
+# margin between them covers (1) the CLI starting its timer before the shim receives the call (process startup and
+# scheduling), and (2) a result write that passed the shim's pre-write check just before the deadline: that is a real
+# result and must finish flushing well before the CLI could time out. A pipe write of one JSON line takes
+# milliseconds; 30 s is the documented floor, the configured margin is ABORT_TIMEOUT_S + CLI_SLACK_S = 240 s.
+CLI_MARGIN_FLOOR_S = 30.0
+CLI_MARGIN_S = ABORT_TIMEOUT_S + CLI_SLACK_S
+assert CLI_MARGIN_S >= CLI_MARGIN_FLOOR_S, "the CLI timeout margin fell below its documented floor"
 CALL_TIMEOUT_S = TURN_TIMEOUT_S + effective_tool_wait(IDLE_S, TOOL_WAIT_S) + CALL_SLACK_S
-CLI_TOOL_TIMEOUT_S = CALL_TIMEOUT_S + ABORT_TIMEOUT_S + CLI_SLACK_S
+CLI_TOOL_TIMEOUT_S = CALL_TIMEOUT_S + CLI_MARGIN_S

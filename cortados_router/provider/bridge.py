@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cortados_router.provider.timeouts import (
-    ABORT_TIMEOUT_S, CALL_SLACK_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
+    ABORT_TIMEOUT_S, CALL_SLACK_S, CALL_TIMEOUT_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
     effective_tool_wait,
 )
 
@@ -137,6 +137,11 @@ class BridgeSession:
         self._cv = threading.Condition()
         self._closed = False
         self._events: queue.Queue = queue.Queue()
+        # Provider-side cleanup when the CLI (and so its shim) exits on its own, e.g. killed by the shim on expiry:
+        # independent of the shim's abort, which may never be sent if the shim dies with its owner.
+        self._exited = False
+        self._closing = False
+        self._exit_handler: Callable[[Any], None] | None = None
         self.dir = Path(tempfile.mkdtemp(prefix="cortados-bridge-", dir=scratch_root))
         self._stderr = None
         prefix = [claude_bin] if isinstance(claude_bin, str) else list(claude_bin)   # a list lets tests run a fake CLI
@@ -155,7 +160,10 @@ class BridgeSession:
                             "CORTADOS_PROVIDER_TOOL_WAIT_S": str(effective_tool_wait(IDLE_S, TOOL_WAIT_S)),
                             "CORTADOS_PROVIDER_TURN_TIMEOUT_S": str(TURN_TIMEOUT_S),
                             "CORTADOS_PROVIDER_CALL_SLACK_S": str(CALL_SLACK_S),
-                            "CORTADOS_PROVIDER_ABORT_TIMEOUT_S": str(ABORT_TIMEOUT_S)}}}}))
+                            "CORTADOS_PROVIDER_ABORT_TIMEOUT_S": str(ABORT_TIMEOUT_S),
+                            # The shim's deadline, verbatim from timeouts.py (the same constant MCP_TOOL_TIMEOUT
+                            # below is derived from), so the two can never drift apart.
+                            "CORTADOS_PROVIDER_CALL_TIMEOUT_S": repr(CALL_TIMEOUT_S)}}}}))
                 args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
                          "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
             else:
@@ -191,6 +199,22 @@ class BridgeSession:
         except ValueError:
             pass                                        # close() shut stdout under us: the session is ending anyway
         self._events.put(("exit", self.proc.wait()))
+        with self._cv:
+            self._exited = True
+            handler = None if self._closing else self._exit_handler
+        if handler:
+            try:
+                handler(self)
+            except Exception:
+                logger.exception("cortados bridge %s: exit cleanup failed", self.id[:8])
+
+    def set_exit_handler(self, handler: Callable[[Any], None]) -> None:
+        """Run `handler(self)` once when the CLI exits on its own (not via close()); at once if it already has."""
+        with self._cv:
+            self._exit_handler = handler
+            run_now = self._exited and not self._closing
+        if run_now:
+            handler(self)
 
     def send_user(self, content: list[dict[str, Any]], timeout: float) -> None:
         """Write one user message, under write_line's deadline rule."""
@@ -338,6 +362,8 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
+        with self._cv:
+            self._closing = True                        # an exit we caused is not an unexpected exit
         try:
             if self.proc.poll() is None:
                 self.proc.stdin.close()
