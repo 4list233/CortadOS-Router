@@ -252,31 +252,84 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
         self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
 
-    def test_queued_shim_call_keeps_its_submission_deadline(self):
-        # Two requests reach the shim together with only one transport slot. The second call's deadline must include
-        # its queue time: it expires closed and can never emit a synthetic result after the first releases the slot.
-        entered = threading.Event()
-        replies, aborted = [], threading.Event()
+    def _shim_dispatcher(self, forward, emit, timeout, clock=time.monotonic, workers=1, max_pending=8):
+        aborted = threading.Event()
+        patches = [mock.patch.object(mcp_shim, "CALL_TIMEOUT_S", timeout),
+                   mock.patch.object(mcp_shim, "_forward", side_effect=forward),
+                   mock.patch.object(mcp_shim, "_emit", side_effect=emit),
+                   mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: aborted.set() or True),
+                   mock.patch.object(mcp_shim, "_terminate_owner", side_effect=AssertionError("abort was confirmed"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        d = mcp_shim._Dispatcher("gateway", "session", "token", workers=workers, max_pending=max_pending, clock=clock)
+        return d, aborted
 
-        def forward(_gateway, _session, _token, params):
-            if params["name"] == "first":
-                entered.set()
-            time.sleep(0.07)
+    def test_queued_shim_call_keeps_its_submission_deadline(self):
+        # Two calls, one worker. The second call's deadline includes its queue time: it expires closed while the
+        # first still holds the worker, and once the session failed closed nothing at all is written.
+        release, entered, lines = threading.Event(), threading.Event(), []
+
+        def forward(_g, _s, _t, params):
+            entered.set()
+            release.wait(5)
             return {"content": [{"type": "text", "text": params["name"]}]}
 
-        with mock.patch.object(mcp_shim, "CALL_TIMEOUT_S", 0.10), \
-             mock.patch.object(mcp_shim, "_forward", side_effect=forward), \
-             mock.patch.object(mcp_shim, "_reply", side_effect=lambda mid, result: replies.append(mid)), \
-             mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: aborted.set() or True):
-            slots = threading.BoundedSemaphore(1)
-            mcp_shim._dispatch_call(1, "gateway", "session", "token", {"name": "first"}, slots)
-            self.assertTrue(entered.wait(1))
-            mcp_shim._dispatch_call(2, "gateway", "session", "token", {"name": "second"}, slots)
-            self.assertTrue(aborted.wait(1))
-            time.sleep(0.08)
+        d, aborted = self._shim_dispatcher(forward, lines.append, 0.3)
+        d.submit(1, {"name": "first"})
+        self.assertTrue(entered.wait(2))
+        d.submit(2, {"name": "second"})
+        self.assertTrue(aborted.wait(5))
+        release.set()
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
 
-        self.assertEqual(replies, [1])
+    def test_shim_deadline_is_taken_at_submission_not_at_thread_start(self):
+        # The clock reads 0 at submission and 100 for every later read: however late any thread is scheduled, the
+        # call's result is past its 10 s deadline and must never be written.
+        reads, lines = [], []
+
+        def clock():
+            reads.append(1)
+            return 0.0 if len(reads) == 1 else 100.0
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, lines.append, 10.0, clock=clock)
+        d.submit(1, {"name": "late"})
+        self.assertTrue(aborted.wait(5))
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
+
+    def test_shim_stays_armed_while_reply_is_blocked_past_deadline(self):
+        # The result is ready in time but the stdout write blocks. The deadline thread must still fail closed:
+        # a call is answered only once its flush returns.
+        writing, unblock = threading.Event(), threading.Event()
+
+        def emit(_line):
+            writing.set()
+            unblock.wait(5)
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, emit, 0.3)
+        d.submit(1, {"name": "blocked"})
+        self.assertTrue(writing.wait(2))
+        self.assertTrue(aborted.wait(5))
+        unblock.set()
+
+    def test_shim_fails_closed_past_pending_cap(self):
+        release, lines = threading.Event(), []
+
+        def forward(*_):
+            release.wait(5)
+            return {"content": []}
+
+        d, aborted = self._shim_dispatcher(forward, lines.append, 60.0, max_pending=2)
+        for mid in (1, 2):
+            d.submit(mid, {"name": "n"})
+        self.assertFalse(aborted.is_set())
+        d.submit(3, {"name": "n"})
         self.assertTrue(aborted.is_set())
+        release.set()
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
 
     def test_subprocess_shim_aborts_before_cli_timeout_can_resume(self):
         from cortados_router.provider import timeouts
