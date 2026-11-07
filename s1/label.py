@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from common import DATA, LABELER_MARKER, QUESTIONS, REPO, core, is_claude_teacher, read_jsonl, read_labels, valid_answers
+from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 
 STATE = Path.home() / ".cortados"
 LABELS = DATA / "labels.jsonl"
@@ -175,10 +176,10 @@ def _config_exit(msg: str) -> None:
 
 
 def provider_config() -> tuple[str, str]:
-    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip().rstrip("/")
-    if not url:
-        _config_exit("label: CORTADOS_PROVIDER_URL is not set; the provider backend needs the cortados endpoint (no default: a wrong "
-                     "host would only show up as a connection error per batch)")
+    try:
+        url = resolve_provider_url()
+    except ProviderURLError as exc:
+        _config_exit(f"label: {exc}")
     tf = Path(os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or TOKEN_FILE_DEFAULT).expanduser()
     try:
         token = tf.read_text().strip()

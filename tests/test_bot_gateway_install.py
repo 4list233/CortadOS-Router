@@ -5,6 +5,7 @@ import os
 import plistlib
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -617,6 +618,31 @@ class LauncherTest(LauncherBase):
                                "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432"})
         self.assertNotIn(PROVIDER_SECRET, err)
 
+    def test_https_file_fallback(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        endpoint = Path(self.tmp.name) / ".config/cortados/provider-url"
+        endpoint.parent.mkdir(parents=True)
+        endpoint.write_text(" https://provider.example:8443/\n")
+        self.environ.pop("CORTADOS_PROVIDER_URL")
+        rc, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls[0][2]["CORTADOS_PROVIDER_URL"], "https://provider.example:8443")
+
+    def test_invalid_ambient_route_timeout_does_not_break_launcher_import(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        launch = str(SCRIPT.parent / "launch.py")
+        argv = ["--provider-env", str(self.envfile), "--python", "/usr/bin/python3", "--",
+                "--host", FAKE_IP, "--port", "8434"]
+        code = ("import importlib.util; "
+                "s=importlib.util.spec_from_file_location('isolated_launch', %r); "
+                "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "raise SystemExit(m.main(%r, environ=%r, execve=lambda *a: None))"
+                % (launch, argv, self.environ))
+        env = dict(os.environ, HOME=self.tmp.name, CORTADOS_HOME=self.tmp.name + "/.cortados",
+                   CORTADOS_SCARCITY_REFRESH="off", CORTADOS_ROUTE_TIMEOUT_S="invalid-ambient-setting")
+        run = subprocess.run([sys.executable, "-I", "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_every_config_failure_exits_78(self):
         good = f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n"
         cases = {
@@ -632,7 +658,7 @@ class LauncherTest(LauncherBase):
             "group writable": (good, {"mode": 0o620}, None),
             "missing HOME": (good, {"unset": "HOME"}, None),
             "missing URL": (good, {"unset": "CORTADOS_PROVIDER_URL"}, None),
-            "https URL": (good, {"url": "https://x:1"}, None),
+            "invalid URL": (good, {"url": "ftp://invalid.example"}, None),
             "start_task flag": (good, {}, ("--enable-start-task",)),
             "not UTF-8": (None, {}, None),
         }

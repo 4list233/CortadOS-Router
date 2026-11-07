@@ -11,7 +11,7 @@
     "providerUrl": {
       "type": "string",
       "title": "Provider URL",
-      "default": "http://127.0.0.1:8432",
+      "default": "",
       "description": "CortadOS provider base URL that subagents route through (e.g. the Air on the tailnet)."
     },
     "providerTokenFile": {

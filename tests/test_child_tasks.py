@@ -260,6 +260,11 @@ class ChildTaskTests(unittest.TestCase):
                                                 "CORTADOS_CHILD_CLAUDE_BIN": bin_, "FAKE_CLAUDE_MODE": "ok",
                                                 "CLAUDECODE": "1",
                                                 "CORTADOS_CONNECTORS_MCP_CONFIG": os.path.join(self.tmp, "no-conn.json"),
+                                                "HOME": self.tmp,
+                                                "CORTADOS_PROVIDER_URL": "",
+                                                "CORTADOS_PROVIDER_URL_FILE": "",
+                                                "CORTADOS_PROVIDER_TOKEN": "",
+                                                "CORTADOS_PROVIDER_TOKEN_FILE": "",
                                                 "CORTADOS_HOME": os.path.join(self.tmp, "home"),
                                                 "CORTADOS_SCARCITY_REFRESH": "off"})
         self.env.start()
@@ -1879,6 +1884,17 @@ class ChildTaskTests(unittest.TestCase):
         self.cfg["url"] = ""
         r, _ = self.call("start_task", task="x", cwd=self.work)
         self.assertIn("not configured", r["content"][0]["text"])
+
+    def test_empty_url_uses_the_isolated_home_provider_file(self):
+        endpoint = os.path.join(self.tmp, ".config", "cortados", "provider-url")
+        os.makedirs(os.path.dirname(endpoint))
+        with open(endpoint, "w") as f:
+            f.write("https://file-provider.example:8443/\n")
+        self.cfg["url"] = ""
+        tid = self.start()
+        self.call("wait_task", task_id=tid, timeout_s=30)
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        self.assertEqual(seen["env"]["ANTHROPIC_BASE_URL"], "https://file-provider.example:8443")
 
 
 if __name__ == "__main__":

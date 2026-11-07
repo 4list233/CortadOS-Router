@@ -60,7 +60,10 @@ class OutcomeCase(unittest.TestCase):
         self.home = tempfile.mkdtemp()
         # The local backend unless a test opts into the provider: a developer shell's CORTADOS_PROVIDER_URL must not
         # send a test's judge/generate call to a real provider.
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local"})
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local",
+                                                "HOME": self.home, "CORTADOS_PROVIDER_URL": "",
+                                                "CORTADOS_PROVIDER_URL_FILE": "", "CORTADOS_PROVIDER_TOKEN": "",
+                                                "CORTADOS_PROVIDER_TOKEN_FILE": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
         from outcome import provider
@@ -816,6 +819,23 @@ class ProviderBackendTests(OutcomeCase):
                 seen.append((req.full_url, _j.loads(req.data), dict(req.header_items())))
             return R(_j.dumps({"model": served, "content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}).encode())
         return op
+
+    def test_provider_https_file_config_and_request(self):
+        endpoint = Path(self.home) / "outcome-provider-url"
+        endpoint.write_text("https://provider.example:8443/\n")
+        with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_URL": "", "CORTADOS_PROVIDER_URL_FILE": str(endpoint)}):
+            self.assertTrue(self.p.enabled())
+            seen = []
+            self.p.ask("claude", "claude-fable-5-1", "sys", "u",
+                       urlopen=self._urlopen("claude-fable-5-1", "hi", seen))
+            self.assertEqual(seen[0][0], "https://provider.example:8443/v1/messages")
+
+    def test_provider_file_fixture_does_not_overwrite_home_file(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}):
+            existing = Path(home) / "outcome-provider-url"
+            existing.write_text("keep existing user data\n")
+            self.test_provider_https_file_config_and_request()
+            self.assertEqual(existing.read_text(), "keep existing user data\n")
 
     def test_every_call_carries_the_min_left_header(self):
         seen = []

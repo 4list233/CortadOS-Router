@@ -425,15 +425,65 @@ class EmbeddedNewlineTokenTests(unittest.TestCase):
 
 
 class ConfigResolutionTests(unittest.TestCase):
-    """How main() resolves the provider URL and token: env first, then the token file; an unexpanded ${VAR} URL is
-    treated as unconfigured (a clear 'not configured' error rather than 'unknown url type')."""
+    """Env overrides files; an unexpanded URL placeholder is a source-named configuration error."""
     import os as _os
     import tempfile as _tempfile
     from unittest import mock as _mock
 
+    def test_bad_url_does_not_disable_mcp_or_provider_independent_tools(self):
+        from cortados_router import child_tasks as ct
+        from pathlib import Path
+
+        for selected in ({}, {"CORTADOS_PROVIDER_URL": "invalid-secret-value"},
+                         {"CORTADOS_PROVIDER_URL_FILE": "missing-endpoint-file"}):
+            with self.subTest(selected=selected), self._tempfile.TemporaryDirectory() as home:
+                env = {"HOME": home, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off",
+                       "CORTADOS_PROVIDER_TOKEN_FILE": str(Path(home) / "missing-token"), **selected}
+                messages = [{"id": 1, "method": "initialize"}, {"id": 2, "method": "tools/list"},
+                            {"id": 3, "method": "ping"}]
+                calls = [("route_task", {"task": "test"}), ("start_task", {"task": "test", "cwd": home}),
+                         ("start_task", {"task": "test", "cwd": home, "chrome": True}),
+                         ("cancel_task", {"task_id": "test"}), ("task_status", {"task_id": "test"}),
+                         ("wait_task", {"task_id": "test"}), ("list_tasks", {})]
+                messages += [{"id": i + 4, "method": "tools/call", "params": {"name": name, "arguments": args}}
+                             for i, (name, args) in enumerate(calls)]
+                replies = []
+                # Exercise main's actual config load; synchronous dispatch makes EOF deterministic.
+                def dispatch(msg, cfg):
+                    replies.append(m.handle(msg, cfg))
+                with self._mock.patch.dict(self._os.environ, env, clear=True), \
+                     self._mock.patch.object(m.sys, "stdin", io.StringIO("\n".join(map(json.dumps, messages)))), \
+                     self._mock.patch.object(m, "_dispatch", dispatch), \
+                     self._mock.patch.object(m, "route_task") as route, \
+                     self._mock.patch.object(ct, "start", return_value={"task_id": "chrome"}) as start, \
+                     self._mock.patch.object(ct, "cancel", return_value={"state": "cancelled"}) as cancel, \
+                     self._mock.patch.object(ct, "status", return_value={"state": "running"}) as status, \
+                     self._mock.patch.object(ct, "wait", return_value={"state": "running"}) as wait, \
+                     self._mock.patch.object(ct, "list_recent", return_value=[]) as recent:
+                    m.main()
+                self.assertEqual(len(replies), len(messages))
+                self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "cortados-route")
+                self.assertIn("tools", replies[1]["result"])
+                self.assertEqual(replies[2]["result"], {})
+                for reply in replies[3:5]:
+                    self.assertTrue(reply["result"]["isError"])
+                    text = reply["result"]["content"][0]["text"]
+                    self.assertIn("CORTADOS_PROVIDER_URL" if "CORTADOS_PROVIDER_URL" in selected else "not found", text)
+                    self.assertNotIn("invalid-secret-value", text)
+                for reply in replies[5:]:
+                    self.assertNotIn("isError", reply["result"])
+                route.assert_not_called()
+                start.assert_called_once()
+                self.assertTrue(start.call_args.args[7])  # Chrome/login path still runs.
+                cancel.assert_called_once()
+                status.assert_called_once()
+                wait.assert_called_once()
+                recent.assert_called_once()
+
     def test_url_drops_unexpanded_placeholder(self):
         with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "${CORTADOS_PROVIDER_URL}"}):
-            self.assertEqual(m._resolve_url(), "")                     # literal placeholder -> unconfigured
+            with self.assertRaisesRegex(m.ProviderURLError, "CORTADOS_PROVIDER_URL"):
+                m._resolve_url()
         with self._mock.patch.dict(self._os.environ, {"CORTADOS_PROVIDER_URL": "  http://host:8432 "}):
             self.assertEqual(m._resolve_url(), "http://host:8432")     # stripped
 

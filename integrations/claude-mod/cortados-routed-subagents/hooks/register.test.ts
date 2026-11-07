@@ -1,5 +1,30 @@
 import { test, expect } from 'claude-code/testing'
-import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
+import { resolveProviderUrl, lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
+
+test('provider URL resolves HTTPS config, env and files without silent fallback', async () => {
+  let path = ''
+  let contents = ' https://file.example:8443/\n'
+  let env = '\0\0/tmp/test-home'
+  const $ = {
+    process: { run: async () => ({ exitCode: 0, stdout: env }) },
+    fs: { read: async (p: string) => { path = p; return contents } },
+  }
+  expect(await resolveProviderUrl($)).toBe('https://file.example:8443')
+  expect(path).toBe('/tmp/test-home/.config/cortados/provider-url')
+  env = '\0/tmp/selected-url\0/tmp/test-home'
+  expect(await resolveProviderUrl($)).toBe('https://file.example:8443')
+  expect(path).toBe('/tmp/selected-url')
+  env = ' https://env.example/ \0/missing\0/tmp/test-home'
+  expect(await resolveProviderUrl($)).toBe('https://env.example')
+  expect(await resolveProviderUrl($, 'https://config.example/')).toBe('https://config.example')
+  env = '\0\0/tmp/test-home'
+  for (const bad of ['', 'ftp://host', 'https://', 'https://host\nhttps://other']) {
+    contents = bad
+    let error = ''
+    try { await resolveProviderUrl($) } catch (e) { error = String(e) }
+    expect(error.includes('provider URL file')).toBe(true)
+  }
+})
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
@@ -900,14 +925,14 @@ test('the session tag is a salted hash, never the raw id', async () => {
 })
 
 /** The mod registered with a full host stand-in: the store, session id/root/model, hostname, clock and fetch. */
-function officeHarness(opts: { officeView?: boolean } = {}) {
+function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string } = {}) {
   const handlers: Record<string, any> = {}
   const on = (event: string, filterOrHandler: any, maybeHandler?: any) => {
     const key = maybeHandler ? `${event}:${filterOrHandler?.tool ?? filterOrHandler?.command ?? ''}` : event
     handlers[key] = maybeHandler ?? filterOrHandler
     return { catch() {} }
   }
-  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, mainSessionGuard: false, ...opts } as any)
+  register(on as any, { providerToken: 'tok', providerUrl: opts.providerUrl ?? 'http://provider.test:8432', orchestratorMode: false, mainSessionGuard: false, ...opts } as any)
   const store: Record<string, unknown> = {}
   const beats: any[] = []
   const childHeaders: string[] = []
@@ -920,6 +945,7 @@ function officeHarness(opts: { officeView?: boolean } = {}) {
     process: {
       run: async (argv: string[], o: any) => {
         if (argv[0] === 'hostname') return { exitCode: 0, stdout: 'pro\n', stderr: '' }
+        if (argv[0] === 'sh') return { exitCode: 0, stdout: '\0\0/tmp/test-home', stderr: '' }
         childHeaders.push(String(o.env.ANTHROPIC_CUSTOM_HEADERS))
         return { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '', isStdoutTruncated: false }
       },
@@ -930,7 +956,7 @@ function officeHarness(opts: { officeView?: boolean } = {}) {
         return { status: 404, ok: false, headers: {}, text: '{}' }
       },
     },
-    fs: { read: async () => 'unused' },
+    fs: { read: async (path: string) => opts.fileUrl && path === '/tmp/test-home/.config/cortados/provider-url' ? opts.fileUrl : 'unused' },
     ui: { status() {}, toast() {}, log(m: string) { logs.push(m) } },
   }
   const settle = () => new Promise((r) => setTimeout(r, 0))
@@ -959,6 +985,13 @@ test('officeView off sends no tags and registers no heartbeat hooks', async () =
   expect(splitRunId(h.childHeaders[0]).base).toBe('x-cortados-reveal: 1')
   expect(h.handlers['turn.complete']).toBe(undefined)
   expect(h.handlers['session.end']).toBe(undefined)
+})
+
+test('file-only provider URL config also routes Office heartbeats', async () => {
+  const h = officeHarness({ providerUrl: '', fileUrl: ' https://file.example:8443/\n' })
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, async (e: any) => e)
+  await h.settle()
+  expect(h.beats[0].url).toBe('https://file.example:8443/v1/cortados/office/heartbeat')
 })
 
 test('heartbeats: tool names on the main loop, throttled, idle on turn end, ended on session end', async () => {
