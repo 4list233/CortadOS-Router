@@ -231,10 +231,12 @@ from unittest import mock
 from cortados_router.provider import bridge, timeouts
 with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
     with mock.patch("threading.Thread.start"):
+        popen = mock.Mock()
         s = bridge.BridgeSession(gateway_url="", token="t", system="", tools=[{"name":"Read"}],
-                                 popen=mock.Mock())
+                                 popen=popen)
         cfg = json.loads((s.dir / "mcp.json").read_text())["mcpServers"]["bridge"]["env"]
-        print(json.dumps([cfg, s.proc is not None, timeouts.CLI_TOOL_TIMEOUT_S]))
+        cli_seconds = int(popen.call_args.kwargs["env"]["MCP_TOOL_TIMEOUT"]) / 1000
+        print(json.dumps([cfg, cli_seconds, timeouts.CLI_TOOL_TIMEOUT_S]))
         s._stderr.close()
         import shutil
         shutil.rmtree(s.dir)
@@ -244,7 +246,8 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
                    WANGCAI_PROVIDER_TOOL_WAIT_S="30", WANGCAI_PROVIDER_CALL_SLACK_S="7")
         result = subprocess.run([sys.executable, "-B", "-c", script], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        cfg, _, cli = json.loads(result.stdout)
+        cfg, actual_cli, cli = json.loads(result.stdout)
+        self.assertEqual(actual_cli, cli)
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TURN_TIMEOUT_S"]), 19000)
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
         self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
