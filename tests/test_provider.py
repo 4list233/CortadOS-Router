@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from cortados_router.provider import anthropic_wire as wire, bridge
+from cortados_router.provider import anthropic_wire as wire, bridge, mcp_shim
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
 from cortados_router.provider import server
@@ -350,6 +350,45 @@ class EndpointHarness(unittest.TestCase):
 
 
 class EndpointTests(EndpointHarness):
+    def test_shim_kills_owner_when_call_and_abort_transports_both_fail(self):
+        failures = [urllib.error.URLError("call failed"), urllib.error.URLError("abort failed")]
+        with mock.patch.object(mcp_shim.urllib.request, "urlopen", side_effect=failures), \
+             mock.patch.object(mcp_shim.os, "getppid", return_value=1234), \
+             mock.patch.object(mcp_shim.os, "kill") as kill, \
+             mock.patch.object(mcp_shim.os, "_exit", side_effect=SystemExit(1)) as exit_:
+            with self.assertRaises(SystemExit):
+                mcp_shim._forward("http://gateway", "session", "token", {
+                    "name": "Read", "arguments": {}, "_meta": {"claudecode/toolUseId": "t"}})
+        kill.assert_called_once_with(1234, mcp_shim.signal.SIGKILL)
+        exit_.assert_called_once_with(1)
+
+    def test_transport_abort_marks_closed_before_slow_teardown(self):
+        s = BridgeSession.__new__(BridgeSession)
+        s.id, s.lock, s.history, s.last_used = uuid.uuid4().hex, threading.Lock(), ["reply"], time.time()
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed = mock.Mock(), False
+        s._tool_result_deadline, s._tool_result_expired = None, False
+        s.emitted = {"t"}
+        closing, release = threading.Event(), threading.Event()
+
+        def slow_close():
+            closing.set()
+            release.wait(2)
+
+        s.close = slow_close
+        self.reg.sessions[s.id] = s
+        done = threading.Event()
+        thread = threading.Thread(target=lambda: (
+            self.post({"session": s.id, "abort": True}, path="/bridge/call"), done.set()))
+        thread.start()
+        self.assertTrue(closing.wait(1))
+        with self.assertRaisesRegex(BridgeError, "session was closed"):
+            s.deliver({"t": {"content": "too late"}})
+        self.assertEqual(s._results, {})
+        release.set()
+        thread.join(1)
+        self.assertTrue(done.is_set())
+
     def test_expired_bridge_call_closes_backend_before_answer_and_late_result(self):
         from types import SimpleNamespace
         closed = mock.Mock()

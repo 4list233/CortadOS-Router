@@ -8,6 +8,7 @@ Usage: mcp_shim.py <gateway url> <session id> <tools.json>; the endpoint token c
 """
 import json
 import os
+import signal
 import sys
 import urllib.error
 import urllib.request
@@ -31,15 +32,24 @@ CALL_TIMEOUT_S = TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S
 
 
 def _abort(gateway, session, token):
-    """Best-effort fail-closed notification after the call transport itself has expired."""
+    """Ask the server to close the backend, returning only once closure is confirmed."""
     body = json.dumps({"session": session, "abort": True}).encode()
     req = urllib.request.Request(gateway.rstrip("/") + "/bridge/call", data=body, method="POST",
                                  headers={"content-type": "application/json", "x-cortados-token": token})
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            resp.read()
-    except (urllib.error.URLError, OSError):
-        pass
+            return json.loads(resp.read()).get("closed") is True
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        return False
+
+
+def _terminate_owner():
+    """Last-resort fail closed: the CLI must die before it can synthesize an MCP error result."""
+    try:
+        os.kill(os.getppid(), signal.SIGKILL)
+    finally:
+        # Never serialize a tool result; SIGKILL delivery to the parent is asynchronous.
+        os._exit(1)
 
 
 def _reply(mid, result=None, error=None):
@@ -62,7 +72,8 @@ def _forward(gateway, session, token, params):
         with urllib.request.urlopen(req, timeout=CALL_TIMEOUT_S) as resp:
             return json.loads(resp.read())["result"]
     except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
-        _abort(gateway, session, token)
+        if not _abort(gateway, session, token):
+            _terminate_owner()
         return {"content": [{"type": "text", "text": f"cortados bridge: tool call failed: {exc}"}], "isError": True}
 
 

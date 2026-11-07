@@ -1175,6 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("abort") is True:
             # The shim's outer transport expired. Close without taking the turn lock: a continuation may own it,
             # but BridgeSession's _cv terminal transition makes a concurrent delivery lose atomically.
+            s.expire_transport()
             if self.server.registry.get(s.id) is s:
                 self.server.registry.drop(s, "bridge_transport_expired")
             return self._json(200, {"closed": True})

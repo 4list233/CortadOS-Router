@@ -237,6 +237,12 @@ class BridgeSession:
             self._tool_result_deadline = None
             self._cv.notify_all()
 
+    def expire_transport(self) -> None:
+        """Make transport abort terminal before the potentially slow process teardown begins."""
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
     # ------------------------------------------------------------------ one turn
     def run_turn(self, timeout: float) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
         """Read the CLI until it finishes or blocks on a bridged tool. Returns (blocks, stop_reason, usage)."""
