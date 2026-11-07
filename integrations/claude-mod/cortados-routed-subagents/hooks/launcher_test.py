@@ -1,5 +1,5 @@
 # Real macOS /bin/sh watchdog regressions. Run: python3 -I launcher_test.py MODE
-# MODE: timeout, early, capture, identity, immediate, census-fail, ledger-fail, sweep.
+# MODE: timeout, early, capture, identity, immediate, census-fail, ledger-fail, sweep, uuid-fail.
 # Only stdlib, fake children and throwaway state; never launches a provider.
 
 import json, os, pathlib, signal, subprocess, sys, tempfile, time
@@ -14,17 +14,50 @@ supervisor = expand(source.split('const BG_SUPERVISE_SH = `', 1)[1].split('\n`\n
 reaper = expand(source.split('export const BG_REAP_SH = `', 1)[1].split('\n`\n', 1)[0])
 launcher = source.split('export const BG_LAUNCH_SH = `', 1)[1].split('`\n', 1)[0]
 launcher = launcher.replace('${BG_REAP_SH}', reaper).replace('${shQuote(BG_SUPERVISE_SH)}', shlex.quote(supervisor))
-launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n')
+launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n').replace(r'\\A', r'\A').replace(r'\\z', r'\z')
 sweep = source.split('export const BG_SWEEP_SH = String.raw`', 1)[1].split('\n`', 1)[0]
 mode = sys.argv[1]
-assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail', 'sweep')
+assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail', 'sweep', 'uuid-fail')
+if mode == 'uuid-fail':
+    import uuid
+    # Each command must be checked, even when the other succeeds; validate successful but malformed output too.
+    for fault in ('first', 'second', 'both', 'empty', 'malformed'):
+        with tempfile.TemporaryDirectory(prefix='route-bg-uuid-') as tmp:
+            base = pathlib.Path(tmp)
+            bindir = base / 'bin'; bindir.mkdir()
+            counter = base / 'count'
+            fake = bindir / 'uuidgen'
+            fake.write_text('#!/bin/sh\n'
+                            'n=0; [ ! -f "$UUID_COUNT" ] || n=$(cat "$UUID_COUNT")\n'
+                            'n=$((n + 1)); printf %s "$n" > "$UUID_COUNT"\n'
+                            'case "$UUID_FAULT:$n" in first:1|second:2|both:*) exit 42;; '
+                            'empty:*) exit 0;; malformed:*) printf invalid; exit 0;; esac\n'
+                            + 'printf %s ' + shlex.quote(str(uuid.uuid4())) + '\n')
+            fake.chmod(0o700)
+            launched = base / 'launched'
+            # Intercept supervisor launch itself so a broken launcher cannot leave a watchdog behind.
+            nohup = bindir / 'nohup'
+            nohup.write_text('#!/bin/sh\n: > "$LAUNCH_SENTINEL"\n')
+            nohup.chmod(0o700)
+            result = subprocess.run(['/bin/sh', '-c', launcher, 'sh', '1', 'true'],
+                                    env={'PATH': str(bindir) + ':/usr/bin:/bin', 'TMPDIR': tmp,
+                                         'UUID_COUNT': str(counter), 'UUID_FAULT': fault,
+                                         'LAUNCH_SENTINEL': str(launched)},
+                                    capture_output=True, text=True, timeout=5)
+            assert result.returncode != 0, fault
+            assert not result.stdout.strip(), fault
+            assert not launched.exists(), fault
+            assert not list(base.glob('cortados-bg.*/exit')), fault
+    print('uuid-fail: first/second/both failures and empty/malformed output block launch')
+    sys.exit(0)
 if mode == 'sweep':
     import uuid
     with tempfile.TemporaryDirectory(prefix='route-bg-sweep-') as tmp:
         processes = []
         dirs = {}
         try:
-            kinds = ('active', 'stale', 'unrelated', 'argv', 'marker', 'ledger', 'copied', 'embedded', 'collision')
+            kinds = ('active', 'stale', 'unrelated', 'argv', 'marker', 'ledger', 'copied', 'embedded', 'collision',
+                     'missing', 'legacy', 'noWindow')
             for kind in kinds:
                 d = pathlib.Path(tmp) / ('cortados-bg.' + kind)
                 d.mkdir(); dirs[kind] = d
@@ -44,17 +77,29 @@ if mode == 'sweep':
                                      env=env, start_new_session=True)
                 processes.append((kind, p))
                 start = subprocess.check_output(['ps', '-p', str(p.pid), '-o', 'lstart='], text=True).strip()
-                if kind in ('ledger', 'stale'):
-                    (d / 'processes').write_text(f'{p.pid}\t{p.pid}\t' + (start if kind == 'ledger' else 'STALE') + '\n')
+                if kind in ('ledger', 'stale', 'missing', 'legacy', 'noWindow'):
+                    (d / 'processes').write_text(f'{p.pid}\t{p.pid}\t' + ('STALE' if kind == 'stale' else start) + '\n')
+                if kind == 'missing': (d / 'sweep-marker').unlink()
+                if kind == 'legacy': (d / 'sweep-marker').write_text('legacy-marker')
+                if kind == 'noWindow': (d / 'run-start').unlink()
                 if kind not in ('copied', 'embedded', 'collision'):
                     (d / 'run-finish').write_text(str(int(time.time()) + 1))
             # Result processing must not discard the identity evidence needed by a later sweep.
             subprocess.run(['/bin/sh', '-c', cleanup, 'sh', str(dirs['ledger'])], check=True)
             assert (dirs['ledger'] / 'processes').exists()
+            bindir = pathlib.Path(tmp) / 'bin'; bindir.mkdir()
+            reader = bindir / 'python3'
+            reader.write_text('#!/bin/sh\nexit 42\n'); reader.chmod(0o700)
+            failed = subprocess.run(['/bin/sh', '-c', sweep],
+                                    env={'PATH': str(bindir) + ':/usr/bin:/bin', 'TMPDIR': tmp},
+                                    capture_output=True, text=True, timeout=5)
+            assert failed.returncode != 0, 'reader failure was swallowed'
+            assert 'sweep marker-reader failed' in failed.stderr
+            assert all(p.poll() is None for _, p in processes), 'failed reader caused a signal'
             subprocess.run(['/bin/sh', '-c', sweep], env={'PATH': '/usr/bin:/bin', 'TMPDIR': tmp},
                            check=True, timeout=30)
             for kind, p in processes:
-                if kind in ('marker', 'ledger'):
+                if kind in ('marker', 'ledger', 'missing', 'legacy', 'noWindow'):
                     p.wait(timeout=3); assert p.returncode < 0, kind
                     log = (dirs[kind] / 'sweep.log').read_text()
                     assert '\tTERM\t' in log
@@ -67,7 +112,7 @@ if mode == 'sweep':
             for _, p in processes:
                 if p.poll() is None: p.kill()
                 p.wait()
-    print('sweep: copied, embedded and colliding hints spared; windowed marker and ledger members terminated')
+    print('sweep: reader failure reported; marker and metadata-independent ledger recovery passed; unrelated processes spared')
     sys.exit(0)
 if mode == 'identity':
     # Exercise the actual watchdog helper against a live, unrelated process in its own group.

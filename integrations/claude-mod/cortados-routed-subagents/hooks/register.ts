@@ -707,7 +707,12 @@ d=$(mktemp -d "\${TMPDIR:-/tmp}/cortados-bg.XXXXXX") || exit 1
 date +%s > "$d/run-start" || exit 1
 # Two v4 UUIDs provide well over 128 random bits. The secret is only in this 0600 file and the inherited environment;
 # it is never placed in argv or diagnostics.
-{ uuidgen; uuidgen; } | tr -d '\\n' > "$d/sweep-marker" || exit 1
+marker1=$(uuidgen) || exit 1
+marker2=$(uuidgen) || exit 1
+printf '%s%s' "$marker1" "$marker2" > "$d/sweep-marker" || exit 1
+# Check the complete value as well as each generator status before any workload can start.
+perl -e 'local $/; my $m = <>; exit(!defined($m) || $m !~ /\\A(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-4[A-Fa-f0-9]{3}-[89ABab][A-Fa-f0-9]{3}-[A-Fa-f0-9]{12}){2}\\z/)' "$d/sweep-marker" || exit 1
+unset marker1 marker2
 D="$d" S="$secs" nohup sh -c ${shQuote(BG_SUPERVISE_SH)} sh "$@" > /dev/null 2>&1 < /dev/null &
 printf '%s\\n' "$d"`
 
@@ -791,9 +796,9 @@ for word in sys.argv[2:]:
     fields = fields[argc:]  # exact environment entries remain
     if want in fields: print(pid)
 };
-  open my $p, "-|", "python3", "-I", "-c", $py, $marker_file, @pids or return \%found;
+  open my $p, "-|", "python3", "-I", "-c", $py, $marker_file, @pids or die "sweep marker-reader failed";
   while (<$p>) { chomp; $found{$_} = 1 if /^\d+$/; }
-  close $p;
+  close $p or die "sweep marker-reader failed";
   return \%found;
 }
 opendir my $dh, $base or die "sweep directory unavailable";
@@ -805,17 +810,18 @@ for my $d (@dirs) {
   next unless owned($d, 1) && owned("$d/owner-v1", 0);
   next unless readfile("$d/exit") =~ /^\d+$/;
   my $marker = readfile("$d/sweep-marker"); chomp $marker;
-  next unless $marker =~ /^(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-4[A-Fa-f0-9]{3}-[89ABab][A-Fa-f0-9]{3}-[A-Fa-f0-9]{12}){2}$/;
+  my $marker_valid = $marker =~ /^(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-4[A-Fa-f0-9]{3}-[89ABab][A-Fa-f0-9]{3}-[A-Fa-f0-9]{12}){2}$/;
   my $began = readfile("$d/run-start"); chomp $began;
   my $finished = readfile("$d/run-finish"); chomp $finished;
-  next unless $began =~ /^\d+$/ && $finished =~ /^\d+$/ && $began <= $finished;
+  # Marker metadata authorizes only marker-based recovery; ledger proof is independent.
+  my $marker_ready = $marker_valid && $began =~ /^\d+$/ && $finished =~ /^\d+$/ && $began <= $finished;
   my %known;
   for (split /\n/, readfile("$d/processes")) {
     my ($pid, $group, $start) = split /\t/;
     next unless defined($start) && $pid =~ /^\d+$/ && $group =~ /^\d+$/;
     $start =~ s/\s+/ /g; $known{$pid} = [$group, $start];
   }
-  my $marked = actual_markers("$d/sweep-marker", keys %$now);
+  my $marked = $marker_ready ? actual_markers("$d/sweep-marker", keys %$now) : {};
   for my $pid (keys %$now) {
     next if $pid <= 1 || $pid == $$ || $pid == getppid();
     my $r = $now->{$pid};
