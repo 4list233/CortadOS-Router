@@ -259,6 +259,28 @@ PY
                 (self.s1 / "data/laya-tonight").unlink(missing_ok=True)
                 (self.s1 / "data/laya-init").unlink(missing_ok=True)
 
+    def test_laya_refusal_flags_survive_term_during_settle(self):
+        # Review r3: the refused stage's one-shot flags must be back on disk before the post-refusal settle delay,
+        # because a supervisor TERM there runs the exit trap, which does not restore them.
+        (self.s1 / "laya").mkdir()
+        (self.s1 / ".venv-laya/bin").mkdir(parents=True)
+        _exe(self.s1 / ".venv-laya/bin/python", "#!/bin/bash\nexit 0\n")
+        _exe(Path(self.env["HOME"]) / ".local/bin/sleep",
+             '#!/bin/bash\nif [ "$1" = 20 ]; then kill -TERM "$(cat "$PWD/data/nightly.pid")"; exit 0; fi\nexec /bin/sleep "$@"\n')
+        _exe(self.s1 / "laya/train.sh", '#!/bin/bash\nmkdir -p "$LAYA_RUN" && touch "$LAYA_RUN/model.safetensors"\n')
+        for stage in ("convert", "train"):
+            with self.subTest(stage=stage):
+                (self.s1 / "data/laya-tonight").touch()
+                (self.s1 / "data/laya-init").write_text("laya/runs/old/checkpoint_latest\n")
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_GATE_REFUSE=stage, CORTADOS_S1_NOW="0700")
+                self.assertEqual(rc, 130, log)
+                self.assertIn("stop requested", log)
+                self.assertTrue((self.s1 / "data/laya-tonight").exists(), log)
+                self.assertEqual((self.s1 / "data/laya-init").read_text(), "laya/runs/old/checkpoint_latest\n", log)
+                (self.s1 / "data/laya-tonight").unlink(missing_ok=True)
+                (self.s1 / "data/laya-init").unlink(missing_ok=True)
+                (self.s1 / "data/nightly.stop").unlink(missing_ok=True)
+
     def status(self):
         return json.loads((self.s1 / "data/status.json").read_text())
 

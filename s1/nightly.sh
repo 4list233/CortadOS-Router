@@ -618,11 +618,15 @@ if [ -f data/laya-tonight ]; then
     ( cd laya && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ); trc=$?
   fi
   lrc=$crc; [ "$crc" -eq 0 ] && lrc=$trc
-  stop_deadline
-  gpu_share; sleep 20
+  # Restore the one-shot flags the moment a refusal is seen, before the cleanup and settle delay below: a supervisor TERM
+  # there runs the exit trap, which does not know about them, and the requested trial and warm-start pointer would be lost.
   if [ "$crc" -eq 75 ] || [ "$trc" -eq 75 ]; then
     if [ "$crc" -eq 75 ]; then refused=convert; else refused=train; fi
     touch data/laya-tonight; [ -n "$init" ] && printf '%s\n' "$init" > data/laya-init
+  fi
+  stop_deadline
+  gpu_share; sleep 20
+  if [ -n "$refused" ]; then
     echo "studio gate refused laya $refused (local model residency unconfirmed): laya flag kept for the next night"
   elif [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
     HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" gated .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN"; erc=$?
