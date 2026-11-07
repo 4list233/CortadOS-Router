@@ -38,6 +38,7 @@ type Cfg = {
   maxTurns: number
   excludeBuilderOnReview: boolean
   mainSessionGuard: boolean
+  officeView: boolean
 }
 
 const FALLBACK: Cfg = {
@@ -77,6 +78,10 @@ const FALLBACK: Cfg = {
   // Warn-only main-session guard (see GUARD_* below): a toast + status counter when the main loop does a big edit or
   // a build/test run itself. Never blocks. /cortados-guard on|off overrides this, persisted in $.store.
   mainSessionGuard: true,
+  // The CortadOS Office view (GET /v1/cortados/office on the provider): tag every routed request with this session's
+  // opaque tag, project, device and the task title, and send the provider a heartbeat of the main session's status.
+  // Metadata only (see OFFICE_* below); off stops both.
+  officeView: true,
 }
 
 // The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
@@ -650,6 +655,233 @@ function guardPublish($: any, guard: GuardState, text: string | undefined): void
   guardTry($, guard, 'status', () => $.ui.status(text))
 }
 
+// ---- Office view: session tags on routed requests + main-session heartbeats (provider/office.py) ---------------
+/** $.store key of this install's random salt. The session tag is sha256(salt:session id) cut to 16 hex: the provider
+ * groups by it but cannot recover the raw session id (which `claude --resume` takes), and without the salt nobody can
+ * test a guessed id against it. Per install, so tags from two machines never collide by construction. */
+export const OFFICE_SALT_KEY = 'officeSalt'
+/** 16 hex = 64 bits: unique across any number of live sessions, short enough for a header and a floor label. */
+export const OFFICE_TAG_HEX = 16
+/** The provider's caps (provider/office.py _HEADER_RULES): a value outside them is dropped there, so it is made to fit
+ * here instead (a title is the Agent call's description, cut to 80 printable ASCII chars; names lose other chars). */
+export const OFFICE_TITLE_MAX = 80
+const OFFICE_NAME_MAX = 64
+/** Heartbeats: on a change of status or tool, at most one per 2 s (a burst of tool calls is one beat, not fifty), and a
+ * refresh at most every 30 s while nothing changes, so a `working` floor stays fresh within the provider's 120 s TTL.
+ * Sends never block tool calls. A slow fetch is reported after 2 s; session.end awaits the serialized final send. */
+export const OFFICE_BEAT_MIN_MS = 2_000
+export const OFFICE_BEAT_REFRESH_MS = 30_000
+export const OFFICE_BEAT_TIMEOUT_MS = 2_000
+
+/** A title the provider accepts: printable ASCII only (anything else becomes a space), spaces collapsed, at most 80
+ * chars; null when nothing is left. */
+export function officeTitle(s: unknown): string | null {
+  const t = String(s ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/ +/g, ' ').trim().slice(0, OFFICE_TITLE_MAX).trim()
+  return t || null
+}
+
+/** A project or device name the provider accepts ([A-Za-z0-9._ -], device without spaces), or null. */
+export function officeName(s: unknown, device = false): string | null {
+  const t = String(s ?? '').replace(device ? /[^A-Za-z0-9._-]+/g : /[^A-Za-z0-9._ -]+/g, '-').trim().slice(0, OFFICE_NAME_MAX)
+  return /[A-Za-z0-9]/.test(t) ? t : null
+}
+
+/** The last path segment of an absolute directory (the project name); never the path itself. */
+export function baseName(dir: unknown): string {
+  const parts = String(dir ?? '').split('/').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : ''
+}
+
+/** sha256(salt:sessionId) as hex, cut to OFFICE_TAG_HEX. */
+export async function sessionTag(salt: string, sessionId: string): Promise<string> {
+  const buf = await (globalThis as any).crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${salt}:${sessionId}`))
+  return Array.from(new Uint8Array(buf), (b: number) => b.toString(16).padStart(2, '0')).join('').slice(0, OFFICE_TAG_HEX)
+}
+
+/** The ANTHROPIC_CUSTOM_HEADERS lines for the Office (each `\nname: value`); '' without a valid session tag, since
+ * the labels only mean something on the session's floor (officeIdentity already reported why the tag is missing). */
+export function officeHeaderLines(o: { session?: string | null; project?: string | null; device?: string | null; title?: string | null }): string {
+  if (!o.session || !/^[0-9a-f]{16,64}$/.test(o.session)) return ''
+  let out = `\nx-cortados-session: ${o.session}`
+  const project = officeName(o.project)
+  if (project) out += `\nx-cortados-project: ${project}`
+  const device = officeName(o.device, true)
+  if (device) out += `\nx-cortados-device: ${device}`
+  const title = officeTitle(o.title)
+  if (title) out += `\nx-cortados-task-title: ${title}`
+  return out
+}
+
+type OfficeBeat = { status: 'working' | 'idle' | 'ended'; tool: string | null; force: boolean }
+
+type OfficeState = {
+  salt: string | null
+  device: string | null
+  project: string | null
+  reported: Set<string>
+  last: { status: string; tool: string | null; at: number } | null
+  failures: number
+  pending: OfficeBeat | null
+  running: Promise<void> | null
+  wake: (() => void) | null
+  ended: boolean
+}
+
+export function newOfficeState(): OfficeState {
+  return { salt: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
+    pending: null, running: null, wake: null, ended: false }
+}
+
+/** Report one Office failure ONCE per kind as a dim transcript notice ($.ui.log is not sent to the model), with its
+ * class name only (never a token, URL or path). Never throws. */
+function officeReport($: any, office: OfficeState, where: string, err: unknown): void {
+  office.failures += 1
+  if (office.reported.has(where)) return
+  office.reported.add(where)
+  const name = err && typeof err === 'object' && typeof (err as any).name === 'string' ? (err as any).name : String(err ?? '')
+  const cls = /^[A-Za-z0-9_ ]{1,40}$/.test(name) ? name : 'Error'
+  try {
+    const r = $.ui.log(`cortados-routed-subagents: office ${where} failed (${cls}); the Office view may miss this session`)
+    if (r && typeof r.then === 'function') r.then(undefined, () => {})
+  } catch { /* nowhere left to report */ }
+}
+
+/** This session's Office identity: { session tag, project, device }. Each part that cannot be read is reported once
+ * and left out (the provider then shows the work in its lobby or without that label); never throws. */
+async function officeIdentity($: any, office: OfficeState): Promise<{ session: string | null; project: string | null; device: string | null }> {
+  if (office.salt === null) {
+    try {
+      const v = await $.store.get(OFFICE_SALT_KEY)
+      if (typeof v === 'string' && /^[0-9a-f]{32}$/.test(v)) office.salt = v
+      else {
+        const bytes = (globalThis as any).crypto.getRandomValues(new Uint8Array(16))
+        const salt = Array.from(bytes as Uint8Array, (b: number) => b.toString(16).padStart(2, '0')).join('')
+        await $.store.set(OFFICE_SALT_KEY, salt)
+        office.salt = salt
+      }
+    } catch (err) {
+      officeReport($, office, 'salt', err)
+    }
+  }
+  let session: string | null = null
+  if (office.salt) {
+    try {
+      // Read every time: /clear and resume move the process to another session id, which is another floor.
+      const id = await $.session.id()
+      if (typeof id === 'string' && id) session = await sessionTag(office.salt, id)
+      else throw new Error('no session id')
+    } catch (err) {
+      officeReport($, office, 'session tag', err)
+    }
+  }
+  // Without a tag there is no floor to label: project and device are not looked up (the work shows in the lobby).
+  if (!session) return { session: null, project: null, device: null }
+  if (office.project === null) {
+    try {
+      office.project = officeName(baseName(await $.session.root())) ?? ''
+    } catch (err) {
+      officeReport($, office, 'project name', err)
+      office.project = ''
+    }
+  }
+  if (office.device === null) {
+    try {
+      const r = await $.process.run(['hostname', '-s'])
+      office.device = officeName(String(r?.stdout ?? '').trim(), true) ?? ''
+    } catch (err) {
+      officeReport($, office, 'device name', err)
+      office.device = ''
+    }
+  }
+  return { session, project: office.project || null, device: office.device || null }
+}
+
+/** One in-flight request and one latest pending state. Changes inside the throttle get a trailing send even if
+ * no further hook fires. Force wakes the delay; ended supersedes pending work and waits for the serialized send.
+ * The host's $.http.fetch has no cancellation option: a slow request is reported at 2 s, but we MUST retain the
+ * serialization lock until it settles (Promise.race would let an older write land after idle/ended). */
+function officeBeat($: any, cfg: Cfg, office: OfficeState, status: 'working' | 'idle' | 'ended', tool: string | null, force = false): Promise<void> {
+  if (office.ended && status !== 'ended') return office.running ?? Promise.resolve()
+  if (status === 'ended') office.ended = true
+  office.pending = { status, tool, force }
+  office.wake?.()
+  if (!office.running) {
+    office.running = officeDrain($, cfg, office).finally(() => {
+      office.running = null
+      // An enqueue can race the drain's last await/return; keep that last state attached to this flush promise.
+      const p = office.pending
+      if (p) return officeBeat($, cfg, office, p.status, p.tool, p.force)
+    })
+  }
+  return office.running
+}
+
+async function officeDrain($: any, cfg: Cfg, office: OfficeState): Promise<void> {
+  while (office.pending) {
+    let now = NaN
+    try {
+      now = Number(await $.clock.now())
+      if (!Number.isFinite(now)) throw new Error('invalid clock')
+    } catch (err) {
+      officeReport($, office, 'clock', err)
+      now = Date.now() // Keep metadata delivery/throttling alive when the host clock is unavailable; reported above.
+    }
+    const p = office.pending!
+    const last = office.last
+    const changed = !last || last.status !== p.status || last.tool !== p.tool
+    if (!p.force && last) {
+      if (!changed && now - last.at < OFFICE_BEAT_REFRESH_MS) {
+        office.pending = null                  // duplicate, not a lost state transition
+        continue
+      }
+      const delay = OFFICE_BEAT_MIN_MS - (now - last.at)
+      if (changed && delay > 0) {
+        const due = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => { office.wake = null; resolve(true) }, delay)
+          office.wake = () => { clearTimeout(timer); office.wake = null; resolve(false) }
+        })
+        if (!due) continue                     // latest state or clock changed: recompute its throttle
+        now += delay
+      }
+    }
+    const beat = office.pending!
+    office.pending = null
+    office.last = { status: beat.status, tool: beat.tool, at: now }
+    await officeSend($, cfg, office, beat)
+  }
+}
+
+async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool }: OfficeBeat): Promise<void> {
+  let timer: any
+  try {
+    const id = await officeIdentity($, office)
+    if (!id.session) return                     // reported by officeIdentity; nothing can name this session's floor
+    const token = await resolveToken($, cfg)
+    if (!token) throw new Error('no provider token')
+    let model: string | null = null
+    try {
+      const m = await $.session.model()
+      if (!headerSafeModel(m)) throw new Error('invalid model')
+      model = String(m)
+    } catch (err) {
+      officeReport($, office, 'model', err)
+      // Model is optional metadata: send the lifecycle state with null instead of inventing a model or losing it.
+      model = null
+    }
+    const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
+                                  tool: tool && validToolName(tool) ? tool : null })
+    const url = String(cfg.providerUrl).replace(/\/+$/, '') + '/v1/cortados/office/heartbeat'
+    timer = setTimeout(() => officeReport($, office, 'heartbeat', new Error('timeout')), OFFICE_BEAT_TIMEOUT_MS)
+    const res: any = await $.http.fetch(url, { method: 'POST', body,
+      headers: { 'content-type': 'application/json', 'x-api-key': token, Authorization: `Bearer ${token}` } })
+    if (!res.ok) throw new Error(`HTTP ${Number(res.status) || 0}`)
+  } catch (err) {
+    officeReport($, office, 'heartbeat', err)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export const register: Register = (on, options) => {
   const cfg: Cfg = { ...FALLBACK, ...(options as Partial<Cfg>) }
   const subagentTimeoutMs = resolveTimeoutMs(cfg.subagentTimeoutMs)
@@ -658,6 +890,9 @@ export const register: Register = (on, options) => {
   // the toast throttle over; the on/off override lives in $.store and survives both.
   const guard: GuardState = newGuardState()
   const guardDefault = cfg.mainSessionGuard !== false
+  // Office state for this session (closure: a reload starts the throttle over; the salt lives in $.store).
+  const office: OfficeState = newOfficeState()
+  const officeOn = cfg.officeView !== false
   /** What the status line rests on when the mod has nothing else to show: the guard's counter, if any. */
   const restingStatus = (): string | undefined =>
     (guard.override ?? guardDefault) ? guardStatusText(guard.edits, guard.runs) : undefined
@@ -696,6 +931,16 @@ export const register: Register = (on, options) => {
       if (excluded.length) customHeaders += '\nx-cortados-exclude-model: ' + excluded.join(',')
     }
     const excludedNames = excluded.join(', ')
+    // Office tags: this session's opaque tag, project, device and the task title (the Agent call's description, which
+    // the orchestrator wrote; never the prompt). Missing parts are reported once and left out; never blocks the launch.
+    let officeLines = ''
+    if (officeOn) {
+      try {
+        officeLines = officeHeaderLines({ ...(await officeIdentity($, office)), title: description })
+      } catch (err) {
+        officeReport($, office, 'tags', err)
+      }
+    }
 
     // --tools bounds the built-in tools the child actually has; --allowedTools grants them (needed under non-bypass
     // modes). --settings disableAllHooks stops THIS mod from firing inside the child and routing recursively.
@@ -766,7 +1011,7 @@ export const register: Register = (on, options) => {
             ANTHROPIC_API_KEY: token,
             ANTHROPIC_AUTH_TOKEN: token,
             CLAUDE_CODE_ENTRYPOINT: 'cli',
-            ANTHROPIC_CUSTOM_HEADERS: headers + '\nx-cortados-run-id: ' + runId,
+            ANTHROPIC_CUSTOM_HEADERS: headers + officeLines + '\nx-cortados-run-id: ' + runId,
             ANTHROPIC_UNIX_SOCKET: '',
             CLAUDE_CODE_USE_BEDROCK: '',
             CLAUDE_CODE_USE_VERTEX: '',
@@ -923,8 +1168,23 @@ export const register: Register = (on, options) => {
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
   }
 
+  // ---- Office heartbeats: the main session's status and current tool NAME (never its input) ----------------------
+  // The 'working' beat rides on the ONE matcher-less tool.call hook (the engine allows one per module), registered below
+  // with the orchestrator gate.
+  if (officeOn) {
+    on('turn.complete', async ($: any, e: any, next: any) => {
+      if (e?.agentId === undefined) void officeBeat($, cfg, office, 'idle', null, true)
+      return next(e)
+    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+    on('session.end', async ($: any, e: any, next: any) => {
+      await officeBeat($, cfg, office, 'ended', null, true)   // flush in order: the process may exit right after
+      return next(e)
+    }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
+  }
+
   on('session.start', async ($: any, e: any, next: any) => {
     const r = await next(e)
+    if (officeOn) void officeBeat($, cfg, office, 'idle', null, true)
     try {
       await $.command.register({ name: GUARD_COMMAND, description: 'Main-session guard (warn only): on, off, or no argument for its state.', argumentHint: '[on|off]', immediate: true })
     } catch (err) {
@@ -956,6 +1216,8 @@ export const register: Register = (on, options) => {
     return { text: `main-session guard ${on_ ? 'on' : 'off'} (warn only${on_ && counts ? `; ${counts}` : ''}${note})` }
   })
 
+  const enforce = Boolean(cfg.orchestratorMode && cfg.orchestratorEnforce)
+
   // ---- Orchestrator mode: direct the main session to plan and delegate; routed subagents do the work. ----------
   if (cfg.orchestratorMode) {
     // Inject the standing directive so the brain delegates by default — no per-session instruction needed. Only on
@@ -968,31 +1230,36 @@ export const register: Register = (on, options) => {
       return { sections: [...r.sections, section] }
     }).catch(($: any, e: any, next: any) => (next.called ? undefined : next(e)))
 
-    // HARD ENFORCEMENT is opt-in (orchestratorEnforce). By default the directive above is trusted and the brain keeps
-    // full tool access — it may act directly when that is clearly sensible. With enforce on, EVERY tool call on the
-    // main loop is gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/
-    // mcp__ tools/future tools are refused unless listed). Non-main loops and allowed tools pass straight through.
-    if (cfg.orchestratorEnforce) {
-      // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
-      // tokens and falls back to the default set so the brain can always at least read and delegate.
-      const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
-      on('tool.call', async ($: any, e: any, next: any) => {
-        if (mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
-        return {
-          deny:
-            `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${e.tool} itself. ` +
-            `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
-            `instead of calling ${e.tool} directly.`,
-        }
-        // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
-        // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
-      }).catch(($: any, e: any, next: any) =>
-        next.called
-          ? undefined
-          : mainLoopAllows(String(e.tool), e.agentId, allow, true)
-            ? next(e)
-            : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
-      )
-    }
+  }
+
+  // ONE matcher-less tool.call hook (the engine refuses a second): the Office 'working' beat for every main-loop call,
+  // and, under orchestratorEnforce, the gate. With the gate off it only beats and passes the call on.
+  // HARD ENFORCEMENT is opt-in (orchestratorEnforce). By default the directive above is trusted and the brain keeps
+  // full tool access — it may act directly when that is clearly sensible. With enforce on, EVERY tool call on the
+  // main loop is gated against the allowlist (an allowlist, not a denylist, so Monitor/memory_write/ExitWorktree/
+  // mcp__ tools/future tools are refused unless listed). Non-main loops and allowed tools pass straight through.
+  if (officeOn || enforce) {
+    // An empty/malformed allowlist would lock out every tool (including Agent); resolveAllowSet drops malformed
+    // tokens and falls back to the default set so the brain can always at least read and delegate.
+    const allow: ReadonlySet<string> = resolveAllowSet(cfg.orchestratorAllowedTools)
+    on('tool.call', async ($: any, e: any, next: any) => {
+      // The main loop's 'working' beat with the tool NAME it calls; fire-and-forget (officeBeat never throws).
+      if (officeOn && e?.agentId == null) void officeBeat($, cfg, office, 'working', String(e?.tool ?? '') || null)
+      if (!enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)) return next(e)
+      return {
+        deny:
+          `Orchestrator mode (enforced): the brain plans and delegates — it does not run ${e.tool} itself. ` +
+          `Spawn a subagent with the Agent tool (it is routed to the CortadOS pool and runs the work here) ` +
+          `instead of calling ${e.tool} directly.`,
+      }
+      // Fail CLOSED for work tools: if the gate throws before deciding, refuse a non-allowed tool (never let it run
+      // on a guard failure) but still let an allowed tool (Agent/Read/...) through so the session is not bricked.
+    }).catch(($: any, e: any, next: any) =>
+      next.called
+        ? undefined
+        : !enforce || mainLoopAllows(String(e.tool), e.agentId, allow, true)
+          ? next(e)
+          : { deny: 'Orchestrator mode gate failed; refusing this tool. Delegate it to a subagent.' },
+    )
   }
 }
