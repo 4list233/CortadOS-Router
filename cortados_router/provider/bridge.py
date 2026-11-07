@@ -23,6 +23,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.timeouts import (
+    ABORT_TIMEOUT_S, CALL_SLACK_S, CALL_TIMEOUT_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
+    effective_tool_wait,
+)
+
 BRIDGE_SERVER = "bridge"
 TOOL_PREFIX = f"mcp__{BRIDGE_SERVER}__"
 SHIM = Path(__file__).with_name("mcp_shim.py")
@@ -91,6 +96,10 @@ class BridgeError(RuntimeError):
     """The CLI died, timed out or reported an error; the server answers 502 (or 409 for a lost session)."""
 
 
+class ToolWaitExpired(BridgeError):
+    """The client did not return a tool result inside its post-reply window."""
+
+
 def write_line(proc: subprocess.Popen, line: str, timeout: float, who: str) -> None:
     """Write one line to a child's stdin under a deadline. A child that stops reading stdin would block the write
     forever once the pipe buffer fills, so the write runs on its own thread and the child is killed if it misses the
@@ -128,9 +137,18 @@ class BridgeSession:
         self.tool_names: set[str] = {t["name"] for t in tools}   # the only tools the shim serves (and the CLI has)
         self._skipped: set[str] = set()                 # ids of skipped non-bridged tool_uses, awaiting the CLI's error
         self._waiting: set[str] = set()                 # tool_use ids a shim call is blocked on
+        # Armed only after the complete tool_use reply is ready. A shim call commonly arrives while the CLI is still
+        # producing that reply, and must not silently consume part of the client's tool-result window.
+        self._tool_result_deadline: float | None = None
+        self._tool_result_expired = False
         self._cv = threading.Condition()
         self._closed = False
         self._events: queue.Queue = queue.Queue()
+        # Provider-side cleanup when the CLI (and so its shim) exits on its own, e.g. killed by the shim on expiry:
+        # independent of the shim's abort, which may never be sent if the shim dies with its owner.
+        self._exited = False
+        self._closing = False
+        self._exit_handler: Callable[[Any], None] | None = None
         self.dir = Path(tempfile.mkdtemp(prefix="cortados-bridge-", dir=scratch_root))
         self._stderr = None
         prefix = [claude_bin] if isinstance(claude_bin, str) else list(claude_bin)   # a list lets tests run a fake CLI
@@ -145,7 +163,14 @@ class BridgeSession:
                 (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
                     "command": sys.executable,
                     "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
-                    "env": {"CORTADOS_PROVIDER_TOKEN": token}}}}))
+                    "env": {"CORTADOS_PROVIDER_TOKEN": token,
+                            "CORTADOS_PROVIDER_TOOL_WAIT_S": str(effective_tool_wait(IDLE_S, TOOL_WAIT_S)),
+                            "CORTADOS_PROVIDER_TURN_TIMEOUT_S": str(TURN_TIMEOUT_S),
+                            "CORTADOS_PROVIDER_CALL_SLACK_S": str(CALL_SLACK_S),
+                            "CORTADOS_PROVIDER_ABORT_TIMEOUT_S": str(ABORT_TIMEOUT_S),
+                            # The shim's deadline, verbatim from timeouts.py (the same constant MCP_TOOL_TIMEOUT
+                            # below is derived from), so the two can never drift apart.
+                            "CORTADOS_PROVIDER_CALL_TIMEOUT_S": repr(CALL_TIMEOUT_S)}}}}))
                 args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
                          "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
             else:
@@ -153,7 +178,7 @@ class BridgeSession:
             if model:
                 args += ["--model", model]
             env = claude_env(config_dir)
-            env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
+            env["MCP_TOOL_TIMEOUT"] = str(int(CLI_TOOL_TIMEOUT_S * 1000))  # call + abort + startup slack
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)
@@ -181,6 +206,22 @@ class BridgeSession:
         except ValueError:
             pass                                        # close() shut stdout under us: the session is ending anyway
         self._events.put(("exit", self.proc.wait()))
+        with self._cv:
+            self._exited = True
+            handler = None if self._closing else self._exit_handler
+        if handler:
+            try:
+                handler(self)
+            except Exception:
+                logger.exception("cortados bridge %s: exit cleanup failed", self.id[:8])
+
+    def set_exit_handler(self, handler: Callable[[Any], None]) -> None:
+        """Run `handler(self)` once when the CLI exits on its own (not via close()); at once if it already has."""
+        with self._cv:
+            self._exit_handler = handler
+            run_now = self._exited and not self._closing
+        if run_now:
+            handler(self)
 
     def send_user(self, content: list[dict[str, Any]], timeout: float) -> None:
         """Write one user message, under write_line's deadline rule."""
@@ -190,18 +231,33 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ shim side
     def wait_result(self, tool_use_id: str, timeout: float) -> dict[str, Any]:
-        """Called on the shim's /bridge/call thread: block until the client has answered this tool_use."""
+        """Block until the client answers, using the absolute deadline armed when its reply was complete."""
         with self._cv:
             if tool_use_id not in self._results:
                 self._waiting.add(tool_use_id)
                 self._events.put(("call", tool_use_id))
-                if not self._cv.wait_for(lambda: tool_use_id in self._results or self._closed, timeout=timeout):
-                    self._waiting.discard(tool_use_id)
-                    raise BridgeError(f"no result for {tool_use_id} within {timeout:.0f}s")
+                while tool_use_id not in self._results and not self._closed:
+                    deadline = self._tool_result_deadline
+                    if deadline is None:                 # reply incomplete: none of the client window has elapsed
+                        self._cv.wait()
+                        continue
+                    remaining = deadline - time.time()
+                    if remaining <= 0 or not self._cv.wait(timeout=remaining):
+                        if tool_use_id not in self._results:
+                            self._waiting.discard(tool_use_id)
+                            # This transition shares _cv with deliver(): exactly one of expiry or delivery wins.
+                            self._tool_result_expired = True
+                            raise ToolWaitExpired(f"no result for {tool_use_id} before the tool-result deadline")
                 if self._closed and tool_use_id not in self._results:
                     raise BridgeError("the session was closed")
             self._waiting.discard(tool_use_id)
             return self._results.pop(tool_use_id)
+
+    def arm_tool_result_deadline(self, deadline: float) -> None:
+        """Start the client window for the tool calls belonging to the reply that just completed."""
+        with self._cv:
+            self._tool_result_deadline = deadline
+            self._cv.notify_all()
 
     def deliver(self, results: dict[str, dict[str, Any]], timeout: float | None = None) -> None:
         """Hand the client's results to the shim's waiting calls. In-process, so `timeout` (the request's remaining
@@ -211,7 +267,17 @@ class BridgeSession:
             raise BridgeError(f"tool results for ids this session never issued: {unknown}")
         self.last_used = time.time()
         with self._cv:
+            if getattr(self, "_tool_result_expired", False) or self._closed:
+                raise BridgeError("the session was closed")
             self._results.update(results)
+            # A later shim call belongs to the next reply and waits for that reply's own deadline.
+            self._tool_result_deadline = None
+            self._cv.notify_all()
+
+    def expire_transport(self) -> None:
+        """Make transport abort terminal before the potentially slow process teardown begins."""
+        with self._cv:
+            self._closed = True
             self._cv.notify_all()
 
     # ------------------------------------------------------------------ one turn
@@ -303,6 +369,8 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
+        with self._cv:
+            self._closing = True                        # an exit we caused is not an unexpected exit
         try:
             if self.proc.poll() is None:
                 self.proc.stdin.close()

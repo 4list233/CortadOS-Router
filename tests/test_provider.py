@@ -2,7 +2,9 @@
 
 The fake runs the real mcp_shim, so every bridged call crosses the same process and HTTP boundaries as in production.
 """
+import io
 import json
+import queue
 import os
 import shutil
 import sqlite3
@@ -13,6 +15,7 @@ os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import threading
 import time
+import types
 import unittest
 import uuid
 import urllib.error
@@ -20,17 +23,538 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from cortados_router.provider import anthropic_wire as wire
+from cortados_router.provider import anthropic_wire as wire, bridge, mcp_shim
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
 from cortados_router.provider import search_lane, server
-from cortados_router.provider.server import ProviderServer, Registry
+from cortados_router.provider.server import Handler, ProviderServer, Registry
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "test-token"
 RUNS_PATH_FOR_TESTS = "/v1/cortados/runs/"
 READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
     "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
+
+
+class IdleLifetimeTests(unittest.TestCase):
+    """Fake wall clock: exercise real registry admission, reply tracking and expiry without a backend."""
+    def setUp(self):
+        from types import SimpleNamespace
+        self.now = 1000.0
+        self.clock = mock.patch.object(server.time, "time", side_effect=lambda: self.now)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.created = []
+        def factory(reg, **kw):
+            s = SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), last_used=self.now,
+                                history=[], close=mock.Mock())
+            self.created.append(s)
+            return s
+        self.reg = Registry(gateway_url="", token=TOKEN, session_factories={"claude-cli": factory})
+        self.turn = wire.parse_request({"messages": [{"role": "user", "content": "test"}]})
+
+    def reply(self, s, stop):
+        blocks = ([{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]
+                  if stop == "tool_use" else [{"type": "text", "text": "done"}])
+        server._remember_reply(s, self.turn, "msg", "cortados", (blocks, stop, {}))
+        s.history.append(wire.reply_fingerprint(blocks))
+
+    def test_tool_wait_survives_old_ttl_then_expires(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.now += 1801                    # backend thinking must not consume the client's window
+        self.reply(s, "tool_use")
+        finished = self.now
+        self.now += 1801
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        continuation = wire.ClientTurn("", [], [], {"t": {}}, history=list(s.history))
+        self.assertIs(self.reg.find(continuation), s)
+        self.now = finished + server.TOOL_WAIT_S
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.now += 1
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+        s.close.assert_called_once()
+
+    def test_end_turn_uses_old_ttl_including_after_tool_wait(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.reply(s, "tool_use")
+        self.now += 2000
+        self.reply(s, "end_turn")
+        self.now += 1800
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.now += 1
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_oversized_reply_still_gets_tool_window(self):
+        s = self.reg.new(self.turn, keep=True)
+        with mock.patch.object(server, "REPLAY_MAX_BYTES", 1):
+            self.reply(s, "tool_use")
+        self.assertIsNone(s.last_reply)
+        self.now += 1801
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+
+    def test_busy_session_is_not_reaped(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.now += server.TOOL_WAIT_S + 1
+        with s.lock:
+            self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_capacity_refuses_new_sessions_without_evicting_tool_waits(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 2):
+            for _ in range(2):
+                self.reply(self.reg.new(self.turn, keep=True), "tool_use")
+            self.now += 1801
+            self.reg.reap(1800)
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 2)
+            self.assertEqual(len(self.created), 2)  # refusal must not even start an extra backend
+            self.assertTrue(all(not s.close.called for s in self.reg.sessions.values()))
+            self.now += server.TOOL_WAIT_S
+            self.reg.reap(1800)
+            self.assertEqual(len(self.reg.sessions), 0)
+            self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_concurrent_opening_counts_toward_cap_and_failure_releases_it(self):
+        factory = self.reg._factories["claude-cli"]
+        def overlapping(reg, **kw):
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                reg.new(self.turn, keep=True)
+            raise BridgeError("fake startup failure")
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            self.reg._factories["claude-cli"] = overlapping
+            with self.assertRaisesRegex(BridgeError, "fake startup"):
+                self.reg.new(self.turn, keep=True)
+            self.assertEqual(self.reg._opening, 0)
+            self.reg._factories["claude-cli"] = factory
+            self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_tool_window_is_configurable(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.reply(s, "tool_use")
+        with mock.patch.object(server, "TOOL_WAIT_S", 20):
+            self.now += 21
+            self.reg.reap(10)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_capacity_is_reserved_before_router_quota_reservation(self):
+        quota_reservations = []
+        self.reg.router = lambda body, client: quota_reservations.append(client) or {"provider": "claude-cli"}
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            self.reg.new(self.turn, keep=True)
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                self.reg.route_new({}, "client")
+        self.assertEqual(quota_reservations, [])
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_bridge_wait_window_starts_when_reply_is_complete(self):
+        from types import SimpleNamespace
+        s = BridgeSession.__new__(BridgeSession)
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed, s._tool_result_deadline = mock.Mock(), False, None
+        got = []
+        waiter = threading.Thread(target=lambda: got.append(s.wait_result("t", timeout=1)))
+        waiter.start()
+        time.sleep(0.01)
+        self.now += server.TOOL_WAIT_S + 100       # backend reply production cannot consume the client window
+        s.arm_tool_result_deadline(self.now + server.TOOL_WAIT_S)
+        self.assertTrue(waiter.is_alive())
+        s.emitted = {"t"}
+        s.deliver({"t": {"content": "ok"}})
+        waiter.join(1)
+        self.assertEqual(got, [{"content": "ok"}])
+
+        s._tool_result_deadline = self.now - 1
+        with self.assertRaises(server.ToolWaitExpired):
+            s.wait_result("late", timeout=1)
+
+    def test_idle_longer_than_tool_window_arms_matching_deadline(self):
+        s = self.reg.new(self.turn, keep=True)
+        s.arm_tool_result_deadline = mock.Mock()
+        with mock.patch.object(server, "IDLE_S", 100), mock.patch.object(server, "TOOL_WAIT_S", 20):
+            self.reply(s, "tool_use")
+            s.arm_tool_result_deadline.assert_called_once_with(self.now + 100)
+            self.now += 21
+            self.reg.reap(100)
+            self.assertIs(self.reg.get(s.id), s)
+
+    def test_registration_atomically_converts_capacity_reservation(self):
+        original = self.reg._new
+        def paused_registration(*args, **kwargs):
+            s = original(*args, **kwargs)
+            # Another opener runs exactly where old code counted both session and reservation.
+            failures = []
+            def concurrent_open():
+                try:
+                    self.reg.reserve_opening()
+                    self.reg.release_opening()
+                except Exception as exc:
+                    failures.append(exc)
+            thread = threading.Thread(target=concurrent_open)
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            return s
+        with mock.patch.object(server, "MAX_SESSIONS", 2), mock.patch.object(self.reg, "_new", paused_registration):
+            self.reg.new(self.turn, keep=True)
+        self.assertEqual(self.reg._opening, 0)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_reaper_final_stale_read_and_removal_hold_replay_lock(self):
+        from types import SimpleNamespace
+        reg, observed = self.reg, []
+        class Session(SimpleNamespace):
+            @property
+            def last_used(inner):
+                observed.append(reg._lock.locked())
+                return 0
+        s = Session(id="stale", lock=threading.Lock(), history=["reply"], awaiting_tool_result=False)
+        def close():
+            self.assertFalse(reg._lock.locked())
+            self.assertIsNone(reg.get(s.id))
+        s.close = close
+        reg.sessions[s.id] = s
+        reg.reap(1)
+        self.assertEqual(observed, [True])
+
+    def test_legacy_timeout_resolution_and_explicit_shim_configuration(self):
+        script = """
+import io
+import json
+from unittest import mock
+from cortados_router.provider import bridge, timeouts
+with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
+    with mock.patch("threading.Thread.start"):
+        popen = mock.Mock()
+        s = bridge.BridgeSession(gateway_url="", token="t", system="", tools=[{"name":"Read"}],
+                                 popen=popen)
+        cfg = json.loads((s.dir / "mcp.json").read_text())["mcpServers"]["bridge"]["env"]
+        cli_seconds = int(popen.call_args.kwargs["env"]["MCP_TOOL_TIMEOUT"]) / 1000
+        print(json.dumps([cfg, cli_seconds, timeouts.CLI_TOOL_TIMEOUT_S]))
+        s._stderr.close()
+        import shutil
+        shutil.rmtree(s.dir)
+"""
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CORTADOS_PROVIDER_", "WANGCAI_PROVIDER_"))}
+        env.update(WANGCAI_PROVIDER_TURN_TIMEOUT_S="19000", WANGCAI_PROVIDER_IDLE_S="20000",
+                   WANGCAI_PROVIDER_TOOL_WAIT_S="30", WANGCAI_PROVIDER_CALL_SLACK_S="7")
+        result = subprocess.run([sys.executable, "-B", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg, actual_cli, cli = json.loads(result.stdout)
+        self.assertEqual(actual_cli, cli)
+        self.assertEqual(float(cfg["CORTADOS_PROVIDER_TURN_TIMEOUT_S"]), 19000)
+        self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
+        self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
+        # The shim's deadline is handed over verbatim and ends at least the documented margin before the CLI's own
+        # MCP tool timeout, so a write past the shim's pre-write check always lands before the CLI could time out.
+        shim_deadline = float(cfg["CORTADOS_PROVIDER_CALL_TIMEOUT_S"])
+        self.assertEqual(shim_deadline, 19000 + 20000 + 7)
+        self.assertLessEqual(shim_deadline + 30, actual_cli)
+
+    def test_shim_deadline_and_cli_timeout_share_one_constant(self):
+        from cortados_router.provider import timeouts
+        self.assertGreaterEqual(timeouts.CLI_MARGIN_S, timeouts.CLI_MARGIN_FLOOR_S)
+        self.assertGreaterEqual(timeouts.CLI_MARGIN_FLOOR_S, 30)
+        self.assertEqual(timeouts.CLI_TOOL_TIMEOUT_S, timeouts.CALL_TIMEOUT_S + timeouts.CLI_MARGIN_S)
+        self.assertLessEqual(timeouts.CALL_TIMEOUT_S + 30, timeouts.CLI_TOOL_TIMEOUT_S)
+
+    def _shim_dispatcher(self, forward, emit, timeout, clock=time.monotonic, workers=1, max_pending=8):
+        aborted = threading.Event()
+        patches = [mock.patch.object(mcp_shim, "CALL_TIMEOUT_S", timeout),
+                   mock.patch.object(mcp_shim, "_forward", side_effect=forward),
+                   mock.patch.object(mcp_shim, "_emit", side_effect=emit),
+                   mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: aborted.set() or True),
+                   mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: self._owner_kills.append(1)),
+                   mock.patch.object(mcp_shim, "_terminate_owner", side_effect=AssertionError("owner kill failed"))]
+        self._owner_kills = []
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        d = mcp_shim._Dispatcher("gateway", "session", "token", workers=workers, max_pending=max_pending, clock=clock)
+        return d, aborted
+
+    def test_stdin_reader_never_blocks_while_transport_abort_and_workers_hang(self):
+        # The reader only reads, timestamps and enqueues: a hanging _forward (transport down), a hanging _abort and a
+        # saturated pool (overflow) never delay a single timestamp.
+        hang = threading.Event()
+        self.addCleanup(hang.set)
+        d, _ = self._shim_dispatcher(lambda *_: hang.wait(30), lambda _l: None, 60.0, workers=2, max_pending=4)
+        p = mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: hang.wait(30))
+        p.start()
+        self.addCleanup(p.stop)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        inbox, written = queue.SimpleQueue(), []
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
+        for i in range(200):
+            written.append(time.monotonic())
+            writer.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {}}) + "\n")
+            writer.flush()
+            item = inbox.get(timeout=2)            # consumed and submitted like main(): overflow fails closed here
+            d.adopt(item[2], i, {})
+            self.assertLess(item[0] - written[-1], 0.5)
+        writer.close()
+        self.assertIs(inbox.get(timeout=2), mcp_shim._EOF)
+        self.assertEqual(self._owner_kills, [1])
+
+    def _pipe_reader(self, d, inbox):
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
+        return writer
+
+    def test_a_full_bounded_inbox_fails_closed_without_blocking_the_reader(self):
+        # Nobody consumes the inbox (main() stuck). The reader must never block on it: the third line finds it full,
+        # signals overflow, and the deadline thread fails closed; the reader still delivers EOF afterwards.
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: None, 60.0, max_pending=64)
+        inbox = queue.Queue(maxsize=2)
+        writer = self._pipe_reader(d, inbox)
+        for i in range(3):
+            writer.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "ping"}) + "\n")
+        writer.flush()
+        self.assertTrue(aborted.wait(2))
+        self.assertEqual(self._owner_kills, [1])
+        self.assertEqual(inbox.qsize(), 2)
+
+    def test_a_provisional_deadline_expires_while_main_is_blocked_in_reply(self):
+        # main() blocks writing a ping reply (stdout stalled). A tools/call read meanwhile sits unparsed in the inbox;
+        # its read-time deadline must still fire: the deadline thread sees it without main() ever adopting it.
+        # The reader's clock stamps the ping 60 s late, so the ping's own provisional deadline lies far past the
+        # assertion window: only the unadopted tools/call's provisional entry (seq 2) can trigger the fail closed.
+        stalled, hang = threading.Event(), threading.Event()
+        self.addCleanup(hang.set)
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: stalled.set() or hang.wait(30), 0.3)
+        inbox = queue.Queue(maxsize=8)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        stamps = []
+
+        def reader_clock():
+            stamps.append(1)
+            return time.monotonic() + (60.0 if len(stamps) == 1 else 0.0)
+
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d, reader_clock), daemon=True).start()
+        threading.Thread(target=mcp_shim._serve, args=(inbox, d, []), daemon=True).start()
+        sent = time.monotonic()
+        writer.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n")
+        writer.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}}) + "\n")
+        writer.flush()
+        self.assertTrue(stalled.wait(2))
+        self.assertTrue(aborted.wait(2))
+        self.assertEqual(self._owner_kills, [1])
+        self.assertLess(time.monotonic(), sent + 0.3 + 1.0)
+        # Attribution: the expired entry is the tools/call's (seq 2, never adopted); the ping's (seq 1) is still armed.
+        self.assertEqual({seq: c["state"] for seq, c in d._live.items()}, {1: "inbox", 2: "expired"})
+        self.assertIsNone(d._live[2]["mid"])
+
+    def test_finish_waits_for_a_signalled_overflow_that_eof_raced(self):
+        # Overflow is signalled, then EOF reaches finish() before the deadline thread has failed closed: finish()
+        # must treat it as a started failure and wait for the cleanup instead of returning (and exiting) at once.
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: None, 60.0)
+        slow = mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: time.sleep(0.3) or self._owner_kills.append(1))
+        slow.start()
+        self.addCleanup(slow.stop)
+        d.signal_overflow()
+        self.assertTrue(d.finish(5))
+        self.assertTrue(d.cleanup_done.is_set())
+        self.assertTrue(aborted.is_set())
+        self.assertEqual(self._owner_kills, [1])
+
+    def test_scaled_transport_down_fails_closed_before_the_cli_timeout(self):
+        # Scaled budgets: deadline 0.2 s, CLI timeout 0.2 + margin 0.3 s. Transport hangs; the shim must kill the
+        # owner (fail closed) well before a simulated CLI timer started when the request was written.
+        hang, killed = threading.Event(), threading.Event()
+        self.addCleanup(hang.set)
+        d, _ = self._shim_dispatcher(lambda *_: hang.wait(30), lambda _l: None, 0.2)
+        p = mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: killed.set())
+        p.start()
+        self.addCleanup(p.stop)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        inbox = queue.SimpleQueue()
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
+        cli_sent = time.monotonic()
+        writer.write("{}\n")
+        writer.flush()
+        _received, _, token = inbox.get(timeout=2)
+        time.sleep(0.1)                             # processing delay after the read does not move the deadline
+        d.adopt(token, 1, {})
+        self.assertTrue(killed.wait(2))
+        self.assertLess(time.monotonic(), cli_sent + 0.2 + 0.3)
+
+    def test_queued_shim_call_keeps_its_submission_deadline(self):
+        # Two calls, one worker. The second call's deadline includes its queue time: it expires closed while the
+        # first still holds the worker, and once the session failed closed nothing at all is written.
+        release, entered, lines = threading.Event(), threading.Event(), []
+
+        def forward(_g, _s, _t, params):
+            entered.set()
+            release.wait(5)
+            return {"content": [{"type": "text", "text": params["name"]}]}
+
+        d, aborted = self._shim_dispatcher(forward, lines.append, 0.3)
+        d.submit(1, {"name": "first"})
+        self.assertTrue(entered.wait(2))
+        d.submit(2, {"name": "second"})
+        self.assertTrue(aborted.wait(5))
+        release.set()
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
+
+    def test_shim_deadline_is_taken_at_submission_not_at_thread_start(self):
+        # The clock reads 0 at submission and 100 for every later read: however late any thread is scheduled, the
+        # call's result is past its 10 s deadline and must never be written.
+        reads, lines = [], []
+
+        def clock():
+            reads.append(1)
+            return 0.0 if len(reads) == 1 else 100.0
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, lines.append, 10.0, clock=clock)
+        d.submit(1, {"name": "late"})
+        self.assertTrue(aborted.wait(5))
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
+
+    def test_shim_stays_armed_while_reply_is_blocked_past_deadline(self):
+        # The result is ready in time but the stdout write blocks. The deadline thread must still fail closed:
+        # a call is answered only once its flush returns.
+        writing, unblock = threading.Event(), threading.Event()
+
+        def emit(_line):
+            writing.set()
+            unblock.wait(5)
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, emit, 0.3)
+        d.submit(1, {"name": "blocked"})
+        self.assertTrue(writing.wait(2))
+        self.assertTrue(aborted.wait(5))
+        unblock.set()
+
+    def test_shim_fails_closed_past_pending_cap(self):
+        release, lines = threading.Event(), []
+
+        def forward(*_):
+            release.wait(5)
+            return {"content": []}
+
+        d, aborted = self._shim_dispatcher(forward, lines.append, 60.0, max_pending=2)
+        for mid in (1, 2):
+            d.submit(mid, {"name": "n"})
+        self.assertFalse(aborted.is_set())
+        d.submit(3, {"name": "n"})          # returns at once: the deadline thread fails closed
+        self.assertTrue(aborted.wait(2))
+        release.set()
+        time.sleep(0.05)
+        self.assertEqual(lines, [])
+
+    def test_shim_late_flush_after_deadline_fails_closed(self):
+        # The write starts in time but its flush returns after the deadline: never counted as answered.
+        now = [0.0]
+
+        def emit(_line):
+            now[0] = 100.0
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, emit, 10.0, clock=lambda: now[0])
+        d.submit(1, {"name": "slow-flush"})
+        self.assertTrue(aborted.wait(5))
+        self.assertEqual(self._owner_kills, [1])
+
+    def test_shim_worker_unblocked_after_failure_writes_nothing(self):
+        # A worker whose result arrives after the session failed (expiry of a sibling) must write nothing at all.
+        release, entered, stream = threading.Event(), threading.Event(), io.StringIO()
+
+        def forward(_g, _s, _t, params):
+            if params["name"] == "held":
+                entered.set()
+                release.wait(5)
+            return {"content": []}
+
+        def emit(line):
+            stream.write(line)
+
+        d, aborted = self._shim_dispatcher(forward, emit, 0.3, workers=2)
+        d.submit(1, {"name": "held"})
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(aborted.wait(5))
+        self.assertEqual(self._owner_kills, [1])     # the owner died before anything was released
+        release.set()
+        time.sleep(0.1)
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_shim_retention_stays_bounded_behind_one_held_call(self):
+        release, entered, lines = threading.Event(), threading.Event(), []
+
+        def forward(_g, _s, _t, params):
+            if params["name"] == "held":
+                entered.set()
+                release.wait(10)
+            return {"content": []}
+
+        d, aborted = self._shim_dispatcher(forward, lines.append, 60.0, workers=2, max_pending=4)
+        self.addCleanup(release.set)
+        d.submit(0, {"name": "held"})
+        self.assertTrue(entered.wait(2))
+        for mid in range(1, 501):
+            d.submit(mid, {"name": "fast"})
+            deadline = time.monotonic() + 2
+            while len(lines) < mid and time.monotonic() < deadline:
+                time.sleep(0.001)
+        self.assertEqual(len(lines), 500)
+        self.assertFalse(aborted.is_set())
+        self.assertLessEqual(len(d._heap), 2 * 4 + mcp_shim.HEAP_SLACK)
+        self.assertEqual(len(d._live), 1)
+
+    def test_subprocess_shim_aborts_before_cli_timeout_can_resume(self):
+        from cortados_router.provider import timeouts
+        self.assertGreater(timeouts.CLI_TOOL_TIMEOUT_S, timeouts.CALL_TIMEOUT_S + timeouts.ABORT_TIMEOUT_S)
+        # Scale all production budgets equally; real child kills its fake CLI owner on double transport failure.
+        child = """
+import time
+import types
+from cortados_router.provider import mcp_shim as shim, timeouts
+shim.CALL_TIMEOUT_S = timeouts.CALL_TIMEOUT_S / 1000
+shim.ABORT_TIMEOUT_S = timeouts.ABORT_TIMEOUT_S / 1000
+def fail(req, timeout):
+    time.sleep(timeout)
+    raise OSError("transport unavailable")
+shim.urllib.request.urlopen = fail
+shim._forward("http://unused", "s", "t", {"_meta":{"claudecode/toolUseId":"t"}})
+"""
+        owner = """
+import subprocess, sys
+from cortados_router.provider import timeouts
+p = subprocess.Popen([sys.executable, "-B", "-c", sys.argv[1]])
+try:
+    p.wait(timeout=timeouts.CLI_TOOL_TIMEOUT_S / 1000)
+except subprocess.TimeoutExpired:
+    print("SYNTHETIC TOOL RESULT", flush=True)
+    p.kill()
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", owner, child], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, -9, result.stderr)
+        self.assertNotIn("SYNTHETIC", result.stdout)
+
+    def test_anthropic_keepalive_is_a_protocol_ping(self):
+        self.assertEqual(wire.sse_ping(), b'event: ping\ndata: {"type": "ping"}\n\n')
 
 
 class WireTests(unittest.TestCase):
@@ -206,6 +730,119 @@ class EndpointHarness(unittest.TestCase):
 
 
 class EndpointTests(EndpointHarness):
+    def test_shim_kills_owner_when_call_and_abort_transports_both_fail(self):
+        failures = [urllib.error.URLError("call failed"), urllib.error.URLError("abort failed")]
+        with mock.patch.object(mcp_shim.urllib.request, "urlopen", side_effect=failures), \
+             mock.patch.object(mcp_shim.os, "getppid", return_value=1234), \
+             mock.patch.object(mcp_shim.os, "kill") as kill, \
+             mock.patch.object(mcp_shim.os, "_exit", side_effect=SystemExit(1)) as exit_:
+            with self.assertRaises(SystemExit):
+                mcp_shim._forward("http://gateway", "session", "token", {
+                    "name": "Read", "arguments": {}, "_meta": {"claudecode/toolUseId": "t"}})
+        kill.assert_called_once_with(1234, mcp_shim.signal.SIGKILL)
+        exit_.assert_called_once_with(1)
+
+    def test_transport_abort_marks_closed_before_slow_teardown(self):
+        s = BridgeSession.__new__(BridgeSession)
+        s.id, s.lock, s.history, s.last_used = uuid.uuid4().hex, threading.Lock(), ["reply"], time.time()
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed = mock.Mock(), False
+        s._tool_result_deadline, s._tool_result_expired = None, False
+        s.emitted = {"t"}
+        closing, release = threading.Event(), threading.Event()
+
+        def slow_close():
+            closing.set()
+            release.wait(2)
+
+        s.close = slow_close
+        self.reg.sessions[s.id] = s
+        done = threading.Event()
+        thread = threading.Thread(target=lambda: (
+            self.post({"session": s.id, "abort": True}, path="/bridge/call"), done.set()))
+        thread.start()
+        self.assertTrue(closing.wait(1))
+        with self.assertRaisesRegex(BridgeError, "session was closed"):
+            s.deliver({"t": {"content": "too late"}})
+        self.assertEqual(s._results, {})
+        release.set()
+        thread.join(1)
+        self.assertTrue(done.is_set())
+
+    def test_expired_bridge_call_closes_backend_before_answer_and_late_result(self):
+        from types import SimpleNamespace
+        closed = mock.Mock()
+        def expired(*_args, **_kwargs):
+            raise server.ToolWaitExpired("expired")
+        s = SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), history=["reply"], last_used=time.time(),
+                            wait_result=expired, close=closed)
+        self.reg.sessions[s.id] = s
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertEqual(cm.exception.code, 410)
+        self.assertIsNone(self.reg.get(s.id))
+        closed.assert_called_once()
+        late = self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertTrue(late["result"]["isError"])
+        self.assertIn("session closed", late["result"]["content"][0]["text"])
+
+    def test_expiry_wins_against_delivery_holding_turn_lock(self):
+        s = BridgeSession.__new__(BridgeSession)
+        s.id, s.lock, s.history, s.last_used = uuid.uuid4().hex, threading.Lock(), ["reply"], time.time()
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed = mock.Mock(), False
+        s._tool_result_deadline, s._tool_result_expired = time.time() - 1, False
+        s.emitted, s.close = {"t"}, mock.Mock()
+        self.reg.sessions[s.id] = s
+        holding, release, rejected = threading.Event(), threading.Event(), []
+
+        def continuation():
+            with s.lock:
+                holding.set()
+                release.wait(2)
+                try:
+                    s.deliver({"t": {"content": "late"}})
+                except BridgeError as exc:
+                    rejected.append(str(exc))
+
+        thread = threading.Thread(target=continuation)
+        thread.start()
+        self.assertTrue(holding.wait(1))
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertEqual(cm.exception.code, 410)
+        self.assertIsNone(self.reg.get(s.id))       # expiry did not wait behind the held turn lock
+        s.close.assert_called_once()
+        release.set()
+        thread.join(1)
+        self.assertEqual(rejected, ["the session was closed"])
+        self.assertEqual(s._results, {})
+
+    def test_real_shim_transport_covers_delayed_reply_then_server_expires_closed(self):
+        # The real shim starts its HTTP timer before run_turn finishes the tool_use reply. Scale every budget down:
+        # the .12s completion delay exceeds the old .10s transport (.05 tool + .05 slack), but fits the new
+        # .30s transport (.20 turn + .05 tool + .05 slack).
+        with mock.patch.object(server, "TOOL_WAIT_S", 0.05), mock.patch.object(server, "IDLE_S", 0.01), \
+             mock.patch.object(bridge, "IDLE_S", 0.01), mock.patch.object(bridge, "TURN_TIMEOUT_S", 0.20), \
+             mock.patch.object(bridge, "CALL_SLACK_S", 0.05), \
+             mock.patch.object(bridge, "TOOL_WAIT_S", 0.05), mock.patch.object(bridge, "SETTLE_S", 0.12):
+            first = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
+        self.assertEqual(first["stop_reason"], "tool_use")
+        deadline = time.time() + 2
+        while self.reg.sessions and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.reg.sessions, {})     # server expiry ended the backend; no synthetic unattended turn
+
+    def test_stream_sends_pings_while_backend_turn_is_running(self):
+        original = BridgeSession.run_turn
+        def slow(session, timeout):
+            time.sleep(0.06)
+            return original(session, timeout)
+        with mock.patch.object(server, "PING_S", 0.01), mock.patch.object(BridgeSession, "run_turn", slow):
+            raw = self.post({"stream": True, "messages": [{"role": "user", "content": "hello"}]})
+        self.assertIn('event: ping\ndata: {"type": "ping"}\n\n', raw)
+        self.assertIn("event: message_stop", raw)
+
     def test_client_cache_markers_are_removed_on_every_claude_path(self):
         def blocks(text):
             return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": "5m"}},
@@ -1546,7 +2183,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
         history = [{"role": "user", "content": "hi"}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history})
         [s] = self.reg.sessions.values()
-        s.last_used = time.time() - 10_000
+        s.last_used = time.time() - max(server.TOOL_WAIT_S, 10_000) - 1
         self.reg.reap(1)
         self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
         follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]
@@ -1621,6 +2258,164 @@ class StartFailureTests(unittest.TestCase):
             BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
                           claude_bin=os.path.join(scratch, "no-such-claude"), scratch_root=scratch)
         self.assertEqual(os.listdir(scratch), [])
+
+
+def _office_handler(reg, *, run_id):
+    """A stand-in for a Handler: just what _office_turn_start/_office_turn_end read."""
+    return types.SimpleNamespace(server=types.SimpleNamespace(registry=reg), _office_tags={"session": "sess-1"},
+                                 _run_id=lambda: (run_id, True))
+
+
+class OwnerDeathTests(unittest.TestCase):
+    def test_owner_death_with_delayed_abort_still_removes_the_conversation(self):
+        # The CLI dies (as when the shim SIGKILLs it on expiry) and the shim's abort never arrives: the provider's
+        # own exit handling must remove the conversation terminally and end its backend.
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                          claude_bin=[sys.executable, "-c", "import time; time.sleep(0.3)"])
+        closed, done = [], threading.Event()
+        real_close = s.close
+
+        def close():
+            real_close()
+            closed.append(True)
+            done.set()                                 # only after the real cleanup has returned
+        s.close = close
+        handler = _office_handler(reg, run_id="w-1")
+        key = Handler._office_turn_start(handler, s, one_shot=False)   # the real path keeps the identity on s
+        self.assertEqual(s.office_worker[0], key)
+        with reg._lock:
+            reg.sessions[s.id] = s
+        s.set_exit_handler(reg._backend_exited)       # what Registry.new wires for every held conversation
+        self.assertTrue(done.wait(10))
+        self.assertIsNone(reg.get(s.id))
+        self.assertEqual(closed, [True])
+        self.assertIsNotNone(s.proc.poll())
+        self.assertEqual(reg.office.workers[key]["status"], "error")    # the dead worker no longer shows working
+        self.assertIsNotNone(reg.office.workers[key]["ended_at"])
+
+    def test_finalizer_after_backend_exit_cannot_resurrect_the_worker(self):
+        # The backend exits after run_turn returned a tool-use reply but before the request's finalizer ran: the
+        # exit's `error` is terminal, so the late turn end must not move the worker back to `working`.
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = types.SimpleNamespace(id="conv-late-1", close=lambda: None)
+        handler = _office_handler(reg, run_id="w-late")
+        key = Handler._office_turn_start(handler, s, one_shot=False)
+        self.assertEqual(reg.office.workers[key]["status"], "working")
+        with reg._lock:
+            reg.sessions[s.id] = s
+        reg._backend_exited(s)                         # exit callback first
+        Handler._office_turn_end(handler, s, key,      # then the finalizer, with a tool-use reply
+                                 {"turn": ([{"type": "tool_use", "name": "Bash", "id": "t1", "input": {}}], "x", None)})
+        self.assertEqual(reg.office.workers[key]["status"], "error")
+        self.assertIsNotNone(reg.office.workers[key]["ended_at"])
+
+    def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                          claude_bin=[sys.executable, str(FAKE)])
+        calls = []
+        s.set_exit_handler(lambda sess: calls.append(sess))
+        s.close()
+        time.sleep(0.3)
+        self.assertEqual(calls, [])
+
+
+    def test_real_shim_reports_unconfirmed_abort_on_stdin_eof(self):
+        # A real shim process under a stand-in owner (so its SIGKILL of getppid() hits the stand-in, never this test
+        # process): a tool call outlives its scaled-down deadline, the shim kills the owner (closing its stdin) and
+        # sends the abort, which the fake bridge refuses or never answers; on EOF the shim must report the unconfirmed
+        # abort on stderr and exit within ABORT_TIMEOUT_S + 5.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        root = str(Path(__file__).resolve().parent.parent)
+        for mode in ("refuse", "hang"):
+            with self.subTest(mode=mode):
+                fixture_errors = []
+
+                class Bridge(BaseHTTPRequestHandler):
+                    def log_message(self, *_):
+                        pass
+
+                    def do_POST(self):
+                        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+                        try:
+                            if body.get("abort"):
+                                if mode == "hang":
+                                    time.sleep(3)          # past the shim's abort timeout: it gives up first
+                                self.send_response(200)
+                                self.end_headers()
+                                self.wfile.write(b'{"closed": false}')
+                                return
+                            # The tool call: keep the socket busy (whitespace is valid JSON padding) so the worker's
+                            # own read timeout never fires; only the deadline thread fails closed.
+                            self.send_response(200)
+                            self.end_headers()
+                            for _ in range(60):
+                                self.wfile.write(b" ")
+                                self.wfile.flush()
+                                time.sleep(0.05)
+                            self.wfile.write(b'{"result": {"content": []}}')
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass                    # expected: the shim gave up on the call / died
+                        except BaseException as exc:
+                            fixture_errors.append(exc)
+                            raise
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+                httpd.daemon_threads = True
+                threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                tmp = Path(tempfile.mkdtemp())
+                (tmp / "tools.json").write_text(json.dumps([READ_TOOL]))
+                err_path = tmp / "shim.stderr"
+                # The test process is the shim's real parent (so it reaps it and reads its true exit status); the shim's
+                # owner is a stand-in sleeper that holds the only write end of the shim's stdin, injected as getppid().
+                owner = """
+import json, os, sys, time
+w = os.fdopen(int(sys.argv[1]), "w")
+w.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\\n")
+w.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+    "name": "Read", "arguments": {}, "_meta": {"claudecode/toolUseId": "tu1"}}}) + "\\n")
+w.flush()
+time.sleep(30)                                  # the shim SIGKILLs us long before this
+"""
+                shim = """
+import os, runpy, sys
+os.getppid = lambda: int(os.environ["CORTADOS_TEST_OWNER_PID"])
+sys.argv = ["mcp_shim"] + sys.argv[1:]
+runpy.run_module("cortados_router.provider.mcp_shim", run_name="__main__")
+"""
+                env = {k: v for k, v in os.environ.items() if not k.startswith("CORTADOS_PROVIDER_")}
+                env.update(CORTADOS_PROVIDER_TOKEN="t", CORTADOS_PROVIDER_CALL_TIMEOUT_S="0.4",
+                           CORTADOS_PROVIDER_ABORT_TIMEOUT_S="0.5", PYTHONPATH=root)
+                r, w = os.pipe()
+                owner_p = subprocess.Popen([sys.executable, "-B", "-c", owner, str(w)], cwd=root, env=env,
+                                           pass_fds=(w,))
+                os.close(w)
+                shim_p = None
+                try:
+                    with open(err_path, "w") as err:
+                        shim_p = subprocess.Popen(
+                            [sys.executable, "-B", "-c", shim, f"http://127.0.0.1:{httpd.server_address[1]}",
+                             "sess-x", str(tmp / "tools.json")], cwd=root,
+                            env=dict(env, CORTADOS_TEST_OWNER_PID=str(owner_p.pid)),
+                            stdin=r, stdout=subprocess.DEVNULL, stderr=err)
+                    os.close(r)
+                    r = None
+                    self.assertEqual(owner_p.wait(timeout=10), -9)   # the shim's fail-closed kill of its owner
+                    self.assertEqual(shim_p.wait(timeout=0.5 + 5 + 3), 0)   # exits after stdin EOF, reaped here
+                    self.assertIn("backend abort for session sess-x unconfirmed", err_path.read_text())
+                    self.assertEqual(fixture_errors, [])
+                finally:
+                    if r is not None:
+                        os.close(r)
+                    for proc in (owner_p, shim_p):
+                        if proc is not None:
+                            if proc.poll() is None:
+                                proc.kill()             # Popen-owned and unreaped: never a recycled PID
+                            proc.wait()
+                    httpd.shutdown()
+                    httpd.server_close()
+                    import shutil
+                    shutil.rmtree(tmp, ignore_errors=True)
 
 
 class StalledCliTests(unittest.TestCase):
@@ -2379,6 +3174,22 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         code, msg = self._refused({server.MIN_LEFT_HEADER: "5"})
         self.assertEqual(code, 429)
         self.assertIn("RuntimeError", msg)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_saturated_search_slots_reserve_nothing_under_a_floor(self):
+        # All slots busy and a floor header: the busy refusal comes before floor.reserve, so the floor ledger (every
+        # reservation goes through floor_search) is unchanged and no CLI starts.
+        reserved = []
+        self.reg.floor_search = lambda cand, floor: reserved.append((cand, floor)) or None
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(1)):
+            search_lane._slots.acquire()
+            try:
+                r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+            finally:
+                search_lane._slots.release()
+            self.assertEqual(search_lane._slots._value, 1, "the busy refusal holds no slot")
+        self.assertIn("search busy", r["content"][0]["text"])
+        self.assertEqual(reserved, [], "a busy refusal must not reserve quota")
         self.assertEqual(self.search_calls(), [])
 
     def test_a_floor_the_search_account_clears_runs_the_search(self):

@@ -46,14 +46,19 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing, search_lane
-from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
+from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
+from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
 
 DEFAULT_PORT = 8432                                     # next to S1's 8431
 # A turn covers the model's thinking until it finishes or asks for a tool; long agentic turns run minutes.
-TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
-# A conversation the client has not touched for this long is closed; its CLI process holds memory and a login slot.
-IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
+# Resolved centrally through compat.getenv; the shim gets the same budgets explicitly.
+# Tool-wait sessions use at least TOOL_WAIT_S (default 3 h), not the ordinary idle TTL.
+# Bound held CLI processes and replay memory even if many clients abandon long-running tools. Refuse new
+# conversations at capacity rather than evicting a client still inside its promised tool-result window.
+MAX_SESSIONS = int(getenv("CORTADOS_PROVIDER_MAX_SESSIONS") or 128)
+if MAX_SESSIONS < 1:
+    raise ValueError("CORTADOS_PROVIDER_MAX_SESSIONS must be positive")
 # A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request,
 # or its next message on the same history, is told why instead of a misleading 409. A tombstone is keyed by the
 # conversation itself (Registry.failure_key: the wire, the calling client, the conversation identity the client sends
@@ -646,7 +651,11 @@ class Registry:
         self.floor_search: Callable[[dict, float], str | None] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
+        # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
+        # `error` is terminal: a finalizer running after it cannot move the dead worker back to `working`/`idle`.
+        self._office_exit_lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
+        self._opening = 0                              # admission reservations: concurrent starts count toward cap
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
@@ -675,7 +684,78 @@ class Registry:
         return None
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
-            scope: str | None = None, wire_path: str | None = None):
+            scope: str | None = None, wire_path: str | None = None, admitted: bool = False):
+        if keep and not admitted:
+            self.reserve_opening()
+        try:
+            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
+        except BaseException:
+            if keep:
+                self.release_opening()
+            raise
+        if keep:
+            # Convert the admission reservation into a live session in one critical section.
+            with self._lock:
+                self.sessions[s.id] = s
+                self._opening -= 1
+            if hasattr(s, "set_exit_handler"):
+                s.set_exit_handler(self._backend_exited)
+        return s
+
+    def _backend_exited(self, s) -> None:
+        """The backend process died on its own (e.g. the shim killed its CLI on a tool deadline): remove the
+        conversation terminally and end the backend, without relying on the shim's abort ever arriving."""
+        with self._lock:
+            if self.sessions.get(s.id) is not s:
+                return
+            del self.sessions[s.id]
+        logger.warning("conversation %s: backend exited; removed", str(s.id)[:8])
+        self.note_closed(s, "exited")
+        # Its Office worker: no request remains to end the turn, so the dead worker would show `working` until expiry.
+        # Only that worker's record changes (status error); orchestrator heartbeats are untouched.
+        worker = getattr(s, "office_worker", None)
+        if worker:
+            try:
+                with self._office_exit_lock:
+                    s.office_ended = True              # terminal: office_turn_end skips this conversation from now on
+                    self.office.turn_end(worker[0], worker[1], status="error")
+            except Exception as exc:
+                logger.warning("office: backend-exit bookkeeping failed: %s", type(exc).__name__)
+        s.close()
+
+    def office_turn_end(self, session, key: str, tags: dict[str, str], **kw) -> None:
+        """A request's turn end on the board, unless the conversation's backend already exited (_backend_exited
+        ended its worker as `error`; that transition is terminal)."""
+        with self._office_exit_lock:
+            if getattr(session, "office_ended", False):
+                return
+            self.office.turn_end(key, tags, **kw)
+
+    def reserve_opening(self) -> None:
+        """Reserve conversation capacity before routing can reserve any quota."""
+        with self._lock:
+            if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
+            self._opening += 1
+
+    def release_opening(self) -> None:
+        with self._lock:
+            self._opening -= 1
+
+    def route_new(self, body: dict, client: str, **kwargs) -> dict:
+        """Reserve a held-session slot before routing can reserve a quota-floor turn."""
+        self.reserve_opening()
+        try:
+            route = self.router(body, client, **kwargs)
+        except BaseException:
+            self.release_opening()
+            raise
+        if route.get("error"):                           # no Registry.new will consume this admission
+            self.release_opening()
+        return route
+
+    def _new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None,
+             scope: str | None, wire_path: str | None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
@@ -705,9 +785,7 @@ class Registry:
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
-        if keep:
-            with self._lock:
-                self.sessions[s.id] = s
+        s.awaiting_tool_result = False
         return s
 
     @staticmethod
@@ -906,10 +984,27 @@ class Registry:
 
     def reap(self, idle_s: float) -> None:
         with self._lock:
-            stale = [s for s in self.sessions.values() if time.time() - s.last_used > idle_s and not s.lock.locked()]
-        for s in stale:
-            logger.info("closing idle conversation %s", s.id[:8])
-            self.drop(s, "reaped")
+            candidates = list(self.sessions.values())
+        for s in candidates:
+            # Own the turn lock through the decision and close: a continuation must not race a stale snapshot.
+            if not s.lock.acquire(blocking=False):
+                continue
+            try:
+                ttl = effective_tool_wait(idle_s, TOOL_WAIT_S) if getattr(s, "awaiting_tool_result", False) else idle_s
+                # Replay refresh and the final stale check/removal share the registry lock.
+                with self._lock:
+                    expired = self.sessions.get(s.id) is s and time.time() - s.last_used > ttl
+                    if expired:
+                        del self.sessions[s.id]
+                        hist = getattr(s, "history", None)
+                        if hist:
+                            self.closed.append((time.time(), "reaped", hist[0], len(hist)))
+                if expired:
+                    logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
+                                s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
+                    s.close()  # teardown must not hold the registry lock
+            finally:
+                s.lock.release()
 
 
 def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
@@ -918,6 +1013,12 @@ def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     its serialized size passes REPLAY_MAX_BYTES (a replay is then a 409, as before), so idle sessions cannot pin
     large replies in memory. Called before the reply's fingerprint is appended, under the session lock."""
     blocks, stop, usage = result
+    # Start the client execution window when the reply is ready, not before a potentially long backend think.
+    # Independent of replay storage: even oversized tool replies must retain their waiting conversation.
+    session.last_used = time.time()
+    session.awaiting_tool_result = stop == "tool_use" or any(b.get("type") == "tool_use" for b in blocks)
+    if session.awaiting_tool_result and hasattr(session, "arm_tool_result_deadline"):
+        session.arm_tool_result_deadline(session.last_used + effective_tool_wait(IDLE_S, TOOL_WAIT_S))
     try:
         size, why = len(json.dumps([blocks, usage], default=str)), None
         if size > REPLAY_MAX_BYTES:
@@ -1219,8 +1320,21 @@ class Handler(BaseHTTPRequestHandler):
         s = self.server.registry.get(body.get("session", ""))
         if s is None or not hasattr(s, "wait_result"):   # only the Claude bridge's MCP shim calls back over HTTP
             return self._json(200, {"result": {"content": [{"type": "text", "text": "cortados: session closed"}], "isError": True}})
+        if body.get("abort") is True:
+            # The shim's outer transport expired. Close without taking the turn lock: a continuation may own it,
+            # but BridgeSession's _cv terminal transition makes a concurrent delivery lose atomically.
+            s.expire_transport()
+            if self.server.registry.get(s.id) is s:
+                self.server.registry.drop(s, "bridge_transport_expired")
+            return self._json(200, {"closed": True})
         try:
-            result = s.wait_result(body["tool_use_id"], timeout=3600)
+            result = s.wait_result(body["tool_use_id"], timeout=effective_tool_wait(IDLE_S, TOOL_WAIT_S))
+        except ToolWaitExpired as exc:
+            # End the CLI before answering the shim. Never convert expiry into an error tool_result that lets the
+            # unattended model take another paid turn; a late client continuation now sees a closed conversation.
+            if self.server.registry.get(s.id) is s:
+                self.server.registry.drop(s, "tool_result_expired")
+            return self._error(410, "invalid_request_error", f"cortados: {exc}")
         except BridgeError as exc:
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}
         self._json(200, {"result": result})
@@ -1364,9 +1478,10 @@ class Handler(BaseHTTPRequestHandler):
                     pass                         # headers may already be out; the client sees a broken response
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
-            self._office_turn_end(office_key, {"turn": (reply, "local", None)} if outcome == "completed"
-                                  else {"error": outcome})
+            self._office_turn_end(session, office_key, {"turn": (reply, "local", None)} if outcome == "completed"
+                                           else {"error": outcome})
             if outcome == "completed":
+                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in reply)
                 session.history.append(anthropic_wire.reply_fingerprint(reply))
                 if route.get("route_id") and not session.route_logged and reg.executed:
                     try:
@@ -1419,28 +1534,33 @@ class Handler(BaseHTTPRequestHandler):
         if refused:
             return self._error(400, "invalid_request_error", refused, wire)
         try:
-            who = search_lane.login()               # the login and its ledger lane, resolved together before launch
-            if floor is not None:
-                # The client's quota floor on the account the search will execute on, checked and reserved through
-                # floor.reserve like a routed conversation's. No enforcer (a fixed-model endpoint) or one that fails:
-                # closed, as the routed paths do.
-                if reg.floor_search is None:
-                    return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
-                                       "x-cortados-min-left-pct for the search lane", wire,
-                                       reason="the client's quota floor cannot be checked here")
-                try:
-                    why = reg.floor_search(who.floor_candidate(), floor)
-                except Exception as exc:
-                    logger.exception("search lane: quota floor check failed")
-                    return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
-                                       f"({type(exc).__name__}); x-cortados-min-left-pct cannot be honoured", wire,
-                                       reason="the client's quota floor cannot be checked here")
-                if why:
-                    return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
-                                       reason="the search account is below the client's quota floor")
-            allowed, blocked = search_lane.domain_filters(body)
-            result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
-                                     search_lane.extract_query(body), who.config_dir, allowed=allowed, blocked=blocked)
+            # Query checks and a search slot come first, then the quota floor's reservation: a refused search (no
+            # query, too long, all slots busy) must never leave a reservation. The slot is held through the launch.
+            query = search_lane.extract_query(body)
+            search_lane.check_query(query)
+            with search_lane.capacity():
+                who = search_lane.login()               # the login and its ledger lane, resolved together before launch
+                if floor is not None:
+                    # The client's quota floor on the account the search will execute on, checked and reserved through
+                    # floor.reserve like a routed conversation's. No enforcer (a fixed-model endpoint) or one that fails:
+                    # closed, as the routed paths do.
+                    if reg.floor_search is None:
+                        return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
+                                           "x-cortados-min-left-pct for the search lane", wire,
+                                           reason="the client's quota floor cannot be checked here")
+                    try:
+                        why = reg.floor_search(who.floor_candidate(), floor)
+                    except Exception as exc:
+                        logger.exception("search lane: quota floor check failed")
+                        return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
+                                           f"({type(exc).__name__}); x-cortados-min-left-pct cannot be honoured", wire,
+                                           reason="the client's quota floor cannot be checked here")
+                    if why:
+                        return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
+                                           reason="the search account is below the client's quota floor")
+                allowed, blocked = search_lane.domain_filters(body)
+                result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
+                                         query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
             reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
@@ -1633,9 +1753,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
                 try:
-                    route = reg.router(wire.routing_body(body), self._client(),
-                                       **({"exclude_model": exclude} if exclude else {}),
-                                       **({"min_left_pct": floor} if floor is not None else {}))
+                    route_fn = reg.router if one_shot else reg.route_new
+                    route = route_fn(wire.routing_body(body), self._client(),
+                                     **({"exclude_model": exclude} if exclude else {}),
+                                     **({"min_left_pct": floor} if floor is not None else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
@@ -1657,7 +1778,7 @@ class Handler(BaseHTTPRequestHandler):
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
                 session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
-                                  wire_path=self.path.split("?")[0])
+                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot))
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
@@ -1882,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
                 # conversation is kept: its client has the earlier replies and can continue.
                 reg.drop(session)
         finally:
-            self._office_turn_end(office_key, outcome)
+            self._office_turn_end(session, office_key, outcome)
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here
 
@@ -1907,28 +2028,32 @@ class Handler(BaseHTTPRequestHandler):
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
                              lane=lane, model=route.get("model") or getattr(session, "model", None))
+            # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
+            # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
+            session.office_worker = (key, dict(tags))
             return key
         except Exception as exc:
             logger.warning("office: turn start bookkeeping failed: %s", type(exc).__name__)
             return None
 
-    def _office_turn_end(self, key: str | None, outcome: dict[str, Any]) -> None:
+    def _office_turn_end(self, session, key: str | None, outcome: dict[str, Any]) -> None:
         """The turn's end on the board: `working` with the tool it handed the client, `idle` after an answer, `error`
-        after a backend failure. Only tool NAMES are read from the reply, never their input or any text."""
+        after a backend failure. Only tool NAMES are read from the reply, never their input or any text. Skipped once
+        the conversation's backend has exited (Registry.office_turn_end)."""
         if not key:
             return
         try:
             tags = getattr(self, "_office_tags", None) or {}
-            board = self.server.registry.office
+            reg = self.server.registry
             if "turn" in outcome:
                 blocks = outcome["turn"][0] or []
                 tools = [b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
                 if tools:
-                    board.turn_end(key, tags, status="working", tool=tools[-1])
+                    reg.office_turn_end(session, key, tags, status="working", tool=tools[-1])
                 else:
-                    board.turn_end(key, tags, status="idle")
+                    reg.office_turn_end(session, key, tags, status="idle")
             elif "error" in outcome:
-                board.turn_end(key, tags, status="error")
+                reg.office_turn_end(session, key, tags, status="error")
             # busy / stale: another request on the conversation holds it and is still working; nothing changes
         except Exception as exc:
             logger.warning("office: turn end bookkeeping failed: %s", type(exc).__name__)
