@@ -23,6 +23,11 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
   `install.sh funnel-on` refuses conflicting configuration and records ownership; `funnel-off` removes only after
   verifying the exact owned handler. An optional exact public Host is supplied at plist generation through
   `CORTADOS_BOT_ALLOWED_HOST` (the bare hostname, no `:port`, since Funnel is on 443); no tailnet name or address is committed.
+  Migrating an install that used port 8443 (its ownership record reads `8443 /mcp ...`; `funnel-on` refuses while it
+  exists), in order: (1) `install.sh funnel-off`, which recognises the legacy record and removes exactly the owned
+  8443 `/mcp` handler, refusing on any non-owned handler; (2) move any private Serve off 443 (for example to 8444);
+  (3) regenerate and reload the plist (`plist`, `unload`, `load`) with `CORTADOS_BOT_ALLOWED_HOST` set to the bare
+  hostname; (4) `install.sh funnel-on`.
 - The system prompt to paste into Grok Bot is [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md) (ticket B10).
 
 **Phase 1 built** (`cortados_router/bot_gateway.py`, tests `tests/test_bot_gateway.py`):

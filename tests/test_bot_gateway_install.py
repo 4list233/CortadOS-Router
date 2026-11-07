@@ -521,6 +521,101 @@ exec /usr/bin/python3 "$@"
         self.assertFalse(self.ts_calls.exists())
 
 
+    def test_owned_443_record_with_conflicting_listener_refused_without_mutation(self):
+        # Valid 443 ownership, so funnel-off reaches configuration validation and must refuse there.
+        other = {"/other": {"Proxy": "http://127.0.0.1:9000"}}
+        mine = {"/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}
+        for handlers, allow in ((other, True), (other, None), (dict(other, **mine), True)):
+            for pending in (False, True):
+                with self.subTest(handlers=handlers, allow=allow, pending=pending):
+                    cfg = {"TCP": {"443": {"HTTPS": True}},
+                           "Web": {"public.example:443": {"Handlers": handlers}}}
+                    if allow:
+                        cfg["AllowFunnel"] = {"public.example:443": True}
+                    self.state.write_text(json.dumps(cfg))
+                    self.marker(pending=pending)
+                    r = self.run_sh("funnel-off")
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn("not exactly ours", r.stderr)
+                    self.assertFalse(self.ts_calls.exists())
+                    self.assertTrue(self.owner.exists())
+
+    def legacy(self, pending=False):
+        legacy = self.expected.replace("443", "8443", 1)
+        self.owner.parent.mkdir(exist_ok=True)
+        self.owner.write_text(("pending " if pending else "") + legacy)
+        self.owner.chmod(0o600)
+        self.legacy_ours = {"TCP": {"8443": {"HTTPS": True}},
+                            "Web": {"public.example:8443": {"Handlers": {
+                                "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}},
+                            "AllowFunnel": {"public.example:8443": True}}
+        self._fake("tailscale", f"""if [ "$1 $2 $3" = "funnel status --json" ]; then
+  /bin/cat {self.state}; exit 0
+fi
+echo "$*" >> {self.ts_calls}
+case "$*" in
+  "funnel --https=8443 --set-path /mcp off") printf '{{}}' > {self.state};;
+esac
+""")
+        return legacy
+
+    def test_legacy_8443_record_blocks_funnel_on_with_migration_hint(self):
+        legacy = self.legacy()
+        self.state.write_text(json.dumps(self.legacy_ours))
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("legacy Funnel ownership record", r.stderr)
+        self.assertIn("funnel-off", r.stderr)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(self.owner.read_text(), legacy)
+
+    def test_legacy_8443_record_funnel_off_removes_exactly_owned_handler(self):
+        self.legacy()
+        self.state.write_text(json.dumps(self.legacy_ours))
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ts_calls.read_text().splitlines(), ["funnel --https=8443 --set-path /mcp off"])
+        self.assertFalse(self.owner.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+        # After migration, funnel-on proceeds on 443.
+        self.fake_tailscale_443()
+        r = self.run_sh("funnel-on")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.owner.read_text(), self.expected)
+
+    def test_legacy_8443_pending_record_with_empty_listener_cleans_without_mutation(self):
+        self.legacy(pending=True)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
+
+    def test_legacy_8443_record_with_conflicting_listener_refused_without_mutation(self):
+        mixed = {"Handlers": {"/other": {"Proxy": "http://127.0.0.1:9000"},
+                              "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                legacy = self.legacy(pending=pending)
+                self.state.write_text(json.dumps(dict(self.legacy_ours, Web={"public.example:8443": mixed})))
+                r = self.run_sh("funnel-off")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("not exactly ours", r.stderr)
+                self.assertFalse(self.ts_calls.exists())
+                self.assertEqual(self.owner.read_text(), ("pending " if pending else "") + legacy)
+
+    def fake_tailscale_443(self):
+        if self.ts_calls.exists():
+            self.ts_calls.unlink()
+        self._fake("tailscale", f"""if [ "$1 $2 $3" = "funnel status --json" ]; then
+  /bin/cat {self.state}; exit 0
+fi
+echo "$*" >> {self.ts_calls}
+case "$*" in
+  "funnel --bg --https=443 --set-path /mcp http://127.0.0.1:8434/mcp")
+    printf '%s' '{json.dumps(self.ours)}' > {self.state};;
+esac
+""")
+
 class LaunchctlTest(InstallerHarness):
     def test_load_status_unload(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
