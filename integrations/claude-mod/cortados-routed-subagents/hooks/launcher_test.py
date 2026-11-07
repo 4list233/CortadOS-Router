@@ -1,5 +1,5 @@
 # Real macOS /bin/sh watchdog regressions. Run: python3 -I launcher_test.py MODE
-# MODE: timeout, early, capture, identity, immediate, census-fail, ledger-fail, sweep, uuid-fail.
+# MODE: timeout, early, capture, identity, immediate, census-fail, ledger-fail, sweep, sweep-read-fail, uuid-fail.
 # Only stdlib, fake children and throwaway state; never launches a provider.
 
 import json, os, pathlib, signal, subprocess, sys, tempfile, time
@@ -17,7 +17,63 @@ launcher = launcher.replace('${BG_REAP_SH}', reaper).replace('${shQuote(BG_SUPER
 launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n').replace(r'\\A', r'\A').replace(r'\\z', r'\z')
 sweep = source.split('export const BG_SWEEP_SH = String.raw`', 1)[1].split('\n`', 1)[0]
 mode = sys.argv[1]
-assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail', 'sweep', 'uuid-fail')
+assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail', 'sweep', 'sweep-read-fail', 'uuid-fail')
+if mode == 'sweep-read-fail':
+    import errno
+    # Inject syscall results, not the error handling: deterministic even when run with elevated permissions.
+    # Each run contains a proven ledger member and an unrelated live process; neither may be signalled.
+    with tempfile.TemporaryDirectory(prefix='route-bg-read-') as tmp:
+        children = [subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)'],
+                                     start_new_session=True) for _ in range(2)]
+        try:
+            d = pathlib.Path(tmp) / 'cortados-bg.readfail'; d.mkdir()
+            (d / 'owner-v1').touch()
+            (d / 'exit').write_text('0')
+            p = children[0]
+            start = subprocess.check_output(['ps', '-p', str(p.pid), '-o', 'lstart='], text=True).strip()
+            (d / 'processes').write_text(f'{p.pid}\t{p.pid}\t{start}\n')
+            # No marker metadata: ledger recovery must not silently disappear.
+            sites = {
+                'stat': ('lstat($p)', '()'),
+                'open': ('open my $f, "<", $p', '0'),
+                'read': ('sysread($f, my $chunk, 8192)', 'undef'),
+            }
+            for filename in ('processes', 'exit'):
+                for stage, (call, failure) in sites.items():
+                    for error in ((errno.EACCES, errno.EIO, errno.ENOENT) if stage != 'read' else (errno.EACCES, errno.EIO)):
+                        assert sweep.count(call) == 1
+                        # Keep lexical declarations in scope when injecting open/read failures.
+                        injected = sweep
+                        if stage == 'open':
+                            injected = injected.replace('open my $f, "<", $p', 'open $f, "<", $p')
+                            injected = injected.replace('  open $f', '  my $f;\n  open $f')
+                            callsite = 'open $f, "<", $p'
+                        elif stage == 'read':
+                            injected = injected.replace('sysread($f, my $chunk, 8192)', 'sysread($f, $chunk, 8192)')
+                            injected = injected.replace('    my $n =', '    my $chunk;\n    my $n =')
+                            callsite = 'sysread($f, $chunk, 8192)'
+                        else:
+                            callsite = call
+                        replacement = f'($p =~ m{{/{filename}$}} ? do {{ $! = {error}; {failure} }} : {callsite})'
+                        injected = injected.replace(callsite, replacement)
+                        result = subprocess.run(['/bin/sh', '-c', injected],
+                                                env={'PATH': '/usr/bin:/bin', 'TMPDIR': tmp},
+                                                capture_output=True, text=True, timeout=5)
+                        if error == errno.ENOENT:
+                            assert result.returncode == 0, (filename, stage, error)
+                            assert not result.stderr, 'absent optional metadata reported as a failure'
+                        else:
+                            assert result.returncode != 0, (filename, stage, error)
+                            assert result.stderr == f'sweep metadata {stage} failed\n', (filename, stage, error)
+                        assert not result.stdout, 'metadata leaked to stdout'
+                        assert all(p.poll() is None for p in children), 'metadata failure caused a signal'
+                        assert not (d / 'sweep.log').exists(), 'metadata failure attempted a signal'
+        finally:
+            for p in children:
+                if p.poll() is None: p.kill()
+                p.wait()
+    print('sweep-read-fail: 12 stat/open/read errors reported, 4 optional ENOENT cases accepted; no collateral signals')
+    sys.exit(0)
 if mode == 'uuid-fail':
     import uuid
     # Each command must be checked, even when the other succeeds; validate successful but malformed output too.

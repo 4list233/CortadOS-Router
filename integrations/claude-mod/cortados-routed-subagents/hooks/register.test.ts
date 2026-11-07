@@ -42,6 +42,29 @@ test('background sweep reports nonzero process exit as failure', async () => {
   expect(failed).toBe(true)
 })
 
+test('periodic sweep reports metadata helper failure without forwarding subprocess output', async () => {
+  let start: any
+  register(((event: string, handler: any) => {
+    if (event === 'session.start') start = handler
+    return { catch() {} }
+  }) as any, { orchestratorMode: false } as any)
+  const logs: string[] = []
+  const $ = {
+    process: { run: async () => ({
+      exitCode: 5, stdout: 'private-metadata-fixture', stderr: 'private-metadata-fixture',
+    }) },
+    ui: { log: (text: string) => { logs.push(text) } },
+    clock: { sleep: () => new Promise(() => {}) },
+    command: { register: async () => {} },
+  }
+  await start($, {}, async () => 'started')
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(logs.length).toBe(1)
+  expect(logs[0]).toMatch(/background sweep/)
+  expect(logs[0].includes('private-metadata-fixture')).toBe(false)
+})
+
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
 /** Split ANTHROPIC_CUSTOM_HEADERS into the lines before the trailing run-id line, and the run id (asserted well-formed). */

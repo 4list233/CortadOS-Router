@@ -727,18 +727,33 @@ perl -e '
 use strict;
 use warnings;
 use Time::Local qw(timelocal);
+use Errno qw(ENOENT);
 $ENV{LC_ALL} = "C";
 my $base = $ENV{TMPDIR} || "/tmp";
 sub owned {
   my ($p, $dir) = @_;
   my @s = lstat($p);
+  die "sweep metadata stat failed\n" if !@s && $! != ENOENT;
   return @s && $s[4] == $< && !-l _ && ($dir ? -d _ : -f _);
 }
 sub readfile {
   my ($p) = @_;
   return "" unless owned($p, 0);
-  open my $f, "<", $p or return "";
-  local $/; return <$f> // "";
+  # Optional metadata may be absent, including a removal racing open. Other failures must not
+  # turn a finished run into a successful no-op. Never include paths, contents or OS error text.
+  open my $f, "<", $p or do {
+    return "" if $! == ENOENT;
+    die "sweep metadata open failed\n";
+  };
+  my $data = "";
+  while (1) {
+    my $n = sysread($f, my $chunk, 8192);
+    die "sweep metadata read failed\n" unless defined $n;
+    last if $n == 0;
+    $data .= $chunk;
+  }
+  close $f or die "sweep metadata close failed\n";
+  return $data;
 }
 sub start_epoch {
   my ($s) = @_;
