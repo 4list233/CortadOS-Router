@@ -53,6 +53,43 @@ The child starts with an empty MCP config (built-in tools only); the parent's MC
 | `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
 | `mainSessionGuard` | `true` | Warn-only nudge when the **main session** does substantive work itself (see **Main-session guard**). Never blocks. `/cortados-guard on\|off` overrides it. |
 
+## Foreground timeout: 60-minute request is host-blocked
+
+The `600000ms` in `$.process.run(...): aborted: still running after 600000ms` comes from the
+mod's `subagentTimeoutMs` default and `MAX_SUBAGENT_TIMEOUT_MS` clamp, both **600,000 ms (10 minutes)**.
+That clamp mirrors a **host maximum**, not just a mod policy. The newest installed plugin-authoring
+`claude-code.d.ts` inspected for this change (bundle `2.1.314/67f0f8d2d963c88ac59e2c543057bb17`)
+says “timeout 30 s by default, ten minutes at most” for `process.run` (lines 3621–3622).
+`ProcessRunInit.timeoutMs` also says the child is **killed and the call rejects** at timeout
+(lines 8271–8275). Raising only the mod constant or supplying `3600000` cannot enable an hour;
+configured values above the host maximum remain clamped. Existing timeout cleanup and partial-result
+handback are unchanged. No `foregroundTimeoutMs` option has been added.
+
+**Proposed follow-up — not implemented:** adapt the existing detached task runner in
+`cortados_router/child_tasks.py` (`start`, `status`/`wait`, `cancel`) for foreground Agent calls.
+Launch via a short host call with output redirected to private task files, then poll through bounded
+calls while keeping the Agent call pending. Use one overall foreground budget (including any retry),
+defaulting to 60 minutes with a documented 3-hour maximum. The existing detached runner's default is
+3 hours (`CHILD_MAX_S_DEFAULT`), not a hard maximum; the new foreground adapter must enforce its own cap.
+Before adopting that runner, preserve this mod's provider environment, tool/MCP isolation, review
+exclusions, run IDs, token scrubbing and result shape: the whole-task launcher's defaults differ.
+Timeout, cancellation and session teardown must cancel and reap the child/process group, even if
+polling stops; partial results must still be returned without native replay. Verify the host's outer
+hook lifetime/cancellation behavior before relying on a pending hour-long Agent call. This is a
+lifecycle change, not a timeout-setting change, and is intentionally left for a separately scoped build.
+
+## Tests
+
+From the repository root, run the mod's native test runner (no provider or real routed child required):
+
+```sh
+claude plugin test integrations/claude-mod/cortados-routed-subagents
+```
+
+Timeout regressions cover the default, a shorter configured budget, the exact host maximum, and
+clamping requested 60-minute and three-hour budgets to the host's 10-minute limit. These use a
+host-like validator; they do not claim an hour-long child was run.
+
 ## Orchestrator mode
 
 With `orchestratorMode` on (the default), the main session is directed to act as a **planning brain**: whatever

@@ -82,6 +82,9 @@ const FALLBACK: Cfg = {
 // The host API's own limit: Claude Code (seen in 2.1.314) validates $.process.run's timeoutMs as an integer in
 // 1..600000, and rejects anything outside it, so a routed subagent with a larger timeout fails to launch at all.
 // resolveTimeoutMs clamps into this range rather than passing an out-of-range value through.
+// Confirmed in the newest installed plugin-authoring types (2.1.314): ProcessRunInit.timeoutMs says
+// "ten minutes at most" and kills the child before rejecting. An hour needs a different execution path,
+// not a larger constant; see README's foreground timeout proposal.
 const MIN_SUBAGENT_TIMEOUT_MS = 1
 // A retry with less than this left cannot start `claude -p` and finish a turn; it would only fail on its own timeout.
 const MIN_RETRY_MS = 30_000

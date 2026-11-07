@@ -105,6 +105,11 @@ function hostLikeProcess(seen: { timeoutMs?: unknown }) {
 
 for (const [label, timeout, expected] of [
   ['the default timeout', undefined, 600_000],
+  ['a configured two-minute timeout', 120_000, 120_000],
+  ['the exact host maximum', 600_000, 600_000],
+  // A config-only increase cannot enable hour-long foreground work: the host still caps process.run.
+  ['a requested 60-minute timeout (host-clamped)', 3_600_000, 600_000],
+  ['a requested three-hour timeout (host-clamped)', 10_800_000, 600_000],
   ['a configured 1_800_000 (clamped)', 1_800_000, 600_000],
   ['a fractional timeout', 90_000.7, 90_000],
 ] as const) {
