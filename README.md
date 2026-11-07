@@ -33,6 +33,77 @@ The router is built to span machines on a private network (here, Tailscale). A w
 
 No model address is hardcoded. Devices live in `tables/s1-endpoints.json` (git-ignored; copy `tables/s1-endpoints.example.json`), so moving S1 to another machine is a one-line config change.
 
+## Studio capacity controller (experimental; NOT deployed)
+
+`cortados_router/studio_capacity.py` is a stdlib residency controller for a future
+Qwen3 8B Q4_K_M Studio deployment. **No routing, local pin admission, S1 job, or
+live configuration is changed.** Its status is an advisory ABI for a future
+`local_resources` reader; this branch does not connect that reader. Locals remain
+pin-only. Do not enable this service until Forest approves deployment.
+
+Policy (binary GiB):
+- Load only with no S1 heavy cycle/process and ≥16 GiB estimated reclaimable
+  memory continuously for 120 seconds (8 GiB model allowance + 8 GiB safety).
+- Unload immediately on an observed training/evaluation process, headroom <8 GiB
+  (host/S1 reserve), non-normal kernel memory pressure, or swap ≥4 GiB. The swap
+  ceiling tolerates the survey's existing ~1.84 GiB while conservatively shedding
+  excess pressure; it is not a measured optimum or a swap-growth detector.
+- Poll every 5 seconds. Missing/malformed measurements fail closed and attempt
+  unload. Restart resets the dwell. A process lock prevents duplicate controllers.
+- Memory = vm_stat free + inactive + speculative pages × reported page size.
+  memory_pressure -Q's percentage is diagnostic, **not** a byte budget.
+- Detect actual `nightly.sh` processes through `ps -axo pid=,stat=,command=`,
+  conservatively reserving the entire cycle including MLX/Laya preflight;
+  also recognize direct MLX LoRA, Laya training and evaluate.py. Stopped
+  processes count as busy. The idle overnight.py supervisor does not.
+  `s1/overnight.py:status_path` points at historical dashboard events, not a
+  trustworthy live heavy-phase lease, so it is deliberately not used.
+
+**Deployment blockers:** polling cannot unload *before* training starts without
+an S1 lease/ack handshake. That integration is NOT implemented here. Nor does
+this branch prevent a pinned inference request from reloading an unloaded model.
+A future gate must enforce fresh availability, one request at a time, exact
+model/context identity and 8K total context. Residency here is verified by exact
+Ollama model name, not a model provenance/context smoke test. No production-ready
+admission guarantee is claimed.
+
+### Status format (v1)
+
+An atomic mode-0600 JSON file contains `version:1`, Unix `sampled_at` and
+`expires_at` (15 seconds after sampling), `model`, `context_tokens:8192`,
+`available` (boolean), `model_loaded`, `action` (load/unload/hold), `reason`,
+and optional `inputs`/`unload_error`. Inputs contain training/eval flags,
+reclaimable/swap bytes and diagnostic pressure percentage. `model_loaded` is
+observational; failures may leave actual residency unknown. Consumers must
+require version 1, exact model, available=true and
+`sampled_at <= now < expires_at`; absent, malformed, future or expired snapshots
+are unavailable. Status is local metadata, not an HTTP endpoint. A controller
+crash leaves a snapshot to expire, not permission to infer.
+
+### Proposed installation — for Forest to approve later
+
+Nothing below has been executed on the Studio:
+1. Review/implement the lease and gate blockers above; profile the idle/training
+   peaks. Approve an existing/provenance-checked Q4_K_M 8B runtime named
+   `studio-qwen3-8b:latest`; no model is downloaded or created by this daemon.
+2. Configure Ollama loopback-only on 127.0.0.1:11434 with
+   `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`. The controller uses
+   only loopback /api/ps and /api/generate, disables HTTP proxies, preloads with
+   keep_alive=-1 and num_ctx=8192, and unloads with keep_alive=0. No pull API.
+3. Copy `integrations/studio-capacity/com.cortados.studio-capacity.plist.template`
+   to a temporary file; replace __HOME__ and __REPO__ with approved absolute
+   Studio paths and verify the Python path. Create the status/log parent
+   directories privately. Inspect with `plutil -lint` before installation.
+4. After explicit approval, copy the rendered file into
+   `~/Library/LaunchAgents/com.cortados.studio-capacity.plist`, then
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cortados.studio-capacity.plist`.
+   Roll back using `launchctl bootout` with the same domain/file. Bootout alone
+   does not prove the model unloaded; confirm release separately before training.
+
+Focused acceptance (all I/O faked; fixtures include a local Mac vm_stat capture):
+`python3 -B -m unittest tests.test_studio_capacity`.
+Full regression and independent review are not part of this time-boxed build.
+
 ## The 12 questions
 
 Six 0–3 rubric scores (anchors in `cortados_router/core.py → ANCHORS`):
