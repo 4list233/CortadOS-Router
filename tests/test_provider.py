@@ -4,6 +4,7 @@ The fake runs the real mcp_shim, so every bridged call crosses the same process 
 """
 import io
 import json
+import queue
 import os
 import sqlite3
 import subprocess
@@ -281,6 +282,55 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         d = mcp_shim._Dispatcher("gateway", "session", "token", workers=workers, max_pending=max_pending, clock=clock)
         return d, aborted
 
+    def test_stdin_reader_never_blocks_while_transport_abort_and_workers_hang(self):
+        # The reader only reads, timestamps and enqueues: a hanging _forward (transport down), a hanging _abort and a
+        # saturated pool (overflow) never delay a single timestamp.
+        hang = threading.Event()
+        self.addCleanup(hang.set)
+        d, _ = self._shim_dispatcher(lambda *_: hang.wait(30), lambda _l: None, 60.0, workers=2, max_pending=4)
+        p = mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: hang.wait(30))
+        p.start()
+        self.addCleanup(p.stop)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        inbox, written = queue.SimpleQueue(), []
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox), daemon=True).start()
+        for i in range(200):
+            written.append(time.monotonic())
+            writer.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {}}) + "\n")
+            writer.flush()
+            item = inbox.get(timeout=2)            # consumed and submitted like main(): overflow fails closed here
+            d.submit(i, {}, item[0])
+            self.assertLess(item[0] - written[-1], 0.5)
+        writer.close()
+        self.assertIs(inbox.get(timeout=2), mcp_shim._EOF)
+        self.assertEqual(self._owner_kills, [1])
+
+    def test_scaled_transport_down_fails_closed_before_the_cli_timeout(self):
+        # Scaled budgets: deadline 0.2 s, CLI timeout 0.2 + margin 0.3 s. Transport hangs; the shim must kill the
+        # owner (fail closed) well before a simulated CLI timer started when the request was written.
+        hang, killed = threading.Event(), threading.Event()
+        self.addCleanup(hang.set)
+        d, _ = self._shim_dispatcher(lambda *_: hang.wait(30), lambda _l: None, 0.2)
+        p = mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: killed.set())
+        p.start()
+        self.addCleanup(p.stop)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        inbox = queue.SimpleQueue()
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox), daemon=True).start()
+        cli_sent = time.monotonic()
+        writer.write("{}\n")
+        writer.flush()
+        received, _ = inbox.get(timeout=2)
+        time.sleep(0.1)                             # processing delay after the read does not move the deadline
+        d.submit(1, {}, received)
+        self.assertTrue(killed.wait(2))
+        self.assertLess(time.monotonic(), cli_sent + 0.2 + 0.3)
+
     def test_queued_shim_call_keeps_its_submission_deadline(self):
         # Two calls, one worker. The second call's deadline includes its queue time: it expires closed while the
         # first still holds the worker, and once the session failed closed nothing at all is written.
@@ -341,8 +391,8 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         for mid in (1, 2):
             d.submit(mid, {"name": "n"})
         self.assertFalse(aborted.is_set())
-        d.submit(3, {"name": "n"})
-        self.assertTrue(aborted.is_set())
+        d.submit(3, {"name": "n"})          # returns at once: the deadline thread fails closed
+        self.assertTrue(aborted.wait(2))
         release.set()
         time.sleep(0.05)
         self.assertEqual(lines, [])
