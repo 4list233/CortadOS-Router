@@ -14,7 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
-import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +41,20 @@ STATUS_TTL_SECONDS = 15
 # Survey recommendation: bounded 8K runtime, not existing 64K/128K tag defaults.
 CONTEXT = 8192
 MODEL = "studio-qwen3-8b:latest"
+# Bounded residency lease: Ollama itself evicts the model this many seconds
+# after the last renewal, so a crashed, killed or wedged controller cannot pin
+# RAM for longer than this. Renewed only after a fresh, safe observation.
+LEASE_SECONDS = 180
+# An observation older than one poll interval no longer describes the host;
+# it must never justify loading or renewing (training may have started).
+MAX_OBSERVATION_AGE_SECONDS = POLL_SECONDS
+# Each local probe (vm_stat, ps, sysctl) finishes in milliseconds; 2 s bounds a
+# wedged probe so five probes cannot exceed STATUS_TTL_SECONDS on their own.
+COMMAND_TIMEOUT_SECONDS = 2
+# Loopback Ollama management calls (ps, keep_alive changes) are sub-second;
+# a cold load of an 8B model from disk can take a few seconds. 10 s bounds a
+# hung daemon; the stale-observation check covers whatever this delays.
+HTTP_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -101,11 +115,38 @@ def parse_swap(text):
     return int(float(match[1]) * 1024 ** ("KMGT".index(match[2]) + 1))
 
 
+_VALUE_FLAGS = {"-W", "-X", "-Q"}
+
+
+def _script(tokens):
+    """First positional argument after an interpreter, skipping its flags.
+
+    ps prints the space-joined argv, not shell-quoted words, so tokens are a
+    plain whitespace split; quoting can never be recovered and is not assumed.
+    """
+    rest = tokens[1:]
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token in ("-m", "-c"):
+            return None
+        if token in _VALUE_FLAGS:
+            i += 2
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return Path(token).name
+    return None
+
+
 def parse_processes(text):
     """ps -axo pid=,stat=,command=. Never exclude T (SIGSTOP) processes.
 
     nightly.sh covers all preflight/MLX/Laya/evaluation phases, unlike the
     dashboard status file which records historical events, not a live lease.
+    Matching is deliberately conservative: a false positive only sheds the
+    local model, a false negative lets it contend with S1.
     """
     if not text.strip():
         raise ValueError("empty ps output cannot prove S1 idle")
@@ -114,26 +155,30 @@ def parse_processes(text):
         fields = line.strip().split(None, 2)
         if len(fields) != 3 or not fields[0].isdigit():
             raise ValueError("invalid ps record")
-        args = shlex.split(fields[2])
-        names = {Path(arg).name for arg in args}
+        raw = fields[2]
+        tokens = raw.split()
+        names = {Path(arg).name for arg in tokens}
         # Only executable/script positions: overnight.py carries nightly.sh as
         # a future command even while sleeping between cycles.
-        scripts = {Path(arg).name for arg in args[:2]}
-        if "nightly.sh" in scripts or ("mlx_lm" in names and "lora" in names):
+        scripts = {Path(tokens[0]).name, _script(tokens)}
+        if "nightly.sh" in scripts:
+            training = True
+        # Any mlx_lm use (python -m mlx_lm lora, mlx_lm.lora, mlx_lm in a -c
+        # source such as the nightly preflight's load()) is S1 model work.
+        if any("mlx_lm" in arg for arg in tokens) and (
+                "lora" in raw or "-c" in tokens or "load" in raw):
             training = True
         if "evaluate.py" in scripts:
             evaluation = True
         # Laya direct/manual runs, not just the nightly parent.
-        if any("laya" in arg for arg in args) and names & {"train.sh", "train.py", "convert.py"}:
-            training = True
-        # Include model-loading preflight invoked by nightly.sh if orphaned.
-        if "-c" in args and any("mlx_lm import load" in arg for arg in args):
+        if "laya" in raw and names & {"train.sh", "train.py", "convert.py"}:
             training = True
     return training, evaluation
 
 
 def command(argv):
-    return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=5).stdout
+    return subprocess.run(argv, check=True, capture_output=True, text=True,
+                          timeout=COMMAND_TIMEOUT_SECONDS).stdout
 
 
 def gather(run=command):
@@ -158,7 +203,7 @@ def ollama(path, payload=None):
     request = urllib.request.Request("http://127.0.0.1:11434" + path, data=data,
                                      headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=30) as response:
+    with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return json.load(response)
 
 
@@ -189,6 +234,19 @@ class Runner:
         self.model, self.collect, self.api, self.clock = model, collect, api, clock
         self.eligible_since = None
         self.last_sample_ts = None
+        # None = unknown. Shedding an unloaded model is skipped only when we
+        # know it is absent: a keep_alive request may itself page weights in.
+        self.maybe_loaded = None
+
+    def shed(self, result=None):
+        """Idempotent unload; Ollama keep_alive=0 releases residency now."""
+        try:
+            self.api("/api/generate", {"model": self.model, "stream": False, "keep_alive": 0})
+        except Exception as unload_error:
+            if result is not None:
+                result["unload_error"] = type(unload_error).__name__
+            return False
+        return True
 
     def tick(self):
         now = self.clock()
@@ -198,14 +256,22 @@ class Runner:
         self.last_sample_ts = now
         result = dict(version=1, sampled_at=now, expires_at=now + STATUS_TTL_SECONDS,
                       model=self.model, context_tokens=CONTEXT, available=False,
-                      model_loaded=False, action="unload", reason="unknown")
+                      model_loaded=False, action="unload", reason="unknown",
+                      lease_seconds=LEASE_SECONDS)
         try:
             inputs = self.collect()
             result["inputs"] = inputs
+            safe = (not inputs["training_active"] and not inputs["eval_active"]
+                    and inputs["free_reclaimable_bytes"] >= UNLOAD_BYTES
+                    and inputs["swap_used_bytes"] < MAX_SWAP_BYTES)
+            if not safe:
+                # Mandatory shedding first: never wait on a residency query.
+                self.eligible_since = None
+                if self.maybe_loaded and not self.shed(result):
+                    raise RuntimeError("unload failed")
             loaded = resident(self.api, self.model)
-            eligible = (not inputs["training_active"] and not inputs["eval_active"]
-                        and inputs["free_reclaimable_bytes"] >= LOAD_BYTES
-                        and inputs["swap_used_bytes"] < MAX_SWAP_BYTES)
+            self.maybe_loaded = loaded
+            eligible = safe and inputs["free_reclaimable_bytes"] >= LOAD_BYTES
             if not eligible:
                 self.eligible_since = None
             elif self.eligible_since is None or now < self.eligible_since:
@@ -214,32 +280,65 @@ class Runner:
                 "training_active", "eval_active", "free_reclaimable_bytes", "swap_used_bytes")},
                 model_loaded=loaded, last_change_ts=(now if self.eligible_since is None else self.eligible_since), now=now)
             result.update(action=decision.action, reason=decision.reason)
-            if decision.action != "hold":
-                payload = {"model": self.model, "stream": False,
-                           "keep_alive": 0 if decision.action == "unload" else -1}
+            renew = decision.action == "load" or (decision.action == "hold" and loaded and safe)
+            if renew and self.clock() - now > MAX_OBSERVATION_AGE_SECONDS:
+                # Training may have started since this observation was taken.
+                raise RuntimeError("stale observation")
+            if decision.action == "unload":
+                if not self.shed(result):
+                    raise RuntimeError("unload failed")
+            elif renew:
+                payload = {"model": self.model, "stream": False, "keep_alive": LEASE_SECONDS}
                 if decision.action == "load":
                     payload["options"] = {"num_ctx": CONTEXT}
+                self.maybe_loaded = True
                 self.api("/api/generate", payload)
+            if decision.action != "hold":
                 loaded = resident(self.api, self.model)
+                self.maybe_loaded = loaded
                 if loaded != (decision.action == "load"):
                     raise RuntimeError("Ollama did not confirm residency transition")
             result["model_loaded"] = loaded
-            result["available"] = (loaded and not inputs["training_active"]
-                                   and not inputs["eval_active"]
-                                   and inputs["free_reclaimable_bytes"] >= UNLOAD_BYTES
-                                   and inputs["swap_used_bytes"] < MAX_SWAP_BYTES)
+            result["available"] = loaded and safe
         except Exception as exc:
             self.eligible_since = None
             result.update(available=False, reason="fail closed: " + type(exc).__name__)
             # Even failed telemetry or residency queries must attempt shedding.
-            try:
-                self.api("/api/generate", {"model": self.model, "stream": False, "keep_alive": 0})
-            except Exception as unload_error:
-                result["unload_error"] = type(unload_error).__name__
-        # Slow HTTP work must not extend the snapshot's validity.
+            if self.maybe_loaded is not False:
+                self.shed(result)
+        # Slow control work must not extend the observation's validity: revoke
+        # status, restart the dwell, and shed rather than keep a stale lease.
         if self.clock() >= result["expires_at"]:
+            self.eligible_since = None
             result.update(available=False, reason="sample expired during control request")
+            if self.maybe_loaded is not False:
+                self.shed(result)
         return result
+
+
+def serve(runner, status_path, sleep=time.sleep, polls=None):
+    """Control loop. Any exit (SIGTERM, status-write failure, crash) unloads."""
+    count = 0
+    try:
+        while polls is None or count < polls:
+            write_status(status_path, runner.tick())
+            count += 1
+            sleep(POLL_SECONDS)
+    finally:
+        if runner.maybe_loaded is not False:
+            runner.shed()
+        try:
+            write_status(status_path, dict(version=1, sampled_at=runner.clock(),
+                                           expires_at=runner.clock(), model=runner.model,
+                                           available=False, model_loaded=False,
+                                           action="unload", reason="controller stopped"))
+        except Exception as exc:
+            print("studio_capacity: final status write failed: " + type(exc).__name__,
+                  file=sys.stderr)
+
+
+def _terminate(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 def main():
@@ -251,10 +350,10 @@ def main():
     # One residency owner; launchd restarts must not race another instance.
     with open(str(args.status) + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        runner = Runner(model=args.model)
-        while True:
-            write_status(args.status, runner.tick())
-            time.sleep(POLL_SECONDS)
+        # launchd stops jobs with SIGTERM; turn it into SystemExit so serve's
+        # finally releases residency instead of leaving the lease to expire.
+        signal.signal(signal.SIGTERM, _terminate)
+        serve(Runner(model=args.model), args.status)
 
 
 if __name__ == "__main__":

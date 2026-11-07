@@ -81,6 +81,12 @@ class ParsingTests(unittest.TestCase):
 
     def test_preflight_and_laya(self):
         self.assertTrue(c.parse_processes("123 S python -c \"from mlx_lm import load; load(123)\"")[0])
+        # Real ps output: argv joined by spaces, no quotes around -c source.
+        self.assertTrue(c.parse_processes("123 S /x/python3 -c from mlx_lm import load; load('/x/model')")[0])
+        self.assertTrue(c.parse_processes("123 S /x/python3 -u -m mlx_lm.lora --train")[0])
+        self.assertEqual(c.parse_processes("123 S /x/python3 -u -B /x/s1/evaluate.py --x"), (False, True))
+        self.assertEqual(c.parse_processes("123 S /x/python3 -W ignore evaluate.py"), (False, True))
+        self.assertEqual(c.parse_processes("9 S /bin/bash -x /x/s1/nightly.sh"), (True, False))
         self.assertTrue(c.parse_processes("123 T /x/laya/python /x/laya/train.py")[0])
 
 
@@ -141,7 +147,7 @@ class RunnerTests(unittest.TestCase):
     def test_failed_load_never_available(self):
         original = self.runner.api
         def refuse(path, payload=None):
-            if payload and payload["keep_alive"] == -1:
+            if payload and payload["keep_alive"] == c.LEASE_SECONDS:
                 raise OSError("load failed")
             return original(path, payload)
         self.runner.api = refuse
@@ -168,12 +174,74 @@ class RunnerTests(unittest.TestCase):
     def test_slow_control_expires_status(self):
         original = self.runner.api
         def slow(path, payload=None):
-            if payload:
+            if payload and payload["keep_alive"]:
                 self.now += 20
             return original(path, payload)
         self.runner.api = slow
         self.runner.tick()
         self.assertFalse(self.advance(120)["available"])
+        # Residency itself is revoked, not just the status flag.
+        self.assertFalse(self.loaded)
+        self.assertEqual(self.calls[-1][1]["keep_alive"], 0)
+
+    def test_stale_observation_never_loads(self):
+        collect = self.runner.collect
+        def slow_collect():
+            inputs = collect()
+            self.now += c.MAX_OBSERVATION_AGE_SECONDS + 1
+            return inputs
+        self.runner.tick()
+        self.advance(120)
+        self.runner.collect = slow_collect
+        self.now += 5
+        result = self.runner.tick()
+        self.assertFalse(result["available"])
+        self.assertFalse(self.loaded)
+        self.assertFalse(any(p and p["keep_alive"] for _, p in self.calls[-3:]))
+
+    def test_lease_bounded_and_renewed(self):
+        self.runner.tick()
+        self.advance(120)
+        leases = [p["keep_alive"] for _, p in self.calls if p]
+        self.assertTrue(leases)
+        self.assertTrue(all(k == c.LEASE_SECONDS for k in leases))
+        before = len(leases)
+        self.advance(5)
+        self.assertEqual(len([p for _, p in self.calls if p]), before + 1)
+        self.assertNotIn(-1, leases)
+
+    def test_training_sheds_before_residency_query(self):
+        self.runner.tick()
+        self.advance(120)
+        self.inputs["training_active"] = True
+        start = len(self.calls)
+        self.now += 5
+        self.runner.tick()
+        self.assertEqual(self.calls[start], ("/api/generate",
+                         {"model": c.MODEL, "stream": False, "keep_alive": 0}))
+        self.assertFalse(self.loaded)
+
+    def test_termination_unloads(self):
+        self.runner.tick()
+        self.advance(120)
+        self.assertTrue(self.loaded)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"capacity.json"
+            def sigterm(_):
+                raise SystemExit(143)
+            with self.assertRaises(SystemExit):
+                c.serve(self.runner, path, sleep=sigterm)
+            self.assertFalse(self.loaded)
+            self.assertFalse(json.loads(path.read_text())["available"])
+
+    def test_status_write_failure_unloads(self):
+        self.runner.tick()
+        self.advance(120)
+        self.assertTrue(self.loaded)
+        with patch.object(c, "write_status", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                c.serve(self.runner, Path("/nonexistent/x.json"), sleep=lambda _: None)
+        self.assertFalse(self.loaded)
 
     def test_clock_rollback_resets(self):
         self.runner.tick()

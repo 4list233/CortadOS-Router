@@ -105,7 +105,9 @@ Nothing below has been executed on the Studio:
 2. Configure Ollama loopback-only on 127.0.0.1:11434 with
    `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`. The controller uses
    only loopback /api/ps and /api/generate, disables HTTP proxies, preloads with
-   keep_alive=-1 and num_ctx=8192, and unloads with keep_alive=0. No pull API.
+   a bounded keep_alive lease of 180 s (renewed only after a fresh safe observation, so a
+   dead controller frees RAM within 3 minutes) and num_ctx=8192, and unloads with keep_alive=0
+   (also on SIGTERM or a status-write failure). No pull API.
 3. Copy `integrations/studio-capacity/com.cortados.studio-capacity.plist.template`
    to a temporary file; replace __HOME__ and __REPO__ with approved absolute
    Studio paths and verify the Python path. Create the status/log parent
