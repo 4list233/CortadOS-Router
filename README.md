@@ -8,9 +8,23 @@ It works in three steps:
 2. **Turn the answers into a requirement.** Hard rules and a band table turn the answers into a capability requirement: a required benchmark index for that kind of work, a band (R0–R4), and a sub-agent count.
 3. **Pick the cheapest capable route.** Every model reachable through a subscription qualifies if its use-case index clears the requirement. The winner is the cheapest, where cost comes from the model's burn on its quota pool and that pool's live scarcity.
 
+## Provider URL
+
+Keep one provider base URL per machine in `~/.config/cortados/provider-url`
+(for example `https://provider.example:8443`). Python clients resolve a non-empty
+`CORTADOS_PROVIDER_URL` first, then `CORTADOS_PROVIDER_URL_FILE`, then that default
+file. Whitespace and trailing slashes are stripped; missing, unreadable or invalid
+selected files fail clearly. Only HTTP(S) URLs with a host are accepted.
+Remove old per-client URL overrides to make moving the provider a one-file edit.
+The session's `--provider-url` and the Claude mod's explicit `providerUrl` remain
+overrides; leave them unset to use the shared file. Restart long-running clients
+after editing it. HTTPS uses each client's normal certificate verification.
+
 ## Two ways to use it
 
 **As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. A client can instead pin a model (`sub/<model>`, `api/<model>`; see the table below) and skip S1 entirely. See `docs/PROVIDER-PLAN.md`.
+
+Claude Code's WebSearch (a request whose only tool is the `web_search_*` server tool) is answered by a separate one-shot `claude -p` whose only tool is WebSearch, on a small Claude model; if that lane fails the model is told the search did not run. This is the one exception to "the headless CLI never runs a tool itself" (`cortados_router/provider/search_lane.py`, `docs/PROVIDER-PLAN.md` "Web search lane").
 
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
@@ -380,6 +394,19 @@ refused when on until local lanes are evaluated); an asleep or busy node fails t
 fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
+
+### Local models on the Pro
+
+The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.
+The switch defaults off: `python3 -B -m cortados_router.local_resources toggle on|off|status`
+(run with one of those three states). It uses `$CORTADOS_HOME/local-enabled` (default
+`~/.cortados/local-enabled`); status prints the switch, availability and reason.
+Unknown/failed `pmset -g ps` readings fail closed. Power is cached for at most 3 seconds;
+the switch is checked on every request, including again after body upload. Disabled requests
+return 503 without reaching Ollama. Fleet telemetry for node `pro` also includes this policy;
+its deployments are unavailable when the policy is disabled or unknown. This does not
+start/stop Ollama or unload resident models;
+existing in-flight inference is not cancelled. Other fit, busy and exclusion checks still apply.
 
 ## Delegating whole tasks from the Claude app
 

@@ -835,7 +835,7 @@ def main(argv=None) -> int:
                                                      "max_tasks_per_day": o.max_tasks_per_day,
                                                      "max_routes_per_day": o.max_routes_per_day},
                      enable_start_task=o.enable_start_task)
-    except GatewayError as exc:
+    except (GatewayError, subagent_mcp.ProviderURLError) as exc:
         sys.stderr.write(f"bot-gateway: refusing to start: {exc}\n")
         return 2
     srv = build_server(gw, o.host, o.port, o.allowed_host)

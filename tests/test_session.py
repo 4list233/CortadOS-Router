@@ -114,6 +114,14 @@ class SessionTests(unittest.TestCase):
         self.assertIn("--append-system-prompt", cmd)
         self.assertIn("MCP", cmd[cmd.index("--append-system-prompt") + 1])
 
+    def test_url_from_shared_https_file(self):
+        endpoint = os.path.join(self.tmp.name, "provider-url")
+        with open(endpoint, "w") as f:
+            f.write(" https://provider.example:8443/\n")
+        _, env, _ = self.prepare(["--token-file", self.tok],
+                                dict(self.base, CORTADOS_PROVIDER_URL_FILE=endpoint))
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://provider.example:8443")
+
     def test_url_from_env_and_extra_args(self):
         base = dict(self.base, CORTADOS_PROVIDER_URL="http://r.example")
         _, env, cmd = self.prepare(

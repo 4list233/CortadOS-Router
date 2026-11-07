@@ -34,7 +34,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `providerUrl` | `http://127.0.0.1:8432` | Provider base URL. Set to `http://<provider-host>:8432` for a remote provider. |
+| `providerUrl` | *(unset)* | Explicit override. Otherwise uses `CORTADOS_PROVIDER_URL`, then `CORTADOS_PROVIDER_URL_FILE` or `~/.config/cortados/provider-url`. HTTP and HTTPS supported; invalid configuration refuses routing. |
 | `providerTokenFile` | `~/.config/cortados/provider-token` | File holding `CORTADOS_PROVIDER_TOKEN`, read fresh at spawn time so the token is never stored in settings. `~` expands to `$HOME`. |
 | `providerToken` | *(unset)* | Optional inline token override. Prefer the file. |
 | `model` | `cortados` | Model id sent to the provider. `cortados` lets S1 route; a concrete id pins one lane. |

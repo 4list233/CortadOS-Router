@@ -19,7 +19,7 @@ Gateway flags are checked against the phase-1 allowlist (exact spellings, separa
 gateway's own argparse would expand (e.g. --enable-start-t) can get through.
 
 Every config failure exits 78 (EX_CONFIG) with a message that names a line NUMBER at most, never a line's content or
-the token. The gateway gets exactly HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (the three from the plist)
+the token. The gateway gets exactly HOME, a fixed PATH, CORTADOS_HOME, CORTADOS_PROVIDER_URL (resolved from the environment or shared URL file)
 and CORTADOS_PROVIDER_TOKEN; nothing else is inherited. The token goes in the environment only, never in argv.
 
 Run (by launchd): /usr/bin/python3 -I launch.py (--provider-env FILE | --provider-token-file FILE)
@@ -36,7 +36,7 @@ import unicodedata
 EX_CONFIG = 78
 TOKEN_NAME = "CORTADOS_PROVIDER_TOKEN"
 FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-FROM_PLIST = ("HOME", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL")   # required plist values; not secrets
+FROM_PLIST = ("HOME", "CORTADOS_HOME")   # required from plist/launchd; URL may come from the shared file
 OPTIONAL_FROM_PLIST = ("CORTADOS_BOT_ALLOWED_HOST",)                 # public hostname; omitted means no Host allowlist
 MAX_BYTES = 64 * 1024            # provider.env is a few lines; a bigger file is not one we wrote
 # Phase-1 gateway flags, exact spellings: flag -> takes a value. Anything else (notably --enable-start-task or any
@@ -174,8 +174,14 @@ def build(argv, environ) -> tuple:
     for k in OPTIONAL_FROM_PLIST:
         if environ.get(k):
             env[k] = environ[k]
-    if not env["CORTADOS_PROVIDER_URL"].startswith("http://"):
-        raise ConfigError("CORTADOS_PROVIDER_URL is not an http:// URL")
+    # -I omits the checkout from sys.path; add only this launcher's trusted repo.
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
+    try:
+        env["CORTADOS_PROVIDER_URL"] = resolve_provider_url(environ)
+    except ProviderURLError as exc:
+        raise ConfigError(str(exc)) from None
     return o.python, [o.python, *CHILD_OPTS, "-c", bootstrap(), *flags], env
 
 
