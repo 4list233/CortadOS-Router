@@ -449,21 +449,59 @@ class LedgerWrite(unittest.TestCase):
             self.assertEqual(w.stats(), {"queued": 0, "lost": usage_ledger.DROP_DETAIL_MAX + 5})
         self.assertTrue(any("5 rejected-row diagnostic detail(s) omitted" in msg for msg in logs.output))
 
+    def _provider_startup_failure(self, message):
+        from cortados_router.provider.server import Handler, ProviderServer, ThreadingHTTPServer
+        servers = []
+        activate = ThreadingHTTPServer.server_activate
+
+        def listening(server):
+            servers.append(server)
+            activate(server)                       # real bind/listen, no serving thread or requests
+
+        error = None
+        try:
+            with mock.patch.object(ThreadingHTTPServer, "server_activate", listening):
+                try:
+                    ProviderServer(("127.0.0.1", 0), None)
+                except RuntimeError as exc:
+                    error = exc
+            # Keep the traceback (and thus the partially constructed server) alive. assertRaises clears it and
+            # would allow garbage collection to hide the leaked listening socket.
+            self.assertIsInstance(error, RuntimeError)
+            self.assertRegex(str(error), message)
+            self.assertIsNotNone(error.__traceback__)
+            self.assertEqual(len(servers), 1)
+            self.assertEqual(servers[0].socket.fileno(), -1)
+            # Reuse the exact port immediately, without GC, sleeps, or a mocked socket constructor.
+            with ThreadingHTTPServer(servers[0].server_address, Handler) as retry:
+                self.assertEqual(retry.server_address, servers[0].server_address)
+            return error
+        finally:
+            for server in servers:
+                server.server_close()              # also clean up if the regression fails
+
     def test_supervisor_start_failure_aborts_provider_startup(self):
-        from cortados_router.provider.server import ProviderServer, ThreadingHTTPServer
         w = self._fresh(start=False)
         failure = RuntimeError("can't start new thread")
-        # No listening socket or real provider: retain the real constructor's ledger startup wiring.
-        with mock.patch.object(ThreadingHTTPServer, "__init__", return_value=None), \
-                mock.patch.object(threading.Thread, "start", side_effect=failure):
-            with self.assertRaisesRegex(RuntimeError, "supervisor thread did not start") as raised:
-                ProviderServer(("127.0.0.1", 0), None)
-        self.assertIs(raised.exception.__cause__, failure)
+        with mock.patch.object(threading.Thread, "start", side_effect=failure):
+            error = self._provider_startup_failure("supervisor thread did not start")
+        self.assertIs(error.__cause__, failure)
         self.assertIsNone(w.supervisor)
         self.assertIsNone(w.writer)
         # A caller may explicitly retry startup; the failed attempt did not publish a phantom supervisor.
         self.assertTrue(w.start())
         self._join_writer(w)
+
+    def test_closed_ledger_aborts_provider_startup_and_releases_socket(self):
+        w = self._fresh(start=False)
+        self.assertEqual(usage_ledger.shutdown(0), 0)
+        self.assertTrue(w.closed)
+        with mock.patch.object(threading.Thread, "start") as start_thread:
+            self._provider_startup_failure("ledger writer is shut down")
+        start_thread.assert_not_called()
+        self.assertIsNone(w.supervisor)
+        self.assertIsNone(w.writer)
+        self.assertEqual(w.stats(), {"queued": 0, "lost": 0})
 
     def test_a_locked_db_never_blocks_the_request_path_and_the_rows_land_once_it_frees(self):
         self._fresh()

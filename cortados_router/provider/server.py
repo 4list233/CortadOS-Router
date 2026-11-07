@@ -1848,10 +1848,16 @@ class ProviderServer(ThreadingHTTPServer):
 
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
-        self.registry = registry
-        # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
-        from cortados_router import usage_ledger
-        usage_ledger.start()
+        try:
+            self.registry = registry
+            # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
+            from cortados_router import usage_ledger
+            if not usage_ledger.start():
+                raise RuntimeError("usage ledger: the ledger writer is shut down; provider startup aborted")
+        except BaseException:
+            # The superclass already bound/listened. Release the port even if a caller retains our traceback.
+            self.server_close()
+            raise
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
