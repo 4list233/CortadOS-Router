@@ -70,13 +70,15 @@ INTENT_REFRESH_SECONDS = 60
 # unload, short enough that a nightly run is never held up meaningfully.
 ACK_WAIT_SECONDS = 30
 ACK_POLL_SECONDS = 0.5
-# Test-only overrides (defaults unchanged when unset): CORTADOS_STUDIO_ACK_WAIT
-# shortens the ack wait so the nightly harness does not spend 30 s per gated
-# step; CORTADOS_STUDIO_OLLAMA_PORT points the loopback management calls at
-# another local port (a closed one stands for "Ollama not running"). The host
-# stays 127.0.0.1 either way: residency control never leaves the machine.
+# CORTADOS_STUDIO_ACK_WAIT may only SHORTEN the ack wait (finite, within
+# [0, ACK_WAIT_SECONDS]); anything else is a configuration error and the gate
+# refuses. A NaN/inf wait would never time out and would hold the intent forever.
 ACK_WAIT_ENV = "CORTADOS_STUDIO_ACK_WAIT"
-OLLAMA_PORT_ENV = "CORTADOS_STUDIO_OLLAMA_PORT"
+# Residency checks always hit the real local Ollama. There is deliberately no
+# environment override: a redirected port that refuses connections reads as
+# "no model resident" and would authorize training beside a loaded model.
+# Tests inject a fake `api` into training_gate / Runner instead.
+OLLAMA_URL = "http://127.0.0.1:11434"
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")  # uuid4().hex, as training_gate writes it
 # Default status path is the one the LaunchAgent template passes via --status.
 DEFAULT_STATUS = Path.home() / "Library" / "Application Support" / "CortadOS" / "studio-capacity.json"
@@ -225,8 +227,7 @@ def gather(run=command):
 def ollama(path, payload=None):
     """Fixed loopback management only; never inherit an HTTP proxy or pull."""
     data = None if payload is None else json.dumps(payload).encode()
-    port = int(os.environ.get(OLLAMA_PORT_ENV) or 11434)
-    request = urllib.request.Request("http://127.0.0.1:%d" % port + path, data=data,
+    request = urllib.request.Request(OLLAMA_URL + path, data=data,
                                      headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
@@ -422,9 +423,15 @@ def live_intents(gate, now, alive=pid_alive):
 
 def _finite(value):
     # bool is an int subclass; json yields NaN/inf for NaN, Infinity and 1e999.
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError("non-finite or non-numeric timestamp")
-    return float(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("non-numeric timestamp")
+    try:
+        number = float(value)  # an int beyond float range (10**400) raises OverflowError
+    except OverflowError:
+        raise ValueError("timestamp out of float range") from None
+    if not math.isfinite(number):
+        raise ValueError("non-finite timestamp")
+    return number
 
 
 def _valid_intent(intent, now):
@@ -565,6 +572,21 @@ def _confirm_unloaded(api, model, log):
 GATE_REFUSED_EXIT = 75
 
 
+def ack_wait_from_env(raw):
+    """Unset/empty -> ACK_WAIT_SECONDS. Otherwise a finite number in
+    [0, ACK_WAIT_SECONDS]; anything else raises ValueError (gate refuses)."""
+    if raw is None or raw == "":
+        return float(ACK_WAIT_SECONDS)
+    try:
+        wait = float(raw)
+    except ValueError:
+        raise ValueError("%s=%r is not a number" % (ACK_WAIT_ENV, raw)) from None
+    if not math.isfinite(wait) or not 0 <= wait <= ACK_WAIT_SECONDS:
+        raise ValueError("%s=%r must be finite and within [0, %d] seconds"
+                         % (ACK_WAIT_ENV, raw, ACK_WAIT_SECONDS))
+    return wait
+
+
 def gate_main(argv):
     """`studio_capacity gate -- cmd ...`: run cmd under a training intent."""
     if argv[:1] == ["--"]:
@@ -572,9 +594,13 @@ def gate_main(argv):
     if not argv:
         print("usage: python -m cortados_router.studio_capacity gate -- <command> ...", file=sys.stderr)
         return 2
+    try:
+        wait = ack_wait_from_env(os.environ.get(ACK_WAIT_ENV))
+    except ValueError as exc:
+        print("studio gate configuration error: %s; refusing" % exc, file=sys.stderr)
+        return GATE_REFUSED_EXIT
     signal.signal(signal.SIGTERM, _terminate)
     try:
-        wait = float(os.environ.get(ACK_WAIT_ENV) or ACK_WAIT_SECONDS)
         gate = training_gate(wait_seconds=wait)
         gate.__enter__()
     except GateRefused as exc:

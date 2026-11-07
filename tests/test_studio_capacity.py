@@ -409,6 +409,21 @@ class HandshakeTests(unittest.TestCase):
                 c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1, alive=lambda p: True)
                 self.assertFalse(path.exists())
 
+    def test_huge_integer_timestamp_is_malformed_and_eventually_deleted(self):
+        self.gate.mkdir(parents=True, exist_ok=True)
+        for field in ("created_at", "expires_at"):
+            with self.subTest(field=field):
+                path = self.gate / ("intent-huge-%s.json" % field)
+                good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
+                path.write_text(json.dumps({**good, field: 10**400}))
+                with self.assertRaises(ValueError):
+                    c._valid_intent(json.loads(path.read_text()), self.now)
+                self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: True),
+                                 [dict(pid=None, nonce=None, expires_at=None)])
+                self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1,
+                                                alive=lambda p: True), [])
+                self.assertFalse(path.exists())
+
     def test_malformed_intent_fails_closed_until_ttl(self):
         self.gate.mkdir(parents=True)
         (self.gate / "intent-1-x.json").write_text("{bad")
@@ -509,3 +524,42 @@ class HandshakeTests(unittest.TestCase):
             time.sleep(0.1)
             self.assertTrue(intent_path.exists())
         self.assertFalse(intent_path.exists())
+
+
+class OllamaEndpointTests(unittest.TestCase):
+    def test_no_env_var_redirects_the_residency_check(self):
+        seen = []
+
+        class Opener:
+            def open(self, request, timeout):
+                seen.append(request.full_url)
+                raise urllib.error.URLError(ConnectionRefusedError())
+
+        env = {"CORTADOS_STUDIO_OLLAMA_PORT": "1", "OLLAMA_HOST": "127.0.0.1:1", "OLLAMA_PORT": "1",
+               "HTTP_PROXY": "http://127.0.0.1:1", "http_proxy": "http://127.0.0.1:1",
+               "CORTADOS_STUDIO_OLLAMA_URL": "http://127.0.0.1:1"}
+        with patch.dict(os.environ, env), patch.object(c.urllib.request, "build_opener", return_value=Opener()):
+            with self.assertRaises(urllib.error.URLError):
+                c.ollama("/api/ps")
+        self.assertEqual(seen, ["http://127.0.0.1:11434/api/ps"])
+        self.assertFalse(hasattr(c, "OLLAMA_PORT_ENV"))
+
+
+class AckWaitConfigTests(unittest.TestCase):
+    def test_valid_values(self):
+        self.assertEqual(c.ack_wait_from_env(None), c.ACK_WAIT_SECONDS)
+        self.assertEqual(c.ack_wait_from_env(""), c.ACK_WAIT_SECONDS)
+        self.assertEqual(c.ack_wait_from_env("0"), 0.0)
+        self.assertEqual(c.ack_wait_from_env(str(c.ACK_WAIT_SECONDS)), c.ACK_WAIT_SECONDS)
+
+    def test_invalid_values_refuse_before_running(self):
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity", "-1", "-0.5", str(c.ACK_WAIT_SECONDS + 1), "1e9",
+                    "abc", "5s", " "):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    c.ack_wait_from_env(raw)
+                with patch.dict(os.environ, {c.ACK_WAIT_ENV: raw}), \
+                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "call") as call:
+                    self.assertEqual(c.gate_main(["--", "true"]), c.GATE_REFUSED_EXIT)
+                gate.assert_not_called()
+                call.assert_not_called()

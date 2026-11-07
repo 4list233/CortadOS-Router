@@ -80,6 +80,15 @@ STUBS = {
 
 # stand-in for the mlx venv python: the base-model probe succeeds, `-m mlx_lm lora` writes a checkpoint, scripts run on python3
 FAKE_PY = """#!/bin/bash
+# Stub studio gate: nightly tests do not test the gate (test_studio_capacity does), and the real gate would
+# query the developer's Ollama. It runs the command, or refuses with 75 for the stage named in STUB_GATE_REFUSE.
+if [ "$1 $2 $3 $4" = "-B -m cortados_router.studio_capacity gate" ]; then
+  shift 4; [ "$1" = "--" ] && shift
+  case "${STUB_GATE_REFUSE:-}:$*" in
+    convert:*convert.py*|train:*train.sh*|eval:*evaluate.py*) echo "stub gate refused: $*" >&2; exit 75 ;;
+  esac
+  exec "$@"
+fi
 [ "$1" = "-c" ] && exit 0
 if [ "$1" = "-m" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--adapter-path" ] && out="$2"; shift; done
@@ -161,9 +170,6 @@ class NightlyEndToEnd(unittest.TestCase):
         self.env = {**keep, "HOME": str(home), "CORTADOS_NIGHTLY_SUPERVISED": "1", "CORTADOS_S1_PY": str(self.tmp / "fake-py"),
                     "CORTADOS_S1_GPU_SETTLE": "0", "CORTADOS_S1_EVAL_SETTLE": "0", "CORTADOS_ROUTER_REPO": str(self.tmp / "no-repo"),
                     "CORTADOS_HOME": str(self.tmp / "cortados-home"),
-                    # studio gate: no 30 s ack wait per gated step, and a closed loopback port as "Ollama not running"
-                    # so the harness never queries or unloads the developer's real Ollama
-                    "CORTADOS_STUDIO_ACK_WAIT": "0", "CORTADOS_STUDIO_OLLAMA_PORT": "1",
                     "CORTADOS_S1_EVAL_MINUTES": "0"}   # no wall-clock dependence; the deadline tests set it
         self.night = 0
 
@@ -228,6 +234,30 @@ PY
                     for pid in map(int, marker.read_text().split()):
                         with self.assertRaises(ProcessLookupError, msg=f"timer {pid} survived nightly exit"):
                             os.kill(pid, 0)
+
+    def test_laya_gate_refusal_at_each_stage_fails_the_night(self):
+        (self.s1 / "laya").mkdir()
+        (self.s1 / ".venv-laya/bin").mkdir(parents=True)
+        _exe(self.s1 / ".venv-laya/bin/python", "#!/bin/bash\necho \"venv $*\" >> \"$HOME/laya.log\"\nexit 0\n")
+        _exe(Path(self.env["HOME"]) / ".local/bin/sleep", '#!/bin/bash\n[ "$1" = 20 ] && exit 0\nexec /bin/sleep "$@"\n')
+        _exe(self.s1 / "laya/train.sh", '#!/bin/bash\necho train >> "$HOME/laya.log"\n'
+                                        'mkdir -p "$LAYA_RUN" && touch "$LAYA_RUN/model.safetensors"\n')
+        log_file = Path(self.env["HOME"]) / "laya.log"
+        for stage, ran, kept in (("convert", [], True), ("train", ["venv convert.py"], True),
+                                 ("eval", ["venv convert.py", "train"], False)):
+            with self.subTest(stage=stage):
+                log_file.unlink(missing_ok=True)
+                (self.s1 / "data/laya-tonight").touch()
+                (self.s1 / "data/laya-init").write_text("laya/runs/old/checkpoint_latest\n")
+                rc, log, _ = self.run_night(STUB_NEW_LABELS=1, STUB_GATE_REFUSE=stage, CORTADOS_S1_NOW="0700")
+                self.assertEqual(rc, 1, log)
+                self.assertIn("studio gate refused laya %s" % stage, log)
+                lines = log_file.read_text().split("\n")[:-1] if log_file.exists() else []
+                self.assertEqual(lines, ran, log)
+                self.assertEqual((self.s1 / "data/laya-tonight").exists(), kept, log)
+                self.assertEqual((self.s1 / "data/laya-init").exists(), kept, log)
+                (self.s1 / "data/laya-tonight").unlink(missing_ok=True)
+                (self.s1 / "data/laya-init").unlink(missing_ok=True)
 
     def status(self):
         return json.loads((self.s1 / "data/status.json").read_text())

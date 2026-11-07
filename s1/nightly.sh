@@ -611,16 +611,32 @@ if [ -f data/laya-tonight ]; then
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
   init=""; [ -f data/laya-init ] && init="$(cat data/laya-init)" && rm -f data/laya-init && [ -d "$init" ] && echo "laya: warm start from $init"
-  ( cd laya && gated ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ) ; lrc=$?
+  # Each gated stage's status is kept: 75 = the studio gate refused (the command did not run). A refusal is a nonzero night,
+  # and when training never started the one-shot flag (and warm-start pointer) is put back so the trial runs next night.
+  ( cd laya && gated ../.venv-laya/bin/python convert.py ); crc=$?; trc=0; erc=""; refused=""
+  if [ "$crc" -eq 0 ]; then
+    ( cd laya && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ); trc=$?
+  fi
+  lrc=$crc; [ "$crc" -eq 0 ] && lrc=$trc
   stop_deadline
   gpu_share; sleep 20
-  if [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
-    HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" gated .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN" \
-      && python3 -c "import json;r=json.load(open('$LRUN/report.json'));c=r['candidate'];print('laya holdout: band',c['band_accuracy'],'under',c['under_routed'],'over',c['over_routed'],'outward',c['outward_recall'],'| would promote:',r['promote'])"
+  if [ "$crc" -eq 75 ] || [ "$trc" -eq 75 ]; then
+    if [ "$crc" -eq 75 ]; then refused=convert; else refused=train; fi
+    touch data/laya-tonight; [ -n "$init" ] && printf '%s\n' "$init" > data/laya-init
+    echo "studio gate refused laya $refused (local model residency unconfirmed): laya flag kept for the next night"
+  elif [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
+    HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" gated .venv-laya/bin/python evaluate.py --engine laya --checkpoint "$LRUN" --out "$LRUN"; erc=$?
+    if [ "$erc" -eq 75 ]; then
+      refused=eval; echo "studio gate refused laya eval (local model residency unconfirmed): $LRUN trained but not evaluated"
+    elif [ "$erc" -eq 0 ]; then
+      python3 -c "import json;r=json.load(open('$LRUN/report.json'));c=r['candidate'];print('laya holdout: band',c['band_accuracy'],'under',c['under_routed'],'over',c['over_routed'],'outward',c['outward_recall'],'| would promote:',r['promote'])"
+    fi
   else
     echo "laya training failed (rc $lrc); see $LRUN/train.log"
   fi
-  echo "laya night: Qwen resume skipped tonight"; echo "=== $(date) nightly end"; exit 0
+  echo "laya night: Qwen resume skipped tonight"; echo "=== $(date) nightly end"
+  [ -z "$refused" ] || exit 1
+  exit 0
 fi
 HF_HUB_OFFLINE=1 gated "$PY" -c "from mlx_lm import load; load('$BASE')" >/dev/null 2>&1; prc=$?   # loads the base: gated
 if [ "$prc" -eq 75 ]; then
