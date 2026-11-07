@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from cortados_router.provider.mcp_shim import CALL_TIMEOUT_S, TOOL_WAIT_S
+
 BRIDGE_SERVER = "bridge"
 TOOL_PREFIX = f"mcp__{BRIDGE_SERVER}__"
 SHIM = Path(__file__).with_name("mcp_shim.py")
@@ -138,7 +140,8 @@ class BridgeSession:
                 (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": {BRIDGE_SERVER: {
                     "command": sys.executable,
                     "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
-                    "env": {"CORTADOS_PROVIDER_TOKEN": token}}}}))
+                    "env": {"CORTADOS_PROVIDER_TOKEN": token,
+                            "CORTADOS_PROVIDER_TOOL_WAIT_S": str(TOOL_WAIT_S)}}}}))
                 args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
                          "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
             else:
@@ -146,7 +149,7 @@ class BridgeSession:
             if model:
                 args += ["--model", model]
             env = claude_env(config_dir)
-            env["MCP_TOOL_TIMEOUT"] = str(3600 * 1000)      # matches mcp_shim.CALL_TIMEOUT_S
+            env["MCP_TOOL_TIMEOUT"] = str(int(CALL_TIMEOUT_S * 1000))  # same window as the shim
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)

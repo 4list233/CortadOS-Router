@@ -48,12 +48,19 @@ from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
+from cortados_router.provider.mcp_shim import TOOL_WAIT_S
 
 DEFAULT_PORT = 8432                                     # next to S1's 8431
 # A turn covers the model's thinking until it finishes or asks for a tool; long agentic turns run minutes.
 TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
-# A conversation the client has not touched for this long is closed; its CLI process holds memory and a login slot.
+# Completed conversations expire after 30 minutes: their CLI holds memory and a login slot.
 IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
+# Tool-wait sessions use at least TOOL_WAIT_S (default 3 h), not the ordinary idle TTL.
+# Bound held CLI processes and replay memory even if many clients abandon long-running tools. Refuse new
+# conversations at capacity rather than evicting a client still inside its promised tool-result window.
+MAX_SESSIONS = int(getenv("CORTADOS_PROVIDER_MAX_SESSIONS") or 128)
+if MAX_SESSIONS < 1:
+    raise ValueError("CORTADOS_PROVIDER_MAX_SESSIONS must be positive")
 # A conversation dropped because its backend FAILED leaves a tombstone, so the client's retry of the failed request,
 # or its next message on the same history, is told why instead of a misleading 409. A tombstone is keyed by the
 # conversation itself (Registry.failure_key: the wire, the calling client, the conversation identity the client sends
@@ -628,6 +635,7 @@ class Registry:
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
+        self._opening = 0                              # admission reservations: concurrent starts count toward cap
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
@@ -654,6 +662,20 @@ class Registry:
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
             scope: str | None = None, wire_path: str | None = None):
+        if keep:
+            with self._lock:
+                if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                    raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
+                self._opening += 1
+        try:
+            return self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
+        finally:
+            if keep:
+                with self._lock:
+                    self._opening -= 1
+
+    def _new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None,
+             scope: str | None, wire_path: str | None):
         provider = route["provider"] if route else "claude-cli"
         factory = self._factories.get(provider) or self._factories.get(_base_provider(provider))
         if factory is None and route and route.get("local") and provider.startswith(local_lane.LANE_PREFIX):
@@ -683,6 +705,7 @@ class Registry:
         s.scope = scope                             # conversation_scope of the request that opened it (failure())
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
+        s.awaiting_tool_result = False
         if keep:
             with self._lock:
                 self.sessions[s.id] = s
@@ -884,10 +907,19 @@ class Registry:
 
     def reap(self, idle_s: float) -> None:
         with self._lock:
-            stale = [s for s in self.sessions.values() if time.time() - s.last_used > idle_s and not s.lock.locked()]
-        for s in stale:
-            logger.info("closing idle conversation %s", s.id[:8])
-            self.drop(s, "reaped")
+            candidates = list(self.sessions.values())
+        for s in candidates:
+            # Own the turn lock through the decision and close: a continuation must not race a stale snapshot.
+            if not s.lock.acquire(blocking=False):
+                continue
+            try:
+                ttl = max(idle_s, TOOL_WAIT_S) if getattr(s, "awaiting_tool_result", False) else idle_s
+                if self.get(s.id) is s and time.time() - s.last_used > ttl:
+                    logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
+                                s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
+                    self.drop(s, "reaped")
+            finally:
+                s.lock.release()
 
 
 def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
@@ -896,6 +928,10 @@ def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     its serialized size passes REPLAY_MAX_BYTES (a replay is then a 409, as before), so idle sessions cannot pin
     large replies in memory. Called before the reply's fingerprint is appended, under the session lock."""
     blocks, stop, usage = result
+    # Start the client execution window when the reply is ready, not before a potentially long backend think.
+    # Independent of replay storage: even oversized tool replies must retain their waiting conversation.
+    session.last_used = time.time()
+    session.awaiting_tool_result = stop == "tool_use" or any(b.get("type") == "tool_use" for b in blocks)
     try:
         size, why = len(json.dumps([blocks, usage], default=str)), None
         if size > REPLAY_MAX_BYTES:
@@ -1116,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
         if s is None or not hasattr(s, "wait_result"):   # only the Claude bridge's MCP shim calls back over HTTP
             return self._json(200, {"result": {"content": [{"type": "text", "text": "cortados: session closed"}], "isError": True}})
         try:
-            result = s.wait_result(body["tool_use_id"], timeout=3600)
+            result = s.wait_result(body["tool_use_id"], timeout=TOOL_WAIT_S)
         except BridgeError as exc:
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}
         self._json(200, {"result": result})
@@ -1259,6 +1295,7 @@ class Handler(BaseHTTPRequestHandler):
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
             if outcome == "completed":
+                session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in reply)
                 session.history.append(anthropic_wire.reply_fingerprint(reply))
                 if route.get("route_id") and not session.route_logged and reg.executed:
                     try:

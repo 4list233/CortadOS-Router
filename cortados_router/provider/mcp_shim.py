@@ -13,9 +13,13 @@ import urllib.error
 import urllib.request
 
 PROTOCOL = "2025-06-18"
-# A call waits for the client to run the tool, which can include a human answering a permission prompt; one hour
-# matches the MCP_TOOL_TIMEOUT the bridge gives the CLI.
-CALL_TIMEOUT_S = 3600
+# Client tools include long test suites and permission prompts. Three hours covers the maximum task runtime;
+# finite expiry still releases abandoned calls. This value is also used by the registry and passed to the CLI.
+TOOL_WAIT_S = float(os.environ.get("CORTADOS_PROVIDER_TOOL_WAIT_S") or 10800)
+if not 0 < TOOL_WAIT_S < float("inf"):
+    raise ValueError("CORTADOS_PROVIDER_TOOL_WAIT_S must be positive and finite")
+# Transport slack lets the server return its timeout diagnostic before the shim/CLI abandon the call.
+CALL_TIMEOUT_S = TOOL_WAIT_S + 120
 
 
 def _reply(mid, result=None, error=None):

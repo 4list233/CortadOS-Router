@@ -31,6 +31,121 @@ READ_TOOL = {"name": "Read", "description": "Read a file", "input_schema": {
     "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
 
 
+class IdleLifetimeTests(unittest.TestCase):
+    """Fake wall clock: exercise real registry admission, reply tracking and expiry without a backend."""
+    def setUp(self):
+        from types import SimpleNamespace
+        self.now = 1000.0
+        self.clock = mock.patch.object(server.time, "time", side_effect=lambda: self.now)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.created = []
+        def factory(reg, **kw):
+            s = SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), last_used=self.now,
+                                history=[], close=mock.Mock())
+            self.created.append(s)
+            return s
+        self.reg = Registry(gateway_url="", token=TOKEN, session_factories={"claude-cli": factory})
+        self.turn = wire.parse_request({"messages": [{"role": "user", "content": "test"}]})
+
+    def reply(self, s, stop):
+        blocks = ([{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]
+                  if stop == "tool_use" else [{"type": "text", "text": "done"}])
+        server._remember_reply(s, self.turn, "msg", "cortados", (blocks, stop, {}))
+        s.history.append(wire.reply_fingerprint(blocks))
+
+    def test_tool_wait_survives_old_ttl_then_expires(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.now += 1801                    # backend thinking must not consume the client's window
+        self.reply(s, "tool_use")
+        finished = self.now
+        self.now += 1801
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        continuation = wire.ClientTurn("", [], [], {"t": {}}, history=list(s.history))
+        self.assertIs(self.reg.find(continuation), s)
+        self.now = finished + server.TOOL_WAIT_S
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.now += 1
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+        s.close.assert_called_once()
+
+    def test_end_turn_uses_old_ttl_including_after_tool_wait(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.reply(s, "tool_use")
+        self.now += 2000
+        self.reply(s, "end_turn")
+        self.now += 1800
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.now += 1
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_oversized_reply_still_gets_tool_window(self):
+        s = self.reg.new(self.turn, keep=True)
+        with mock.patch.object(server, "REPLAY_MAX_BYTES", 1):
+            self.reply(s, "tool_use")
+        self.assertIsNone(s.last_reply)
+        self.now += 1801
+        self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+
+    def test_busy_session_is_not_reaped(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.now += server.TOOL_WAIT_S + 1
+        with s.lock:
+            self.reg.reap(1800)
+        self.assertIs(self.reg.get(s.id), s)
+        self.reg.reap(1800)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_capacity_refuses_new_sessions_without_evicting_tool_waits(self):
+        with mock.patch.object(server, "MAX_SESSIONS", 2):
+            for _ in range(2):
+                self.reply(self.reg.new(self.turn, keep=True), "tool_use")
+            self.now += 1801
+            self.reg.reap(1800)
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 2)
+            self.assertEqual(len(self.created), 2)  # refusal must not even start an extra backend
+            self.assertTrue(all(not s.close.called for s in self.reg.sessions.values()))
+            self.now += server.TOOL_WAIT_S
+            self.reg.reap(1800)
+            self.assertEqual(len(self.reg.sessions), 0)
+            self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_concurrent_opening_counts_toward_cap_and_failure_releases_it(self):
+        factory = self.reg._factories["claude-cli"]
+        def overlapping(reg, **kw):
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                reg.new(self.turn, keep=True)
+            raise BridgeError("fake startup failure")
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            self.reg._factories["claude-cli"] = overlapping
+            with self.assertRaisesRegex(BridgeError, "fake startup"):
+                self.reg.new(self.turn, keep=True)
+            self.assertEqual(self.reg._opening, 0)
+            self.reg._factories["claude-cli"] = factory
+            self.reg.new(self.turn, keep=True)
+            self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_tool_window_is_configurable(self):
+        s = self.reg.new(self.turn, keep=True)
+        self.reply(s, "tool_use")
+        with mock.patch.object(server, "TOOL_WAIT_S", 20):
+            self.now += 21
+            self.reg.reap(10)
+        self.assertIsNone(self.reg.get(s.id))
+
+    def test_anthropic_keepalive_is_a_protocol_ping(self):
+        self.assertEqual(wire.sse_ping(), b'event: ping\ndata: {"type": "ping"}\n\n')
+
+
 class WireTests(unittest.TestCase):
     def test_cache_metadata_is_not_application_data_and_request_is_not_mutated(self):
         block = {"type": "tool_use", "input": {"cache_control": "application data"},
@@ -204,6 +319,16 @@ class EndpointHarness(unittest.TestCase):
 
 
 class EndpointTests(EndpointHarness):
+    def test_stream_sends_pings_while_backend_turn_is_running(self):
+        original = BridgeSession.run_turn
+        def slow(session, timeout):
+            time.sleep(0.06)
+            return original(session, timeout)
+        with mock.patch.object(server, "PING_S", 0.01), mock.patch.object(BridgeSession, "run_turn", slow):
+            raw = self.post({"stream": True, "messages": [{"role": "user", "content": "hello"}]})
+        self.assertIn('event: ping\ndata: {"type": "ping"}\n\n', raw)
+        self.assertIn("event: message_stop", raw)
+
     def test_client_cache_markers_are_removed_on_every_claude_path(self):
         def blocks(text):
             return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": "5m"}},
@@ -1533,7 +1658,7 @@ class FailedSessionTombstoneTests(EndpointHarness):
         history = [{"role": "user", "content": "hi"}]
         r1 = self.post({"tools": [READ_TOOL], "messages": history})
         [s] = self.reg.sessions.values()
-        s.last_used = time.time() - 10_000
+        s.last_used = time.time() - max(server.TOOL_WAIT_S, 10_000) - 1
         self.reg.reap(1)
         self.assertEqual((self.reg.sessions, dict(self.reg.tombstones)), ({}, {}))
         follow = history + [{"role": "assistant", "content": r1["content"]}, {"role": "user", "content": "more"}]

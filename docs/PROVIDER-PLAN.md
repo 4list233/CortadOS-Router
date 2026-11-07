@@ -18,6 +18,18 @@ its own tools; the chosen model only thinks.
 - Vendor terms: confirmed by Forest as compatible.
 - S1 keeps training nightly on the Studio (or this Mac), from the route log the endpoint writes.
 
+## Conversation lifetime and timeouts
+
+- `CORTADOS_PROVIDER_IDLE_S` (1800 s): reclaim completed, inactive conversations and their CLI resources.
+- `CORTADOS_PROVIDER_TOOL_WAIT_S` (10800 s / 3 h): replies requesting client tools retain their conversation
+  for at least this window from reply completion, or the ordinary idle TTL if longer. Abandoned tools still expire.
+  Claude bridge result waits use the same setting; shim HTTP and CLI MCP deadlines add 120 s for timeout delivery.
+- `CORTADOS_PROVIDER_MAX_SESSIONS` (128): bound held conversations/processes and their replay memory (at most
+  1 MiB of replay per session). New held conversations receive 503 at capacity; existing tool waits are not evicted.
+- `CORTADOS_PROVIDER_TURN_TIMEOUT_S` (1800 s): bounds one backend model turn, not execution of client tools.
+  Streaming turns already send Anthropic `ping` SSE events every 10 s. Non-streaming clients must allow the whole
+  backend turn in their own read timeout. Socket reads/writes are bounded at 120 s to release stalled connections.
+
 ## How the bridge works (verified 2026-10-20, Claude Code 2.1.304)
 
 ```
