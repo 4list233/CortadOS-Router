@@ -161,7 +161,7 @@ def _left(w: dict):
 
 
 
-def _account_verdict(reading: dict, model: str | None, age_s: float) -> tuple[bool, str]:
+def _account_verdict(reading: dict, model: str | None, age_s: float, lane: str = "") -> tuple[bool, str]:
     """Advisory: whether one account of the lane looks able to take a call. `age_s` is the reading's age NOW
     (provider-relative age at the fetch plus local time since it), so a cached snapshot keeps ageing. The binding check
     and the reservation are the provider's (cortados_router/provider/floor.py, on the account that executes, under
@@ -192,7 +192,7 @@ def _account_verdict(reading: dict, model: str | None, age_s: float) -> tuple[bo
         if not isinstance(left, (int, float)):
             return False, f"{w.get('window')}: no usage figure"
         # One call's assumed cost, scaled for a pool's smaller cap (quota.POOL_CAP_SCALE: Fable 2x), must stay above it.
-        per_call = quota.ASSUMED_PCT_PER_CALL * quota.POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
+        per_call = quota.assumed_pct_per_call(lane) * quota.POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
         if left - per_call < MIN_LEFT_PCT:
             return False, f"{w.get('window')}: {left:.0f}% left (one {per_call:g}% call would pass {MIN_LEFT_PCT:.0f}%)"
         reset = w.get("reset_epoch")
@@ -230,7 +230,7 @@ def admit(lane: str, model: str | None = None, now: float | None = None, urlopen
         # The reading's sample time on THIS machine's clock (provider clock skew cancels: age is provider-relative);
         # it stays the original sample time for the hold comparison, however long the snapshot is cached.
         sampled_local = local_at - fetch_age
-        ok, why = _account_verdict(reading, model, fetch_age + elapsed)
+        ok, why = _account_verdict(reading, model, fetch_age + elapsed, acct)
         if ok and hold_ts is not None and sampled_local <= hold_ts:
             ok, why = False, "held since a low/spent reveal or refusal; awaiting a usage reading sampled after it"
         reasons.append(f"{acct} {why}")

@@ -576,6 +576,18 @@ class QuotaTests(OutcomeCase):
     def _core(self, sc):
         return mock.Mock(_scarcity_module=lambda: sc)
 
+    def test_verdict_uses_shared_lane_cost_and_unknown_default(self):
+        for lane, cost in (("claude", 0.5), ("claude#b", 0.5), ("codex", 0.15),
+                           ("claude#new", 1.0), ("unknown", 1.0)):
+            for scale in (1.0, 2.0):
+                with self.subTest(lane=lane, scale=scale):
+                    w = dict(lane=lane, window="week", key="k", cap_scale=scale,
+                             used_pct=95 - 3 * cost * scale, elapsed_pct=100,
+                             projected_pct_at_reset=0, reset_epoch=10000)
+                    self.assertTrue(quota.verdict([w], {"k": 2}, now=0)[0])
+                    w["used_pct"] += 0.01
+                    self.assertFalse(quota.verdict([w], {"k": 2}, now=0)[0])
+
     def test_real_window_view_output_is_admitted_when_there_is_room(self):
         w = self._w(used=10, hours=24)
         self.assertIsInstance(w["reset_epoch"], float)
@@ -615,7 +627,7 @@ class QuotaTests(OutcomeCase):
         for sc in (FakeScarcity([self._w()], scarcity=None), FakeScarcity([self._w()], refusing=True)):
             self.assertFalse(quota.admit(self._core(sc), "claude", "m")[0])
 
-    def _near_stop(self, extra_pool=False, used=90.0):
+    def _near_stop(self, extra_pool=False, used=92.0):
         w = self._w(used=used, hours=1.5)                    # 1.5 h before a weekly reset: ~99 % of the window gone
         # windows[0] stays the binding weekly window; a healthy session window satisfies the required-windows check.
         return [w] + ([dict(w, pool="fable", used_pct=10.0, projected_pct_at_reset=10)] if extra_pool else []) + [self._sess()]
@@ -624,7 +636,7 @@ class QuotaTests(OutcomeCase):
     def _expected_calls(w):
         """How many calls fit by the producer's own pace formula (used / elapsed share)."""
         k = 0
-        while (w["used_pct"] + (k + 1) * quota.ASSUMED_PCT_PER_CALL) / max(w["elapsed_pct"] / 100, 0.05) <= quota.STOP_PROJECTED_PCT:
+        while (w["used_pct"] + (k + 1) * quota.assumed_pct_per_call("claude")) / max(w["elapsed_pct"] / 100, 0.05) <= quota.STOP_PROJECTED_PCT:
             k += 1
         return k
 
@@ -819,15 +831,15 @@ class ProviderBackendTests(OutcomeCase):
     def test_the_door_charges_a_fable_call_at_the_pool_scale(self):
         snap = _readings(claude=50)
         w = snap["readings"]["claude"]["windows"]
-        fable = {"window": "week (fable)", "pool": "fable", "used_pct": 93.0, "headroom_pct": 7.0,
+        fable = {"window": "week (fable)", "pool": "fable", "used_pct": 94.0, "headroom_pct": 6.0,
                  "reset_epoch": w[0]["reset_epoch"], "stale": False}
         w.append(fable)
         _set_resources(self.p, snap)
-        self.assertTrue(self.p.admit("claude", "claude-fable-5-1")[0])            # 7 - 2 = 5: admitted
-        fable.update(used_pct=93.5, headroom_pct=6.5)
+        self.assertTrue(self.p.admit("claude", "claude-fable-5-1")[0])            # 6 - 1 = 5: admitted
+        fable.update(used_pct=94.5, headroom_pct=5.5)
         _set_resources(self.p, snap)
-        ok, why = self.p.admit("claude", "claude-fable-5-1")                      # 6.5 - 2 < 5: held
-        self.assertFalse(ok); self.assertIn("2% call", why)
+        ok, why = self.p.admit("claude", "claude-fable-5-1")                      # 5.5 - 1 < 5: held
+        self.assertFalse(ok); self.assertIn("1% call", why)
 
     def test_a_carried_forward_low_model_pool_holds_an_absent_one_falls_back(self):
         snap = _readings(claude=50)

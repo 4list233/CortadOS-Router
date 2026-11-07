@@ -21,8 +21,8 @@ from outcome import store
 # higher risks Forest's own work hitting the cap before the reset.
 STOP_PROJECTED_PCT = 95.0
 # The stop rules shared with the provider's floor (one canonical copy, with their reasons): never in the last hour
-# before a reset, no reading older than an hour, 1 % assumed per call, in-flight horizon, Fable pool cost 2x.
-from cortados_router.provider.floor import (ASSUMED_PCT_PER_CALL, IN_FLIGHT_S, MAX_READING_AGE_S,  # noqa: E402
+# before a reset, no reading older than an hour, measured per-lane run costs, in-flight horizon, Fable pool cost 2x.
+from cortados_router.provider.floor import (assumed_pct_per_call, IN_FLIGHT_S, MAX_READING_AGE_S,  # noqa: E402
                                             POOL_CAP_SCALE, STOP_HOURS_BEFORE_RESET)
 LANES = ("claude", "codex")
 
@@ -91,9 +91,9 @@ def _confirmed_shared(lane: str, model: str | None) -> bool:
 # weekly passes ~48 %. Forest asserted a 50/50 split for his account (2026-10-25); set CORTADOS_FABLE_WEEKLY_SHARE=0.5 to
 # model Fable at that split (then Fable util == weekly util) at his own risk (Codex review 2026-10-25).
 FABLE_WEEKLY_SHARE = float(os.environ.get("CORTADOS_FABLE_WEEKLY_SHARE", "1.0"))
-# How much of ITS OWN cap one call consumes relative to the weekly budget, per separately-metered pool. A call is about
-# 1 % of the weekly budget (ASSUMED_PCT_PER_CALL); Fable's cap is HALF that budget, so the same call is ~2 % of Fable's
-# cap. Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
+# How much of ITS OWN cap one call consumes relative to the weekly budget, per separately-metered pool.
+# Fable's cap is HALF that budget, so the same run costs twice its lane's reserved weekly percentage.
+# Reservations against ANY Fable window — derived from the weekly window or measured from the panel — count at this
 # scale, so pending calls are not under-counted when the panel recovers before they appear in a sample (Codex review).
 
 
@@ -177,7 +177,7 @@ def _windows(sc, lane: str, model: str | None):
         # Reservation identity is STABLE across a pool's derived and measured readings (their window names differ):
         # pooled windows key on the pool, general windows on the window name (Codex review 2026-10-25).
         key = f"{lane}|pool|{wp}" if wp != "all" else f"{lane}|win|{w.get('window')}"
-        applicable.append(dict(w, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched, key=key,
+        applicable.append(dict(w, lane=lane, reset_epoch=_reset_epoch(w, fetched), observed_at=fetched, key=key,
                                cap_scale=w.get("cap_scale", POOL_CAP_SCALE.get(wp, 1.0))))
     if not applicable:
         return None, "no usage window applies"
@@ -196,10 +196,9 @@ def verdict(windows: list[dict], reserved: dict | None = None, now: float | None
         used, elapsed, reset = w.get("used_pct"), w.get("elapsed_pct"), w.get("reset_epoch")
         if not all(isinstance(x, (int, float)) for x in (used, elapsed, reset, w.get("projected_pct_at_reset"))):
             return False, f"window {w.get('window')} reading is incomplete"
-        # A call consumes cap_scale × ASSUMED_PCT_PER_CALL of THIS window's budget: for the derived Fable pool (cap_scale
-        # = 2 × share) one call is a larger slice of its half-sized cap than of the weekly budget, so reservations must be
-        # scaled too, not only the sampled usage — otherwise the pool can still be exhausted between samples (Codex review).
-        per_call = ASSUMED_PCT_PER_CALL * w.get("cap_scale", 1.0)
+        # Scale the canonical lane cost to THIS window's budget: Fable has half the weekly cap.
+        # Missing lane identity retains the conservative unmeasured default, never a cheap family guess.
+        per_call = assumed_pct_per_call(w.get("lane", "")) * w.get("cap_scale", 1.0)
         used = used + (reserved.get(w.get("key"), 0) + 1) * per_call
         projected = max(w["projected_pct_at_reset"], used / max(elapsed / 100.0, 0.05))
         hours = (reset - now) / 3600
