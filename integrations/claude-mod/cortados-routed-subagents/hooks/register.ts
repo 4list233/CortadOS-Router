@@ -882,6 +882,7 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
   try {
     const id = await officeIdentity($, office)
     if (!id.session) return                     // reported by officeIdentity; nothing can name this session's floor
+    const providerUrl = await resolveProviderUrl($, cfg.providerUrl)
     const token = await resolveToken($, cfg)
     if (!token) throw new Error('no provider token')
     let model: string | null = null
@@ -896,7 +897,7 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
     }
     const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
                                   tool: tool && validToolName(tool) ? tool : null })
-    const url = String(cfg.providerUrl).replace(/\/+$/, '') + '/v1/cortados/office/heartbeat'
+    const url = providerUrl + '/v1/cortados/office/heartbeat'
     timer = setTimeout(() => officeReport($, office, 'heartbeat', new Error('timeout')), OFFICE_BEAT_TIMEOUT_MS)
     const res: any = await $.http.fetch(url, { method: 'POST', body,
       headers: { 'content-type': 'application/json', 'x-api-key': token, Authorization: `Bearer ${token}` } })

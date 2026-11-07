@@ -925,14 +925,14 @@ test('the session tag is a salted hash, never the raw id', async () => {
 })
 
 /** The mod registered with a full host stand-in: the store, session id/root/model, hostname, clock and fetch. */
-function officeHarness(opts: { officeView?: boolean } = {}) {
+function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string } = {}) {
   const handlers: Record<string, any> = {}
   const on = (event: string, filterOrHandler: any, maybeHandler?: any) => {
     const key = maybeHandler ? `${event}:${filterOrHandler?.tool ?? filterOrHandler?.command ?? ''}` : event
     handlers[key] = maybeHandler ?? filterOrHandler
     return { catch() {} }
   }
-  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false, mainSessionGuard: false, ...opts } as any)
+  register(on as any, { providerToken: 'tok', providerUrl: opts.providerUrl ?? 'http://provider.test:8432', orchestratorMode: false, mainSessionGuard: false, ...opts } as any)
   const store: Record<string, unknown> = {}
   const beats: any[] = []
   const childHeaders: string[] = []
@@ -945,6 +945,7 @@ function officeHarness(opts: { officeView?: boolean } = {}) {
     process: {
       run: async (argv: string[], o: any) => {
         if (argv[0] === 'hostname') return { exitCode: 0, stdout: 'pro\n', stderr: '' }
+        if (argv[0] === 'sh') return { exitCode: 0, stdout: '\0\0/tmp/test-home', stderr: '' }
         childHeaders.push(String(o.env.ANTHROPIC_CUSTOM_HEADERS))
         return { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '', isStdoutTruncated: false }
       },
@@ -955,7 +956,7 @@ function officeHarness(opts: { officeView?: boolean } = {}) {
         return { status: 404, ok: false, headers: {}, text: '{}' }
       },
     },
-    fs: { read: async () => 'unused' },
+    fs: { read: async (path: string) => opts.fileUrl && path === '/tmp/test-home/.config/cortados/provider-url' ? opts.fileUrl : 'unused' },
     ui: { status() {}, toast() {}, log(m: string) { logs.push(m) } },
   }
   const settle = () => new Promise((r) => setTimeout(r, 0))
@@ -984,6 +985,13 @@ test('officeView off sends no tags and registers no heartbeat hooks', async () =
   expect(splitRunId(h.childHeaders[0]).base).toBe('x-cortados-reveal: 1')
   expect(h.handlers['turn.complete']).toBe(undefined)
   expect(h.handlers['session.end']).toBe(undefined)
+})
+
+test('file-only provider URL config also routes Office heartbeats', async () => {
+  const h = officeHarness({ providerUrl: '', fileUrl: ' https://file.example:8443/\n' })
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, async (e: any) => e)
+  await h.settle()
+  expect(h.beats[0].url).toBe('https://file.example:8443/v1/cortados/office/heartbeat')
 })
 
 test('heartbeats: tool names on the main loop, throttled, idle on turn end, ended on session end', async () => {
