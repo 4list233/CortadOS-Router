@@ -318,15 +318,44 @@ class PlistTest(InstallerHarness):
         doc = plistlib.loads(self.plist().read_bytes())
         self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_BOT_ALLOWED_HOST"], "gateway.example.test")
 
-    def test_funnel_commands_change_only_mcp_handler(self):
+    def test_funnel_reserved_port_preserves_unrelated_handlers_and_verifies_owner(self):
         calls = Path(self.tmp.name) / "tailscale.calls"
-        self._fake("tailscale", f'echo "$*" >> {calls}\n')
+        state = Path(self.tmp.name) / "funnel.json"
+        unrelated = ('{"TCP":{"443":{"HTTPS":true}},"Web":{"public.example:443":{"Handlers":'
+                     '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":{"public.example:443":true}}')
+        ours = ('{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":'
+                '{"public.example:443":{"Handlers":{"/other":{"Proxy":"http://127.0.0.1:9000"}}},'
+                '"public.example:8443":{"Handlers":{"/mcp":{"Proxy":"http://127.0.0.1:8434/mcp"}}}},'
+                '"AllowFunnel":{"public.example:443":true,"public.example:8443":true}}')
+        state.write_text(unrelated)
+        self._fake("tailscale", f'''echo "$*" >> {calls}
+if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; exit 0; fi
+case "$*" in
+  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp") printf '%s' '{ours}' > {state};;
+  "funnel --https=8443 --set-path /mcp off") printf '%s' '{unrelated}' > {state};;
+esac
+''')
         self.assertEqual(self.run_sh("funnel-on").returncode, 0)
+        owner = self.home / ".cortados" / "bot-gateway-funnel-owner"
+        self.assertTrue(owner.exists())
         self.assertEqual(self.run_sh("funnel-off").returncode, 0)
-        self.assertEqual(calls.read_text().splitlines(), [
-            "funnel --bg --set-path /mcp http://127.0.0.1:8434/mcp",
-            "funnel --set-path /mcp off",
+        self.assertFalse(owner.exists())
+        self.assertEqual(state.read_text(), unrelated)
+        commands = [line for line in calls.read_text().splitlines() if "status --json" not in line]
+        self.assertEqual(commands, [
+            "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp",
+            "funnel --https=8443 --set-path /mcp off",
         ])
+
+    def test_funnel_refuses_reserved_port_conflict_and_unowned_removal(self):
+        state = Path(self.tmp.name) / "funnel.json"
+        state.write_text('{"TCP":{"8443":{"HTTPS":true}},"Web":{"public.example:8443":{"Handlers":'
+                         '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":'
+                         '{"public.example:8443":true}}')
+        self._fake("tailscale", f'''if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; fi
+''')
+        self.assertNotEqual(self.run_sh("funnel-on").returncode, 0)
+        self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
@@ -355,6 +384,16 @@ class LaunchctlTest(InstallerHarness):
         self.assertIn(f"bootstrap gui/{uid} {self.plist()}", calls)
         self.assertIn(f"print gui/{uid}/com.cortados.bot-gateway", calls)
         self.assertEqual(calls.count(f"bootout gui/{uid}/com.cortados.bot-gateway"), 2)   # load's reset + unload
+
+    def test_status_uses_allowed_host_from_installed_plist(self):
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        self.run_sh("token")
+        self.assertEqual(self.run_sh("plist", extra_env={"CORTADOS_BOT_ALLOWED_HOST": "gateway.example.test"}).returncode, 0)
+        curl_calls = Path(self.tmp.name) / "curl.calls"
+        self._fake("curl", f'echo "$*" >> {curl_calls}\nprintf 401\n')
+        s = self.run_sh("status")
+        self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+        self.assertIn("-H Host: gateway.example.test", curl_calls.read_text())
 
     def test_status_never_prints_log_contents(self):
         log = self.home / ".cortados" / "bot-gateway.out"

@@ -89,7 +89,8 @@ AUTH_FAILURES = 5
 AUTH_WINDOW_S = 10 * 60
 # One minute is a short first lockout; repeated bursts double up to the one-hour operationally recoverable ceiling.
 AUTH_COOLDOWN_S, AUTH_COOLDOWN_MAX_S = 60, 60 * 60
-# Sixty failed tokens/minute bounds aggregate internet noise without ever applying the cap to a valid token.
+# Sixty failed tokens/minute is response signalling, not an aggregate admission limit: a valid credential is always
+# compared first so shared-egress attackers cannot lock it out. It makes widespread guessing visible/back off with 429.
 GLOBAL_AUTH_FAILURES = 60
 # 4096 addresses bounds memory under source-address churn while retaining far more than the expected bot population.
 MAX_AUTH_CLIENTS = 4096
@@ -112,7 +113,7 @@ def client_address(peer: str, forwarded: str = "") -> str:
 
 
 class AuthThrottle:
-    """In-memory failed-auth limiter. Callers check a client's active cooldown before comparing its token."""
+    """Bounded failed-auth response limiter; valid credentials deliberately bypass all cooldowns."""
 
     def __init__(self, clock=time.monotonic):
         self.clock, self.lock = clock, threading.Lock()
@@ -142,7 +143,13 @@ class AuthThrottle:
             state = self.clients.get(address)
             if state is None:
                 if len(self.clients) >= MAX_AUTH_CLIENTS:
-                    self.clients.popitem(last=False)
+                    # Source churn must not evict an active ban. Evict the oldest inactive entry; if every bounded
+                    # slot is actively banned, leave the new source untracked and use only aggregate 429 signalling.
+                    victim = next((key for key, value in self.clients.items()
+                                   if value["blocked_until"] <= now), None)
+                    if victim is None:
+                        return 60
+                    del self.clients[victim]
                 state = {"failures": collections.deque(), "cooldown": 0, "blocked_until": 0.0}
                 self.clients[address] = state
             self.clients.move_to_end(address)
@@ -696,14 +703,18 @@ def make_handler(gw: Gateway, allowed_hosts=(), clock=time.monotonic):
         def _client_addr(self):
             # Funnel is trusted only on loopback and appends the real client as the last XFF hop; earlier hops are
             # attacker-controlled. Invalid appended values fall back to the TCP peer rather than becoming log/state keys.
-            return client_address(self.client_address[0], self.headers.get("x-forwarded-for", ""))
+            headers = getattr(self, "headers", None)
+            forwarded = headers.get("x-forwarded-for", "") if headers is not None else ""
+            return client_address(self.client_address[0], forwarded)
 
         def log_message(self, fmt, *args):
             pass                                      # log_request below is the sole bounded, header-free access log
 
         def log_request(self, code="-", size="-"):
+            command = getattr(self, "command", "-")
+            path = getattr(self, "path", "-")
             sys.stderr.write("bot-gateway: %s %s %s %s\n" %
-                             (self.command, self.path.split("?")[0][:100], code, self._client_addr()))
+                             (command, path.split("?")[0][:100], code, self._client_addr()))
 
         def _send(self, code: int, obj, headers=()) -> None:
             body = json.dumps(obj).encode()
@@ -740,11 +751,13 @@ def make_handler(gw: Gateway, allowed_hosts=(), clock=time.monotonic):
             if self.path.split("?")[0] != "/mcp":
                 return self._send(404, {"error": "not found"})
             client = self._client_addr()
-            retry = throttle.blocked(client)
-            if retry is not None:
-                return self._send(429, {"error": "too many failed authentication attempts"},
-                                  (("Retry-After", str(retry)),))
+            # Compare first: clients sharing a Funnel egress address cannot lock a valid credential out. Cooldowns
+            # and the aggregate counter therefore limit only invalid responses, not token-comparison admission.
             if not gw.authorized(self.headers.get("authorization")):
+                retry = throttle.blocked(client)
+                if retry is not None:
+                    return self._send(429, {"error": "too many failed authentication attempts"},
+                                      (("Retry-After", str(retry)),))
                 retry = throttle.failed(client)
                 if retry is not None:
                     return self._send(429, {"error": "too many failed authentication attempts"},

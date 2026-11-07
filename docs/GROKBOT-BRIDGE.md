@@ -17,9 +17,10 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
   then every child is sent `permission_mode: "plan"` explicitly (an omitted mode would resolve to `auto`).
 - The gateway will run on the Air on port 8434; phase 1 only builds and tests it.
 - **Funnel exposure (owner decision 2026-11-06):** the installed gateway binds only
-  `127.0.0.1:8434`; Tailscale Funnel terminates public HTTPS and maps only `/mcp` to the local `/mcp`.
-  `install.sh funnel-on` adds that path handler and `funnel-off` removes only it. An optional exact public Host is
-  supplied at plist generation through `CORTADOS_BOT_ALLOWED_HOST`; no tailnet name or address is committed.
+  `127.0.0.1:8434`; Tailscale Funnel uses reserved public HTTPS port 8443 and maps `/mcp` to the local `/mcp`.
+  `install.sh funnel-on` refuses conflicting configuration and records ownership; `funnel-off` removes only after
+  verifying the exact owned handler. An optional exact public Host is supplied at plist generation through
+  `CORTADOS_BOT_ALLOWED_HOST`; no tailnet name or address is committed.
 - The system prompt to paste into Grok Bot is [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md) (ticket B10).
 
 **Phase 1 built** (`cortados_router/bot_gateway.py`, tests `tests/test_bot_gateway.py`):
@@ -28,8 +29,9 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
 - Auth: `Authorization: Bearer <token>`, compared with `hmac.compare_digest` against `--token-file` /
   `CORTADOS_BOT_TOKEN_FILE` (regular file, owned by the gateway user, mode 0600, else it refuses to start). 401
   otherwise. Failed authentication is throttled per Funnel client (trusted last `X-Forwarded-For` hop only from
-  loopback) and globally, with bounded in-memory state. The access log prints method, path, status and client address,
-  never headers or tokens.
+  loopback), with bounded in-memory state. Valid credentials bypass cooldown so shared egress cannot cause lockout;
+  the aggregate failure threshold is 429 response signalling, not token-comparison admission control. The access log
+  prints method, path, status and client address, never headers or tokens.
 - Tools, reusing `subagent_mcp`: phase 1 lists `route_task` only. With `--enable-start-task` (not for phase 1) six:
   `start_task`, `wait_task`, `task_status`, `list_tasks`, `cancel_task`, `route_task`.
 - HTTP admission: capacity (16 connections) is taken at accept, before a worker thread exists or a header is parsed

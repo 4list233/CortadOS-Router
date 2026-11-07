@@ -8,7 +8,7 @@
 #   install.sh load     (re)load the LaunchAgent
 #   install.sh unload   stop and unload it
 #   install.sh status   launchctl state, an unauthenticated POST /mcp (expected: 401), the log path and line count
-#   install.sh funnel-on|funnel-off   add/remove only Funnel's /mcp handler; never changes another serve handler
+#   install.sh funnel-on|funnel-off   verify and add/remove the owned /mcp handler on reserved public port 8443
 # Secrets: this script never reads, prints or copies a token value. Of ~/.cortados/provider.env it checks only whether
 # a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output). At run time launch.py reads that file
 # as data (never as shell code) and execs the gateway with an explicit environment.
@@ -16,6 +16,9 @@ set -eu
 
 LABEL=com.cortados.bot-gateway
 PORT=8434                                        # docs/GROKBOT-BRIDGE.md section 0: the gateway's one port on the Air
+# A dedicated public port prevents Funnel from publishing unrelated private Serve paths sharing its HTTPS listener;
+# 8443 is the conventional alternate HTTPS port and avoids the default 443 listener used by private Serve handlers.
+FUNNEL_PORT=8443
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${CORTADOS_BOT_GATEWAY_REPO:-$(cd "$HERE/../.." && pwd)}"   # the checkout this script lives in (~/cortados-router on the Air)
 PYBIN="${CORTADOS_BOT_GATEWAY_PYTHON:-/usr/bin/python3}"          # the interpreter the LaunchAgent runs (3.9 on the Air)
@@ -29,6 +32,7 @@ STATE_DIR="$HOME/.cortados"
 LOG="$STATE_DIR/bot-gateway.out"
 WORKSPACE="$HOME/cortados-bot-workspace"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+FUNNEL_OWNER="$STATE_DIR/bot-gateway-funnel-owner"
 DOMAIN="gui/$(id -u)"
 ALLOWED_HOST="${CORTADOS_BOT_ALLOWED_HOST:-}"       # optional exact public Host, copied into the plist; never hard-coded
 
@@ -156,15 +160,46 @@ cmd_unload() {
   if launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null; then echo "unloaded $LABEL"; else echo "$LABEL was not loaded"; fi
 }
 
+funnel_state() {
+  ts="$1"
+  out="$("$ts" funnel status --json 2>/dev/null)" || die "tailscale funnel status failed"
+  # Refuse anything except our single exact handler on the reserved port. This treats unknown schema/configuration as
+  # conflict rather than risking exposure or deletion; other ports are deliberately ignored.
+  python3 -I -c '
+import json, sys
+try:
+    cfg=json.loads(sys.argv[1]); port=sys.argv[2]; target=sys.argv[3]
+    web=cfg.get("Web", {}); allow=cfg.get("AllowFunnel", {}); tcp=cfg.get("TCP", {})
+    keys=[k for k in set(web)|set(allow) if k.rsplit(":",1)[-1] == port]
+    tcp_used=port in tcp or int(port) in tcp
+    if not keys and not tcp_used:
+        print("empty"); raise SystemExit
+    ours=(len(keys)==1 and web.get(keys[0],{}).get("Handlers",{}) == {"/mcp":{"Proxy":target}}
+          and allow.get(keys[0]) is True)
+    print("ours" if ours else "conflict")
+except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+    print("conflict")' "$out" "$FUNNEL_PORT" "http://127.0.0.1:$PORT/mcp"
+}
+
 cmd_funnel_on() {
   ts="$(tailscale_cli)"
-  "$ts" funnel --bg --set-path /mcp http://127.0.0.1:8434/mcp
+  [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel port $FUNNEL_PORT already has configuration"
+  [ ! -e "$FUNNEL_OWNER" ] && [ ! -L "$FUNNEL_OWNER" ] || die "stale Funnel ownership marker: $FUNNEL_OWNER"
+  "$ts" funnel --bg --https="$FUNNEL_PORT" --set-path /mcp "http://127.0.0.1:$PORT/mcp"
+  [ "$(funnel_state "$ts")" = ours ] || die "Funnel did not install the exact reserved-port handler"
+  ( umask 077; mkdir -p "$STATE_DIR"; printf '%s\n' "$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp" > "$FUNNEL_OWNER.tmp" )
+  mv "$FUNNEL_OWNER.tmp" "$FUNNEL_OWNER"
 }
 
 cmd_funnel_off() {
   ts="$(tailscale_cli)"
-  # The installed CLI help verifies --set-path; target "off" is the path-scoped removal syntax (not run during build).
-  "$ts" funnel --set-path /mcp off
+  expected="$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp"
+  marker=""; IFS= read -r marker < "$FUNNEL_OWNER" 2>/dev/null || die "no Funnel ownership marker; refusing removal"
+  [ "$marker" = "$expected" ] || die "Funnel ownership marker mismatch; refusing removal"
+  [ "$(funnel_state "$ts")" = ours ] || die "reserved Funnel configuration is not exactly ours; refusing removal"
+  "$ts" funnel --https="$FUNNEL_PORT" --set-path /mcp off
+  [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel configuration remains after removal"
+  rm -f "$FUNNEL_OWNER"
 }
 
 cmd_status() {
@@ -174,9 +209,19 @@ cmd_status() {
   else
     echo "not loaded"
   fi
+  # Read the installed allowlist (not the caller's environment), so status probes the configuration launchd runs.
+  probe_host=""
+  if [ -f "$PLIST" ]; then
+    probe_host="$(python3 -I -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("EnvironmentVariables",{}).get("CORTADOS_BOT_ALLOWED_HOST",""))' "$PLIST")" || die "cannot read allowed host from plist"
+  fi
   # Unauthenticated on purpose: a 401 shows the loopback gateway is up and checks auth without using the token.
-  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' \
-          "http://127.0.0.1:$PORT/mcp" 2>/dev/null)" || true
+  if [ -n "$probe_host" ]; then
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST -H 'content-type: application/json' \
+            -H "Host: $probe_host" --data '{}' "http://127.0.0.1:$PORT/mcp" 2>/dev/null)" || true
+  else
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST -H 'content-type: application/json' \
+            --data '{}' "http://127.0.0.1:$PORT/mcp" 2>/dev/null)" || true
+  fi
   echo "== POST http://127.0.0.1:$PORT/mcp without a token: HTTP ${code:-none} (expected 401)"
   # Log contents are never printed: the access log records request paths, and a client that put its token in the
   # path would have it echoed here. The owner reads the file himself.

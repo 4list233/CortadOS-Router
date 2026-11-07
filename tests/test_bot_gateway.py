@@ -533,6 +533,17 @@ class AuthThrottleTest(unittest.TestCase):
             self.assertIsNone(throttle.failed(f"203.0.113.{i}"))
         self.assertEqual(throttle.failed("203.0.113.250"), 60)
 
+    def test_source_churn_does_not_evict_active_bans(self):
+        now = [0.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        with mock.patch.object(bg, "MAX_AUTH_CLIENTS", 2):
+            for address in ("198.51.100.1", "198.51.100.2"):
+                for _ in range(bg.AUTH_FAILURES):
+                    throttle.failed(address)
+            self.assertEqual(throttle.failed("198.51.100.3"), 60)  # bounded overflow is signalled, not stored
+        self.assertEqual(set(throttle.clients), {"198.51.100.1", "198.51.100.2"})
+        self.assertIsNotNone(throttle.blocked("198.51.100.1"))
+
     def test_xff_only_from_loopback_and_last_hop(self):
         self.assertEqual(bg.client_address("127.0.0.1", "192.0.2.1, 198.51.100.2"), "198.51.100.2")
         self.assertEqual(bg.client_address("203.0.113.8", "198.51.100.2"), "203.0.113.8")
@@ -586,7 +597,9 @@ class HttpTest(unittest.TestCase):
         bad = {"X-Forwarded-For": "198.51.100.11"}
         for _ in range(bg.AUTH_FAILURES):
             self.assertEqual(self.post(msg, "wrong-token-0000000000", bad)[0], 401)
-        self.assertEqual(self.post(msg, TOKEN, bad)[0], 429)  # cooldown is checked before this token
+        # A bad actor sharing the public egress address cannot lock the legitimate bearer out.
+        self.assertEqual(self.post(msg, TOKEN, bad)[0], 200)
+        self.assertEqual(self.post(msg, "wrong-token-0000000000", bad)[0], 429)
         self.assertEqual(self.post(msg, TOKEN, {"X-Forwarded-For": "198.51.100.12"})[0], 200)
         log = self.err.getvalue()
         self.assertIn("POST /mcp 429 198.51.100.11", log)
@@ -642,6 +655,19 @@ class HttpTest(unittest.TestCase):
                 t0 = time.monotonic()
                 self.assertEqual(s.recv(100), b"")
                 self.assertLess(time.monotonic() - t0, 3)
+
+    def test_malformed_and_too_many_headers_return_errors_without_traceback(self):
+        import socket
+        for request, expected in (
+            (b"BOGUS\r\n\r\n", b"400"),
+            (b"GET /mcp HTTP/1.1\r\n" + b"X: y\r\n" * 101 + b"\r\n", b"431"),
+        ):
+            with self.subTest(expected=expected):
+                with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+                    s.sendall(request)
+                    self.assertIn(expected, s.recv(4096).split(b"\r\n", 1)[0])
+        self.assertNotIn("Traceback", self.err.getvalue())
+        self.assertNotIn("AttributeError", self.err.getvalue())
 
     def test_body_deadline_closes_trickler(self):
         import socket
