@@ -15,7 +15,9 @@ Run: python3 -B -m cortados_router.bot_gateway --token-file F --workspace-root D
 from __future__ import annotations
 
 import argparse
+import collections
 import hmac
+import ipaddress
 import json
 import os
 import socket
@@ -81,11 +83,85 @@ REQUEST_TIMEOUT_S = 30                    # a bot sends its JSON-RPC at once or 
 # and headers, then the body, each get an absolute deadline (as local_gate does), after which the socket is shut.
 HEADER_DEADLINE_S = 10.0                  # a bot sends its headers in one write; 10 s is generous for a slow link
 BODY_DEADLINE_S = 30.0                    # MAX_BODY (1 MiB) in 30 s is ~280 kbit/s, slower than any real bot link
+# Five guesses is enough to catch a broken configuration without making a typo immediately lock a client out.
+AUTH_FAILURES = 5
+# Ten minutes prevents slow password guessing while allowing stale mistakes to age out.
+AUTH_WINDOW_S = 10 * 60
+# One minute is a short first lockout; repeated bursts double up to the one-hour operationally recoverable ceiling.
+AUTH_COOLDOWN_S, AUTH_COOLDOWN_MAX_S = 60, 60 * 60
+# Sixty failed tokens/minute is response signalling, not an aggregate admission limit: a valid credential is always
+# compared first so shared-egress attackers cannot lock it out. It makes widespread guessing visible/back off with 429.
+GLOBAL_AUTH_FAILURES = 60
+# 4096 addresses bounds memory under source-address churn while retaining far more than the expected bot population.
+MAX_AUTH_CLIENTS = 4096
 _PENDING = "__pending__"                  # placeholder prefix reserving a concurrency slot while a child starts
 
 
 class GatewayError(Exception):
     pass
+
+
+def client_address(peer: str, forwarded: str = "") -> str:
+    """Use Funnel's appended last XFF hop only for a loopback TCP peer."""
+    if peer in LOOPBACK:
+        candidate = forwarded.rsplit(",", 1)[-1].strip()
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            pass
+    return peer
+
+
+class AuthThrottle:
+    """Bounded failed-auth response limiter; valid credentials deliberately bypass all cooldowns."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.lock = clock, threading.Lock()
+        self.clients = collections.OrderedDict()
+        # At most the threshold plus one is needed to decide that the global cap has been crossed.
+        self.global_failures = collections.deque(maxlen=GLOBAL_AUTH_FAILURES + 1)
+
+    def blocked(self, address: str):
+        now = self.clock()
+        with self.lock:
+            state = self.clients.get(address)
+            if state is None:
+                return None
+            self.clients.move_to_end(address)
+            if state["blocked_until"] > now:
+                return max(1, int(state["blocked_until"] - now + .999))
+            return None
+
+    def failed(self, address: str):
+        """Record an invalid token. The threshold failure stays 401; later attempts are blocked before token checking."""
+        now = self.clock()
+        with self.lock:
+            while self.global_failures and now - self.global_failures[0] >= 60:
+                self.global_failures.popleft()
+            self.global_failures.append(now)
+            global_block = len(self.global_failures) > GLOBAL_AUTH_FAILURES
+            state = self.clients.get(address)
+            if state is None:
+                if len(self.clients) >= MAX_AUTH_CLIENTS:
+                    # Source churn must not evict an active ban. Evict the oldest inactive entry; if every bounded
+                    # slot is actively banned, leave the new source untracked and use only aggregate 429 signalling.
+                    victim = next((key for key, value in self.clients.items()
+                                   if value["blocked_until"] <= now), None)
+                    if victim is None:
+                        return 60
+                    del self.clients[victim]
+                state = {"failures": collections.deque(), "cooldown": 0, "blocked_until": 0.0}
+                self.clients[address] = state
+            self.clients.move_to_end(address)
+            failures = state["failures"]
+            while failures and now - failures[0] >= AUTH_WINDOW_S:
+                failures.popleft()
+            failures.append(now)
+            if len(failures) >= AUTH_FAILURES:
+                state["cooldown"] = min(AUTH_COOLDOWN_MAX_S, state["cooldown"] * 2 or AUTH_COOLDOWN_S)
+                state["blocked_until"] = now + state["cooldown"]
+                failures.clear()
+            return 60 if global_block else None
 
 
 def read_token_file(path: str) -> str:
@@ -576,7 +652,10 @@ class GatewayServer(ThreadingHTTPServer):
             self.slots.release()
 
 
-def make_handler(gw: Gateway):
+def make_handler(gw: Gateway, allowed_hosts=(), clock=time.monotonic):
+    throttle = AuthThrottle(clock)
+    allowed_hosts = frozenset(allowed_hosts)
+
     class H(BaseHTTPRequestHandler):
         server_version = "cortados-bot-gateway"
         timeout = REQUEST_TIMEOUT_S
@@ -621,14 +700,29 @@ def make_handler(gw: Gateway):
                 return None                   # the client stalled or left; the caller closes the connection
             return b"".join(parts)
 
-        def log_message(self, fmt, *args):          # path + status only; headers (the token) are never logged
-            sys.stderr.write("bot-gateway: %s %s\n" % (self.command, self.path.split("?")[0][:100]))
+        def _client_addr(self):
+            # Funnel is trusted only on loopback and appends the real client as the last XFF hop; earlier hops are
+            # attacker-controlled. Invalid appended values fall back to the TCP peer rather than becoming log/state keys.
+            headers = getattr(self, "headers", None)
+            forwarded = headers.get("x-forwarded-for", "") if headers is not None else ""
+            return client_address(self.client_address[0], forwarded)
 
-        def _send(self, code: int, obj) -> None:
+        def log_message(self, fmt, *args):
+            pass                                      # log_request below is the sole bounded, header-free access log
+
+        def log_request(self, code="-", size="-"):
+            command = getattr(self, "command", "-")
+            path = getattr(self, "path", "-")
+            sys.stderr.write("bot-gateway: %s %s %s %s\n" %
+                             (command, path.split("?")[0][:100], code, self._client_addr()))
+
+        def _send(self, code: int, obj, headers=()) -> None:
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -637,6 +731,8 @@ def make_handler(gw: Gateway):
             self.close_connection = True
             if self._expired:
                 return
+            if allowed_hosts and self.headers.get("host") not in allowed_hosts:
+                return self._send(421, {"error": "misdirected request"})
             self._send(405, {"error": "use POST /mcp"})   # no SSE stream offered
 
         def do_POST(self):
@@ -650,9 +746,22 @@ def make_handler(gw: Gateway):
                 self.close_connection = True
 
         def _post(self):
+            if allowed_hosts and self.headers.get("host") not in allowed_hosts:
+                return self._send(421, {"error": "misdirected request"})
             if self.path.split("?")[0] != "/mcp":
                 return self._send(404, {"error": "not found"})
+            client = self._client_addr()
+            # Compare first: clients sharing a Funnel egress address cannot lock a valid credential out. Cooldowns
+            # and the aggregate counter therefore limit only invalid responses, not token-comparison admission.
             if not gw.authorized(self.headers.get("authorization")):
+                retry = throttle.blocked(client)
+                if retry is not None:
+                    return self._send(429, {"error": "too many failed authentication attempts"},
+                                      (("Retry-After", str(retry)),))
+                retry = throttle.failed(client)
+                if retry is not None:
+                    return self._send(429, {"error": "too many failed authentication attempts"},
+                                      (("Retry-After", str(retry)),))
                 return self._send(401, {"error": "unauthorized"})
             try:
                 n = int(self.headers.get("content-length") or 0)
@@ -684,8 +793,9 @@ def make_handler(gw: Gateway):
     return H
 
 
-def build_server(gw: Gateway, host: str = "127.0.0.1", port: int = 8434) -> ThreadingHTTPServer:
-    return GatewayServer((host, port), make_handler(gw), MAX_INFLIGHT)
+def build_server(gw: Gateway, host: str = "127.0.0.1", port: int = 8434, allowed_hosts=(),
+                 clock=time.monotonic) -> ThreadingHTTPServer:
+    return GatewayServer((host, port), make_handler(gw, allowed_hosts, clock), MAX_INFLIGHT)
 
 
 def main(argv=None) -> int:
@@ -696,6 +806,9 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace-root", default=os.environ.get("CORTADOS_BOT_WORKSPACE_ROOT", ""))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8434)
+    env_host = os.environ.get("CORTADOS_BOT_ALLOWED_HOST")
+    ap.add_argument("--allowed-host", action="append", default=[env_host] if env_host else [],
+                    help="exact permitted Host header (repeatable); unset accepts any Host")
     ap.add_argument("--children-run-as-me", action="store_true",
                     help="allow a non-loopback --host although children run as the owner's user (no per-user "
                          "boundary until phase 2 B5)")
@@ -725,7 +838,7 @@ def main(argv=None) -> int:
     except GatewayError as exc:
         sys.stderr.write(f"bot-gateway: refusing to start: {exc}\n")
         return 2
-    srv = build_server(gw, o.host, o.port)
+    srv = build_server(gw, o.host, o.port, o.allowed_host)
     sys.stderr.write(f"bot-gateway: listening on {o.host}:{o.port} /mcp\n")
     srv.serve_forever()
     return 0

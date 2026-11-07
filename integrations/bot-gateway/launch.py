@@ -36,7 +36,8 @@ import unicodedata
 EX_CONFIG = 78
 TOKEN_NAME = "CORTADOS_PROVIDER_TOKEN"
 FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-FROM_PLIST = ("HOME", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL")   # set by the plist (HOME by launchd); not secrets
+FROM_PLIST = ("HOME", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL")   # required plist values; not secrets
+OPTIONAL_FROM_PLIST = ("CORTADOS_BOT_ALLOWED_HOST",)                 # public hostname; omitted means no Host allowlist
 MAX_BYTES = 64 * 1024            # provider.env is a few lines; a bigger file is not one we wrote
 # Phase-1 gateway flags, exact spellings: flag -> takes a value. Anything else (notably --enable-start-task or any
 # prefix of it, which the gateway's argparse would expand) is refused: phase 1 is route_task only (owner decision
@@ -48,7 +49,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # -B: no .pyc writes into the checkout.
 CHILD_OPTS = ("-I", "-S", "-B")
 ALLOWED_FLAGS = {"--host": True, "--port": True, "--token-file": True, "--workspace-root": True,
-                 "--children-run-as-me": False}
+                 "--allowed-host": True, "--children-run-as-me": False}
 
 LINE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 UNQUOTED = re.compile(r"^[^\s'\"`$\\;&|<>(){}*?\[\]!#~]*$")
@@ -170,6 +171,9 @@ def build(argv, environ) -> tuple:
         if not v:
             raise ConfigError(f"{k} is not set (the plist sets it)")
         env[k] = v
+    for k in OPTIONAL_FROM_PLIST:
+        if environ.get(k):
+            env[k] = environ[k]
     if not env["CORTADOS_PROVIDER_URL"].startswith("http://"):
         raise ConfigError("CORTADOS_PROVIDER_URL is not an http:// URL")
     return o.python, [o.python, *CHILD_OPTS, "-c", bootstrap(), *flags], env
