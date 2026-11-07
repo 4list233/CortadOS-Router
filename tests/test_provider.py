@@ -253,6 +253,18 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TURN_TIMEOUT_S"]), 19000)
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
         self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
+        # The shim's deadline is handed over verbatim and ends at least the documented margin before the CLI's own
+        # MCP tool timeout, so a write past the shim's pre-write check always lands before the CLI could time out.
+        shim_deadline = float(cfg["CORTADOS_PROVIDER_CALL_TIMEOUT_S"])
+        self.assertEqual(shim_deadline, 19000 + 20000 + 7)
+        self.assertLessEqual(shim_deadline + 30, actual_cli)
+
+    def test_shim_deadline_and_cli_timeout_share_one_constant(self):
+        from cortados_router.provider import timeouts
+        self.assertGreaterEqual(timeouts.CLI_MARGIN_S, timeouts.CLI_MARGIN_FLOOR_S)
+        self.assertGreaterEqual(timeouts.CLI_MARGIN_FLOOR_S, 30)
+        self.assertEqual(timeouts.CLI_TOOL_TIMEOUT_S, timeouts.CALL_TIMEOUT_S + timeouts.CLI_MARGIN_S)
+        self.assertLessEqual(timeouts.CALL_TIMEOUT_S + 30, timeouts.CLI_TOOL_TIMEOUT_S)
 
     def _shim_dispatcher(self, forward, emit, timeout, clock=time.monotonic, workers=1, max_pending=8):
         aborted = threading.Event()
@@ -2115,6 +2127,36 @@ class StartFailureTests(unittest.TestCase):
             BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
                           claude_bin=os.path.join(scratch, "no-such-claude"), scratch_root=scratch)
         self.assertEqual(os.listdir(scratch), [])
+
+
+class OwnerDeathTests(unittest.TestCase):
+    def test_owner_death_with_delayed_abort_still_removes_the_conversation(self):
+        # The CLI dies (as when the shim SIGKILLs it on expiry) and the shim's abort never arrives: the provider's
+        # own exit handling must remove the conversation terminally and end its backend.
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                          claude_bin=[sys.executable, "-c", "import time; time.sleep(0.3)"])
+        closed = []
+        real_close = s.close
+        s.close = lambda: (closed.append(True), real_close())
+        with reg._lock:
+            reg.sessions[s.id] = s
+        s.set_exit_handler(reg._backend_exited)       # what Registry.new wires for every held conversation
+        deadline = time.time() + 10
+        while reg.get(s.id) is not None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNone(reg.get(s.id))
+        self.assertEqual(closed, [True])
+
+    def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
+                          claude_bin=[sys.executable, str(FAKE)])
+        calls = []
+        s.set_exit_handler(lambda sess: calls.append(sess))
+        s.close()
+        time.sleep(0.3)
+        self.assertEqual(calls, [])
 
 
 class StalledCliTests(unittest.TestCase):
