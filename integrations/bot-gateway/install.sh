@@ -66,8 +66,12 @@ u = sys.argv[1]
 try:
     p = urllib.parse.urlsplit(u)
     p.port  # raises ValueError on a malformed or out-of-range port
-    ok = (p.scheme in ("http", "https") and bool(p.hostname) and "@" not in p.netloc
-          and not p.query and not p.fragment and u.isprintable() and not any(c.isspace() for c in u))
+    # The scheme text must be exactly lowercase http/https: urlsplit lowercases it, but launch.py
+    # (resolve_provider_url) checks the literal prefix, so "HTTP://" would pass here and crash-loop the gateway (78).
+    # Any literal "?" or "#" is refused: a bare trailing one gives an empty query/fragment that urlsplit hides.
+    ok = (u.startswith(("http://", "https://")) and p.scheme in ("http", "https") and bool(p.hostname)
+          and "@" not in p.netloc and "?" not in u and "#" not in u
+          and u.isprintable() and not any(c.isspace() for c in u))
 except ValueError:
     ok = False
 sys.exit(0 if ok else 1)' "$1" || die "CORTADOS_BOT_PROVIDER_URL must be an http(s) URL with a host and no credentials, query or fragment"

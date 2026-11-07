@@ -279,7 +279,9 @@ class PlistTest(InstallerHarness):
 
     def test_bad_provider_url_refused(self):
         cases = ["ftp://127.0.0.1:8432", "http://user:pw@127.0.0.1:8432", "http://tok@127.0.0.1:8432",
-                 "http://127.0.0.1:8432/?token=x", "http://127.0.0.1:8432/#x", "http://", "127.0.0.1:8432",
+                 "http://127.0.0.1:8432/?token=x", "http://127.0.0.1:8432/#x", "http://127.0.0.1:8432/?",
+                 "http://127.0.0.1:8432?", "http://127.0.0.1:8432/#", "http://127.0.0.1:8432#",
+                 "HTTP://127.0.0.1:8432", "Https://provider.example.test", "http://", "127.0.0.1:8432",
                  "http://127.0.0.1:99999", "http://127.0.0.1:8432/ x", "http://127.0.0.1:8432\nX=1", ""]
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         self.assertEqual(self.run_sh("token").returncode, 0)
@@ -309,6 +311,10 @@ class PlistTest(InstallerHarness):
                 doc = plistlib.loads(self.plist().read_bytes())
                 self.assertIn("--host 127.0.0.1 ", " ".join(doc["ProgramArguments"]))
                 self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], url)
+                # The written value must survive the real launcher's resolution (review r1: an accepted
+                # "HTTP://" would otherwise exit 78 in a crash loop).
+                from cortados_router.subagent_mcp import resolve_provider_url
+                self.assertEqual(resolve_provider_url(dict(doc["EnvironmentVariables"])), url.rstrip("/"))
 
     def test_allowed_host_is_read_from_environment_into_plist(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
