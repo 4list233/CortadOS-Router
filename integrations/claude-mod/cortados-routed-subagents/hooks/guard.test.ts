@@ -21,6 +21,7 @@ function engine(on: any, store: Record<string, unknown> = {}) {
   on('ui.status', (_$: any, e: any) => { statuses.push(e.text); return { value: undefined } })
   const commands: string[] = []
   on('command.register', (_$: any, e: any) => { commands.push(e.name); return { value: { command: e.name } } })
+  on('process.run', () => ({ value: { stdout: '', stderr: '', exitCode: 0 } }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   return { ran, toasts, statuses, clock, commands, store }
 }
@@ -151,9 +152,11 @@ function faulty(on: any, fail: 'store.get' | 'store.set' | 'clock.now' | 'ui.sta
   const boom = () => { throw new TypeError('injected fault secret-ish detail') }
   on('tool.call', (_$: any, e: any) => { ran.push(e); return { result: { ok: true } } })
   on('ui.log', (_$: any, e: any) => { logs.push(e.text); return { value: undefined } })
+  on('process.run', () => ({ value: { stdout: '', stderr: '', exitCode: 0 } }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('store.get', fail === 'store.get' ? boom : (_$: any, e: any) => ({ value: store[e.key] }))
   on('store.set', fail === 'store.set' ? boom : (_$: any, e: any) => { store[e.key] = e.value; return { value: undefined } })
+  on('clock.sleep', async () => new Promise(() => {}))
   on('clock.now', fail === 'clock.now' ? boom : () => ({ value: 1_000_000 }))
   on('ui.status', fail === 'ui.status' ? boom : (_$: any, e: any) => { statuses.push(e.text); return { value: undefined } })
   on('ui.toast', fail === 'ui.toast' ? boom : (_$: any, e: any) => { toasts.push(e.text); return { value: undefined } })

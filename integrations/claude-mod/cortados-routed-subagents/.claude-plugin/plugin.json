@@ -11,7 +11,7 @@
     "providerUrl": {
       "type": "string",
       "title": "Provider URL",
-      "default": "http://127.0.0.1:8432",
+      "default": "",
       "description": "CortadOS provider base URL that subagents route through (e.g. the Air on the tailnet)."
     },
     "providerTokenFile": {
@@ -53,8 +53,8 @@
     "routeBackground": {
       "type": "boolean",
       "title": "Route background subagents too",
-      "default": false,
-      "description": "Off by default: background (run_in_background) subagents pass through to native handling, because a routed subagent runs under a 10-minute ceiling. Turn on only for short background tasks."
+      "default": true,
+      "description": "On by default (owner decision 2026-11-04: every subagent goes through S1). A background (run_in_background) subagent is started detached under backgroundTimeoutMs, the Agent call answers at once as launched, and the result arrives as a notification from this plugin and in the launch record's outputFile. Off hands background subagents back to native handling."
     },
     "orchestratorMode": {
       "type": "boolean",
@@ -78,7 +78,13 @@
       "type": "number",
       "title": "Routed subagent timeout (ms)",
       "default": 600000,
-      "description": "How long a routed subagent may run before it is aborted. Max 600000 (10 min), Claude Code's own limit for a mod's process; larger values are clamped, fractions are rounded down, invalid values use the default."
+      "description": "How long a routed foreground subagent may run before it is aborted. Max 600000 (10 min), Claude Code's own limit for a mod's process; larger values are clamped, fractions are rounded down, invalid values use the default. Background subagents use backgroundTimeoutMs."
+    },
+    "backgroundTimeoutMs": {
+      "type": "number",
+      "title": "Routed background subagent timeout (ms)",
+      "default": 7200000,
+      "description": "How long a routed background subagent may run before its watchdog stops it. Default 7200000 (2 h): real background builders run 30-60+ minutes. Max 10800000 (3 h, the CortadOS child-task limit), because an unattended child that never ends burns quota; larger values are clamped, fractions are rounded down, invalid values use the default. Foreground subagents keep subagentTimeoutMs."
     },
     "maxTurns": {
       "type": "number",
@@ -97,6 +103,12 @@
       "title": "Main-session guard (warn only)",
       "default": true,
       "description": "When on, a big Edit/Write/NotebookEdit (over 40 lines or 2000 characters of new content) or a build/test Bash run (python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test) on the MAIN session shows a toast (at most one per 10 minutes) and a status-line counter nudging you to delegate. Never blocks a call. Subagents are never watched. /cortados-guard on|off overrides this, kept in the plugin store."
+    },
+    "officeView": {
+      "type": "boolean",
+      "title": "CortadOS Office view",
+      "default": true,
+      "description": "When on, every routed request carries this session's opaque tag (a salted hash of the session id), the project folder name, the device's short hostname and the task title (the Agent call's description, at most 80 characters), and the main session sends the provider a heartbeat with its status and current tool name, so GET /v1/cortados/office can draw this session as a floor. Metadata only: never prompt text, tool input or file contents."
     }
   }
 }

@@ -6,6 +6,7 @@ import io
 import json
 import queue
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from unittest import mock
 from cortados_router.provider import anthropic_wire as wire, bridge, mcp_shim
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
-from cortados_router.provider import server
+from cortados_router.provider import search_lane, server
 from cortados_router.provider.server import ProviderServer, Registry
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
@@ -957,11 +958,9 @@ class EndpointTests(EndpointHarness):
         self.assertEqual([e for e in events if e["type"] == "message_delta"][0]["delta"]["stop_reason"], "tool_use")
 
     def test_the_headless_cli_runs_isolated(self):
-        os.environ["ANTHROPIC_BASE_URL"] = self.url
-        try:
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": self.url,
+                                          "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r1"}):
             self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "hi"}]})
-        finally:
-            os.environ.pop("ANTHROPIC_BASE_URL")
         seen = json.loads(Path(self.argv_file).read_text())
         argv = seen["argv"]
         self.assertEqual(argv[argv.index("--tools") + 1], "")
@@ -971,6 +970,19 @@ class EndpointTests(EndpointHarness):
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "mcp__bridge__Read")
         self.assertIsNone(seen["env"]["ANTHROPIC_BASE_URL"])        # would loop back into this endpoint
         self.assertEqual(os.listdir(seen["cwd"]), [])                # empty scratch dir, never the project
+        self.assertFalse([k for k in server.claude_env(None) if k.startswith("ANTHROPIC_")])
+
+    def test_claude_env_strips_every_anthropic_variable_by_prefix(self):
+        from cortados_router.provider import bridge
+        ambient = {k: "" for k in os.environ if k.startswith("ANTHROPIC_")}   # the developer's shell, cleared
+        with mock.patch.dict(os.environ, {**ambient, "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r1",
+                                          "ANTHROPIC_MODEL": "m", "CLAUDE_CODE_OAUTH_TOKEN": "tok", "KEEP_ME": "1"}):
+            env = bridge.claude_env(None)
+            self.assertFalse([k for k in env if k.startswith("ANTHROPIC_")])
+            self.assertEqual((env["KEEP_ME"], env["CLAUDE_CODE_OAUTH_TOKEN"]), ("1", "tok"))
+            env = bridge.claude_env("/cfg/b")
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg/b")
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
 
     def test_toolless_requests_are_one_shot_and_keep_no_session(self):
         r = self.post({"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
@@ -2674,10 +2686,82 @@ class RevealModelTests(unittest.TestCase):
             self.assertIsNone(server.reveal_model(route))
 
 
-class ServerToolTests(EndpointHarness):
-    """Anthropic server tools (web_search_*) cannot run on any backend here: incident 2026-11-03, where Claude Code's
-    WebSearch got an empty success with no links. The model must read that the search did not happen."""
+FAKE_SEARCH = """import json, os, sys, time
+open(os.environ["FAKE_SEARCH_LOG"], "a").write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
+    "env": {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CONFIG_DIR"))}}) + "\\n")
+mode = os.environ.get("FAKE_SEARCH_MODE", "ok")
+if mode == "fail":
+    sys.stderr.write("boom"); sys.exit(3)
+if mode == "detach":
+    # double-fork a writer into its own session that holds stdout/stderr open, then answer normally and exit: the
+    # lane's group kill cannot reach it, so stdout never reaches EOF while it lives
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            open(os.environ["FAKE_SEARCH_PIDFILE"], "w").write(str(os.getpid()))
+            time.sleep(30); os._exit(0)
+        os._exit(0)
+    os.wait()
+    while not os.path.exists(os.environ["FAKE_SEARCH_PIDFILE"]):
+        time.sleep(0.01)
+if mode == "sleep":
+    time.sleep(float(os.environ.get("FAKE_SEARCH_SLEEP", "5")))
+if mode in ("bigout", "bigerr"):
+    # write past the lane's cap, then hang: only a kill on overflow ends this child before the test's timeout
+    out = sys.stdout.buffer if mode == "bigout" else sys.stderr.buffer
+    out.write(b"x" * int(os.environ.get("FAKE_SEARCH_BYTES", "65536"))); out.flush()
+    time.sleep(30)
+def emit(e): print(json.dumps(e))
+emit({"type": "system", "subtype": "init"})
+if mode != "nosearch":
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "WebSearch",
+                                                        "input": {"query": "q"}}]}})
+    if mode == "toolerror":
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1", "is_error": True,
+                                                       "content": "<tool_use_error>search failed</tool_use_error>"}]}})
+    else:
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1",
+                                                       "content": "Web search results for query: q"}]}})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}})
+emit({"type": "result", "subtype": "success", "is_error": False,
+      "result": "1. Cortados - https://example.com/c - a router\\nAnswer: it routes.",
+      "usage": {"input_tokens": 11, "output_tokens": 7, "server_tool_use": {"web_search_requests": 0}}})
+"""
+
+
+# The stream events of a WebSearch that ran (the shape a live CLI run produced, 2026-11-03).
+SEARCH_EVIDENCE = [
+    {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "WebSearch", "input": {}}]}},
+    {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "ws1", "content": "results"}]}}]
+
+
+class SearchFakeMixin:
+    """A fake `claude -p` for the search lane, writing each call's argv and ANTHROPIC_* env to FAKE_SEARCH_LOG."""
+
+    def install_fake_search(self, mode="ok"):
+        path = os.path.join(self.scratch, "fake_search.py")
+        Path(path).write_text(FAKE_SEARCH)
+        self.search_log = os.path.join(self.scratch, "search.jsonl")
+        for k, v in (("FAKE_SEARCH_LOG", self.search_log), ("FAKE_SEARCH_MODE", mode)):
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        self.reg.search_bin = [sys.executable, path]
+
+    def search_calls(self):
+        if not os.path.exists(self.search_log):
+            return []
+        return [json.loads(line) for line in Path(self.search_log).read_text().splitlines()]
+
+
+class ServerToolTests(SearchFakeMixin, EndpointHarness):
+    """Anthropic server tools (web_search_*) cannot run on the bridged backends: incident 2026-11-03, where Claude Code's
+    WebSearch got an empty success with no links. When the search lane fails, the model must read that the search did
+    not happen (these tests run with a failing search CLI; SearchLaneTests covers the working lane)."""
     WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+
+    def setUp(self):
+        super().setUp()
+        self.install_fake_search("fail")
     SEARCH = {"model": "cortados", "tools": [WEB_SEARCH],
               "messages": [{"role": "user", "content": "Perform a web search for the query: cortados"}]}
 
@@ -2749,6 +2833,564 @@ class ServerToolTests(EndpointHarness):
                        "messages": [{"role": "user", "content": "please use tool"}]})
         self.assertEqual(r["stop_reason"], "tool_use")
         self.assertEqual(r["content"][-1]["name"], "Read")
+
+
+class SearchLaneTests(SearchFakeMixin, EndpointHarness):
+    """The search lane (search_lane.py): a web-search-only request runs a headless CLI with only WebSearch."""
+    SEARCH = ServerToolTests.REAL
+
+    def setUp(self):
+        super().setUp()
+        self.install_fake_search("ok")
+        # A successful search writes a usage-ledger row; capture it rather than touch any real usage.db.
+        self.ledger = []
+        p = mock.patch("cortados_router.usage_ledger.record_async",
+                       side_effect=lambda lane, model, usage, **kw: self.ledger.append((lane, model, usage)))
+        p.start()
+        self._ledger_patch = p
+        self.addCleanup(p.stop)
+
+    def test_query_extraction(self):
+        q = search_lane.extract_query
+        self.assertEqual(q(self.SEARCH), "cortados router")
+        self.assertEqual(q({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Perform a web search for the query: a b"}]}]}), "a b")
+        self.assertEqual(q({"messages": [{"role": "user", "content": "plain words"}]}), "plain words")
+        self.assertEqual(q({"messages": []}), "")
+        self.assertEqual(q({}), "")
+
+    def test_json_reply_carries_the_result_and_usage(self):
+        r = self.post(self.SEARCH)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(r["usage"]["output_tokens"], 7)
+        self.assertFalse(os.path.exists(self.argv_file), "the bridge CLI is never started for a search")
+        self.assertEqual(self.reg.sessions, {})
+
+    def test_sse_reply_carries_the_result(self):
+        raw = self.post(dict(self.SEARCH, stream=True))
+        self.assertIn("event: message_start", raw)
+        self.assertIn("https://example.com/c", raw)
+        self.assertIn('"stop_reason": "end_turn"', raw)
+
+    def test_argv_has_only_websearch_and_no_bridge_and_env_is_stripped(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://x", "ANTHROPIC_AUTH_TOKEN": "t",
+                                          "ANTHROPIC_API_KEY": "k",
+                                          "ANTHROPIC_CUSTOM_HEADERS": "x-cortados-run-id: r1"}):
+            self.post(self.SEARCH)
+        [call] = self.search_calls()
+        a = call["argv"]
+        self.assertEqual(a[a.index("--setting-sources") + 1], "")
+        self.assertEqual(a[a.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(json.loads(a[a.index("--settings") + 1]), {"disableAllHooks": True})
+        self.assertEqual(a[a.index("--tools") + 1], "WebSearch")
+        self.assertEqual(a[a.index("--allowedTools") + 1], "WebSearch")
+        self.assertEqual(a[a.index("--model") + 1], search_lane.SEARCH_MODEL)
+        self.assertEqual(json.loads(a[a.index("--mcp-config") + 1]), {"mcpServers": {}})
+        self.assertIn("--strict-mcp-config", a)
+        self.assertIn("cortados router", a[a.index("-p") + 1])
+        self.assertFalse(any("bridge" in x or "mcp_shim" in x for x in a))
+        self.assertEqual(call["env"], {})
+        self.assertIn("cortados-search-", call["cwd"])
+
+    def test_named_account_runs_on_its_login_and_an_unknown_one_falls_back(self):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "zz"}), self._accounts(self.ACCTS):
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+
+    def test_nonzero_exit_falls_back_to_the_unavailable_text(self):
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        r = self.post(self.SEARCH)
+        self.assertIn("web_search is unavailable on this CortadOS lane", r["content"][0]["text"])
+        self.assertIn("exit_3", r["content"][0]["text"])
+
+    def test_timeout_falls_back_to_the_unavailable_text(self):
+        os.environ["FAKE_SEARCH_MODE"] = "sleep"
+        with mock.patch.object(search_lane, "SEARCH_TIMEOUT_S", 0.5):
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("timeout", r["content"][0]["text"])
+
+    def test_past_the_cap_the_reply_says_search_busy(self):
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(1)):
+            search_lane._slots.acquire()
+            try:
+                r = self.post(self.SEARCH)
+            finally:
+                search_lane._slots.release()
+        self.assertIn("search busy", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+
+    def test_concurrent_searches_are_capped(self):
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_SLEEP"] = "sleep", "1"
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_SLEEP", None)
+        out = []
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(2)):
+            ts = [threading.Thread(target=lambda: out.append(self.post(self.SEARCH)["content"][0]["text"]))
+                  for _ in range(4)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(sum("search busy" in t for t in out), 2)
+        self.assertEqual(sum("example.com" in t for t in out), 2)
+
+    def test_a_scratch_dir_failure_is_an_unavailable_reply_and_leaks_no_slot(self):
+        before = search_lane._slots._value
+        with mock.patch.object(search_lane.tempfile, "mkdtemp", side_effect=OSError("disk full")):
+            r = self.post(self.SEARCH)
+        self.assertIn("web_search is unavailable on this CortadOS lane", r["content"][0]["text"])
+        self.assertIn("start_failed", r["content"][0]["text"])
+        self.assertEqual(search_lane._slots._value, before)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_an_unexpected_lane_error_is_an_unavailable_reply_not_a_dropped_connection(self):
+        with mock.patch.object(search_lane, "run", side_effect=RuntimeError("bug")), \
+                self.assertLogs("cortados.provider", "ERROR"):
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("the search lane failed: internal", r["content"][0]["text"])
+
+    def test_an_overlong_query_is_refused_before_any_cli(self):
+        body = {"model": "cortados", "tools": [ServerToolTests.WEB_SEARCH],
+                "messages": [{"role": "user", "content": "q" * (search_lane.MAX_QUERY_CHARS + 1)}]}
+        r = self.post(body)
+        self.assertIn("query_too_long", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+
+    def test_domain_filters_reach_the_prompt(self):
+        tool = dict(ServerToolTests.WEB_SEARCH, allowed_domains=["docs.python.org", ""],
+                    blocked_domains=["spam.example"])
+        self.post({"model": "cortados", "tools": [tool],
+                   "messages": [{"role": "user", "content": "asyncio timeout"}]})
+        p = self.search_calls()[0]["argv"]
+        p = p[p.index("-p") + 1]
+        self.assertIn("Only use results from these domains: docs.python.org.", p)
+        self.assertIn("Never use results from these domains: spam.example.", p)
+        self.assertEqual(search_lane.prompt("x"), search_lane.PROMPT.format(query="x"))
+
+    def test_non_finite_usage_is_dropped(self):
+        self.assertIsNone(search_lane._usage_int(float("nan")))
+        self.assertIsNone(search_lane._usage_int(float("inf")))
+        self.assertIsNone(search_lane._usage_int(True))
+        self.assertEqual(search_lane._usage_int(7.0), 7)
+        out = {"type": "result", "is_error": False, "result": "r",
+               "usage": {"input_tokens": float("nan"), "output_tokens": 3}}
+        done = (0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE + [out]), "")
+        with mock.patch.object(search_lane, "_run_cli", return_value=done):
+            res = search_lane.run("claude", "q", None)
+        self.assertEqual(res.usage, {"output_tokens": 3})
+
+    def test_a_search_is_recorded_in_the_usage_ledger_on_its_claude_lane(self):
+        self.post(self.SEARCH)
+        self.assertEqual(self.ledger, [("claude", search_lane.SEARCH_MODEL, {"input_tokens": 11, "output_tokens": 7})])
+        self.ledger.clear()
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
+            self.post(self.SEARCH)
+        self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
+        self.ledger.clear()
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        self.post(self.SEARCH)
+        self.assertEqual(self.ledger, [], "a failed search spent nothing worth learning from and is not recorded")
+
+    def _bounded_run(self, mode, **env):
+        """search_lane.run on the fake CLI in `mode` with small caps; returns (failure kind, seconds, slot delta)."""
+        os.environ["FAKE_SEARCH_MODE"] = mode
+        for k, v in env.items():
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        before = search_lane._slots._value
+        t0 = time.monotonic()
+        with mock.patch.object(search_lane, "STDOUT_CAP", 16 * 1024), \
+                mock.patch.object(search_lane, "STDERR_CAP", 4 * 1024), \
+                self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        return cm.exception.kind, time.monotonic() - t0, search_lane._slots._value - before
+
+    def test_oversized_stdout_kills_the_child_and_fails_output_too_large(self):
+        kind, took, delta = self._bounded_run("bigout", FAKE_SEARCH_BYTES=str(1024 * 1024))
+        self.assertEqual(kind, "output_too_large")
+        self.assertLess(took, 8, "the child is killed on overflow, not waited out (it sleeps 30 s)")
+        self.assertEqual(delta, 0, "the slot is released")
+
+    def test_oversized_stderr_kills_the_child_and_fails_output_too_large(self):
+        kind, took, delta = self._bounded_run("bigerr", FAKE_SEARCH_BYTES=str(256 * 1024))
+        self.assertEqual(kind, "output_too_large")
+        self.assertLess(took, 8)
+        self.assertEqual(delta, 0)
+
+    def test_output_under_the_caps_is_not_cut(self):
+        # 32 KiB to stderr is under the default 256 KiB cap; the child then hangs, so the run ends as a timeout
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_BYTES"] = "bigerr", str(32 * 1024)
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_BYTES", None)
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=1)
+        self.assertEqual(cm.exception.kind, "timeout")
+
+    def test_timeout_kills_the_child_and_releases_the_slot(self):
+        kind, took, delta = self._bounded_run("sleep", FAKE_SEARCH_SLEEP="30")
+        self.assertEqual(kind, "timeout")
+        self.assertLess(took, 14)
+        self.assertEqual(delta, 0)
+
+    def test_an_oversized_reply_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_BYTES"] = "bigout", str(64 * 1024)
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_BYTES", None)
+        before = search_lane._slots._value
+        with mock.patch.object(search_lane, "STDOUT_CAP", 16 * 1024):
+            r = self.post(self.SEARCH)
+        self.assertIn("output_too_large", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+        self.assertEqual(search_lane._slots._value, before)
+
+    def _real_ledger_home(self):
+        """Stop the record_async mock and point CORTADOS_HOME at a throwaway dir: the real writer runs."""
+        self._ledger_patch.stop()
+        home = tempfile.mkdtemp(prefix="cortados-ledger-")
+        self.addCleanup(shutil.rmtree, home, True)
+        p = mock.patch.dict(os.environ, {"CORTADOS_HOME": home})
+        p.start()
+        self.addCleanup(p.stop)
+        return home
+
+    def _ledger_rows(self, home, want, wait=5.0):
+        db, rows, until = os.path.join(home, "usage.db"), [], time.monotonic() + wait
+        while time.monotonic() < until:
+            if os.path.exists(db):
+                c = sqlite3.connect(db)
+                try:
+                    rows = c.execute("SELECT lane, model, input_tokens, output_tokens FROM usage").fetchall()
+                except sqlite3.OperationalError:            # table not created yet
+                    rows = []
+                finally:
+                    c.close()
+                if len(rows) >= want:
+                    break
+            time.sleep(0.05)
+        return rows
+
+    def test_a_completed_search_persists_its_ledger_row(self):
+        home = self._real_ledger_home()
+        r = self.post(self.SEARCH)
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(self._ledger_rows(home, 1), [("claude", search_lane.SEARCH_MODEL, 11, 7)])
+
+    def test_a_failed_search_persists_no_ledger_row(self):
+        home = self._real_ledger_home()
+        os.environ["FAKE_SEARCH_MODE"] = "fail"
+        r = self.post(self.SEARCH)
+        self.assertIn("exit_3", r["content"][0]["text"])
+        self.assertEqual(self._ledger_rows(home, 1, wait=1.0), [])
+
+    def test_a_ledger_write_failure_is_logged_at_error_with_the_lane_and_run(self):
+        home = self._real_ledger_home()
+        os.mkdir(os.path.join(home, "usage.db"))            # a directory where the db file must go: the write fails
+        with self.assertLogs("cortados.usage_ledger", "ERROR") as logs:
+            r = self.post(self.SEARCH, headers={"x-cortados-run-id": "search-run-0001"})
+            until = time.monotonic() + 5
+            while not logs.records and time.monotonic() < until:
+                time.sleep(0.05)
+        self.assertIn("https://example.com/c", r["content"][0]["text"], "the reply is unaffected")
+        msg = logs.output[0]
+        self.assertIn("ERROR", msg)
+        self.assertIn("lane claude", msg)
+        self.assertIn("search lane, run search-run-0001", msg)
+
+    def _refused(self, headers):
+        """POST the search under `headers`; (status, error message). The CLI must never have been invoked."""
+        try:
+            self.post(self.SEARCH, headers=headers)
+            return 200, ""
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())["error"]["message"]
+
+    def test_an_excluded_search_model_is_refused_before_launch(self):
+        code, msg = self._refused({server.EXCLUDE_MODEL_HEADER: search_lane.SEARCH_MODEL})
+        self.assertEqual(code, 400)
+        self.assertIn("excluded model", msg)
+        self.assertEqual(self.search_calls(), [], "the CLI is never invoked")
+        code, _ = self._refused({server.EXCLUDE_MODEL_HEADER: "sub/"})     # an item naming no model: refused too
+        self.assertEqual(code, 400)
+        self.assertEqual(self.search_calls(), [])
+        self.post(self.SEARCH, headers={server.EXCLUDE_MODEL_HEADER: "gpt-5.5"})   # another model: searched
+        self.assertEqual(len(self.search_calls()), 1)
+
+    def test_a_floor_with_no_enforcer_fails_closed_before_launch(self):
+        self.reg.floor_search = None
+        code, msg = self._refused({server.MIN_LEFT_HEADER: "50"})
+        self.assertEqual(code, 429)
+        self.assertIn("x-cortados-min-left-pct", msg)
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(self.ledger, [])
+
+    def test_a_floor_refusal_on_the_search_account_is_429_before_launch(self):
+        seen = []
+        self.reg.floor_search = lambda cand, floor: seen.append((cand, floor)) or "week: 3% left"
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(self.ACCTS):
+            code, msg = self._refused({server.MIN_LEFT_HEADER: "50"})
+        self.assertEqual(code, 429)
+        self.assertIn("week: 3% left", msg)
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(seen, [({"lane": "claude#b", "provider": "claude-cli#b", "account": "b", "config_dir": "/cfg/b"},
+                                 50.0)], "the floor is checked on the account the search executes on")
+
+    def test_a_failing_floor_check_fails_closed_before_launch(self):
+        def boom(cand, floor):
+            raise RuntimeError("ledger unreadable")
+        self.reg.floor_search = boom
+        code, msg = self._refused({server.MIN_LEFT_HEADER: "5"})
+        self.assertEqual(code, 429)
+        self.assertIn("RuntimeError", msg)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_a_floor_the_search_account_clears_runs_the_search(self):
+        self.reg.floor_search = lambda cand, floor: None
+        r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+        self.assertIn("https://example.com/c", r["content"][0]["text"])
+        self.assertEqual(len(self.search_calls()), 1)
+
+    def test_floor_search_reserves_through_floor_reserve(self):
+        # the production wiring: floor.reserve on the search model; no usage reading -> held, nothing reserved
+        state = Path(self.scratch) / "state"
+        core_stub = mock.Mock(STATE=state, subscription_readings=mock.Mock(return_value={}))
+        why = server._floor_search(core_stub, {"lane": "claude", "provider": "claude-cli", "account": None,
+                                               "config_dir": None}, 5.0)
+        self.assertIn("no current usage reading", why)
+        self.assertFalse((state / "floor-reservations.jsonl").exists())
+
+    def test_the_group_is_signalled_before_the_child_is_reaped(self):
+        # A reaped child's pid may be reused at once; signalling it as a group after the reap could kill a stranger.
+        calls = []
+        real_killpg, real_wait = os.killpg, subprocess.Popen.wait
+
+        def killpg(pid, sig):
+            calls.append("killpg")
+            return real_killpg(pid, sig)
+
+        def wait(proc, *a, **kw):
+            calls.append("wait")
+            return real_wait(proc, *a, **kw)
+
+        with mock.patch.object(search_lane.os, "killpg", side_effect=killpg), \
+                mock.patch.object(subprocess.Popen, "wait", autospec=True, side_effect=wait):
+            res = search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        self.assertIn("example.com", res.text)
+        self.assertEqual(calls[:2], ["killpg", "wait"])
+
+    def test_a_selector_failure_still_signals_reaps_and_closes_both_pipes(self):
+        # EMFILE at selector construction, with the child already running: cleanup must still run in full.
+        os.environ["FAKE_SEARCH_MODE"], os.environ["FAKE_SEARCH_SLEEP"] = "sleep", "30"
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_SLEEP", None)
+        calls, procs = [], []
+        real_killpg, real_wait = os.killpg, subprocess.Popen.wait
+
+        def killpg(pid, sig):
+            calls.append("killpg")
+            return real_killpg(pid, sig)
+
+        def wait(proc, *a, **kw):
+            calls.append("wait")
+            procs.append(proc)
+            return real_wait(proc, *a, **kw)
+
+        slots, t0 = search_lane._slots._value, time.monotonic()
+        with mock.patch.object(search_lane.selectors, "DefaultSelector", side_effect=OSError(24, "Too many open files")), \
+                mock.patch.object(search_lane.os, "killpg", side_effect=killpg), \
+                mock.patch.object(subprocess.Popen, "wait", autospec=True, side_effect=wait), \
+                self.assertRaises(OSError):
+            search_lane.run(self.reg.search_bin, "q", None, timeout=10)
+        self.assertLess(time.monotonic() - t0, 8, "the child is killed, not waited out")
+        self.assertEqual(calls[:2], ["killpg", "wait"])
+        p = procs[0]
+        self.assertEqual(p.returncode, -9, "the running child was killed and reaped")
+        self.assertTrue(p.stdout.closed and p.stderr.closed, "both pipes are closed")
+        self.assertEqual(search_lane._slots._value, slots)
+
+    def _fds(self):
+        return len(os.listdir("/dev/fd"))
+
+    def test_a_detached_writer_holding_the_pipes_fails_incomplete_within_the_timeout(self):
+        os.environ["FAKE_SEARCH_MODE"] = "detach"
+        pidfile = os.path.join(self.scratch, "detached.pid")
+        os.environ["FAKE_SEARCH_PIDFILE"] = pidfile
+        self.addCleanup(os.environ.pop, "FAKE_SEARCH_PIDFILE", None)
+
+        def reap_writer():
+            try:
+                os.kill(int(Path(pidfile).read_text()), 9)
+            except (OSError, ValueError):
+                pass
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+        self.addCleanup(reap_writer)
+        fds, threads, slots = self._fds(), threading.active_count(), search_lane._slots._value
+        t0 = time.monotonic()
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run(self.reg.search_bin, "q", None, timeout=2)
+        took = time.monotonic() - t0
+        self.assertEqual(cm.exception.kind, "incomplete_output",
+                         "a full-looking answer without EOF on stdout is not taken as a success")
+        self.assertLess(took, 6, "the run ends at its deadline, not when the detached writer lets go (30 s)")
+        self.assertEqual(search_lane._slots._value, slots, "the slot is released")
+        self.assertEqual(self._fds(), fds, "both pipes are closed")
+        self.assertEqual(threading.active_count(), threads, "no reader thread is left behind")
+        reap_writer()
+        # through the endpoint: unavailable, and no usage-ledger row
+        with mock.patch.object(search_lane, "SEARCH_TIMEOUT_S", 2):
+            r = self.post(self.SEARCH)
+        self.assertIn("incomplete_output", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+        self.assertEqual(search_lane._slots._value, slots)
+
+    def test_start_failure_releases_the_slot(self):
+        before = search_lane._slots._value
+        with self.assertRaises(search_lane.SearchFailed) as cm:
+            search_lane.run([os.path.join(self.scratch, "no-such-cli")], "q", None)
+        self.assertEqual(cm.exception.kind, "start_failed")
+        self.assertEqual(search_lane._slots._value, before)
+
+    def test_login_takes_dir_and_lane_from_one_accounts_snapshot(self):
+        # accounts.json changes between reads: account b moves from /cfg/b1 (lane claude#b) to /cfg/b2 (lane claude#x).
+        # Whatever is read, the pair must come from one snapshot, and the file is read once per search.
+        snaps = [[{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+                  {"lane": "claude#b", "account": "b", "config_dir": "/cfg/b1"}],
+                 [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+                  {"lane": "claude#x", "account": "b", "config_dir": "/cfg/b2"}]]
+        from cortados_router import core
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
+                mock.patch.object(core, "_vendor_accounts", side_effect=snaps) as reads:
+            who = search_lane.login()
+        self.assertEqual((who.config_dir, who.ledger_lane), ("/cfg/b1", "claude#b"))
+        self.assertEqual(reads.call_count, 1)
+        # end to end: the CLI runs on the dir and the ledger row is charged on the lane of the same snapshot
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), \
+                mock.patch.object(core, "_vendor_accounts", side_effect=list(snaps)) as reads:
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[-1]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b1"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
+        self.assertEqual(reads.call_count, 1)
+
+    def test_account_row(self):
+        from cortados_router import core
+        self.assertEqual(core.account_row(self.ACCTS, "b")["config_dir"], "/cfg/b")
+        self.assertIsNone(core.account_row(self.ACCTS, "zz"))
+        self.assertIsNone(core.account_row(self.ACCTS, None))
+
+    def test_argv_streams_events(self):
+        a = search_lane.argv("claude", "q")
+        self.assertEqual(a[a.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", a)
+
+    def test_a_reply_without_a_search_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"] = "nosearch"
+        r = self.post(self.SEARCH)
+        text = r["content"][0]["text"]
+        self.assertIn("web_search is unavailable on this CortadOS lane", text)
+        self.assertIn("no search was performed", text)
+        self.assertNotIn("example.com", text, "an answer from memory must not reach the client")
+        self.assertEqual(self.ledger, [])
+
+    def test_a_failed_websearch_tool_call_is_unavailable_and_unrecorded(self):
+        os.environ["FAKE_SEARCH_MODE"] = "toolerror"
+        r = self.post(self.SEARCH)
+        self.assertIn("no search was performed", r["content"][0]["text"])
+        self.assertEqual(self.ledger, [])
+
+    def test_search_evidence(self):
+        ev = search_lane.search_evidence
+        self.assertTrue(ev(SEARCH_EVIDENCE))
+        self.assertFalse(ev([]))
+        self.assertFalse(ev(SEARCH_EVIDENCE[:1]), "a tool_use with no result is not a search")
+        self.assertFalse(ev(SEARCH_EVIDENCE[1:]), "a result for no WebSearch call is not a search")
+        other = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "ws1", "name": "Bash"}]}},
+                 SEARCH_EVIDENCE[1]]
+        self.assertFalse(ev(other))
+        empty = [SEARCH_EVIDENCE[0], {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "ws1", "content": [{"type": "text", "text": " "}]}]}}]
+        self.assertFalse(ev(empty))
+        # a server-side usage count of 0 (what the live CLI reports even after a search) does not veto stream evidence
+        done = SEARCH_EVIDENCE + [{"type": "result", "is_error": False, "result": "first"},
+                                  {"type": "result", "is_error": False, "result": "last",
+                                   "usage": {"server_tool_use": {"web_search_requests": 0}}}]
+        with mock.patch.object(search_lane, "_run_cli", return_value=(
+                0, "noise\n" + "\n".join(json.dumps(e) for e in done), "")):
+            self.assertEqual(search_lane.run("claude", "q", None).text, "last", "the last result line is the answer")
+        with mock.patch.object(search_lane, "_run_cli", return_value=(
+                0, "\n".join(json.dumps(e) for e in SEARCH_EVIDENCE), "")):
+            with self.assertRaises(search_lane.SearchFailed) as cm:
+                search_lane.run("claude", "q", None)
+        self.assertEqual(cm.exception.kind, "bad_output")
+
+    def _accounts(self, rows):
+        from cortados_router import core
+        return mock.patch.object(core, "_vendor_accounts", return_value=rows)
+
+    ACCTS = [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"},
+             {"lane": "claude#b", "account": "b", "config_dir": "/cfg/b"}]
+
+    def test_configured_account_runs_and_is_charged_on_that_account(self):
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b", "CLAUDE_CONFIG_DIR": "/cfg/a"}), \
+                self._accounts(self.ACCTS):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/b"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude#b"])
+
+    def test_default_with_accounts_runs_on_the_first_account_explicitly_despite_an_inherited_dir(self):
+        # The provider runs with account b's dir in its env; the default search must not inherit it while charging
+        # `claude`: it runs on the first account (the bare claude lane) explicitly.
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/cfg/b"}), self._accounts(self.ACCTS):
+            os.environ.pop(search_lane.ACCOUNT_ENV, None)
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {"CLAUDE_CONFIG_DIR": "/cfg/a"})
+        self.assertEqual([row[0] for row in self.ledger], ["claude"])
+
+    def test_an_inherited_dir_matching_no_account_fails_before_the_cli_is_launched(self):
+        # The login cannot be charged to any lane, so no quota is spent on it: refused before launch, never run unrecorded.
+        default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/somewhere/else"}), self._accounts(default):
+            os.environ.pop(search_lane.ACCOUNT_ENV, None)
+            r = self.post(self.SEARCH)
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [], "the CLI is never invoked")
+        self.assertEqual(self.ledger, [])
+
+    def test_a_named_account_without_a_lane_fails_before_the_cli_is_launched(self):
+        rows = [{"lane": "claude", "account": "a", "config_dir": "/cfg/a"}, {"account": "b", "config_dir": "/cfg/b"}]
+        with mock.patch.dict(os.environ, {search_lane.ACCOUNT_ENV: "b"}), self._accounts(rows):
+            r = self.post(self.SEARCH)
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+        self.assertEqual(self.ledger, [])
+
+    def test_default_without_accounts_or_inherited_dir_is_charged_to_claude(self):
+        default = [{"lane": "claude", "provider": "claude-cli", "account": None, "config_dir": None}]
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", search_lane.ACCOUNT_ENV)}
+        with mock.patch.dict(os.environ, env, clear=True), self._accounts(default):
+            self.post(self.SEARCH)
+        self.assertEqual(self.search_calls()[0]["env"], {})
+        self.assertEqual([row[0] for row in self.ledger], ["claude"])
+
+    def test_unreadable_accounts_fail_the_search(self):
+        from cortados_router import core
+        with mock.patch.object(core, "_vendor_accounts", side_effect=core.AccountsConfigError("bad")):
+            r = self.post(self.SEARCH)
+        self.assertIn("no_claude_lane", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
+
+    def test_forced_client_tool_choice_is_still_400(self):
+        self.assertEqual(self.status_of(dict(self.SEARCH, tools=[ServerToolTests.WEB_SEARCH, READ_TOOL])), 400)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_a_non_search_server_tool_is_not_sent_to_the_search_lane(self):
+        r = self.post({"model": "cortados", "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}],
+                       "messages": [{"role": "user", "content": "x"}]})
+        self.assertIn("unavailable", r["content"][0]["text"])
+        self.assertEqual(self.search_calls(), [])
 
 
 if __name__ == "__main__":

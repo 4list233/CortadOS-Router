@@ -521,6 +521,28 @@ class MinLeftFloorTests(unittest.TestCase):
         p = core.STATE / "floor-reservations.jsonl"
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
+    def test_block_uses_exact_lane_cost_and_conservative_unknown_default(self):
+        from cortados_router.provider import floor
+        from unittest import mock
+        cases = [("claude", 0.5), ("claude#b", 0.5), ("codex", 0.15),
+                 ("claude#new", 1.0), ("codex#new", 1.0), ("unknown", 1.0),
+                 ("claude-cli", 1.0), ("", 1.0)]
+        for lane, cost in cases:
+            for pool, scale in (("all", 1.0), ("fable", 2.0)):
+                with self.subTest(lane=lane, pool=pool):
+                    self.assertEqual(floor.assumed_pct_per_call(lane), cost)
+                    cand = {"lane": lane, "provider": "claude-cli"}
+                    key = f"{lane}|win|week" if pool == "all" else f"{lane}|pool|fable"
+                    # Two outstanding runs plus this run fit exactly, but not 0.01% below.
+                    for short, blocked in ((0.0, False), (0.01, True)):
+                        window = self.win(100 - (5 + 3 * cost * scale - short), pool)
+                        windows = [window] if pool == "all" else [self.win(10), window]
+                        rd = {lane: {"fetched_at": self.now, "windows": windows}}
+                        with mock.patch.object(floor, "_identity_unproven", return_value=None):
+                            why, _ = floor.block(core, cand, "claude-fable-5-1", 5, rd,
+                                                 {key: 2}, self.now)
+                        self.assertEqual(why is not None, blocked, why)
+
     def test_absent_header_keeps_todays_choice_and_reserves_nothing(self):
         core.subscription_readings = lambda: (_ for _ in ()).throw(AssertionError("no floor: readings not consulted"))
         r = self.pin("sub/opus")
@@ -539,8 +561,8 @@ class MinLeftFloorTests(unittest.TestCase):
         self.assertEqual(set(lanes), {("claude-cli", "claude")})
 
     def test_low_account_excluded_before_ranking_and_reservations_count(self):
-        # claude at 3% left is out; claude#b (a reserve) at 8% left takes three 1% turns, then everything is refused
-        self.readings([self.win(97)], [self.win(92)])
+        # claude at 3% left is out; claude#b at 6.5% left takes three 0.5% runs, then refuses.
+        self.readings([self.win(97)], [self.win(93.5)])
         got = [self.pin("sub/opus", 5) for _ in range(4)]
         self.assertEqual([r.get("provider") for r in got[:3]], ["claude-cli#b"] * 3)
         self.assertTrue(got[3].get("quota_blocked"))
@@ -548,10 +570,10 @@ class MinLeftFloorTests(unittest.TestCase):
         self.assertEqual([row["lane"] for row in self.ledger()], ["claude#b"] * 3)
 
     def test_fable_pool_costs_twice_per_turn(self):
-        self.readings([self.win(10), self.win(93, "fable")], [self.win(10), self.win(93.5, "fable")])
-        r = self.pin("sub/fable", 5)                                       # claude: 7% - 2% = 5% left: admitted
+        self.readings([self.win(10), self.win(94, "fable")], [self.win(10), self.win(94.5, "fable")])
+        r = self.pin("sub/fable", 5)                                       # claude: 6% - 1% = 5% left: admitted
         self.assertEqual(r.get("provider"), "claude-cli")
-        r = self.pin("sub/fable", 5)                                       # claude: 7% - 4% < 5%; claude#b: 6.5% - 2% < 5%
+        r = self.pin("sub/fable", 5)                                       # claude: 6% - 2% < 5%; claude#b: 5.5% - 1% < 5%
         self.assertTrue(r.get("quota_blocked"), r)
 
     def test_carried_forward_low_or_figureless_pool_holds(self):
@@ -590,7 +612,7 @@ class MinLeftFloorTests(unittest.TestCase):
             self.assertEqual(self.pin("sub/opus", 5).get("provider"), "claude-cli")
 
     def test_one_conversation_is_charged_once_not_per_turn(self):
-        self.readings([self.win(92)], [self.win(10)])                     # 8% left: three runs fit
+        self.readings([self.win(93.5)], [self.win(10)])                   # 6.5% left: three runs fit
         route = self.pin("sub/opus", 5)
         for _ in range(20):                                               # 20 continuations of the same run
             self.assertIsNone(routing.floor_turn(core, route, 5))
@@ -614,8 +636,8 @@ class MinLeftFloorTests(unittest.TestCase):
         for _ in range(2):
             self.assertEqual(self.pin("sub/fable", 5).get("provider"), "claude-cli")
         self.assertTrue(all("claude|pool|fable" in row["keys"] for row in self.ledger()))
-        self.readings([self.win(10), self.win(90, "fable")], [self.win(10), self.win(99, "fable")])
-        r = self.pin("sub/fable", 5)                                      # 10% - (2 outstanding + 1) x 2% = 4% < 5%
+        self.readings([self.win(10), self.win(92.5, "fable")], [self.win(10), self.win(99, "fable")])
+        r = self.pin("sub/fable", 5)                                      # 7.5% - (2 outstanding + 1) x 1% = 4.5% < 5%
         self.assertTrue(r.get("quota_blocked"), r)
         self.assertIn("2 run(s) outstanding", r["error"])
 

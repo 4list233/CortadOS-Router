@@ -1,9 +1,11 @@
 """integrations/bot-gateway/install.sh in a throwaway HOME with fake tailscale / launchctl / curl on PATH.
 Nothing real is touched: no LaunchAgent is loaded, no network call is made, no real provider.env is read."""
+import json
 import os
 import plistlib
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,8 +37,8 @@ class InstallerHarness(unittest.TestCase):
         p.write_text("#!/bin/sh\n" + body)
         p.chmod(0o755)
 
-    def run_sh(self, *args):
-        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin"}
+    def run_sh(self, *args, extra_env=None):
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin", **(extra_env or {})}
         return subprocess.run(["sh", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
 
     def provider_env(self, text):
@@ -106,7 +108,7 @@ class PlistTest(InstallerHarness):
         return doc
 
     def gateway_args(self, cmdline):
-        self.assertIn(f"--host {FAKE_IP} --port 8434", cmdline)
+        self.assertIn("--host 127.0.0.1 --port 8434", cmdline)
         self.assertIn(f"--token-file {self.token_path()}", cmdline)
         self.assertIn(f"--workspace-root {self.home / 'cortados-bot-workspace'}", cmdline)
 
@@ -306,12 +308,203 @@ class PlistTest(InstallerHarness):
                 self._fake("tailscale", f"echo {ip}\n")
                 r = self.run_sh("plist")
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn(f"--host {ip} ", " ".join(plistlib.loads(self.plist().read_bytes())["ProgramArguments"]))
+                doc = plistlib.loads(self.plist().read_bytes())
+                self.assertIn("--host 127.0.0.1 ", " ".join(doc["ProgramArguments"]))
+                self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], f"http://{ip}:8432")
+
+    def test_allowed_host_is_read_from_environment_into_plist(self):
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        self.assertEqual(self.run_sh("token").returncode, 0)
+        r = self.run_sh("plist", extra_env={"CORTADOS_BOT_ALLOWED_HOST": "gateway.example.test"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = plistlib.loads(self.plist().read_bytes())
+        self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_BOT_ALLOWED_HOST"], "gateway.example.test")
+
+    def test_funnel_reserved_port_preserves_unrelated_handlers_and_verifies_owner(self):
+        calls = Path(self.tmp.name) / "tailscale.calls"
+        state = Path(self.tmp.name) / "funnel.json"
+        unrelated = ('{"TCP":{"443":{"HTTPS":true}},"Web":{"public.example:443":{"Handlers":'
+                     '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":{"public.example:443":true}}')
+        ours = ('{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":'
+                '{"public.example:443":{"Handlers":{"/other":{"Proxy":"http://127.0.0.1:9000"}}},'
+                '"public.example:8443":{"Handlers":{"/mcp":{"Proxy":"http://127.0.0.1:8434/mcp"}}}},'
+                '"AllowFunnel":{"public.example:443":true,"public.example:8443":true}}')
+        state.write_text(unrelated)
+        self._fake("tailscale", f'''echo "$*" >> {calls}
+if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; exit 0; fi
+case "$*" in
+  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp") printf '%s' '{ours}' > {state};;
+  "funnel --https=8443 --set-path /mcp off") printf '%s' '{unrelated}' > {state};;
+esac
+''')
+        self.assertEqual(self.run_sh("funnel-on").returncode, 0)
+        owner = self.home / ".cortados" / "bot-gateway-funnel-owner"
+        self.assertTrue(owner.exists())
+        self.assertEqual(self.run_sh("funnel-off").returncode, 0)
+        self.assertFalse(owner.exists())
+        self.assertEqual(state.read_text(), unrelated)
+        commands = [line for line in calls.read_text().splitlines() if "status --json" not in line]
+        self.assertEqual(commands, [
+            "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp",
+            "funnel --https=8443 --set-path /mcp off",
+        ])
+
+    def test_funnel_refuses_reserved_port_conflict_and_unowned_removal(self):
+        state = Path(self.tmp.name) / "funnel.json"
+        state.write_text('{"TCP":{"8443":{"HTTPS":true}},"Web":{"public.example:8443":{"Handlers":'
+                         '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":'
+                         '{"public.example:8443":true}}')
+        self._fake("tailscale", f'''if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; fi
+''')
+        self.assertNotEqual(self.run_sh("funnel-on").returncode, 0)
+        self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         r = self.run_sh("plist")
         self.assertNotEqual(r.returncode, 0)
+
+
+class FunnelReviewTest(InstallerHarness):
+    def setUp(self):
+        super().setUp()
+        self.state = Path(self.tmp.name) / "funnel.json"
+        self.ts_calls = Path(self.tmp.name) / "tailscale.calls"
+        self.owner = self.home / ".cortados" / "bot-gateway-funnel-owner"
+        self.expected = "8443 /mcp http://127.0.0.1:8434/mcp\n"
+        self.ours = {"TCP": {"8443": {"HTTPS": True}},
+                     "Web": {"public.example:8443": {"Handlers": {
+                         "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}},
+                     "AllowFunnel": {"public.example:8443": True}}
+        self.state.write_text("{}")
+        self._fake("tailscale", f"""if [ "$1 $2 $3" = "funnel status --json" ]; then
+  /bin/cat {self.state}; exit 0
+fi
+echo "$*" >> {self.ts_calls}
+case "$*" in
+  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp")
+    [ "$(/bin/cat {self.owner})" = "pending {self.expected.strip()}" ] || exit 9
+    printf '%s' '{json.dumps(self.ours)}' > {self.state};;
+  "funnel --https=8443 --set-path /mcp off") printf '{{}}' > {self.state};;
+esac
+""")
+
+    def marker(self, pending=False):
+        self.owner.parent.mkdir(exist_ok=True)
+        self.owner.write_text(("pending " if pending else "") + self.expected)
+        self.owner.chmod(0o600)
+
+    def fail_record(self, action):
+        # Fail only the record operation, not status parsing; never invoke a real tailscale.
+        self._fake("python3", f'if [ "$4" = "{action}" ]; then exit 1; fi\n'
+                              'exec /usr/bin/python3 "$@"\n')
+
+    def test_exact_config_rejects_missing_conflicting_and_extended_tcp(self):
+        for listener in (None, {"TCPForward": "127.0.0.1:9000"},
+                         {"HTTPS": True, "TCPForward": "127.0.0.1:9000"},
+                         {"HTTPS": 1}, {"HTTPS": False}):
+            with self.subTest(listener=listener):
+                cfg = dict(self.ours, TCP={} if listener is None else {"8443": listener})
+                self.state.write_text(json.dumps(cfg))
+                self.marker()
+                self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+                self.assertFalse(self.ts_calls.exists())
+                self.assertTrue(self.owner.exists())
+
+    def test_exact_config_rejects_unknown_web_and_top_level_fields(self):
+        for cfg in (dict(self.ours, Unknown={}),
+                    dict(self.ours, Web={"public.example:8443": dict(
+                        self.ours["Web"]["public.example:8443"], Unknown=True)})):
+            with self.subTest(cfg=cfg):
+                self.state.write_text(json.dumps(cfg))
+                self.marker()
+                self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+                self.assertFalse(self.ts_calls.exists())
+
+    def test_intent_is_present_before_activation_and_finalized(self):
+        r = self.run_sh("funnel-on")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.owner.read_text(), self.expected)
+        self.assertEqual(stat.S_IMODE(self.owner.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.state.read_text()), self.ours)
+
+    def test_intent_write_failure_never_activates(self):
+        self.fail_record("create")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+        self.assertFalse(self.owner.exists())
+
+    def test_intent_fsync_failure_never_activates_and_can_be_cleaned(self):
+        # Execute the actual record helper, but fail its durability barrier after writing.
+        self._fake("python3", """if [ "$4" = create ]; then
+  exec /usr/bin/python3 -I -c '
+import os, sys
+code = sys.stdin.read()
+sys.argv = ["-", *sys.argv[1:]]
+def fail(fd):
+    raise OSError("injected fsync failure")
+os.fsync = fail
+exec(compile(code, "<record>", "exec"))
+' "$3" "$4" "$5"
+fi
+exec /usr/bin/python3 "$@"
+""")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("injected fsync failure", r.stderr)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
+
+    def test_lock_prevents_pending_cleanup_during_activation(self):
+        self.marker(pending=True)
+        Path(str(self.owner) + ".lock").mkdir()
+        for command in ("funnel-on", "funnel-off"):
+            with self.subTest(command=command):
+                r = self.run_sh(command)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("operation locked", r.stderr)
+                self.assertTrue(self.owner.exists())
+                self.assertFalse(self.ts_calls.exists())
+
+    def test_exclusive_intent_refuses_existing_record(self):
+        self.marker(pending=True)
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+
+    def test_finalize_failure_retains_recoverable_durable_intent(self):
+        self.fail_record("finalize")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(json.loads(self.state.read_text()), self.ours)
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+
+    def test_empty_pending_record_cleanup_does_not_mutate_tailscale(self):
+        self.marker(pending=True)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
+
+    def test_conflicting_pending_record_is_retained_without_mutation(self):
+        self.marker(pending=True)
+        self.state.write_text(json.dumps(dict(self.ours, TCP={})))
+        r = self.run_sh("funnel-off")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
 
 
 class LaunchctlTest(InstallerHarness):
@@ -335,6 +528,16 @@ class LaunchctlTest(InstallerHarness):
         self.assertIn(f"bootstrap gui/{uid} {self.plist()}", calls)
         self.assertIn(f"print gui/{uid}/com.cortados.bot-gateway", calls)
         self.assertEqual(calls.count(f"bootout gui/{uid}/com.cortados.bot-gateway"), 2)   # load's reset + unload
+
+    def test_status_uses_allowed_host_from_installed_plist(self):
+        self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        self.run_sh("token")
+        self.assertEqual(self.run_sh("plist", extra_env={"CORTADOS_BOT_ALLOWED_HOST": "gateway.example.test"}).returncode, 0)
+        curl_calls = Path(self.tmp.name) / "curl.calls"
+        self._fake("curl", f'echo "$*" >> {curl_calls}\nprintf 401\n')
+        s = self.run_sh("status")
+        self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+        self.assertIn("-H Host: gateway.example.test", curl_calls.read_text())
 
     def test_status_never_prints_log_contents(self):
         log = self.home / ".cortados" / "bot-gateway.out"
@@ -415,6 +618,31 @@ class LauncherTest(LauncherBase):
                                "CORTADOS_PROVIDER_URL": f"http://{FAKE_IP}:8432"})
         self.assertNotIn(PROVIDER_SECRET, err)
 
+    def test_https_file_fallback(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        endpoint = Path(self.tmp.name) / ".config/cortados/provider-url"
+        endpoint.parent.mkdir(parents=True)
+        endpoint.write_text(" https://provider.example:8443/\n")
+        self.environ.pop("CORTADOS_PROVIDER_URL")
+        rc, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls[0][2]["CORTADOS_PROVIDER_URL"], "https://provider.example:8443")
+
+    def test_invalid_ambient_route_timeout_does_not_break_launcher_import(self):
+        self.write(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
+        launch = str(SCRIPT.parent / "launch.py")
+        argv = ["--provider-env", str(self.envfile), "--python", "/usr/bin/python3", "--",
+                "--host", FAKE_IP, "--port", "8434"]
+        code = ("import importlib.util; "
+                "s=importlib.util.spec_from_file_location('isolated_launch', %r); "
+                "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "raise SystemExit(m.main(%r, environ=%r, execve=lambda *a: None))"
+                % (launch, argv, self.environ))
+        env = dict(os.environ, HOME=self.tmp.name, CORTADOS_HOME=self.tmp.name + "/.cortados",
+                   CORTADOS_SCARCITY_REFRESH="off", CORTADOS_ROUTE_TIMEOUT_S="invalid-ambient-setting")
+        run = subprocess.run([sys.executable, "-I", "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_every_config_failure_exits_78(self):
         good = f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n"
         cases = {
@@ -430,7 +658,7 @@ class LauncherTest(LauncherBase):
             "group writable": (good, {"mode": 0o620}, None),
             "missing HOME": (good, {"unset": "HOME"}, None),
             "missing URL": (good, {"unset": "CORTADOS_PROVIDER_URL"}, None),
-            "https URL": (good, {"url": "https://x:1"}, None),
+            "invalid URL": (good, {"url": "ftp://invalid.example"}, None),
             "start_task flag": (good, {}, ("--enable-start-task",)),
             "not UTF-8": (None, {}, None),
         }

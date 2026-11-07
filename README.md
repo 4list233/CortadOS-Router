@@ -8,9 +8,23 @@ It works in three steps:
 2. **Turn the answers into a requirement.** Hard rules and a band table turn the answers into a capability requirement: a required benchmark index for that kind of work, a band (R0–R4), and a sub-agent count.
 3. **Pick the cheapest capable route.** Every model reachable through a subscription qualifies if its use-case index clears the requirement. The winner is the cheapest, where cost comes from the model's burn on its quota pool and that pool's live scarcity.
 
+## Provider URL
+
+Keep one provider base URL per machine in `~/.config/cortados/provider-url`
+(for example `https://provider.example:8443`). Python clients resolve a non-empty
+`CORTADOS_PROVIDER_URL` first, then `CORTADOS_PROVIDER_URL_FILE`, then that default
+file. Whitespace and trailing slashes are stripped; missing, unreadable or invalid
+selected files fail clearly. Only HTTP(S) URLs with a host are accepted.
+Remove old per-client URL overrides to make moving the provider a one-file edit.
+The session's `--provider-url` and the Claude mod's explicit `providerUrl` remain
+overrides; leave them unset to use the shared file. Restart long-running clients
+after editing it. HTTPS uses each client's normal certificate verification.
+
 ## Two ways to use it
 
 **As a model provider (the main path).** The router exposes a single model named `cortados` over an HTTP endpoint. Point any coding tool at it; each new conversation is scored once and routed to a model, which it keeps for its follow-up turns, while a standalone tool-less request is routed on its own. The chosen model's text comes back, and its tool calls run in the client (a tool bridge). Claude Code talks to it on `/v1/messages`, Codex on `/v1/responses`. A client can instead pin a model (`sub/<model>`, `api/<model>`; see the table below) and skip S1 entirely. See `docs/PROVIDER-PLAN.md`.
+
+Claude Code's WebSearch (a request whose only tool is the `web_search_*` server tool) is answered by a separate one-shot `claude -p` whose only tool is WebSearch, on a small Claude model; if that lane fails the model is told the search did not run. This is the one exception to "the headless CLI never runs a tool itself" (`cortados_router/provider/search_lane.py`, `docs/PROVIDER-PLAN.md` "Web search lane").
 
 Two more pieces build on the provider, both delegating work rather than routing a whole session:
 
@@ -32,6 +46,81 @@ The router is built to span machines on a private network (here, Tailscale). A w
 - **The client** is the coding tool. It points `ANTHROPIC_BASE_URL` at the provider and runs `--model cortados`.
 
 No model address is hardcoded. Devices live in `tables/s1-endpoints.json` (git-ignored; copy `tables/s1-endpoints.example.json`), so moving S1 to another machine is a one-line config change.
+
+## Studio capacity controller (experimental; NOT deployed)
+
+`cortados_router/studio_capacity.py` is a stdlib residency controller for a future
+Qwen3 8B Q4_K_M Studio deployment. **No routing, local pin admission, S1 job, or
+live configuration is changed.** Its status is an advisory ABI for a future
+`local_resources` reader; this branch does not connect that reader. Locals remain
+pin-only. Do not enable this service until Forest approves deployment.
+
+Policy (binary GiB):
+- Load only with no S1 heavy cycle/process and ≥16 GiB estimated reclaimable
+  memory continuously for 120 seconds (8 GiB model allowance + 8 GiB safety).
+- Unload immediately on an observed training/evaluation process, headroom <8 GiB
+  (host/S1 reserve), non-normal kernel memory pressure, or swap ≥4 GiB. The swap
+  ceiling tolerates the survey's existing ~1.84 GiB while conservatively shedding
+  excess pressure; it is not a measured optimum or a swap-growth detector.
+- Poll every 5 seconds. Missing/malformed measurements fail closed and attempt
+  unload. Restart or a sampling gap >10 seconds resets the dwell (no proof of
+  continuous safety across missing samples). A process lock prevents duplicate
+  controllers using the same status path.
+- Memory = vm_stat free + inactive + speculative pages × reported page size.
+  memory_pressure -Q's percentage is diagnostic, **not** a byte budget.
+- Detect actual `nightly.sh` processes through `ps -axo pid=,stat=,command=`,
+  conservatively reserving the entire cycle including MLX/Laya preflight;
+  also recognize direct MLX LoRA, Laya training and evaluate.py. Stopped
+  processes count as busy. The idle overnight.py supervisor does not.
+  `s1/overnight.py:status_path` points at historical dashboard events, not a
+  trustworthy live heavy-phase lease, so it is deliberately not used.
+
+**Deployment blockers:** polling cannot unload *before* training starts without
+an S1 lease/ack handshake. That integration is NOT implemented here. Nor does
+this branch prevent a pinned inference request from reloading an unloaded model.
+A future gate must enforce fresh availability, one request at a time, exact
+model/context identity and 8K total context. Residency here is verified by exact
+Ollama model name, not a model provenance/context smoke test. No production-ready
+admission guarantee is claimed.
+
+### Status format (v1)
+
+An atomic mode-0600 JSON file contains `version:1`, Unix `sampled_at` and
+`expires_at` (15 seconds after sampling), `model`, `context_tokens:8192`,
+`available` (boolean), `model_loaded`, `action` (load/unload/hold), `reason`,
+and optional `inputs`/`unload_error`. Inputs contain training/eval flags,
+reclaimable/swap bytes and diagnostic pressure percentage. `model_loaded` is
+observational; failures may leave actual residency unknown. Consumers must
+require version 1, exact model, available=true and
+`sampled_at <= now < expires_at`; absent, malformed, future or expired snapshots
+are unavailable. Status is local metadata, not an HTTP endpoint. A controller
+crash leaves a snapshot to expire, not permission to infer.
+
+### Proposed installation — for Forest to approve later
+
+Nothing below has been executed on the Studio:
+1. Review/implement the lease and gate blockers above; profile the idle/training
+   peaks. Approve an existing/provenance-checked Q4_K_M 8B runtime named
+   `studio-qwen3-8b:latest`; no model is downloaded or created by this daemon.
+2. Configure Ollama loopback-only on 127.0.0.1:11434 with
+   `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`. The controller uses
+   only loopback /api/ps and /api/generate, disables HTTP proxies, preloads with
+   a bounded keep_alive lease of 180 s (renewed only after a fresh safe observation, so a
+   dead controller frees RAM within 3 minutes) and num_ctx=8192, and unloads with keep_alive=0
+   (also on SIGTERM or a status-write failure). No pull API.
+3. Copy `integrations/studio-capacity/com.cortados.studio-capacity.plist.template`
+   to a temporary file; replace __HOME__ and __REPO__ with approved absolute
+   Studio paths and verify the Python path. Create the status/log parent
+   directories privately. Inspect with `plutil -lint` before installation.
+4. After explicit approval, copy the rendered file into
+   `~/Library/LaunchAgents/com.cortados.studio-capacity.plist`, then
+   `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cortados.studio-capacity.plist`.
+   Roll back using `launchctl bootout` with the same domain/file. Bootout alone
+   does not prove the model unloaded; confirm release separately before training.
+
+Focused acceptance (all I/O faked; fixtures include a local Mac vm_stat capture):
+`python3 -B -m unittest tests.test_studio_capacity`.
+Full regression and independent review are not part of this time-boxed build.
 
 ## The 12 questions
 
@@ -307,6 +396,19 @@ refused when on until local lanes are evaluated); an asleep or busy node fails t
 fallback. Ollama has no auth, so it stays on localhost and the node runs a token gate
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
+
+### Local models on the Pro
+
+The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.
+The switch defaults off: `python3 -B -m cortados_router.local_resources toggle on|off|status`
+(run with one of those three states). It uses `$CORTADOS_HOME/local-enabled` (default
+`~/.cortados/local-enabled`); status prints the switch, availability and reason.
+Unknown/failed `pmset -g ps` readings fail closed. Power is cached for at most 3 seconds;
+the switch is checked on every request, including again after body upload. Disabled requests
+return 503 without reaching Ollama. Fleet telemetry for node `pro` also includes this policy;
+its deployments are unavailable when the policy is disabled or unknown. This does not
+start/stop Ollama or unload resident models;
+existing in-flight inference is not cancelled. Other fit, busy and exclusion checks still apply.
 
 ## Delegating whole tasks from the Claude app
 

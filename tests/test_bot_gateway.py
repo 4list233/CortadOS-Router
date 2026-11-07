@@ -510,6 +510,46 @@ class TokenFileTest(unittest.TestCase):
         self.assertNotIn(TOKEN, err.getvalue())
 
 
+class AuthThrottleTest(unittest.TestCase):
+    def test_fake_clock_cooldown_doubles_and_caps(self):
+        now = [1000.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        for expected in (60, 120, 240, 480, 960, 1920, 3600, 3600):
+            for _ in range(bg.AUTH_FAILURES):
+                self.assertIsNone(throttle.failed("198.51.100.7"))
+            self.assertEqual(throttle.blocked("198.51.100.7"), expected)
+            now[0] += expected + .1
+
+    def test_window_global_cap_and_bounded_state(self):
+        now = [0.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        with mock.patch.object(bg, "MAX_AUTH_CLIENTS", 2):
+            throttle.failed("198.51.100.1")
+            throttle.failed("198.51.100.2")
+            throttle.failed("198.51.100.3")
+        self.assertEqual(list(throttle.clients), ["198.51.100.2", "198.51.100.3"])
+        now[0] += bg.AUTH_WINDOW_S + 1
+        for i in range(bg.GLOBAL_AUTH_FAILURES):
+            self.assertIsNone(throttle.failed(f"203.0.113.{i}"))
+        self.assertEqual(throttle.failed("203.0.113.250"), 60)
+
+    def test_source_churn_does_not_evict_active_bans(self):
+        now = [0.0]
+        throttle = bg.AuthThrottle(lambda: now[0])
+        with mock.patch.object(bg, "MAX_AUTH_CLIENTS", 2):
+            for address in ("198.51.100.1", "198.51.100.2"):
+                for _ in range(bg.AUTH_FAILURES):
+                    throttle.failed(address)
+            self.assertEqual(throttle.failed("198.51.100.3"), 60)  # bounded overflow is signalled, not stored
+        self.assertEqual(set(throttle.clients), {"198.51.100.1", "198.51.100.2"})
+        self.assertIsNotNone(throttle.blocked("198.51.100.1"))
+
+    def test_xff_only_from_loopback_and_last_hop(self):
+        self.assertEqual(bg.client_address("127.0.0.1", "192.0.2.1, 198.51.100.2"), "198.51.100.2")
+        self.assertEqual(bg.client_address("203.0.113.8", "198.51.100.2"), "203.0.113.8")
+        self.assertEqual(bg.client_address("127.0.0.1", "not-an-address"), "127.0.0.1")
+
+
 class HttpTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -530,8 +570,8 @@ class HttpTest(unittest.TestCase):
         self.red.__exit__(None, None, None)
         self.env.stop()
 
-    def post(self, obj, token=TOKEN):
-        h = {"content-type": "application/json"}
+    def post(self, obj, token=TOKEN, headers=None):
+        h = {"content-type": "application/json", **(headers or {})}
         if token is not None:
             h["authorization"] = f"Bearer {token}"
         req = urllib.request.Request(self.url, data=json.dumps(obj).encode(), headers=h, method="POST")
@@ -551,6 +591,35 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         self.assertNotIn(TOKEN, self.err.getvalue())
         self.assertIn("POST /mcp", self.err.getvalue())
+
+    def test_per_address_throttle_and_valid_other_address(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        bad = {"X-Forwarded-For": "198.51.100.11"}
+        for _ in range(bg.AUTH_FAILURES):
+            self.assertEqual(self.post(msg, "wrong-token-0000000000", bad)[0], 401)
+        # A bad actor sharing the public egress address cannot lock the legitimate bearer out.
+        self.assertEqual(self.post(msg, TOKEN, bad)[0], 200)
+        self.assertEqual(self.post(msg, "wrong-token-0000000000", bad)[0], 429)
+        self.assertEqual(self.post(msg, TOKEN, {"X-Forwarded-For": "198.51.100.12"})[0], 200)
+        log = self.err.getvalue()
+        self.assertIn("POST /mcp 429 198.51.100.11", log)
+        self.assertIn("POST /mcp 200 198.51.100.12", log)
+        self.assertNotIn(TOKEN, log)
+
+    def test_allowed_host_returns_421_before_auth(self):
+        srv = bg.build_server(self.gw, "127.0.0.1", 0, ["gateway.example.test"])
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        old_url = self.url
+        try:
+            self.url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+            msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+            self.assertEqual(self.post(msg, None)[0], 421)
+            self.assertEqual(self.post(msg, TOKEN, {"Host": "gateway.example.test"})[0], 200)
+        finally:
+            self.url = old_url
+            srv.shutdown()
+            srv.server_close()
 
     def test_batch_cap_and_timeout(self):
         one = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
@@ -586,6 +655,19 @@ class HttpTest(unittest.TestCase):
                 t0 = time.monotonic()
                 self.assertEqual(s.recv(100), b"")
                 self.assertLess(time.monotonic() - t0, 3)
+
+    def test_malformed_and_too_many_headers_return_errors_without_traceback(self):
+        import socket
+        for request, expected in (
+            (b"BOGUS\r\n\r\n", b"400"),
+            (b"GET /mcp HTTP/1.1\r\n" + b"X: y\r\n" * 101 + b"\r\n", b"431"),
+        ):
+            with self.subTest(expected=expected):
+                with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+                    s.sendall(request)
+                    self.assertIn(expected, s.recv(4096).split(b"\r\n", 1)[0])
+        self.assertNotIn("Traceback", self.err.getvalue())
+        self.assertNotIn("AttributeError", self.err.getvalue())
 
     def test_body_deadline_closes_trickler(self):
         import socket

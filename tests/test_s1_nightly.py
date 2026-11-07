@@ -94,6 +94,52 @@ def _exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+class DeadlineCleanup(unittest.TestCase):
+    def run_cleanup(self, setup):
+        # Exercise the production helper with real Bash jobs; log signaling instead of
+        # relying on the OS to recycle a PID (or ever risking an unrelated process).
+        source = (S1 / "nightly.sh").read_text()
+        helper = source[source.index('deadline=""\nstop_deadline()'):source.index("\ncleanup()")]
+        script = helper + """
+kill() { printf 'kill:%s\\n' "$*"; }
+wait() { printf 'wait:%s\\n' "$*"; builtin wait "$@" 2>/dev/null; }
+""" + setup + """
+saved=$deadline
+stop_deadline
+[ -z "$deadline" ] || exit 10
+stop_deadline
+printf 'saved:%s\\n' "$saved"
+"""
+        out = subprocess.run(["/bin/bash", "-u", "-c", script],
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.splitlines()
+
+    def test_completed_watcher_is_reaped_without_signaling(self):
+        for status in (0, 7):
+            with self.subTest(status=status):
+                lines = self.run_cleanup(
+                    f"(exit {status}) & deadline=$!\n"
+                    # A foreground command lets Bash reap the completed watcher,
+                    # just as training can continue after the clock watcher exits.
+                    "/bin/sleep 0.1\n")
+                pid = lines[-1].split(":")[1]
+                self.assertEqual(lines, [f"wait:{pid}", f"saved:{pid}"])
+
+    def test_nonchild_pid_is_not_signaled(self):
+        lines = self.run_cleanup("deadline=$$\n")
+        pid = lines[-1].split(":")[1]
+        self.assertEqual(lines, [f"wait:{pid}", f"saved:{pid}"])
+
+    def test_running_watcher_is_signaled_and_reaped(self):
+        # The kill spy forwards only in this case, to a known active child.
+        lines = self.run_cleanup(
+            "kill() { printf 'kill:%s\\n' \"$*\"; builtin kill \"$@\"; }\n"
+            "/bin/sleep 30 & deadline=$!\n")
+        pid = lines[-1].split(":")[1]
+        self.assertEqual(lines, [f"kill:-TERM {pid}", f"wait:{pid}", f"saved:{pid}"])
+
+
 class NightlyEndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="s1-nightly-"))
@@ -123,11 +169,62 @@ class NightlyEndToEnd(unittest.TestCase):
         run = f"runs/2026-01-{self.night:02d}"   # production-style: the runs/20*/ globs (retention, resume) run here
         out = subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh")], cwd=self.tmp,
                              env={**self.env, "CORTADOS_S1_RUN": run,
+                                  # Pin every deadline clock; permit explicit matrix runs without consulting local time.
+                                  "CORTADOS_S1_NOW": os.environ.get("CORTADOS_S1_NOW", "0300"),
                                   "CORTADOS_S1_NIGHT_DATE": (date(2026, 1, 1) + timedelta(days=self.night)).isoformat(),
                                   **{k: str(v) for k, v in env.items()}},
                              capture_output=True, text=True, timeout=60)
         log = (self.s1 / run / "nightly.log").read_text()
         return out.returncode, log, self.s1 / run
+
+    def test_laya_looping_clock_returns_promptly_and_reaps_watcher(self):
+        (self.s1 / "laya").mkdir()
+        (self.s1 / ".venv-laya/bin").mkdir(parents=True)
+        _exe(self.s1 / ".venv-laya/bin/python", "#!/bin/bash\nexit 0\n")
+        # Skip only Laya's unrelated 20-second GPU settle; keep the real watcher sleep to expose leaked timers.
+        _exe(Path(self.env["HOME"]) / ".local/bin/sleep",
+             '#!/bin/bash\n[ "$1" = 20 ] && exit 0\n'
+             '[ "$1" != 60 ] || echo "$$ $PPID" > "$HOME/watcher-pids"\nexec /bin/sleep "$@"\n')
+        _exe(self.s1 / "laya/train.sh", """#!/bin/bash
+python3 - <<'PY'
+import os, signal, time
+from pathlib import Path
+marker = Path(os.environ["HOME"]) / "watcher-pids"
+end = time.monotonic() + 2
+while not marker.exists() and time.monotonic() < end:
+    time.sleep(0.01)
+assert marker.exists(), "watcher must enter its sleeping branch"
+if os.environ.get("STUB_LAYA_TERM") == "1":
+    os.kill(int(Path("../data/nightly.pid").read_text()), signal.SIGTERM)
+PY
+""")
+        marker = Path(self.env["HOME"]) / "watcher-pids"
+
+        def remove_timers():
+            # Clean up even a regressed implementation, so a failed assertion cannot leak a 60-second sleeper.
+            if marker.exists():
+                for pid in map(int, marker.read_text().split()):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # Already reaped is the expected successful path.
+        self.addCleanup(remove_timers)
+        # Both sides of midnight loop; normal completion and TERM must both own the watcher's lifetime.
+        for now in ("1300", "0300"):
+            for terminate in ("0", "1"):
+                with self.subTest(now=now, terminate=terminate):
+                    remove_timers()  # Subtests continue after failure; clear the previous timer before replacing its PID record.
+                    marker.unlink(missing_ok=True)
+                    (self.s1 / "data/laya-tonight").touch()
+                    start = time.monotonic()
+                    rc, log, _ = self.run_night(STUB_NEW_LABELS=1, CORTADOS_S1_NOW=now,
+                                                STUB_LAYA_TERM=terminate)
+                    self.assertLess(time.monotonic() - start, 5, "watcher must not delay pipe EOF or EXIT cleanup")
+                    self.assertEqual(rc, 130 if terminate == "1" else 0, log)
+                    self.assertTrue(marker.exists(), log)
+                    for pid in map(int, marker.read_text().split()):
+                        with self.assertRaises(ProcessLookupError, msg=f"timer {pid} survived nightly exit"):
+                            os.kill(pid, 0)
 
     def status(self):
         return json.loads((self.s1 / "data/status.json").read_text())
@@ -265,7 +362,8 @@ class NightlyEndToEnd(unittest.TestCase):
 
     def _bare(self, *args, **env):
         return subprocess.run(["/bin/bash", str(self.s1 / "nightly.sh"), *args], cwd=self.tmp,
-                              env={**self.env, **{k: str(v) for k, v in env.items()}}, capture_output=True, text=True, timeout=60)
+                              env={**self.env, "CORTADOS_S1_NOW": os.environ.get("CORTADOS_S1_NOW", "0300"),
+                                   **{k: str(v) for k, v in env.items()}}, capture_output=True, text=True, timeout=60)
 
     def test_continuous_stop_flag_is_kept_and_refuses_the_cycle(self):
         flag = self.s1 / "data/nightly.stop"; flag.touch()

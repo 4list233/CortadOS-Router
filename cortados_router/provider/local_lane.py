@@ -170,6 +170,10 @@ def _prefix(base_url: str) -> str:
     return urllib.parse.urlparse(base_url).path.rstrip("/")
 
 
+PRO_LOCAL_REFUSALS = {"local gate: local switch off", "local gate: local disabled: on battery",
+                      "local gate: local disabled: unknown power source",
+                      "local gate: local disabled: power check failed"}
+
 GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the provider's token file does not "
                 "match the gate's")
 
@@ -185,7 +189,18 @@ def probe(node: dict[str, Any]) -> set[str]:
     try:
         conn.request("GET", _prefix(node["base_url"]) + "/api/tags", headers=_auth(node))
         resp = conn.getresponse()
-        raw = resp.read()
+        # Error bodies are deliberately capped at 64 KiB, but a valid Ollama
+        # catalog can contain many models and gets its own larger documented cap.
+        raw = _catalog_read(resp) if resp.status == 200 else _bounded_read(resp)
+        if raw is None:
+            raise ValueError("truncated or stalled probe response")
+        if resp.status == 503:
+            # Preserve only our fixed policy reasons, not arbitrary upstream text.
+            data = json.loads(raw)
+            error = data.get("error") if isinstance(data, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            if isinstance(message, str) and message in PRO_LOCAL_REFUSALS:
+                raise LocalUnavailable(f"node {node['node']}: {message}")
         if resp.status == 401:
             raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
         if resp.status != 200:
@@ -202,14 +217,15 @@ def probe(node: dict[str, Any]) -> set[str]:
 
 
 ERROR_BODY_MAX = 65536      # an error body is a short JSON message; more is not read, so a stall cannot pin a thread
+CATALOG_MAX = 4 * 1024 * 1024  # successful /api/tags JSON; bounded so a peer cannot pin memory with an unbounded catalog
 
 
-def _bounded_read(resp) -> bytes | None:
-    """At most ERROR_BODY_MAX bytes of an error response, or None when it is truncated (IncompleteRead), stalls past
+def _read_capped(resp, cap: int) -> bytes | None:
+    """At most cap bytes of a response, or None when it is truncated (IncompleteRead), stalls past
     the read timeout, or the connection drops. read(amt) returns a short read at EOF rather than raising, so the
     length the response declared is checked: fewer bytes than min(declared, cap) is a truncated body."""
     declared = resp.length                      # None for a chunked or close-delimited body
-    want = ERROR_BODY_MAX if declared is None else min(declared, ERROR_BODY_MAX)
+    want = cap if declared is None else min(declared, cap)
     try:
         data = resp.read(want)
     except (OSError, http.client.HTTPException):
@@ -217,6 +233,16 @@ def _bounded_read(resp) -> bytes | None:
     if declared is not None and len(data) < want:
         return None
     return data
+
+
+def _bounded_read(resp) -> bytes | None:
+    """Read an error response with the 64 KiB cap."""
+    return _read_capped(resp, ERROR_BODY_MAX)
+
+
+def _catalog_read(resp) -> bytes | None:
+    """Read a successful /api/tags catalog with its separate 4 MiB cap."""
+    return _read_capped(resp, CATALOG_MAX)
 
 
 def _send_json(handler, code: int, data: dict[str, Any]) -> None:

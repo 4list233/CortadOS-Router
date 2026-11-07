@@ -40,6 +40,13 @@ def server_tool_names(body: dict[str, Any]) -> list[str]:
     return [str(t.get("name") or t.get("type")) for t in tools if is_server_tool(t)]
 
 
+def server_tool_kinds(body: dict[str, Any]) -> list[tuple[str, str]]:
+    """(name, type) of each server tool the request declares; the search lane serves only web_search_* ones."""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    return [(str(t.get("name") or ""), str(t.get("type") or "")) for t in (tools if isinstance(tools, list) else [])
+            if is_server_tool(t)]
+
+
 def _forced_server_tool_choice(tools: list[Any], choice: dict[str, Any]) -> bool:
     """True when a non-auto tool_choice forces only server tools, so the request can reach the server's unavailable
     reply. Claude Code's WebSearch (2.1.317) sends tools=[web_search_*] with tool_choice {"type": "tool", "name":

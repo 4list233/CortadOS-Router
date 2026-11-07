@@ -23,14 +23,16 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import secrets
 import sys
 import threading
 import urllib.error
 import urllib.request
+import urllib.parse
 
 PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
-TIMEOUT_S = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", "300"))   # a routed subtask can take a while (cold lane, large output)
+DEFAULT_TIMEOUT_S = 300.0          # a routed subtask can take a while (cold lane, large output)
 DEFAULT_MAX_TOKENS = 8000
 MIN_TOKEN_LEN = 8                 # shorter is not a provider token (see route_task)
 
@@ -72,6 +74,8 @@ CHILD_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "task": {"type": "string", "description": "The complete, self-contained task prompt."},
          "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
+         "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
+                   "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
                           "model such as fable, opus, sonnet, gpt-6.1-sol: that pins the child's MAIN model; the "
                           "child's subagents are still routed by S1."},
@@ -150,6 +154,8 @@ def _child_module():
 def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
     """Run one child-task tool. Errors come back as isError tool results; the provider token is scrubbed from every
     model-visible string (a child could echo it)."""
+    if name == "start_task" and not a.get("chrome", False) and cfg.get("url_error"):
+        return _err(cfg["url_error"])
     token = (cfg.get("token") or "").strip()
     try:
         ct = _child_module()
@@ -172,7 +178,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
             out = ct.start(a.get("task"), a.get("cwd"), a.get("orchestrator") or "cortados",
                            a.get("permission_mode") or None, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
-                           a.get("connectors"), client=cfg.get("client"))
+                           a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
+                           session_tag=cfg.get("session_tag"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
@@ -244,7 +251,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                                           # attribution: which front door asked (e.g. the bot gateway's "grokbot")
                                           **({"x-cortados-client": str(client)} if client else {})})
     try:
-        with urlopen(req, timeout=TIMEOUT_S) as resp:
+        # Parse this operation-specific setting only when route_task needs it. Importers use the URL resolver too;
+        # unrelated ambient route settings must not break those imports.
+        timeout_s = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", str(DEFAULT_TIMEOUT_S)))
+        with urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -315,6 +325,8 @@ def handle(msg: dict, cfg: dict) -> dict | None:
             return {**base, "result": call_child_tool(params["name"], a, cfg)}
         if params.get("name") != "route_task":
             return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
+        if cfg.get("url_error"):
+            return {**base, "result": _err(cfg["url_error"])}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
                                               a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS),
                                               model=a.get("model"))}
@@ -362,17 +374,62 @@ def _resolve_token() -> str:
         return ""                                       # never crash the stdio server; route_task reports 'not configured'
 
 
+class ProviderURLError(ValueError):
+    """Invalid endpoint configuration; messages name the source, never its contents."""
+
+
+def resolve_provider_url(environ=None, *, required=True) -> str:
+    """Resolve env > explicit file > per-machine file (stdlib, standalone-safe).
+
+    Only an absent DEFAULT file may mean unconfigured for optional clients. An
+    explicitly selected file or malformed value must never silently fall back.
+    """
+    env = os.environ if environ is None else environ
+    source = "CORTADOS_PROVIDER_URL"
+    url = (env.get(source) or "").strip()
+    if not url:
+        selected = env.get("CORTADOS_PROVIDER_URL_FILE")
+        path = selected or "~/.config/cortados/provider-url"
+        if path.startswith("~/"):
+            path = os.path.join(env.get("HOME") or os.path.expanduser("~"), path[2:])
+        source = f"provider URL file {path}"
+        try:
+            with open(path, encoding="utf-8") as f:
+                url = f.read().strip()
+        except FileNotFoundError:
+            if not selected and not required:
+                return ""
+            raise ProviderURLError(f"{source}: not found") from None
+        except (OSError, UnicodeError, ValueError):
+            raise ProviderURLError(f"{source}: cannot read URL") from None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        valid = (url.startswith(("http://", "https://")) and bool(parsed.hostname)
+                 and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url))
+        parsed.port  # malformed ports must fail before any request
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ProviderURLError(f"{source}: expected one http:// or https:// URL with a host")
+    return url.rstrip("/")
+
+
 def _resolve_url() -> str:
-    """The provider URL, or "" when it is unset or still an unexpanded ${VAR} placeholder (a shell that did not export
-    the var leaves the literal, which would otherwise become an 'unknown url type' error instead of a clear 'not
-    configured' one)."""
-    url = (os.environ.get("CORTADOS_PROVIDER_URL") or "").strip()
-    return "" if url.startswith("${") else url
+    return resolve_provider_url()
 
 
 def main() -> None:
-    cfg = {"url": _resolve_url(), "token": _resolve_token(),
-           "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}   # the child launcher reads the file
+    cfg = {"url": "", "token": _resolve_token(),
+           "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None,   # the child launcher reads the file
+           # One opaque Office tag per server process: Claude Code starts one cortados-route server per session, so
+           # the children it starts share a floor (provider/office.py). Random, not derived from any session id.
+           "session_tag": secrets.token_hex(8)}
+    try:
+        cfg["url"] = _resolve_url()
+    except ProviderURLError as exc:
+        # Keep task management and unrouted Chrome/login tasks available without a provider.
+        # Only provider-dependent calls report the retained, source-named configuration error.
+        cfg["url_error"] = str(exc)
     for line in sys.stdin:
         if not line.strip():
             continue
