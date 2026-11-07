@@ -2186,17 +2186,21 @@ class OwnerDeathTests(unittest.TestCase):
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
         s = BridgeSession(system="", tools=[], gateway_url="http://127.0.0.1:9", token="t",
                           claude_bin=[sys.executable, "-c", "import time; time.sleep(0.3)"])
-        closed = []
+        closed, done = [], threading.Event()
         real_close = s.close
-        s.close = lambda: (closed.append(True), real_close())
+
+        def close():
+            real_close()
+            closed.append(True)
+            done.set()                                 # only after the real cleanup has returned
+        s.close = close
         with reg._lock:
             reg.sessions[s.id] = s
         s.set_exit_handler(reg._backend_exited)       # what Registry.new wires for every held conversation
-        deadline = time.time() + 10
-        while reg.get(s.id) is not None and time.time() < deadline:
-            time.sleep(0.05)
+        self.assertTrue(done.wait(10))
         self.assertIsNone(reg.get(s.id))
         self.assertEqual(closed, [True])
+        self.assertIsNotNone(s.proc.poll())
 
     def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
