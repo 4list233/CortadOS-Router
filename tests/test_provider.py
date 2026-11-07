@@ -252,6 +252,32 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
         self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
 
+    def test_queued_shim_call_keeps_its_submission_deadline(self):
+        # Two requests reach the shim together with only one transport slot. The second call's deadline must include
+        # its queue time: it expires closed and can never emit a synthetic result after the first releases the slot.
+        entered = threading.Event()
+        replies, aborted = [], threading.Event()
+
+        def forward(_gateway, _session, _token, params):
+            if params["name"] == "first":
+                entered.set()
+            time.sleep(0.07)
+            return {"content": [{"type": "text", "text": params["name"]}]}
+
+        with mock.patch.object(mcp_shim, "CALL_TIMEOUT_S", 0.10), \
+             mock.patch.object(mcp_shim, "_forward", side_effect=forward), \
+             mock.patch.object(mcp_shim, "_reply", side_effect=lambda mid, result: replies.append(mid)), \
+             mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: aborted.set() or True):
+            slots = threading.BoundedSemaphore(1)
+            mcp_shim._dispatch_call(1, "gateway", "session", "token", {"name": "first"}, slots)
+            self.assertTrue(entered.wait(1))
+            mcp_shim._dispatch_call(2, "gateway", "session", "token", {"name": "second"}, slots)
+            self.assertTrue(aborted.wait(1))
+            time.sleep(0.08)
+
+        self.assertEqual(replies, [1])
+        self.assertTrue(aborted.is_set())
+
     def test_subprocess_shim_aborts_before_cli_timeout_can_resume(self):
         from cortados_router.provider import timeouts
         self.assertGreater(timeouts.CLI_TOOL_TIMEOUT_S, timeouts.CALL_TIMEOUT_S + timeouts.ABORT_TIMEOUT_S)

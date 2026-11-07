@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -33,6 +34,11 @@ CALL_TIMEOUT_S = TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S
 ABORT_TIMEOUT_S = float(os.environ.get("CORTADOS_PROVIDER_ABORT_TIMEOUT_S") or 120)
 if not 0 < ABORT_TIMEOUT_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_ABORT_TIMEOUT_S must be positive and finite")
+
+# Claude may issue sibling calls together. Never make a later call spend its CLI timeout queued behind an earlier
+# HTTP request. The semaphore limits transport fan-out; each call's watchdog starts before that semaphore.
+MAX_IN_FLIGHT = 16
+_WRITE_LOCK = threading.Lock()
 
 
 def _abort(gateway, session, token):
@@ -59,8 +65,9 @@ def _terminate_owner():
 def _reply(mid, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": mid}
     msg.update({"error": error} if error else {"result": result})
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    with _WRITE_LOCK:
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
 
 
 def _forward(gateway, session, token, params):
@@ -81,12 +88,47 @@ def _forward(gateway, session, token, params):
         return {"content": [{"type": "text", "text": f"cortados bridge: tool call failed: {exc}"}], "isError": True}
 
 
+def _dispatch_call(mid, gateway, session, token, params, slots):
+    """Run independently; arm the fail-closed clock as soon as this stdin request is observed."""
+    finished = threading.Event()
+    state_lock = threading.Lock()
+    state = {"expired": False}
+
+    def expire():
+        if finished.wait(CALL_TIMEOUT_S):
+            return
+        with state_lock:
+            if finished.is_set():
+                return
+            state["expired"] = True
+        # A confirmed abort closed the owning CLI. If it cannot be confirmed, kill that CLI here. Never write a
+        # synthetic MCP result once this request's budget has expired.
+        if not _abort(gateway, session, token):
+            _terminate_owner()
+
+    def run():
+        with slots:
+            with state_lock:
+                if state["expired"]:
+                    return
+            result = _forward(gateway, session, token, params)
+        with state_lock:
+            if state["expired"]:
+                return
+            finished.set()
+        _reply(mid, result)
+
+    threading.Thread(target=expire, daemon=True, name=f"cortados-mcp-deadline-{mid}").start()
+    threading.Thread(target=run, daemon=True, name=f"cortados-mcp-call-{mid}").start()
+
+
 def main(argv):
     gateway, session, tools_path = argv[1], argv[2], argv[3]
     token = os.environ.get("CORTADOS_PROVIDER_TOKEN", "")
     with open(tools_path) as f:
         tools = [{"name": t["name"], "description": t.get("description", ""),
                   "inputSchema": t.get("input_schema") or {"type": "object"}} for t in json.load(f)]
+    slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -100,7 +142,7 @@ def main(argv):
         elif method == "tools/list":
             _reply(mid, {"tools": tools})
         elif method == "tools/call":
-            _reply(mid, _forward(gateway, session, token, params))
+            _dispatch_call(mid, gateway, session, token, params, slots)
         elif method == "ping":
             _reply(mid, {})
         else:
