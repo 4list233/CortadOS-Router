@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -308,3 +310,142 @@ class RunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandshakeTests(unittest.TestCase):
+    """Training lease/ack handshake; temp dirs and fake Ollama only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.gate = Path(self.tmp.name) / "studio-gate"
+        self.status = Path(self.tmp.name) / "status.json"
+        self.now = 1000.0
+        self.loaded = True
+        self.calls = []
+        self.dead = set()
+        self.inputs = dict(training_active=False, eval_active=False,
+                           free_reclaimable_bytes=32*c.GIB, swap_used_bytes=0)
+        self.logs = []
+        self.runner = c.Runner(collect=lambda: self.inputs.copy(), api=self.api,
+                               clock=lambda: self.now, gate=self.gate,
+                               alive=lambda pid: pid not in self.dead)
+
+    def api(self, path, payload=None):
+        self.calls.append((path, payload))
+        if path == "/api/ps":
+            return {"models": [{"name": c.MODEL}] if self.loaded else []}
+        self.loaded = payload["keep_alive"] != 0
+        return {}
+
+    def intent(self, pid=4242, nonce="n1", expires=None):
+        self.gate.mkdir(parents=True, exist_ok=True)
+        c.write_status(self.gate / ("intent-%d-%s.json" % (pid, nonce)),
+                       dict(version=1, pid=pid, nonce=nonce, created_at=self.now,
+                            expires_at=self.now + 300 if expires is None else expires))
+
+    def test_intent_sheds_and_acks(self):
+        self.runner.maybe_loaded = True
+        self.intent()
+        result = self.runner.tick()
+        self.assertFalse(self.loaded)
+        # Shed precedes the residency query, so the decision itself is hold.
+        self.assertIn(("/api/generate", {"model": c.MODEL, "stream": False, "keep_alive": 0}), self.calls)
+        self.assertEqual(result["training_intents"], 1)
+        ack = json.loads((self.gate / "ack-n1.json").read_text())
+        self.assertEqual((ack["nonce"], ack["model_loaded"]), ("n1", False))
+
+    def test_no_load_or_renew_while_intent_live(self):
+        self.loaded = False
+        self.intent()
+        for _ in range(60):  # 5 minutes of otherwise eligible samples
+            self.now += 5
+            self.intent()  # trainer keeps refreshing
+            self.runner.tick()
+        self.assertFalse(self.loaded)
+        self.assertFalse([p for p in self.calls if p[0] == "/api/generate" and p[1]["keep_alive"] != 0])
+
+    def test_expired_intent_ignored_and_removed(self):
+        self.loaded = False
+        self.intent(expires=self.now - 1)
+        self.assertEqual(c.live_intents(self.gate, self.now), [])
+        self.assertFalse(list(self.gate.glob("intent-*")))
+
+    def test_dead_trainer_intent_cleaned(self):
+        self.dead.add(4242)
+        self.intent()
+        (self.gate / "ack-n1.json").write_text("{}")
+        self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: p not in self.dead), [])
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_malformed_intent_fails_closed_until_ttl(self):
+        self.gate.mkdir(parents=True)
+        (self.gate / "intent-1-x.json").write_text("{bad")
+        self.assertEqual(len(c.live_intents(self.gate, time.time())), 1)
+        self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1), [])
+
+    def gate_ctx(self, **kw):
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+            kw.pop("on_sleep", lambda: None)()
+        self.runner.clock = lambda: clock[0]  # daemon and trainer share one clock
+        args = dict(gate=self.gate, status_path=self.status, api=self.api,
+                    clock=lambda: clock[0], sleep=sleep, log=self.logs.append, pid=os.getpid())
+        args.update({k: v for k, v in kw.items() if k != "on_sleep"})
+        return c.training_gate(**args), clock
+
+    def test_trainer_waits_for_daemon_ack(self):
+        def daemon_tick():
+            self.runner.maybe_loaded = None
+            self.runner.alive = lambda pid: True
+            self.runner.tick()
+        ctx, clock = self.gate_ctx(on_sleep=daemon_tick)
+        with ctx as intent_path:
+            self.assertFalse(self.loaded)
+            self.assertTrue(intent_path.exists())
+        self.assertIn("daemon acked", self.logs[-1])
+        self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
+        self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
+
+    def test_daemon_dead_proceeds_with_log(self):
+        ctx, clock = self.gate_ctx()
+        with ctx:
+            pass
+        self.assertGreaterEqual(clock[0], c.ACK_WAIT_SECONDS)
+        self.assertIn("not running", self.logs[-1])
+        self.assertTrue(self.loaded)  # proceeds; nothing under daemon control
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_live_daemon_without_ack_trainer_unloads_itself(self):
+        c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
+        ctx, _ = self.gate_ctx()
+        with ctx:
+            self.assertFalse(self.loaded)
+        self.assertIn(("/api/generate", {"model": c.MODEL, "stream": False, "keep_alive": 0}), self.calls)
+        self.assertIn("confirmed", self.logs[-1])
+
+    def test_live_daemon_unload_unconfirmed_refuses(self):
+        c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
+        def stuck(path, payload=None):
+            return {"models": [{"name": c.MODEL}]} if path == "/api/ps" else {}
+        ctx, _ = self.gate_ctx(api=stuck)
+        with self.assertRaises(RuntimeError):
+            with ctx:
+                self.fail("training must not start")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_crash_in_block_removes_intent(self):
+        ctx, _ = self.gate_ctx()
+        with self.assertRaises(ValueError):
+            with ctx:
+                raise ValueError("trainer crashed")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_intent_refreshed_while_held(self):
+        ctx, _ = self.gate_ctx(refresh_seconds=0.01)
+        with ctx as intent_path:
+            first = intent_path.stat().st_mtime_ns
+            time.sleep(0.1)
+            self.assertTrue(intent_path.exists())
+        self.assertFalse(intent_path.exists())

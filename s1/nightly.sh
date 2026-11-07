@@ -284,10 +284,14 @@ gpu_share() {
   launchctl load "$SCORER_PLIST" 2>/dev/null; echo "scorer back"
 }
 state() { python3 -B ./nightly_state.py "$@"; }
+# Studio capacity handshake: each training/eval step runs under a training intent, so the capacity daemon unloads the
+# local Ollama model (confirmed via /api/ps) BEFORE the step starts. Bounded 30 s wait; never proceeds silently.
+GATE_ROOT="$(cd .. && pwd)"   # repo root, fixed here: gated also runs from inside s1/laya
+gated() { PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -B -m cortados_router.studio_capacity gate -- "$@"; }
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
-    $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
+    gated $PY evaluate.py --base "$BASE" --adapter "$1/adapter" --out "$1" --baseline
 }
 # The no-new-data marker is committed only once a night's outcome is final (published, or intentionally not promoted): saved
 # before a failed promotion, the next unchanged-data night would skip and the approved candidate would never be served.
@@ -602,7 +606,7 @@ if [ -f data/laya-tonight ]; then
   # data/laya-init names a checkpoint dir (e.g. laya/runs/2026-09-30/checkpoint_latest): tonight's run warm-starts from it (2026-09-30: 1,110 of
   # 2,000 steps fitted before the 06:45 deadline at 15.8 s/step — the 8B and nomic share the GPU all night, so a full run takes two nights)
   init=""; [ -f data/laya-init ] && init="$(cat data/laya-init)" && rm -f data/laya-init && [ -d "$init" ] && echo "laya: warm start from $init"
-  ( cd laya && ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" ./train.sh ) ; lrc=$?
+  ( cd laya && ../.venv-laya/bin/python convert.py && LAYA_INIT="${init:+../$init}" LAYA_RUN="../$LRUN" LAYA_MAX_STEPS="${LAYA_MAX_STEPS:-2000}" gated ./train.sh ) ; lrc=$?
   stop_deadline
   gpu_share; sleep 20
   if [ "$lrc" -eq 0 ] && [ -f "$LRUN/model.safetensors" ]; then
@@ -683,7 +687,7 @@ while :; do
   for f in "$RUN"/adapter/0*_adapters.safetensors; do [ ! -f "$f" ] || mv "$f" "$f.old"; done
   echo "$done_iters" > "$RUN/iters-base.tmp"; mv "$RUN/iters-base.tmp" "$RUN/iters-base"
   echo "segment target $target; $done_iters checkpointed; $remaining steps remain"
-  HF_HUB_OFFLINE=1 $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
+  HF_HUB_OFFLINE=1 gated $PY -m mlx_lm lora --model "$BASE" --train --data data/sft --fine-tune-type lora --num-layers 16 --batch-size "$BATCH" --iters "$remaining" \
     --learning-rate "$LR" --mask-prompt --max-seq-length 1536 --grad-checkpoint --steps-per-eval 100 --save-every 100 --adapter-path "$RUN/adapter" $resume && break
   [ -f "$STOPFLAG" ] && { echo "stopped by request; not relaunching"; exit 130; }
   attempt=$((attempt + 1)); echo "trainer died (attempt $attempt)"; [ "$attempt" -ge 4 ] && exit 1
