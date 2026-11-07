@@ -1402,5 +1402,70 @@ class OutcomeEvalTests(OutcomeCase):
         self.assertEqual(evaluate.promote_decision(c, None, None, None, False), (False, False)) # no bar at all: never promote
 
 
+class PromotionRuleOutcomesLead(unittest.TestCase):
+    """Forest 2026-11-07: real-task outcomes decide; bounded teacher tolerance; outward recall floor 0.85."""
+    # Live adapter on the 11-05 holdouts: teacher n=610, outcome n=75 (band acc .40, over .507, under .093).
+    LIVE_T = {"n": 610, "band_accuracy": 0.80, "under_routed": 0.066, "outward_recall": 0.90}
+    LIVE_O = {"n": 75, "band_hits": 30, "under": 7, "over": 38}
+    CAND_O = {"n": 75, "band_hits": 44, "under": 7, "over": 24}          # .587 / .093 / .32
+
+    def decide(self, c, co, obar=None, has=True):
+        import evaluate
+        return evaluate.promotion_report(c, self.LIVE_T, self.LIVE_O if obar is None else obar, co, has, holdout_rows=610)
+
+    def cand(self, **kw):
+        return dict({"n": 610, "band_accuracy": 0.80, "under_routed": 0.116, "outward_recall": 0.85}, **kw)
+
+    def failed(self, r):
+        return sorted(ch["check"] for ch in r["checks"] if not ch["ok"])
+
+    def test_table(self):
+        cases = [
+            # (name, candidate teacher, candidate outcome, has outcome holdout, promote, rule, failing checks)
+            ("11-05 outcomes, teacher under +.05", self.cand(), self.CAND_O, True, True, "new", []),
+            ("11-05 exact: teacher under .13 vs .066 (+.064 > .05)", self.cand(under_routed=0.13), self.CAND_O, True,
+             False, "new", ["teacher under-routing"]),
+            ("outcome under-routing worse by 2 tasks", self.cand(), dict(self.CAND_O, under=9), True, False, "new",
+             ["outcome under-routing"]),
+            ("outcome under-routing worse by 1 task (1/n slack)", self.cand(), dict(self.CAND_O, under=8), True, True, "new", []),
+            ("outward recall .84", self.cand(outward_recall=0.84), self.CAND_O, True, False, "new", ["outward recall"]),
+            ("teacher under +.06", self.cand(under_routed=0.126), self.CAND_O, True, False, "new", ["teacher under-routing"]),
+            ("over-routing drop < .05", self.cand(), dict(self.CAND_O, over=36), True, False, "new", ["outcome over-routing"]),
+            ("outcome band accuracy drops", self.cand(), dict(self.CAND_O, band_hits=29, over=24), True, False, "new",
+             ["outcome band accuracy"]),
+            ("teacher band accuracy drops > slack", self.cand(band_accuracy=0.79), self.CAND_O, True, False, "new",
+             ["teacher band accuracy"]),
+            ("missing outcome holdout: old rule", self.cand(), None, False, False, "fallback",
+             ["outward recall", "teacher under-routing"]),
+        ]
+        for name, c, co, has, promote, rule, failing in cases:
+            with self.subTest(name):
+                r = self.decide(c, co, None if has else None, has)
+                self.assertEqual((r["promote"], r["rule"], self.failed(r)), (promote, rule, failing), r)
+
+    def test_small_outcome_holdout_falls_back_to_old_rule(self):
+        import evaluate
+        small_l = {"n": evaluate.MIN_OUTCOME_HOLDOUT - 1, "band_hits": 10, "under": 4, "over": 20}
+        small_c = {"n": evaluate.MIN_OUTCOME_HOLDOUT - 1, "band_hits": 20, "under": 4, "over": 10}
+        r = self.decide(self.cand(), small_c, obar=small_l)
+        self.assertEqual((r["promote"], r["rule"]), (False, "fallback"))       # old rule: teacher under + outward regress
+        self.assertIn("MIN_OUTCOME_HOLDOUT", r["reason"])
+        # same small holdout, candidate equal to live on teacher data: old rule promotes
+        same = dict(self.LIVE_T)
+        self.assertEqual(self.decide(same, small_c, obar=small_l)["rule"], "fallback")
+        self.assertTrue(self.decide(same, small_c, obar=small_l)["promote"])
+
+    def test_bar_without_over_counts_falls_back(self):
+        legacy = {k: v for k, v in self.LIVE_O.items() if k != "over"}
+        r = self.decide(self.cand(), self.CAND_O, obar=legacy)
+        self.assertEqual((r["promote"], r["rule"]), (False, "fallback"))
+
+    def test_every_check_is_reported_with_values(self):
+        r = self.decide(self.cand(), self.CAND_O)
+        self.assertEqual(len(r["checks"]), 6)
+        for ch in r["checks"]:
+            self.assertTrue({"check", "candidate", "live", "rule", "ok"} <= set(ch))
+
+
 if __name__ == "__main__":
     unittest.main()
