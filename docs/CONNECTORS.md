@@ -15,7 +15,9 @@ Root: integer `version: 1`, `servers: []`. Each server has a unique nonempty
 mcp_http), and `tools: []`. Each tool has a per-server unique `name` and
 `class: read|write|outward`. URLs must be HTTP(S), with no credentials,
 query or fragment. Unknown fields, duplicate names and invalid classes fail.
-Names are exact and case-sensitive; URL is metadata, not authority.
+Names are exact, case-sensitive, printable ASCII, without surrounding whitespace;
+non-ASCII/confusable names are rejected, not normalized into another identity.
+URL is metadata, not authority.
 
 `suggest_class(name)` offers human-authoring suggestions: send/post/publish/
 delete/share/pay/invite/deploy/transfer → outward; get/list/search/read/query/
@@ -48,7 +50,10 @@ Approval records are trusted host-owned dictionaries:
 The digest is SHA-256 of canonical JSON `[server, tool, args]` (sorted object
 keys, compact separators, ASCII escapes). Argument order within objects is
 irrelevant; array order and values matter. Non-JSON/coercible values and
-nonfinite floats are rejected. No wildcard, name-only or truthy approval works.
+nonfinite floats are rejected. Surrogate code points in argument strings and keys
+are rejected before hashing, preventing JSON from aliasing a surrogate pair with
+a Unicode scalar. Other Unicode argument strings retain their exact code points
+(no normalization). No wildcard, name-only or truthy approval works.
 The host must authenticate approvals, scope them to the current run, and prevent
 model/connector content from changing the manifest, taint, targets or approvals.
 This core does not issue, store, consume or authenticate approvals.

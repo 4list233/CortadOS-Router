@@ -32,8 +32,11 @@ def _fields(value, required, optional, path):
 
 
 def _name(value, path):
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ManifestError(f"{path}: expected nonempty name without surrounding whitespace")
+    # Identity is exact ASCII, never Unicode-normalized: confusable names must
+    # not inherit another entry's permissions or alias through JSON copying.
+    if (type(value) is not str or not value.strip() or value != value.strip()
+            or not value.isascii() or not value.isprintable()):
+        raise ManifestError(f"{path}: expected nonempty printable ASCII name without surrounding whitespace")
 
 
 def validate_manifest(manifest):
@@ -86,7 +89,7 @@ def validate_manifest(manifest):
 
 def suggest_class(tool_name):
     """Name-only suggestion for human manifest authors. NEVER authorization."""
-    if not isinstance(tool_name, str):
+    if not isinstance(tool_name, str) or not tool_name.isascii() or not tool_name.isprintable():
         return "outward"
     words = set(re.sub(r"([a-z])([A-Z])", r"\1_\2", tool_name).lower().replace("-", "_").split("_"))
     words.update(re.findall(r"[a-z]+", tool_name.lower()))
@@ -101,7 +104,13 @@ def suggest_class(tool_name):
 
 def _json_value(value):
     # Reject coercions (integer object keys, tuples, NaN) that can alias another call.
-    if value is None or type(value) in (str, bool, int):
+    if type(value) is str:
+        # JSON escapes alias a surrogate pair with its Unicode scalar. Reject
+        # all surrogate code points (including lone ones) before hashing.
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+            raise ValueError("argument strings and keys must not contain surrogates")
+        return
+    if value is None or type(value) in (bool, int):
         return
     if type(value) is float and math.isfinite(value):
         return
@@ -110,7 +119,8 @@ def _json_value(value):
             _json_value(item)
         return
     if type(value) is dict and all(type(k) is str for k in value):
-        for item in value.values():
+        for key, item in value.items():
+            _json_value(key)
             _json_value(item)
         return
     raise ValueError("arguments must contain only finite JSON values with string object keys")

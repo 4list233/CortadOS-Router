@@ -126,6 +126,73 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(suggest_class(None), "outward")
 
 
+class UnicodeBoundaryTests(unittest.TestCase):
+    def test_names_fail_closed_in_manifest_and_calls(self):
+        for name in ("\ud800", "\udfff", (chr(0xD83D) + chr(0xDE00)), "\U0001f600",
+                     "rеad_mail", "ｒead_mail", "read_\x00mail"):
+            for field in ("server", "tool"):
+                with self.subTest(name=repr(name), field=field):
+                    data = manifest()
+                    if field == "server":
+                        data["servers"][0]["name"] = name
+                    else:
+                        data["servers"][0]["tools"][0]["name"] = name
+                    with self.assertRaises(ManifestError):
+                        validate_manifest(data)
+                    server, tool = ((name, "read_mail") if field == "server"
+                                    else ("outside", name))
+                    with self.assertRaises(ValueError):
+                        call_hash(server, tool, {})
+                    self.assertEqual(decide("bot", server, tool, {},
+                                            RunState(manifest()), {})[0], "deny")
+                    self.assertEqual(decide("bot", "outside", "read_mail", {},
+                                            RunState(data), {})[0], "deny")
+
+    def test_copy_cannot_introduce_duplicate_names(self):
+        data = manifest()
+        data["servers"][0]["tools"] = [
+            {"name": (chr(0xD83D) + chr(0xDE00)), "class": "read"},
+            {"name": "\U0001f600", "class": "outward"},
+        ]
+        with self.assertRaises(ManifestError):
+            validate_manifest(data)
+        self.assertEqual(decide("bot", "outside", "\U0001f600", {},
+                                RunState(data), {})[0], "deny")
+        valid = validate_manifest(manifest())
+        self.assertEqual(valid, manifest())
+        for server in valid["servers"]:
+            names = [tool["name"] for tool in server["tools"]]
+            self.assertEqual(len(names), len(set(names)))
+
+    def test_surrogates_in_nested_arguments_fail_closed(self):
+        state = RunState(manifest())
+        approval = {call_hash("outside", "send_mail", {"x": "\U0001f600"}):
+                    {"approved": True}}
+        for bad in ("\ud800", "\udfff", (chr(0xD83D) + chr(0xDE00))):
+            for args in ({"x": bad}, {bad: "value"}, {"x": [{"nested": bad}]},
+                         {"x": [{bad: "value"}]}):
+                with self.subTest(args=repr(args)):
+                    with self.assertRaises(ValueError):
+                        call_hash("outside", "send_mail", args)
+                    self.assertEqual(decide("owner-interactive", "outside", "send_mail",
+                                            args, state, approval)[0], "deny")
+
+    def test_distinct_accepted_unicode_cannot_share_approval(self):
+        values = ["\U0001f600", "é", "é", "е", "e", "\\ud83d\\ude00"]
+        args_list = [{"x": value} for value in values] + [{value: "x"} for value in values]
+        hashes = [call_hash("outside", "send_mail", args) for args in args_list]
+        self.assertEqual(len(hashes), len(set(hashes)))
+        for index, digest in enumerate(hashes):
+            for other, args in enumerate(args_list):
+                self.assertEqual(decide("owner-interactive", "outside", "send_mail",
+                                        args, RunState(manifest()),
+                                        {digest: {"approved": True}})[0],
+                                 "allow" if index == other else "ask")
+
+    def test_confusable_suggestion_is_not_read(self):
+        self.assertEqual(suggest_class("read_ｍail"), "outward")
+
+
 class HashTests(unittest.TestCase):
     def test_canonical_order_and_nested_json(self):
         a = {"z": [{"b": 2, "a": "é"}], "x": None}
