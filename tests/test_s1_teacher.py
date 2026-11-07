@@ -15,6 +15,7 @@ from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "s1"))
@@ -289,23 +290,40 @@ class ProviderTeacherTests(unittest.TestCase):
         self.assertIn("only Claude teachers", e.getvalue())
 
     def test_provider_config_needs_url_and_token_file(self):
-        old = {k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE")}
-        try:
-            os.environ.pop("CORTADOS_PROVIDER_URL", None)
-            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
-                label.provider_config()
-            self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
-            tf = self.tmp / "tok"; tf.write_text("secret-x\n")
-            os.environ.update(CORTADOS_PROVIDER_URL="https://teacher.example:8443/", CORTADOS_PROVIDER_TOKEN_FILE=str(tf))
-            self.assertEqual(label.provider_config(), ("https://teacher.example:8443", "secret-x"))
-            os.environ["CORTADOS_PROVIDER_TOKEN_FILE"] = str(self.tmp / "missing")
+        # label captures its default token path at import time; isolate that as well as HOME.
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}, clear=True), \
+             mock.patch.object(label, "TOKEN_FILE_DEFAULT", Path(home) / ".config/cortados/provider-token"):
             with redirect_stderr(io.StringIO()) as e, self.assertRaises(SystemExit) as cm:
                 label.provider_config()
-            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
+            self.assertIn("provider-url: not found", e.getvalue())
+            tf = Path(home) / "tok"; tf.write_text("secret-x\n")
+            os.environ.update(CORTADOS_PROVIDER_URL="https://teacher.example:8443/", CORTADOS_PROVIDER_TOKEN_FILE=str(tf))
+            self.assertEqual(label.provider_config(), ("https://teacher.example:8443", "secret-x"))
+            os.environ["CORTADOS_PROVIDER_TOKEN_FILE"] = str(Path(home) / "missing")
+            with redirect_stderr(io.StringIO()) as e, self.assertRaises(SystemExit) as cm:
+                label.provider_config()
+            self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
             self.assertIn("unreadable", e.getvalue())
-        finally:
-            for k, v in old.items():
-                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_provider_config_uses_isolated_default_files(self):
+        # label captures its default token path at import time; isolate that as well as HOME.
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}, clear=True), \
+             mock.patch.object(label, "TOKEN_FILE_DEFAULT", Path(home) / ".config/cortados/provider-token"):
+            config = Path(home) / ".config" / "cortados"
+            config.mkdir(parents=True)
+            (config / "provider-url").write_text("https://teacher.example:8443/\n")
+            (config / "provider-token").write_text("default-secret\n")
+            self.assertEqual(label.provider_config(), ("https://teacher.example:8443", "default-secret"))
+            os.environ["CORTADOS_PROVIDER_URL_FILE"] = str(config / "missing")
+            with redirect_stderr(io.StringIO()) as e, self.assertRaises(SystemExit) as cm:
+                label.provider_config()
+            self.assertEqual(cm.exception.code, label.EXIT_CONFIG)
+            self.assertIn("missing: not found", e.getvalue())
+            endpoint = config / "explicit-url"
+            endpoint.write_text("https://explicit.example:8443/\n")
+            os.environ["CORTADOS_PROVIDER_URL_FILE"] = str(endpoint)
+            self.assertEqual(label.provider_config(), ("https://explicit.example:8443", "default-secret"))
 
 
 class MainExitCodeTests(unittest.TestCase):
@@ -318,10 +336,12 @@ class MainExitCodeTests(unittest.TestCase):
         (self.tmp / "tok").write_text("tok-test\n")
         self._common_data = common.DATA
         self._saved = (label.DATA, label.LABELS, label.BACKEND, label.PROVIDER, label.PROVIDER_BACKOFF_S, dict(label.TEACHER), sys.argv)
-        self._env = {k: os.environ.get(k) for k in ("CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
+        self._env = {k: os.environ.get(k) for k in ("HOME", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_URL_FILE",
+                                                     "CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_TOKEN_FILE",
                                                      "CORTADOS_S1_TEACHER_TRAIN", "CORTADOS_S1_TEACHER_HOLDOUT")}
         for k in self._env:
             os.environ.pop(k, None)
+        os.environ["HOME"] = str(self.tmp)
         label.DATA, label.LABELS, label.PROVIDER_BACKOFF_S = self.tmp, self.tmp / "labels.jsonl", (0.0, 0.0)
         common.DATA = self.tmp
         reset_pass_state()

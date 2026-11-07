@@ -806,7 +806,7 @@ class ProviderBackendTests(OutcomeCase):
         return op
 
     def test_provider_https_file_config_and_request(self):
-        endpoint = Path(os.environ["HOME"]) / "outcome-provider-url"
+        endpoint = Path(self.home) / "outcome-provider-url"
         endpoint.write_text("https://provider.example:8443/\n")
         with mock.patch.dict(os.environ, {"CORTADOS_PROVIDER_URL": "", "CORTADOS_PROVIDER_URL_FILE": str(endpoint)}):
             self.assertTrue(self.p.enabled())
@@ -814,6 +814,13 @@ class ProviderBackendTests(OutcomeCase):
             self.p.ask("claude", "claude-fable-5-1", "sys", "u",
                        urlopen=self._urlopen("claude-fable-5-1", "hi", seen))
             self.assertEqual(seen[0][0], "https://provider.example:8443/v1/messages")
+
+    def test_provider_file_fixture_does_not_overwrite_home_file(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}):
+            existing = Path(home) / "outcome-provider-url"
+            existing.write_text("keep existing user data\n")
+            self.test_provider_https_file_config_and_request()
+            self.assertEqual(existing.read_text(), "keep existing user data\n")
 
     def test_every_call_carries_the_min_left_header(self):
         seen = []

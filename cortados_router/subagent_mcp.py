@@ -151,6 +151,8 @@ def _child_module():
 def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
     """Run one child-task tool. Errors come back as isError tool results; the provider token is scrubbed from every
     model-visible string (a child could echo it)."""
+    if name == "start_task" and not a.get("chrome", False) and cfg.get("url_error"):
+        return _err(cfg["url_error"])
     token = (cfg.get("token") or "").strip()
     try:
         ct = _child_module()
@@ -316,6 +318,8 @@ def handle(msg: dict, cfg: dict) -> dict | None:
             return {**base, "result": call_child_tool(params["name"], a, cfg)}
         if params.get("name") != "route_task":
             return {**base, "result": _err(f"unknown tool {params.get('name')!r}")}
+        if cfg.get("url_error"):
+            return {**base, "result": _err(cfg["url_error"])}
         return {**base, "result": route_task(cfg.get("url", ""), cfg.get("token", ""), a.get("task", ""),
                                               a.get("context", ""), a.get("max_tokens", DEFAULT_MAX_TOKENS),
                                               model=a.get("model"))}
@@ -408,8 +412,14 @@ def _resolve_url() -> str:
 
 
 def main() -> None:
-    cfg = {"url": _resolve_url(), "token": _resolve_token(),
+    cfg = {"url": "", "token": _resolve_token(),
            "token_file": os.environ.get("CORTADOS_PROVIDER_TOKEN_FILE") or None}   # the child launcher reads the file
+    try:
+        cfg["url"] = _resolve_url()
+    except ProviderURLError as exc:
+        # Keep task management and unrouted Chrome/login tasks available without a provider.
+        # Only provider-dependent calls report the retained, source-named configuration error.
+        cfg["url_error"] = str(exc)
     for line in sys.stdin:
         if not line.strip():
             continue
