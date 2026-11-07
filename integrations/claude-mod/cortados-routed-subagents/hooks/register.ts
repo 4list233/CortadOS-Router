@@ -557,7 +557,7 @@ const shQuote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'"
 export const BG_CLEANUP_SH = `
 d=$1
 [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$d/owner-v1" ] && [ ! -L "$d/owner-v1" ] || exit 1
-rm -f "$d/stdout" "$d/stderr" "$d/out.pipe" "$d/err.pipe" "$d/child-exit" "$d/child-exit.tmp" "$d/processes"
+rm -f "$d/stdout" "$d/stderr" "$d/out.pipe" "$d/err.pipe" "$d/child-exit" "$d/child-exit.tmp" "$d/processes" "$d/processes.tmp" "$d/supervisor-failed"
 `
 
 // A killed supervisor cannot run its own expiry. On the next launch reclaim only this user's marked directories
@@ -574,18 +574,14 @@ find "\${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cortados-bg.*' -user "$(id -u
 `)} sh {} +
 `
 
-/** The supervisor is the watchdog: one owner decides timeout and finishes descendant cleanup before publishing
- * exit. Perl setpgrp separates the workload from helpers. A one-second ps census records descendants including
- * Bash tools in separate sessions/groups, and retains their identity after reparenting. Signals require a matching
- * start time; groups come from the current matching process, never just a recycled pid. Polling is lifecycle cleanup,
- * not an adversarial sandbox: a process that forks and reparents entirely between censuses can escape. No external setsid binary needed.
- * FIFO readers drain excess bytes without storing them and signal overflow. Exit is published only after readers
- * finish. Raw files expire after 1 h even if the mod disappears; successful processing removes them immediately.
- * All dynamic values remain positional arguments/environment, never shell source. */
+/** WIP lifecycle hardening, NOT an OS-owned containment boundary. Only observed group leaders authorize
+ * group broadcasts; this reduces collateral signaling but does not eliminate snapshot-to-signal races.
+ * Census-only ownership still misses fast detached descendants. FIFO draining is independently bounded,
+ * and detected tracking failures publish failure metadata instead of silently abandoning supervision. */
 const BG_SUPERVISE_SH = `
 umask 077
 printf %s "$$" > "$D/supervisor"
-mkfifo "$D/out.pipe" "$D/err.pipe" || exit 1
+mkfifo "$D/out.pipe" "$D/err.pipe" || { : > "$D/supervisor-failed"; printf 125 > "$D/exit"; exit 1; }
 capture() {
   head -c ${BG_CAPTURE_BYTES} > "$D/$1" || : > "$D/overflow"
   if [ "$(dd bs=1 count=1 2>/dev/null | wc -c)" -ne 0 ]; then : > "$D/overflow"; fi
@@ -600,8 +596,7 @@ perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV; die "exec: $!"' sh -c $
   printf %s "$ec" > "$D/child-exit.tmp" && mv "$D/child-exit.tmp" "$D/child-exit"
 `)} sh "$@" > "$D/out.pipe" 2> "$D/err.pipe" < /dev/null &
 c=$!
-# Persist observed identities: pid, pgid, lstart. One ps snapshot keeps ancestry and identity coherent.
-# Retained live descendants seed later walks, so reparenting does not sever the tracked tree.
+# Ledger: pid, pgid, lstart, owned-group. A group becomes owned only when its leader is observed in-run.
 track() {
   perl -e ${shQuote(`
     use strict;
@@ -612,22 +607,19 @@ track() {
       open my $in, "<", $file or die "read process ledger: $!";
       while (<$in>) {
         chomp;
-        my ($pid, $group, $start) = split /\\t/, $_, 3;
-        $known{$pid} = [$group, $start];
+        my ($pid, $group, $start, $owned) = split /\\t/, $_, 4;
+        $known{$pid} = [$group, $start, $owned || 0];
       }
       close $in;
     }
     open my $ps, "-|", "ps", "-axo", "pid=,ppid=,pgid=,lstart=" or die "ps: $!";
     while (<$ps>) {
-      if (/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(.+?)\\s*$/) {
-        $now{$1} = [$2, $3, $4];
-      }
+      if (/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(.+?)\\s*$/) { $now{$1} = [$2, $3, $4]; }
     }
     close $ps or die "ps failed";
     my %live = map {
       my $p = $_;
-      exists $now{$p} && $now{$p}[2] eq $known{$p}[1]
-        ? ($p => 1) : ()
+      exists $now{$p} && $now{$p}[2] eq $known{$p}[1] ? ($p => 1) : ()
     } keys %known;
     if ($mode eq "scan") {
       $live{$root} = 1 if exists $now{$root} && !exists $known{$root};
@@ -638,45 +630,54 @@ track() {
           if (!$live{$p} && $live{$now{$p}[0]}) { $live{$p} = 1; $changed = 1; }
         }
       }
-      for my $p (keys %live) { $known{$p} = [$now{$p}[1], $now{$p}[2]]; }
-      open my $out, ">", $file or die "write process ledger: $!";
+      for my $p (keys %live) {
+        my $owned = ($p == $now{$p}[1]) ? 1 : ($known{$p} ? $known{$p}[2] : 0);
+        $known{$p} = [$now{$p}[1], $now{$p}[2], $owned];
+      }
+      open my $out, ">", "$file.tmp" or die "write process ledger: $!";
       for my $p (keys %known) { print $out join("\\t", $p, @{$known{$p}}), "\\n"; }
       close $out or die "close process ledger: $!";
+      rename "$file.tmp", $file or die "publish process ledger: $!";
     } else {
       my %groups;
       for my $p (keys %live) {
         my $group = $now{$p}[1];
-        # Never signal the supervisor/helpers own group, even if a child joins it.
-        if ($group > 1 && $group != getpgrp() && !$groups{$group}++) { kill $mode, -$group; }
-        kill $mode, $p;
+        # Never broadcast to a merely discovered group. The remaining snapshot-to-signal race is unresolved.
+        if ($known{$p}[2] && $group == $known{$p}[0] && $group > 1 &&
+            $group != getpgrp() && !$groups{$group}++) { kill $mode, -$group; }
       }
     }
   `)} "$c" "$D/processes" "$1"
 }
+failed=0
 end=$(( $(date +%s) + S ))
 while :; do
-  track scan || exit 1
+  if ! track scan; then failed=1; : > "$D/supervisor-failed"; break; fi
   [ ! -f "$D/child-exit" ] || break
   if [ "$(date +%s)" -ge "$end" ]; then : > "$D/timedout"; break; fi
   [ ! -f "$D/overflow" ] || break
   kill -0 "$c" 2>/dev/null || break
   sleep 1
 done
-# Even a normal early exit may leave detached descendants. Re-scan throughout the TERM grace
-# to catch shutdown-time children; each census keeps already observed orphans in the boundary.
-track TERM || exit 1
+# Best-effort root teardown after census/ledger failure. This is not an identity-safe OS boundary.
+kill -TERM "-$c" 2>/dev/null || :
+track TERM || { failed=1; : > "$D/supervisor-failed"; }
 grace=$(( $(date +%s) + 10 ))
 while [ "$(date +%s)" -lt "$grace" ]; do
   sleep 1
-  track scan && track TERM || exit 1
+  track scan && track TERM || { failed=1; : > "$D/supervisor-failed"; break; }
 done
-track KILL || exit 1
+kill -KILL "-$c" 2>/dev/null || :
+track KILL || { failed=1; : > "$D/supervisor-failed"; }
 wait "$c"; ec=$?
-# A TERM handler may have returned valid JSON and exit 0. Preserve that code AND the independent timeout marker.
 if [ -f "$D/child-exit" ]; then ec=$(cat "$D/child-exit"); fi
-wait "$out"; wait "$err"
+# A missed process may retain a FIFO. Bound drains independently so terminal publication cannot hang.
+drain_end=$(( $(date +%s) + 2 ))
+while { kill -0 "$out" 2>/dev/null || kill -0 "$err" 2>/dev/null; } && [ "$(date +%s)" -lt "$drain_end" ]; do sleep 1; done
+kill "$out" "$err" 2>/dev/null || :
+wait "$out" 2>/dev/null; wait "$err" 2>/dev/null
+[ "$failed" -eq 0 ] || ec=125
 printf %s "$ec" > "$D/exit.tmp" && mv "$D/exit.tmp" "$D/exit"
-# One bounded recovery window, without retaining the provider credentials in a separate janitor process.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_CUSTOM_HEADERS
 end=$(( $(date +%s) + 3600 ))
 while [ ! -f "$D/processed" ] && [ -d "$D" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 60; done
@@ -1025,7 +1026,7 @@ export const register: Register = (on, options) => {
       }
       /** Wait for a detached run's exit file, then read what it left. Never throws for a missing file; a run whose
        * launcher vanished (no exit file a grace past the limit) comes back as exit -1. */
-      const waitDetached = async (dir: string, timeoutMs: number): Promise<RunRes & { timedOut: boolean; overflow: boolean }> => {
+      const waitDetached = async (dir: string, timeoutMs: number): Promise<RunRes & { timedOut: boolean; overflow: boolean; supervisorFailed: boolean }> => {
         const giveUpAt = Date.now() + timeoutMs + BG_GRACE_MS
         let exitText: string | null = null
         for (;;) {
@@ -1050,6 +1051,7 @@ export const register: Register = (on, options) => {
         }
         timedOut = await marker('timedout') || timedOut
         const overflow = await marker('overflow')
+        const supervisorFailed = await marker('supervisor-failed')
         const code = exitText === null ? -1 : Number.parseInt(exitText.trim(), 10)
         // A terminal run no longer needs raw (possibly credential-bearing) artifacts, retries included. If the
         // supervisor vanished, its bounded expiry/recovery owns cleanup; do not unlink files still being written.
@@ -1059,7 +1061,7 @@ export const register: Register = (on, options) => {
             if (cleaned.exitCode !== 0) throw new Error('cleanup failed')
           } catch { $.ui.toast('routed-subagents: raw background cleanup failed; expiry/recovery will retry') }
         }
-        return { exitCode: Number.isFinite(code) ? code : -1, stdout, stderr, isStdoutTruncated: isStdoutTruncated || overflow, timedOut, overflow }
+        return { exitCode: supervisorFailed ? 125 : Number.isFinite(code) ? code : -1, stdout, stderr, isStdoutTruncated: isStdoutTruncated || overflow, timedOut, overflow, supervisorFailed }
       }
 
       let firstDir: string
@@ -1092,7 +1094,7 @@ export const register: Register = (on, options) => {
           let note = ''
           // As in the foreground: an exclude header the router refused is retried ONCE without it, in what is left
           // of the one overall budget.
-          if (excluded.length && !res.timedOut && !res.overflow && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
+          if (excluded.length && !res.timedOut && !res.overflow && !res.supervisorFailed && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
             const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
             const remainingMs = Math.floor(backgroundTimeoutMs - (Date.now() - startedAt))
             if (reason && remainingMs >= MIN_RETRY_MS) {
@@ -1105,7 +1107,7 @@ export const register: Register = (on, options) => {
           }
           const record = await recordLastRun()
           if (res.timedOut || !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
-            const why = `exit ${res.exitCode}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}${res.overflow ? `, capture overflow (limit ${BG_CAPTURE_BYTES} bytes per stream)` : ''}${res.timedOut ? `, timeout ${fmtSecs(backgroundTimeoutMs)}` : ''}`
+            const why = `exit ${res.exitCode}${res.supervisorFailed ? ', supervisor failure (teardown not guaranteed)' : ''}${p.isError ? ', error' : ''}${res.isStdoutTruncated ? ', truncated' : ''}${res.overflow ? `, capture overflow (limit ${BG_CAPTURE_BYTES} bytes per stream)` : ''}${res.timedOut ? `, timeout ${fmtSecs(backgroundTimeoutMs)}` : ''}`
             const detail = typeof p.text === 'string' && p.text ? scrubToken(p.text, token).slice(-500) : '(no parseable output)'
             body = `${note}routed background subagent did not complete cleanly (${why}): ${detail}\n${await partialNote()}`
           } else {

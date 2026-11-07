@@ -176,6 +176,14 @@ reason — it never silently re-runs the task as a native subagent, which would 
 
 ## Background subagents
 
+**Review r3 WIP — not ready for deployment.** The shell supervisor still lacks an OS-owned per-run boundary.
+P1 collateral-process/snapshot-to-signal races remain unresolved, as does P1 immediate detached-descendant escape.
+Detected census/ledger failures now publish failure metadata and bounded FIFO draining avoids indefinite terminal
+publication, but P2 workload teardown on tracking failure is still best-effort, not guaranteed.
+`launcher_test.py immediate`, `census-fail`, and `ledger-fail` are unresolved reproductions, not passing acceptance
+checks. The census failure fixture delays its fault until the fake workload can start; it does not count a
+pre-launch kill as successful descendant cleanup. Do not merge or deploy this WIP as a containment fix.
+
 A background Agent call (`run_in_background: true`) is routed like any other, but answered the way Claude Code
 answers its own background agents:
 

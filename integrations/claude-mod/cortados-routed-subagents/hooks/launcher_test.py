@@ -1,5 +1,5 @@
 # Real macOS /bin/sh watchdog regressions. Run: python3 -I launcher_test.py MODE
-# MODE: timeout, early, capture, identity.
+# MODE: timeout, early, capture, identity; WIP reproductions: immediate, census-fail, ledger-fail.
 # Only stdlib, fake children and throwaway state; never launches a provider.
 
 import json, os, pathlib, signal, subprocess, sys, tempfile, time
@@ -16,11 +16,11 @@ launcher = source.split('export const BG_LAUNCH_SH = `', 1)[1].split('`\n', 1)[0
 launcher = launcher.replace('${BG_REAP_SH}', reaper).replace('${shQuote(BG_SUPERVISE_SH)}', shlex.quote(supervisor))
 launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n')
 mode = sys.argv[1]
-assert mode in ('timeout', 'early', 'capture', 'identity')
+assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail')
 if mode == 'identity':
     # Exercise the actual watchdog helper against a live, unrelated process in its own group.
     # A ledger entry for its pid with a different start time must not adopt or signal it.
-    tracker = 'track() {' + supervisor.split('track() {', 1)[1].split('\n}\nend=', 1)[0] + '\n}\n'
+    tracker = 'track() {' + supervisor.split('track() {', 1)[1].split('\n}\nfailed=', 1)[0] + '\n}\n'
     with tempfile.TemporaryDirectory(prefix='route-bg-identity-') as tmp:
         sleeper = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)'],
                                    start_new_session=True)
@@ -96,6 +96,8 @@ signal.signal(signal.SIGTERM, finish)
 pathlib.Path(sys.argv[1] + '.group').write_text(str(os.getpgrp()))
 subprocess.Popen([sys.executable, '-I', '-c', sys.argv[3], sys.argv[1]], start_new_session=True)
 while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)
+if sys.argv[2] == 'immediate':
+    finish()
 if sys.argv[2] == 'early':
     # Let the periodic census observe the detached tool before deliberately orphaning it.
     ledger = pathlib.Path(os.environ['D']) / 'processes'
@@ -113,8 +115,14 @@ with tempfile.TemporaryDirectory(prefix='route-bg-test-') as tmp:
     groupfile = pathlib.Path(str(pidfile) + '.group')
     try:
         env = {'PATH': '/usr/bin:/bin', 'TMPDIR': tmp}
+        run_launcher = launcher
+        if mode == 'census-fail':
+            # Allow the fake workload to start before failing every census, including teardown.
+            run_launcher = launcher.replace('close $ps or die "ps failed";', 'close $ps or die "ps failed"; sleep 1; die "injected census failure";')
+        elif mode == 'ledger-fail':
+            run_launcher = launcher.replace('open my $out, ">", "$file.tmp"', 'sleep 1; mkdir "$file.tmp"; open my $out, ">", "$file.tmp"')
         d = pathlib.Path(subprocess.check_output(
-            ['/bin/sh', '-c', launcher, 'sh', '2' if mode == 'timeout' else '30',
+            ['/bin/sh', '-c', run_launcher, 'sh', '2' if mode in ('timeout', 'census-fail') else '30',
              sys.executable, '-I', '-c', child, str(pidfile), mode, grandchild],
             env=env, text=True, timeout=3).strip())
         deadline = time.monotonic() + 17
@@ -123,11 +131,15 @@ with tempfile.TemporaryDirectory(prefix='route-bg-test-') as tmp:
         assert pidfile.exists(), 'fake grandchild never started'
         pid = int(pidfile.read_text())
         assert pid != int(groupfile.read_text()), 'probe did not detach from child group'
-        assert any(line.split()[0] == str(pid) for line in (d / 'processes').read_text().splitlines()), 'detached tool was not tracked'
+        if mode not in ('census-fail', 'ledger-fail', 'immediate'):
+            assert any(line.split()[0] == str(pid) for line in (d / 'processes').read_text().splitlines()), 'detached tool was not tracked'
+        elif mode in ('census-fail', 'ledger-fail'):
+            assert (d / 'supervisor-failed').exists(), 'census failure was not published'
         while not gone(pid) and time.monotonic() < deadline: time.sleep(.05)
         assert gone(pid), 'TERM-resistant detached grandchild survived descendant cleanup'
         assert (d / 'timedout').exists() == (mode == 'timeout')
-        assert (d / 'exit').read_text() == '0', (d / 'exit').read_text()
+        expected_exit = '125' if mode in ('census-fail', 'ledger-fail') else '0'
+        assert (d / 'exit').read_text() == expected_exit, (d / 'exit').read_text()
         assert json.loads((d / 'stdout').read_text())['result'] == 'partial result'
     finally:
         if 'd' in locals() and (d / 'supervisor').exists():

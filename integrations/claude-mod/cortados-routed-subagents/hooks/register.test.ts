@@ -888,7 +888,7 @@ function agentHandlerFor(opts: any): any {
 const BG_DIR = '/var/folders/x/T/cortados-bg.Ab12Cd'
 
 /** A $ for a background run: the launcher prints BG_DIR; the exit file appears after `pollsBeforeExit` polls. */
-function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; timedOut?: boolean; overflow?: boolean; markerError?: { name: string; code: string }; drop?: string; failWrites?: number[]; launch?: () => any } = {}) {
+function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; timedOut?: boolean; overflow?: boolean; supervisorFailed?: boolean; markerError?: { name: string; code: string }; drop?: string; failWrites?: number[]; launch?: () => any } = {}) {
   const seen: any = { argv: null as string[] | null, env: null as any, runOpts: null as any, writes: [] as Array<[string, string]>, sleeps: 0, submitted: [] as string[], fgRuns: 0 }
   let resolveDone: (t: string) => void = () => {}
   const done = new Promise<string>((r) => { resolveDone = r })
@@ -900,6 +900,7 @@ function bgHost(o: { stdout?: string; exit?: string; pollsBeforeExit?: number; t
   seen.toasts = []
   if (o.overflow) files[`${BG_DIR}/overflow`] = ''
   if (o.timedOut) files[`${BG_DIR}/timedout`] = ''
+  if (o.supervisorFailed) files[`${BG_DIR}/supervisor-failed`] = ''
   const $ = {
     process: {
       run: async (argv: string[], opts: any) => {
@@ -1146,7 +1147,16 @@ test('overflow is a failure even with valid JSON and exit zero; raw artifacts ar
   expect(seen.cleaned).toEqual([BG_DIR])
 })
 
-for (const name of ['timedout', 'overflow']) {
+test('supervisor failure overrides valid JSON and exit zero, and reports uncertain teardown', async () => {
+  const { $, seen, done } = bgHost({ supervisorFailed: true })
+  await agentHandlerFor({})($, bgEvent, async () => 'native')
+  const report = reportOf(await done)
+  expect(report.status).toBe('FAILED')
+  expect(report.result).toContain('supervisor failure (teardown not guaranteed)')
+  expect(seen.cleaned).toEqual([BG_DIR])
+})
+
+for (const name of ['timedout', 'overflow', 'supervisor-failed']) {
   for (const code of ['EACCES', 'EIO']) {
     test(`unreadable ${name} marker (${code}) fails closed despite exit zero and valid JSON`, async () => {
       const { $, done } = bgHost({ markerError: { name, code } })
