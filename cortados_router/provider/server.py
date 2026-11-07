@@ -651,6 +651,9 @@ class Registry:
         self.floor_search: Callable[[dict, float], str | None] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
+        # Orders a conversation's backend-exit Office transition against its requests' turn-end writes, so the exit's
+        # `error` is terminal: a finalizer running after it cannot move the dead worker back to `working`/`idle`.
+        self._office_exit_lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
         self._opening = 0                              # admission reservations: concurrent starts count toward cap
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
@@ -713,10 +716,20 @@ class Registry:
         worker = getattr(s, "office_worker", None)
         if worker:
             try:
-                self.office.turn_end(worker[0], worker[1], status="error")
+                with self._office_exit_lock:
+                    s.office_ended = True              # terminal: office_turn_end skips this conversation from now on
+                    self.office.turn_end(worker[0], worker[1], status="error")
             except Exception as exc:
                 logger.warning("office: backend-exit bookkeeping failed: %s", type(exc).__name__)
         s.close()
+
+    def office_turn_end(self, session, key: str, tags: dict[str, str], **kw) -> None:
+        """A request's turn end on the board, unless the conversation's backend already exited (_backend_exited
+        ended its worker as `error`; that transition is terminal)."""
+        with self._office_exit_lock:
+            if getattr(session, "office_ended", False):
+                return
+            self.office.turn_end(key, tags, **kw)
 
     def reserve_opening(self) -> None:
         """Reserve conversation capacity before routing can reserve any quota."""
@@ -1465,8 +1478,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass                         # headers may already be out; the client sees a broken response
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
-            self._office_turn_end(office_key, {"turn": (reply, "local", None)} if outcome == "completed"
-                                  else {"error": outcome})
+            self._office_turn_end(session, office_key, {"turn": (reply, "local", None)} if outcome == "completed"
+                                           else {"error": outcome})
             if outcome == "completed":
                 session.awaiting_tool_result = any(b.get("type") == "tool_use" for b in reply)
                 session.history.append(anthropic_wire.reply_fingerprint(reply))
@@ -1990,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
                 # conversation is kept: its client has the earlier replies and can continue.
                 reg.drop(session)
         finally:
-            self._office_turn_end(office_key, outcome)
+            self._office_turn_end(session, office_key, outcome)
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here
 
@@ -2015,34 +2028,32 @@ class Handler(BaseHTTPRequestHandler):
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
                              lane=lane, model=route.get("model") or getattr(session, "model", None))
-            try:
-                # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request
-                # left to end the turn, can still end this worker on the board.
-                session.office_worker = (key, dict(tags))
-            except Exception:
-                pass                                # a session type that refuses attributes: no exit transition
+            # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
+            # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
+            session.office_worker = (key, dict(tags))
             return key
         except Exception as exc:
             logger.warning("office: turn start bookkeeping failed: %s", type(exc).__name__)
             return None
 
-    def _office_turn_end(self, key: str | None, outcome: dict[str, Any]) -> None:
+    def _office_turn_end(self, session, key: str | None, outcome: dict[str, Any]) -> None:
         """The turn's end on the board: `working` with the tool it handed the client, `idle` after an answer, `error`
-        after a backend failure. Only tool NAMES are read from the reply, never their input or any text."""
+        after a backend failure. Only tool NAMES are read from the reply, never their input or any text. Skipped once
+        the conversation's backend has exited (Registry.office_turn_end)."""
         if not key:
             return
         try:
             tags = getattr(self, "_office_tags", None) or {}
-            board = self.server.registry.office
+            reg = self.server.registry
             if "turn" in outcome:
                 blocks = outcome["turn"][0] or []
                 tools = [b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
                 if tools:
-                    board.turn_end(key, tags, status="working", tool=tools[-1])
+                    reg.office_turn_end(session, key, tags, status="working", tool=tools[-1])
                 else:
-                    board.turn_end(key, tags, status="idle")
+                    reg.office_turn_end(session, key, tags, status="idle")
             elif "error" in outcome:
-                board.turn_end(key, tags, status="error")
+                reg.office_turn_end(session, key, tags, status="error")
             # busy / stale: another request on the conversation holds it and is still working; nothing changes
         except Exception as exc:
             logger.warning("office: turn end bookkeeping failed: %s", type(exc).__name__)

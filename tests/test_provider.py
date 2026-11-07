@@ -15,6 +15,7 @@ os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
 os.environ.setdefault("CORTADOS_SCARCITY_REFRESH", "off")
 import threading
 import time
+import types
 import unittest
 import uuid
 import urllib.error
@@ -26,7 +27,7 @@ from cortados_router.provider import anthropic_wire as wire, bridge, mcp_shim
 from cortados_router.provider.bridge import BridgeError, BridgeSession
 from cortados_router import core, scarcity
 from cortados_router.provider import search_lane, server
-from cortados_router.provider.server import ProviderServer, Registry
+from cortados_router.provider.server import Handler, ProviderServer, Registry
 
 FAKE = Path(__file__).with_name("fixtures") / "fake_claude_cli.py"
 TOKEN = "test-token"
@@ -528,6 +529,7 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         # Scale all production budgets equally; real child kills its fake CLI owner on double transport failure.
         child = """
 import time
+import types
 from cortados_router.provider import mcp_shim as shim, timeouts
 shim.CALL_TIMEOUT_S = timeouts.CALL_TIMEOUT_S / 1000
 shim.ABORT_TIMEOUT_S = timeouts.ABORT_TIMEOUT_S / 1000
@@ -2258,6 +2260,12 @@ class StartFailureTests(unittest.TestCase):
         self.assertEqual(os.listdir(scratch), [])
 
 
+def _office_handler(reg, *, run_id):
+    """A stand-in for a Handler: just what _office_turn_start/_office_turn_end read."""
+    return types.SimpleNamespace(server=types.SimpleNamespace(registry=reg), _office_tags={"session": "sess-1"},
+                                 _run_id=lambda: (run_id, True))
+
+
 class OwnerDeathTests(unittest.TestCase):
     def test_owner_death_with_delayed_abort_still_removes_the_conversation(self):
         # The CLI dies (as when the shim SIGKILLs it on expiry) and the shim's abort never arrives: the provider's
@@ -2273,9 +2281,9 @@ class OwnerDeathTests(unittest.TestCase):
             closed.append(True)
             done.set()                                 # only after the real cleanup has returned
         s.close = close
-        tags = {"session": "sess-1"}
-        reg.office.turn_start("w-1", tags, run_id="w-1", provider=None, lane=None, model=None)
-        s.office_worker = ("w-1", tags)               # what _office_turn_start keeps on the conversation
+        handler = _office_handler(reg, run_id="w-1")
+        key = Handler._office_turn_start(handler, s, one_shot=False)   # the real path keeps the identity on s
+        self.assertEqual(s.office_worker[0], key)
         with reg._lock:
             reg.sessions[s.id] = s
         s.set_exit_handler(reg._backend_exited)       # what Registry.new wires for every held conversation
@@ -2283,8 +2291,24 @@ class OwnerDeathTests(unittest.TestCase):
         self.assertIsNone(reg.get(s.id))
         self.assertEqual(closed, [True])
         self.assertIsNotNone(s.proc.poll())
-        self.assertEqual(reg.office.workers["w-1"]["status"], "error")    # the dead worker no longer shows working
-        self.assertIsNotNone(reg.office.workers["w-1"]["ended_at"])
+        self.assertEqual(reg.office.workers[key]["status"], "error")    # the dead worker no longer shows working
+        self.assertIsNotNone(reg.office.workers[key]["ended_at"])
+
+    def test_finalizer_after_backend_exit_cannot_resurrect_the_worker(self):
+        # The backend exits after run_turn returned a tool-use reply but before the request's finalizer ran: the
+        # exit's `error` is terminal, so the late turn end must not move the worker back to `working`.
+        reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
+        s = types.SimpleNamespace(id="conv-late-1", close=lambda: None)
+        handler = _office_handler(reg, run_id="w-late")
+        key = Handler._office_turn_start(handler, s, one_shot=False)
+        self.assertEqual(reg.office.workers[key]["status"], "working")
+        with reg._lock:
+            reg.sessions[s.id] = s
+        reg._backend_exited(s)                         # exit callback first
+        Handler._office_turn_end(handler, s, key,      # then the finalizer, with a tool-use reply
+                                 {"turn": ([{"type": "tool_use", "name": "Bash", "id": "t1", "input": {}}], "x", None)})
+        self.assertEqual(reg.office.workers[key]["status"], "error")
+        self.assertIsNotNone(reg.office.workers[key]["ended_at"])
 
     def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
