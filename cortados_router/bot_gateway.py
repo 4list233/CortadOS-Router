@@ -689,7 +689,9 @@ def build_server(gw: Gateway, host: str = "127.0.0.1", port: int = 8434) -> Thre
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False: a prefix such as --enable-start-t must not expand to --enable-start-task; the Air launcher
+    # (integrations/bot-gateway/launch.py) allowlists exact spellings, and this keeps the two parsers in agreement.
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("--token-file", default=os.environ.get("CORTADOS_BOT_TOKEN_FILE", ""))
     ap.add_argument("--workspace-root", default=os.environ.get("CORTADOS_BOT_WORKSPACE_ROOT", ""))
     ap.add_argument("--host", default="127.0.0.1")

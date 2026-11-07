@@ -91,6 +91,18 @@
       "title": "Keep reviews off the builder's model",
       "default": true,
       "description": "When on, a review subagent (description matching 'review', or a review subagent type) is sent with x-cortados-exclude-model listing the MAIN SESSION's own model plus the models routed non-review subagents ran on since the last review (up to 3, read from the provider's run record; the list resets on mod reload and after a completed review). If the session model can't be read or the session is itself routed ('cortados'), only the worker models are excluded; if nothing can be excluded, no header is sent and a toast says so."
+    },
+    "mainSessionGuard": {
+      "type": "boolean",
+      "title": "Main-session guard (warn only)",
+      "default": true,
+      "description": "When on, a big Edit/Write/NotebookEdit (over 40 lines or 2000 characters of new content) or a build/test Bash run (python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test) on the MAIN session shows a toast (at most one per 10 minutes) and a status-line counter nudging you to delegate. Never blocks a call. Subagents are never watched. /cortados-guard on|off overrides this, kept in the plugin store."
+    },
+    "officeView": {
+      "type": "boolean",
+      "title": "CortadOS Office view",
+      "default": true,
+      "description": "When on, every routed request carries this session's opaque tag (a salted hash of the session id), the project folder name, the device's short hostname and the task title (the Agent call's description, at most 80 characters), and the main session sends the provider a heartbeat with its status and current tool name, so GET /v1/cortados/office can draw this session as a floor. Metadata only: never prompt text, tool input or file contents."
     }
   }
 }

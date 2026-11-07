@@ -773,6 +773,7 @@ class SubscriptionPinEndpointTests(EndpointHarness):
         def recording(provider):
             def factory(reg, **kw):
                 self.opened.append((provider, kw["model"]))
+                kw.pop("codex_home", None)          # the frozen Codex home (Registry.new); the Claude stand-in has none
                 return server._claude_session(reg, **kw)
             return factory
         self.reg._factories = {"claude-cli": recording("claude-cli"), "codex-cli": recording("codex-cli")}

@@ -266,16 +266,25 @@ def _holds(cond: dict[str, Any], v: dict[str, int]) -> bool:
 
 
 _sc_mod = None
+# One loader at a time: callers on worker threads (the S1 outcome loop's run workers) can arrive while the first is still
+# executing scarcity.py, and must wait for it rather than see a half-executed module (Studio 2026-11-04).
+_sc_lock = threading.Lock()
 
 
 def _scarcity_module():
-    """core.py is loaded by file path under a unique name (no package), so its sibling is loaded the same way."""
+    """core.py is loaded by file path under a unique name (no package), so its sibling is loaded the same way.
+    The module is published only after it has executed completely; a failed load publishes nothing (the next call
+    retries)."""
     global _sc_mod
     if _sc_mod is None:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("cortados_router_scarcity", str(Path(__file__).with_name("scarcity.py")))
-        _sc_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_sc_mod)
+        with _sc_lock:
+            if _sc_mod is None:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("cortados_router_scarcity",
+                                                              str(Path(__file__).with_name("scarcity.py")))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _sc_mod = mod
     return _sc_mod
 
 
@@ -495,6 +504,11 @@ def _reading_for_other_login(reading: dict[str, Any], c: dict[str, Any]) -> bool
     (accounts reordered, or a default<->named transition: the default login's config_dir None is a distinct identity).
     The one identity rule of candidate_health, _tokens_left_for and headroom_pct_for."""
     return "config_dir" in reading and reading.get("config_dir") != c.get("config_dir")
+
+
+def codex_login_identity(env: dict[str, str]) -> str | None:
+    """The login a Codex CLI started with `env` runs on (scarcity's rule, which also stamps each Codex reading's `login`)."""
+    return _scarcity_module().codex_login_identity(env)
 
 
 def claude_login_identity(env: dict[str, str]) -> str | None:

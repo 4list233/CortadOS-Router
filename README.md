@@ -451,6 +451,70 @@ claude mcp add -s user cortados-route \
   -- python3 /ABSOLUTE/PATH/TO/CortadOS-Router/cortados_router/subagent_mcp.py
 ```
 
+## Bot gateway on the Air
+
+`integrations/bot-gateway/install.sh` runs the bot gateway (`cortados_router/bot_gateway.py`, phase 1: `route_task`
+only; design in `docs/GROKBOT-BRIDGE.md`) as the LaunchAgent `com.cortados.bot-gateway`, as the Air's normal user, on
+the Air's tailnet address, port 8434. Run these on the Air, from the checkout, in order:
+
+```bash
+cd ~/cortados-router && git pull
+integrations/bot-gateway/install.sh token    # creates ~/.config/cortados/bot-gateway-token (0600); never prints it
+integrations/bot-gateway/install.sh plist    # writes ~/Library/LaunchAgents/com.cortados.bot-gateway.plist
+integrations/bot-gateway/install.sh load     # (re)loads it
+integrations/bot-gateway/install.sh status   # launchctl state, unauthenticated POST /mcp (expect 401), log path + line count
+```
+
+The owner views the bot token himself (`cat ~/.config/cortados/bot-gateway-token`) and pastes it into Grok Bot's
+secret field. The system prompt is in `docs/BOT-INSTRUCTIONS.md`. `install.sh unload` stops the gateway.
+
+The plist holds `RunAtLoad`, `KeepAlive` (it keeps retrying while Tailscale is not up yet), logs to
+`~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://<Air tailnet address>:8432`, and the gateway flags
+`--host <Air tailnet address> --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
+~/cortados-bot-workspace --children-run-as-me`. The address comes from `tailscale ip -4` at install time and must be exactly one IPv4 address in 100.64.0.0/10 (anything else, including a failing CLI, multiple lines or 0.0.0.0, is refused); it is never
+stored in the repo. If it changes, rerun `plist` and `load`. There is no `--enable-start-task`. The plist passes
+`--children-run-as-me` because the gateway refuses any non-loopback `--host` without it. In phase 1 the gateway starts
+no child, so no task runs as the owner on a bot's behalf. The plist holds no secret values.
+
+**Provider token for route_task: design (a), read from `~/.cortados/provider.env` as data.** The provider's own
+LaunchAgent already keeps its token in that file, so the gateway uses the same file and there is no second copy of the
+secret to keep in step. Fallback, design (b): if provider.env does not assign the name, `plist` uses a 0600 file the
+owner creates himself, `~/.config/cortados/bot-gateway-provider-token`, holding the token alone. If neither exists,
+`plist` refuses to run. The installer only checks that a line assigns the variable *name* `CORTADOS_PROVIDER_TOKEN`
+(`grep -q`, with the launcher's own line grammar: leading spaces or tabs and an optional `export`); it never reads
+the value.
+
+Both designs run the same stdlib launcher: `/usr/bin/python3 -I integrations/bot-gateway/launch.py
+(--provider-env F | --provider-token-file F) --python /usr/bin/python3 -- <gateway flags>`. It:
+
+- never executes provider.env. Lines are split on LF only (CRLF accepted), and only spaces and tabs are trimmed. It
+  accepts only blank lines, `#` comments and `[export ]NAME=value`, with the value unquoted, single-quoted or
+  double-quoted, and expands nothing;
+- refuses the whole file, with exit 78 (EX_CONFIG) and a message naming the line number only (never a name or a
+  value), for any other line: a control character (NUL, U+001C, a stray CR), a Unicode line separator, `$`, a
+  backtick, a backslash, `set -x`, a trap, a command, `readonly`, or a repeated name;
+- reads the token file (design b) as the token plus at most one trailing LF or CRLF, nothing else trimmed. The file
+  must be 0600;
+- requires the token to be non-empty printable ASCII with no spaces. A symlink, a file owned by someone else, a file
+  that others may write (or, for the token file, read), or a missing `HOME`, `CORTADOS_HOME` or
+  `CORTADOS_PROVIDER_URL` also exits 78;
+- passes gateway flags only if each is an exact phase-1 spelling (`--host`, `--port`, `--token-file`,
+  `--workspace-root`, `--children-run-as-me`). So no abbreviation of `--enable-start-task` gets through, and the
+  gateway's own argparse no longer expands abbreviations either (`allow_abbrev=False`);
+- `os.execve`s the gateway as `python3 -I -S -B -c <bootstrap>`. The fixed bootstrap puts only this checkout on
+  `sys.path` and runs `cortados_router.bot_gateway` with `runpy`. `-I -S` keep the child from loading any
+  `sitecustomize` / `usercustomize` from the user site under `HOME` or from `PYTHONPATH`, code that would see the
+  token and could edit the gateway's argv (review r4). The child gets an explicit environment: exactly `HOME`, a fixed
+  `PATH`, `CORTADOS_HOME` and `CORTADOS_PROVIDER_URL` (all from the plist) plus the token. launchd's own environment
+  (a `PYTHONPATH`, proxies, an ambient `CORTADOS_PROVIDER_TOKEN`) never reaches the gateway. The token is never on a
+  command line and never printed.
+
+The design does not source provider.env as shell code (review r2). Sourcing would let anything in the file print the
+token (`set -x`, traps), hand it to another program, or put variables into the gateway's environment. Python adds
+`LC_CTYPE` when it starts in the C locale, and `/usr/bin/python3` (Apple's shim) adds its developer-tools variables;
+neither carries anything from provider.env. Tests: `tests/test_bot_gateway_install.py` (temp HOME, fake `tailscale` /
+`launchctl` / `curl`, a fake `execve`).
+
 ## The resource pool at a glance
 
 A read-only `GET /resources` on the provider (same token) returns one JSON snapshot of the pool: logged routing usage (counts by band and lane, the degraded rate, S1 latency), each subscription's cached scarcity and expiring credit, the online local devices with their memory and GPU headroom, and a rough estimate of which local models would fit (`tables/local-models.json`; weights-only, an upper bound, never an admission promise). It opens no vendor CLI and never blocks on a probe: subscription numbers come from the cached reading and device telemetry is sampled on a background timer. This is the data behind the usage dashboard. The provider serves a browser dashboard at `GET /dashboard` (see below), and a Claude Code pane that stays beside the chat lives in `integrations/claude-mod/cortados-pulse`.

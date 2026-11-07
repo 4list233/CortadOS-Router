@@ -45,8 +45,9 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
 
 **Phase 2 still needs:** a dedicated low-privilege workspace user for bot children; repo cloning into the workspace
 root; the child's own routed traffic carrying `x-cortados-client` (today it is attributable through its run id and the
-event log) and the provider recording that header; Air deployment (launchd plist, token file, Tailscale ACL as in
-section 4); a dashboard line reading `bot-usage.jsonl`.
+event log) and the provider recording that header; the Tailscale ACL from section 4; a dashboard line reading
+`bot-usage.jsonl`. The Air installer (LaunchAgent run as the Air's normal user, token file, tailnet bind on 8434) is
+built: `integrations/bot-gateway/install.sh`, steps in README.md under "Bot gateway on the Air".
 
 ## 1. Goal
 

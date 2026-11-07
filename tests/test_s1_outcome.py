@@ -268,9 +268,21 @@ class RunTests(OutcomeCase):
         self.assertEqual([r for r in store.read("runs") if r.get("result")], [])
         self.assertEqual(store.read("ladders"), [])
 
+    def test_redaction_covers_tokens_json_would_escape(self):
+        for secret in ('pt"ok', "pt\\ok", 'p\\"t'):
+            trace = {"final": f"x{secret}y", "outward_calls": [{"tool": "t", "args": {secret: [f"a {secret}"]}}]}
+            out = agents.redact(trace, secret)
+            self.assertNotIn(secret, json.dumps(out, ensure_ascii=False) + json.dumps(out))
+            self.assertNotIn(json.dumps(secret)[1:-1], json.dumps(out))      # nor its escaped spelling
+            self.assertEqual(out["final"], "x[redacted]y")
+            self.assertEqual(out["outward_calls"][0]["args"], {"[redacted]": ["a [redacted]"]})
+
     def test_provider_mode_redacts_the_provider_token_from_the_trace(self):
         self._provider_mode("claude-opus-5-5 · 60% left", FAKE_PRINT_TOKEN="1")
-        result = run.run_one(_spec(), self._rung())
+        relayed = [{"tool": "send_email", "args": {"body": "the token is ptok"}}]   # relayed through a mock outward call
+        with mock.patch.object(agents, "_read_calls", return_value=relayed):
+            result = run.run_one(_spec(), self._rung())
+        self.assertEqual(result["trace"]["outward_calls"][0]["args"]["body"], "the token is [redacted]")
         self.assertNotIn("ptok", json.dumps(result))
         self.assertIn("[redacted]", result["trace"]["final"])
 
@@ -316,8 +328,7 @@ class RunTests(OutcomeCase):
         self.assertEqual((t["served_model"], t["served_lane"], t["left_pct"], t["via"]), ("gpt-6-astra", "codex", 48.0, "provider"))
         from outcome import provider
         _set_resources(provider, _readings(codex=48))
-        ok, why = provider.admit("codex"); self.assertFalse(ok)              # Codex is held up front in provider mode
-        self.assertIn("codex readings not bound to a login", why)
+        ok, why = provider.admit("codex"); self.assertTrue(ok); self.assertIn("48%", why)   # /resources decides
 
     def test_provider_mode_low_headroom_on_the_serving_lane_holds_later_bands(self):
         self._provider_mode("claude-opus-5-5 · 2% left")
@@ -958,8 +969,7 @@ class ProviderBackendTests(OutcomeCase):
             judge.judge(limit=1); gen.generate(limit=1)
         lanes = [(c.args[0], c.args[1]) for c in ask.call_args_list]
         self.assertIn(("claude", judge.TEACHER), lanes)
-        # Generation runs on Codex, which provider mode holds up front (Codex readings carry no login): no call at all.
-        self.assertNotIn(("codex", gen.GENERATOR), lanes)
+        self.assertIn(("codex", gen.GENERATOR), lanes)
 
     def test_judge_and_generate_default_to_the_local_backend_without_a_url(self):
         self._seed_work()
