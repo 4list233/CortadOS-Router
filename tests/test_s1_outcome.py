@@ -62,7 +62,8 @@ class OutcomeCase(unittest.TestCase):
         # send a test's judge/generate call to a real provider.
         self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local",
                                                 "HOME": self.home, "CORTADOS_PROVIDER_URL": "",
-                                                "CORTADOS_PROVIDER_URL_FILE": ""})
+                                                "CORTADOS_PROVIDER_URL_FILE": "", "CORTADOS_PROVIDER_TOKEN": "",
+                                                "CORTADOS_PROVIDER_TOKEN_FILE": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
         from outcome import provider

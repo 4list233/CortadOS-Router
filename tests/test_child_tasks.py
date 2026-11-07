@@ -263,6 +263,8 @@ class ChildTaskTests(unittest.TestCase):
                                                 "HOME": self.tmp,
                                                 "CORTADOS_PROVIDER_URL": "",
                                                 "CORTADOS_PROVIDER_URL_FILE": "",
+                                                "CORTADOS_PROVIDER_TOKEN": "",
+                                                "CORTADOS_PROVIDER_TOKEN_FILE": "",
                                                 "CORTADOS_HOME": os.path.join(self.tmp, "home"),
                                                 "CORTADOS_SCARCITY_REFRESH": "off"})
         self.env.start()
