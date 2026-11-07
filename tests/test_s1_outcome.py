@@ -60,7 +60,9 @@ class OutcomeCase(unittest.TestCase):
         self.home = tempfile.mkdtemp()
         # The local backend unless a test opts into the provider: a developer shell's CORTADOS_PROVIDER_URL must not
         # send a test's judge/generate call to a real provider.
-        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local"})
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_OUTCOME_HOME": self.home, "CORTADOS_OUTCOME_BACKEND": "local",
+                                                "HOME": self.home, "CORTADOS_PROVIDER_URL": "",
+                                                "CORTADOS_PROVIDER_URL_FILE": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
         from outcome import provider

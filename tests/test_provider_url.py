@@ -1,5 +1,6 @@
 """Endpoint resolution only: no network, vendor CLI or real machine configuration."""
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -70,6 +71,23 @@ class ProviderURLTests(unittest.TestCase):
         standalone = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(standalone)
         self.assertEqual(standalone.resolve_provider_url(self.env), m.resolve_provider_url(self.env))
+
+    def test_import_ignores_invalid_ambient_route_timeout(self):
+        spec = importlib.util.spec_from_file_location("standalone_bad_timeout", m.__file__)
+        standalone = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"CORTADOS_ROUTE_TIMEOUT_S": "invalid-ambient-setting"}):
+            spec.loader.exec_module(standalone)
+        self.assertEqual(standalone.resolve_provider_url(self.env), "https://provider.example:8443")
+
+    def test_mcp_main_starts_with_only_the_shared_url_file(self):
+        seen = []
+        request = '{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "CORTADOS_PROVIDER_URL": "",
+                                          "CORTADOS_PROVIDER_URL_FILE": ""}, clear=True), \
+                mock.patch.object(m.sys, "stdin", io.StringIO(request)), \
+                mock.patch.object(m, "_dispatch", lambda message, cfg: seen.append((message, dict(cfg)))):
+            m.main()
+        self.assertEqual(seen[0][1]["url"], "https://provider.example:8443")
 
     def test_https_route_request(self):
         seen = []

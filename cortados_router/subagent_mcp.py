@@ -31,7 +31,7 @@ import urllib.parse
 
 PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18"}   # only versions whose required behaviour (no mandatory JSON-RPC batching) we implement
-TIMEOUT_S = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", "300"))   # a routed subtask can take a while (cold lane, large output)
+DEFAULT_TIMEOUT_S = 300.0          # a routed subtask can take a while (cold lane, large output)
 DEFAULT_MAX_TOKENS = 8000
 MIN_TOKEN_LEN = 8                 # shorter is not a provider token (see route_task)
 
@@ -247,7 +247,10 @@ def route_task(provider_url: str, token: str, task: str, context: str = "", max_
                                           # attribution: which front door asked (e.g. the bot gateway's "grokbot")
                                           **({"x-cortados-client": str(client)} if client else {})})
     try:
-        with urlopen(req, timeout=TIMEOUT_S) as resp:
+        # Parse this operation-specific setting only when route_task needs it. Importers use the URL resolver too;
+        # unrelated ambient route settings must not break those imports.
+        timeout_s = float(os.environ.get("CORTADOS_ROUTE_TIMEOUT_S", str(DEFAULT_TIMEOUT_S)))
+        with urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
