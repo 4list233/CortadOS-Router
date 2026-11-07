@@ -24,16 +24,21 @@ if mode == 'sweep':
         processes = []
         dirs = {}
         try:
-            for kind in ('active', 'stale', 'unrelated', 'argv', 'marker', 'ledger'):
+            kinds = ('active', 'stale', 'unrelated', 'argv', 'marker', 'ledger', 'copied', 'embedded', 'collision')
+            for kind in kinds:
                 d = pathlib.Path(tmp) / ('cortados-bg.' + kind)
-                d.mkdir()
-                dirs[kind] = d
+                d.mkdir(); dirs[kind] = d
                 (d / 'owner-v1').touch()
-                marker = str(uuid.uuid4())
+                marker = str(uuid.uuid4()) + str(uuid.uuid4())
                 (d / 'sweep-marker').write_text(marker + '\n')
+                (d / 'run-start').write_text(str(int(time.time()) - 10))
+                # Copied/embedded markers and the active-run collision start after this finished run's window.
+                if kind in ('copied', 'embedded', 'collision'):
+                    (d / 'run-finish').write_text(str(int(time.time()) - 5))
                 if kind != 'active': (d / 'exit').write_text('0')
                 env = {'PATH': '/usr/bin:/bin'}
-                if kind in ('active', 'marker'): env['CORTADOS_BG_RUN'] = marker
+                if kind in ('active', 'marker', 'copied', 'collision'): env['CORTADOS_BG_RUN'] = marker
+                if kind == 'embedded': env['UNRELATED_LOG_TEXT'] = 'captured text CORTADOS_BG_RUN=' + marker + ' end'
                 p = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)',
                                       'CORTADOS_BG_RUN=' + marker if kind == 'argv' else kind],
                                      env=env, start_new_session=True)
@@ -41,6 +46,8 @@ if mode == 'sweep':
                 start = subprocess.check_output(['ps', '-p', str(p.pid), '-o', 'lstart='], text=True).strip()
                 if kind in ('ledger', 'stale'):
                     (d / 'processes').write_text(f'{p.pid}\t{p.pid}\t' + (start if kind == 'ledger' else 'STALE') + '\n')
+                if kind not in ('copied', 'embedded', 'collision'):
+                    (d / 'run-finish').write_text(str(int(time.time()) + 1))
             # Result processing must not discard the identity evidence needed by a later sweep.
             subprocess.run(['/bin/sh', '-c', cleanup, 'sh', str(dirs['ledger'])], check=True)
             assert (dirs['ledger'] / 'processes').exists()
@@ -48,17 +55,19 @@ if mode == 'sweep':
                            check=True, timeout=30)
             for kind, p in processes:
                 if kind in ('marker', 'ledger'):
-                    p.wait(timeout=3)
-                    assert p.returncode < 0, kind
-                    assert '\tTERM\t' in (dirs[kind] / 'sweep.log').read_text()
+                    p.wait(timeout=3); assert p.returncode < 0, kind
+                    log = (dirs[kind] / 'sweep.log').read_text()
+                    assert '\tTERM\t' in log
+                    assert ('\tmarker-window\n' in log) == (kind == 'marker')
                 else:
                     assert p.poll() is None, 'collateral kill: ' + kind
-                    assert not (dirs[kind] / 'sweep.log').exists(), kind
+                    log = dirs[kind] / 'sweep.log'
+                    assert not log.exists() or '\tTERM\t' not in log.read_text(), kind
         finally:
             for _, p in processes:
                 if p.poll() is None: p.kill()
                 p.wait()
-    print('sweep: active, stale, unrelated and argv-only spared; marker and ledger members terminated')
+    print('sweep: copied, embedded and colliding hints spared; windowed marker and ledger members terminated')
     sys.exit(0)
 if mode == 'identity':
     # Exercise the actual watchdog helper against a live, unrelated process in its own group.
@@ -83,7 +92,25 @@ if mode == 'identity':
         finally:
             if sleeper.poll() is None: sleeper.kill()
             sleeper.wait()
-    print('stale identity ignored; matching identity terminated')
+    # A tracked leader that moves into an unrelated live group loses group-broadcast authority.
+    with tempfile.TemporaryDirectory(prefix='route-bg-group-move-') as tmp:
+        gate = pathlib.Path(tmp) / 'move'
+        unrelated = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)'], preexec_fn=os.setpgrp)
+        mover_code = ('import os,sys,time,pathlib\ngate=pathlib.Path(sys.argv[1]); target=int(sys.argv[2])\n'
+                      'while not gate.exists(): time.sleep(.01)\nos.setpgid(0,target)\ntime.sleep(60)')
+        mover = subprocess.Popen([sys.executable, '-I', '-c', mover_code, str(gate), str(unrelated.pid)], preexec_fn=os.setpgrp)
+        try:
+            ledger = pathlib.Path(tmp) / 'processes'
+            command = 'D=$1; c=$2\n' + tracker + '\ntrack scan; : > "$3"; sleep 1; track scan; track TERM'
+            subprocess.run(['/bin/sh', '-c', command, 'sh', tmp, str(mover.pid), str(gate)], check=True)
+            mover.wait(timeout=3)
+            assert mover.returncode < 0, 'moved tracked process was not individually signalled'
+            assert unrelated.poll() is None, 'ownership followed the tracked process into an unrelated group'
+        finally:
+            for p in (mover, unrelated):
+                if p.poll() is None: p.kill()
+                p.wait()
+    print('stale identities ignored; moved leader signalled individually without killing unrelated group')
     sys.exit(0)
 if mode == 'capture':
     with tempfile.TemporaryDirectory(prefix='route-bg-capture-') as tmp:

@@ -633,7 +633,11 @@ track() {
         }
       }
       for my $p (keys %live) {
-        my $owned = ($p == $now{$p}[1]) ? 1 : ($known{$p} ? $known{$p}[2] : 0);
+        # Ownership is attached to the group we actually observed this process lead. A leader that later joins
+        # somebody else\x27s group must not carry authority to broadcast into that group.
+        my $old = $known{$p};
+        my $owned = ($p == $now{$p}[1]) ? 1
+          : ($old && $old->[0] == $now{$p}[1] ? $old->[2] : 0);
         $known{$p} = [$now{$p}[1], $now{$p}[2], $owned];
       }
       open my $out, ">", "$file.tmp" or die "write process ledger: $!";
@@ -642,11 +646,17 @@ track() {
       rename "$file.tmp", $file or die "publish process ledger: $!";
     } else {
       my %groups;
+      # A broadcast needs the still-live, identity-checked leader. Historical ownership on another member is not
+      # enough; members of a group without that proof are signalled only by pid.
       for my $p (keys %live) {
         my $group = $now{$p}[1];
-        # Never broadcast to a merely discovered group. The remaining snapshot-to-signal race is unresolved.
-        if ($known{$p}[2] && $group == $known{$p}[0] && $group > 1 &&
-            $group != getpgrp() && !$groups{$group}++) { kill $mode, -$group; }
+        $groups{$group} = 1 if $p == $group && $known{$p}[2] && $known{$p}[0] == $group &&
+          $group > 1 && $group != getpgrp();
+      }
+      for my $p (keys %live) {
+        my $group = $now{$p}[1];
+        if (($groups{$group} || 0) == 1) { kill $mode, -$group; $groups{$group} = 2; }
+        elsif (!$groups{$group}) { kill $mode, $p; }
       }
     }
   `)} "$c" "$D/processes" "$1"
@@ -678,6 +688,7 @@ while { kill -0 "$out" 2>/dev/null || kill -0 "$err" 2>/dev/null; } && [ "$(date
 kill "$out" "$err" 2>/dev/null || :
 wait "$out" 2>/dev/null; wait "$err" 2>/dev/null
 [ "$failed" -eq 0 ] || ec=125
+date +%s > "$D/run-finish.tmp" && mv "$D/run-finish.tmp" "$D/run-finish"
 printf %s "$ec" > "$D/exit.tmp" && mv "$D/exit.tmp" "$D/exit"
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_CUSTOM_HEADERS
 end=$(( $(date +%s) + 3600 ))
@@ -693,7 +704,10 @@ case "$secs" in ''|*[!0-9]*) exit 1;; esac
 ${BG_REAP_SH}
 d=$(mktemp -d "\${TMPDIR:-/tmp}/cortados-bg.XXXXXX") || exit 1
 : > "$d/owner-v1"
-uuidgen > "$d/sweep-marker" || exit 1
+date +%s > "$d/run-start" || exit 1
+# Two v4 UUIDs provide well over 128 random bits. The secret is only in this 0600 file and the inherited environment;
+# it is never placed in argv or diagnostics.
+{ uuidgen; uuidgen; } | tr -d '\\n' > "$d/sweep-marker" || exit 1
 D="$d" S="$secs" nohup sh -c ${shQuote(BG_SUPERVISE_SH)} sh "$@" > /dev/null 2>&1 < /dev/null &
 printf '%s\\n' "$d"`
 
@@ -707,6 +721,7 @@ export const BG_SWEEP_SH = String.raw`
 perl -e '
 use strict;
 use warnings;
+use Time::Local qw(timelocal);
 $ENV{LC_ALL} = "C";
 my $base = $ENV{TMPDIR} || "/tmp";
 sub owned {
@@ -719,6 +734,14 @@ sub readfile {
   return "" unless owned($p, 0);
   open my $f, "<", $p or return "";
   local $/; return <$f> // "";
+}
+sub start_epoch {
+  my ($s) = @_;
+  my %month = (Jan=>0, Feb=>1, Mar=>2, Apr=>3, May=>4, Jun=>5,
+               Jul=>6, Aug=>7, Sep=>8, Oct=>9, Nov=>10, Dec=>11);
+  return undef unless $s =~ /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Z][a-z]{2})\s+(\d+) (\d+):(\d+):(\d+) (\d{4})$/;
+  return undef unless exists $month{$1};
+  return eval { timelocal($5, $4, $3, $2, $month{$1}, $6) };
 }
 sub census {
   my ($pid, $env) = @_;
@@ -739,47 +762,89 @@ sub census {
   die "sweep census failed" if !$ok && !defined($pid);
   return \%rows;
 }
-sub marked {
-  my ($pid, $row, $marker, $rows) = @_;
-  return 0 unless $marker =~ /^[A-Fa-f0-9-]{36}$/;
-  my $env = ($rows || census($pid, 1))->{$pid};
-  return 0 unless $env && $env->[0] == $row->[0] && $env->[1] eq $row->[1];
-  # ps eww appends the environment after argv; never treat an argv substring as an env marker.
-  return 0 unless index($env->[2], $row->[2]) == 0;
-  my $tail = substr($env->[2], length($row->[2]));
-  return $tail =~ /(?:^|\s)CORTADOS_BG_RUN=\Q$marker\E(?:\s|$)/;
+sub actual_markers {
+  my ($marker_file, @pids) = @_;
+  my %found;
+  return \%found unless @pids;
+  # KERN_PROCARGS2 preserves NUL-delimited argv/environment entries. Unlike ps eww text, an unrelated variable value
+  # containing "CORTADOS_BG_RUN=..." cannot be mistaken for the actual environment entry.
+  my $py = q{
+import ctypes, pathlib, struct, sys
+secret = pathlib.Path(sys.argv[1]).read_bytes().strip()
+want = b"CORTADOS_BG_RUN=" + secret
+libc = ctypes.CDLL(None, use_errno=True)
+for word in sys.argv[2:]:
+    try: pid = int(word)
+    except ValueError: continue
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 5: continue
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0: continue
+    raw = bytes(buf[:size.value])
+    argc = struct.unpack_from("=i", raw)[0]
+    fields = raw[4:].split(b"\0")
+    while fields and not fields[0]: fields.pop(0)
+    if not fields: continue
+    fields.pop(0)  # exec path
+    while fields and not fields[0]: fields.pop(0)
+    fields = fields[argc:]  # exact environment entries remain
+    if want in fields: print(pid)
+};
+  open my $p, "-|", "python3", "-I", "-c", $py, $marker_file, @pids or return \%found;
+  while (<$p>) { chomp; $found{$_} = 1 if /^\d+$/; }
+  close $p;
+  return \%found;
 }
 opendir my $dh, $base or die "sweep directory unavailable";
 my @dirs = map { "$base/$_" } grep { /^cortados-bg\.[A-Za-z0-9]+$/ } readdir $dh;
 closedir $dh;
 my $now = census(undef, 0);
-my $envs = census(undef, 1);
 my @targets;
 for my $d (@dirs) {
   next unless owned($d, 1) && owned("$d/owner-v1", 0);
   next unless readfile("$d/exit") =~ /^\d+$/;
   my $marker = readfile("$d/sweep-marker"); chomp $marker;
+  next unless $marker =~ /^(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-4[A-Fa-f0-9]{3}-[89ABab][A-Fa-f0-9]{3}-[A-Fa-f0-9]{12}){2}$/;
+  my $began = readfile("$d/run-start"); chomp $began;
+  my $finished = readfile("$d/run-finish"); chomp $finished;
+  next unless $began =~ /^\d+$/ && $finished =~ /^\d+$/ && $began <= $finished;
   my %known;
   for (split /\n/, readfile("$d/processes")) {
     my ($pid, $group, $start) = split /\t/;
     next unless defined($start) && $pid =~ /^\d+$/ && $group =~ /^\d+$/;
     $start =~ s/\s+/ /g; $known{$pid} = [$group, $start];
   }
+  my $marked = actual_markers("$d/sweep-marker", keys %$now);
   for my $pid (keys %$now) {
     next if $pid <= 1 || $pid == $$ || $pid == getppid();
     my $r = $now->{$pid};
     my $recorded = $known{$pid} && $known{$pid}[0] == $r->[0] && $known{$pid}[1] eq $r->[1];
-    next unless $recorded || marked($pid, $r, $marker, $envs);
-    push @targets, [$d, $pid, $r, $recorded ? "ledger" : "marker", $marker];
+    my $hint = $marked->{$pid};
+    my $started = start_epoch($r->[1]);
+    my $trusted_marker = $hint && defined($started) && $started >= $began && $started <= $finished;
+    if (!$recorded && !$trusted_marker) {
+      # Marker-like processes that fail the independently stored run window are audit-only. Never log argv/env/secret.
+      if ($hint && !-l "$d/sweep.log") {
+        open my $log, ">>", "$d/sweep.log" or die "sweep log unavailable";
+        print $log time(), "\\tSKIP\\t$pid\\tuntrusted-marker\\n"; close $log or die "sweep log failed";
+      }
+      next;
+    }
+    push @targets, [$d, $pid, $r, $recorded ? "ledger" : "marker-window", $marker, $began, $finished];
   }
 }
 for my $sig ("TERM", "KILL") {
   for my $t (@targets) {
-    my ($d, $pid, $old, $proof, $marker) = @$t;
+    my ($d, $pid, $old, $proof, $marker, $began, $finished) = @$t;
     next unless owned($d, 1) && readfile("$d/exit") =~ /^\d+$/;
     my $r = census($pid, 0)->{$pid};
     next unless $r && $r->[0] == $old->[0] && $r->[1] eq $old->[1];
-    next if $proof eq "marker" && !marked($pid, $r, $marker);
+    if ($proof eq "marker-window") {
+      my $started = start_epoch($r->[1]);
+      my $marked = actual_markers("$d/sweep-marker", $pid);
+      next unless $marked->{$pid} && defined($started) && $started >= $began && $started <= $finished;
+    }
     next if -l "$d/sweep.log";
     open my $log, ">>", "$d/sweep.log" or die "sweep log unavailable";
     # Log the attempt before signaling; no credentials or process arguments.
