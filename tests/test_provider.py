@@ -142,6 +142,37 @@ class IdleLifetimeTests(unittest.TestCase):
             self.reg.reap(10)
         self.assertIsNone(self.reg.get(s.id))
 
+    def test_capacity_is_reserved_before_router_quota_reservation(self):
+        quota_reservations = []
+        self.reg.router = lambda body, client: quota_reservations.append(client) or {"provider": "claude-cli"}
+        with mock.patch.object(server, "MAX_SESSIONS", 1):
+            self.reg.new(self.turn, keep=True)
+            with self.assertRaisesRegex(server.UnservedProvider, "capacity"):
+                self.reg.route_new({}, "client")
+        self.assertEqual(quota_reservations, [])
+        self.assertEqual(self.reg._opening, 0)
+
+    def test_bridge_wait_window_starts_when_reply_is_complete(self):
+        from types import SimpleNamespace
+        s = BridgeSession.__new__(BridgeSession)
+        s._cv, s._results, s._waiting = threading.Condition(), {}, set()
+        s._events, s._closed, s._tool_result_deadline = mock.Mock(), False, None
+        got = []
+        waiter = threading.Thread(target=lambda: got.append(s.wait_result("t", timeout=1)))
+        waiter.start()
+        time.sleep(0.01)
+        self.now += server.TOOL_WAIT_S + 100       # backend reply production cannot consume the client window
+        s.arm_tool_result_deadline(self.now + server.TOOL_WAIT_S)
+        self.assertTrue(waiter.is_alive())
+        s.emitted = {"t"}
+        s.deliver({"t": {"content": "ok"}})
+        waiter.join(1)
+        self.assertEqual(got, [{"content": "ok"}])
+
+        s._tool_result_deadline = self.now - 1
+        with self.assertRaises(server.ToolWaitExpired):
+            s.wait_result("late", timeout=1)
+
     def test_anthropic_keepalive_is_a_protocol_ping(self):
         self.assertEqual(wire.sse_ping(), b'event: ping\ndata: {"type": "ping"}\n\n')
 
@@ -319,6 +350,23 @@ class EndpointHarness(unittest.TestCase):
 
 
 class EndpointTests(EndpointHarness):
+    def test_expired_bridge_call_closes_backend_before_answer_and_late_result(self):
+        from types import SimpleNamespace
+        closed = mock.Mock()
+        def expired(*_args, **_kwargs):
+            raise server.ToolWaitExpired("expired")
+        s = SimpleNamespace(id=uuid.uuid4().hex, lock=threading.Lock(), history=["reply"], last_used=time.time(),
+                            wait_result=expired, close=closed)
+        self.reg.sessions[s.id] = s
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertEqual(cm.exception.code, 410)
+        self.assertIsNone(self.reg.get(s.id))
+        closed.assert_called_once()
+        late = self.post({"session": s.id, "tool_use_id": "t"}, path="/bridge/call")
+        self.assertTrue(late["result"]["isError"])
+        self.assertIn("session closed", late["result"]["content"][0]["text"])
+
     def test_stream_sends_pings_while_backend_turn_is_running(self):
         original = BridgeSession.run_turn
         def slow(session, timeout):

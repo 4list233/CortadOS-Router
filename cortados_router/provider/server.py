@@ -46,7 +46,7 @@ if __package__ in (None, ""):                           # run as a file: make th
 
 from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
-from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
+from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 from cortados_router.provider.mcp_shim import TOOL_WAIT_S
 
@@ -661,18 +661,37 @@ class Registry:
         return None
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
-            scope: str | None = None, wire_path: str | None = None):
-        if keep:
-            with self._lock:
-                if len(self.sessions) + self._opening >= MAX_SESSIONS:
-                    raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
-                self._opening += 1
+            scope: str | None = None, wire_path: str | None = None, admitted: bool = False):
+        if keep and not admitted:
+            self.reserve_opening()
         try:
             return self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
         finally:
             if keep:
-                with self._lock:
-                    self._opening -= 1
+                self.release_opening()
+
+    def reserve_opening(self) -> None:
+        """Reserve conversation capacity before routing can reserve any quota."""
+        with self._lock:
+            if len(self.sessions) + self._opening >= MAX_SESSIONS:
+                raise UnservedProvider("held conversation capacity reached; retry after idle conversations expire")
+            self._opening += 1
+
+    def release_opening(self) -> None:
+        with self._lock:
+            self._opening -= 1
+
+    def route_new(self, body: dict, client: str, **kwargs) -> dict:
+        """Reserve a held-session slot before routing can reserve a quota-floor turn."""
+        self.reserve_opening()
+        try:
+            route = self.router(body, client, **kwargs)
+        except BaseException:
+            self.release_opening()
+            raise
+        if route.get("error"):                           # no Registry.new will consume this admission
+            self.release_opening()
+        return route
 
     def _new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None,
              scope: str | None, wire_path: str | None):
@@ -932,6 +951,8 @@ def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     # Independent of replay storage: even oversized tool replies must retain their waiting conversation.
     session.last_used = time.time()
     session.awaiting_tool_result = stop == "tool_use" or any(b.get("type") == "tool_use" for b in blocks)
+    if session.awaiting_tool_result and hasattr(session, "arm_tool_result_deadline"):
+        session.arm_tool_result_deadline(session.last_used + TOOL_WAIT_S)
     try:
         size, why = len(json.dumps([blocks, usage], default=str)), None
         if size > REPLAY_MAX_BYTES:
@@ -1153,6 +1174,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"result": {"content": [{"type": "text", "text": "cortados: session closed"}], "isError": True}})
         try:
             result = s.wait_result(body["tool_use_id"], timeout=TOOL_WAIT_S)
+        except ToolWaitExpired as exc:
+            # End the CLI before answering the shim. Never convert expiry into an error tool_result that lets the
+            # unattended model take another paid turn; a late client continuation now sees a closed conversation.
+            with s.lock:
+                if self.server.registry.get(s.id) is s:
+                    self.server.registry.drop(s, "tool_result_expired")
+            return self._error(410, "invalid_request_error", f"cortados: {exc}")
         except BridgeError as exc:
             result = {"content": [{"type": "text", "text": f"cortados: {exc}"}], "isError": True}
         self._json(200, {"result": result})
@@ -1488,9 +1516,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid:
                     return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
                 try:
-                    route = reg.router(wire.routing_body(body), self._client(),
-                                       **({"exclude_model": exclude} if exclude else {}),
-                                       **({"min_left_pct": floor} if floor is not None else {}))
+                    route_fn = reg.router if one_shot else reg.route_new
+                    route = route_fn(wire.routing_body(body), self._client(),
+                                     **({"exclude_model": exclude} if exclude else {}),
+                                     **({"min_left_pct": floor} if floor is not None else {}))
                 except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                     logger.exception("routing failed")
                     return self._error(503, "overloaded_error", f"cortados: routing failed: {type(exc).__name__}: {exc}", wire,
@@ -1512,7 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
                             route["band"], " (S1 degraded)" if route.get("degraded") else "")
             try:
                 session = reg.new(turn, keep=not one_shot, route=route, scope=scope,
-                                  wire_path=self.path.split("?")[0])
+                                  wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot))
             except UnservedProvider as exc:
                 return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
             except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)

@@ -86,6 +86,10 @@ class BridgeError(RuntimeError):
     """The CLI died, timed out or reported an error; the server answers 502 (or 409 for a lost session)."""
 
 
+class ToolWaitExpired(BridgeError):
+    """The client did not return a tool result inside its post-reply window."""
+
+
 def write_line(proc: subprocess.Popen, line: str, timeout: float, who: str) -> None:
     """Write one line to a child's stdin under a deadline. A child that stops reading stdin would block the write
     forever once the pipe buffer fills, so the write runs on its own thread and the child is killed if it misses the
@@ -123,6 +127,9 @@ class BridgeSession:
         self.tool_names: set[str] = {t["name"] for t in tools}   # the only tools the shim serves (and the CLI has)
         self._skipped: set[str] = set()                 # ids of skipped non-bridged tool_uses, awaiting the CLI's error
         self._waiting: set[str] = set()                 # tool_use ids a shim call is blocked on
+        # Armed only after the complete tool_use reply is ready. A shim call commonly arrives while the CLI is still
+        # producing that reply, and must not silently consume part of the client's tool-result window.
+        self._tool_result_deadline: float | None = None
         self._cv = threading.Condition()
         self._closed = False
         self._events: queue.Queue = queue.Queue()
@@ -186,18 +193,31 @@ class BridgeSession:
 
     # ------------------------------------------------------------------ shim side
     def wait_result(self, tool_use_id: str, timeout: float) -> dict[str, Any]:
-        """Called on the shim's /bridge/call thread: block until the client has answered this tool_use."""
+        """Block until the client answers, using the absolute deadline armed when its reply was complete."""
         with self._cv:
             if tool_use_id not in self._results:
                 self._waiting.add(tool_use_id)
                 self._events.put(("call", tool_use_id))
-                if not self._cv.wait_for(lambda: tool_use_id in self._results or self._closed, timeout=timeout):
-                    self._waiting.discard(tool_use_id)
-                    raise BridgeError(f"no result for {tool_use_id} within {timeout:.0f}s")
+                while tool_use_id not in self._results and not self._closed:
+                    deadline = self._tool_result_deadline
+                    if deadline is None:                 # reply incomplete: none of the client window has elapsed
+                        self._cv.wait()
+                        continue
+                    remaining = deadline - time.time()
+                    if remaining <= 0 or not self._cv.wait(timeout=remaining):
+                        if tool_use_id not in self._results:
+                            self._waiting.discard(tool_use_id)
+                            raise ToolWaitExpired(f"no result for {tool_use_id} before the tool-result deadline")
                 if self._closed and tool_use_id not in self._results:
                     raise BridgeError("the session was closed")
             self._waiting.discard(tool_use_id)
             return self._results.pop(tool_use_id)
+
+    def arm_tool_result_deadline(self, deadline: float) -> None:
+        """Start the client window for the tool calls belonging to the reply that just completed."""
+        with self._cv:
+            self._tool_result_deadline = deadline
+            self._cv.notify_all()
 
     def deliver(self, results: dict[str, dict[str, Any]], timeout: float | None = None) -> None:
         """Hand the client's results to the shim's waiting calls. In-process, so `timeout` (the request's remaining
@@ -208,6 +228,8 @@ class BridgeSession:
         self.last_used = time.time()
         with self._cv:
             self._results.update(results)
+            # A later shim call belongs to the next reply and waits for that reply's own deadline.
+            self._tool_result_deadline = None
             self._cv.notify_all()
 
     # ------------------------------------------------------------------ one turn
