@@ -2213,6 +2213,94 @@ class OwnerDeathTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+    def test_real_shim_reports_unconfirmed_abort_on_stdin_eof(self):
+        # A real shim process under a stand-in owner (so its SIGKILL of getppid() hits the stand-in, never this test
+        # process): a tool call outlives its scaled-down deadline, the shim kills the owner (closing its stdin) and
+        # sends the abort, which the fake bridge refuses or never answers; on EOF the shim must report the unconfirmed
+        # abort on stderr and exit within ABORT_TIMEOUT_S + 5.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        root = str(Path(__file__).resolve().parent.parent)
+        for mode in ("refuse", "hang"):
+            with self.subTest(mode=mode):
+                class Bridge(BaseHTTPRequestHandler):
+                    def log_message(self, *_):
+                        pass
+
+                    def do_POST(self):
+                        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+                        try:
+                            if body.get("abort"):
+                                if mode == "hang":
+                                    time.sleep(3)          # past the shim's abort timeout: it gives up first
+                                self.send_response(200)
+                                self.end_headers()
+                                self.wfile.write(b'{"closed": false}')
+                                return
+                            # The tool call: keep the socket busy (whitespace is valid JSON padding) so the worker's
+                            # own read timeout never fires; only the deadline thread fails closed.
+                            self.send_response(200)
+                            self.end_headers()
+                            for _ in range(60):
+                                self.wfile.write(b" ")
+                                self.wfile.flush()
+                                time.sleep(0.05)
+                            self.wfile.write(b'{"result": {"content": []}}')
+                        except OSError:
+                            pass
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+                httpd.daemon_threads = True
+                threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                tmp = Path(tempfile.mkdtemp())
+                (tmp / "tools.json").write_text(json.dumps([READ_TOOL]))
+                err_path = tmp / "shim.stderr"
+                owner = """
+import json, subprocess, sys, time
+gateway, tools, err = sys.argv[1:4]
+p = subprocess.Popen([sys.executable, "-B", "-m", "cortados_router.provider.mcp_shim", gateway, "sess-x", tools],
+                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(err, "w"), text=True)
+print(p.pid, flush=True)
+p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\\n")
+p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+    "name": "Read", "arguments": {}, "_meta": {"claudecode/toolUseId": "tu1"}}}) + "\\n")
+p.stdin.flush()
+time.sleep(30)                                  # the shim SIGKILLs us long before this
+"""
+                env = {k: v for k, v in os.environ.items() if not k.startswith("CORTADOS_PROVIDER_")}
+                env.update(CORTADOS_PROVIDER_TOKEN="t", CORTADOS_PROVIDER_CALL_TIMEOUT_S="0.4",
+                           CORTADOS_PROVIDER_ABORT_TIMEOUT_S="0.5", PYTHONPATH=root)
+                parent = subprocess.Popen([sys.executable, "-B", "-c", owner,
+                                           f"http://127.0.0.1:{httpd.server_address[1]}", str(tmp / "tools.json"),
+                                           str(err_path)], cwd=root, env=env, stdout=subprocess.PIPE, text=True)
+                shim_pid = None
+                try:
+                    shim_pid = int(parent.stdout.readline())
+                    self.assertEqual(parent.wait(timeout=10), -9)   # the shim's fail-closed kill of its owner
+                    gone_by = time.monotonic() + 0.5 + 5 + 3
+                    while time.monotonic() < gone_by:
+                        try:
+                            os.kill(shim_pid, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("shim did not exit after stdin EOF")
+                    self.assertIn("backend abort for session sess-x unconfirmed", err_path.read_text())
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                    parent.wait()
+                    parent.stdout.close()
+                    if shim_pid is not None:
+                        try:
+                            os.kill(shim_pid, 9)
+                        except ProcessLookupError:
+                            pass
+                    httpd.shutdown()
+                    httpd.server_close()
+                    import shutil
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+
 class StalledCliTests(unittest.TestCase):
     def test_a_cli_that_stops_reading_input_is_killed_at_the_deadline(self):
         os.environ["FAKE_CLAUDE_STALL"] = "1"
