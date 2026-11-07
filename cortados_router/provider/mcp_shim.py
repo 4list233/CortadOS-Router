@@ -20,6 +20,7 @@ and reports an unconfirmed abort on stderr; independently, the provider removes 
 """
 import collections
 import heapq
+import queue
 import json
 import os
 import signal
@@ -53,12 +54,12 @@ if not 0 < ABORT_TIMEOUT_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_ABORT_TIMEOUT_S must be positive and finite")
 
 # Claude may issue sibling calls together. Never make a later call spend its CLI timeout queued behind an earlier
-# HTTP request: every call's absolute deadline is taken on the stdin thread at submission, before any queueing.
+# HTTP request: every call's absolute deadline is anchored at the time the stdin reader read its line, before any parsing or queueing.
 # Capacity, per shim process (one shim per bridge session; the provider admits at most 128 conversations, so at
-# most 128 shims exist): 1 stdin thread + 1 deadline thread + MAX_IN_FLIGHT workers = 18 threads, fixed and
+# most 128 shims exist): 1 stdin reader + 1 main (parse/dispatch) + 1 deadline thread + MAX_IN_FLIGHT workers = 19 threads, fixed and
 # independent of how many calls arrive. Across the 128-conversation cap that is at most 128 * 16 = 2048 concurrent
 # /bridge/call requests, each of which the provider parks on one handler thread; abort traffic is sent from the
-# deadline thread (or the stdin thread on overflow), never from a worker, so it never waits for worker capacity.
+# deadline thread (overflow included), never from a worker or the stdin reader, so it never waits for worker capacity.
 # 16 is well above the parallel tool fan-out Claude Code issues in one assistant turn.
 MAX_IN_FLIGHT = 16
 # Calls accepted but not yet answered (queued + running + being written). Queued calls cost one small dict, no
@@ -154,12 +155,15 @@ class _Dispatcher:
         self._queue = collections.deque()
         self._seq = 0
         self._failed = False                # set once; from then on nothing is written for any call
+        self._overflow = False              # set by submit(); the deadline thread fails closed on it
         threading.Thread(target=self._watch, daemon=True, name="cortados-mcp-deadlines").start()
         for i in range(MAX_IN_FLIGHT if workers is None else workers):
             threading.Thread(target=self._work, daemon=True, name=f"cortados-mcp-worker-{i}").start()
 
-    def submit(self, mid, params):
-        deadline = self._clock() + CALL_TIMEOUT_S   # taken before any queueing or thread scheduling
+    def submit(self, mid, params, received=None):
+        # `received` is the monotonic time the stdin reader took the moment the line was read (see _read_stdin);
+        # the deadline is anchored there, never at processing time, so parsing/dispatch delay cannot eat the margin.
+        deadline = (self._clock() if received is None else received) + CALL_TIMEOUT_S
         with self._cond:
             if self._failed:
                 return
@@ -170,9 +174,10 @@ class _Dispatcher:
                 self._live[self._seq] = call
                 heapq.heappush(self._heap, (deadline, self._seq))
                 self._queue.append(call)
-                self._cond.notify_all()
-        if overflow:
-            self._fail_closed()
+            else:
+                # Never fail closed (kill + network abort) on the submitting thread: hand it to the deadline thread.
+                self._overflow = True
+            self._cond.notify_all()
 
     def _expired_locked(self, call):
         return self._failed or call["state"] == "expired" or self._clock() >= call["deadline"]
@@ -229,6 +234,8 @@ class _Dispatcher:
                         heapq.heappop(self._heap)
                     if self._failed:
                         return
+                    if self._overflow:
+                        break
                     if self._heap and self._heap[0][0] <= self._clock():
                         self._live[heapq.heappop(self._heap)[1]]["state"] = "expired"
                         break
@@ -267,6 +274,20 @@ class _Dispatcher:
         return True
 
 
+_EOF = None
+
+
+def _read_stdin(stream, inbox, clock=time.monotonic):
+    """The stdin reader thread: read a line, timestamp it, enqueue it. Nothing else, by design.
+
+    No parsing, no locks shared with workers or the deadline thread, no network, no abort: queue.SimpleQueue.put never
+    blocks (unbounded, lock-free for the producer in practice). So the delay between the CLI writing a request and the
+    shim timestamping it is bounded by pipe latency alone, which CLI_MARGIN_S covers (timeouts.py)."""
+    for line in iter(stream.readline, ""):
+        inbox.put((clock(), line))
+    inbox.put(_EOF)
+
+
 def main(argv):
     gateway, session, tools_path = argv[1], argv[2], argv[3]
     token = os.environ.get("CORTADOS_PROVIDER_TOKEN", "")
@@ -274,7 +295,13 @@ def main(argv):
         tools = [{"name": t["name"], "description": t.get("description", ""),
                   "inputSchema": t.get("input_schema") or {"type": "object"}} for t in json.load(f)]
     dispatcher = _Dispatcher(gateway, session, token)
-    for line in sys.stdin:
+    inbox = queue.SimpleQueue()
+    threading.Thread(target=_read_stdin, args=(sys.stdin, inbox), daemon=True, name="cortados-mcp-stdin").start()
+    while True:
+        item = inbox.get()
+        if item is _EOF:
+            break
+        received, line = item
         if not line.strip():
             continue
         msg = json.loads(line)
@@ -287,7 +314,7 @@ def main(argv):
         elif method == "tools/list":
             _reply(mid, {"tools": tools})
         elif method == "tools/call":
-            dispatcher.submit(mid, params)
+            dispatcher.submit(mid, params, received)
         elif method == "ping":
             _reply(mid, {})
         else:

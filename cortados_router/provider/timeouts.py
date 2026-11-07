@@ -28,7 +28,10 @@ def effective_tool_wait(idle_s, tool_wait_s):
 # margin between them covers (1) the CLI starting its timer before the shim receives the call (process startup and
 # scheduling), and (2) a result write that passed the shim's pre-write check just before the deadline: that is a real
 # result and must finish flushing well before the CLI could time out. A pipe write of one JSON line takes
-# milliseconds; 30 s is the documented floor, the configured margin is ABORT_TIMEOUT_S + CLI_SLACK_S = 240 s.
+# milliseconds; 30 s is the documented floor. The shim's deadline is anchored at the instant its stdin reader thread
+# read the request line; that thread does nothing but read, timestamp and enqueue (no parsing, locks, network or
+# abort), so the delay before the timestamp is pipe latency only and cannot grow while the transport is down, an
+# abort hangs or workers are saturated. The margin therefore always holds, the configured margin is ABORT_TIMEOUT_S + CLI_SLACK_S = 240 s.
 CLI_MARGIN_FLOOR_S = 30.0
 CLI_MARGIN_S = ABORT_TIMEOUT_S + CLI_SLACK_S
 assert CLI_MARGIN_S >= CLI_MARGIN_FLOOR_S, "the CLI timeout margin fell below its documented floor"
