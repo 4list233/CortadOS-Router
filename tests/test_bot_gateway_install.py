@@ -1,5 +1,6 @@
 """integrations/bot-gateway/install.sh in a throwaway HOME with fake tailscale / launchctl / curl on PATH.
 Nothing real is touched: no LaunchAgent is loaded, no network call is made, no real provider.env is read."""
+import json
 import os
 import plistlib
 import stat
@@ -361,6 +362,148 @@ esac
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         r = self.run_sh("plist")
         self.assertNotEqual(r.returncode, 0)
+
+
+class FunnelReviewTest(InstallerHarness):
+    def setUp(self):
+        super().setUp()
+        self.state = Path(self.tmp.name) / "funnel.json"
+        self.ts_calls = Path(self.tmp.name) / "tailscale.calls"
+        self.owner = self.home / ".cortados" / "bot-gateway-funnel-owner"
+        self.expected = "8443 /mcp http://127.0.0.1:8434/mcp\n"
+        self.ours = {"TCP": {"8443": {"HTTPS": True}},
+                     "Web": {"public.example:8443": {"Handlers": {
+                         "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}},
+                     "AllowFunnel": {"public.example:8443": True}}
+        self.state.write_text("{}")
+        self._fake("tailscale", f"""if [ "$1 $2 $3" = "funnel status --json" ]; then
+  /bin/cat {self.state}; exit 0
+fi
+echo "$*" >> {self.ts_calls}
+case "$*" in
+  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp")
+    [ "$(/bin/cat {self.owner})" = "pending {self.expected.strip()}" ] || exit 9
+    printf '%s' '{json.dumps(self.ours)}' > {self.state};;
+  "funnel --https=8443 --set-path /mcp off") printf '{{}}' > {self.state};;
+esac
+""")
+
+    def marker(self, pending=False):
+        self.owner.parent.mkdir(exist_ok=True)
+        self.owner.write_text(("pending " if pending else "") + self.expected)
+        self.owner.chmod(0o600)
+
+    def fail_record(self, action):
+        # Fail only the record operation, not status parsing; never invoke a real tailscale.
+        self._fake("python3", f'if [ "$4" = "{action}" ]; then exit 1; fi\n'
+                              'exec /usr/bin/python3 "$@"\n')
+
+    def test_exact_config_rejects_missing_conflicting_and_extended_tcp(self):
+        for listener in (None, {"TCPForward": "127.0.0.1:9000"},
+                         {"HTTPS": True, "TCPForward": "127.0.0.1:9000"},
+                         {"HTTPS": 1}, {"HTTPS": False}):
+            with self.subTest(listener=listener):
+                cfg = dict(self.ours, TCP={} if listener is None else {"8443": listener})
+                self.state.write_text(json.dumps(cfg))
+                self.marker()
+                self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+                self.assertFalse(self.ts_calls.exists())
+                self.assertTrue(self.owner.exists())
+
+    def test_exact_config_rejects_unknown_web_and_top_level_fields(self):
+        for cfg in (dict(self.ours, Unknown={}),
+                    dict(self.ours, Web={"public.example:8443": dict(
+                        self.ours["Web"]["public.example:8443"], Unknown=True)})):
+            with self.subTest(cfg=cfg):
+                self.state.write_text(json.dumps(cfg))
+                self.marker()
+                self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+                self.assertFalse(self.ts_calls.exists())
+
+    def test_intent_is_present_before_activation_and_finalized(self):
+        r = self.run_sh("funnel-on")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.owner.read_text(), self.expected)
+        self.assertEqual(stat.S_IMODE(self.owner.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.state.read_text()), self.ours)
+
+    def test_intent_write_failure_never_activates(self):
+        self.fail_record("create")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+        self.assertFalse(self.owner.exists())
+
+    def test_intent_fsync_failure_never_activates_and_can_be_cleaned(self):
+        # Execute the actual record helper, but fail its durability barrier after writing.
+        self._fake("python3", """if [ "$4" = create ]; then
+  exec /usr/bin/python3 -I -c '
+import os, sys
+code = sys.stdin.read()
+sys.argv = ["-", *sys.argv[1:]]
+def fail(fd):
+    raise OSError("injected fsync failure")
+os.fsync = fail
+exec(compile(code, "<record>", "exec"))
+' "$3" "$4" "$5"
+fi
+exec /usr/bin/python3 "$@"
+""")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("injected fsync failure", r.stderr)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
+
+    def test_lock_prevents_pending_cleanup_during_activation(self):
+        self.marker(pending=True)
+        Path(str(self.owner) + ".lock").mkdir()
+        for command in ("funnel-on", "funnel-off"):
+            with self.subTest(command=command):
+                r = self.run_sh(command)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("operation locked", r.stderr)
+                self.assertTrue(self.owner.exists())
+                self.assertFalse(self.ts_calls.exists())
+
+    def test_exclusive_intent_refuses_existing_record(self):
+        self.marker(pending=True)
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.ts_calls.exists())
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+
+    def test_finalize_failure_retains_recoverable_durable_intent(self):
+        self.fail_record("finalize")
+        r = self.run_sh("funnel-on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(json.loads(self.state.read_text()), self.ours)
+        self.assertEqual(self.owner.read_text(), "pending " + self.expected)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertEqual(json.loads(self.state.read_text()), {})
+
+    def test_empty_pending_record_cleanup_does_not_mutate_tailscale(self):
+        self.marker(pending=True)
+        r = self.run_sh("funnel-off")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
+
+    def test_conflicting_pending_record_is_retained_without_mutation(self):
+        self.marker(pending=True)
+        self.state.write_text(json.dumps(dict(self.ours, TCP={})))
+        r = self.run_sh("funnel-off")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(self.owner.exists())
+        self.assertFalse(self.ts_calls.exists())
 
 
 class LaunchctlTest(InstallerHarness):

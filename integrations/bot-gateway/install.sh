@@ -169,37 +169,110 @@ funnel_state() {
 import json, sys
 try:
     cfg=json.loads(sys.argv[1]); port=sys.argv[2]; target=sys.argv[3]
+    if not isinstance(cfg, dict) or set(cfg) - {"Web", "AllowFunnel", "TCP"}:
+        raise ValueError("unknown configuration")
     web=cfg.get("Web", {}); allow=cfg.get("AllowFunnel", {}); tcp=cfg.get("TCP", {})
+    if not all(isinstance(v, dict) for v in (web, allow, tcp)):
+        raise ValueError("invalid configuration")
     keys=[k for k in set(web)|set(allow) if k.rsplit(":",1)[-1] == port]
-    tcp_used=port in tcp or int(port) in tcp
-    if not keys and not tcp_used:
+    if not keys and port not in tcp:
         print("empty"); raise SystemExit
-    ours=(len(keys)==1 and web.get(keys[0],{}).get("Handlers",{}) == {"/mcp":{"Proxy":target}}
-          and allow.get(keys[0]) is True)
+    ours=(len(keys)==1 and web.get(keys[0]) == {"Handlers":{"/mcp":{"Proxy":target}}}
+          and allow.get(keys[0]) is True and tcp.get(port) == {"HTTPS":True}
+          and tcp[port]["HTTPS"] is True)
     print("ours" if ours else "conflict")
-except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError):
     print("conflict")' "$out" "$FUNNEL_PORT" "http://127.0.0.1:$PORT/mcp"
+}
+
+# Serialize intent creation, mutation and recovery: otherwise an off command could remove a pending
+# record while an on command is about to activate Funnel. A crash-stale lock requires manual inspection.
+funnel_lock() {
+  ( umask 077; mkdir -p "$STATE_DIR" )
+  mkdir "$FUNNEL_OWNER.lock" 2>/dev/null || die "Funnel operation locked; inspect $FUNNEL_OWNER.lock"
+  trap 'rmdir "$FUNNEL_OWNER.lock"' EXIT
+  trap 'exit 2' INT TERM
+}
+
+# The pending record is already ownership, not a disposable temporary file. Persist it exclusively
+# before any public mutation, and replace it atomically only after exact configuration verification.
+# A failed finalization leaves the durable pending record available to funnel-off.
+funnel_record() {
+  python3 -I - "$FUNNEL_OWNER" "$1" "$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp" <<'PY'
+import os, stat, sys, tempfile
+path, action, expected = sys.argv[1:]
+pending = "pending " + expected + "\n"
+final = expected + "\n"
+directory = os.path.dirname(path)
+dfd = os.open(directory, os.O_RDONLY)
+tmp = None
+try:
+    if action == "create":
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pending)
+            f.flush()
+            os.fsync(f.fileno())
+        os.fsync(dfd)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+                raise ValueError("unsafe ownership record")
+            record = f.read()
+        if record not in (pending, final):
+            raise ValueError("ownership record mismatch")
+        if action == "finalize":
+            fd, tmp = tempfile.mkstemp(prefix=".bot-gateway-funnel-", dir=directory)
+            with os.fdopen(fd, "w") as f:
+                f.write(final)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
+            os.fsync(dfd)
+        elif action == "remove":
+            os.unlink(path)
+            os.fsync(dfd)
+        elif action == "check":
+            print("pending" if record == pending else "final")
+        else:
+            raise ValueError("unknown record action")
+except (OSError, ValueError) as e:
+    print("Funnel ownership record: " + str(e), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if tmp is not None:
+        os.unlink(tmp)
+    os.close(dfd)
+PY
 }
 
 cmd_funnel_on() {
   ts="$(tailscale_cli)"
+  funnel_lock
   [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel port $FUNNEL_PORT already has configuration"
-  [ ! -e "$FUNNEL_OWNER" ] && [ ! -L "$FUNNEL_OWNER" ] || die "stale Funnel ownership marker: $FUNNEL_OWNER"
+  funnel_record create || die "cannot persist exclusive Funnel ownership intent; nothing activated"
   "$ts" funnel --bg --https="$FUNNEL_PORT" --set-path /mcp "http://127.0.0.1:$PORT/mcp"
-  [ "$(funnel_state "$ts")" = ours ] || die "Funnel did not install the exact reserved-port handler"
-  ( umask 077; mkdir -p "$STATE_DIR"; printf '%s\n' "$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp" > "$FUNNEL_OWNER.tmp" )
-  mv "$FUNNEL_OWNER.tmp" "$FUNNEL_OWNER"
+  [ "$(funnel_state "$ts")" = ours ] || die "Funnel did not install the exact reserved-port handler; ownership intent retained"
+  funnel_record finalize || die "cannot finalize Funnel ownership; durable intent retained for funnel-off"
 }
 
 cmd_funnel_off() {
   ts="$(tailscale_cli)"
-  expected="$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp"
-  marker=""; IFS= read -r marker < "$FUNNEL_OWNER" 2>/dev/null || die "no Funnel ownership marker; refusing removal"
-  [ "$marker" = "$expected" ] || die "Funnel ownership marker mismatch; refusing removal"
-  [ "$(funnel_state "$ts")" = ours ] || die "reserved Funnel configuration is not exactly ours; refusing removal"
+  funnel_lock
+  record="$(funnel_record check)" || die "no valid Funnel ownership marker; refusing removal"
+  state="$(funnel_state "$ts")"
+  # A failed activation can leave only its intent. Never issue a Tailscale mutation in that case.
+  if [ "$state" = empty ] && [ "$record" = pending ]; then
+    funnel_record remove
+    return
+  fi
+  [ "$state" = ours ] || die "reserved Funnel configuration is not exactly ours; refusing removal"
   "$ts" funnel --https="$FUNNEL_PORT" --set-path /mcp off
   [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel configuration remains after removal"
-  rm -f "$FUNNEL_OWNER"
+  funnel_record remove
 }
 
 cmd_status() {
