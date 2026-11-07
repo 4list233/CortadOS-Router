@@ -569,11 +569,13 @@ The owner views the bot token himself (`cat ~/.config/cortados/bot-gateway-token
 secret field. The system prompt is in `docs/BOT-INSTRUCTIONS.md`. `install.sh unload` stops the gateway.
 
 The plist holds `RunAtLoad`, `KeepAlive` (it keeps retrying while Tailscale is not up yet), logs to
-`~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://<Air tailnet address>:8432`, and the gateway flags
-`--host <Air tailnet address> --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
-~/cortados-bot-workspace --children-run-as-me`. The address comes from `tailscale ip -4` at install time and must be exactly one IPv4 address in 100.64.0.0/10 (anything else, including a failing CLI, multiple lines or 0.0.0.0, is refused); it is never
-stored in the repo. If it changes, rerun `plist` and `load`. There is no `--enable-start-task`. The plist passes
-`--children-run-as-me` because the gateway refuses any non-loopback `--host` without it. In phase 1 the gateway starts
+`~/.cortados/bot-gateway.out`, `CORTADOS_PROVIDER_URL=http://127.0.0.1:8432` (the gateway runs on the provider's
+host, and the provider listens on loopback only; other machines reach it through a tailnet-only Tailscale Serve), and
+the gateway flags `--host 127.0.0.1 --port 8434 --token-file ~/.config/cortados/bot-gateway-token --workspace-root
+~/cortados-bot-workspace`. Set `CORTADOS_BOT_PROVIDER_URL` before `plist` to point the gateway elsewhere; it must be an
+http(s) URL with a host and no credentials, query or fragment (anything else is refused). Rerun `plist` and `load`
+after changing it. There is no `--enable-start-task`, and no `--children-run-as-me` (the gateway
+binds loopback, so it does not need it). In phase 1 the gateway starts
 no child, so no task runs as the owner on a bot's behalf. The plist holds no secret values.
 
 **Provider token for route_task: design (a), read from `~/.cortados/provider.env` as data.** The provider's own

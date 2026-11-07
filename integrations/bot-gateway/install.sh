@@ -54,22 +54,24 @@ tailscale_cli() {
   else die "no tailscale CLI found (set TAILSCALE=<path>)"; fi
 }
 
-# The tailnet IPv4 is needed only for the gateway's provider URL. The internet-facing gateway itself binds loopback.
-tailnet_ip() {
-  ts="$(tailscale_cli)"
-  # The CLI's own exit status is checked (no pipe in between to mask it); a failing CLI is never read for an address.
-  out="$("$ts" ip -4 2>/dev/null)" || die "tailscale ip -4 failed (is Tailscale up?)"
-  # The complete output must be exactly one IPv4 address in 100.64.0.0/10, Tailscale's address range: more lines, a
-  # malformed address, 0.0.0.0 (every interface) or any address outside the tailnet would bind beyond the tailnet.
+# The gateway's provider URL. Default: loopback, because the gateway runs on the same host as the provider and the
+# provider listens on 127.0.0.1:8432 only (other machines reach it through a tailnet-only Tailscale Serve; the Tailscale
+# app cannot proxy to the host's own tailnet IP, so the provider no longer binds that address).
+# CORTADOS_BOT_PROVIDER_URL overrides it: an http(s) URL with a host, no credentials, no query or fragment, so no
+# secret is written into the plist and the value is never shell-interpreted.
+provider_url() {
   python3 -I -c '
-import ipaddress, sys
-s = sys.argv[1]
+import sys, urllib.parse
+u = sys.argv[1]
 try:
-    ok = s == str(ipaddress.IPv4Address(s)) and ipaddress.IPv4Address(s) in ipaddress.ip_network("100.64.0.0/10")
+    p = urllib.parse.urlsplit(u)
+    p.port  # raises ValueError on a malformed or out-of-range port
+    ok = (p.scheme in ("http", "https") and bool(p.hostname) and "@" not in p.netloc
+          and not p.query and not p.fragment and u.isprintable() and not any(c.isspace() for c in u))
 except ValueError:
     ok = False
-sys.exit(0 if ok else 1)' "$out" || die "tailscale ip -4 did not give exactly one tailnet (100.64.0.0/10) IPv4 address"
-  printf '%s' "$out"
+sys.exit(0 if ok else 1)' "$1" || die "CORTADOS_BOT_PROVIDER_URL must be an http(s) URL with a host and no credentials, query or fragment"
+  printf '%s' "$1"
 }
 
 cmd_token() {
@@ -108,16 +110,15 @@ cmd_plist() {
   else
     die "no provider token for route_task: $PROVIDER_ENV does not assign CORTADOS_PROVIDER_TOKEN, and there is no 0600 $PROVIDER_TOKEN_FILE. Create that file yourself (umask 077; then write the provider token into it) and rerun"
   fi
-  ip="$(tailnet_ip)"
+  url="$(provider_url "${CORTADOS_BOT_PROVIDER_URL:-http://127.0.0.1:8432}")"
   ( umask 077; mkdir -p "$STATE_DIR" "$WORKSPACE" "$HOME/Library/LaunchAgents" )
   chmod 700 "$WORKSPACE"
   [ -e "$LOG" ] || ( umask 077; : > "$LOG" )
-  python3 -I - "$PLIST" "$LABEL" "$mode" "$ip" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$WORKSPACE" "$LOG" \
+  python3 -I - "$PLIST" "$LABEL" "$mode" "$url" "$PORT" "$REPO" "$PYBIN" "$TOKEN_FILE" "$WORKSPACE" "$LOG" \
     "$PROVIDER_ENV" "$PROVIDER_TOKEN_FILE" "$STATE_DIR" "$ALLOWED_HOST" <<'PY'
 import os, plistlib, sys
-(plist, label, mode, ip, port, repo, py, token_file, workspace, log,
+(plist, label, mode, url, port, repo, py, token_file, workspace, log,
  provider_env, provider_token_file, state_dir, allowed_host) = sys.argv[1:15]
-url = f"http://{ip}:8432"
 gateway = [py, "-B", "-m", "cortados_router.bot_gateway", "--host", "127.0.0.1", "--port", port,
            "--token-file", token_file, "--workspace-root", workspace]
 env = {"CORTADOS_PROVIDER_URL": url, "CORTADOS_HOME": state_dir, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
@@ -143,7 +144,7 @@ os.chmod(tmp, 0o644)
 os.replace(tmp, plist)
 PY
   if command -v plutil >/dev/null 2>&1; then plutil -lint "$PLIST" >/dev/null || die "plutil rejected $PLIST"; fi
-  echo "plist: wrote $PLIST (gateway on 127.0.0.1:$PORT, provider http://$ip:8432, provider token: $([ "$mode" = env ] && echo "read by launch.py from $PROVIDER_ENV" || echo "file $PROVIDER_TOKEN_FILE"))"
+  echo "plist: wrote $PLIST (gateway on 127.0.0.1:$PORT, provider $url, provider token: $([ "$mode" = env ] && echo "read by launch.py from $PROVIDER_ENV" || echo "file $PROVIDER_TOKEN_FILE"))"
   echo "next: $HERE/install.sh load"
 }
 

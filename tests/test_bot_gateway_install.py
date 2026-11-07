@@ -101,7 +101,7 @@ class PlistTest(InstallerHarness):
         log = str(self.home / ".cortados" / "bot-gateway.out")
         self.assertEqual(doc["StandardOutPath"], log)
         self.assertEqual(doc["StandardErrorPath"], log)
-        self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], f"http://{FAKE_IP}:8432")
+        self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], "http://127.0.0.1:8432")
         self.assertNotIn("CORTADOS_PROVIDER_TOKEN", doc["EnvironmentVariables"])
         self.assertTrue((self.home / "cortados-bot-workspace").is_dir())
         self.assertEqual(stat.S_IMODE(self.token_path().stat().st_mode), 0o600)
@@ -162,7 +162,7 @@ class PlistTest(InstallerHarness):
         self.assertEqual(set(got), {"HOME", "PATH", "CORTADOS_HOME", "CORTADOS_PROVIDER_URL",
                                     "CORTADOS_PROVIDER_TOKEN"})
         self.assertEqual(got["CORTADOS_PROVIDER_TOKEN"], PROVIDER_SECRET)
-        self.assertEqual(got["CORTADOS_PROVIDER_URL"], f"http://{FAKE_IP}:8432")
+        self.assertEqual(got["CORTADOS_PROVIDER_URL"], "http://127.0.0.1:8432")
         self.assertEqual(got["HOME"], str(self.home))
         self.assertEqual(got["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
         self.assertEqual(argv[1:5], ["-I", "-S", "-B", "-c"])
@@ -277,40 +277,38 @@ class PlistTest(InstallerHarness):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(self.plist().exists())
 
-    def test_bad_tailnet_ip_refused(self):
-        cases = {
-            "nonzero exit": f"echo {FAKE_IP}; exit 1",
-            "stopped": "echo 'Tailscale is stopped.' >&2; exit 1",
-            "empty": "exit 0",
-            "two lines": f"echo {FAKE_IP}; echo 100.64.0.2",
-            "bad octet": "echo 100.64.0.300",
-            "wildcard": "echo 0.0.0.0",
-            "not CGNAT": "echo 192.0.2.10",
-            "loopback": "echo 127.0.0.1",
-            "padded": f"echo ' {FAKE_IP}'",
-            "leading zero": "echo 100.064.0.1",
-            "IPv6": "echo fd7a:115c:a1e0::1",
-        }
+    def test_bad_provider_url_refused(self):
+        cases = ["ftp://127.0.0.1:8432", "http://user:pw@127.0.0.1:8432", "http://tok@127.0.0.1:8432",
+                 "http://127.0.0.1:8432/?token=x", "http://127.0.0.1:8432/#x", "http://", "127.0.0.1:8432",
+                 "http://127.0.0.1:99999", "http://127.0.0.1:8432/ x", "http://127.0.0.1:8432\nX=1", ""]
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         self.assertEqual(self.run_sh("token").returncode, 0)
-        for name, body in cases.items():
-            with self.subTest(name):
-                self._fake("tailscale", body + "\n")
-                r = self.run_sh("plist")
+        for url in cases:
+            with self.subTest(url):
+                r = self.run_sh("plist", extra_env={"CORTADOS_BOT_PROVIDER_URL": url})
+                if url == "":
+                    # Empty means unset (${VAR:-default}): the loopback default is used.
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.plist().unlink()
+                    continue
                 self.assertNotEqual(r.returncode, 0, r.stdout)
                 self.assertFalse(self.plist().exists())
 
-    def test_cgnat_edges_accepted(self):
+    def test_provider_url_override_and_no_tailscale_needed(self):
+        # The plist no longer asks Tailscale for anything: a failing tailscale CLI does not matter.
+        self._fake("tailscale", "exit 1\n")
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
         self.assertEqual(self.run_sh("token").returncode, 0)
-        for ip in ("100.64.0.1", "100.127.255.254"):
-            with self.subTest(ip):
-                self._fake("tailscale", f"echo {ip}\n")
-                r = self.run_sh("plist")
+        r = self.run_sh("plist")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("provider http://127.0.0.1:8432,", r.stdout)
+        for url in ("https://provider.example.test", "http://127.0.0.1:9000/"):
+            with self.subTest(url):
+                r = self.run_sh("plist", extra_env={"CORTADOS_BOT_PROVIDER_URL": url})
                 self.assertEqual(r.returncode, 0, r.stderr)
                 doc = plistlib.loads(self.plist().read_bytes())
                 self.assertIn("--host 127.0.0.1 ", " ".join(doc["ProgramArguments"]))
-                self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], f"http://{ip}:8432")
+                self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_PROVIDER_URL"], url)
 
     def test_allowed_host_is_read_from_environment_into_plist(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
