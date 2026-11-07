@@ -295,16 +295,68 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
         self.addCleanup(reader.close)
         inbox, written = queue.SimpleQueue(), []
-        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox), daemon=True).start()
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
         for i in range(200):
             written.append(time.monotonic())
             writer.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {}}) + "\n")
             writer.flush()
             item = inbox.get(timeout=2)            # consumed and submitted like main(): overflow fails closed here
-            d.submit(i, {}, item[0])
+            d.adopt(item[2], i, {})
             self.assertLess(item[0] - written[-1], 0.5)
         writer.close()
         self.assertIs(inbox.get(timeout=2), mcp_shim._EOF)
+        self.assertEqual(self._owner_kills, [1])
+
+    def _pipe_reader(self, d, inbox):
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
+        return writer
+
+    def test_a_full_bounded_inbox_fails_closed_without_blocking_the_reader(self):
+        # Nobody consumes the inbox (main() stuck). The reader must never block on it: the third line finds it full,
+        # signals overflow, and the deadline thread fails closed; the reader still delivers EOF afterwards.
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: None, 60.0, max_pending=64)
+        inbox = queue.Queue(maxsize=2)
+        writer = self._pipe_reader(d, inbox)
+        for i in range(3):
+            writer.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "ping"}) + "\n")
+        writer.flush()
+        self.assertTrue(aborted.wait(2))
+        self.assertEqual(self._owner_kills, [1])
+        self.assertEqual(inbox.qsize(), 2)
+
+    def test_a_provisional_deadline_expires_while_main_is_blocked_in_reply(self):
+        # main() blocks writing a ping reply (stdout stalled). A tools/call read meanwhile sits unparsed in the inbox;
+        # its read-time deadline must still fire: the deadline thread sees it without main() ever adopting it.
+        stalled, hang = threading.Event(), threading.Event()
+        self.addCleanup(hang.set)
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: stalled.set() or hang.wait(30), 0.3)
+        inbox = queue.Queue(maxsize=8)
+        writer = self._pipe_reader(d, inbox)
+        threading.Thread(target=mcp_shim._serve, args=(inbox, d, []), daemon=True).start()
+        sent = time.monotonic()
+        writer.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n")
+        writer.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}}) + "\n")
+        writer.flush()
+        self.assertTrue(stalled.wait(2))
+        self.assertTrue(aborted.wait(2))
+        self.assertEqual(self._owner_kills, [1])
+        self.assertLess(time.monotonic(), sent + 0.3 + 1.0)
+
+    def test_finish_waits_for_a_signalled_overflow_that_eof_raced(self):
+        # Overflow is signalled, then EOF reaches finish() before the deadline thread has failed closed: finish()
+        # must treat it as a started failure and wait for the cleanup instead of returning (and exiting) at once.
+        d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: None, 60.0)
+        slow = mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: time.sleep(0.3) or self._owner_kills.append(1))
+        slow.start()
+        self.addCleanup(slow.stop)
+        d.signal_overflow()
+        self.assertTrue(d.finish(5))
+        self.assertTrue(d.cleanup_done.is_set())
+        self.assertTrue(aborted.is_set())
         self.assertEqual(self._owner_kills, [1])
 
     def test_scaled_transport_down_fails_closed_before_the_cli_timeout(self):
@@ -321,13 +373,13 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         self.addCleanup(reader.close)
         self.addCleanup(writer.close)
         inbox = queue.SimpleQueue()
-        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox), daemon=True).start()
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d), daemon=True).start()
         cli_sent = time.monotonic()
         writer.write("{}\n")
         writer.flush()
-        received, _ = inbox.get(timeout=2)
+        _received, _, token = inbox.get(timeout=2)
         time.sleep(0.1)                             # processing delay after the read does not move the deadline
-        d.submit(1, {}, received)
+        d.adopt(token, 1, {})
         self.assertTrue(killed.wait(2))
         self.assertLess(time.monotonic(), cli_sent + 0.2 + 0.3)
 
@@ -2222,6 +2274,8 @@ class OwnerDeathTests(unittest.TestCase):
         root = str(Path(__file__).resolve().parent.parent)
         for mode in ("refuse", "hang"):
             with self.subTest(mode=mode):
+                fixture_errors = []
+
                 class Bridge(BaseHTTPRequestHandler):
                     def log_message(self, *_):
                         pass
@@ -2245,56 +2299,63 @@ class OwnerDeathTests(unittest.TestCase):
                                 self.wfile.flush()
                                 time.sleep(0.05)
                             self.wfile.write(b'{"result": {"content": []}}')
-                        except OSError:
-                            pass
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass                    # expected: the shim gave up on the call / died
+                        except BaseException as exc:
+                            fixture_errors.append(exc)
+                            raise
                 httpd = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
                 httpd.daemon_threads = True
                 threading.Thread(target=httpd.serve_forever, daemon=True).start()
                 tmp = Path(tempfile.mkdtemp())
                 (tmp / "tools.json").write_text(json.dumps([READ_TOOL]))
                 err_path = tmp / "shim.stderr"
+                # The test process is the shim's real parent (so it reaps it and reads its true exit status); the shim's
+                # owner is a stand-in sleeper that holds the only write end of the shim's stdin, injected as getppid().
                 owner = """
-import json, subprocess, sys, time
-gateway, tools, err = sys.argv[1:4]
-p = subprocess.Popen([sys.executable, "-B", "-m", "cortados_router.provider.mcp_shim", gateway, "sess-x", tools],
-                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(err, "w"), text=True)
-print(p.pid, flush=True)
-p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\\n")
-p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+import json, os, sys, time
+w = os.fdopen(int(sys.argv[1]), "w")
+w.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\\n")
+w.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
     "name": "Read", "arguments": {}, "_meta": {"claudecode/toolUseId": "tu1"}}}) + "\\n")
-p.stdin.flush()
+w.flush()
 time.sleep(30)                                  # the shim SIGKILLs us long before this
+"""
+                shim = """
+import os, runpy, sys
+os.getppid = lambda: int(os.environ["CORTADOS_TEST_OWNER_PID"])
+sys.argv = ["mcp_shim"] + sys.argv[1:]
+runpy.run_module("cortados_router.provider.mcp_shim", run_name="__main__")
 """
                 env = {k: v for k, v in os.environ.items() if not k.startswith("CORTADOS_PROVIDER_")}
                 env.update(CORTADOS_PROVIDER_TOKEN="t", CORTADOS_PROVIDER_CALL_TIMEOUT_S="0.4",
                            CORTADOS_PROVIDER_ABORT_TIMEOUT_S="0.5", PYTHONPATH=root)
-                parent = subprocess.Popen([sys.executable, "-B", "-c", owner,
-                                           f"http://127.0.0.1:{httpd.server_address[1]}", str(tmp / "tools.json"),
-                                           str(err_path)], cwd=root, env=env, stdout=subprocess.PIPE, text=True)
-                shim_pid = None
+                r, w = os.pipe()
+                owner_p = subprocess.Popen([sys.executable, "-B", "-c", owner, str(w)], cwd=root, env=env,
+                                           pass_fds=(w,))
+                os.close(w)
+                shim_p = None
                 try:
-                    shim_pid = int(parent.stdout.readline())
-                    self.assertEqual(parent.wait(timeout=10), -9)   # the shim's fail-closed kill of its owner
-                    gone_by = time.monotonic() + 0.5 + 5 + 3
-                    while time.monotonic() < gone_by:
-                        try:
-                            os.kill(shim_pid, 0)
-                        except ProcessLookupError:
-                            break
-                        time.sleep(0.05)
-                    else:
-                        self.fail("shim did not exit after stdin EOF")
+                    with open(err_path, "w") as err:
+                        shim_p = subprocess.Popen(
+                            [sys.executable, "-B", "-c", shim, f"http://127.0.0.1:{httpd.server_address[1]}",
+                             "sess-x", str(tmp / "tools.json")], cwd=root,
+                            env=dict(env, CORTADOS_TEST_OWNER_PID=str(owner_p.pid)),
+                            stdin=r, stdout=subprocess.DEVNULL, stderr=err)
+                    os.close(r)
+                    r = None
+                    self.assertEqual(owner_p.wait(timeout=10), -9)   # the shim's fail-closed kill of its owner
+                    self.assertEqual(shim_p.wait(timeout=0.5 + 5 + 3), 0)   # exits after stdin EOF, reaped here
                     self.assertIn("backend abort for session sess-x unconfirmed", err_path.read_text())
+                    self.assertEqual(fixture_errors, [])
                 finally:
-                    if parent.poll() is None:
-                        parent.kill()
-                    parent.wait()
-                    parent.stdout.close()
-                    if shim_pid is not None:
-                        try:
-                            os.kill(shim_pid, 9)
-                        except ProcessLookupError:
-                            pass
+                    if r is not None:
+                        os.close(r)
+                    for proc in (owner_p, shim_p):
+                        if proc is not None:
+                            if proc.poll() is None:
+                                proc.kill()             # Popen-owned and unreaped: never a recycled PID
+                            proc.wait()
                     httpd.shutdown()
                     httpd.server_close()
                     import shutil
