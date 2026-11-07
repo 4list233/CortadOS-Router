@@ -50,6 +50,8 @@ MAX_IN_FLIGHT = 16
 # Calls accepted but not yet answered (queued + running + being written). Queued calls cost one small dict, no
 # thread. Above this the session is abnormal: fail closed (abort the backend) rather than grow without bound.
 MAX_PENDING = 64
+# Answered calls leave dead heap entries; compact once they exceed this many beyond 2x the live calls.
+HEAP_SLACK = 64
 _WRITE_LOCK = threading.Lock()
 
 
@@ -72,6 +74,14 @@ def _terminate_owner():
     finally:
         # Never serialize a tool result; SIGKILL delivery to the parent is asynchronous.
         os._exit(1)
+
+
+def _kill_owner():
+    """Fail closed on expiry: SIGKILL the owning CLI now, without exiting the shim (it still sends the abort)."""
+    try:
+        os.kill(os.getppid(), signal.SIGKILL)
+    except OSError:
+        _terminate_owner()          # could not signal the owner: exit so no write of ours can ever reach it
 
 
 def _emit(line):
@@ -110,10 +120,12 @@ class _Dispatcher:
 
     Each call's deadline is an absolute monotonic time captured in submit(), on the stdin thread. The deadline thread
     stays armed for a call until its reply line has been written and flushed: a call counts as answered only after
-    flush returns. Both paths check the deadline: a worker whose result is ready at or after the deadline never writes
-    it, and the deadline thread fails the session closed for any call not answered by then. Fail closed means: ask
-    the server to close the backend, and kill the owning CLI if closure is not confirmed. After that no call of this
-    session ever writes a result.
+    flush returns AND the deadline still had not passed when it returned. A worker whose result is ready at or after
+    the deadline never writes it, and one whose flush returns after the deadline reports expiry instead of marking the
+    call answered. Fail closed means, synchronously and under the dispatcher lock: SIGKILL the owning CLI (a dead
+    owner cannot consume any later write, whatever a paused worker does), mark the session failed, then ask the
+    server to close the backend for cleanup. Workers check the failed flag under that same lock immediately before
+    writing, so after failure no call of this session writes a result.
     """
 
     def __init__(self, gateway, session, token, workers=None, max_pending=None, clock=time.monotonic):
@@ -121,10 +133,10 @@ class _Dispatcher:
         self._max_pending = MAX_PENDING if max_pending is None else max_pending
         self._clock = clock
         self._cond = threading.Condition()
-        self._heap = []                     # (deadline, seq, call); answered entries are dropped lazily
+        self._heap = []                     # (deadline, seq); entries whose seq left _live are dead
+        self._live = {}                     # seq -> call, for calls not yet answered
         self._queue = collections.deque()
         self._seq = 0
-        self._pending = 0
         self._failed = False                # set once; from then on nothing is written for any call
         threading.Thread(target=self._watch, daemon=True, name="cortados-mcp-deadlines").start()
         for i in range(MAX_IN_FLIGHT if workers is None else workers):
@@ -132,15 +144,15 @@ class _Dispatcher:
 
     def submit(self, mid, params):
         deadline = self._clock() + CALL_TIMEOUT_S   # taken before any queueing or thread scheduling
-        call = {"mid": mid, "params": params, "deadline": deadline, "state": "queued"}
         with self._cond:
             if self._failed:
                 return
-            overflow = self._pending >= self._max_pending
+            overflow = len(self._live) >= self._max_pending
             if not overflow:
-                self._pending += 1
                 self._seq += 1
-                heapq.heappush(self._heap, (deadline, self._seq, call))
+                call = {"mid": mid, "params": params, "deadline": deadline, "state": "queued", "seq": self._seq}
+                self._live[self._seq] = call
+                heapq.heappush(self._heap, (deadline, self._seq))
                 self._queue.append(call)
                 self._cond.notify_all()
         if overflow:
@@ -148,6 +160,16 @@ class _Dispatcher:
 
     def _expired_locked(self, call):
         return self._failed or call["state"] == "expired" or self._clock() >= call["deadline"]
+
+    def _answered_locked(self, call):
+        del self._live[call["seq"]]
+        call["state"] = "answered"
+        # Dead heap entries behind one slow earliest call would otherwise pile up while _live stays under the cap.
+        # Bound: the heap never holds more than 2 * live + HEAP_SLACK entries (so <= 2 * MAX_PENDING + HEAP_SLACK).
+        if len(self._heap) > 2 * len(self._live) + HEAP_SLACK:
+            self._heap = [(c["deadline"], seq) for seq, c in self._live.items()]
+            heapq.heapify(self._heap)
+        self._cond.notify_all()
 
     def _work(self):
         while True:
@@ -162,35 +184,37 @@ class _Dispatcher:
                 call["state"] = "running"
             result = _forward(self._gateway, self._session, self._token, call["params"])
             line = json.dumps({"jsonrpc": "2.0", "id": call["mid"], "result": result}) + "\n"
+            late = None
             with _WRITE_LOCK:
-                with self._cond:
+                with self._cond:            # the lock _fail_closed holds while killing the owner and setting failed
                     if self._expired_locked(call):
                         late = not self._failed
                         call["state"] = "expired"
                     else:
-                        late = None
-                        call["state"] = "writing"   # still armed: only a completed flush answers the call
+                        call["state"] = "writing"   # still armed: only a completed, in-time flush answers the call
                 if late is None:
                     _emit(line)
             if late is None:
                 with self._cond:
-                    if call["state"] == "writing":
-                        call["state"] = "answered"
-                        self._pending -= 1
-                        self._cond.notify_all()
-            elif late:
+                    if self._expired_locked(call):
+                        # The flush returned at or after the deadline: the CLI may already be past its budget.
+                        late = not self._failed
+                        call["state"] = "expired"
+                    else:
+                        self._answered_locked(call)
+            if late:
                 self._fail_closed()
 
     def _watch(self):
         while True:
             with self._cond:
                 while True:
-                    while self._heap and self._heap[0][2]["state"] == "answered":
+                    while self._heap and self._heap[0][1] not in self._live:
                         heapq.heappop(self._heap)
                     if self._failed:
                         return
                     if self._heap and self._heap[0][0] <= self._clock():
-                        heapq.heappop(self._heap)[2]["state"] = "expired"
+                        self._live[heapq.heappop(self._heap)[1]]["state"] = "expired"
                         break
                     timeout = self._heap[0][0] - self._clock() if self._heap else None
                     self._cond.wait(timeout)
@@ -201,12 +225,12 @@ class _Dispatcher:
         with self._cond:
             if self._failed:
                 return
+            # Kill first, under the lock every writer checks: no write can be decided between the kill and the flag,
+            # and any write already past its check lands on a dead owner. Never write a synthetic MCP result.
+            _kill_owner()
             self._failed = True
             self._cond.notify_all()
-        # A confirmed abort closed the owning CLI. If it cannot be confirmed, kill that CLI here. Never write a
-        # synthetic MCP result once a request's budget has expired.
-        if not _abort(self._gateway, self._session, self._token):
-            _terminate_owner()
+        _abort(self._gateway, self._session, self._token)   # backend cleanup; the owner is already dead
 
 
 def main(argv):

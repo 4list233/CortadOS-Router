@@ -2,6 +2,7 @@
 
 The fake runs the real mcp_shim, so every bridged call crosses the same process and HTTP boundaries as in production.
 """
+import io
 import json
 import os
 import sqlite3
@@ -226,6 +227,7 @@ class IdleLifetimeTests(unittest.TestCase):
 
     def test_legacy_timeout_resolution_and_explicit_shim_configuration(self):
         script = """
+import io
 import json
 from unittest import mock
 from cortados_router.provider import bridge, timeouts
@@ -258,7 +260,9 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
                    mock.patch.object(mcp_shim, "_forward", side_effect=forward),
                    mock.patch.object(mcp_shim, "_emit", side_effect=emit),
                    mock.patch.object(mcp_shim, "_abort", side_effect=lambda *_: aborted.set() or True),
-                   mock.patch.object(mcp_shim, "_terminate_owner", side_effect=AssertionError("abort was confirmed"))]
+                   mock.patch.object(mcp_shim, "_kill_owner", side_effect=lambda: self._owner_kills.append(1)),
+                   mock.patch.object(mcp_shim, "_terminate_owner", side_effect=AssertionError("owner kill failed"))]
+        self._owner_kills = []
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -330,6 +334,63 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         release.set()
         time.sleep(0.05)
         self.assertEqual(lines, [])
+
+    def test_shim_late_flush_after_deadline_fails_closed(self):
+        # The write starts in time but its flush returns after the deadline: never counted as answered.
+        now = [0.0]
+
+        def emit(_line):
+            now[0] = 100.0
+
+        d, aborted = self._shim_dispatcher(lambda *_: {"content": []}, emit, 10.0, clock=lambda: now[0])
+        d.submit(1, {"name": "slow-flush"})
+        self.assertTrue(aborted.wait(5))
+        self.assertEqual(self._owner_kills, [1])
+
+    def test_shim_worker_unblocked_after_failure_writes_nothing(self):
+        # A worker whose result arrives after the session failed (expiry of a sibling) must write nothing at all.
+        release, entered, stream = threading.Event(), threading.Event(), io.StringIO()
+
+        def forward(_g, _s, _t, params):
+            if params["name"] == "held":
+                entered.set()
+                release.wait(5)
+            return {"content": []}
+
+        def emit(line):
+            stream.write(line)
+
+        d, aborted = self._shim_dispatcher(forward, emit, 0.3, workers=2)
+        d.submit(1, {"name": "held"})
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(aborted.wait(5))
+        self.assertEqual(self._owner_kills, [1])     # the owner died before anything was released
+        release.set()
+        time.sleep(0.1)
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_shim_retention_stays_bounded_behind_one_held_call(self):
+        release, entered, lines = threading.Event(), threading.Event(), []
+
+        def forward(_g, _s, _t, params):
+            if params["name"] == "held":
+                entered.set()
+                release.wait(10)
+            return {"content": []}
+
+        d, aborted = self._shim_dispatcher(forward, lines.append, 60.0, workers=2, max_pending=4)
+        self.addCleanup(release.set)
+        d.submit(0, {"name": "held"})
+        self.assertTrue(entered.wait(2))
+        for mid in range(1, 501):
+            d.submit(mid, {"name": "fast"})
+            deadline = time.monotonic() + 2
+            while len(lines) < mid and time.monotonic() < deadline:
+                time.sleep(0.001)
+        self.assertEqual(len(lines), 500)
+        self.assertFalse(aborted.is_set())
+        self.assertLessEqual(len(d._heap), 2 * 4 + mcp_shim.HEAP_SLACK)
+        self.assertEqual(len(d._live), 1)
 
     def test_subprocess_shim_aborts_before_cli_timeout_can_resume(self):
         from cortados_router.provider import timeouts
