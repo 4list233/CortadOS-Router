@@ -659,17 +659,16 @@ while :; do
   kill -0 "$c" 2>/dev/null || break
   sleep 1
 done
-# Best-effort root teardown after census/ledger failure. This is not an identity-safe OS boundary.
-kill -TERM "-$c" 2>/dev/null || :
+# Do not bypass identity checks with a raw numeric root-group signal when tracking fails.
+# Failure publication is guaranteed on the paths below; workload teardown still requires an OS boundary.
 track TERM || { failed=1; : > "$D/supervisor-failed"; }
 grace=$(( $(date +%s) + 10 ))
 while [ "$(date +%s)" -lt "$grace" ]; do
   sleep 1
   track scan && track TERM || { failed=1; : > "$D/supervisor-failed"; break; }
 done
-kill -KILL "-$c" 2>/dev/null || :
 track KILL || { failed=1; : > "$D/supervisor-failed"; }
-wait "$c"; ec=$?
+if [ "$failed" -eq 0 ]; then wait "$c"; ec=$?; else ec=125; fi
 if [ -f "$D/child-exit" ]; then ec=$(cat "$D/child-exit"); fi
 # A missed process may retain a FIFO. Bound drains independently so terminal publication cannot hang.
 drain_end=$(( $(date +%s) + 2 ))
