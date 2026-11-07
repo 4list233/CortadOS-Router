@@ -17,10 +17,12 @@ Machines are named Pro, Air and Studio only; no addresses, hostnames or secrets 
   then every child is sent `permission_mode: "plan"` explicitly (an omitted mode would resolve to `auto`).
 - The gateway will run on the Air on port 8434; phase 1 only builds and tests it.
 - **Funnel exposure (owner decision 2026-11-06):** the installed gateway binds only
-  `127.0.0.1:8434`; Tailscale Funnel uses reserved public HTTPS port 8443 and maps `/mcp` to the local `/mcp`.
+  `127.0.0.1:8434`; Tailscale Funnel uses public HTTPS port 443 (outside bots' egress proxies
+  commonly pass only 443) and maps only `/mcp` to the local `/mcp`; private tailnet-only Serve (the provider) uses
+  its own port, so 443 carries nothing private.
   `install.sh funnel-on` refuses conflicting configuration and records ownership; `funnel-off` removes only after
   verifying the exact owned handler. An optional exact public Host is supplied at plist generation through
-  `CORTADOS_BOT_ALLOWED_HOST`; no tailnet name or address is committed.
+  `CORTADOS_BOT_ALLOWED_HOST` (the bare hostname, no `:port`, since Funnel is on 443); no tailnet name or address is committed.
 - The system prompt to paste into Grok Bot is [`BOT-INSTRUCTIONS.md`](BOT-INSTRUCTIONS.md) (ticket B10).
 
 **Phase 1 built** (`cortados_router/bot_gateway.py`, tests `tests/test_bot_gateway.py`):

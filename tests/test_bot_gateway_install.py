@@ -324,21 +324,22 @@ class PlistTest(InstallerHarness):
         doc = plistlib.loads(self.plist().read_bytes())
         self.assertEqual(doc["EnvironmentVariables"]["CORTADOS_BOT_ALLOWED_HOST"], "gateway.example.test")
 
-    def test_funnel_reserved_port_preserves_unrelated_handlers_and_verifies_owner(self):
+    def test_funnel_443_preserves_private_serve_on_other_port_and_verifies_owner(self):
         calls = Path(self.tmp.name) / "tailscale.calls"
         state = Path(self.tmp.name) / "funnel.json"
-        unrelated = ('{"TCP":{"443":{"HTTPS":true}},"Web":{"public.example:443":{"Handlers":'
-                     '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":{"public.example:443":true}}')
-        ours = ('{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":'
-                '{"public.example:443":{"Handlers":{"/other":{"Proxy":"http://127.0.0.1:9000"}}},'
-                '"public.example:8443":{"Handlers":{"/mcp":{"Proxy":"http://127.0.0.1:8434/mcp"}}}},'
-                '"AllowFunnel":{"public.example:443":true,"public.example:8443":true}}')
+        # Private tailnet-only Serve lives on its own port (8444 here) and is never touched or published.
+        unrelated = ('{"TCP":{"8444":{"HTTPS":true}},"Web":{"public.example:8444":{"Handlers":'
+                     '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}}}')
+        ours = ('{"TCP":{"8444":{"HTTPS":true},"443":{"HTTPS":true}},"Web":'
+                '{"public.example:8444":{"Handlers":{"/other":{"Proxy":"http://127.0.0.1:9000"}}},'
+                '"public.example:443":{"Handlers":{"/mcp":{"Proxy":"http://127.0.0.1:8434/mcp"}}}},'
+                '"AllowFunnel":{"public.example:443":true}}')
         state.write_text(unrelated)
         self._fake("tailscale", f'''echo "$*" >> {calls}
 if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; exit 0; fi
 case "$*" in
-  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp") printf '%s' '{ours}' > {state};;
-  "funnel --https=8443 --set-path /mcp off") printf '%s' '{unrelated}' > {state};;
+  "funnel --bg --https=443 --set-path /mcp http://127.0.0.1:8434/mcp") printf '%s' '{ours}' > {state};;
+  "funnel --https=443 --set-path /mcp off") printf '%s' '{unrelated}' > {state};;
 esac
 ''')
         self.assertEqual(self.run_sh("funnel-on").returncode, 0)
@@ -349,19 +350,28 @@ esac
         self.assertEqual(state.read_text(), unrelated)
         commands = [line for line in calls.read_text().splitlines() if "status --json" not in line]
         self.assertEqual(commands, [
-            "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp",
-            "funnel --https=8443 --set-path /mcp off",
+            "funnel --bg --https=443 --set-path /mcp http://127.0.0.1:8434/mcp",
+            "funnel --https=443 --set-path /mcp off",
         ])
 
     def test_funnel_refuses_reserved_port_conflict_and_unowned_removal(self):
         state = Path(self.tmp.name) / "funnel.json"
-        state.write_text('{"TCP":{"8443":{"HTTPS":true}},"Web":{"public.example:8443":{"Handlers":'
-                         '{"/other":{"Proxy":"http://127.0.0.1:9000"}}}},"AllowFunnel":'
-                         '{"public.example:8443":true}}')
-        self._fake("tailscale", f'''if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; fi
+        calls = Path(self.tmp.name) / "tailscale.calls"
+        self._fake("tailscale", f'''if [ "$1 $2 $3" = "funnel status --json" ]; then /bin/cat {state}; exit 0; fi
+echo "$*" >> {calls}
 ''')
-        self.assertNotEqual(self.run_sh("funnel-on").returncode, 0)
-        self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+        # Any non-owned handler or path on 443 (private Serve or public, alone or beside our /mcp) is a conflict:
+        # publishing or removing there could expose or break unrelated paths.
+        other = {"Handlers": {"/other": {"Proxy": "http://127.0.0.1:9000"}}}
+        mixed = {"Handlers": {"/other": {"Proxy": "http://127.0.0.1:9000"},
+                              "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}
+        for web, allow in ((other, {"public.example:443": True}), (other, {}), (mixed, {"public.example:443": True})):
+            with self.subTest(web=web, allow=allow):
+                state.write_text(json.dumps({"TCP": {"443": {"HTTPS": True}},
+                                             "Web": {"public.example:443": web}, "AllowFunnel": allow}))
+                self.assertNotEqual(self.run_sh("funnel-on").returncode, 0)
+                self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
+                self.assertFalse(calls.exists())
 
     def test_plist_without_token_refused(self):
         self.provider_env(f"CORTADOS_PROVIDER_TOKEN={PROVIDER_SECRET}\n")
@@ -375,21 +385,21 @@ class FunnelReviewTest(InstallerHarness):
         self.state = Path(self.tmp.name) / "funnel.json"
         self.ts_calls = Path(self.tmp.name) / "tailscale.calls"
         self.owner = self.home / ".cortados" / "bot-gateway-funnel-owner"
-        self.expected = "8443 /mcp http://127.0.0.1:8434/mcp\n"
-        self.ours = {"TCP": {"8443": {"HTTPS": True}},
-                     "Web": {"public.example:8443": {"Handlers": {
+        self.expected = "443 /mcp http://127.0.0.1:8434/mcp\n"
+        self.ours = {"TCP": {"443": {"HTTPS": True}},
+                     "Web": {"public.example:443": {"Handlers": {
                          "/mcp": {"Proxy": "http://127.0.0.1:8434/mcp"}}}},
-                     "AllowFunnel": {"public.example:8443": True}}
+                     "AllowFunnel": {"public.example:443": True}}
         self.state.write_text("{}")
         self._fake("tailscale", f"""if [ "$1 $2 $3" = "funnel status --json" ]; then
   /bin/cat {self.state}; exit 0
 fi
 echo "$*" >> {self.ts_calls}
 case "$*" in
-  "funnel --bg --https=8443 --set-path /mcp http://127.0.0.1:8434/mcp")
+  "funnel --bg --https=443 --set-path /mcp http://127.0.0.1:8434/mcp")
     [ "$(/bin/cat {self.owner})" = "pending {self.expected.strip()}" ] || exit 9
     printf '%s' '{json.dumps(self.ours)}' > {self.state};;
-  "funnel --https=8443 --set-path /mcp off") printf '{{}}' > {self.state};;
+  "funnel --https=443 --set-path /mcp off") printf '{{}}' > {self.state};;
 esac
 """)
 
@@ -408,7 +418,7 @@ esac
                          {"HTTPS": True, "TCPForward": "127.0.0.1:9000"},
                          {"HTTPS": 1}, {"HTTPS": False}):
             with self.subTest(listener=listener):
-                cfg = dict(self.ours, TCP={} if listener is None else {"8443": listener})
+                cfg = dict(self.ours, TCP={} if listener is None else {"443": listener})
                 self.state.write_text(json.dumps(cfg))
                 self.marker()
                 self.assertNotEqual(self.run_sh("funnel-off").returncode, 0)
@@ -417,8 +427,8 @@ esac
 
     def test_exact_config_rejects_unknown_web_and_top_level_fields(self):
         for cfg in (dict(self.ours, Unknown={}),
-                    dict(self.ours, Web={"public.example:8443": dict(
-                        self.ours["Web"]["public.example:8443"], Unknown=True)})):
+                    dict(self.ours, Web={"public.example:443": dict(
+                        self.ours["Web"]["public.example:443"], Unknown=True)})):
             with self.subTest(cfg=cfg):
                 self.state.write_text(json.dumps(cfg))
                 self.marker()

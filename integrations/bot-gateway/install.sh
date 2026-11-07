@@ -8,7 +8,7 @@
 #   install.sh load     (re)load the LaunchAgent
 #   install.sh unload   stop and unload it
 #   install.sh status   launchctl state, an unauthenticated POST /mcp (expected: 401), the log path and line count
-#   install.sh funnel-on|funnel-off   verify and add/remove the owned /mcp handler on reserved public port 8443
+#   install.sh funnel-on|funnel-off   verify and add/remove the owned /mcp handler on reserved public port 443
 # Secrets: this script never reads, prints or copies a token value. Of ~/.cortados/provider.env it checks only whether
 # a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output). At run time launch.py reads that file
 # as data (never as shell code) and execs the gateway with an explicit environment.
@@ -16,9 +16,11 @@ set -eu
 
 LABEL=com.cortados.bot-gateway
 PORT=8434                                        # docs/GROKBOT-BRIDGE.md section 0: the gateway's one port on the Air
-# A dedicated public port prevents Funnel from publishing unrelated private Serve paths sharing its HTTPS listener;
-# 8443 is the conventional alternate HTTPS port and avoids the default 443 listener used by private Serve handlers.
-FUNNEL_PORT=8443
+# Funnel on 443 because outside bots' egress proxies commonly pass only 443 (TLS to 8443 fails there). Funnel shares
+# a port's HTTPS listener with every Serve path on it, so private tailnet-only Serve (e.g. the provider's) must use
+# another port; funnel-on/off refuse a 443 listener holding any handler or path that is not exactly ours.
+# Tailscale keys the web handler "<host>:443"; the gateway's CORTADOS_BOT_ALLOWED_HOST is then the bare hostname.
+FUNNEL_PORT=443
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${CORTADOS_BOT_GATEWAY_REPO:-$(cd "$HERE/../.." && pwd)}"   # the checkout this script lives in (~/cortados-router on the Air)
 PYBIN="${CORTADOS_BOT_GATEWAY_PYTHON:-/usr/bin/python3}"          # the interpreter the LaunchAgent runs (3.9 on the Air)
@@ -34,7 +36,7 @@ WORKSPACE="$HOME/cortados-bot-workspace"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FUNNEL_OWNER="$STATE_DIR/bot-gateway-funnel-owner"
 DOMAIN="gui/$(id -u)"
-ALLOWED_HOST="${CORTADOS_BOT_ALLOWED_HOST:-}"       # optional exact public Host, copied into the plist; never hard-coded
+ALLOWED_HOST="${CORTADOS_BOT_ALLOWED_HOST:-}"       # optional exact public Host (bare hostname on 443), copied into the plist; never hard-coded
 
 die() { echo "install.sh: $*" >&2; exit 2; }
 case "$ALLOWED_HOST" in *[!A-Za-z0-9.:-]* ) die "CORTADOS_BOT_ALLOWED_HOST contains an invalid character" ;; esac
