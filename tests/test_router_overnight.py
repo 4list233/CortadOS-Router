@@ -662,3 +662,110 @@ class ReviewFixesRound4(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NightWindowBudget(unittest.TestCase):
+    """Forest 2026-11-07 option (a): a local-time night window with a looser latency budget; memory guard unchanged."""
+
+    def _guard(self, now, lat, mem=100.0, window='01:00-07:00', logs=None, sig=None):
+        logs = [] if logs is None else logs
+        sig = [] if sig is None else sig
+        lats = iter(lat)
+        g = night.Guard(latency=lambda: next(lats), memory=lambda: mem, budget_s=1, min_free_gb=8, interval_s=0,
+                        max_pause_s=1800, signaller=lambda pid, s: sig.append(s), log=logs.append,
+                        alerter=lambda n, d: None, wall=lambda: now[0],
+                        night_window=night.parse_night_window(window), night_budget_s=6.0)
+        g.baseline_samples = [2.0]
+        return g
+
+    def test_inside_window_uses_night_budget(self):
+        now, logs, sig = [datetime(2026, 11, 7, 3, 0)], [], []
+        g = self._guard(now, [5.5, 8.5], logs=logs, sig=sig)
+        g.tick(42)
+        self.assertEqual(sig, [], '5.5 s is within 2.0 + 6.0 at night')
+        g.tick(42)
+        self.assertEqual(sig, [signal.SIGSTOP], '8.5 s is above the night ceiling: a stalled scorer still pauses')
+        self.assertIn('night budget 6s (01:00-07:00 local', logs[-1])
+
+    def test_outside_window_keeps_day_budget(self):
+        now, logs, sig = [datetime(2026, 11, 7, 12, 0)], [], []
+        g = self._guard(now, [3.5], logs=logs, sig=sig)
+        g.tick(42)
+        self.assertEqual(sig, [signal.SIGSTOP])
+        self.assertIn('day budget 1s', logs[-1])
+        self.assertEqual(g.current_budget()[0], 1)
+
+    def test_window_edges_are_start_inclusive_end_exclusive(self):
+        w = night.parse_night_window('01:00-07:00')
+        self.assertTrue(night.in_night_window(w, datetime(2026, 11, 7, 1, 0)))
+        self.assertTrue(night.in_night_window(w, datetime(2026, 11, 7, 6, 59)))
+        self.assertFalse(night.in_night_window(w, datetime(2026, 11, 7, 7, 0)))
+        self.assertFalse(night.in_night_window(w, datetime(2026, 11, 7, 0, 59)))
+        self.assertFalse(night.in_night_window(None, datetime(2026, 11, 7, 3, 0)))
+
+    def test_window_crossing_midnight(self):
+        w = night.parse_night_window('23:00-05:00')
+        for h, inside in ((22, False), (23, True), (0, True), (4, True), (5, False), (12, False)):
+            with self.subTest(hour=h):
+                self.assertEqual(night.in_night_window(w, datetime(2026, 11, 7, h, 30 if h == 22 else 0)), inside)
+
+    def test_local_wall_time_follows_dst(self):
+        # 2026-11-01 02:00 EDT -> 01:00 EST in Toronto: the same instant-based clock reads local wall time on both sides.
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/Toronto')
+        w = night.parse_night_window('01:00-07:00')
+        before = datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc).astimezone(tz)   # 01:30 EDT
+        after = datetime(2026, 11, 1, 12, 30, tzinfo=timezone.utc).astimezone(tz)   # 07:30 EST
+        self.assertTrue(night.in_night_window(w, before))
+        self.assertFalse(night.in_night_window(w, after))
+        self.assertTrue(night.in_night_window(w, datetime(2026, 11, 1, 11, 30, tzinfo=timezone.utc).astimezone(tz)))  # 06:30 EST
+
+    def test_invalid_window_rejected(self):
+        for bad in ('', '1-7', '25:00-07:00', '01:60-07:00', '01:00-01:00', '01:00', 'night'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                night.parse_night_window(bad)
+        self.assertIsNone(night.parse_night_window('off'))
+
+    def test_invalid_env_window_reported_and_default_used(self):
+        with patch.dict(os.environ, {'CORTADOS_S1_NIGHT_WINDOW': '25:00-07:00'}), patch('builtins.print') as pr:
+            self.assertEqual(night._env_night_window(), night.parse_night_window('01:00-07:00'))
+        self.assertIn('CORTADOS_S1_NIGHT_WINDOW', str(pr.call_args.args[0]))
+        with patch.dict(os.environ, {'CORTADOS_S1_NIGHT_WINDOW': '22:30-06:00'}):
+            self.assertEqual(night._env_night_window(), (night.time(22, 30), night.time(6, 0)))
+
+    def test_night_budget_below_day_rejected(self):
+        with self.assertRaises(ValueError):
+            night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, night_budget_s=0.5,
+                        night_window=night.parse_night_window('01:00-07:00'), log=lambda m: None, alerter=lambda n, d: None)
+        with patch.dict(os.environ, {'CORTADOS_S1_NIGHT_LATENCY_BUDGET_S': '0.5'}), patch('builtins.print') as pr:
+            g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, log=lambda m: None, alerter=lambda n, d: None)
+        self.assertEqual(g.night_budget, 6.0)
+        self.assertIn('below the day budget', str(pr.call_args.args[0]))
+
+    def test_env_defaults(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('CORTADOS_S1_')}
+        with patch.dict(os.environ, env, clear=True):
+            g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, log=lambda m: None, alerter=lambda n, d: None)
+        self.assertEqual((g.budget, g.night_budget, g.night_window), (1.0, 6.0, (night.time(1), night.time(7))))
+
+    def test_memory_guard_still_pauses_at_night(self):
+        now, logs, sig = [datetime(2026, 11, 7, 3, 0)], [], []
+        g = self._guard(now, [2.1], mem=4.0, logs=logs, sig=sig)
+        g.tick(42)
+        self.assertEqual(sig, [signal.SIGSTOP])
+        self.assertIn('free memory 4.0 GB < 8 GB', logs[-1])
+        self.assertIn('night budget', logs[-1])
+
+    def test_resume_logs_budget_and_switches_at_window_end(self):
+        now, logs, sig = [datetime(2026, 11, 7, 6, 58)], [], []
+        g = self._guard(now, [5.0, 5.0, 5.0, 5.0, 2.5, 2.5, 2.5], logs=logs, sig=sig)
+        g.tick(42)
+        self.assertEqual(sig, [])
+        now[0] = datetime(2026, 11, 7, 7, 0)
+        g.tick(42)
+        self.assertEqual(sig, [signal.SIGSTOP], 'at 07:00 the day budget applies again')
+        g.baseline_samples = [2.0]
+        for _ in range(5):
+            g.tick(42)
+        self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT])
+        self.assertIn('RESUME', logs[-1]); self.assertIn('day budget 1s', logs[-1])
