@@ -331,11 +331,23 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
     def test_a_provisional_deadline_expires_while_main_is_blocked_in_reply(self):
         # main() blocks writing a ping reply (stdout stalled). A tools/call read meanwhile sits unparsed in the inbox;
         # its read-time deadline must still fire: the deadline thread sees it without main() ever adopting it.
+        # The reader's clock stamps the ping 60 s late, so the ping's own provisional deadline lies far past the
+        # assertion window: only the unadopted tools/call's provisional entry (seq 2) can trigger the fail closed.
         stalled, hang = threading.Event(), threading.Event()
         self.addCleanup(hang.set)
         d, aborted = self._shim_dispatcher(lambda *_: None, lambda _l: stalled.set() or hang.wait(30), 0.3)
         inbox = queue.Queue(maxsize=8)
-        writer = self._pipe_reader(d, inbox)
+        r, w = os.pipe()
+        reader, writer = os.fdopen(r, "r"), os.fdopen(w, "w")
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        stamps = []
+
+        def reader_clock():
+            stamps.append(1)
+            return time.monotonic() + (60.0 if len(stamps) == 1 else 0.0)
+
+        threading.Thread(target=mcp_shim._read_stdin, args=(reader, inbox, d, reader_clock), daemon=True).start()
         threading.Thread(target=mcp_shim._serve, args=(inbox, d, []), daemon=True).start()
         sent = time.monotonic()
         writer.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n")
@@ -345,6 +357,9 @@ with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
         self.assertTrue(aborted.wait(2))
         self.assertEqual(self._owner_kills, [1])
         self.assertLess(time.monotonic(), sent + 0.3 + 1.0)
+        # Attribution: the expired entry is the tools/call's (seq 2, never adopted); the ping's (seq 1) is still armed.
+        self.assertEqual({seq: c["state"] for seq, c in d._live.items()}, {1: "inbox", 2: "expired"})
+        self.assertIsNone(d._live[2]["mid"])
 
     def test_finish_waits_for_a_signalled_overflow_that_eof_raced(self):
         # Overflow is signalled, then EOF reaches finish() before the deadline thread has failed closed: finish()
