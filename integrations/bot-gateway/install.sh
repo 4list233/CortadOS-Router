@@ -8,7 +8,7 @@
 #   install.sh load     (re)load the LaunchAgent
 #   install.sh unload   stop and unload it
 #   install.sh status   launchctl state, an unauthenticated POST /mcp (expected: 401), the log path and line count
-#   install.sh funnel-on|funnel-off   verify and add/remove the owned /mcp handler on reserved public port 8443
+#   install.sh funnel-on|funnel-off   verify and add/remove the owned /mcp handler on reserved public port 443
 # Secrets: this script never reads, prints or copies a token value. Of ~/.cortados/provider.env it checks only whether
 # a line assigns the variable NAME CORTADOS_PROVIDER_TOKEN (grep -q, no output). At run time launch.py reads that file
 # as data (never as shell code) and execs the gateway with an explicit environment.
@@ -16,9 +16,15 @@ set -eu
 
 LABEL=com.cortados.bot-gateway
 PORT=8434                                        # docs/GROKBOT-BRIDGE.md section 0: the gateway's one port on the Air
-# A dedicated public port prevents Funnel from publishing unrelated private Serve paths sharing its HTTPS listener;
-# 8443 is the conventional alternate HTTPS port and avoids the default 443 listener used by private Serve handlers.
-FUNNEL_PORT=8443
+# Funnel on 443 because outside bots' egress proxies commonly pass only 443 (TLS to 8443 fails there). Funnel shares
+# a port's HTTPS listener with every Serve path on it, so private tailnet-only Serve (e.g. the provider's) must use
+# another port; funnel-on/off refuse a 443 listener holding any handler or path that is not exactly ours.
+# Tailscale keys the web handler "<host>:443"; the gateway's CORTADOS_BOT_ALLOWED_HOST is then the bare hostname.
+FUNNEL_PORT=443
+# Earlier installs published on 8443 and recorded "8443 /mcp ..." ownership. funnel-off still recognises that legacy
+# record and removes exactly the owned 8443 handler, so an upgrade can withdraw the old public listener;
+# funnel-on refuses while it exists (migration order: docs/GROKBOT-BRIDGE.md).
+LEGACY_FUNNEL_PORT=8443
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${CORTADOS_BOT_GATEWAY_REPO:-$(cd "$HERE/../.." && pwd)}"   # the checkout this script lives in (~/cortados-router on the Air)
 PYBIN="${CORTADOS_BOT_GATEWAY_PYTHON:-/usr/bin/python3}"          # the interpreter the LaunchAgent runs (3.9 on the Air)
@@ -34,7 +40,7 @@ WORKSPACE="$HOME/cortados-bot-workspace"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FUNNEL_OWNER="$STATE_DIR/bot-gateway-funnel-owner"
 DOMAIN="gui/$(id -u)"
-ALLOWED_HOST="${CORTADOS_BOT_ALLOWED_HOST:-}"       # optional exact public Host, copied into the plist; never hard-coded
+ALLOWED_HOST="${CORTADOS_BOT_ALLOWED_HOST:-}"       # optional exact public Host (bare hostname on 443), copied into the plist; never hard-coded
 
 die() { echo "install.sh: $*" >&2; exit 2; }
 case "$ALLOWED_HOST" in *[!A-Za-z0-9.:-]* ) die "CORTADOS_BOT_ALLOWED_HOST contains an invalid character" ;; esac
@@ -166,7 +172,7 @@ cmd_unload() {
 }
 
 funnel_state() {
-  ts="$1"
+  ts="$1"; port="${2:-$FUNNEL_PORT}"
   out="$("$ts" funnel status --json 2>/dev/null)" || die "tailscale funnel status failed"
   # Refuse anything except our single exact handler on the reserved port. This treats unknown schema/configuration as
   # conflict rather than risking exposure or deletion; other ports are deliberately ignored.
@@ -187,7 +193,7 @@ try:
           and tcp[port]["HTTPS"] is True)
     print("ours" if ours else "conflict")
 except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError):
-    print("conflict")' "$out" "$FUNNEL_PORT" "http://127.0.0.1:$PORT/mcp"
+    print("conflict")' "$out" "$port" "http://127.0.0.1:$PORT/mcp"
 }
 
 # Serialize intent creation, mutation and recovery: otherwise an off command could remove a pending
@@ -203,7 +209,7 @@ funnel_lock() {
 # before any public mutation, and replace it atomically only after exact configuration verification.
 # A failed finalization leaves the durable pending record available to funnel-off.
 funnel_record() {
-  python3 -I - "$FUNNEL_OWNER" "$1" "$FUNNEL_PORT /mcp http://127.0.0.1:$PORT/mcp" <<'PY'
+  python3 -I - "$FUNNEL_OWNER" "$1" "${2:-$FUNNEL_PORT} /mcp http://127.0.0.1:$PORT/mcp" <<'PY'
 import os, stat, sys, tempfile
 path, action, expected = sys.argv[1:]
 pending = "pending " + expected + "\n"
@@ -257,6 +263,9 @@ PY
 cmd_funnel_on() {
   ts="$(tailscale_cli)"
   funnel_lock
+  if funnel_record check "$LEGACY_FUNNEL_PORT" >/dev/null 2>&1; then
+    die "legacy Funnel ownership record for port $LEGACY_FUNNEL_PORT found; run '$0 funnel-off' first to remove the old listener"
+  fi
   [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel port $FUNNEL_PORT already has configuration"
   funnel_record create || die "cannot persist exclusive Funnel ownership intent; nothing activated"
   "$ts" funnel --bg --https="$FUNNEL_PORT" --set-path /mcp "http://127.0.0.1:$PORT/mcp"
@@ -267,17 +276,25 @@ cmd_funnel_on() {
 cmd_funnel_off() {
   ts="$(tailscale_cli)"
   funnel_lock
-  record="$(funnel_record check)" || die "no valid Funnel ownership marker; refusing removal"
-  state="$(funnel_state "$ts")"
+  # The current 443 record first; otherwise a legacy 8443 record from an earlier install, handled identically.
+  if record="$(funnel_record check "$FUNNEL_PORT" 2>/dev/null)"; then
+    port="$FUNNEL_PORT"
+  elif record="$(funnel_record check "$LEGACY_FUNNEL_PORT" 2>/dev/null)"; then
+    port="$LEGACY_FUNNEL_PORT"
+  else
+    funnel_record check "$FUNNEL_PORT" >/dev/null || true
+    die "no valid Funnel ownership marker; refusing removal"
+  fi
+  state="$(funnel_state "$ts" "$port")"
   # A failed activation can leave only its intent. Never issue a Tailscale mutation in that case.
   if [ "$state" = empty ] && [ "$record" = pending ]; then
-    funnel_record remove
+    funnel_record remove "$port"
     return
   fi
-  [ "$state" = ours ] || die "reserved Funnel configuration is not exactly ours; refusing removal"
-  "$ts" funnel --https="$FUNNEL_PORT" --set-path /mcp off
-  [ "$(funnel_state "$ts")" = empty ] || die "reserved Funnel configuration remains after removal"
-  funnel_record remove
+  [ "$state" = ours ] || die "reserved Funnel configuration on port $port is not exactly ours; refusing removal"
+  "$ts" funnel --https="$port" --set-path /mcp off
+  [ "$(funnel_state "$ts" "$port")" = empty ] || die "reserved Funnel configuration remains after removal"
+  funnel_record remove "$port"
 }
 
 cmd_status() {
