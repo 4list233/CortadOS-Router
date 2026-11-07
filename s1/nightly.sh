@@ -335,8 +335,15 @@ report_promotes() { python3 -c "import json,sys;sys.exit(0 if json.load(open(sys
 deadline=""
 stop_deadline() {
   # Own and reap the watcher on every exit, not just successful training; otherwise it can set a stale stop flag later.
+  local pid
   if [ -n "$deadline" ]; then
-    kill -TERM "$deadline" 2>/dev/null
+    # Bash may already have reaped a naturally completed watcher. Its saved PID can
+    # then be reused, so signal only a running/stopped job still owned by this shell.
+    for pid in $(jobs -pr) $(jobs -ps); do
+      [ "$pid" = "$deadline" ] || continue
+      kill -TERM "$deadline" 2>/dev/null
+      break
+    done
     wait "$deadline" 2>/dev/null
     deadline=""
   fi

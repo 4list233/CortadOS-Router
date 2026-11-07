@@ -94,6 +94,52 @@ def _exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+class DeadlineCleanup(unittest.TestCase):
+    def run_cleanup(self, setup):
+        # Exercise the production helper with real Bash jobs; log signaling instead of
+        # relying on the OS to recycle a PID (or ever risking an unrelated process).
+        source = (S1 / "nightly.sh").read_text()
+        helper = source[source.index('deadline=""\nstop_deadline()'):source.index("\ncleanup()")]
+        script = helper + """
+kill() { printf 'kill:%s\\n' "$*"; }
+wait() { printf 'wait:%s\\n' "$*"; builtin wait "$@" 2>/dev/null; }
+""" + setup + """
+saved=$deadline
+stop_deadline
+[ -z "$deadline" ] || exit 10
+stop_deadline
+printf 'saved:%s\\n' "$saved"
+"""
+        out = subprocess.run(["/bin/bash", "-u", "-c", script],
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.splitlines()
+
+    def test_completed_watcher_is_reaped_without_signaling(self):
+        for status in (0, 7):
+            with self.subTest(status=status):
+                lines = self.run_cleanup(
+                    f"(exit {status}) & deadline=$!\n"
+                    # A foreground command lets Bash reap the completed watcher,
+                    # just as training can continue after the clock watcher exits.
+                    "/bin/sleep 0.1\n")
+                pid = lines[-1].split(":")[1]
+                self.assertEqual(lines, [f"wait:{pid}", f"saved:{pid}"])
+
+    def test_nonchild_pid_is_not_signaled(self):
+        lines = self.run_cleanup("deadline=$$\n")
+        pid = lines[-1].split(":")[1]
+        self.assertEqual(lines, [f"wait:{pid}", f"saved:{pid}"])
+
+    def test_running_watcher_is_signaled_and_reaped(self):
+        # The kill spy forwards only in this case, to a known active child.
+        lines = self.run_cleanup(
+            "kill() { printf 'kill:%s\\n' \"$*\"; builtin kill \"$@\"; }\n"
+            "/bin/sleep 30 & deadline=$!\n")
+        pid = lines[-1].split(":")[1]
+        self.assertEqual(lines, [f"kill:-TERM {pid}", f"wait:{pid}", f"saved:{pid}"])
+
+
 class NightlyEndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="s1-nightly-"))
