@@ -75,9 +75,22 @@ Policy (binary GiB):
   `s1/overnight.py:status_path` points at historical dashboard events, not a
   trustworthy live heavy-phase lease, so it is deliberately not used.
 
-**Deployment blockers:** polling cannot unload *before* training starts without
-an S1 lease/ack handshake. That integration is NOT implemented here. Nor does
-this branch prevent a pinned inference request from reloading an unloaded model.
+**Training handshake (lease/ack):** every S1 training/eval step in `s1/nightly.sh`
+(MLX LoRA, Laya `train.sh`, `evaluate.py`) runs under
+`python -m cortados_router.studio_capacity gate -- <cmd>` (`training_gate()`). It writes an atomic
+intent (`$CORTADOS_HOME/studio-gate/intent-<pid>-<nonce>.json`: pid, nonce, 300 s expiry refreshed
+every 60 s) and waits up to 30 s for the daemon's `ack-<nonce>.json`. Each daemon tick treats any
+live intent (unexpired, pid alive) as training: it sheds, confirms the model absent via `/api/ps`,
+then acks; it never loads or renews while an intent is live. Expired/dead-pid intents are deleted.
+On timeout the trainer proceeds with a log line if the daemon's status file is stale/missing (daemon
+down), or, if the daemon is alive, sends `keep_alive=0` itself and proceeds only after `/api/ps`
+confirms the model is gone (else it refuses to start). The intent is removed in `finally`. The
+`ps`-based detection stays as a second line of defence. The daemon reads intents from `--gate`
+(default `$CORTADOS_HOME/studio-gate`); the trainer reads status from `CORTADOS_STUDIO_STATUS`
+(default the template's `~/Library/Application Support/CortadOS/studio-capacity.json`), so both
+must agree on `CORTADOS_HOME` on the Studio.
+
+**Remaining deployment blockers:** this branch does not prevent a pinned inference request from reloading an unloaded model.
 A future gate must enforce fresh availability, one request at a time, exact
 model/context identity and 8K total context. Residency here is verified by exact
 Ollama model name, not a model provenance/context smoke test. No production-ready

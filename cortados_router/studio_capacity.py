@@ -7,6 +7,7 @@ sample and on restart. See README's Studio capacity section for the status ABI.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass
 import fcntl
 import json
@@ -18,8 +19,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+import uuid
 
 from .local_resources import mac_memory
 
@@ -55,6 +58,30 @@ COMMAND_TIMEOUT_SECONDS = 2
 # a cold load of an 8B model from disk can take a few seconds. 10 s bounds a
 # hung daemon; the stale-observation check covers whatever this delays.
 HTTP_TIMEOUT_SECONDS = 10
+# --- S1 training lease/ack handshake ---------------------------------------
+# A trainer's intent expires unless refreshed, so a trainer that dies without
+# its finally (SIGKILL, power loss) cannot keep the model shed forever; the pid
+# liveness check frees it sooner on an ordinary crash.
+INTENT_TTL_SECONDS = 300
+# Refresh well inside the TTL: four missed refreshes before an intent lapses.
+INTENT_REFRESH_SECONDS = 60
+# The daemon acks within one poll after the unload is confirmed (5 s poll + a
+# sub-second keep_alive=0 + /api/ps); 30 s is six polls, enough for a slow
+# unload, short enough that a nightly run is never held up meaningfully.
+ACK_WAIT_SECONDS = 30
+ACK_POLL_SECONDS = 0.5
+# CORTADOS_STUDIO_ACK_WAIT may only SHORTEN the ack wait (finite, within
+# [0, ACK_WAIT_SECONDS]); anything else is a configuration error and the gate
+# refuses. A NaN/inf wait would never time out and would hold the intent forever.
+ACK_WAIT_ENV = "CORTADOS_STUDIO_ACK_WAIT"
+# Residency checks always hit the real local Ollama. There is deliberately no
+# environment override: a redirected port that refuses connections reads as
+# "no model resident" and would authorize training beside a loaded model.
+# Tests inject a fake `api` into training_gate / Runner instead.
+OLLAMA_URL = "http://127.0.0.1:11434"
+NONCE_RE = re.compile(r"^[0-9a-f]{32}$")  # uuid4().hex, as training_gate writes it
+# Default status path is the one the LaunchAgent template passes via --status.
+DEFAULT_STATUS = Path.home() / "Library" / "Application Support" / "CortadOS" / "studio-capacity.json"
 
 
 @dataclass(frozen=True)
@@ -200,7 +227,7 @@ def gather(run=command):
 def ollama(path, payload=None):
     """Fixed loopback management only; never inherit an HTTP proxy or pull."""
     data = None if payload is None else json.dumps(payload).encode()
-    request = urllib.request.Request("http://127.0.0.1:11434" + path, data=data,
+    request = urllib.request.Request(OLLAMA_URL + path, data=data,
                                      headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
@@ -230,8 +257,11 @@ def write_status(path, status):
 
 
 class Runner:
-    def __init__(self, model=MODEL, collect=gather, api=ollama, clock=time.time):
+    def __init__(self, model=MODEL, collect=gather, api=ollama, clock=time.time,
+                 gate=None, alive=None):
         self.model, self.collect, self.api, self.clock = model, collect, api, clock
+        # gate: handshake directory; None disables the handshake (tests/legacy).
+        self.gate, self.alive = gate, alive or pid_alive
         self.eligible_since = None
         self.last_sample_ts = None
         # None = unknown. Shedding an unloaded model is skipped only when we
@@ -259,9 +289,16 @@ class Runner:
                       model_loaded=False, action="unload", reason="unknown",
                       lease_seconds=LEASE_SECONDS)
         try:
+            # Explicit trainer intents first: a live intent forces shed and
+            # forbids load/renew. Reading them failing raises -> fail closed.
+            intents = ([] if self.gate is None else
+                       live_intents(self.gate, now, alive=self.alive))
+            result["training_intents"] = len(intents)
             inputs = self.collect()
             result["inputs"] = inputs
-            safe = (not inputs["training_active"] and not inputs["eval_active"]
+            # ps-based detection stays as the second line of defence.
+            heavy = inputs["training_active"] or bool(intents)
+            safe = (not heavy and not inputs["eval_active"]
                     and inputs["free_reclaimable_bytes"] >= UNLOAD_BYTES
                     and inputs["swap_used_bytes"] < MAX_SWAP_BYTES)
             if not safe:
@@ -278,8 +315,8 @@ class Runner:
                 self.eligible_since = None
             elif self.eligible_since is None or now < self.eligible_since:
                 self.eligible_since = now
-            decision = decide(**{k: inputs[k] for k in (
-                "training_active", "eval_active", "free_reclaimable_bytes", "swap_used_bytes")},
+            decision = decide(training_active=heavy, **{k: inputs[k] for k in (
+                "eval_active", "free_reclaimable_bytes", "swap_used_bytes")},
                 model_loaded=loaded, last_change_ts=(now if self.eligible_since is None else self.eligible_since), now=now)
             result.update(action=decision.action, reason=decision.reason)
             renew = decision.action == "load" or (decision.action == "hold" and loaded and safe)
@@ -303,6 +340,12 @@ class Runner:
                     raise RuntimeError("Ollama did not confirm residency transition")
             result["model_loaded"] = loaded
             result["available"] = loaded and safe
+            if intents:
+                # Ack only after /api/ps confirmed the model is not resident.
+                if loaded or resident(self.api, self.model):
+                    raise RuntimeError("model still resident under training intent")
+                for intent in intents:
+                    write_ack(self.gate, intent, self.model, self.clock())
         except Exception as exc:
             self.eligible_since = None
             result.update(available=False, reason="fail closed: " + type(exc).__name__)
@@ -317,6 +360,256 @@ class Runner:
             if self.maybe_loaded is not False:
                 self.shed(result)
         return result
+
+
+def gate_dir(home=None):
+    """Handshake directory: $CORTADOS_HOME/studio-gate (intents + acks)."""
+    home = home or os.environ.get("CORTADOS_HOME") or str(Path.home() / ".cortados")
+    return Path(home) / "studio-gate"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
+def _read_json(path):
+    with open(path) as stream:
+        return json.load(stream)
+
+
+def live_intents(gate, now, alive=pid_alive):
+    """Unexpired intents whose trainer pid is alive. Expired or dead ones are
+    removed so a crashed trainer cannot hold the model off forever."""
+    gate = Path(gate)
+    if not gate.is_dir():
+        return []
+    live = []
+    for path in sorted(gate.glob("intent-*.json")):
+        try:
+            intent = _read_json(path)
+            pid, nonce, expires = _valid_intent(intent, now)
+        except FileNotFoundError:
+            continue  # trainer removed it between glob and read
+        except (ValueError, KeyError, TypeError, AttributeError):
+            # A malformed intent fails closed (counts as live) until it is
+            # older than one TTL, then it is discarded with a log line.
+            try:
+                age = now - path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age < INTENT_TTL_SECONDS:
+                live.append(dict(pid=None, nonce=None, expires_at=None))
+            else:
+                print("studio_capacity: discarding malformed intent " + path.name, file=sys.stderr)
+                path.unlink()
+            continue
+        if expires <= now or not alive(pid):
+            print("studio_capacity: discarding %s intent pid %d" % (
+                "expired" if expires <= now else "dead", pid), file=sys.stderr)
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                (gate / ("ack-" + nonce + ".json")).unlink()
+            continue
+        live.append(dict(pid=pid, nonce=nonce, expires_at=expires))
+    return live
+
+
+def _finite(value):
+    # bool is an int subclass; json yields NaN/inf for NaN, Infinity and 1e999.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("non-numeric timestamp")
+    try:
+        number = float(value)  # an int beyond float range (10**400) raises OverflowError
+    except OverflowError:
+        raise ValueError("timestamp out of float range") from None
+    if not math.isfinite(number):
+        raise ValueError("non-finite timestamp")
+    return number
+
+
+def _valid_intent(intent, now):
+    """Strict v1 schema. Anything else raises and takes the malformed path,
+    whose mtime bound guarantees cleanup (a NaN/inf expiry never would)."""
+    if intent.get("version") != 1:
+        raise ValueError("unsupported intent version")
+    pid = intent["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("invalid pid")
+    nonce = intent["nonce"]
+    if not isinstance(nonce, str) or not NONCE_RE.match(nonce):
+        raise ValueError("invalid nonce")
+    created, expires = _finite(intent["created_at"]), _finite(intent["expires_at"])
+    # A lease longer than the TTL, or one reaching past now + TTL, is not one
+    # training_gate writes; bounding it keeps every intent's hold finite.
+    if not 0 < expires - created <= INTENT_TTL_SECONDS or expires > now + INTENT_TTL_SECONDS:
+        raise ValueError("lease out of bounds")
+    return pid, nonce, expires
+
+
+def _connection_refused(exc):
+    """Nothing listening on the Ollama port: no model can be resident."""
+    reason = getattr(exc, "reason", None)
+    return isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError)
+
+
+class GateRefused(RuntimeError):
+    """Residency could not be confirmed absent: training must not start."""
+
+
+def write_ack(gate, intent, model, now):
+    if intent.get("nonce") is None:
+        return  # malformed intent: shed, but there is nobody to ack
+    write_status(Path(gate) / ("ack-" + intent["nonce"] + ".json"),
+                 dict(version=1, nonce=intent["nonce"], pid=intent["pid"], model=model,
+                      model_loaded=False, acked_at=now))
+
+
+def _daemon_alive(status_path, now):
+    """A fresh v1 snapshot from a running controller; else the daemon is down."""
+    try:
+        status = _read_json(status_path)
+        return (status.get("version") == 1 and status.get("reason") != "controller stopped"
+                and float(status["sampled_at"]) <= now < float(status["expires_at"]))
+    except FileNotFoundError:
+        return False
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+@contextlib.contextmanager
+def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=time.time,
+                  sleep=time.sleep, log=None, pid=None, wait_seconds=ACK_WAIT_SECONDS,
+                  refresh_seconds=INTENT_REFRESH_SECONDS):
+    """Hold an S1 training intent for the duration of the block.
+
+    Writes an intent, waits (bounded) for the daemon's ack that the model is
+    confirmed unloaded, and never proceeds silently: on timeout, whatever the
+    daemon's status says, it queries /api/ps itself, unloads a resident model
+    and confirms absence, raising GateRefused if that cannot be confirmed.
+    Only a refused connection (Ollama not running) proceeds without a query
+    result, with a log line."""
+    log = log or (lambda message: print("studio_gate: " + message, file=sys.stderr))
+    gate = Path(gate) if gate is not None else gate_dir()
+    status_path = Path(status_path or os.environ.get("CORTADOS_STUDIO_STATUS") or DEFAULT_STATUS)
+    gate.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid() if pid is None else pid
+    nonce = uuid.uuid4().hex
+    intent_path = gate / ("intent-%d-%s.json" % (pid, nonce))
+    ack_path = gate / ("ack-" + nonce + ".json")
+
+    def write_intent():
+        now = clock()
+        write_status(intent_path, dict(version=1, pid=pid, nonce=nonce, created_at=now,
+                                       expires_at=now + INTENT_TTL_SECONDS))
+
+    stop = threading.Event()
+
+    def refresh():
+        while not stop.wait(refresh_seconds):
+            try:
+                write_intent()
+            except OSError as exc:
+                log("intent refresh failed: " + type(exc).__name__)
+
+    write_intent()
+    refresher = threading.Thread(target=refresh, daemon=True)
+    refresher.start()
+    try:
+        deadline = clock() + wait_seconds
+        while not ack_path.exists():
+            if clock() >= deadline:
+                # Status freshness says nothing about residency (a daemon killed
+                # right after a renewal leaves the model loaded for a whole lease;
+                # a wrong status path looks "dead"): always ask Ollama directly.
+                log("no ack in %ss (capacity daemon %s); checking %s residency directly" % (
+                    wait_seconds, "live" if _daemon_alive(status_path, clock()) else
+                    "not running: status %s stale or missing" % status_path, model))
+                _confirm_unloaded(api, model, log)
+                break
+            sleep(ACK_POLL_SECONDS)
+        else:
+            log("daemon acked: %s unloaded" % model)
+        yield intent_path
+    finally:
+        stop.set()
+        refresher.join(timeout=5)
+        for path in (intent_path, ack_path):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+
+def _confirm_unloaded(api, model, log):
+    try:
+        loaded = resident(api, model)
+    except Exception as exc:
+        if _connection_refused(exc):
+            log("Ollama not running (connection refused): nothing resident; proceeding")
+            return
+        raise GateRefused("studio_gate: residency query failed (%s); refusing to start" %
+                          type(exc).__name__) from exc
+    if loaded:
+        log("%s resident; unloading (keep_alive=0)" % model)
+        try:
+            api("/api/generate", {"model": model, "stream": False, "keep_alive": 0})
+            loaded = resident(api, model)
+        except Exception as exc:
+            raise GateRefused("studio_gate: unload of %s unconfirmed (%s); refusing to start" % (
+                model, type(exc).__name__)) from exc
+        if loaded:
+            raise GateRefused("studio_gate: %s still resident after keep_alive=0" % model)
+    log("confirmed %s not resident; proceeding" % model)
+
+
+# Exit status of `gate` when it refuses (EX_TEMPFAIL): callers can tell a
+# refused gate from a failing command.
+GATE_REFUSED_EXIT = 75
+
+
+def ack_wait_from_env(raw):
+    """Unset/empty -> ACK_WAIT_SECONDS. Otherwise a finite number in
+    [0, ACK_WAIT_SECONDS]; anything else raises ValueError (gate refuses)."""
+    if raw is None or raw == "":
+        return float(ACK_WAIT_SECONDS)
+    try:
+        wait = float(raw)
+    except ValueError:
+        raise ValueError("%s=%r is not a number" % (ACK_WAIT_ENV, raw)) from None
+    if not math.isfinite(wait) or not 0 <= wait <= ACK_WAIT_SECONDS:
+        raise ValueError("%s=%r must be finite and within [0, %d] seconds"
+                         % (ACK_WAIT_ENV, raw, ACK_WAIT_SECONDS))
+    return wait
+
+
+def gate_main(argv):
+    """`studio_capacity gate -- cmd ...`: run cmd under a training intent."""
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    if not argv:
+        print("usage: python -m cortados_router.studio_capacity gate -- <command> ...", file=sys.stderr)
+        return 2
+    try:
+        wait = ack_wait_from_env(os.environ.get(ACK_WAIT_ENV))
+    except ValueError as exc:
+        print("studio gate configuration error: %s; refusing" % exc, file=sys.stderr)
+        return GATE_REFUSED_EXIT
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        gate = training_gate(wait_seconds=wait)
+        gate.__enter__()
+    except GateRefused as exc:
+        print(str(exc), file=sys.stderr)
+        return GATE_REFUSED_EXIT
+    try:
+        return subprocess.call(argv)
+    finally:
+        gate.__exit__(None, None, None)
 
 
 def serve(runner, status_path, sleep=time.sleep, polls=None):
@@ -350,9 +643,13 @@ def _terminate(signum, frame):
 
 
 def main():
+    if sys.argv[1:2] == ["gate"]:
+        sys.exit(gate_main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--status", type=Path, required=True)
+    parser.add_argument("--gate", type=Path, default=None,
+                        help="training handshake directory (default $CORTADOS_HOME/studio-gate)")
     args = parser.parse_args()
     args.status.parent.mkdir(parents=True, exist_ok=True)
     # One residency owner; launchd restarts must not race another instance.
@@ -361,7 +658,7 @@ def main():
         # launchd stops jobs with SIGTERM; turn it into SystemExit so serve's
         # finally releases residency instead of leaving the lease to expire.
         signal.signal(signal.SIGTERM, _terminate)
-        serve(Runner(model=args.model), args.status)
+        serve(Runner(model=args.model, gate=args.gate or gate_dir()), args.status)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,16 @@
 import json
+import os
+import time
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from cortados_router import studio_capacity as c
+
+
+N1 = "0000000000000000000000000000000a"  # canonical nonce (uuid4().hex shape)
 
 
 class PolicyTests(unittest.TestCase):
@@ -308,3 +314,252 @@ class RunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandshakeTests(unittest.TestCase):
+    """Training lease/ack handshake; temp dirs and fake Ollama only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.gate = Path(self.tmp.name) / "studio-gate"
+        self.status = Path(self.tmp.name) / "status.json"
+        self.now = 1000.0
+        self.loaded = True
+        self.calls = []
+        self.dead = set()
+        self.inputs = dict(training_active=False, eval_active=False,
+                           free_reclaimable_bytes=32*c.GIB, swap_used_bytes=0)
+        self.logs = []
+        self.runner = c.Runner(collect=lambda: self.inputs.copy(), api=self.api,
+                               clock=lambda: self.now, gate=self.gate,
+                               alive=lambda pid: pid not in self.dead)
+
+    def api(self, path, payload=None):
+        self.calls.append((path, payload))
+        if path == "/api/ps":
+            return {"models": [{"name": c.MODEL}] if self.loaded else []}
+        self.loaded = payload["keep_alive"] != 0
+        return {}
+
+    def intent(self, pid=4242, nonce=N1, expires=None):
+        self.gate.mkdir(parents=True, exist_ok=True)
+        c.write_status(self.gate / ("intent-%d-%s.json" % (pid, nonce)),
+                       dict(version=1, pid=pid, nonce=nonce, created_at=(self.now if expires is None else expires - 300),
+                            expires_at=self.now + 300 if expires is None else expires))
+
+    def test_intent_sheds_and_acks(self):
+        self.runner.maybe_loaded = True
+        self.intent()
+        result = self.runner.tick()
+        self.assertFalse(self.loaded)
+        # Shed precedes the residency query, so the decision itself is hold.
+        self.assertIn(("/api/generate", {"model": c.MODEL, "stream": False, "keep_alive": 0}), self.calls)
+        self.assertEqual(result["training_intents"], 1)
+        ack = json.loads((self.gate / ("ack-%s.json" % N1)).read_text())
+        self.assertEqual((ack["nonce"], ack["model_loaded"]), (N1, False))
+
+    def test_no_load_or_renew_while_intent_live(self):
+        self.loaded = False
+        self.intent()
+        for _ in range(60):  # 5 minutes of otherwise eligible samples
+            self.now += 5
+            self.intent()  # trainer keeps refreshing
+            self.runner.tick()
+        self.assertFalse(self.loaded)
+        self.assertFalse([p for p in self.calls if p[0] == "/api/generate" and p[1]["keep_alive"] != 0])
+
+    def test_expired_intent_ignored_and_removed(self):
+        self.loaded = False
+        self.intent(expires=self.now - 1)
+        self.assertEqual(c.live_intents(self.gate, self.now), [])
+        self.assertFalse(list(self.gate.glob("intent-*")))
+
+    def test_dead_trainer_intent_cleaned(self):
+        self.dead.add(4242)
+        self.intent()
+        (self.gate / ("ack-%s.json" % N1)).write_text("{}")
+        self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: p not in self.dead), [])
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_invalid_intent_schema_takes_malformed_path(self):
+        good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
+        bad = [dict(expires_at=float("nan")), dict(expires_at=float("inf")), dict(created_at=float("-inf")),
+               dict(pid=0), dict(pid=-5), dict(pid=True), dict(pid="4242"), dict(nonce="n1"),
+               dict(nonce=N1.upper()), dict(version=2), dict(expires_at=self.now + 10**6),
+               dict(created_at=self.now - 10**6), dict(expires_at="1e999")]
+        for i, override in enumerate(bad):
+            with self.subTest(override=override):
+                self.gate.mkdir(parents=True, exist_ok=True)
+                path = self.gate / ("intent-%d.json" % i)
+                path.write_text(json.dumps({**good, **override}))  # allow_nan: writes NaN/Infinity
+                self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: True),
+                                 [dict(pid=None, nonce=None, expires_at=None)])
+                # bounded: discarded once older than one TTL by mtime
+                self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1,
+                                                alive=lambda p: True), [])
+                self.assertFalse(path.exists())
+        # raw JSON spellings the decoder turns into non-finite floats
+        for i, raw in enumerate(('NaN', 'Infinity', '1e999')):
+            with self.subTest(raw=raw):
+                path = self.gate / ("intent-raw-%d.json" % i)
+                path.write_text('{"version": 1, "pid": 4242, "nonce": "%s", "created_at": %s, "expires_at": %s}'
+                                % (N1, self.now, raw))
+                self.assertEqual(len(c.live_intents(self.gate, self.now, alive=lambda p: True)), 1)
+                c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1, alive=lambda p: True)
+                self.assertFalse(path.exists())
+
+    def test_huge_integer_timestamp_is_malformed_and_eventually_deleted(self):
+        self.gate.mkdir(parents=True, exist_ok=True)
+        for field in ("created_at", "expires_at"):
+            with self.subTest(field=field):
+                path = self.gate / ("intent-huge-%s.json" % field)
+                good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
+                path.write_text(json.dumps({**good, field: 10**400}))
+                with self.assertRaises(ValueError):
+                    c._valid_intent(json.loads(path.read_text()), self.now)
+                self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: True),
+                                 [dict(pid=None, nonce=None, expires_at=None)])
+                self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1,
+                                                alive=lambda p: True), [])
+                self.assertFalse(path.exists())
+
+    def test_malformed_intent_fails_closed_until_ttl(self):
+        self.gate.mkdir(parents=True)
+        (self.gate / "intent-1-x.json").write_text("{bad")
+        self.assertEqual(len(c.live_intents(self.gate, time.time())), 1)
+        self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1), [])
+
+    def gate_ctx(self, **kw):
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+            kw.pop("on_sleep", lambda: None)()
+        self.runner.clock = lambda: clock[0]  # daemon and trainer share one clock
+        args = dict(gate=self.gate, status_path=self.status, api=self.api,
+                    clock=lambda: clock[0], sleep=sleep, log=self.logs.append, pid=os.getpid())
+        args.update({k: v for k, v in kw.items() if k != "on_sleep"})
+        return c.training_gate(**args), clock
+
+    def test_trainer_waits_for_daemon_ack(self):
+        def daemon_tick():
+            self.runner.maybe_loaded = None
+            self.runner.alive = lambda pid: True
+            self.runner.tick()
+        ctx, clock = self.gate_ctx(on_sleep=daemon_tick)
+        with ctx as intent_path:
+            self.assertFalse(self.loaded)
+            self.assertTrue(intent_path.exists())
+        self.assertIn("daemon acked", self.logs[-1])
+        self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
+        self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
+
+    def test_daemon_dead_model_resident_trainer_unloads(self):
+        # A daemon killed right after a renewal leaves the model resident for a
+        # lease: stale status must not let training start beside it.
+        self.loaded = True
+        ctx, clock = self.gate_ctx()
+        with ctx:
+            self.assertFalse(self.loaded)
+        self.assertGreaterEqual(clock[0], c.ACK_WAIT_SECONDS)
+        self.assertTrue(any("not running" in line for line in self.logs))
+        self.assertIn("confirmed", self.logs[-1])
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_daemon_dead_unload_unconfirmed_refuses(self):
+        def stuck(path, payload=None):
+            return {"models": [{"name": c.MODEL}]} if path == "/api/ps" else {}
+        ctx, _ = self.gate_ctx(api=stuck)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_ollama_not_running_proceeds_with_log(self):
+        def refused(path, payload=None):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+        ctx, _ = self.gate_ctx(api=refused)
+        with ctx:
+            pass
+        self.assertIn("connection refused", self.logs[-1])
+
+    def test_ollama_error_refuses(self):
+        def broken(path, payload=None):
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        ctx, _ = self.gate_ctx(api=broken)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_live_daemon_without_ack_trainer_unloads_itself(self):
+        c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
+        ctx, _ = self.gate_ctx()
+        with ctx:
+            self.assertFalse(self.loaded)
+        self.assertIn(("/api/generate", {"model": c.MODEL, "stream": False, "keep_alive": 0}), self.calls)
+        self.assertIn("confirmed", self.logs[-1])
+
+    def test_live_daemon_unload_unconfirmed_refuses(self):
+        c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
+        def stuck(path, payload=None):
+            return {"models": [{"name": c.MODEL}]} if path == "/api/ps" else {}
+        ctx, _ = self.gate_ctx(api=stuck)
+        with self.assertRaises(RuntimeError):
+            with ctx:
+                self.fail("training must not start")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_crash_in_block_removes_intent(self):
+        ctx, _ = self.gate_ctx()
+        with self.assertRaises(ValueError):
+            with ctx:
+                raise ValueError("trainer crashed")
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_intent_refreshed_while_held(self):
+        ctx, _ = self.gate_ctx(refresh_seconds=0.01)
+        with ctx as intent_path:
+            first = intent_path.stat().st_mtime_ns
+            time.sleep(0.1)
+            self.assertTrue(intent_path.exists())
+        self.assertFalse(intent_path.exists())
+
+
+class OllamaEndpointTests(unittest.TestCase):
+    def test_no_env_var_redirects_the_residency_check(self):
+        seen = []
+
+        class Opener:
+            def open(self, request, timeout):
+                seen.append(request.full_url)
+                raise urllib.error.URLError(ConnectionRefusedError())
+
+        env = {"CORTADOS_STUDIO_OLLAMA_PORT": "1", "OLLAMA_HOST": "127.0.0.1:1", "OLLAMA_PORT": "1",
+               "HTTP_PROXY": "http://127.0.0.1:1", "http_proxy": "http://127.0.0.1:1",
+               "CORTADOS_STUDIO_OLLAMA_URL": "http://127.0.0.1:1"}
+        with patch.dict(os.environ, env), patch.object(c.urllib.request, "build_opener", return_value=Opener()):
+            with self.assertRaises(urllib.error.URLError):
+                c.ollama("/api/ps")
+        self.assertEqual(seen, ["http://127.0.0.1:11434/api/ps"])
+        self.assertFalse(hasattr(c, "OLLAMA_PORT_ENV"))
+
+
+class AckWaitConfigTests(unittest.TestCase):
+    def test_valid_values(self):
+        self.assertEqual(c.ack_wait_from_env(None), c.ACK_WAIT_SECONDS)
+        self.assertEqual(c.ack_wait_from_env(""), c.ACK_WAIT_SECONDS)
+        self.assertEqual(c.ack_wait_from_env("0"), 0.0)
+        self.assertEqual(c.ack_wait_from_env(str(c.ACK_WAIT_SECONDS)), c.ACK_WAIT_SECONDS)
+
+    def test_invalid_values_refuse_before_running(self):
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity", "-1", "-0.5", str(c.ACK_WAIT_SECONDS + 1), "1e9",
+                    "abc", "5s", " "):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    c.ack_wait_from_env(raw)
+                with patch.dict(os.environ, {c.ACK_WAIT_ENV: raw}), \
+                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "call") as call:
+                    self.assertEqual(c.gate_main(["--", "true"]), c.GATE_REFUSED_EXIT)
+                gate.assert_not_called()
+                call.assert_not_called()
