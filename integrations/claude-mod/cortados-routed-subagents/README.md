@@ -176,13 +176,23 @@ reason — it never silently re-runs the task as a native subagent, which would 
 
 ## Background subagents
 
-**Review r3 WIP — not ready for deployment.** The shell supervisor still lacks an OS-owned per-run boundary.
-P1 collateral-process/snapshot-to-signal races remain unresolved, as does P1 immediate detached-descendant escape.
-Detected census/ledger failures now publish failure metadata and bounded FIFO draining avoids indefinite terminal
-publication, but P2 workload teardown on tracking failure is still best-effort, not guaranteed.
-`launcher_test.py immediate`, `census-fail`, and `ledger-fail` are unresolved reproductions, not passing acceptance
-checks. The census failure fixture delays its fault until the fake workload can start; it does not count a
-pre-launch kill as successful descendant cleanup. Do not merge or deploy this WIP as a containment fix.
+**Documented detach limit (owner decision 2026-11-07).** A descendant that creates a new session between
+watchdog polls can outlive its run. Cleanup sweeps run once at session start and every five minutes via
+the mod clock: normally at most ~5 minutes until TERM, then a 10-second grace before KILL.
+This bound requires a running mod session and successful sweeps; after shutdown, cleanup resumes at
+the next session start. Sweeps scan all same-user processes, but only target finished runs (numeric
+terminal `exit` file in a same-user, non-symlink, launcher-marked directory).
+Membership is either a recorded PID/PGID/lstart match, or the exact per-run UUID inherited as
+`CORTADOS_BG_RUN` in the child's environment, visible through macOS `ps eww` (argv alone is not proof).
+Each signal rechecks PID/PGID/lstart; marker-discovered processes also recheck the marker. Sweeps
+signal individual PIDs, never whole groups, and log attempts in `sweep.log` without command lines or
+environment values. Ledgers and markers survive raw-capture expiry for restart recovery.
+The immediate-detach, census-failure and ledger-failure regressions exercise the sweep directly.
+
+This remains lifecycle cleanup, **not an OS-owned containment boundary**: a deliberately untracked child
+that clears its marker cannot be proven to belong to the run and is not killed. Portable ps/lstart checks
+also cannot eliminate the final snapshot-to-signal race or distinguish PID reuse within the same second.
+Detected tracking failures publish failure metadata; FIFO draining is bounded independently.
 
 A background Agent call (`run_in_background: true`) is routed like any other, but answered the way Claude Code
 answers its own background agents:

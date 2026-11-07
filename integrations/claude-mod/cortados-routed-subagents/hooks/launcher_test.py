@@ -1,5 +1,5 @@
 # Real macOS /bin/sh watchdog regressions. Run: python3 -I launcher_test.py MODE
-# MODE: timeout, early, capture, identity; WIP reproductions: immediate, census-fail, ledger-fail.
+# MODE: timeout, early, capture, identity, immediate, census-fail, ledger-fail, sweep.
 # Only stdlib, fake children and throwaway state; never launches a provider.
 
 import json, os, pathlib, signal, subprocess, sys, tempfile, time
@@ -15,8 +15,51 @@ reaper = expand(source.split('export const BG_REAP_SH = `', 1)[1].split('\n`\n',
 launcher = source.split('export const BG_LAUNCH_SH = `', 1)[1].split('`\n', 1)[0]
 launcher = launcher.replace('${BG_REAP_SH}', reaper).replace('${shQuote(BG_SUPERVISE_SH)}', shlex.quote(supervisor))
 launcher = launcher.replace(r'\${', '${').replace(r'\\n', r'\n')
+sweep = source.split('export const BG_SWEEP_SH = String.raw`', 1)[1].split('\n`', 1)[0]
 mode = sys.argv[1]
-assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail')
+assert mode in ('timeout', 'early', 'immediate', 'capture', 'identity', 'census-fail', 'ledger-fail', 'sweep')
+if mode == 'sweep':
+    import uuid
+    with tempfile.TemporaryDirectory(prefix='route-bg-sweep-') as tmp:
+        processes = []
+        dirs = {}
+        try:
+            for kind in ('active', 'stale', 'unrelated', 'argv', 'marker', 'ledger'):
+                d = pathlib.Path(tmp) / ('cortados-bg.' + kind)
+                d.mkdir()
+                dirs[kind] = d
+                (d / 'owner-v1').touch()
+                marker = str(uuid.uuid4())
+                (d / 'sweep-marker').write_text(marker + '\n')
+                if kind != 'active': (d / 'exit').write_text('0')
+                env = {'PATH': '/usr/bin:/bin'}
+                if kind in ('active', 'marker'): env['CORTADOS_BG_RUN'] = marker
+                p = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)',
+                                      'CORTADOS_BG_RUN=' + marker if kind == 'argv' else kind],
+                                     env=env, start_new_session=True)
+                processes.append((kind, p))
+                start = subprocess.check_output(['ps', '-p', str(p.pid), '-o', 'lstart='], text=True).strip()
+                if kind in ('ledger', 'stale'):
+                    (d / 'processes').write_text(f'{p.pid}\t{p.pid}\t' + (start if kind == 'ledger' else 'STALE') + '\n')
+            # Result processing must not discard the identity evidence needed by a later sweep.
+            subprocess.run(['/bin/sh', '-c', cleanup, 'sh', str(dirs['ledger'])], check=True)
+            assert (dirs['ledger'] / 'processes').exists()
+            subprocess.run(['/bin/sh', '-c', sweep], env={'PATH': '/usr/bin:/bin', 'TMPDIR': tmp},
+                           check=True, timeout=30)
+            for kind, p in processes:
+                if kind in ('marker', 'ledger'):
+                    p.wait(timeout=3)
+                    assert p.returncode < 0, kind
+                    assert '\tTERM\t' in (dirs[kind] / 'sweep.log').read_text()
+                else:
+                    assert p.poll() is None, 'collateral kill: ' + kind
+                    assert not (dirs[kind] / 'sweep.log').exists(), kind
+        finally:
+            for _, p in processes:
+                if p.poll() is None: p.kill()
+                p.wait()
+    print('sweep: active, stale, unrelated and argv-only spared; marker and ledger members terminated')
+    sys.exit(0)
 if mode == 'identity':
     # Exercise the actual watchdog helper against a live, unrelated process in its own group.
     # A ledger entry for its pid with a different start time must not adopt or signal it.
@@ -135,6 +178,11 @@ with tempfile.TemporaryDirectory(prefix='route-bg-test-') as tmp:
             assert any(line.split()[0] == str(pid) for line in (d / 'processes').read_text().splitlines()), 'detached tool was not tracked'
         elif mode in ('census-fail', 'ledger-fail'):
             assert (d / 'supervisor-failed').exists(), 'census failure was not published'
+        if mode in ('immediate', 'census-fail', 'ledger-fail'):
+            assert not gone(pid), 'fixture did not reproduce watchdog escape'
+            subprocess.run(['/bin/sh', '-c', sweep], env=env, check=True, timeout=30)
+            assert '\tKILL\t' + str(pid) + '\t' in (d / 'sweep.log').read_text()
+            deadline = time.monotonic() + 3
         while not gone(pid) and time.monotonic() < deadline: time.sleep(.05)
         assert gone(pid), 'TERM-resistant detached grandchild survived descendant cleanup'
         assert (d / 'timedout').exists() == (mode == 'timeout')

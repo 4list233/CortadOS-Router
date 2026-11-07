@@ -1,5 +1,46 @@
 import { test, expect } from 'claude-code/testing'
+import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
+
+test('background sweep starts once per session and repeats on the mod clock', async () => {
+  let start: any
+  const on = (event: string, handler: any) => {
+    if (event === 'session.start') start = handler
+    return { catch() {} }
+  }
+  register(on as any, { orchestratorMode: false } as any)
+  let runs = 0
+  let wake: any
+  const $ = {
+    process: { run: async (argv: string[], opts: any) => {
+      expect(argv).toEqual(['sh', '-c', BG_SWEEP_SH])
+      expect(opts.timeoutMs).toBe(120_000)
+      runs++
+      return { exitCode: 0 }
+    } },
+    clock: { sleep: (ms: number) => {
+      expect(ms).toBe(BG_SWEEP_MS)
+      return new Promise(resolve => { wake = resolve })
+    } },
+    command: { register: async () => {} },
+  }
+  await start($, {}, async () => 'started')
+  await Promise.resolve()
+  expect(runs).toBe(1)
+  await start($, {}, async () => 'started')
+  expect(runs).toBe(1)
+  wake()
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(runs).toBe(2)
+})
+
+test('background sweep reports nonzero process exit as failure', async () => {
+  let failed = false
+  try { await sweepBackgroundRuns({ process: { run: async () => ({ exitCode: 1 }) } }) }
+  catch { failed = true }
+  expect(failed).toBe(true)
+})
 
 const RUN_ID = /^[A-Za-z0-9_-]{8,64}$/
 
