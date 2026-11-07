@@ -243,5 +243,98 @@ class LocalResources(unittest.TestCase):
             self.assertTrue(started.wait(5), "without the switch the refresh is scheduled")
 
 
+class ProLocalPolicy(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        env = patch.dict(os.environ, {"CORTADOS_HOME": self.home.name})
+        env.start()
+        self.addCleanup(env.stop)
+        cache = patch.object(resources, "_power_cache", None)
+        cache.start()
+        self.addCleanup(cache.stop)
+        self.flag = Path(self.home.name) / "local-enabled"
+        self.flag.touch()
+
+    def check_output(self, output):
+        with patch.object(resources, "command", return_value=output) as cmd:
+            result = resources.pro_local_allowed()
+        cmd.assert_called_once_with(["/usr/bin/pmset", "-g", "ps"], timeout=2)
+        return result
+
+    def test_ac_and_switch_on_allowed(self):
+        self.assertTrue(self.check_output(b"Now drawing from 'AC Power'\n -InternalBattery-0 100%; charged\n")[0])
+
+    def test_battery_refused(self):
+        allowed, reason = self.check_output(b"Now drawing from 'Battery Power'\n")
+        self.assertFalse(allowed)
+        self.assertIn("on battery", reason)
+
+    def test_switch_off_refused_without_power_probe(self):
+        self.flag.unlink()
+        with patch.object(resources, "command") as cmd:
+            self.assertEqual(resources.pro_local_allowed(), (False, "local switch off"))
+        cmd.assert_not_called()
+
+    def test_unknown_and_ambiguous_power_fail_closed(self):
+        for output in (b"", b"AC Power", b"garbage", b"Now drawing from 'UPS Power'\n",
+                       b"Now drawing from 'AC Power'\nNow drawing from 'Battery Power'\n",
+                       b"Now drawing from 'AC Power'\xff"):
+            with self.subTest(output=output), patch.object(resources, "_power_cache", None):
+                self.assertFalse(self.check_output(output)[0])
+
+    def test_command_failure_fails_closed(self):
+        with patch.object(resources, "command", side_effect=OSError("missing")):
+            allowed, reason = resources.pro_local_allowed()
+        self.assertFalse(allowed)
+        self.assertIn("power check failed", reason)
+
+    def test_power_cache_expires_but_switch_is_never_cached(self):
+        with patch.object(resources.time, "monotonic", return_value=100) as clock, \
+             patch.object(resources, "command", return_value=b"Now drawing from 'AC Power'\n") as cmd:
+            self.assertTrue(resources.pro_local_allowed()[0])
+            clock.return_value = 102
+            self.assertTrue(resources.pro_local_allowed()[0])
+            cmd.assert_called_once()
+            self.flag.unlink()
+            self.assertFalse(resources.pro_local_allowed()[0])
+            self.flag.touch()
+            clock.return_value = 104
+            cmd.return_value = b"Now drawing from 'Battery Power'\n"
+            self.assertFalse(resources.pro_local_allowed()[0])
+            self.assertEqual(cmd.call_count, 2)
+
+    def test_pro_telemetry_enforces_policy_beside_fit_and_exclusions(self):
+        with patch.object(resources, "collect_node", return_value={"sampled_at": 1000}), \
+             patch.object(resources, "pro_local_allowed", return_value=(False, "local switch off")):
+            node = resources.sample_node({"id": "pro", "target": "local", "pool_eligible": True}, b"")
+        self.assertFalse(node["local_allowed"])
+        node.update(gpu_headroom_estimate_bytes=10 * resources.GIB,
+                    gpu_budget_bytes=24 * resources.GIB, gpu_utilization_pct=0)
+        deployment = {"ready": True, "nodes": ["pro"], "max_context_tokens": 4096,
+                      "additional_memory_gib_by_node": {"pro": 2}}
+        row = resources.deployment_health(deployment, {"pro": node}, 1000, 120)
+        self.assertFalse(row["ok"])
+        self.assertIn("local switch off", row["why"])
+        node["local_allowed"] = True
+        self.assertTrue(resources.deployment_health(deployment, {"pro": node}, 1000, 120)["ok"])
+        node["pool_eligible"] = False
+        self.assertFalse(resources.deployment_health(deployment, {"pro": node}, 1000, 120)["ok"])
+
+    def test_toggle_cli_uses_only_configured_home(self):
+        import contextlib
+        import io
+        self.flag.unlink()
+        with patch.object(resources, "command", return_value=b"Now drawing from 'AC Power'\n"):
+            for state, expected in (("on", True), ("status", True), ("off", False), ("off", False)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    resources.main(["toggle", state])
+                data = json.loads(out.getvalue())
+                self.assertEqual(data["allowed"], expected)
+                self.assertEqual(data["switch"], "on" if expected else "off")
+                self.assertTrue(data["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

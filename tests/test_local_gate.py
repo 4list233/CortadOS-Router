@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from cortados_router import local_gate
 from cortados_router.provider import local_lane
@@ -25,6 +26,9 @@ def token_file(directory, token=TOKEN, mode=0o600):
 
 class GateHarness(unittest.TestCase):
     def setUp(self):
+        allowed = patch.object(local_gate, "pro_local_allowed", return_value=(True, "test AC + on"))
+        allowed.start()
+        self.addCleanup(allowed.stop)
         self.ollama = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
         FakeOllama.seen = []
@@ -58,6 +62,41 @@ class GateTests(GateHarness):
         self.assertIn(TAG, raw)
         code, raw = self.call("/v1/messages", self.MSG, headers={"x-api-key": TOKEN})
         self.assertEqual((code, json.loads(raw)["stop_reason"]), (200, "end_turn"))
+
+    def test_policy_rechecked_for_probe_and_inference_without_forwarding(self):
+        from cortados_router import local_resources
+        with tempfile.TemporaryDirectory() as home, \
+             patch.dict(os.environ, {"CORTADOS_HOME": home}), \
+             patch.object(local_resources, "_power_cache", None), \
+             patch.object(local_resources, "command", return_value=b"Now drawing from 'AC Power'\n"), \
+             patch.object(local_gate, "pro_local_allowed", side_effect=local_resources.pro_local_allowed):
+            auth = {"x-api-key": TOKEN}
+            code, raw = self.call("/api/tags", headers=auth)
+            self.assertEqual(code, 503)
+            self.assertIn("local switch off", raw)
+            self.assertEqual(FakeOllama.seen, [])
+            flag = Path(home) / "local-enabled"
+            flag.touch()
+            self.assertEqual(self.call("/api/tags", headers=auth)[0], 200)
+            flag.unlink()
+            code, raw = self.call("/v1/messages", self.MSG, headers=auth)
+            self.assertEqual(code, 503)
+            self.assertIn("local switch off", raw)
+            self.assertEqual(FakeOllama.seen, [])
+            flag.touch()
+            with patch.object(local_resources, "_power_cache", None), \
+                 patch.object(local_resources, "command", return_value=b"Now drawing from 'Battery Power'\n"):
+                code, raw = self.call("/api/tags", headers=auth)
+                self.assertEqual(code, 503)
+                self.assertIn("on battery", raw)
+
+    def test_policy_rechecked_after_upload(self):
+        with patch.object(local_gate, "pro_local_allowed",
+                          side_effect=[(True, "AC"), (False, "local switch off")]):
+            code, raw = self.call("/v1/messages", self.MSG, headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 503)
+        self.assertIn("local switch off", raw)
+        self.assertEqual(FakeOllama.seen, [])
 
     def test_missing_or_wrong_token_is_401_without_echo(self):
         for headers in ({}, {"authorization": "Bearer nope"}, {"x-api-key": TOKEN[:-1]}, {"authorization": TOKEN}):
@@ -343,6 +382,9 @@ class ProviderThroughGateTests(LocalHarness):
 
     def setUp(self):
         super().setUp()
+        allowed = patch.object(local_gate, "pro_local_allowed", return_value=(True, "test AC + on"))
+        allowed.start()
+        self.addCleanup(allowed.stop)
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
                                           upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)
         threading.Thread(target=self.gate.serve_forever, daemon=True).start()
@@ -362,6 +404,21 @@ class ProviderThroughGateTests(LocalHarness):
         raw = self.post({**self.BODY, "stream": True})
         self.assertIn('"qwen"', raw)
         self.assertTrue(raw.rstrip().endswith('{"type": "message_stop"}'))
+
+    def test_disabled_gate_reason_reaches_provider(self):
+        with patch.object(local_gate, "pro_local_allowed", return_value=(False, "local disabled: on battery")):
+            code, msg = self.error_of(self.BODY)
+        self.assertEqual(code, 503)
+        self.assertIn("local disabled: on battery", msg)
+        self.assertEqual(FakeOllama.seen, [])
+
+    def test_a_refusal_after_probe_rechecks_policy(self):
+        with patch.object(local_lane, "probe", return_value={TAG}), \
+             patch.object(local_gate, "pro_local_allowed", return_value=(False, "local switch off")):
+            code, msg = self.error_of(self.BODY)
+        self.assertEqual(code, 503)
+        self.assertIn("local switch off", msg)
+        self.assertEqual(FakeOllama.seen, [])
 
     def test_a_refused_token_is_a_clear_503(self):
         self.gate.token = b"b" * 40

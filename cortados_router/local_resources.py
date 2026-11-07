@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 GIB = 2 ** 30
@@ -29,6 +30,49 @@ GIB = 2 ** 30
 def command(argv, timeout=5):
     result = subprocess.run(argv, capture_output=True, timeout=timeout, check=True)
     return result.stdout
+
+
+# Power changes should stop new admissions within seconds, without a subprocess per request.
+POWER_CACHE_S = 3.0
+_power_cache = None
+_power_lock = threading.Lock()
+
+
+def _ac_power():
+    global _power_cache
+    with _power_lock:
+        now = time.monotonic()
+        if _power_cache is not None and 0 <= now - _power_cache[0] < POWER_CACHE_S:
+            return _power_cache[1]
+        try:
+            raw = command(["/usr/bin/pmset", "-g", "ps"], timeout=2).decode("utf-8")
+            # Only the source header counts; battery detail can say "AC attached".
+            sources = re.findall(r"^Now drawing from '([^'\n]+)'\s*$", raw, re.M)
+            if sources == ["AC Power"]:
+                result = (True, "AC power")
+            elif sources == ["Battery Power"]:
+                result = (False, "local disabled: on battery")
+            else:
+                result = (False, "local disabled: unknown power source")
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            result = (False, "local disabled: power check failed")
+        _power_cache = (time.monotonic(), result)
+        return result
+
+
+def local_switch_path():
+    return Path(os.environ.get("CORTADOS_HOME") or "~/.cortados").expanduser() / "local-enabled"
+
+
+def pro_local_allowed():
+    """(allowed, reason): Pro admission policy. No writes, model loads or service starts."""
+    try:
+        if not local_switch_path().is_file():
+            return False, "local switch off"
+    except OSError as exc:
+        return False, "local disabled: switch unreadable (" + type(exc).__name__ + ")"
+    allowed, reason = _ac_power()
+    return (True, "local enabled: AC power + manual switch on") if allowed else (False, reason)
 
 
 def mac_memory(text):
@@ -116,10 +160,14 @@ def sample_node(node, collector_source):
     try:
         if target == "local":
             data = collect_node(node.get("metal_probe"))
+            if node["id"] == "pro":
+                data["local_allowed"], data["local_why"] = pro_local_allowed()
         else:
             if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*", target):
                 raise ValueError("invalid SSH target")
             remote = ["python3", "-", "--collect"]
+            if node["id"] == "pro":
+                remote.append("--pro-local")
             if node.get("metal_probe"):
                 remote += ["--metal-probe", node["metal_probe"]]
             proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=yes",
@@ -152,6 +200,8 @@ def deployment_health(deployment, nodes, now, max_age_s):
     requirements = deployment.get("additional_memory_gib_by_node") or {}
     for member in members:
         node = nodes.get(member) or {}
+        if member == "pro" and node.get("local_allowed") is not True:
+            reasons.append(member + ": " + (node.get("local_why") or "local disabled: policy unknown"))
         if not node.get("pool_eligible"):
             reasons.append(member + " is excluded from the stable pool")
         age = now - float(node.get("sampled_at") or 0)
@@ -212,14 +262,34 @@ def sample(config_path):
             "note": "Sum is inventory headroom, not proof one model fits. Host RAM is separate; no automatic failover."}
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action")
+    toggle = commands.add_parser("toggle", help="Pro local admission switch (does not start Ollama)")
+    toggle.add_argument("state", choices=("on", "off", "status"))
     parser.add_argument("--collect", action="store_true", help="collect this node only; writes JSON to stdout")
     parser.add_argument("--metal-probe")
+    parser.add_argument("--pro-local", action="store_true", help="include Pro admission policy in node telemetry")
     parser.add_argument("--config", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.action == "toggle":
+        flag = local_switch_path()
+        try:
+            if args.state == "on":
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.touch(exist_ok=True)
+            elif args.state == "off":
+                flag.unlink(missing_ok=True)
+        except OSError as exc:
+            parser.error("cannot change local switch: " + str(exc))
+        allowed, reason = pro_local_allowed()
+        print(json.dumps({"switch": "on" if flag.is_file() else "off",
+                          "allowed": allowed, "reason": reason}))
+        return
     if args.collect:
         result = collect_node(args.metal_probe)
+        if args.pro_local:
+            result["local_allowed"], result["local_why"] = pro_local_allowed()
     elif args.config:
         result = sample(args.config)
     else:

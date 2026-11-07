@@ -33,6 +33,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cortados_router.local_resources import pro_local_allowed
+
 logger = logging.getLogger("cortados.local_gate")
 
 DEFAULT_PORT = 11435                      # next to Ollama's 11434, which stays on loopback
@@ -300,6 +302,11 @@ class GateHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if (method, path) not in ROUTES:
             return self._error(404, "not_found_error", "not a forwarded path")
+        allowed, reason = pro_local_allowed()
+        if not allowed:
+            if self._drain():
+                self._error(503, "overloaded_error", reason)
+            return
         body = None
         if method == "POST":
             try:
@@ -313,6 +320,10 @@ class GateHandler(BaseHTTPRequestHandler):
             body = self._read_body(n, self.server.body_deadline)
             if body is None:                     # too slow or gone: close, freeing the slot
                 return
+        # Body upload can outlast the power cache or a switch change: check at admission too.
+        allowed, reason = pro_local_allowed()
+        if not allowed:
+            return self._error(503, "overloaded_error", reason)
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
                                           timeout=self.server.connect_timeout)
         try:

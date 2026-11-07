@@ -170,6 +170,10 @@ def _prefix(base_url: str) -> str:
     return urllib.parse.urlparse(base_url).path.rstrip("/")
 
 
+PRO_LOCAL_REFUSALS = {"local gate: local switch off", "local gate: local disabled: on battery",
+                      "local gate: local disabled: unknown power source",
+                      "local gate: local disabled: power check failed"}
+
 GATE_REFUSED = ("local gate on node {node} refused the provider token (401): the provider's token file does not "
                 "match the gate's")
 
@@ -185,7 +189,16 @@ def probe(node: dict[str, Any]) -> set[str]:
     try:
         conn.request("GET", _prefix(node["base_url"]) + "/api/tags", headers=_auth(node))
         resp = conn.getresponse()
-        raw = resp.read()
+        raw = _bounded_read(resp)
+        if raw is None:
+            raise ValueError("truncated or stalled probe response")
+        if resp.status == 503:
+            # Preserve only our fixed policy reasons, not arbitrary upstream text.
+            data = json.loads(raw)
+            error = data.get("error") if isinstance(data, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            if isinstance(message, str) and message in PRO_LOCAL_REFUSALS:
+                raise LocalUnavailable(f"node {node['node']}: {message}")
         if resp.status == 401:
             raise LocalUnavailable(GATE_REFUSED.format(node=node["node"]))
         if resp.status != 200:
