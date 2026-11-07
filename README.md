@@ -322,6 +322,19 @@ fallback. Ollama has no auth, so it stays on localhost and the node runs a token
 (`python3 -m cortados_router.local_gate`) on its Tailscale address. Config schema, gate and launchd template:
 `docs/LOCAL-RESOURCES.md` ("Local models").
 
+### Local models on the Pro
+
+The Pro gate admits probes and inference only on **AC power AND with the manual switch ON**.
+The switch defaults off: `python3 -B -m cortados_router.local_resources toggle on|off|status`
+(run with one of those three states). It uses `$CORTADOS_HOME/local-enabled` (default
+`~/.cortados/local-enabled`); status prints the switch, availability and reason.
+Unknown/failed `pmset -g ps` readings fail closed. Power is cached for at most 3 seconds;
+the switch is checked on every request, including again after body upload. Disabled requests
+return 503 without reaching Ollama. Fleet telemetry for node `pro` also includes this policy;
+its deployments are unavailable when the policy is disabled or unknown. This does not
+start/stop Ollama or unload resident models;
+existing in-flight inference is not cancelled. Other fit, busy and exclusion checks still apply.
+
 ## Delegating whole tasks from the Claude app
 
 The same `cortados-route` server also hands off WHOLE tasks: each one runs as a separate headless Claude Code session

@@ -258,6 +258,16 @@ class LocalPinTests(LocalHarness):
         self.assertEqual(code, 503)
         self.assertIn("not an object", msg)
 
+    def test_probe_accepts_a_valid_catalog_larger_than_error_cap(self):
+        FakeOllama.tags_body = json.dumps({
+            "models": [{"name": TAG, "model": TAG}] +
+                      [{"name": f"extra-{i}-" + "x" * 50} for i in range(1500)]
+        }).encode()
+        try:
+            self.assertEqual(self.post(self.BODY)["stop_reason"], "end_turn")
+        finally:
+            FakeOllama.tags_body = None
+
     def test_too_large_for_the_context_is_413(self):
         big = {**self.BODY, "messages": [{"role": "user", "content": "x" * (4 * 40000)}]}
         self.assertEqual(self.error_of(big)[0], 413)
