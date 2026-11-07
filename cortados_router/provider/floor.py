@@ -23,25 +23,33 @@ STOP_HOURS_BEFORE_RESET = 1.0
 # The sampler refreshes every ~20 minutes; routing tolerates 6-hour-old readings, but a client that spends steadily
 # must not act on a reading older than an hour.
 MAX_READING_AGE_S = 3600
-# Assumed share of a window one admitted call consumes until the next sample shows the real figure. A "call" is one
-# RUN: a whole conversation (an agent run with all its tool turns, or one judge/generate request), never one turn. Not
-# yet measured (ENG-10: recorded as an assumption): an agent run on a fixture task is a few hundred thousand tokens at
-# most, about 1 % of a weekly window on the plans seen so far. The provider charges it once per conversation (reserve's
-# `conv`, the route_id), so a long ladder run is not refused mid-run by its own turn count (Codex review r4). Too small:
-# spending overshoots the floor between samples. Too large: work stalls until each new sample although room is left.
-# Known limit (Codex review r5 P3-4): the charge bounds runs, not turns; one conversation's later turns are seen only by
-# the next reading. The S1 loop's 900 s run timeout bounds that for its runs; ENG-10 stays open to measure %/run.
-ASSUMED_PCT_PER_CALL = 1.0
+# ENG-10 is now measured (Air usage history, 2026-11-07): weekly % used per admitted run was
+# claude 0.107 %, claude#b 0.084 %, codex 0.023 %. Method: delta weekly % used between usage
+# readings divided by runs admitted; background spend is included, so real per-run cost is lower.
+# Forest's conservative reservations below apply until the next sample shows actual usage.
+# A call is one RUN (a whole conversation including tool turns, or one judge/generate request),
+# charged once via reserve's `conv`/route_id, not once per turn. Later turns are visible only in
+# the next reading; the S1 loop's 900 s run timeout bounds that for its runs.
+# Keys are cand['lane'] account identities, NOT provider names. Unmeasured lanes keep 1 %:
+# inheriting a measured sibling's cheap value could overshoot the floor between samples.
+ASSUMED_PCT_PER_CALL_BY_LANE = {"claude": 0.5, "claude#b": 0.5, "codex": 0.15}
+DEFAULT_ASSUMED_PCT_PER_CALL = 1.0
+
 # How long admitted work can be running before the vendor's usage screen shows it: up to one task run (the run
 # timeout, 900 s) plus one sampler interval (~20 min). Shorter: running work is forgotten and spending overshoots.
 # Longer: finished work is counted twice and work pauses early.
 IN_FLIGHT_S = 900 + 1200
-# A call consumes cap_scale x ASSUMED_PCT_PER_CALL of a pool's own budget: the Fable pool is about half the weekly
-# budget, so one call is twice the slice of it (s1/outcome/quota.py's derived pool, Codex review 2026-10-25).
+# A call consumes cap_scale x its lane's reserved weekly percentage of a pool's own budget.
+# The Fable pool is about half the weekly budget, so one call is twice the slice of it (s1/outcome/quota.py's derived pool, Codex review 2026-10-25).
 POOL_CAP_SCALE = {"fable": 2.0}
 
 LEDGER = "floor-reservations.jsonl"
 _thread_lock = threading.Lock()
+
+
+def assumed_pct_per_call(lane: str) -> float:
+    """Reserved weekly percentage per run; unmeasured accounts retain the conservative default."""
+    return ASSUMED_PCT_PER_CALL_BY_LANE.get(lane, DEFAULT_ASSUMED_PCT_PER_CALL)
 
 
 def _left(w: dict) -> float | None:
@@ -130,7 +138,7 @@ def block(core, cand: dict[str, Any], model: str, floor: float, readings: dict |
             continue
         if left is None:
             return f"{w.get('window')}: no usage figure to check {tag}", []
-        per_call = ASSUMED_PCT_PER_CALL * POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
+        per_call = assumed_pct_per_call(lane) * POOL_CAP_SCALE.get(w.get("pool") or "all", 1.0)
         n = reserved.get(_key(lane, w), 0)
         if left - (n + extra) * per_call < floor:
             return (f"{w.get('window')}: {left:.0f}% left, {n} run(s) outstanding; one more ({per_call:g}%) would pass "

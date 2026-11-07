@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from cortados_router.provider import routing
+from cortados_router.subagent_mcp import resolve_provider_url, ProviderURLError
 
 # Short names map to the ids the provider itself serves (routing.SUB_ALIASES is the provider's alias table, checked
 # against the tables' claude-cli models), so the launcher can never pin a model the provider would refuse.
@@ -93,18 +94,38 @@ def read_token(path: str) -> str:
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")   # the provider's x-cortados-run-id pattern (provider/server.py)
 
 
-def custom_headers(run_id: str | None = None) -> str:
+# The Office tag headers a child task may carry (provider/office.py groups its traffic under its orchestrator's floor).
+# Only these names, and a value of printable ASCII up to 80 chars: the variable is newline-separated, so a newline in
+# a value would inject a header of its own (an x-api-key overriding the provider token).
+OFFICE_HEADERS = ("x-cortados-session", "x-cortados-project", "x-cortados-device", "x-cortados-task-title")
+_OFFICE_VALUE_RE = re.compile(r"[\x20-\x7e]{1,80}")
+
+
+def parse_office_header(item: str) -> tuple[str, str]:
+    name, sep, value = str(item).partition(":")
+    name, value = name.strip().lower(), value.strip()
+    if not sep or name not in OFFICE_HEADERS or not _OFFICE_VALUE_RE.fullmatch(value):
+        raise SessionError("an --office-header must be `<office header>: <printable ASCII, 1-80 chars>`")
+    return name, value
+
+
+def custom_headers(run_id: str | None = None, office_headers=None) -> str:
     """ANTHROPIC_CUSTOM_HEADERS (newline-separated `name: value` lines). With a run id, every request of the session is
-    recorded by the provider under it (GET /v1/cortados/runs/<id>)."""
+    recorded by the provider under it (GET /v1/cortados/runs/<id>); office headers (`name: value` items, OFFICE_HEADERS
+    only) tag it for the Office view."""
     lines = ["x-cortados-reveal: 1"]
     if run_id:
         if not RUN_ID_RE.fullmatch(run_id):
             raise SessionError(f"run id {run_id!r} does not match the provider's run-id pattern")
         lines.append("x-cortados-run-id: " + run_id)
+    for item in office_headers or ():
+        name, value = parse_office_header(item)
+        lines.append(f"{name}: {value}")
     return "\n".join(lines)
 
 
-def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None) -> dict:
+def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
+                 office_headers=None) -> dict:
     """Every variable the launcher sets (BLANKED ones as empty)."""
     env = dict(
         {
@@ -121,7 +142,7 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
             "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "cortados",
             "ANTHROPIC_SMALL_FAST_MODEL": SMALL_FAST_MODEL,
-            "ANTHROPIC_CUSTOM_HEADERS": custom_headers(run_id),
+            "ANTHROPIC_CUSTOM_HEADERS": custom_headers(run_id, office_headers),
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CORTADOS_WHOLE_SESSION": "1",
             "CORTADOS_DELEGATE_BUDGET": str(delegate_budget),
@@ -132,14 +153,16 @@ def launcher_env(provider_url: str, token: str, delegate_budget: int = 3, run_id
     return env
 
 
-def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None) -> dict:
+def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 3, run_id: str | None = None,
+              office_headers=None) -> dict:
     # Kept in the process env too, so anything that reads the environment before settings load sees the same values.
-    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id)}
+    return {**base, **launcher_env(provider_url, token, delegate_budget, run_id, office_headers)}
 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
-                     run_id: str | None = None) -> dict:
-    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id), "enabledPlugins": {PLUGIN_ID: False}}
+                     run_id: str | None = None, office_headers=None) -> dict:
+    content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers),
+               "enabledPlugins": {PLUGIN_ID: False}}
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
@@ -292,6 +315,8 @@ def parse(argv: list):
     ap.add_argument("--print-env", action="store_true")
     ap.add_argument("--settings-dir", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--run-id", default=None, help=argparse.SUPPRESS)   # child tasks: record the session under this id
+    # child tasks: `name: value` Office tags (OFFICE_HEADERS) sent on every request of the session
+    ap.add_argument("--office-header", action="append", default=[], help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
@@ -300,9 +325,10 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
     check_passthrough(extra)
     if args.delegate_budget < 0:
         raise SessionError("--delegate-budget must be nonnegative")
-    url = (args.provider_url or base_env.get("CORTADOS_PROVIDER_URL") or "").strip()
-    if not url:
-        raise SessionError("no provider URL: pass --provider-url or set CORTADOS_PROVIDER_URL")
+    try:
+        url = resolve_provider_url({**base_env, **({"CORTADOS_PROVIDER_URL": args.provider_url} if args.provider_url else {})})
+    except ProviderURLError as exc:
+        raise SessionError(str(exc)) from None
     model = resolve_model(args.orchestrator)
     token = read_token(args.token_file)
     directive = None
@@ -310,10 +336,12 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         directive = DIRECTIVE_FILE.read_text(encoding="utf-8").strip()
         if not args.no_gate:
             directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
-    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id)), managed_dirs)
+    office = args.office_header
+    check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
-                                   settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id), home)
-    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id),
+                                   settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
+                                                    office), home)
+    return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office),
             build_argv(model, directive, extra, settings_path))
 
 

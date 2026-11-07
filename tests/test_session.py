@@ -114,6 +114,14 @@ class SessionTests(unittest.TestCase):
         self.assertIn("--append-system-prompt", cmd)
         self.assertIn("MCP", cmd[cmd.index("--append-system-prompt") + 1])
 
+    def test_url_from_shared_https_file(self):
+        endpoint = os.path.join(self.tmp.name, "provider-url")
+        with open(endpoint, "w") as f:
+            f.write(" https://provider.example:8443/\n")
+        _, env, _ = self.prepare(["--token-file", self.tok],
+                                dict(self.base, CORTADOS_PROVIDER_URL_FILE=endpoint))
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://provider.example:8443")
+
     def test_url_from_env_and_extra_args(self):
         base = dict(self.base, CORTADOS_PROVIDER_URL="http://r.example")
         _, env, cmd = self.prepare(
@@ -342,3 +350,15 @@ class SessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OfficeHeaderTests(unittest.TestCase):
+    def test_office_headers_are_allowlisted_and_cannot_inject_lines(self):
+        from cortados_router import session as sess
+        h = sess.custom_headers("run-12345678", ["x-cortados-task-title: fix it", "X-Cortados-Session: 3f9a1c2e9b7d4a10"])
+        self.assertEqual(h.split("\n"), ["x-cortados-reveal: 1", "x-cortados-run-id: run-12345678",
+                                         "x-cortados-task-title: fix it", "x-cortados-session: 3f9a1c2e9b7d4a10"])
+        for bad in ("x-api-key: steal", "x-cortados-task-title: a\nx-api-key: steal", "x-cortados-project:",
+                    "x-cortados-device", "x-cortados-task-title: " + "x" * 81):
+            with self.assertRaises(sess.SessionError, msg=bad):
+                sess.custom_headers(None, [bad])

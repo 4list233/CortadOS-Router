@@ -11,7 +11,7 @@
     "providerUrl": {
       "type": "string",
       "title": "Provider URL",
-      "default": "http://127.0.0.1:8432",
+      "default": "",
       "description": "CortadOS provider base URL that subagents route through (e.g. the Air on the tailnet)."
     },
     "providerTokenFile": {
@@ -103,6 +103,12 @@
       "title": "Main-session guard (warn only)",
       "default": true,
       "description": "When on, a big Edit/Write/NotebookEdit (over 40 lines or 2000 characters of new content) or a build/test Bash run (python -m unittest/pytest, pytest, make, npm/yarn/pnpm build or test) on the MAIN session shows a toast (at most one per 10 minutes) and a status-line counter nudging you to delegate. Never blocks a call. Subagents are never watched. /cortados-guard on|off overrides this, kept in the plugin store."
+    },
+    "officeView": {
+      "type": "boolean",
+      "title": "CortadOS Office view",
+      "default": true,
+      "description": "When on, every routed request carries this session's opaque tag (a salted hash of the session id), the project folder name, the device's short hostname and the task title (the Agent call's description, at most 80 characters), and the main session sends the provider a heartbeat with its status and current tool name, so GET /v1/cortados/office can draw this session as a floor. Metadata only: never prompt text, tool input or file contents."
     }
   }
 }

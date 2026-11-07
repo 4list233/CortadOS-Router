@@ -34,7 +34,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `providerUrl` | `http://127.0.0.1:8432` | Provider base URL. Set to `http://<provider-host>:8432` for a remote provider. |
+| `providerUrl` | *(unset)* | Explicit override. Otherwise uses `CORTADOS_PROVIDER_URL`, then `CORTADOS_PROVIDER_URL_FILE` or `~/.config/cortados/provider-url`. HTTP and HTTPS supported; invalid configuration refuses routing. |
 | `providerTokenFile` | `~/.config/cortados/provider-token` | File holding `CORTADOS_PROVIDER_TOKEN`, read fresh at spawn time so the token is never stored in settings. `~` expands to `$HOME`. |
 | `providerToken` | *(unset)* | Optional inline token override. Prefer the file. |
 | `model` | `cortados` | Model id sent to the provider. `cortados` lets S1 route; a concrete id pins one lane. |
@@ -53,6 +53,7 @@ The child starts with an empty MCP config (built-in tools only); the parent's MC
 | `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. `Agent` and `route_task` (both delegation primitives) are always allowed regardless. |
 | `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
 | `mainSessionGuard` | `true` | Warn-only nudge when the **main session** does substantive work itself (see **Main-session guard**). Never blocks. `/cortados-guard on\|off` overrides it. |
+| `officeView` | `true` | Feed the CortadOS **Office view** (`GET /v1/cortados/office`): each routed request carries `x-cortados-session` (sha256 of a per-install salt kept in the mod's store and the session id, cut to 16 hex; never the raw id), `x-cortados-project` (the project folder's name), `x-cortados-device` (`hostname -s`) and `x-cortados-task-title` (the Agent call's description, 80 printable ASCII chars at most); the main session POSTs `/v1/cortados/office/heartbeat` with its status and current tool **name** on session start/end, turn end and tool calls (on change at most every 2 s, else every 30 s; serialized and coalesced with a trailing send; tool hooks never wait, session end flushes and awaits `ended`; a slow fetch is noted after 2 s but retains the send lock until it settles because the host HTTP API cannot cancel requests; a failure is noted once in the transcript). Metadata only: never prompt text, tool input or file contents. Takes effect after a Claude Code restart. |
 
 ## Orchestrator mode
 
@@ -228,6 +229,16 @@ refusal names the elapsed time, the timeout in seconds, the session id and trans
 parent can see how far it got instead of losing all the work. The whole refusal is scrubbed of the provider token. The
 child's prompt also ends with: "If a tool returns nothing useful twice in a row, stop and report what you have and
 what failed."
+
+## Tests
+
+Run the mod's tests in the native hook host (no model calls):
+
+```sh
+CORTADOS_HOME=$(mktemp -d) CORTADOS_SCARCITY_REFRESH=off claude plugin test integrations/claude-mod/cortados-routed-subagents
+```
+
+Run from the repository root. This covers `hooks/register.test.ts` and `hooks/guard.test.ts`.
 
 ## Notes
 

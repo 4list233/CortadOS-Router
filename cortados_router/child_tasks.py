@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -116,6 +117,14 @@ WAIT_MAX_S = CLIENT_REQUEST_TIMEOUT_S - POST_WAIT_RESERVE_S
 # No MCP client the router serves holds a request open for an hour; a larger value is almost surely a unit slip
 # (milliseconds), and taking it would let one wait_task call block its client far past any request timeout.
 WAIT_MAX_S_CEILING = 3600
+# The Office view (provider/office.py): a child's title and its orchestrator's session tag ride on its requests as
+# headers and on its events. A title is the orchestrator's short label (the owner's cap: 80 printable ASCII chars; a
+# longer or odd one is refused, not cut, so the caller sees why). The tag is an opaque hash (16-64 hex). Project and
+# device are derived (cwd basename, short hostname) and simply left out when they do not fit the view's charset.
+TITLE_RE = re.compile(r"[\x20-\x7e]{1,80}")
+SESSION_TAG_RE = re.compile(r"[0-9a-f]{16,64}")
+_OFFICE_NAME_RE = re.compile(r"[A-Za-z0-9._ -]{1,64}")
+_DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 PS_TIMEOUT_S = 10                   # guards a hung ps only (see the ASSUMPTION above)
 RUN_FETCH_MIN_S = 1                 # a fetch with less than this left is not worth starting short of zero
 
@@ -519,15 +528,44 @@ def select_connectors(names) -> dict | None:
     return {n: servers[n] for n in dict.fromkeys(names)}
 
 
+def office_tags(cwd, title=None, session_tag=None) -> dict:
+    """The Office fields of a task: title and session (validated, TaskError when bad), project and device (derived,
+    omitted when they do not fit). Empty when neither title nor tag is given and nothing could be derived."""
+    out = {}
+    if title is not None:
+        if not isinstance(title, str) or not TITLE_RE.fullmatch(title.strip()):
+            raise TaskError("title must be 1-80 printable ASCII characters")
+        out["title"] = title.strip()
+    if session_tag is not None:
+        if not isinstance(session_tag, str) or not SESSION_TAG_RE.fullmatch(session_tag):
+            raise TaskError("session must be 16-64 lowercase hex characters (an opaque session tag)")
+        out["session"] = session_tag
+    project = os.path.basename(os.path.normpath(str(cwd))) if cwd else ""
+    if _OFFICE_NAME_RE.fullmatch(project):
+        out["project"] = project
+    device = socket.gethostname().split(".")[0]
+    if _DEVICE_RE.fullmatch(device):
+        out["device"] = device
+    return out
+
+
+_OFFICE_HEADER_OF = {"session": "x-cortados-session", "project": "x-cortados-project", "device": "x-cortados-device",
+                     "title": "x-cortados-task-title"}
+
+
 def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tools=None,
-          provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None) -> dict:
+          provider_url="", token_file=None, chrome=False, red=None, connectors=None, client=None,
+          title=None, session_tag=None) -> dict:
     """`client` (optional, e.g. "grokbot" from the bot gateway) is recorded in meta.json and every event line, so usage
     can be attributed to the caller. `red` carries the launch credentials (env token and token file's token as they are now). `permission_mode`
-    None picks auto where the model supports it (resolve_permission_mode)."""
+    None picks auto where the model supports it (resolve_permission_mode). `title` (<= 80 chars) and `session_tag`
+    (the orchestrator's opaque tag) label the task in the Office view: on its events, and as headers on its routed
+    requests."""
     if os.environ.get(NESTED_ENV):
         raise TaskError("start_task is not available inside a child task: children may not start children "
                         "(unbounded fan-out would spend subscription quota unattended)")
     tools = _validate(task, cwd, orchestrator, permission_mode, allowed_tools)
+    office = office_tags(cwd, title, session_tag)
     if not isinstance(chrome, bool):
         raise TaskError("chrome must be true or false")
     login = None
@@ -542,7 +580,10 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     permission_mode, mode_note = resolve_permission_mode(permission_mode, login or orchestrator)
     selected = select_connectors(None if chrome else connectors)
     if not provider_url and not chrome:
-        raise TaskError("start_task is not configured: set CORTADOS_PROVIDER_URL for the cortados-route MCP server")
+        try:
+            provider_url = session.resolve_provider_url()
+        except session.ProviderURLError as exc:
+            raise TaskError(f"start_task is not configured: {exc}") from None
     max_s = _max_s()
     exe = claude_bin()
     root = _private_root()
@@ -564,7 +605,7 @@ def start(task, cwd, orchestrator="cortados", permission_mode=None, allowed_tool
     try:
         meta, env, cmd = _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file,
                                   red or Redactor(),
-                                  chrome, max_s, exe, selected, login)
+                                  chrome, max_s, exe, selected, login, office)
         if client:
             meta["client"] = str(client)[:64]
             # cmd.json's event fields were written by _prepare before the client was known; the runner logs the
@@ -627,14 +668,18 @@ def _abort_runner(runner, d: str) -> None:
 
 
 def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provider_url, token_file, red, chrome, max_s,
-             exe, selected=None, login=None):
+             exe, selected=None, login=None, office=None):
     """Everything before the spawn: settings, prompt, cmd.json, meta.json. Returns (meta, env, cmd)."""
     os.chmod(d, 0o700)                          # mkdir's mode is masked by umask; the launcher verifies exactly 0700
     if login:
-        return _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, login)
+        meta, env, cmd = _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe,
+                                        login, office)
+        return meta, env, cmd
     launch = ["--orchestrator", orchestrator, "--provider-url", provider_url, "--settings-dir", d, "--run-id", task_id]
     if token_file:
         launch += ["--token-file", token_file]
+    for k, v in (office or {}).items():         # validated by office_tags; session.py checks them again
+        launch += ["--office-header", f"{_OFFICE_HEADER_OF[k]}: {v}"]
     # Never the whole-session ORCHESTRATOR directive or its delegation gate, whatever the orchestrator: a child is the
     # delegate and does the work itself (CHILD_DIRECTIVE). A pinned orchestrator only pins the child's main model; its
     # native subagents are still routed by S1 (CLAUDE_CODE_SUBAGENT_MODEL).
@@ -683,14 +728,14 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
             "started_at": time.time(), "connectors": sorted(selected) if selected else [],
             "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
-            "argv": cmd[1:]}
+            "argv": cmd[1:], **({"office": office} if office else {})}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
                                               "event": _event_fields(meta), "started_at": meta["started_at"]})
     _write_json(os.path.join(d, "meta.json"), meta)    # before Popen: a task dir always has its meta
     return meta, env, cmd
 
 
-def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model):
+def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, red, max_s, exe, model, office=None):
     """chrome: true. No launcher, no --settings provider file, no provider env: claude on the user's own login."""
     cmd = [exe, "--model", model, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
            permission_mode, "--permission-prompts", "none"]
@@ -713,6 +758,7 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
     meta = {"task_id": task_id, "cwd": cwd, "orchestrator": orchestrator, "permission_mode": permission_mode,
             "allowed_tools": tools, "task_chars": len(task), "task_preview": red.text(task.strip())[:200],
             "started_at": time.time(), "connectors": [], "chrome": True, "lane": LOGIN_LANE, "model": model,
+            # Login-mode children never route through CortadOS, so carry no Office identity into lifecycle events.
             "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:]}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, "cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S,
                                               "event": _event_fields(meta), "started_at": meta["started_at"]})
@@ -739,6 +785,9 @@ def _event_fields(meta: dict) -> dict:
         out["client"] = meta["client"]
     if meta.get("lane"):
         out.update(lane=meta["lane"], model=meta.get("model"))
+    # Office fields (title, session tag, project, device): metadata the view shows, never the prompt.
+    for k, v in (meta.get("office") or {}).items():
+        out[k] = v
     return out
 
 

@@ -577,7 +577,8 @@ _VIEW = _Obj({
                          "truncated": _bool}),
     "ledger": _Obj({"source": _enum("usage.db"), "today": _List(_LEDGER_ROW, ROUTED_TOP, "today_truncated"),
                     "last_7d": _List(_LEDGER_ROW, ROUTED_TOP, "last_7d_truncated"),
-                    "today_truncated": _bool, "last_7d_truncated": _bool}),
+                    "today_truncated": _bool, "last_7d_truncated": _bool,
+                    "queued": _number, "lost": _number}),
     "bots": _Obj({"window": _enum("7d"), "calls": _number, "by_client": _COUNTS("bots_by_client_truncated"),
                   "by_tool": _COUNTS("by_tool_truncated"), "by_outcome": _COUNTS("by_outcome_truncated"),
                   "unparsable_lines": _number, "truncated": _bool}),
@@ -771,6 +772,13 @@ def _collect(*, state_dir: Path, scarcity_reader: Callable[[], dict[str, Any]], 
     else:
         errors.append({"source": "usage.db", "error": "absent"})
         out["ledger"] = {}
+    try:
+        # this process's async writer (usage_ledger.record_async): rows waiting to be committed and rows lost since
+        # start, so a ledger that is dropping rows is visible here, not only in the log
+        from cortados_router import usage_ledger
+        out["ledger"] = {**(out["ledger"] or {}), **usage_ledger.stats()}
+    except Exception as exc:
+        errors.append({"source": "usage.db", "error": f"writer stats: {type(exc).__name__}"})
     bpath = state_dir / "bot-usage.jsonl"
     if bpath.exists() or bpath.with_name(bpath.name + ".1").exists():
         out["bots"] = guard("bot-usage.jsonl", lambda: _bots(bpath, now), {})
