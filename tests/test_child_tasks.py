@@ -556,6 +556,32 @@ class ChildTaskTests(unittest.TestCase):
         ev = [e for e in _events() if e.get("task_id") == tid]
         self.assertEqual([(e["event"], e.get("client")) for e in ev], [("started", "grokbot"), ("finished", "grokbot")])
 
+    def test_title_and_session_tag_pass_through_to_headers_and_events(self):
+        # The Office view: the title and the orchestrator's tag ride on the child's requests and on both events.
+        self.cfg = {**self.cfg, "session_tag": "3f9a1c2e9b7d4a10"}
+        tid = self.start(title="draft README section")
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        with open(os.path.join(self.work, "fake-argv.json")) as f:
+            headers = json.load(f)["headers"].split("\n")
+        self.assertIn("x-cortados-run-id: " + tid, headers)
+        self.assertIn("x-cortados-task-title: draft README section", headers)
+        self.assertIn("x-cortados-session: 3f9a1c2e9b7d4a10", headers)
+        self.assertIn("x-cortados-project: work", headers)
+        ev = [e for e in _events() if e.get("task_id") == tid]
+        self.assertEqual([(e["event"], e.get("title"), e.get("session"), e.get("project")) for e in ev],
+                         [("started", "draft README section", "3f9a1c2e9b7d4a10", "work"),
+                          ("finished", "draft README section", "3f9a1c2e9b7d4a10", "work")])
+
+    def test_a_bad_title_or_tag_is_refused_before_anything_runs(self):
+        for kw in ({"title": "x" * 81}, {"title": "two\nlines"}, {"title": 7}):
+            r, _ = self.call("start_task", task="hello", cwd=self.work, **kw)
+            self.assertTrue(r.get("isError"), kw)
+            self.assertIn("title", r["content"][0]["text"])
+        with self.assertRaises(ct.TaskError):
+            ct.start("hello", self.work, provider_url=self.cfg["url"], session_tag="NOT-HEX")
+        self.assertFalse(os.path.exists(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")))
+
     def test_run_record_fetch_failure_is_a_field(self):
         tid = self.start()
         _, w = self.call("wait_task", task_id=tid, timeout_s=30)
@@ -1402,7 +1428,8 @@ class ChildTaskTests(unittest.TestCase):
                            "CORTADOS_PROVIDER_TOKEN": "tok-test-000000002", "CORTADOS_PROVIDER_URL": "http://p.invalid",
                            "CORTADOS_PROVIDER_TOKEN_FILE": "/t", "ANTHROPIC_SMALL_FAST_MODEL": "m",
                            "ANTHROPIC_MODEL": "m", "ANTHROPIC_DEFAULT_OPUS_MODEL": "m", "CLAUDE_CONFIG_DIR": "/c"})
-        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True)
+        self.cfg = {**self.cfg, "session_tag": "3f9a1c2e9b7d4a10"}
+        r, out = self.call("start_task", task="hi", cwd=self.work, chrome=True, title="browser task")
         self.assertEqual(out["lane"], ct.LOGIN_LANE)
         self.assertEqual(out["model"], "claude-sonnet-5-5")
         d = ct.task_path(out["task_id"])
@@ -1411,6 +1438,10 @@ class ChildTaskTests(unittest.TestCase):
         self.assertIn("login mode", st["router_run"]["note"])
         meta = _load(os.path.join(d, "meta.json"))
         self.assertEqual((meta["lane"], meta["model"]), (ct.LOGIN_LANE, "claude-sonnet-5-5"))
+        self.assertNotIn("office", meta)
+        cmd = _load(os.path.join(d, "cmd.json"))
+        self.assertNotIn("session", cmd["event"])
+        self.assertNotIn("title", cmd["event"])
         seen = _load(os.path.join(self.work, "fake-argv.json"))
         a = seen["argv"]
         for k in ("CORTADOS_PROVIDER_TOKEN", "CORTADOS_PROVIDER_URL", "CORTADOS_PROVIDER_TOKEN_FILE",
@@ -1455,7 +1486,11 @@ class ChildTaskTests(unittest.TestCase):
             self.assertNotIn("CORTADOS_PROVIDER_TOKEN", ct.login_env(os.environ))
             self.assertNotIn("ANTHROPIC_MODEL", ct.login_env(os.environ))
         with open(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")) as f:
-            self.assertIn(ct.LOGIN_LANE, f.read())
+            log = f.read()
+        self.assertIn(ct.LOGIN_LANE, log)
+        for event in map(json.loads, log.splitlines()):
+            self.assertNotIn("session", event)
+            self.assertNotIn("title", event)
 
     def test_chrome_model_mapping_and_refusals(self):
         self.assertEqual(ct.login_model("cortados"), "claude-sonnet-5-5")

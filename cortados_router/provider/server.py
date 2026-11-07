@@ -45,7 +45,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
-from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
+from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
@@ -343,6 +343,10 @@ RUN_ID_HEADER = "x-cortados-run-id"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _RUN_ID_BAD = "cortados: x-cortados-run-id is not a run id"
 RUNS_PATH = "/v1/cortados/runs/"
+# The Office view (provider/office.py): GET is open to the owner token and to a client token with the office:read scope
+# (provider/clients.py); the heartbeat POST, which writes, needs the owner token (the mod already holds it to route).
+OFFICE_HEARTBEAT_PATH = "/v1/cortados/office/heartbeat"
+_SCOPE_DENIED = "cortados: this token's scopes do not cover this endpoint"
 
 # What a refusal record (RunRecords.refuse) and the refusal log line hold: the status, the error type, an endpoint id
 # from _ENDPOINT_IDS, and a fixed reason string of this endpoint's own (a call site's, the allowlisted
@@ -353,6 +357,7 @@ RUNS_PATH = "/v1/cortados/runs/"
 _REFUSAL_REASONS = {
     400: "the request was refused as invalid",
     401: "bad or missing token",
+    403: "the client token's scopes do not cover this endpoint",
     404: "not found",
     409: "the request does not match the conversation's current state",
     413: "the request is larger than the model's context",
@@ -375,6 +380,10 @@ def endpoint_id(path: str | None) -> str:
         return "responses"
     if p.startswith(RUNS_PATH):
         return "runs"
+    if p == clients.OFFICE_PATH:
+        return "office"
+    if p == OFFICE_HEARTBEAT_PATH:
+        return "office_heartbeat"
     if p.startswith("/v1/models"):
         return "models"
     if p in ("/health", "/resources", "/bridge/call"):
@@ -631,6 +640,10 @@ class Registry:
         # failure_key of a failed conversation -> (diagnostic, failed_at, short id); under self._lock, oldest first.
         self.tombstones: "OrderedDict[str, tuple[str, float, str]]" = OrderedDict()
         self.runs = RunRecords()                    # x-cortados-run-id -> what its routed requests ran on
+        self.office = office.OfficeBoard()          # floors / workers / heartbeats behind GET /v1/cortados/office
+        # Scoped client tokens (clients.json). Consulted only when the owner token does not match, so the owner's
+        # behaviour is unchanged; a client token opens only its scopes' endpoints and gets 403 everywhere else.
+        self.clients = clients.ClientTokens(owner_token=token)
         # Recently closed conversations, for the 409 diagnostic only (find -> _lost_diagnostic): (closed_at, reason,
         # first reply fingerprint, history length). A 409 whose first fingerprint is here was a conversation this
         # endpoint closed itself (reaped, dropped, failed), which tells a reap from a lost response or an edited
@@ -946,6 +959,7 @@ def _failed_reason(exc: object) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     server: "ProviderServer"
+    _scoped: "clients.Client | None" = None             # the scoped client of the current request (_scope_gate)
     protocol_version = "HTTP/1.1"
     timeout = SOCKET_TIMEOUT_S
 
@@ -953,14 +967,44 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug("%s " + fmt, self.address_string(), *args)
 
     # ------------------------------------------------------------------ plumbing
-    def _authorized(self) -> bool:
+    def _credential(self) -> str:
         given = self.headers.get("x-cortados-token") or self.headers.get("x-api-key") or ""
         auth = self.headers.get("authorization") or ""
         if auth.lower().startswith("bearer "):
             given = given or auth[7:]
-        ok = hmac.compare_digest(given.encode(), self.server.registry.token.encode())
+        return given
+
+    def _authorized(self) -> bool:
+        ok = hmac.compare_digest(self._credential().encode(), self.server.registry.token.encode())
         self._authed = ok                               # per request: do_GET/do_POST reset it first (keep-alive reuse)
         return ok
+
+    def _scoped_client(self) -> "clients.Client | None":
+        """The scoped client whose token this request carries, or None (no token, the owner token, or an unknown one).
+        The owner token is checked first and never reaches the client table."""
+        given = self._credential()
+        if not given or hmac.compare_digest(given.encode(), self.server.registry.token.encode()):
+            return None
+        return self.server.registry.clients.match(given)
+
+    def _scope_gate(self, method: str) -> bool:
+        """For a request carrying a scoped client token: True when it was refused (403: its scopes do not cover this
+        method and path, the public pages included, so a reader's token is only ever good for its view). Sets
+        self._scoped to the client when its scopes do cover the request. False for every other request, untouched."""
+        self._scoped = None
+        try:
+            c = self._scoped_client()
+        except Exception as exc:                        # the table failed: fail closed for that token, owner unaffected
+            logger.error("client token check failed: %s", type(exc).__name__)
+            c = None
+        if c is None:
+            return False
+        if c.allows(method, self.path.split("?")[0]):
+            self._scoped = c
+            return False
+        self._scoped = c
+        self._error(403, "permission_error", _SCOPE_DENIED)
+        return True
 
     def _body(self) -> dict[str, Any]:
         n = int(self.headers.get("content-length") or 0)
@@ -980,7 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
     def _error(self, code: int, kind: str, message: str, w: Wire = wire, *, reason: str | None = None) -> None:
         """Answer an error in the wire's shape. `message` goes to the client only; the log line and the run record get
@@ -996,6 +1041,11 @@ class Handler(BaseHTTPRequestHandler):
         _REFUSAL_REASONS). Bookkeeping only: it never raises into the response."""
         try:
             where = endpoint_id(self.path)
+            client = getattr(self, "_scoped", None)
+            if client is not None:
+                # A scoped client: named in the log, never recorded (its token cannot write run records).
+                logger.warning("client %s: %s %s refused with %s %s", client.name, self.command, where, code, kind)
+                return
             if not getattr(self, "_authed", False):
                 # Logged apart and never recorded: an unauthenticated caller must not create or evict run records.
                 logger.warning("unauthenticated %s %s refused with %s %s", self.command, where, code, kind)
@@ -1006,12 +1056,44 @@ class Handler(BaseHTTPRequestHandler):
                 run_id, valid = self._run_id()
                 if run_id and valid:
                     self.server.registry.runs.refuse(run_id, status=code, kind=kind, reason=reason)
+                    if self.path.split("?")[0] in WIRES:   # the office shows the refused run as an error
+                        tags = getattr(self, "_office_tags", None) or {}
+                        board = self.server.registry.office
+                        key = board.worker_key(tags, run_id, None)
+                        board.turn_start(key, tags, run_id=run_id, provider=None, lane=None, model=None)
+                        board.turn_end(key, tags, status="error")
         except Exception as exc:
             logger.warning("refusal bookkeeping failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------ routes
+    def _unsupported_method(self):
+        self._authed = False
+        if not self._scope_gate(self.command):
+            # Preserve BaseHTTPRequestHandler's unsupported-method response for owner/unknown credentials.
+            self.send_error(501, "Unsupported method (%r)" % self.command)
+
+    def __getattr__(self, name):
+        # BaseHTTPRequestHandler dispatches via do_<method>. Cover EVERY unsupported method, including extension
+        # methods, rather than an allowlist that silently leaves gaps in the scoped-token 403 contract.
+        if name.startswith("do_"):
+            return self._unsupported_method
+        raise AttributeError(name)
+
     def do_GET(self):
         self._authed = False
+        if self._scope_gate("GET"):
+            return
+        if self.path.split("?")[0] == clients.OFFICE_PATH:
+            # The one endpoint a scoped token may open (office:read), and the owner's too. Read-only, metadata only.
+            if self._scoped is None and not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:
+                view = self.server.office_view(self.server.registry)
+                body = json.dumps(view, allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("office: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: office view unavailable (see provider log)")
+            return self._json(200, body)
         if self.path == "/health":
             return self._json(200, {"ok": True, "conversations": len(self.server.registry.sessions)})
         if self.path in ("/", "/dashboard"):
@@ -1088,7 +1170,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._authed = False
+        self._office_tags = {}
         path = self.path.split("?")[0]
+        if self._scope_gate("POST"):
+            return
         # Every error on a wire's path is in that wire's shape, the 401 and the unreadable body included: Codex prints
         # the Responses error body verbatim and would show an Anthropic envelope as noise.
         w = WIRES.get(path, wire)
@@ -1103,7 +1188,17 @@ class Handler(BaseHTTPRequestHandler):
         if path in WIRES:
             if not self._run_id()[1]:                   # checked before any routing or spend, like the exclude header
                 return self._error(400, "invalid_request_error", _RUN_ID_BAD, w, reason=_RUN_ID_BAD)
+            try:   # cosmetic: an invalid tag is dropped and counted inside, and a bug here never refuses the request
+                self._office_tags = self.server.registry.office.read_tags(self.headers)
+            except Exception as exc:
+                logger.warning("office: tag read failed: %s", type(exc).__name__)
             return self._messages(body, w)
+        if path == OFFICE_HEARTBEAT_PATH:
+            hb, bad = office.validate_heartbeat(body)
+            if hb is None:
+                return self._error(400, "invalid_request_error", f"cortados: heartbeat field {bad} is invalid",
+                                   reason="the heartbeat is malformed")
+            return self._json(200, self.server.registry.office.heartbeat(hb))
         if path == "/v1/messages/count_tokens":
             # Estimate only (chars / 4): the CLI behind cortados counts its own tokens and exposes no counter.
             return self._json(200, {"input_tokens": len(json.dumps(body)) // 4})
@@ -1245,6 +1340,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "compact it or start a new conversation", wire,
                                    reason="the conversation exceeds the local model's configured context")
             t0 = time.time()
+            office_key = self._office_turn_start(session, one_shot=one_shot)
+            outcome = "incomplete"
             try:
                 outcome = local_lane.serve(self, body, local["node"], local["model"], echo_model=turn.model,
                                            reply=reply)
@@ -1258,6 +1355,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass                         # headers may already be out; the client sees a broken response
             turn_ms = int((time.time() - t0) * 1000)
             session.last_used = time.time()
+            self._office_turn_end(office_key, {"turn": (reply, "local", None)} if outcome == "completed"
+                                  else {"error": outcome})
             if outcome == "completed":
                 session.history.append(anthropic_wire.reply_fingerprint(reply))
                 if route.get("route_id") and not session.route_logged and reg.executed:
@@ -1536,6 +1635,7 @@ class Handler(BaseHTTPRequestHandler):
                     reg.drop(session)
                 return
         outcome: dict[str, Any] = {}
+        office_key = self._office_turn_start(session, one_shot=one_shot)
 
         def work():
             # One deadline covers waiting for the session, writing to the CLI and reading its reply.
@@ -1699,8 +1799,56 @@ class Handler(BaseHTTPRequestHandler):
                 # conversation is kept: its client has the earlier replies and can continue.
                 reg.drop(session)
         finally:
+            self._office_turn_end(office_key, outcome)
             if one_shot and not outcome.get("closed"):
                 session.close()                         # the worker never got to it (it did not run): close it here
+
+    # ------------------------------------------------------------------ office bookkeeping (provider/office.py)
+    def _office_turn_start(self, session, *, one_shot: bool) -> str | None:
+        """Mark this request's worker `working` on the Office board; returns its key (or None: nothing to show). A
+        tool-less side call (a title or summary request) of a worker or main loop already on the board changes
+        nothing, so it cannot flip a working agent to idle. Bookkeeping only: never raises into a turn."""
+        try:
+            board = self.server.registry.office
+            tags = getattr(self, "_office_tags", None) or {}
+            run_id, valid = self._run_id()
+            run_id = run_id if valid else None
+            # untagged, no run id: named by a digest of the conversation's id (the id itself is never published)
+            conv = (None if (run_id or tags.get("session"))
+                    else "c-" + hashlib.sha256(str(session.id).encode()).hexdigest()[:12])
+            key = board.worker_key(tags, run_id, conv)
+            if key is None or (one_shot and (key.startswith("main:") or board.known(key))):
+                return None
+            route = getattr(session, "route", None) or {}
+            rp = str(route.get("provider") or "claude-cli")       # no route: a fixed-model endpoint, the Claude CLI
+            lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
+            board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
+                             lane=lane, model=route.get("model") or getattr(session, "model", None))
+            return key
+        except Exception as exc:
+            logger.warning("office: turn start bookkeeping failed: %s", type(exc).__name__)
+            return None
+
+    def _office_turn_end(self, key: str | None, outcome: dict[str, Any]) -> None:
+        """The turn's end on the board: `working` with the tool it handed the client, `idle` after an answer, `error`
+        after a backend failure. Only tool NAMES are read from the reply, never their input or any text."""
+        if not key:
+            return
+        try:
+            tags = getattr(self, "_office_tags", None) or {}
+            board = self.server.registry.office
+            if "turn" in outcome:
+                blocks = outcome["turn"][0] or []
+                tools = [b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+                if tools:
+                    board.turn_end(key, tags, status="working", tool=tools[-1])
+                else:
+                    board.turn_end(key, tags, status="idle")
+            elif "error" in outcome:
+                board.turn_end(key, tags, status="error")
+            # busy / stale: another request on the conversation holds it and is still working; nothing changes
+        except Exception as exc:
+            logger.warning("office: turn end bookkeeping failed: %s", type(exc).__name__)
 
     def _client(self) -> str:
         """The calling tool, from its User-Agent ("claude-cli/2.1.304 (external, cli)" → "claude-cli",
@@ -1782,6 +1930,19 @@ class ProviderServer(ThreadingHTTPServer):
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
         self.registry = registry
+
+    def office_view(self, registry: Registry) -> dict[str, Any]:
+        """GET /v1/cortados/office (provider/office.py): the board plus the child-task log. Tests replace it."""
+        from cortados_router import paths
+        now = time.time()
+        errors: list[dict[str, str]] = []
+        try:
+            events = office.read_child_events(paths.state_dir() / office.CHILD_EVENT_LOG, now)
+        except OSError as exc:                          # said in the view, never hidden as "no child tasks"
+            logger.warning("office: child-task log unreadable: %s", type(exc).__name__)
+            errors.append({"source": "child_tasks", "error": type(exc).__name__})
+            events = []
+        return registry.office.view(events, now=now, errors=errors)
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""

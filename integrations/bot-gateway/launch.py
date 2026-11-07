@@ -37,6 +37,7 @@ EX_CONFIG = 78
 TOKEN_NAME = "CORTADOS_PROVIDER_TOKEN"
 FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 FROM_PLIST = ("HOME", "CORTADOS_HOME")   # required from plist/launchd; URL may come from the shared file
+OPTIONAL_FROM_PLIST = ("CORTADOS_BOT_ALLOWED_HOST",)                 # public hostname; omitted means no Host allowlist
 MAX_BYTES = 64 * 1024            # provider.env is a few lines; a bigger file is not one we wrote
 # Phase-1 gateway flags, exact spellings: flag -> takes a value. Anything else (notably --enable-start-task or any
 # prefix of it, which the gateway's argparse would expand) is refused: phase 1 is route_task only (owner decision
@@ -48,7 +49,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # -B: no .pyc writes into the checkout.
 CHILD_OPTS = ("-I", "-S", "-B")
 ALLOWED_FLAGS = {"--host": True, "--port": True, "--token-file": True, "--workspace-root": True,
-                 "--children-run-as-me": False}
+                 "--allowed-host": True, "--children-run-as-me": False}
 
 LINE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 UNQUOTED = re.compile(r"^[^\s'\"`$\\;&|<>(){}*?\[\]!#~]*$")
@@ -170,6 +171,9 @@ def build(argv, environ) -> tuple:
         if not v:
             raise ConfigError(f"{k} is not set (the plist sets it)")
         env[k] = v
+    for k in OPTIONAL_FROM_PLIST:
+        if environ.get(k):
+            env[k] = environ[k]
     # -I omits the checkout from sys.path; add only this launcher's trusted repo.
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
