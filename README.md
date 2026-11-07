@@ -49,7 +49,9 @@ Policy (binary GiB):
   ceiling tolerates the survey's existing ~1.84 GiB while conservatively shedding
   excess pressure; it is not a measured optimum or a swap-growth detector.
 - Poll every 5 seconds. Missing/malformed measurements fail closed and attempt
-  unload. Restart resets the dwell. A process lock prevents duplicate controllers.
+  unload. Restart or a sampling gap >10 seconds resets the dwell (no proof of
+  continuous safety across missing samples). A process lock prevents duplicate
+  controllers using the same status path.
 - Memory = vm_stat free + inactive + speculative pages × reported page size.
   memory_pressure -Q's percentage is diagnostic, **not** a byte budget.
 - Detect actual `nightly.sh` processes through `ps -axo pid=,stat=,command=`,

@@ -21,6 +21,8 @@ import tempfile
 import time
 import urllib.request
 
+from .local_resources import mac_memory
+
 GIB = 2 ** 30
 # 8 GiB model allowance + 8 GiB remaining host/S1 safety margin.
 LOAD_BYTES = 16 * GIB
@@ -32,6 +34,8 @@ DWELL_SECONDS = 120
 MAX_SWAP_BYTES = 4 * GIB
 # Short observation interval, not a mutual-exclusion guarantee with S1.
 POLL_SECONDS = 5
+# A missed observation interval breaks proof of continuously safe headroom.
+MAX_SAMPLE_GAP_SECONDS = 2 * POLL_SECONDS
 # Consumers must fail closed after three missed observations.
 STATUS_TTL_SECONDS = 15
 # Survey recommendation: bounded 8K runtime, not existing 64K/128K tag defaults.
@@ -79,7 +83,7 @@ def parse_vm_stat(text):
     if not page or int(page[1]) <= 0 or len(pages) != 3:
         raise ValueError("incomplete vm_stat")
     # Do not add purgeable, wired, compressor or GPU allocations (overlap).
-    return sum(int(n) for n in pages.values()) * int(page[1])
+    return mac_memory(text)
 
 
 def parse_memory_pressure(text):
@@ -103,6 +107,8 @@ def parse_processes(text):
     nightly.sh covers all preflight/MLX/Laya/evaluation phases, unlike the
     dashboard status file which records historical events, not a live lease.
     """
+    if not text.strip():
+        raise ValueError("empty ps output cannot prove S1 idle")
     training = evaluation = False
     for line in text.splitlines():
         fields = line.strip().split(None, 2)
@@ -182,9 +188,14 @@ class Runner:
     def __init__(self, model=MODEL, collect=gather, api=ollama, clock=time.time):
         self.model, self.collect, self.api, self.clock = model, collect, api, clock
         self.eligible_since = None
+        self.last_sample_ts = None
 
     def tick(self):
         now = self.clock()
+        if (self.last_sample_ts is not None and
+                not 0 <= now - self.last_sample_ts <= MAX_SAMPLE_GAP_SECONDS):
+            self.eligible_since = None
+        self.last_sample_ts = now
         result = dict(version=1, sampled_at=now, expires_at=now + STATUS_TTL_SECONDS,
                       model=self.model, context_tokens=CONTEXT, available=False,
                       model_loaded=False, action="unload", reason="unknown")

@@ -75,8 +75,13 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(c.parse_processes("74980 S python /x/s1/serve.py"), (False, False))
 
     def test_bad_process_record(self):
-        with self.assertRaises(ValueError):
-            c.parse_processes("garbled")
+        for text in ("garbled", ""):
+            with self.assertRaises(ValueError):
+                c.parse_processes(text)
+
+    def test_preflight_and_laya(self):
+        self.assertTrue(c.parse_processes("123 S python -c \"from mlx_lm import load; load(123)\"")[0])
+        self.assertTrue(c.parse_processes("123 T /x/laya/python /x/laya/train.py")[0])
 
 
 class RunnerTests(unittest.TestCase):
@@ -94,10 +99,15 @@ class RunnerTests(unittest.TestCase):
             return {}
         self.runner = c.Runner(collect=lambda: self.inputs.copy(), api=api, clock=lambda: self.now)
 
+    def advance(self, seconds):
+        for _ in range(seconds // 5):
+            self.now += 5
+            result = self.runner.tick()
+        return result
+
     def test_load_then_training_unload(self):
         self.assertFalse(self.runner.tick()["available"])
-        self.now += 120
-        self.assertTrue(self.runner.tick()["available"])
+        self.assertTrue(self.advance(120)["available"])
         payload = [p for _, p in self.calls if p][-1]
         self.assertEqual(payload["options"], {"num_ctx": 8192})
         self.inputs["training_active"] = True
@@ -112,8 +122,7 @@ class RunnerTests(unittest.TestCase):
         self.inputs["free_reclaimable_bytes"] += 1
         self.now += 1
         self.assertFalse(self.runner.tick()["available"])
-        self.now += 120
-        self.assertTrue(self.runner.tick()["available"])
+        self.assertTrue(self.advance(120)["available"])
 
     def test_collection_failure_unloads(self):
         self.loaded = True
@@ -122,6 +131,55 @@ class RunnerTests(unittest.TestCase):
         self.runner.collect = fail
         self.assertFalse(self.runner.tick()["available"])
         self.assertFalse(self.loaded)
+
+    def test_sampling_gap_resets_dwell(self):
+        self.runner.tick()
+        self.now += 120
+        self.assertFalse(self.runner.tick()["available"])
+        self.assertTrue(self.advance(120)["available"])
+
+    def test_failed_load_never_available(self):
+        original = self.runner.api
+        def refuse(path, payload=None):
+            if payload and payload["keep_alive"] == -1:
+                raise OSError("load failed")
+            return original(path, payload)
+        self.runner.api = refuse
+        self.runner.tick()
+        result = self.advance(120)
+        self.assertFalse(result["available"])
+        self.assertIn("OSError", result["reason"])
+
+    def test_unload_failure_reported(self):
+        def fail(*args):
+            raise OSError("Ollama down")
+        self.runner.api = fail
+        result = self.runner.tick()
+        self.assertFalse(result["available"])
+        self.assertEqual(result["unload_error"], "OSError")
+
+    def test_residency_not_confirmed(self):
+        self.runner.api = lambda path, payload=None: {"models": []}
+        self.runner.tick()
+        result = self.advance(120)
+        self.assertFalse(result["available"])
+        self.assertIn("RuntimeError", result["reason"])
+
+    def test_slow_control_expires_status(self):
+        original = self.runner.api
+        def slow(path, payload=None):
+            if payload:
+                self.now += 20
+            return original(path, payload)
+        self.runner.api = slow
+        self.runner.tick()
+        self.assertFalse(self.advance(120)["available"])
+
+    def test_clock_rollback_resets(self):
+        self.runner.tick()
+        self.advance(60)
+        self.now = 50
+        self.assertFalse(self.runner.tick()["available"])
 
     def test_status_atomic_private(self):
         with tempfile.TemporaryDirectory() as tmp:
