@@ -2273,6 +2273,9 @@ class OwnerDeathTests(unittest.TestCase):
             closed.append(True)
             done.set()                                 # only after the real cleanup has returned
         s.close = close
+        tags = {"session": "sess-1"}
+        reg.office.turn_start("w-1", tags, run_id="w-1", provider=None, lane=None, model=None)
+        s.office_worker = ("w-1", tags)               # what _office_turn_start keeps on the conversation
         with reg._lock:
             reg.sessions[s.id] = s
         s.set_exit_handler(reg._backend_exited)       # what Registry.new wires for every held conversation
@@ -2280,6 +2283,8 @@ class OwnerDeathTests(unittest.TestCase):
         self.assertIsNone(reg.get(s.id))
         self.assertEqual(closed, [True])
         self.assertIsNotNone(s.proc.poll())
+        self.assertEqual(reg.office.workers["w-1"]["status"], "error")    # the dead worker no longer shows working
+        self.assertIsNotNone(reg.office.workers["w-1"]["ended_at"])
 
     def test_exit_after_close_is_not_treated_as_an_unexpected_exit(self):
         reg = Registry(gateway_url="", token=TOKEN, claude_bin=[sys.executable, str(FAKE)])
@@ -3145,6 +3150,22 @@ class SearchLaneTests(SearchFakeMixin, EndpointHarness):
         code, msg = self._refused({server.MIN_LEFT_HEADER: "5"})
         self.assertEqual(code, 429)
         self.assertIn("RuntimeError", msg)
+        self.assertEqual(self.search_calls(), [])
+
+    def test_saturated_search_slots_reserve_nothing_under_a_floor(self):
+        # All slots busy and a floor header: the busy refusal comes before floor.reserve, so the floor ledger (every
+        # reservation goes through floor_search) is unchanged and no CLI starts.
+        reserved = []
+        self.reg.floor_search = lambda cand, floor: reserved.append((cand, floor)) or None
+        with mock.patch.object(search_lane, "_slots", threading.BoundedSemaphore(1)):
+            search_lane._slots.acquire()
+            try:
+                r = self.post(self.SEARCH, headers={server.MIN_LEFT_HEADER: "5"})
+            finally:
+                search_lane._slots.release()
+            self.assertEqual(search_lane._slots._value, 1, "the busy refusal holds no slot")
+        self.assertIn("search busy", r["content"][0]["text"])
+        self.assertEqual(reserved, [], "a busy refusal must not reserve quota")
         self.assertEqual(self.search_calls(), [])
 
     def test_a_floor_the_search_account_clears_runs_the_search(self):

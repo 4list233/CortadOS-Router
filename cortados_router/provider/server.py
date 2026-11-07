@@ -708,6 +708,14 @@ class Registry:
             del self.sessions[s.id]
         logger.warning("conversation %s: backend exited; removed", str(s.id)[:8])
         self.note_closed(s, "exited")
+        # Its Office worker: no request remains to end the turn, so the dead worker would show `working` until expiry.
+        # Only that worker's record changes (status error); orchestrator heartbeats are untouched.
+        worker = getattr(s, "office_worker", None)
+        if worker:
+            try:
+                self.office.turn_end(worker[0], worker[1], status="error")
+            except Exception as exc:
+                logger.warning("office: backend-exit bookkeeping failed: %s", type(exc).__name__)
         s.close()
 
     def reserve_opening(self) -> None:
@@ -1513,28 +1521,33 @@ class Handler(BaseHTTPRequestHandler):
         if refused:
             return self._error(400, "invalid_request_error", refused, wire)
         try:
-            who = search_lane.login()               # the login and its ledger lane, resolved together before launch
-            if floor is not None:
-                # The client's quota floor on the account the search will execute on, checked and reserved through
-                # floor.reserve like a routed conversation's. No enforcer (a fixed-model endpoint) or one that fails:
-                # closed, as the routed paths do.
-                if reg.floor_search is None:
-                    return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
-                                       "x-cortados-min-left-pct for the search lane", wire,
-                                       reason="the client's quota floor cannot be checked here")
-                try:
-                    why = reg.floor_search(who.floor_candidate(), floor)
-                except Exception as exc:
-                    logger.exception("search lane: quota floor check failed")
-                    return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
-                                       f"({type(exc).__name__}); x-cortados-min-left-pct cannot be honoured", wire,
-                                       reason="the client's quota floor cannot be checked here")
-                if why:
-                    return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
-                                       reason="the search account is below the client's quota floor")
-            allowed, blocked = search_lane.domain_filters(body)
-            result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
-                                     search_lane.extract_query(body), who.config_dir, allowed=allowed, blocked=blocked)
+            # Query checks and a search slot come first, then the quota floor's reservation: a refused search (no
+            # query, too long, all slots busy) must never leave a reservation. The slot is held through the launch.
+            query = search_lane.extract_query(body)
+            search_lane.check_query(query)
+            with search_lane.capacity():
+                who = search_lane.login()               # the login and its ledger lane, resolved together before launch
+                if floor is not None:
+                    # The client's quota floor on the account the search will execute on, checked and reserved through
+                    # floor.reserve like a routed conversation's. No enforcer (a fixed-model endpoint) or one that fails:
+                    # closed, as the routed paths do.
+                    if reg.floor_search is None:
+                        return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
+                                           "x-cortados-min-left-pct for the search lane", wire,
+                                           reason="the client's quota floor cannot be checked here")
+                    try:
+                        why = reg.floor_search(who.floor_candidate(), floor)
+                    except Exception as exc:
+                        logger.exception("search lane: quota floor check failed")
+                        return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
+                                           f"({type(exc).__name__}); x-cortados-min-left-pct cannot be honoured", wire,
+                                           reason="the client's quota floor cannot be checked here")
+                    if why:
+                        return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
+                                           reason="the search account is below the client's quota floor")
+                allowed, blocked = search_lane.domain_filters(body)
+                result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
+                                         query, who.config_dir, allowed=allowed, blocked=blocked, slot_held=True)
         except search_lane.SearchFailed as exc:
             logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
             reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
@@ -2002,6 +2015,12 @@ class Handler(BaseHTTPRequestHandler):
             lane = rp if rp.startswith(local_lane.LANE_PREFIX) else (_route_lane(route) if route else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
                              lane=lane, model=route.get("model") or getattr(session, "model", None))
+            try:
+                # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request
+                # left to end the turn, can still end this worker on the board.
+                session.office_worker = (key, dict(tags))
+            except Exception:
+                pass                                # a session type that refuses attributes: no exit transition
             return key
         except Exception as exc:
             logger.warning("office: turn start bookkeeping failed: %s", type(exc).__name__)

@@ -8,6 +8,7 @@ without this lane the client could only be told the search did not happen.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -257,23 +258,43 @@ def _run_cli(cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float) -
     return (p.returncode, bufs["stdout"].decode("utf-8", "replace"), bufs["stderr"].decode("utf-8", "replace"))
 
 
-def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
-        timeout: float | None = None, allowed: list[str] | None = None,
-        blocked: list[str] | None = None) -> SearchResult:
-    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, output_too_large,
-    incomplete_output, exit_<n>, bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
-    timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
+def check_query(query: str) -> None:
+    """The query checks run() applies, callable before any quota is reserved: raises SearchFailed no_query /
+    query_too_long."""
     if not query:
         raise SearchFailed("no_query", "the request carries no user text to search for")
     if len(query) > MAX_QUERY_CHARS:
         raise SearchFailed("query_too_long", f"{len(query)} chars, the limit is {MAX_QUERY_CHARS}")
+
+
+@contextlib.contextmanager
+def capacity():
+    """Hold one search slot (non-blocking; raises SearchFailed busy when all are taken) for a run(..., slot_held=True)
+    inside the block. The provider takes it before the quota floor reserves anything, so saturated search slots can
+    never leave a reservation behind for a search that was refused."""
+    if not _slots.acquire(blocking=False):
+        raise SearchFailed("busy", f"{MAX_CONCURRENT} searches already running")
+    try:
+        yield
+    finally:
+        _slots.release()
+
+
+def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
+        timeout: float | None = None, allowed: list[str] | None = None,
+        blocked: list[str] | None = None, slot_held: bool = False) -> SearchResult:
+    """One search on a fresh CLI. Raises SearchFailed (busy, no_query, query_too_long, timeout, output_too_large,
+    incomplete_output, exit_<n>, bad_output, cli_error, no_search, empty, start_failed); never returns an empty success."""
+    timeout = SEARCH_TIMEOUT_S if timeout is None else timeout
+    check_query(query)
     try:
         work = tempfile.mkdtemp(prefix="cortados-search-")
     except OSError as exc:
         raise SearchFailed("start_failed", f"no scratch dir: {exc}") from None
     # The slot is taken only after the scratch dir exists, and released in the same finally that removes it, so no
-    # path between acquire and release can leave a slot taken forever.
-    if not _slots.acquire(blocking=False):
+    # path between acquire and release can leave a slot taken forever. A caller already holding one (capacity())
+    # does not take a second: the provider takes it before reserving quota, so a busy refusal reserves nothing.
+    if not slot_held and not _slots.acquire(blocking=False):
         shutil.rmtree(work, ignore_errors=True)
         raise SearchFailed("busy", f"{MAX_CONCURRENT} searches already running")
     try:
@@ -297,7 +318,8 @@ def run(claude_bin: str | list[str], query: str, config_dir: str | None, *,
                                  "cache_creation_input_tokens") if (n := _usage_int(u.get(k))) is not None}
         return SearchResult(text.strip(), usage)
     finally:
-        _slots.release()
+        if not slot_held:
+            _slots.release()
         shutil.rmtree(work, ignore_errors=True)
 
 
