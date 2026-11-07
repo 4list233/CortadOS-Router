@@ -5,6 +5,49 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const families = new Set(['claude', 'codex', 'grok', 'ollama', 'local']);
 const text = value => typeof value === 'string' ? value : null;
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const statuses = new Set(['working', 'idle', 'done', 'error']);
+
+// Local adapter guardrails, not provider protocol/security guarantees:
+// 16 printable ASCII characters rejects likely truncated/mistaken token files;
+// 4096 characters caps the bearer header at 4 KiB. Longer/shorter credentials
+// need an explicit policy revision; length alone does not establish entropy.
+const TOKEN_MIN_CHARS = 16;
+const TOKEN_MAX_CHARS = 4096;
+// 10,000 ms bounds a stalled GET/body read while tolerating ordinary remote
+// latency. Slow providers fail visibly and retry; polls never overlap.
+const REQUEST_TIMEOUT_MS = 10000;
+// 1,000 ms avoids accidental busy polling; 3,600,000 ms (one hour) catches
+// likely units mistakes and prevents a nominally live view refreshing less
+// than hourly. These are local operational policy, not provider requirements.
+const POLL_MIN_MS = 1000;
+const POLL_MAX_MS = 3600000;
+const reportPollError = message => process.stderr.write(message + '\n');
+
+function validateRecord(record, role, lobby) {
+  if (!object(record)) throw new Error('invalid office record');
+  // Required projection fields come from office.py _orchestrator/_pub_worker.
+  // Nullable metadata is valid, but absent fields and wrong types are not.
+  const fields = role === 'orchestrator' ? ['model', 'tool'] :
+    ['run_id', 'provider', 'lane', 'model', 'title', 'tool'];
+  if (!statuses.has(record.status) || fields.some(field =>
+    !Object.hasOwn(record, field) || (record[field] !== null && typeof record[field] !== 'string'))) {
+    throw new Error('invalid office record');
+  }
+  for (const field of ['provider', 'lane', 'model', 'title', 'tool']) {
+    if (Object.hasOwn(record, field) && record[field] !== null && typeof record[field] !== 'string') {
+      throw new Error('invalid office record');
+    }
+  }
+  if (role === 'worker' && (record.run_id === null ? !lobby :
+      !/^[A-Za-z0-9_-]{8,64}$/.test(record.run_id))) throw new Error('invalid office worker identity');
+  for (const field of ['started_at', 'ended_at', 'last_seen']) {
+    if (Object.hasOwn(record, field) && record[field] !== null &&
+        (typeof record[field] !== 'number' || !Number.isFinite(record[field]))) {
+      throw new Error('invalid office timestamp');
+    }
+  }
+}
 export function characterFamily(provider) {
   // Unknown gets a neutral local character, never a guessed vendor identity.
   return families.has(provider) ? provider : 'local';
@@ -12,19 +55,25 @@ export function characterFamily(provider) {
 
 /** Pure allowlist projection. No source objects are spread into the output. */
 export function mapOffice(view) {
-  if (view?.version !== 1 || !Array.isArray(view.floors) ||
-      !Array.isArray(view.lobby?.workers)) throw new Error('invalid office snapshot');
+  if (!object(view) || view.version !== 1 || !Array.isArray(view.floors) ||
+      !object(view.lobby) || !Array.isArray(view.lobby.workers)) throw new Error('invalid office snapshot');
   const agents = [];
+  const ids = new Set();
+  const sessions = new Set();
   function add(record, floor, role, index) {
-    if (!record || typeof record !== 'object') throw new Error('invalid office record');
+    validateRecord(record, role, floor.session === 'lobby');
     const provider = text(record.provider);
     // v1 omits conversation IDs in the lobby. Metadata fingerprint is best-effort
     // identity there; ordinal disambiguates otherwise identical anonymous records.
-    const workerId = text(record.run_id) ?? createHash('sha256')
-      .update(JSON.stringify([provider, record.model, record.started_at, index])).digest('hex').slice(0, 20);
+    const workerId = record.run_id === null ? 'anonymous-' + createHash('sha256')
+      .update(JSON.stringify([provider, record.model, record.started_at, index])).digest('hex').slice(0, 20)
+      : 'run-' + record.run_id;
     const id = role === 'orchestrator' ? 'office-' + floor.session + '-orchestrator'
-      : 'office-' + floor.session + '-' + workerId;
-    const status = ['working', 'idle', 'done', 'error'].includes(record.status) ? record.status : 'idle';
+      : 'office-' + floor.session + '-worker-' + workerId;
+    // Duplicate source identities must not conflate roster/lifecycle state.
+    if (ids.has(id)) throw new Error('duplicate office identity');
+    ids.add(id);
+    const status = record.status;
     const name = text(record.title) ?? (role === 'orchestrator' ? 'Orchestrator' : 'Worker');
     agents.push({
       id, name, identity: { name, emoji: role === 'orchestrator' ? '👔' : '🤖' }, role,
@@ -37,10 +86,18 @@ export function mapOffice(view) {
     });
   }
   for (const floor of view.floors) {
-    if (typeof floor?.session !== 'string' || !Array.isArray(floor.workers)) {
-      throw new Error('invalid office floor');
+    // Provider v1 session tags are 16..64 lowercase hex (office.py header rule).
+    // Enforcing that grammar also prevents delimiter and reserved-lobby aliases.
+    if (!object(floor) || typeof floor.session !== 'string' ||
+        !/^[0-9a-f]{16,64}$/.test(floor.session) || !Array.isArray(floor.workers) ||
+        sessions.has(floor.session)) throw new Error('invalid office floor');
+    sessions.add(floor.session);
+    for (const field of ['project', 'device']) {
+      if (floor[field] != null && typeof floor[field] !== 'string') throw new Error('invalid office floor');
     }
-    if (floor.orchestrator) add(floor.orchestrator, floor, 'orchestrator', 0);
+    if (floor.orchestrator !== null && floor.orchestrator !== undefined) {
+      add(floor.orchestrator, floor, 'orchestrator', 0);
+    }
     floor.workers.forEach((worker, i) => add(worker, floor, 'worker', i));
   }
   view.lobby.workers.forEach((worker, i) => add(worker, { session: 'lobby' }, 'worker', i));
@@ -152,18 +209,19 @@ export async function pollOffice({ url, tokenFile, fetchImpl = fetch, signal }) 
     throw new Error('remote office URL requires HTTPS');
   }
   const token = (await readFile(tokenFile, 'utf8')).trim();
-  if (!/^[\x21-\x7e]{16,4096}$/.test(token)) throw new Error('invalid office token file');
+  if (token.length < TOKEN_MIN_CHARS || token.length > TOKEN_MAX_CHARS ||
+      !/^[\x21-\x7e]+$/.test(token)) throw new Error('invalid office token file');
   const response = await fetchImpl(endpoint, {
     method: 'GET', redirect: 'error', headers: { Authorization: 'Bearer ' + token },
-    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error('office request failed');
   return response.json();
 }
 
-export async function runPolling({ gateway, intervalMs = 5000, signal, onError = () => {}, ...options }) {
-  // One second floor prevents accidental tight-loop polling; no overlapping fetches.
-  if (!Number.isFinite(intervalMs) || intervalMs < 1000 || intervalMs > 3600000) {
+export async function runPolling({ gateway, intervalMs = 5000, signal, onError = reportPollError, ...options }) {
+  if (typeof onError !== 'function') throw new Error('error reporter must be a function');
+  if (!Number.isFinite(intervalMs) || intervalMs < POLL_MIN_MS || intervalMs > POLL_MAX_MS) {
     throw new Error('poll interval must be 1..3600 seconds');
   }
   while (!signal?.aborted) {

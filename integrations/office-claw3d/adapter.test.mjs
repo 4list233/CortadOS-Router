@@ -8,7 +8,7 @@ import { mapOffice, characterFamily, OfficeGateway, pollOffice, runPolling } fro
 const worker = { run_id: 'run-12345678', provider: 'codex', lane: 'codex', model: 'gpt',
   title: 'Review', status: 'working', tool: 'Read' };
 const view = () => ({ version: 1, floors: [{ session: '0123456789abcdef',
-  project: 'Router', device: 'pro', orchestrator: { model: 'claude', status: 'idle' },
+  project: 'Router', device: 'pro', orchestrator: { model: 'claude', status: 'idle', tool: null },
   workers: [{ ...worker }] }], lobby: { workers: [] } });
 
 for (const family of ['claude', 'codex', 'grok', 'ollama', 'local']) {
@@ -119,6 +119,163 @@ test('poll uses file credential, exact GET, no redirects; rereads rotation', asy
     await assert.rejects(pollOffice({ ...options, fetchImpl: async () => ({ ok: false }) }), /office request failed/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+test('orchestrator-named worker has independent roster, session and lifecycle IDs', () => {
+  const input = view();
+  input.floors[0].orchestrator.status = 'working';
+  input.floors[0].workers[0].run_id = 'orchestrator';
+  const { gateway, frames } = connected();
+  gateway.update(input);
+  assert.equal(new Set(gateway.agents.map(a => a.id)).size, 2);
+  assert.equal(new Set(gateway.sessions().map(s => s.key)).size, 2);
+  assert.equal(gateway.runs.size, 2);
+  const starts = frames.filter(f => f.event === 'agent' && f.payload.stream === 'lifecycle');
+  assert.equal(starts.length, 2);
+  assert.notEqual(starts[0].payload.runId, starts[1].payload.runId);
+});
+
+test('nested malformed records retain all previous state and emit nothing', () => {
+  const badRecords = [[], {}, null, false, { ...worker, status: 'unknown' },
+    { ...worker, status: null }, { ...worker, provider: [] }, { ...worker, model: {} },
+    { ...worker, run_id: '' }, { ...worker, run_id: 123 }, { ...worker, started_at: 'yesterday' }];
+  for (const field of Object.keys(worker)) {
+    const missing = { ...worker }; delete missing[field]; badRecords.push(missing);
+  }
+  const main = view().floors[0].orchestrator;
+  const badMains = [[], {}, false, { ...main, status: 'unknown' },
+    { ...main, model: {} }, { ...main, tool: [] }, { ...main, last_seen: 'yesterday' }];
+  for (const field of ['status', 'model', 'tool']) {
+    const missing = { ...main }; delete missing[field]; badMains.push(missing);
+  }
+  for (const target of ['worker', 'orchestrator', 'lobby']) {
+    for (const bad of target === 'orchestrator' ? badMains : badRecords) {
+      const { gateway, frames } = connected();
+      gateway.update(view());
+      const previous = gateway.agents;
+      const runs = [...gateway.runs];
+      const generation = gateway.generation;
+      const count = frames.length;
+      const input = view();
+      if (target === 'worker') input.floors[0].workers = [bad];
+      else if (target === 'orchestrator') input.floors[0].orchestrator = bad;
+      else input.lobby.workers = [bad];
+      assert.throws(() => gateway.update(input), /invalid office/);
+      assert.equal(gateway.agents, previous);
+      assert.deepEqual([...gateway.runs], runs);
+      assert.equal(gateway.generation, generation);
+      assert.equal(frames.length, count);
+    }
+  }
+});
+
+test('duplicate and malformed floor identities fail closed', () => {
+  for (const mutate of [
+    input => input.floors.push(structuredClone(input.floors[0])),
+    input => input.floors[0].workers.push({ ...worker }),
+    input => { input.floors[0].session = 'lobby'; },
+    input => { input.floors[0].project = []; },
+    input => { input.floors[0].orchestrator = false; },
+  ]) {
+    const input = view(); mutate(input);
+    assert.throws(() => mapOffice(input));
+  }
+});
+
+test('token length boundaries are enforced before fetching', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-token-boundaries-'));
+  try {
+    const tokenFile = join(dir, 'token');
+    for (const length of [15, 16, 4096, 4097]) {
+      await writeFile(tokenFile, 'x'.repeat(length), { mode: 0o600 });
+      let calls = 0;
+      const promise = pollOffice({ url: 'http://localhost/v1/cortados/office', tokenFile,
+        fetchImpl: async () => { calls++; return { ok: true, json: async () => view() }; } });
+      if (length === 16 || length === 4096) {
+        await promise; assert.equal(calls, 1);
+      } else {
+        await assert.rejects(promise, /invalid office token file/); assert.equal(calls, 0);
+      }
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('request timeout is ten seconds and combines caller cancellation', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-timeout-'));
+  const timeoutController = new AbortController();
+  const caller = new AbortController();
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    assert.equal(milliseconds, 10000);
+    return timeoutController.signal;
+  });
+  try {
+    const tokenFile = join(dir, 'token');
+    await writeFile(tokenFile, 'test-token-1234567890');
+    for (const signal of [undefined, caller.signal]) {
+      let requestSignal;
+      await pollOffice({ url: 'http://localhost/v1/cortados/office', tokenFile, signal,
+        fetchImpl: async (_, init) => {
+          requestSignal = init.signal;
+          return { ok: true, json: async () => view() };
+        } });
+      assert.equal(requestSignal.aborted, false);
+      if (signal) {
+        caller.abort(); assert.equal(requestSignal.aborted, true);
+      } else {
+        assert.equal(requestSignal, timeoutController.signal);
+      }
+    }
+    timeoutController.abort();
+    assert.equal(timeoutController.signal.aborted, true);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('default reporter exposes failed polls safely and loop recovers', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'office-recovery-'));
+  const controller = new AbortController();
+  const diagnostics = [];
+  t.mock.method(process.stderr, 'write', message => { diagnostics.push(message); return true; });
+  try {
+    const tokenFile = join(dir, 'token');
+    await writeFile(tokenFile, 'test-token-1234567890');
+    const gateway = new OfficeGateway(() => {});
+    gateway.update(view());
+    const previous = gateway.agents;
+    let calls = 0;
+    await runPolling({ gateway, intervalMs: 1000, signal: controller.signal,
+      url: 'http://localhost/v1/cortados/office', tokenFile,
+      fetchImpl: async () => {
+        calls++;
+        assert.equal(gateway.agents, previous);
+        if (calls === 1) return { ok: false }; // authentication/HTTP failure
+        if (calls === 2) throw new Error('SECRET token path URL'); // network failure
+        if (calls === 3) return { ok: true, json: async () => {
+          const bad = view(); bad.floors[0].workers = [{}]; return bad;
+        } };
+        controller.abort();
+        const recovered = view(); recovered.floors[0].workers[0].status = 'done';
+        return { ok: true, json: async () => recovered };
+      } });
+    assert.equal(calls, 4);
+    assert.equal(diagnostics.length, 3);
+    for (const message of diagnostics) {
+      assert.equal(message, 'Office poll failed; last successful snapshot retained (may be stale)\n');
+      assert.ok(!message.includes('SECRET'));
+    }
+    assert.equal(gateway.agents[1].office.status, 'done');
+    assert.notEqual(gateway.agents, previous);
+  } finally { controller.abort(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('poll interval exact boundaries and invalid reporter', async () => {
+  const controller = new AbortController(); controller.abort();
+  for (const intervalMs of [1000, 3600000]) {
+    await runPolling({ signal: controller.signal, intervalMs });
+  }
+  for (const intervalMs of [999, 3600001, NaN, Infinity, '1000']) {
+    await assert.rejects(runPolling({ signal: controller.signal, intervalMs }), /interval/);
+  }
+  await assert.rejects(runPolling({ signal: controller.signal, onError: null }), /reporter/);
+});
+
 test('poll loop cancellation and interval validation', async () => {
   const controller = new AbortController(); controller.abort();
   await runPolling({ gateway: new OfficeGateway(() => {}), signal: controller.signal });

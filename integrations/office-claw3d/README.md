@@ -45,7 +45,15 @@ accepts request(frame) and update(officeSnapshot). Poll updates fan out to those
 instances. Existing Claw3D UI still needs an extension bridge for office.snapshot,
 floor layout and character hints; skeleton is not a deployable gateway yet.
 
-Stable IDs use floor/session + run_id, with a distinct orchestrator ID. Lobby
+Stable IDs namespace orchestrators separately from workers, and named workers
+separately from anonymous fingerprints. Duplicate identities reject the snapshot.
+Nested records require a recognized status and typed projection metadata (nullable
+strings, not arrays/objects); workers require run_id (nullable only in the lobby).
+Malformed snapshots leave the previous roster and lifecycle state untouched.
+The exported polling API reports fixed, credential-safe diagnostics to stderr by
+default; callers may supply an onError function. Operational limits and their
+local-policy rationale are documented beside their constants in adapter.mjs.
+Lobby
 records lacking run_id use a best-effort metadata fingerprint + ordinal: v1 hides
 conversation IDs, so reordering anonymous records may recreate their characters.
 Floors with absent orchestrators do not get fabricated people. Appearance art is
