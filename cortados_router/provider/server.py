@@ -45,7 +45,7 @@ if __package__ in (None, ""):                           # run as a file: make th
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cortados_router.compat import getenv
-from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing
+from cortados_router.provider import anthropic_wire, clients, local_lane, office, responses_wire, routing, search_lane
 from cortados_router.provider.bridge import BridgeError, BridgeSession, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
 
@@ -526,6 +526,12 @@ def _ledger_turn(session: Any, usage: dict | None) -> None:
 _ledger_hook_warned: set[str] = set()
 
 
+def _floor_search(core, cand: dict, min_left_pct: float) -> str | None:
+    """One search under the client's floor: a whole run, charged once (no conversation id), on its executing account."""
+    from cortados_router.provider import floor
+    return floor.reserve(core, cand, search_lane.SEARCH_MODEL, min_left_pct)
+
+
 def _log_ledger_hook_failure(exc: BaseException) -> None:
     """Type name only (the message could carry a path or usage payload), once per type, so a broken hook cannot flood the log."""
     kind = type(exc).__name__
@@ -630,10 +636,14 @@ class Registry:
                  session_factories: dict[str, Callable[..., Any]] | None = None):
         self.gateway_url, self.token, self.claude_bin, self.model = gateway_url, token, claude_bin, model
         self.codex_bin, self.codex_home = codex_bin, codex_home
+        self.search_bin = claude_bin                # the search lane's CLI (search_lane.py); tests swap in a fake
         self.router, self.executed, self.log_outcome = router, executed, log_outcome
         # floor_turn(route, min_left_pct) -> refusal or None: rechecks and reserves a continuation's executing account
         # under the client's x-cortados-min-left-pct (routing.floor_turn). None: a floor on a continuation fails closed.
         self.floor_turn: Callable[[dict | None, float], str | None] | None = None
+        # floor_search(candidate, min_left_pct) -> refusal or None: checks and reserves the search lane's executing
+        # account under the floor before a search launches (floor.reserve). None: a floor on a search fails closed.
+        self.floor_search: Callable[[dict, float], str | None] | None = None
         self._factories = SESSION_FACTORIES if session_factories is None else session_factories
         self._lock = threading.Lock()
         self.sessions: dict[str, Any] = {}
@@ -658,9 +668,8 @@ class Registry:
             return None
         try:
             from cortados_router import core
-            for a in core._vendor_accounts("claude", "claude", "claude-cli"):
-                if a.get("account") == account:
-                    return a.get("config_dir")
+            row = core.account_row(core._vendor_accounts("claude", "claude", "claude-cli"), account)
+            return row.get("config_dir") if row else None
         except Exception:
             pass
         return None
@@ -1381,13 +1390,96 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             session.lock.release()
 
-    def _server_tools_unavailable(self, turn, names: list[str], wire: Wire) -> None:
+    def _exclusion_refusal(self, model: str, label: str, advice: str) -> str | None:
+        """Why x-cortados-exclude-model refuses a request that can only run on `model` (a lane that never reaches the
+        router, which applies the header otherwise: the api/ pin, the search lane), or None. The same rules as choose:
+        a malformed header, an item naming no model, or `model` itself excluded."""
+        raw, valid = _exclude_model_header(self.headers)
+        if not valid:
+            return _EXCLUDE_MODEL_BAD
+        pinned_key = routing.model_key(routing.normalize_model(model))
+        for item in (raw.split(",") if raw else []):   # each listed model, the same rules as choose
+            excluded = routing.normalize_model(item)
+            if excluded == "":                    # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
+                return (f"cortados: x-cortados-exclude-model: {item} names no model this endpoint serves; the review "
+                        "could not be kept off it")
+            if excluded and routing.model_key(excluded) == pinned_key:
+                return f"cortados: {label} is the excluded model (x-cortados-exclude-model); {advice}"
+        return None
+
+    def _web_search(self, body: dict[str, Any], turn, names: list[str], wire: Wire, floor: float | None = None) -> None:
+        """A web-search-only request on the search lane (search_lane.py: a headless Claude CLI with only WebSearch,
+        the one exception to bridge.py's no-tool rule). Its result text is the reply; any failure falls back to the
+        explicit unavailable reply, naming the failure class, never to an empty success."""
+        reg = self.server.registry
+        # The request's policy headers bind this lane as they bind routed calls (the router never sees this request):
+        # both checks run before launch, and nothing here spends quota until they pass.
+        refused = self._exclusion_refusal(search_lane.SEARCH_MODEL, f"the search lane's model {search_lane.SEARCH_MODEL}",
+                                          "this request cannot be searched under that exclusion")
+        if refused:
+            return self._error(400, "invalid_request_error", refused, wire)
+        try:
+            who = search_lane.login()               # the login and its ledger lane, resolved together before launch
+            if floor is not None:
+                # The client's quota floor on the account the search will execute on, checked and reserved through
+                # floor.reserve like a routed conversation's. No enforcer (a fixed-model endpoint) or one that fails:
+                # closed, as the routed paths do.
+                if reg.floor_search is None:
+                    return self._error(429, "rate_limit_error", "cortados: this endpoint cannot check "
+                                       "x-cortados-min-left-pct for the search lane", wire,
+                                       reason="the client's quota floor cannot be checked here")
+                try:
+                    why = reg.floor_search(who.floor_candidate(), floor)
+                except Exception as exc:
+                    logger.exception("search lane: quota floor check failed")
+                    return self._error(429, "rate_limit_error", "cortados: the search lane's quota floor check failed "
+                                       f"({type(exc).__name__}); x-cortados-min-left-pct cannot be honoured", wire,
+                                       reason="the client's quota floor cannot be checked here")
+                if why:
+                    return self._error(429, "rate_limit_error", f"cortados: {why}", wire,
+                                       reason="the search account is below the client's quota floor")
+            allowed, blocked = search_lane.domain_filters(body)
+            result = search_lane.run(getattr(reg, "search_bin", None) or reg.claude_bin,
+                                     search_lane.extract_query(body), who.config_dir, allowed=allowed, blocked=blocked)
+        except search_lane.SearchFailed as exc:
+            logger.warning("web search lane failed (%s): %s", exc.kind, exc.detail[:200])
+            reason = ("search busy" if exc.kind == "busy" else "no search was performed" if exc.kind == "no_search"
+                      else f"the search lane failed: {exc.kind}")
+            return self._server_tools_unavailable(turn, names, wire, reason=reason)
+        except Exception:
+            # Anything else is a bug in the lane: the client still gets a complete reply (never a dropped
+            # connection), and the traceback goes to the log.
+            logger.exception("web search lane failed unexpectedly")
+            return self._server_tools_unavailable(turn, names, wire, reason="the search lane failed: internal")
+        logger.info("web search answered on the search lane (%s, %d chars)", search_lane.SEARCH_MODEL,
+                    len(result.text))
+        # Accounting, not a quota gate: scarcity/quota decide whether a lane may spend; the ledger only teaches
+        # unitcost tokens per %. So, like every other lane, the row is written after the fact (record_async) with no
+        # pre-launch reservation; a lost row weakens one learning interval and is logged at error level with the lane
+        # and run id. Only a completed search reaches here: every failure (incomplete_output included) returned above.
+        try:
+            from cortados_router import usage_ledger
+            run_id, valid = self._run_id()
+            usage_ledger.record_async(who.ledger_lane, search_lane.SEARCH_MODEL, result.usage,
+                                      context=f"search lane, run {run_id if run_id and valid else '-'}")
+        except Exception as exc:
+            _log_ledger_hook_failure(exc)               # the ledger never breaks a reply (as _ledger_turn's caller)
+        return self._reply_text(turn, result.text, result.usage, wire)
+
+    def _server_tools_unavailable(self, turn, names: list[str], wire: Wire, reason: str = "") -> None:
         """A complete, ordinary assistant reply whose text tells the model the server tools did not run. A reply,
         not a 4xx: the client hands the text to the model as the tool's output, so the model reads why and stops
         retrying, where an HTTP error may be retried or surface only as a generic API error."""
         text = anthropic_wire.SERVER_TOOL_UNAVAILABLE.format(names=", ".join(sorted(set(names))))
-        logger.warning("request with server tool(s) %s answered as unavailable", sorted(set(names)))
-        msg_id, blocks, usage = wire.new_message_id(), [{"type": "text", "text": text}], {}
+        if reason:
+            text += f" (reason: {reason})"
+        logger.warning("request with server tool(s) %s answered as unavailable%s", sorted(set(names)),
+                       f" ({reason})" if reason else "")
+        return self._reply_text(turn, text, {}, wire)
+
+    def _reply_text(self, turn, text: str, usage: dict[str, int], wire: Wire) -> None:
+        """One complete end_turn text reply, as JSON or SSE."""
+        msg_id, blocks = wire.new_message_id(), [{"type": "text", "text": text}]
         if not turn.stream:
             return self._json(200, wire.message_json(msg_id, turn.model, blocks, "end_turn", usage))
         try:
@@ -1402,7 +1494,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
             self.wfile.flush()
         except OSError as gone:
-            logger.info("client gone while the server-tool refusal was written (%s)", gone)
+            logger.info("client gone while a server-tool reply was written (%s)", gone)
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
         """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
@@ -1419,20 +1511,9 @@ class Handler(BaseHTTPRequestHandler):
             if api_model:
                 # api/ requests are stateless, so each is a new conversation: honour x-cortados-exclude-model here
                 # (the router, which applies it otherwise, is never called for this lane).
-                raw, valid = _exclude_model_header(self.headers)
-                if not valid:
-                    return self._error(400, "invalid_request_error", _EXCLUDE_MODEL_BAD, wire)
-                pinned_key = routing.model_key(routing.normalize_model(api_model))
-                for item in (raw.split(",") if raw else []):   # each listed model, the same rules as choose
-                    excluded = routing.normalize_model(item)
-                    if excluded == "":                # `api`, `sub/`, `api/`: a prefix naming no model, as in choose
-                        return self._error(400, "invalid_request_error",
-                                           f"cortados: x-cortados-exclude-model: {item} names no model this endpoint "
-                                           "serves; the review could not be kept off it", wire)
-                    if excluded and routing.model_key(excluded) == pinned_key:
-                        return self._error(400, "invalid_request_error",
-                                           f"cortados: api/{api_model} is the excluded model (x-cortados-exclude-model); "
-                                           "pin another model or use cortados", wire)
+                refused = self._exclusion_refusal(api_model, f"api/{api_model}", "pin another model or use cortados")
+                if refused:
+                    return self._error(400, "invalid_request_error", refused, wire)
                 # Pinned to the anthropic-api credit lane: proxy it directly, bypassing S1 and the session machinery.
                 return self._serve_api_lane(body, api_model, wire)
             # The client's quota floor is read on EVERY request, new or continuation: a bad value is refused before any
@@ -1446,6 +1527,8 @@ class Handler(BaseHTTPRequestHandler):
                 # A request whose only tools are server tools (Claude Code's WebSearch makes exactly such a call) asks
                 # for work no backend here can do. Answer it at once with text saying so, never spend a backend on it:
                 # a routed model would answer without searching, and the client would show that as an empty success.
+                if all(t.startswith("web_search_") for _, t in anthropic_wire.server_tool_kinds(body)):
+                    return self._web_search(body, turn, server_tools, wire, floor)
                 return self._server_tools_unavailable(turn, server_tools, wire)
             if server_tools:
                 # Mixed with client tools: parse_request dropped the server tools, the client tools are served.
@@ -1929,7 +2012,16 @@ class ProviderServer(ThreadingHTTPServer):
 
     def __init__(self, addr, registry: Registry):
         super().__init__(addr, Handler)
-        self.registry = registry
+        try:
+            self.registry = registry
+            # The usage ledger's writer starts with the endpoint, never from a request (record_async only queues).
+            from cortados_router import usage_ledger
+            if not usage_ledger.start():
+                raise RuntimeError("usage ledger: the ledger writer is shut down; provider startup aborted")
+        except BaseException:
+            # The superclass already bound/listened. Release the port even if a caller retains our traceback.
+            self.server_close()
+            raise
 
     def office_view(self, registry: Registry) -> dict[str, Any]:
         """GET /v1/cortados/office (provider/office.py): the board plus the child-task log. Tests replace it."""
@@ -1985,6 +2077,7 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
                         log_outcome=log_turn_outcome)
     if not fixed_model:
         registry.floor_turn = lambda route, floor: routing.floor_turn(core, route, floor, codex_home)
+        registry.floor_search = lambda cand, floor: _floor_search(core, cand, floor)
     httpd = ProviderServer((host, port), registry)
 
     def reaper():
