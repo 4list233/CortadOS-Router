@@ -21,7 +21,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from cortados_router.provider.mcp_shim import CALL_TIMEOUT_S, TOOL_WAIT_S
+from cortados_router.provider.timeouts import (
+    ABORT_TIMEOUT_S, CALL_SLACK_S, CLI_TOOL_TIMEOUT_S, IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S,
+    effective_tool_wait,
+)
 
 BRIDGE_SERVER = "bridge"
 TOOL_PREFIX = f"mcp__{BRIDGE_SERVER}__"
@@ -149,7 +152,10 @@ class BridgeSession:
                     "command": sys.executable,
                     "args": ["-I", str(SHIM), gateway_url, self.id, str(self.dir / "tools.json")],
                     "env": {"CORTADOS_PROVIDER_TOKEN": token,
-                            "CORTADOS_PROVIDER_TOOL_WAIT_S": str(TOOL_WAIT_S)}}}}))
+                            "CORTADOS_PROVIDER_TOOL_WAIT_S": str(effective_tool_wait(IDLE_S, TOOL_WAIT_S)),
+                            "CORTADOS_PROVIDER_TURN_TIMEOUT_S": str(TURN_TIMEOUT_S),
+                            "CORTADOS_PROVIDER_CALL_SLACK_S": str(CALL_SLACK_S),
+                            "CORTADOS_PROVIDER_ABORT_TIMEOUT_S": str(ABORT_TIMEOUT_S)}}}}))
                 args += ["--strict-mcp-config", "--mcp-config", str(self.dir / "mcp.json"),
                          "--allowedTools", ",".join(TOOL_PREFIX + t["name"] for t in tools)]
             else:
@@ -157,7 +163,7 @@ class BridgeSession:
             if model:
                 args += ["--model", model]
             env = claude_env(config_dir)
-            env["MCP_TOOL_TIMEOUT"] = str(int(CALL_TIMEOUT_S * 1000))  # same window as the shim
+            env["MCP_TOOL_TIMEOUT"] = str(int(CLI_TOOL_TIMEOUT_S * 1000))  # call + abort + startup slack
             self._stderr = open(self.dir / "stderr.log", "w")
             self.proc = popen(args, cwd=self.dir / "work", env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=self._stderr, text=True, bufsize=1)

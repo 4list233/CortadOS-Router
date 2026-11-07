@@ -15,7 +15,7 @@ import urllib.request
 
 PROTOCOL = "2025-06-18"
 # Client tools include long test suites and permission prompts. Three hours covers the maximum task runtime;
-# finite expiry still releases abandoned calls. This value is also used by the registry and passed to the CLI.
+# finite expiry still releases abandoned calls. The provider passes max(idle TTL, tool window) explicitly.
 TOOL_WAIT_S = float(os.environ.get("CORTADOS_PROVIDER_TOOL_WAIT_S") or 10800)
 if not 0 < TOOL_WAIT_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_TOOL_WAIT_S must be positive and finite")
@@ -29,6 +29,10 @@ CALL_SLACK_S = float(os.environ.get("CORTADOS_PROVIDER_CALL_SLACK_S") or 120)
 if not 0 < CALL_SLACK_S < float("inf"):
     raise ValueError("CORTADOS_PROVIDER_CALL_SLACK_S must be positive and finite")
 CALL_TIMEOUT_S = TURN_TIMEOUT_S + TOOL_WAIT_S + CALL_SLACK_S
+# The provider resolves compatibility aliases and supplies all budgets explicitly to this standalone process.
+ABORT_TIMEOUT_S = float(os.environ.get("CORTADOS_PROVIDER_ABORT_TIMEOUT_S") or 120)
+if not 0 < ABORT_TIMEOUT_S < float("inf"):
+    raise ValueError("CORTADOS_PROVIDER_ABORT_TIMEOUT_S must be positive and finite")
 
 
 def _abort(gateway, session, token):
@@ -37,7 +41,7 @@ def _abort(gateway, session, token):
     req = urllib.request.Request(gateway.rstrip("/") + "/bridge/call", data=body, method="POST",
                                  headers={"content-type": "application/json", "x-cortados-token": token})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=ABORT_TIMEOUT_S) as resp:
             return json.loads(resp.read()).get("closed") is True
     except (urllib.error.URLError, OSError, ValueError, AttributeError):
         return False

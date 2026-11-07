@@ -5,6 +5,7 @@ The fake runs the real mcp_shim, so every bridged call crosses the same process 
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 os.environ.setdefault("CORTADOS_HOME", tempfile.mkdtemp())
@@ -172,6 +173,110 @@ class IdleLifetimeTests(unittest.TestCase):
         s._tool_result_deadline = self.now - 1
         with self.assertRaises(server.ToolWaitExpired):
             s.wait_result("late", timeout=1)
+
+    def test_idle_longer_than_tool_window_arms_matching_deadline(self):
+        s = self.reg.new(self.turn, keep=True)
+        s.arm_tool_result_deadline = mock.Mock()
+        with mock.patch.object(server, "IDLE_S", 100), mock.patch.object(server, "TOOL_WAIT_S", 20):
+            self.reply(s, "tool_use")
+            s.arm_tool_result_deadline.assert_called_once_with(self.now + 100)
+            self.now += 21
+            self.reg.reap(100)
+            self.assertIs(self.reg.get(s.id), s)
+
+    def test_registration_atomically_converts_capacity_reservation(self):
+        original = self.reg._new
+        def paused_registration(*args, **kwargs):
+            s = original(*args, **kwargs)
+            # Another opener runs exactly where old code counted both session and reservation.
+            failures = []
+            def concurrent_open():
+                try:
+                    self.reg.reserve_opening()
+                    self.reg.release_opening()
+                except Exception as exc:
+                    failures.append(exc)
+            thread = threading.Thread(target=concurrent_open)
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            return s
+        with mock.patch.object(server, "MAX_SESSIONS", 2), mock.patch.object(self.reg, "_new", paused_registration):
+            self.reg.new(self.turn, keep=True)
+        self.assertEqual(self.reg._opening, 0)
+        self.assertEqual(len(self.reg.sessions), 1)
+
+    def test_reaper_final_stale_read_and_removal_hold_replay_lock(self):
+        from types import SimpleNamespace
+        reg, observed = self.reg, []
+        class Session(SimpleNamespace):
+            @property
+            def last_used(inner):
+                observed.append(reg._lock.locked())
+                return 0
+        s = Session(id="stale", lock=threading.Lock(), history=["reply"], awaiting_tool_result=False)
+        def close():
+            self.assertFalse(reg._lock.locked())
+            self.assertIsNone(reg.get(s.id))
+        s.close = close
+        reg.sessions[s.id] = s
+        reg.reap(1)
+        self.assertEqual(observed, [True])
+
+    def test_legacy_timeout_resolution_and_explicit_shim_configuration(self):
+        script = """
+import json
+from unittest import mock
+from cortados_router.provider import bridge, timeouts
+with mock.patch.object(bridge.BridgeSession, "_read_stdout"):
+    with mock.patch("threading.Thread.start"):
+        s = bridge.BridgeSession(gateway_url="", token="t", system="", tools=[{"name":"Read"}],
+                                 popen=mock.Mock())
+        cfg = json.loads((s.dir / "mcp.json").read_text())["mcpServers"]["bridge"]["env"]
+        print(json.dumps([cfg, s.proc is not None, timeouts.CLI_TOOL_TIMEOUT_S]))
+        s._stderr.close()
+        import shutil
+        shutil.rmtree(s.dir)
+"""
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CORTADOS_PROVIDER_", "WANGCAI_PROVIDER_"))}
+        env.update(WANGCAI_PROVIDER_TURN_TIMEOUT_S="19000", WANGCAI_PROVIDER_IDLE_S="20000",
+                   WANGCAI_PROVIDER_TOOL_WAIT_S="30", WANGCAI_PROVIDER_CALL_SLACK_S="7")
+        result = subprocess.run([sys.executable, "-B", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg, _, cli = json.loads(result.stdout)
+        self.assertEqual(float(cfg["CORTADOS_PROVIDER_TURN_TIMEOUT_S"]), 19000)
+        self.assertEqual(float(cfg["CORTADOS_PROVIDER_TOOL_WAIT_S"]), 20000)
+        self.assertGreater(cli, 19000 + 20000 + 7 + float(cfg["CORTADOS_PROVIDER_ABORT_TIMEOUT_S"]))
+
+    def test_subprocess_shim_aborts_before_cli_timeout_can_resume(self):
+        from cortados_router.provider import timeouts
+        self.assertGreater(timeouts.CLI_TOOL_TIMEOUT_S, timeouts.CALL_TIMEOUT_S + timeouts.ABORT_TIMEOUT_S)
+        # Scale all production budgets equally; real child kills its fake CLI owner on double transport failure.
+        child = """
+import time
+from cortados_router.provider import mcp_shim as shim, timeouts
+shim.CALL_TIMEOUT_S = timeouts.CALL_TIMEOUT_S / 1000
+shim.ABORT_TIMEOUT_S = timeouts.ABORT_TIMEOUT_S / 1000
+def fail(req, timeout):
+    time.sleep(timeout)
+    raise OSError("transport unavailable")
+shim.urllib.request.urlopen = fail
+shim._forward("http://unused", "s", "t", {"_meta":{"claudecode/toolUseId":"t"}})
+"""
+        owner = """
+import subprocess, sys
+from cortados_router.provider import timeouts
+p = subprocess.Popen([sys.executable, "-B", "-c", sys.argv[1]])
+try:
+    p.wait(timeout=timeouts.CLI_TOOL_TIMEOUT_S / 1000)
+except subprocess.TimeoutExpired:
+    print("SYNTHETIC TOOL RESULT", flush=True)
+    p.kill()
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", owner, child], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, -9, result.stderr)
+        self.assertNotIn("SYNTHETIC", result.stdout)
 
     def test_anthropic_keepalive_is_a_protocol_ping(self):
         self.assertEqual(wire.sse_ping(), b'event: ping\ndata: {"type": "ping"}\n\n')
@@ -442,8 +547,9 @@ class EndpointTests(EndpointHarness):
         # The real shim starts its HTTP timer before run_turn finishes the tool_use reply. Scale every budget down:
         # the .12s completion delay exceeds the old .10s transport (.05 tool + .05 slack), but fits the new
         # .30s transport (.20 turn + .05 tool + .05 slack).
-        env = {"CORTADOS_PROVIDER_TURN_TIMEOUT_S": "0.20", "CORTADOS_PROVIDER_CALL_SLACK_S": "0.05"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(server, "TOOL_WAIT_S", 0.05), \
+        with mock.patch.object(server, "TOOL_WAIT_S", 0.05), mock.patch.object(server, "IDLE_S", 0.01), \
+             mock.patch.object(bridge, "IDLE_S", 0.01), mock.patch.object(bridge, "TURN_TIMEOUT_S", 0.20), \
+             mock.patch.object(bridge, "CALL_SLACK_S", 0.05), \
              mock.patch.object(bridge, "TOOL_WAIT_S", 0.05), mock.patch.object(bridge, "SETTLE_S", 0.12):
             first = self.post({"tools": [READ_TOOL], "messages": [{"role": "user", "content": "use tool"}]})
         self.assertEqual(first["stop_reason"], "tool_use")

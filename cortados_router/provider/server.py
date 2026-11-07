@@ -48,13 +48,11 @@ from cortados_router.compat import getenv
 from cortados_router.provider import anthropic_wire, local_lane, responses_wire, routing
 from cortados_router.provider.bridge import BridgeError, BridgeSession, ToolWaitExpired, claude_env
 from cortados_router.provider.codex_bridge import CodexSession
-from cortados_router.provider.mcp_shim import TOOL_WAIT_S
+from cortados_router.provider.timeouts import IDLE_S, TOOL_WAIT_S, TURN_TIMEOUT_S, effective_tool_wait
 
 DEFAULT_PORT = 8432                                     # next to S1's 8431
 # A turn covers the model's thinking until it finishes or asks for a tool; long agentic turns run minutes.
-TURN_TIMEOUT_S = float(getenv("CORTADOS_PROVIDER_TURN_TIMEOUT_S") or 1800)
-# Completed conversations expire after 30 minutes: their CLI holds memory and a login slot.
-IDLE_S = float(getenv("CORTADOS_PROVIDER_IDLE_S") or 1800)
+# Resolved centrally through compat.getenv; the shim gets the same budgets explicitly.
 # Tool-wait sessions use at least TOOL_WAIT_S (default 3 h), not the ordinary idle TTL.
 # Bound held CLI processes and replay memory even if many clients abandon long-running tools. Refuse new
 # conversations at capacity rather than evicting a client still inside its promised tool-result window.
@@ -665,10 +663,17 @@ class Registry:
         if keep and not admitted:
             self.reserve_opening()
         try:
-            return self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
-        finally:
+            s = self._new(turn, keep=keep, route=route, scope=scope, wire_path=wire_path)
+        except BaseException:
             if keep:
                 self.release_opening()
+            raise
+        if keep:
+            # Convert the admission reservation into a live session in one critical section.
+            with self._lock:
+                self.sessions[s.id] = s
+                self._opening -= 1
+        return s
 
     def reserve_opening(self) -> None:
         """Reserve conversation capacity before routing can reserve any quota."""
@@ -725,9 +730,6 @@ class Registry:
         s.wire_path = wire_path                     # the wire it was opened on (/v1/messages, /v1/responses): _replays
         s.tool_names, s.tools_warned = {t["name"] for t in turn.tools}, False   # what the backend was started with
         s.awaiting_tool_result = False
-        if keep:
-            with self._lock:
-                self.sessions[s.id] = s
         return s
 
     @staticmethod
@@ -932,11 +934,19 @@ class Registry:
             if not s.lock.acquire(blocking=False):
                 continue
             try:
-                ttl = max(idle_s, TOOL_WAIT_S) if getattr(s, "awaiting_tool_result", False) else idle_s
-                if self.get(s.id) is s and time.time() - s.last_used > ttl:
+                ttl = effective_tool_wait(idle_s, TOOL_WAIT_S) if getattr(s, "awaiting_tool_result", False) else idle_s
+                # Replay refresh and the final stale check/removal share the registry lock.
+                with self._lock:
+                    expired = self.sessions.get(s.id) is s and time.time() - s.last_used > ttl
+                    if expired:
+                        del self.sessions[s.id]
+                        hist = getattr(s, "history", None)
+                        if hist:
+                            self.closed.append((time.time(), "reaped", hist[0], len(hist)))
+                if expired:
                     logger.info("closing idle conversation %s (awaiting_tool_result=%s, ttl=%ss)",
                                 s.id[:8], getattr(s, "awaiting_tool_result", False), ttl)
-                    self.drop(s, "reaped")
+                    s.close()  # teardown must not hold the registry lock
             finally:
                 s.lock.release()
 
@@ -952,7 +962,7 @@ def _remember_reply(session, turn, msg_id: str, model: str, result) -> None:
     session.last_used = time.time()
     session.awaiting_tool_result = stop == "tool_use" or any(b.get("type") == "tool_use" for b in blocks)
     if session.awaiting_tool_result and hasattr(session, "arm_tool_result_deadline"):
-        session.arm_tool_result_deadline(session.last_used + TOOL_WAIT_S)
+        session.arm_tool_result_deadline(session.last_used + effective_tool_wait(IDLE_S, TOOL_WAIT_S))
     try:
         size, why = len(json.dumps([blocks, usage], default=str)), None
         if size > REPLAY_MAX_BYTES:
@@ -1180,7 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.registry.drop(s, "bridge_transport_expired")
             return self._json(200, {"closed": True})
         try:
-            result = s.wait_result(body["tool_use_id"], timeout=TOOL_WAIT_S)
+            result = s.wait_result(body["tool_use_id"], timeout=effective_tool_wait(IDLE_S, TOOL_WAIT_S))
         except ToolWaitExpired as exc:
             # End the CLI before answering the shim. Never convert expiry into an error tool_result that lets the
             # unattended model take another paid turn; a late client continuation now sees a closed conversation.

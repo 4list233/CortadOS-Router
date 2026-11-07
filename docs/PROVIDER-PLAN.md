@@ -23,7 +23,11 @@ its own tools; the chosen model only thinks.
 - `CORTADOS_PROVIDER_IDLE_S` (1800 s): reclaim completed, inactive conversations and their CLI resources.
 - `CORTADOS_PROVIDER_TOOL_WAIT_S` (10800 s / 3 h): replies requesting client tools retain their conversation
   for at least this window from reply completion, or the ordinary idle TTL if longer. Abandoned tools still expire.
-  Claude bridge result waits use the same setting; shim HTTP and CLI MCP deadlines add 120 s for timeout delivery.
+  One effective tool window, `max(IDLE_S, TOOL_WAIT_S)`, governs bridge waits, reaping and the shim.
+  Shim HTTP budget = turn timeout + effective tool window + 120 s delivery slack. CLI MCP timeout is strictly
+  longer: shim HTTP budget + 120 s abort budget + 120 s startup/scheduling slack, preventing CLI-synthesized
+  tool errors before backend shutdown. Provider timeout settings support legacy `WANGCAI_*` aliases through
+  `compat.getenv()`; resolved values are explicitly passed to the standalone shim.
 - `CORTADOS_PROVIDER_MAX_SESSIONS` (128): bound held conversations/processes and their replay memory (at most
   1 MiB of replay per session). New held conversations receive 503 at capacity; existing tool waits are not evicted.
 - `CORTADOS_PROVIDER_TURN_TIMEOUT_S` (1800 s): bounds one backend model turn, not execution of client tools.
