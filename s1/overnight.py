@@ -5,7 +5,9 @@ No window, no deadline: one cycle = one nightly.sh run. Only a cycle that exits 
 (labels added, training ran, an evaluation/promotion attempted) starts the next cycle at once; any other rc-0 exit is idle and sleeps
 CORTADOS_S1_CYCLE_IDLE_S (default 900); a failure (rc 1/2/3/...) backs off exponentially from that interval, capped at 4 h; rc 130 ends. The live scorer stays up (nightly.sh skips
 gpu_alone under CORTADOS_S1_CONTINUOUS=1); a guard SIGSTOPs the work process group while
-  - scorer latency > baseline + CORTADOS_S1_LATENCY_BUDGET_S (default 1.0 s, Forest 2026-11-03), or
+  - scorer latency > baseline + CORTADOS_S1_LATENCY_BUDGET_S (default 1.0 s, Forest 2026-11-03), or, inside the local-time
+    night window CORTADOS_S1_NIGHT_WINDOW (default 01:00-07:00, "off" disables), > baseline + CORTADOS_S1_NIGHT_LATENCY_BUDGET_S
+    (default 6.0 s, Forest 2026-11-07), or
   - free memory (vm_stat free+inactive+speculative) < CORTADOS_S1_MIN_FREE_GB (default 8),
 and SIGCONTs it after RESUME_AFTER consecutive good probes. Latency = wall time of a fixed short POST /score probe (serve.py does
 not log per-request latency), at most every CORTADOS_S1_PROBE_S (default 30) s; the baseline is the median of probes taken while
@@ -82,6 +84,75 @@ def run_bounded(command: list[str], seconds: float, *, grace: float = 20, pidfil
                     pidfile.unlink()
             except FileNotFoundError:
                 pass
+
+
+# Night window (Forest 2026-11-07, option a): training alone pushes scorer latency to 4.4-5.5 s, so the +1 s day budget kept the
+# trainer frozen almost all the time. At night there is almost no routing traffic, so a slower scorer costs little; the night
+# budget is still a hard ceiling so a scorer that has stalled (not merely slowed) still pauses the trainer. Local wall time
+# (not a fixed UTC offset) so the window follows DST; the memory guard is the same in both windows (it protects the machine).
+DEFAULT_NIGHT_WINDOW = "01:00-07:00"
+DEFAULT_NIGHT_BUDGET_S = 6.0
+
+
+def parse_night_window(text: str) -> tuple[time, time] | None:
+    """'HH:MM-HH:MM' -> (start, end) local times; 'off' -> None. start == end is rejected (empty or 24 h is ambiguous).
+    A window whose end is before its start crosses midnight (e.g. 23:00-05:00). Raises ValueError on anything else."""
+    text = text.strip()
+    if text.lower() == "off":
+        return None
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", text)
+    if not m:
+        raise ValueError(f"night window {text!r} is not HH:MM-HH:MM or 'off'")
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        raise ValueError(f"night window {text!r} has an hour outside 0-23 or a minute outside 0-59")
+    start, end = time(h1, m1), time(h2, m2)
+    if start == end:
+        raise ValueError(f"night window {text!r} starts and ends at the same time")
+    return start, end
+
+
+def in_night_window(window: tuple[time, time] | None, now: datetime) -> bool:
+    """True when the local wall time of `now` is in [start, end); handles windows crossing midnight."""
+    if window is None:
+        return False
+    start, end = window
+    t = now.time().replace(tzinfo=None)
+    return start <= t < end if start < end else (t >= start or t < end)
+
+
+def _check_night_window(window) -> tuple[time, time] | None:
+    """Validate an injected window with the same rules parse_night_window applies to text. Without this, equal endpoints
+    (time(1), time(1)) fall through in_night_window's midnight branch as all-day and silently apply the night budget in
+    daytime. Raises ValueError for anything but None or a (start, end) pair of distinct naive datetime.time values."""
+    if window is None:
+        return None
+    if not isinstance(window, tuple) or len(window) != 2:
+        raise ValueError(f"night window {window!r} is not None or a (start, end) tuple")
+    start, end = window
+    if not (isinstance(start, time) and isinstance(end, time)):
+        raise ValueError(f"night window {window!r} endpoints must be datetime.time values")
+    if start.tzinfo is not None or end.tzinfo is not None:
+        raise ValueError(f"night window {window!r} endpoints must be naive local times")
+    if start == end:
+        raise ValueError(f"night window {window!r} starts and ends at the same time")
+    return start, end
+
+
+def _env_night_window() -> tuple[time, time] | None:
+    """CORTADOS_S1_NIGHT_WINDOW, reported and replaced by the default when invalid (the _env_float convention)."""
+    raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW")
+    if raw is None or raw.strip() == "":
+        return parse_night_window(DEFAULT_NIGHT_WINDOW)
+    try:
+        return parse_night_window(raw)
+    except ValueError as e:
+        print(f"overnight: CORTADOS_S1_NIGHT_WINDOW: {e}; using {DEFAULT_NIGHT_WINDOW}", flush=True)
+        return parse_night_window(DEFAULT_NIGHT_WINDOW)
+
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None, above: float | None = None) -> float:
@@ -275,11 +346,30 @@ class Guard:
     def __init__(self, *, latency=probe_scorer_latency, memory=free_memory_gb, clock=_time.monotonic, signaller=None,
                  budget_s: float | None = None, min_free_gb: float | None = None, interval_s: float | None = None,
                  max_pause_s: float | None = None, release_hold_s: float | None = None, log=lambda m: print(m, flush=True),
-                 alerter=None):
+                 alerter=None, wall=_local_now, night_window="env", night_budget_s: float | None = None):
         self.latency, self.memory, self.clock, self.log = latency, memory, clock, log
         self.signaller = signaller or signal_group
         self.alerter = alerter or (lambda name, detail: alert(name, detail, log=self.log))
         self.budget = _env_float("CORTADOS_S1_LATENCY_BUDGET_S", 1.0, minimum=0) if budget_s is None else budget_s
+        # Night window: read from the environment only when the day budget is (an injected day budget without an injected
+        # window means a test pinned the budget, and the real wall clock must not loosen it between 01:00 and 07:00).
+        if night_window == "env":
+            night_window = _env_night_window() if budget_s is None else None
+        self.night_window = _check_night_window(night_window)
+        self.wall = wall
+        night = (_env_float("CORTADOS_S1_NIGHT_LATENCY_BUDGET_S", DEFAULT_NIGHT_BUDGET_S, minimum=0)
+                 if night_budget_s is None else night_budget_s)
+        if not math.isfinite(night) or night < self.budget:
+            # The night budget is the looser one by definition; a stricter or broken value is a misconfiguration. Injected
+            # (code) values raise; an environment value is reported and replaced, as _env_float does, so a bad launchd
+            # setting cannot crash-loop the supervisor.
+            if night_budget_s is not None:
+                raise ValueError(f"night latency budget {night!r} must be finite and >= the day budget {self.budget:g}s")
+            fixed = max(DEFAULT_NIGHT_BUDGET_S, self.budget)
+            print(f"overnight: CORTADOS_S1_NIGHT_LATENCY_BUDGET_S={night:g} is below the day budget {self.budget:g}s; "
+                  f"using {fixed:g}", flush=True)
+            night = fixed
+        self.night_budget = night
         self.min_free = _env_float("CORTADOS_S1_MIN_FREE_GB", 8.0, minimum=0) if min_free_gb is None else min_free_gb
         self.interval = _env_float("CORTADOS_S1_PROBE_S", 30.0, above=0) if interval_s is None else interval_s
         # A trainer stopped longer than this is a stalled cycle, not back-pressure: release it, log loudly and alert.
@@ -309,6 +399,13 @@ class Guard:
         self.config_logged = False
         self.blind = False   # set after a forced release: an unreadable scorer must not re-pause the tree at once
         self.hold_until = None   # clock time before which a forced release is not re-paused (release_hold)
+
+    def current_budget(self) -> tuple[float, str]:
+        """(latency budget in seconds, label naming which budget applies) at the current local wall time."""
+        if in_night_window(self.night_window, self.wall()):
+            s, e = self.night_window
+            return self.night_budget, f"night budget {self.night_budget:g}s ({s:%H:%M}-{e:%H:%M} local, Forest 2026-11-07)"
+        return self.budget, f"day budget {self.budget:g}s (Forest 2026-11-03)"
 
     @property
     def baseline(self) -> float | None:
@@ -395,14 +492,15 @@ class Guard:
             self.hold_until = None
         reasons = [refused] if refused else []
         base = self.baseline
-        if lat is not None and base is not None and lat > base + self.budget:
-            reasons.append(f"scorer latency {lat:.2f}s > baseline {base:.2f}s + budget {self.budget:g}s (Forest 2026-11-03)")
+        budget, budget_label = self.current_budget()
+        if lat is not None and base is not None and lat > base + budget:
+            reasons.append(f"scorer latency {lat:.2f}s > baseline {base:.2f}s + {budget_label}")
         if mem is not None and mem < self.min_free:
             reasons.append(f"free memory {mem:.1f} GB < {self.min_free:g} GB")
         if reasons:
             self.good = 0
             if not self.paused:
-                self._pause(pgid, "; ".join(reasons))
+                self._pause(pgid, "; ".join(reasons) + f" [latency budget in force: {budget_label}]")
             return
         if lat is None and base is None and not self.paused and not self.blind:
             # Without a baseline the latency rule cannot be judged: pause once to measure the scorer alone.
@@ -419,7 +517,7 @@ class Guard:
                 self.paused_at = None
                 self.good = 0
                 self.forced_releases = 0
-                self.log(f"overnight: RESUME work tree: latency {lat:.2f}s within budget for {self.RESUME_AFTER} probes"
+                self.log(f"overnight: RESUME work tree: latency {lat:.2f}s within {budget_label} for {self.RESUME_AFTER} probes"
                          + (f", free memory {mem:.1f} GB" if mem is not None else ""))
 
 
