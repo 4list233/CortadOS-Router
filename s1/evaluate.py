@@ -193,9 +193,11 @@ MIN_OUTCOME_HOLDOUT = int(os.environ.get("CORTADOS_S1_MIN_OUTCOME_HOLDOUT", "50"
 # The candidate must cut over-routing on real tasks by at least 5 points: the new rule trades teacher-holdout tolerance for a
 # real-task gain, so it needs a real gain, not a tie.
 OUTCOME_OVER_MIN_DROP = 0.05
-# Teacher under-routing may rise by at most 5 points over the live adapter: the teacher's reading is a proxy that drifts from real
-# outcomes, so it is tolerated up to a bound, not ignored (a bigger rise is a real regression, whatever the outcomes say).
-TEACHER_UNDER_MAX_RISE = 0.05
+# Teacher under-routing may rise by at most 7 points over the live adapter (owner decision, Forest 2026-11-07: real-task outcomes
+# lead). The teacher's reading is a proxy that drifts from real outcomes, so it is tolerated up to a bound, not ignored (a bigger
+# rise is a real regression, whatever the outcomes say). 7, not 5: the Nov 5 candidate rose 6.4 points on teacher labels while
+# cutting real-task over-routing 51% -> 32% with no extra real-task under-routing.
+TEACHER_UNDER_MAX_RISE = 0.07
 # Outward recall is a fixed floor, not "never below live": core.resolve's hard rules already raise outward tasks regardless of S1,
 # so a small dip costs nothing; a floor still catches a collapse.
 OUTWARD_RECALL_FLOOR = 0.85

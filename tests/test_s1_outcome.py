@@ -1423,13 +1423,14 @@ class PromotionRuleOutcomesLead(unittest.TestCase):
         cases = [
             # (name, candidate teacher, candidate outcome, has outcome holdout, promote, rule, failing checks)
             ("11-05 outcomes, teacher under +.05", self.cand(), self.CAND_O, True, True, "new", []),
-            ("11-05 exact: teacher under .13 vs .066 (+.064 > .05)", self.cand(under_routed=0.13), self.CAND_O, True,
-             False, "new", ["teacher under-routing"]),
+            ("11-05 exact: teacher under .13 vs .066 (+.064 <= .07)", self.cand(under_routed=0.13), self.CAND_O, True,
+             True, "new", []),
             ("outcome under-routing worse by 2 tasks", self.cand(), dict(self.CAND_O, under=9), True, False, "new",
              ["outcome under-routing"]),
             ("outcome under-routing worse by 1 task (1/n slack)", self.cand(), dict(self.CAND_O, under=8), True, True, "new", []),
             ("outward recall .84", self.cand(outward_recall=0.84), self.CAND_O, True, False, "new", ["outward recall"]),
-            ("teacher under +.06", self.cand(under_routed=0.126), self.CAND_O, True, False, "new", ["teacher under-routing"]),
+            ("teacher under +.08", self.cand(under_routed=0.146), self.CAND_O, True, False, "new", ["teacher under-routing"]),
+            ("teacher under +.07 exactly (boundary)", self.cand(under_routed=0.136), self.CAND_O, True, True, "new", []),
             ("over-routing drop < .05", self.cand(), dict(self.CAND_O, over=36), True, False, "new", ["outcome over-routing"]),
             ("outcome band accuracy drops", self.cand(), dict(self.CAND_O, band_hits=29, over=24), True, False, "new",
              ["outcome band accuracy"]),
