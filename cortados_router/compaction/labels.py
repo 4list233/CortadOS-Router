@@ -50,8 +50,28 @@ GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--e
 MUTATING_PROGRAMS = {"rm", "mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "tee", "rmdir", "truncate", "dd"}
 INSTALLERS = {"pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"}, "npm": {"install", "i", "ci", "uninstall"},
               "brew": {"install", "uninstall", "upgrade"}, "uv": {"add", "remove", "pip"}}
-SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
+# Characters shlex emits as punctuation tokens. "\n" is among them (and removed from the whitespace set) so an
+# unquoted newline survives as a command boundary: as whitespace it vanished and `git status\ngit -C /repo commit`
+# read as one `git status` with extra arguments.
+PUNCTUATION = "();<>|&\n"
+# Any token made only of PUNCTUATION chars that is not a redirect ends the command (";", "&&", "|&", "(", "\n", ...).
 WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
+# `>&` writes a file (`echo hi >&out.txt`) unless its target is a descriptor: digits (`2>&1`, `>&2`) or `-` (close).
+DUP_REDIRECT = ">&"
+# Wrappers whose arguments run the real program; each maps to the wrapper options that take a separate argument,
+# skipped together with their value so `sudo -u user rm x` or `env -u HOME rm x` still reach `rm`.
+WRAPPERS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U"},
+    "env": {"-u", "-C", "-S", "-P", "--unset", "--chdir", "--split-string"},
+    "exec": {"-a"},
+    "time": set(),
+    "command": set(),
+    "nohup": set(),
+    "nice": {"-n", "--adjustment"},
+}
+# `timeout DURATION cmd`: the first non-option argument is the duration, not the program.
+WRAPPERS_WITH_POSITIONAL = {"timeout": {"-s", "-k", "--signal", "--kill-after"}}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _git_subcommand(args: list[str]):
@@ -67,11 +87,33 @@ def _git_subcommand(args: list[str]):
     return None
 
 
+def _unwrap(seg: list[str]) -> list[str]:
+    """Strip VAR=value assignments and wrapper programs (with their options) until the real program is first.
+    Iterative on purpose: `env FOO=1 git commit` carries the assignment AFTER the wrapper, and `sudo env X=1 cmd`
+    nests wrappers. Every iteration drops at least one token, so the loop ends."""
+    i = 0
+    while i < len(seg):
+        t = seg[i]
+        if ASSIGNMENT.match(t):
+            i += 1
+            continue
+        name = os.path.basename(t)
+        if name not in WRAPPERS and name not in WRAPPERS_WITH_POSITIONAL:
+            break
+        with_arg = WRAPPERS[name] if name in WRAPPERS else WRAPPERS_WITH_POSITIONAL[name]
+        i += 1
+        while i < len(seg) and seg[i].startswith("-"):
+            if seg[i] == "--":
+                i += 1
+                break
+            i += 2 if seg[i] in with_arg else 1
+        if name in WRAPPERS_WITH_POSITIONAL:
+            i += 1                  # the positional (timeout's DURATION)
+    return seg[i:]
+
+
 def _segment_mutates(seg: list[str]) -> bool:
-    while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
-        seg = seg[1:]               # leading VAR=value assignments
-    while seg and seg[0] in ("sudo", "env", "command", "exec", "time", "nohup"):
-        seg = seg[1:]
+    seg = _unwrap(seg)
     if not seg:
         return False
     prog, args = os.path.basename(seg[0]), seg[1:]
@@ -90,27 +132,54 @@ def _segment_mutates(seg: list[str]) -> bool:
     return False
 
 
-def command_has_side_effect(cmd: str) -> bool:
+def _tokens(cmd: str) -> tuple[list[str], bool]:
+    """Shell tokens of `cmd` and whether the whole command parsed. On a parse error (unbalanced quote, trailing
+    backslash) the tokens emitted BEFORE the error are returned: those commands are complete and a shell may well have
+    run them before reaching the bad line, so they still get classified instead of being lost to the fallback."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=PUNCTUATION)
+    lex.whitespace_split = True
+    lex.whitespace = " \t\r"       # not "\n": the newline is a punctuation token (command boundary), see PUNCTUATION
+    lex.commenters = ""            # a comment would swallow its newline and glue the next line onto this command
+    tokens: list[str] = []
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        tokens = list(lex)
+        for t in lex:
+            tokens.append(t)
     except ValueError:
-        return bool(SIDE_EFFECT_COMMAND.search(cmd))   # unbalanced quotes etc.: fall back to the regex
+        return tokens, False
+    return tokens, True
+
+
+def _tokens_mutate(tokens: list[str]) -> bool:
     seg: list[str] = []
     for i, t in enumerate(tokens):
-        if t in WRITE_REDIRECTS:
+        if t and all(c in PUNCTUATION for c in t):
+            op = t.replace("\n", "")   # ";\n", "&&\n", "\n>" ... : the operator, if any, decides
             nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-            if nxt != "/dev/null" and not nxt.startswith("&"):
-                return True
-            continue
-        if t in SEPARATORS:
+            if op in WRITE_REDIRECTS:
+                if nxt != "/dev/null":
+                    return True
+                continue
+            if op == DUP_REDIRECT:
+                if not (nxt.isdigit() or nxt == "-") and nxt != "/dev/null":
+                    return True    # `>&file` creates/truncates file; `2>&1` / `>&-` only move descriptors
+                continue
+            if op.startswith("<"):
+                continue           # input redirects (`<`, `<<`, `<<<`, `<&`) read; the word after them stays an argument
             if _segment_mutates(seg):
                 return True
             seg = []
             continue
         seg.append(t)
     return _segment_mutates(seg)
+
+
+def command_has_side_effect(cmd: str) -> bool:
+    tokens, complete = _tokens(cmd)
+    if _tokens_mutate(tokens):
+        return True
+    if not complete:
+        return bool(SIDE_EFFECT_COMMAND.search(cmd))   # the unparsed tail: regex is the best remaining evidence
+    return False
 
 
 # Distinctive identifiers: git-like hashes, uuids, slash paths, long id-like tokens mixing letters and digits.

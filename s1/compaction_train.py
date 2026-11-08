@@ -86,12 +86,15 @@ def supervise(cmd: list[str], deadline: datetime | None, out: Path, *, now_fn, e
         why = None
         try:
             while True:
-                rc = child.poll()
-                if rc is not None:
-                    return rc
+                # The latch is read BEFORE the child's status: a signal latched during the spawn, with the gate child
+                # already gone by the first poll (its own descendants may still hold the lock), must still stop the
+                # whole group and report 128+signum, not hand back the child's exit code and skip the cleanup.
                 if latch.signum is not None:
                     why = "signal"
                     break
+                rc = child.poll()
+                if rc is not None:
+                    return rc
                 if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
                     why = "deadline"
                     break

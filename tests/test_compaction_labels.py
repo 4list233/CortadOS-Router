@@ -132,6 +132,38 @@ class LabelTests(unittest.TestCase):
                   "pip list", "curl -s https://x"):
             self.assertFalse(command_has_side_effect(c), c)
 
+    def test_multiline_commands_keep_boundaries(self):
+        # An unquoted newline ends a command: the second line must not read as arguments of the first.
+        for c in ("git status\ngit -C /repo commit -m fix", "ls\nrm -rf build", "cd /r &&\ngit -C x add .",
+                  "ls # a comment\nrm x"):
+            self.assertTrue(command_has_side_effect(c), c)
+        for c in ("git status\ngit -C /repo log -1", "ls\ncat a.txt\ngrep rm b.txt", "echo 'rm x\nrm y'",
+                  "echo \"git\ncommit\"", "ls;\ncat x"):
+            self.assertFalse(command_has_side_effect(c), c)
+
+    def test_wrapper_options_and_assignments_are_unwrapped(self):
+        for c in ("env FOO=1 git -C /repo commit -m fix", "sudo -u user rm -rf x", "sudo -E env -i X=1 touch f",
+                  "nohup env -u HOME git push", "timeout 30 rm -r x", "nice -n 10 mkdir d", "sudo -- rm x",
+                  "FOO=1 env BAR=2 sudo -g wheel -u root git -C /r commit -m x"):
+            self.assertTrue(command_has_side_effect(c), c)
+        for c in ("env FOO=1 git -C /repo status", "sudo -u user ls -la", "env", "sudo -u", "timeout 30 cat f",
+                  "env -i X=1 grep rm f"):
+            self.assertFalse(command_has_side_effect(c), c)
+
+    def test_dup_redirect_writes_file_but_not_descriptor(self):
+        for c in ("echo hello >&out.txt", "echo hello >& out.txt", "ls 2>&1 >&log.txt"):
+            self.assertTrue(command_has_side_effect(c), c)
+        for c in ("ls 2>&1", "echo warn >&2", "ls 1>&2", "ls >&-", "ls >&/dev/null", "ls 2>&1 | grep x"):
+            self.assertFalse(command_has_side_effect(c), c)
+
+    def test_parse_error_keeps_completed_prefix(self):
+        # A shell runs the first line before hitting the unterminated quote: the commit must still count.
+        for c in ('git -C /repo commit -m fix\necho "unterminated', "touch f\necho 'open", "git -C r add .\necho a\\"):
+            self.assertTrue(command_has_side_effect(c), c)
+        for c in ('git -C /repo status\necho "unterminated', 'echo "unterminated'):
+            self.assertFalse(command_has_side_effect(c), c)
+        self.assertTrue(command_has_side_effect('echo "x && rm -rf y'))     # unparsed tail: the regex still decides
+
     def test_target_kinds(self):
         self.assertEqual(target(ev(0, 0, "Grep", {"pattern": " a  b "})), ("query", "grep:a b"))
         self.assertIsNone(target(ev(0, 0, "Other", {"x": 1})))

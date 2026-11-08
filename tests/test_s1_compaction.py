@@ -333,10 +333,10 @@ class SignalTests(unittest.TestCase):
             try:
                 end = time.monotonic() + 15
                 while time.monotonic() < end:
-                    if os.path.exists(pids) and len(open(pids).read().split()) == 2:
+                    if os.path.exists(pids) and len(Path(pids).read_text().split()) == 2:
                         break
                     time.sleep(0.05)
-                held = [int(x) for x in open(pids).read().split()]
+                held = [int(x) for x in Path(pids).read_text().split()]
                 self.assertEqual(len(held), 2)
                 fd = os.open(lock, os.O_RDWR)
                 with self.assertRaises(BlockingIOError):
@@ -384,6 +384,28 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(rc, 128 + signal.SIGTERM)
         self.assertEqual(events, ["stopped", "reaped"])
         self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_signal_during_spawn_with_child_already_exited_still_stops_group(self):
+        # Boundary: SIGTERM arrives while popen runs and the gate child is gone before the first poll. The group's
+        # descendants may still hold the lock, so the latch must win over the child's exit code: cleanup runs, rc 143.
+        import signal
+        child = FakeChild()
+        child.returncode = 0
+        events = []
+
+        def popen(*a, **k):
+            os.kill(os.getpid(), signal.SIGTERM)          # latched by the handlers installed before the spawn
+            return child
+
+        def stop(c, *, grace):
+            events.append("stopped")
+
+        child.wait = lambda timeout=None: events.append("reaped") or child.returncode
+        with redirect_stderr(StringIO()):
+            rc = ct.supervise(["gate"], None, Path("/nonexistent"), now_fn=datetime.now, popen=popen, stop=stop,
+                              sleep=lambda s: self.fail("polled instead of acting on the latched signal"), grace=1.0)
+        self.assertEqual(rc, 128 + signal.SIGTERM)
+        self.assertEqual(events, ["stopped", "reaped"])
 
 
 if __name__ == "__main__":
