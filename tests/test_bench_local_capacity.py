@@ -5,6 +5,7 @@ import http.server
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -72,14 +73,21 @@ def fake_server(state):
 
 
 class FakeProc:
+    _next = [50000]
+
     def __init__(self):
         self.signals, self.returncode = [], None
+        self.pid = FakeProc._next[0]
+        FakeProc._next[0] += 1
+        self.on_signal = None
 
     def poll(self):
         return self.returncode
 
     def send_signal(self, sig):
         self.signals.append(sig)
+        if self.on_signal:
+            self.on_signal()
         self.returncode = -sig
 
     def wait(self, timeout=None):
@@ -112,10 +120,14 @@ class Base(unittest.TestCase):
                           "--out", os.path.join(self.home, "out.json")] + list(extra))
         return a
 
-    def deps(self, sampler=None, session=None):
+    def deps(self, sampler=None, session=None, **kw):
         sampler = sampler or (lambda url: {"available_bytes": 20 * GIB, "swap_bytes": 0, "ollama_size": 7 * GIB,
                                            "ollama_vram": 7 * GIB})
-        return b.Deps(popen=self.popen, sampler=sampler, session=session or b.run_session, sleep=lambda s: None)
+        # The fake Ollama lives on the bench port, so the occupied-port check and the listener-owner check are
+        # injected here; OccupiedPort below exercises the real ones.
+        kw.setdefault("in_use", lambda port: False)
+        kw.setdefault("listeners", lambda port: ({self.procs[-1].pid}, {self.procs[-1].pid}))
+        return b.Deps(popen=self.popen, sampler=sampler, session=session or b.run_session, sleep=lambda s: None, **kw)
 
 
 class Preconditions(Base):
@@ -216,7 +228,8 @@ class Bench(Base):
         report = json.load(open(args.out))
         self.assertEqual([s["verdict"] for s in report["steps"]], ["PASS", "PASS"])
         self.assertEqual(report["recommended_cap"], 2)
-        self.assertIn("max_connections", out.getvalue())
+        self.assertIn("NUM_PARALLEL", out.getvalue())
+        self.assertIn("uncapped", out.getvalue())
         self.assertEqual([e["OLLAMA_NUM_PARALLEL"] for e in self.envs], ["1", "2"])
         self.assertTrue(all(p.signals for p in self.procs))  # every step's server stopped
 
@@ -261,6 +274,152 @@ class Bench(Base):
         report = b.run_bench(args, deps, self.gate)
         self.assertEqual(report["steps"][0]["verdict"], "FAIL")
         self.assertIn("S1 failure", "; ".join(report["steps"][0]["reasons"]))
+
+
+class Percentile(unittest.TestCase):
+    def test_exact_integer_ranks(self):
+        self.assertEqual(b.pct(range(1, 21), 95), 19)
+        self.assertEqual(b.pct(range(1, 11), 50), 5)
+        self.assertEqual(b.pct([7], 95), 7)
+        self.assertEqual(b.pct([7], 50), 7)
+        self.assertEqual(b.pct(range(1, 21), 100), 20)
+        self.assertIsNone(b.pct([], 50))
+
+
+class TrickleHandler(http.server.BaseHTTPRequestHandler):
+    """Streams a non-final NDJSON line every 50 ms forever: never idle long enough for an inactivity timeout."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        try:
+            for _ in range(400):  # 20 s ceiling so the fake thread itself ends
+                self.wfile.write(json.dumps({"message": {"content": "x"}, "done": False}).encode() + b"\n")
+                self.wfile.flush()
+                time.sleep(0.05)
+        except OSError as exc:  # the client closed at its deadline: expected, record it
+            self.server.closed.append(exc)
+
+
+class Deadlines(unittest.TestCase):
+    def test_trickling_response_stops_at_deadline_as_error(self):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TrickleHandler)
+        srv.closed = []
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d" % srv.server_address[1]
+        t0 = time.monotonic()
+        res = b.run_session(url, "m", "p", 1, timeout=0.5)
+        took = time.monotonic() - t0
+        self.assertFalse(res["ok"])
+        self.assertIn("DeadlineExceeded", res["error"])
+        self.assertLess(took, 3.0)
+
+    def test_round_join_bounded_and_counts_error(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hang(*a):
+            release.wait(30)
+            return dict(ok=True)
+
+        t0 = time.monotonic()
+        results, _ = b.run_round("http://x", "m", 2, 10, 1, 0, session=hang, request_timeout=0.2,
+                                 stop=sc.StopRequest())
+        self.assertLess(time.monotonic() - t0, b.JOIN_SLACK_S + 2)
+        self.assertEqual([r["ok"] for r in results], [False, False])
+        self.assertIn("round deadline", results[0]["error"])
+
+
+class OccupiedPort(Base):
+    def test_refuses_when_bench_port_has_listener(self):
+        other_state = {}
+        other, _ = fake_server(other_state)
+        self.addCleanup(other.shutdown)
+        args = self.args(["--port", str(other.server_address[1])])
+        deps = self.deps(in_use=b.port_in_use)
+        with self.assertRaisesRegex(b.Refused, "already has a listener"):
+            b.run_bench(args, deps, self.gate)
+        self.assertEqual(self.procs, [])
+        paths = [p for p, _ in other_state.get("posts", [])]
+        self.assertNotIn("/api/generate", paths)
+        self.assertNotIn("/api/chat", paths)
+        self.assertLockFree()
+
+    def test_refuses_when_listener_is_not_our_child(self):
+        deps = self.deps(listeners=lambda port: ({4242}, {4242, 1}))
+        with self.assertRaisesRegex(b.Refused, "not our ollama serve"):
+            b.run_bench(self.args(), deps, self.gate)
+        self.assertTrue(self.procs[0].signals)  # the spawned child was stopped
+        self.assertNotIn("/api/generate", [p for p, _ in self.prod_state.get("posts", [])])
+
+    def assertLockFree(self):
+        fd = sc.open_node_lock(self.gate)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+class WarmupInVerdict(Base):
+    def test_swap_growth_during_warmup_fails(self):
+        def sampler(url):
+            warmed = any(p == "/api/generate" for p, _ in self.prod_state.get("posts", []))
+            return {"available_bytes": 20 * GIB, "swap_bytes": (1 * GIB if warmed else 0), "ollama_size": 0,
+                    "ollama_vram": 0}
+
+        report = b.run_bench(self.args(), self.deps(sampler=sampler), self.gate)
+        self.assertEqual(report["steps"][0]["verdict"], "FAIL")
+        self.assertIn("swap grew", "; ".join(report["steps"][0]["reasons"]))
+
+
+class Signals(Base):
+    def test_sigint_during_teardown_stops_server_before_lock_release(self):
+        events = []
+        real_release = b.release_lock
+
+        def release(fd):
+            events.append(("release", [p.returncode for p in self.procs]))
+            real_release(fd)
+
+        def session(*a):
+            signal.raise_signal(signal.SIGINT)  # Ctrl-C mid-round: only sets the flag
+            return dict(ok=True, ttft_s=0.1, tokens=1, decode_tps=1.0)
+
+        deps = self.deps(session=session)
+
+        def popen(argv, env=None, **kw):
+            p = Base.popen(self, argv, env=env, **kw)
+            p.on_signal = lambda: (signal.raise_signal(signal.SIGINT), events.append(("server-stop", p.pid)))
+            return p
+
+        deps.popen = popen
+        old = signal.getsignal(signal.SIGINT)
+        with unittest.mock.patch.object(b, "release_lock", release), \
+                unittest.mock.patch("sys.stderr", io.StringIO()), redirect_stdout(io.StringIO()):
+            rc = b.main(["--s1-url", self.prod_url, "--production-url", self.prod_url, "--steps", "1,2",
+                         "--rounds", "2", "--s1-interval", "0.01", "--port", str(self.prod.server_address[1]),
+                         "--out", os.path.join(self.home, "o.json")], deps=deps, gate=self.gate)
+        self.assertIs(signal.getsignal(signal.SIGINT), old)
+        self.assertEqual(rc, 130)
+        self.assertEqual([e[0] for e in events], ["server-stop", "release"])
+        self.assertTrue(all(code is not None for code in events[-1][1]))  # every server reaped before the release
+        self.assertEqual(len(self.procs), 1)  # step 2 never started
+        self.assertFalse(os.path.exists(os.path.join(self.home, "o.json")))
+
+    def test_sigterm_exit_code(self):
+        stop = sc.StopRequest()
+        stop.handle(signal.SIGTERM, None)
+        self.assertEqual(stop.exit_code(), 143)
+        with self.assertRaises(b.Stopped):
+            b.run_bench(self.args(), self.deps(stop=stop), self.gate)
+        self.assertEqual(self.procs, [])
 
 
 import unittest.mock  # noqa: E402

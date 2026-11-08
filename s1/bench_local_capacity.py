@@ -15,20 +15,23 @@ as the S1 bearer token. Stdlib only.
 import argparse
 import datetime
 import fcntl
+import http.client
 import json
+import math
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, so `import cortados_router` works from any cwd
 from cortados_router import studio_capacity as sc  # noqa: E402
-from cortados_router.local_gate import MAX_CONNECTIONS as GATE_MAX_CONNECTIONS  # noqa: E402
 
 GIB = 2 ** 30
 MIB = 2 ** 20
@@ -39,7 +42,12 @@ DEFAULT_STEPS = "1,2,4,6,8,10,12,16"
 SAMPLE_SECONDS = 1.0          # 1 s sampling catches a swap / memory dip that a whole-step average would hide
 READY_TIMEOUT_S = 60          # ollama serve answers /api/version within seconds; a minute means it is wedged
 WARM_TIMEOUT_S = 300          # cold load of ~6.3 GB weights from disk plus KV allocation for N x ctx
-SESSION_TIMEOUT_S = 900       # 16 sessions x 6000-token prefill on an M1 Max can take minutes; beyond 15 min it is a failure
+SESSION_TIMEOUT_S = 900       # default --request-timeout, ABSOLUTE per session: 16 sessions x 6000-token prefill on an
+                              # M1 Max can take minutes before the first byte; beyond 15 min the step has failed anyway
+JOIN_SLACK_S = 5              # round join = request deadline + this: covers thread start and the watchdog's shutdown
+STOP_POLL_S = 0.1             # how often a wait checks the stop flag: a Ctrl-C is acted on within this
+PORT_PROBE_TIMEOUT_S = 1      # loopback connect answers in microseconds; a second means nothing usable is listening
+LSOF_TIMEOUT_S = 10           # lsof on one port returns in well under a second; ten means it is wedged
 S1_TIMEOUT_S = 30             # far above the ~1 s score time: a reply this late is counted as a failure anyway
 STOP_WAIT_S = 15              # SIGTERM grace for ollama serve to release Metal buffers before SIGKILL
 S1_BASELINE_PROBES = 10       # enough idle samples for a stable p95 without a long idle wait
@@ -50,14 +58,115 @@ class Refused(RuntimeError):
     """A precondition failed: the bench does not start (nothing was loaded)."""
 
 
-# ---------- preconditions ----------
+class Stopped(Exception):
+    """A stop was requested (SIGINT/SIGTERM set the flag); raised by our own code at a safe point, never by a handler."""
+
+
+class DeadlineExceeded(TimeoutError):
+    """A request ran past its ABSOLUTE deadline (a trickling reply resets an inactivity timeout, never this one)."""
+
+
+def check_stop(stop):
+    if stop is not None and stop.is_set():
+        raise Stopped()
+
+
+# ---------- bounded HTTP ----------
+
+def bounded_request(url, payload=None, limit_s=10, headers=None, on_line=None, clock=time.monotonic):
+    """One HTTP request with an ABSOLUTE deadline of limit_s seconds. Reason: urllib's timeout bounds each recv, so a
+    server that trickles a byte every few seconds keeps a request (and every join waiting on it) alive forever.
+
+    The deadline is enforced twice: a watchdog timer shuts the socket down at the deadline (unblocking a recv in
+    progress), and the read loop checks the clock after every read. Plain http only: loopback / tailnet, no proxy.
+    Without on_line the whole body is parsed as JSON; with on_line each NDJSON line is passed to it and the first
+    non-None return value ends the request and is returned (None if the stream ends first)."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "http":
+        raise ValueError("bench URLs must be http:// (loopback / tailnet): %s" % url)
+    deadline = clock() + limit_s
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=limit_s)
+    fired = []
+
+    def expire():
+        fired.append(True)
+        sock = conn.sock
+        if sock is None:
+            return  # not connected yet or already closed: the clock check in the read loop ends the request
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError as exc:  # socket closed between the check and the shutdown: the read already ended
+            fired.append(exc)
+
+    timer = threading.Timer(limit_s, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        body = None if payload is None else json.dumps(payload).encode()
+        try:
+            conn.request("GET" if body is None else "POST", (u.path or "/") + ("?" + u.query if u.query else ""),
+                         body=body, headers={"Content-Type": "application/json", **(headers or {})})
+            resp = conn.getresponse()
+            buf = b""
+            while True:
+                if fired or clock() >= deadline:
+                    raise DeadlineExceeded("no complete reply within %.1fs" % limit_s)
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if on_line is not None and resp.status < 400:
+                    *lines, buf = buf.split(b"\n")
+                    for line in lines:
+                        if line.strip():
+                            result = on_line(json.loads(line))
+                            if result is not None:
+                                return result
+        except OSError as exc:
+            if fired or clock() >= deadline:  # the watchdog's shutdown surfaces as a read error: report the cause
+                raise DeadlineExceeded("no complete reply within %.1fs" % limit_s) from exc
+            raise
+        if fired or clock() >= deadline:
+            raise DeadlineExceeded("no complete reply within %.1fs" % limit_s)
+        if resp.status >= 400:
+            raise OSError("HTTP %d from %s: %s" % (resp.status, url, buf[:200].decode("utf-8", "replace")))
+        if on_line is not None:
+            if buf.strip():
+                return on_line(json.loads(buf))
+            return None
+        return json.loads(buf)
+    finally:
+        timer.cancel()
+        conn.close()
+
 
 def _http_json(url, payload=None, timeout=10, headers=None):
-    data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **(headers or {})})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback / tailnet only: never a proxy
-    with opener.open(req, timeout=timeout) as resp:
-        return json.load(resp)
+    return bounded_request(url, payload, limit_s=timeout, headers=headers)
+
+
+def run_bounded(fn, limit_s, stop, clock=time.monotonic):
+    """fn() in a daemon thread, joined in STOP_POLL_S slices up to limit_s; raises Stopped on a stop request and
+    TimeoutError past the limit (fn's own deadline should end it first). Returns fn's result or re-raises its error."""
+    box = {}
+
+    def work():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # re-raised below in the calling thread
+            box["error"] = exc
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    deadline = clock() + limit_s
+    while t.is_alive():
+        check_stop(stop)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError("did not finish within %.1fs" % limit_s)
+        t.join(min(STOP_POLL_S, remaining))
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def check_production_idle(prod_url=PRODUCTION_URL, http=_http_json):
@@ -127,9 +236,39 @@ def preconditions(gate, prod_url=PRODUCTION_URL, http=_http_json):
 
 # ---------- bench ollama server ----------
 
+def port_in_use(port):
+    """True if something already accepts on 127.0.0.1:port. Reason: /api/version would succeed against that other
+    server and the bench would load models into, and measure, a process it does not own."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=PORT_PROBE_TIMEOUT_S):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except OSError as exc:
+        raise Refused("cannot tell whether bench port %d is free: %s" % (port, exc)) from exc
+
+
+def listener_pids(port):
+    """PIDs listening on TCP port, plus each one's parent PID (so a child of our process also counts as ours)."""
+    out = subprocess.run(["/usr/sbin/lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"], capture_output=True,
+                         text=True, timeout=LSOF_TIMEOUT_S)
+    if out.returncode not in (0, 1):  # 1 = no match
+        raise Refused("lsof failed on port %d: %s" % (port, out.stderr.strip()))
+    pids = {int(x) for x in out.stdout.split() if x.strip().isdigit()}
+    owners = set(pids)
+    for pid in pids:
+        ps = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                            timeout=LSOF_TIMEOUT_S)
+        if ps.returncode == 0 and ps.stdout.strip().isdigit():
+            owners.add(int(ps.stdout.strip()))
+    return pids, owners
+
+
 class OllamaServer:
     def __init__(self, port, ctx, n, binary=OLLAMA_BIN, popen=subprocess.Popen, http=_http_json, clock=time.monotonic,
-                 sleep=time.sleep):
+                 sleep=time.sleep, in_use=port_in_use, listeners=listener_pids, stop=None):
+        self.port = port
+        self.in_use, self.listeners, self.stop_req = in_use, listeners, stop
         self.url = "http://127.0.0.1:%d" % port
         self.env = dict(os.environ, OLLAMA_HOST="127.0.0.1:%d" % port, OLLAMA_NUM_PARALLEL=str(n),
                         OLLAMA_CONTEXT_LENGTH=str(ctx), OLLAMA_MAX_LOADED_MODELS="1", OLLAMA_KEEP_ALIVE="1m")
@@ -137,22 +276,40 @@ class OllamaServer:
         self.proc = None
 
     def start(self):
+        if self.in_use(self.port):
+            raise Refused("bench port %d already has a listener; refusing to load into a server we do not own"
+                          % self.port)
         self.proc = self.popen([self.binary, "serve"], env=self.env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = self.clock() + READY_TIMEOUT_S
         last = None
         while self.clock() < deadline:
+            check_stop(self.stop_req)
             if self.proc.poll() is not None:
                 raise RuntimeError("bench ollama serve exited with %s" % self.proc.returncode)
             try:
                 self.http(self.url + "/api/version", timeout=2)
-                return
             except (urllib.error.URLError, OSError) as exc:
                 last = exc
                 self.sleep(0.25)
+                continue
+            self.verify_owner()
+            return
         raise RuntimeError("bench ollama serve not ready after %ds: %s" % (READY_TIMEOUT_S, last))
 
+    def verify_owner(self):
+        """The answering server must be our child: alive, and the port's listener is its pid (or its child)."""
+        if self.proc.poll() is not None:
+            raise Refused("bench ollama serve exited (%s) yet port %d answers: another server owns it"
+                          % (self.proc.returncode, self.port))
+        pids, owners = self.listeners(self.port)
+        if self.proc.pid not in owners:
+            raise Refused("port %d is served by pid(s) %s, not our ollama serve (pid %d); refusing"
+                          % (self.port, sorted(pids) or "none", self.proc.pid))
+
     def stop(self):
+        """SIGTERM, bounded wait, SIGKILL, reap. Called from teardown, which a signal never interrupts (the handler
+        only sets a flag), so this always completes before the caller releases the node lock."""
         proc, self.proc = self.proc, None
         if proc is None or proc.poll() is not None:
             return
@@ -160,6 +317,7 @@ class OllamaServer:
         try:
             proc.wait(timeout=STOP_WAIT_S)
         except subprocess.TimeoutExpired:
+            print("bench: ollama serve ignored SIGTERM for %ss; sending SIGKILL" % STOP_WAIT_S, file=sys.stderr)
             proc.kill()
             proc.wait(timeout=STOP_WAIT_S)
 
@@ -174,34 +332,37 @@ def synthetic_prompt(index, words):
 
 
 def run_session(url, model, prompt, gen_tokens, timeout=SESSION_TIMEOUT_S, clock=time.monotonic):
-    """One streaming /api/chat; returns {ok, ttft_s, decode_tps, tokens, error}."""
+    """One streaming /api/chat with an ABSOLUTE deadline of timeout seconds; returns {ok, ttft_s, decode_tps, tokens,
+    error}. Past the deadline the connection is closed and the session counts as an error."""
     payload = {"model": model, "stream": True, "messages": [{"role": "user", "content": prompt}],
                "options": {"num_predict": gen_tokens}}
-    req = urllib.request.Request(url + "/api/chat", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     t0 = clock()
-    ttft = None
+    state = {"ttft": None}
+
+    def on_line(msg):
+        if msg.get("error"):
+            return dict(ok=False, error=str(msg["error"]))
+        if state["ttft"] is None and (msg.get("message") or {}).get("content"):
+            state["ttft"] = clock() - t0
+        if msg.get("done"):
+            count, dur = msg.get("eval_count") or 0, msg.get("eval_duration") or 0
+            ttft = state["ttft"]
+            return dict(ok=True, ttft_s=ttft if ttft is not None else clock() - t0, tokens=count,
+                        decode_tps=(count / (dur / 1e9)) if dur else None, wall_s=clock() - t0)
+        return None
+
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            for line in resp:
-                if not line.strip():
-                    continue
-                msg = json.loads(line)
-                if msg.get("error"):
-                    return dict(ok=False, error=str(msg["error"]))
-                if ttft is None and (msg.get("message") or {}).get("content"):
-                    ttft = clock() - t0
-                if msg.get("done"):
-                    count, dur = msg.get("eval_count") or 0, msg.get("eval_duration") or 0
-                    return dict(ok=True, ttft_s=ttft if ttft is not None else clock() - t0, tokens=count,
-                                decode_tps=(count / (dur / 1e9)) if dur else None, wall_s=clock() - t0)
+        result = bounded_request(url + "/api/chat", payload, limit_s=timeout, on_line=on_line, clock=clock)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return dict(ok=False, error="%s: %s" % (type(exc).__name__, exc))
-    return dict(ok=False, error="stream ended without done")
+    return result if result is not None else dict(ok=False, error="stream ended without done")
 
 
-def run_round(url, model, n, prompt_words, gen_tokens, round_index, session=run_session):
+def run_round(url, model, n, prompt_words, gen_tokens, round_index, session=run_session,
+              request_timeout=SESSION_TIMEOUT_S, stop=None, clock=time.monotonic):
+    """N concurrent sessions. Joins are bounded by the round deadline (request deadline + JOIN_SLACK_S) and poll the
+    stop flag; a session still running at the round deadline is counted as an error (its daemon thread dies with
+    the server at teardown)."""
     results = [None] * n
     crashed = []
 
@@ -212,15 +373,22 @@ def run_round(url, model, n, prompt_words, gen_tokens, round_index, session=run_
             crashed.append(exc)
 
     threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(n)]
-    t0 = time.monotonic()
+    t0 = clock()
+    deadline = t0 + request_timeout + JOIN_SLACK_S
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        while t.is_alive():
+            check_stop(stop)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            t.join(min(STOP_POLL_S, remaining))
     if crashed:
         raise crashed[0]
-    wall = time.monotonic() - t0
-    return results, wall
+    results = [r if r is not None else dict(ok=False, error="session still running at the round deadline (%.0fs)"
+                                            % (request_timeout + JOIN_SLACK_S)) for r in results]
+    return results, clock() - t0
 
 
 # ---------- probes and sampling ----------
@@ -281,8 +449,8 @@ def pct(values, q):
     vals = sorted(v for v in values if v is not None)
     if not vals:
         return None
-    k = max(0, min(len(vals) - 1, int(round(q / 100.0 * len(vals) + 0.5)) - 1))
-    return vals[k]
+    rank = max(1, min(len(vals), math.ceil(q * len(vals) / 100.0)))  # nearest rank: ceil(q/100 * n), 1-based
+    return vals[rank - 1]
 
 
 def summarize(n, sessions, walls, s1_probes, samples):
@@ -345,8 +513,10 @@ class Deps:
     """Everything the bench touches outside Python, injectable for tests."""
 
     def __init__(self, popen=subprocess.Popen, http=_http_json, sampler=None, session=run_session, s1=None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, in_use=port_in_use, listeners=listener_pids, stop=None):
         self.popen, self.http, self.session, self.sleep = popen, http, session, sleep
+        self.in_use, self.listeners = in_use, listeners
+        self.stop = stop if stop is not None else sc.StopRequest()
         self.sampler = sampler or (lambda url: system_sample(url, http=http))
         self.s1 = s1 or (lambda url, token: s1_score(url, token, http=http))
 
@@ -354,6 +524,7 @@ class Deps:
 def s1_baseline(args, deps):
     probes = []
     for _ in range(S1_BASELINE_PROBES):
+        check_stop(deps.stop)
         probes.append(deps.s1(args.s1_url, args.s1_token))
         deps.sleep(args.s1_interval)
     fails = [p for p in probes if not p[0]]
@@ -362,28 +533,49 @@ def s1_baseline(args, deps):
     return {"p50_s": pct([p[1] for p in probes], 50), "p95_s": pct([p[1] for p in probes], 95), "probes": len(probes)}
 
 
+def _sample_once(deps, url):
+    try:
+        return deps.sampler(url)
+    except Exception as exc:  # counted as a sampler error by summarize (fails the step), like Periodic's samples
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
 def run_step(n, args, deps):
-    server = OllamaServer(args.port, args.ctx, n, args.ollama_bin, popen=deps.popen, http=deps.http, sleep=deps.sleep)
+    server = OllamaServer(args.port, args.ctx, n, args.ollama_bin, popen=deps.popen, http=deps.http, sleep=deps.sleep,
+                          in_use=deps.in_use, listeners=deps.listeners, stop=deps.stop)
     sampler = Periodic(lambda: deps.sampler(server.url), SAMPLE_SECONDS)
     prober = Periodic(lambda: deps.s1(args.s1_url, args.s1_token), args.s1_interval)
-    sessions, walls = [], []
+    sessions, walls, first, last = [], [], [], []
     try:
         server.start()
-        deps.http(server.url + "/api/generate", {"model": args.model, "prompt": "", "keep_alive": "1m"},
-                  timeout=WARM_TIMEOUT_S)  # warm load: the weights land before the timed rounds
+        # Baseline sample, sampling and S1 probing start BEFORE warm-up: model load and KV allocation are where swap
+        # grows, memory bottoms out and S1 is disrupted, so the verdict must include them.
+        first.append(_sample_once(deps, server.url))
         sampler.start()
         prober.start()
+        run_bounded(lambda: deps.http(server.url + "/api/generate",
+                                      {"model": args.model, "prompt": "", "keep_alive": "1m"}, timeout=WARM_TIMEOUT_S),
+                    WARM_TIMEOUT_S + JOIN_SLACK_S, deps.stop)  # warm load: the weights land before the timed rounds
         for r in range(args.rounds):
+            check_stop(deps.stop)
             results, wall = run_round(server.url, args.model, n, args.prompt_tokens, args.gen_tokens, r,
-                                      session=deps.session)
+                                      session=deps.session, request_timeout=args.request_timeout, stop=deps.stop)
             sessions.extend(results)
             walls.append(wall)
+        last.append(_sample_once(deps, server.url))  # closing sample: a step shorter than SAMPLE_SECONDS is still seen
     finally:
+        # Teardown, in order and never interrupted (signal handlers only set a flag): probers (bounded joins), then
+        # the owned server (SIGTERM, bounded wait, SIGKILL, reap). The caller releases the lock only after this.
         probes = prober.stop() if prober.is_alive() else prober.out
         samples = sampler.stop() if sampler.is_alive() else sampler.out
         server.stop()
+    check_stop(deps.stop)
     probes = [p if isinstance(p, tuple) else (False, None, p.get("error")) for p in probes]
-    return summarize(n, sessions, walls, probes, samples)
+    return summarize(n, sessions, walls, probes, first + samples + last)
+
+
+def release_lock(fd):
+    os.close(fd)  # closing the only fd drops LOCK_SH
 
 
 def run_bench(args, deps, gate):
@@ -401,13 +593,14 @@ def run_bench(args, deps, gate):
                 # machine that serves S1.
                 break
     finally:
-        os.close(fd)  # releases LOCK_SH: training may start again
+        release_lock(fd)  # only after run_step's teardown stopped the bench server: training may start again
     return {"model": args.model, "ctx": args.ctx, "prompt_tokens": args.prompt_tokens, "gen_tokens": args.gen_tokens,
             "rounds": args.rounds, "s1_baseline": baseline, "steps": steps, "recommended_cap": recommended_cap(steps),
             "thresholds": {"s1_budget_s": args.s1_budget, "swap_limit_mib": args.swap_limit_mib,
                            "reserve_gib": args.reserve_gib},
-            "note": "local_gate max_connections (default %d) also caps concurrency through the gate; the effective "
-                    "cap is min(recommended_cap, max_connections)." % GATE_MAX_CONNECTIONS}
+            "note": "the local gate is uncapped by default (local_gate max_connections 0 = unlimited); concurrency "
+                    "through the gate is limited by Ollama OLLAMA_NUM_PARALLEL / OLLAMA_MAX_QUEUE, not by the gate. "
+                    "Set OLLAMA_NUM_PARALLEL on the production instance to at most recommended_cap."}
 
 
 def _f(v, fmt="%.2f"):
@@ -445,6 +638,7 @@ def parse_args(argv=None):
     p.add_argument("--prompt-tokens", type=int, default=6000)
     p.add_argument("--gen-tokens", type=int, default=256)
     p.add_argument("--rounds", type=int, default=2)
+    p.add_argument("--request-timeout", type=float, default=SESSION_TIMEOUT_S)  # absolute per-session bound (see top)
     p.add_argument("--s1-interval", type=float, default=2.0)
     p.add_argument("--s1-budget", type=float, default=1.0)       # S1 day latency budget: baseline + 1.0 s
     p.add_argument("--swap-limit-mib", type=int, default=256)    # more than noise-level swap means RAM is exhausted
@@ -483,12 +677,21 @@ def main(argv=None, deps=None, gate=None):
         os.close(fd)
         print("check: ok (no training lock or intent, production Ollama idle); nothing loaded (dry run)")
         return 0
-    signal.signal(signal.SIGINT, signal.default_int_handler)  # KeyboardInterrupt unwinds through the finally blocks
+    # SIGINT/SIGTERM only set a flag (no exception can land inside teardown); waits poll it and raise Stopped at a
+    # safe point, so the bench server is always stopped before the node lock is released.
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    deps.stop.install()
     try:
         report = run_bench(args, deps, gate)
     except Refused as exc:
         print("REFUSED: %s" % exc, file=sys.stderr)
         return 2
+    except Stopped:
+        print("stopped by signal %d; bench server stopped, lock released" % deps.stop.signum, file=sys.stderr)
+        return deps.stop.exit_code()
+    finally:
+        for sig, handler in previous.items():  # restore, so an embedding caller (tests) keeps its own handlers
+            signal.signal(sig, handler)
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
     print(markdown(report))
