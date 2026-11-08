@@ -365,6 +365,37 @@ class TrainingHoldTests(GateHarness):
         self.assertIn("unreadable", raw)
         self.assertNotIn(str(self.dir), raw)
 
+    def test_intent_written_after_marker_refuses_and_removes_marker(self):
+        # The trainer writes its intent right after this request's marker: the admission check (made after
+        # the marker) must see it, refuse without forwarding, and remove the marker.
+        real = local_gate.begin_active_request
+        made = []
+        def begin(gate):
+            made.append(real(gate))
+            self.write_intent(60)
+            return made[-1]
+        n = len(FakeOllama.seen)
+        with patch.object(local_gate, "begin_active_request", begin):
+            code, raw = self.call("/v1/messages", GateTests.MSG, headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 503)
+        self.assertIn("S1 training in progress", raw)
+        self.assertEqual(len(FakeOllama.seen), n)
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].exists())
+
+    def test_marker_held_while_forwarding_and_removed_after(self):
+        from cortados_router import studio_capacity
+        seen = []
+        real = local_gate.GateHandler._forward
+        def forward(handler, *a):
+            seen.append(len(studio_capacity.live_active_requests(self.dir, __import__("time").time())))
+            return real(handler, *a)
+        with patch.object(local_gate.GateHandler, "_forward", forward):
+            code, _ = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 200)
+        self.assertEqual(seen, [1])
+        self.assertFalse(list(self.dir.glob("active-*")))
+
     def test_unauthorized_still_401_not_hold(self):
         self.write_intent(60)
         code, _ = self.call("/api/tags", headers={"authorization": "Bearer wrong"})

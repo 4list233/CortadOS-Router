@@ -450,7 +450,8 @@ class HandshakeTests(unittest.TestCase):
         with ctx as intent_path:
             self.assertFalse(self.loaded)
             self.assertTrue(intent_path.exists())
-        self.assertIn("daemon acked", self.logs[-1])
+        self.assertTrue(any("daemon acked" in line for line in self.logs))
+        self.assertIn("confirmed no model resident", self.logs[-1])
         self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
         self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
 
@@ -540,6 +541,97 @@ class HandshakeTests(unittest.TestCase):
                 self.fail("training must not start")
         self.assertIn("stuck:latest", str(cm.exception))
         self.assertFalse(list(self.gate.iterdir()))
+
+    def ack_on_sleep(self):
+        """Fake daemon: acks every live intent at the first poll, unloading only its own model."""
+        def tick():
+            for intent in c.live_intents(self.gate, 0.0, alive=lambda p: True):
+                c.write_ack(self.gate, intent, c.MODEL, 0.0)
+        return tick
+
+    def multi_api(self, resident, stuck=()):
+        def api(path, payload=None):
+            self.calls.append((path, payload))
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["keep_alive"] == 0 and payload["model"] not in stuck:
+                resident.discard(payload["model"])
+            return {}
+        return api
+
+    def test_after_ack_every_other_model_is_unloaded(self):
+        # The daemon only unloads its own model; another pinned model must not stay beside training.
+        resident = {"huihui-9b:latest", "third:q4"}
+        ctx, _ = self.gate_ctx(api=self.multi_api(resident), on_sleep=self.ack_on_sleep())
+        with ctx:
+            self.assertEqual(resident, set())
+        self.assertTrue(any("daemon acked" in line for line in self.logs))
+        self.assertEqual({p["model"] for path, p in self.calls if path == "/api/generate"},
+                         {"huihui-9b:latest", "third:q4"})
+
+    def test_after_ack_survivor_refuses(self):
+        resident = {"huihui-9b:latest", "stuck:latest"}
+        ctx, _ = self.gate_ctx(api=self.multi_api(resident, stuck={"stuck:latest"}), on_sleep=self.ack_on_sleep())
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("stuck:latest", str(cm.exception))
+        self.assertFalse(list(self.gate.iterdir()))
+
+    def test_malformed_ps_reply_refuses(self):
+        for reply in ({"models": {}}, {"models": ""}, {}, {"models": [{"size": 1}]}, {"models": [{"name": ""}]},
+                      {"models": ["x"]}, []):
+            with self.subTest(reply=reply):
+                ctx, _ = self.gate_ctx(api=lambda path, payload=None, r=reply: r, wait_seconds=0)
+                with self.assertRaises(c.GateRefused):
+                    with ctx:
+                        self.fail("training must not start")
+                self.assertFalse(list(self.gate.iterdir()))
+
+    # Active-request markers (local_gate <-> training_gate), deterministic: injected clock, sleep and pid check.
+
+    def test_trainer_waits_for_in_flight_request_then_proceeds(self):
+        self.loaded = False
+        marker = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
+        def on_sleep():  # gate_ctx runs this at the first poll only: the request ends while the trainer waits
+            self.assertTrue(marker.exists())
+            c.end_active_request(marker)
+        ctx, clock = self.gate_ctx(on_sleep=on_sleep, wait_seconds=0)
+        with ctx as intent_path:
+            self.assertFalse(marker.exists())
+            self.assertTrue(intent_path.exists())
+        self.assertEqual(clock[0], c.ACK_POLL_SECONDS)  # waited exactly one poll
+        self.assertIn("confirmed no model resident", self.logs[-1])
+
+    def test_dead_gate_marker_ignored_and_removed(self):
+        self.loaded = False
+        marker = c.begin_active_request(self.gate, pid=999999, clock=lambda: 0.0)
+        ctx, clock = self.gate_ctx(wait_seconds=0, alive=lambda pid: pid != 999999)
+        with ctx:
+            self.assertFalse(marker.exists())
+        self.assertEqual(clock[0], 0.0)  # no wait at all
+
+    def test_old_and_malformed_markers_bounded(self):
+        old = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
+        self.assertEqual(c.live_active_requests(self.gate, c.ACTIVE_REQUEST_MAX_AGE_SECONDS - 1)[0]["path"], old)
+        self.assertEqual(c.live_active_requests(self.gate, c.ACTIVE_REQUEST_MAX_AGE_SECONDS), [])
+        self.assertFalse(old.exists())
+        bad = self.gate / "active-1-x.json"
+        bad.write_text("{bad")
+        self.assertEqual(len(c.live_active_requests(self.gate, time.time())), 1)  # fails closed
+        self.assertEqual(c.live_active_requests(self.gate, time.time() + c.ACTIVE_REQUEST_MAX_AGE_SECONDS + 1), [])
+        self.assertFalse(bad.exists())
+
+    def test_trainer_times_out_on_in_flight_request(self):
+        marker = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
+        ctx, clock = self.gate_ctx(request_wait_seconds=5)
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("in flight", str(cm.exception))
+        self.assertGreaterEqual(clock[0], 5)
+        self.assertEqual([p.name for p in self.gate.iterdir()], [marker.name])  # intent cleaned, marker untouched
+        self.assertFalse([p for p in self.calls if p[0] == "/api/generate"])  # never reached the unload step
 
     def test_crash_in_block_removes_intent(self):
         ctx, _ = self.gate_ctx()

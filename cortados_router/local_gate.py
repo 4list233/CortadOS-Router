@@ -35,7 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cortados_router.local_resources import pro_local_allowed
-from cortados_router.studio_capacity import gate_dir as default_studio_gate_dir, live_intents
+from cortados_router.studio_capacity import (begin_active_request, end_active_request,
+                                             gate_dir as default_studio_gate_dir, live_intents)
 
 logger = logging.getLogger("cortados.local_gate")
 
@@ -357,10 +358,26 @@ class GateHandler(BaseHTTPRequestHandler):
             body = self._read_body(n, self.server.body_deadline)
             if body is None:                     # too slow or gone: close, freeing the slot
                 return
-        # Body upload can outlast the power cache, a switch change or a trainer's intent: check at admission too.
-        allowed, reason = self._node_free()
-        if not allowed:
-            return self._error(503, "overloaded_error", reason)
+        # Admission, Dekker-style with studio_capacity.training_gate: FIRST mark this request active, THEN check
+        # intents (body upload can outlast the power cache, a switch change or a trainer's intent). A trainer that
+        # wrote its intent after this check sees the marker and waits until the finally removes it.
+        marker = None
+        if self.server.studio_gate_dir is not None:
+            try:
+                marker = begin_active_request(self.server.studio_gate_dir)
+            except OSError as exc:
+                logger.warning("studio-gate marker unwritable (%s): refusing local request", type(exc).__name__)
+                return self._error(503, "overloaded_error", "S1 training state unwritable; local model refused")
+        try:
+            allowed, reason = self._node_free()
+            if not allowed:
+                return self._error(503, "overloaded_error", reason)
+            self._forward(method, path, body)
+        finally:
+            if marker is not None:
+                end_active_request(marker)
+
+    def _forward(self, method: str, path: str, body: bytes | None) -> None:
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
                                           timeout=self.server.connect_timeout)
         try:

@@ -463,6 +463,74 @@ class GateRefused(RuntimeError):
     """Residency could not be confirmed absent: training must not start."""
 
 
+# Active-request markers (Dekker-style handshake with local_gate). The gate FIRST writes
+# active-<pid>-<uuid>.json, THEN checks for live intents; the trainer FIRST writes its intent,
+# THEN waits for live markers to disappear. Whichever writes second sees the other's file, so a
+# request can never pass the gate's last intent check and then load a model under training.
+#
+# A marker is stale (ignored and removed) when its gate pid is dead (a killed gate never reaches
+# its finally) or it is older than ACTIVE_REQUEST_MAX_AGE_SECONDS: 3x the gate's 300 s upstream
+# read timeout, a bound on a pid that was reused. Dropping a marker of a still-running request is
+# not unsafe: the trainer's unload-all confirmation after the wait refuses while a model stays.
+ACTIVE_REQUEST_MAX_AGE_SECONDS = 900
+# How long the trainer waits for in-flight gate requests to end: a typical local generation
+# finishes well within 2 min; longer means the node is busy and training should retry later.
+ACTIVE_REQUEST_WAIT_SECONDS = 120
+
+
+def begin_active_request(gate, pid=None, clock=time.time):
+    """Write this request's marker before checking intents; returns its path (pass to end_active_request)."""
+    gate = Path(gate)
+    gate.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid() if pid is None else pid
+    path = gate / ("active-%d-%s.json" % (pid, uuid.uuid4().hex))
+    write_status(path, dict(version=1, pid=pid, created_at=clock()))
+    return path
+
+
+def end_active_request(path):
+    with contextlib.suppress(FileNotFoundError):
+        Path(path).unlink()
+
+
+def live_active_requests(gate, now, alive=pid_alive):
+    """Markers of gate requests that may still load a model. Malformed markers fail closed (count as
+    live) until older than ACTIVE_REQUEST_MAX_AGE_SECONDS by mtime; stale ones are removed."""
+    gate = Path(gate)
+    if not gate.is_dir():
+        return []
+    live = []
+    for path in sorted(gate.glob("active-*.json")):
+        try:
+            marker = _read_json(path)
+            if marker.get("version") != 1:
+                raise ValueError("unsupported marker version")
+            pid = marker["pid"]
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise ValueError("invalid pid")
+            created = _finite(marker["created_at"])
+        except FileNotFoundError:
+            continue  # the request ended between glob and read
+        except (ValueError, KeyError, TypeError, AttributeError):
+            try:
+                age = now - path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age < ACTIVE_REQUEST_MAX_AGE_SECONDS:
+                live.append(dict(pid=None, created_at=None, path=path))
+            else:
+                print("studio_capacity: discarding malformed marker " + path.name, file=sys.stderr)
+                end_active_request(path)
+            continue
+        if now - created >= ACTIVE_REQUEST_MAX_AGE_SECONDS or not alive(pid):
+            print("studio_capacity: discarding %s active-request marker pid %d" % (
+                "dead" if not alive(pid) else "expired", pid), file=sys.stderr)
+            end_active_request(path)
+            continue
+        live.append(dict(pid=pid, created_at=created, path=path))
+    return live
+
+
 def write_ack(gate, intent, model, now):
     if intent.get("nonce") is None:
         return  # malformed intent: shed, but there is nobody to ack
@@ -486,13 +554,14 @@ def _daemon_alive(status_path, now):
 @contextlib.contextmanager
 def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=time.time,
                   sleep=time.sleep, log=None, pid=None, wait_seconds=ACK_WAIT_SECONDS,
-                  refresh_seconds=INTENT_REFRESH_SECONDS):
+                  refresh_seconds=INTENT_REFRESH_SECONDS, alive=pid_alive,
+                  request_wait_seconds=ACTIVE_REQUEST_WAIT_SECONDS):
     """Hold an S1 training intent for the duration of the block.
 
-    Writes an intent, waits (bounded) for the daemon's ack that the model is
-    confirmed unloaded, and never proceeds silently: on timeout, whatever the
-    daemon's status says, it queries /api/ps itself, unloads EVERY resident model
-    and confirms none remain, raising GateRefused if that cannot be confirmed.
+    Writes an intent, waits (bounded) for in-flight local gate requests to end
+    (GateRefused on timeout), then waits (bounded) for the daemon's ack. After an
+    ack or its timeout alike it queries /api/ps itself, unloads EVERY resident
+    model and confirms none remain, raising GateRefused if that cannot be confirmed.
     Only a refused connection (Ollama not running) proceeds without a query
     result, with a log line."""
     log = log or (lambda message: print("studio_gate: " + message, file=sys.stderr))
@@ -522,20 +591,30 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
     refresher = threading.Thread(target=refresh, daemon=True)
     refresher.start()
     try:
+        # Intent is written: no new gate request is admitted from here on. Wait out in-flight ones,
+        # which may still load a model (see ACTIVE_REQUEST_WAIT_SECONDS).
+        request_deadline = clock() + request_wait_seconds
+        while True:
+            active = live_active_requests(gate, clock(), alive=alive)
+            if not active:
+                break
+            if clock() >= request_deadline:
+                raise GateRefused("studio_gate: %d local gate request(s) still in flight after %ss; refusing to start"
+                                  % (len(active), request_wait_seconds))
+            sleep(ACK_POLL_SECONDS)
         deadline = clock() + wait_seconds
         while not ack_path.exists():
             if clock() >= deadline:
-                # Status freshness says nothing about residency (a daemon killed
-                # right after a renewal leaves the model loaded for a whole lease;
-                # a wrong status path looks "dead"): always ask Ollama directly.
-                log("no ack in %ss (capacity daemon %s); checking %s residency directly" % (
+                log("no ack in %ss (capacity daemon %s); checking residency directly" % (
                     wait_seconds, "live" if _daemon_alive(status_path, clock()) else
-                    "not running: status %s stale or missing" % status_path, model))
-                _confirm_unloaded(api, model, log)
+                    "not running: status %s stale or missing" % status_path))
                 break
             sleep(ACK_POLL_SECONDS)
         else:
             log("daemon acked: %s unloaded" % model)
+        # Always, ack or not: the daemon only unloads its own model, and status freshness says nothing
+        # about residency, so ask Ollama directly that NO model is resident.
+        _confirm_unloaded(api, model, log)
         yield intent_path
     finally:
         stop.set()
@@ -546,8 +625,18 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
 
 
 def loaded_models(api):
-    """Every model name /api/ps reports resident (any model, not just ours)."""
-    return [m.get("name") or m.get("model") for m in api("/api/ps")["models"]]
+    """Every model name /api/ps reports resident (any model, not just ours). A reply that is not a list
+    of entries each naming its model raises ValueError: an unparseable reply must never read as "none"."""
+    models = api("/api/ps").get("models")
+    if not isinstance(models, list):
+        raise ValueError("/api/ps models is not a list")
+    names = []
+    for entry in models:
+        name = entry.get("name") or entry.get("model") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not name:
+            raise ValueError("/api/ps entry without a model name")
+        names.append(name)
+    return names
 
 
 def _confirm_unloaded(api, model, log):
