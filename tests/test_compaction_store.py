@@ -49,25 +49,29 @@ class StoreTests(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
 
+    def rec(self, cid, **kw):
+        ok = self.s.record_turn(cid, **turn(**kw))
+        self.assertTrue(self.s.flush())
+        return ok
+
     def test_off_by_default_writes_nothing(self):
-        self.assertFalse(self.s.record_turn("conv", **turn()))
+        self.assertFalse(self.rec("conv"))
         self.assertFalse(os.path.exists(os.path.join(self.home, "compaction")))
 
     def test_on_writes_records_with_modes(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):
-            self.assertTrue(self.s.record_turn("conv/../x", **turn()))
-            self.assertTrue(self.s.record_turn("conv/../x", **turn(
-                user_content=[], tool_results={"t1": {"content": [{"type": "text", "text": "x" * 10}], "isError": True}},
-                assistant_blocks=[{"type": "text", "text": "done"}])))
+            self.assertTrue(self.rec("conv/../x"))
+            self.assertTrue(self.rec("conv/../x", user_content=[], assistant_blocks=[{"type": "text", "text": "d"}],
+                                     tool_results={"t1": {"content": [{"type": "text", "text": "x" * 10}], "isError": True}}))
         p = store.session_path("conv/../x")
         self.assertEqual(p.parent, store.sessions_dir())
-        self.assertNotIn("/", p.name.replace(".jsonl", "")[0:0] + p.name)
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(store.sessions_dir()).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(store.root()).st_mode), 0o700)
         recs = [json.loads(l) for l in p.read_text().splitlines()]
         self.assertEqual(recs[0]["meta"], {"run_id": "run-1", "session": "s-1"})
         self.assertEqual([r["kind"] for r in recs[:4]], ["turn", "message", "message", "tool_call"])
+        self.assertEqual(self.s.write_failures, 0)
 
     def test_cap_comes_from_policy_per_source(self):
         pol = store.load_policy()
@@ -87,35 +91,83 @@ class StoreTests(unittest.TestCase):
         w, r = [x for x in recs if x["kind"] == "tool_call"]
         self.assertTrue(w["input_truncated"])
         self.assertGreater(w["input_chars"], cap * 3)
-        self.assertLessEqual(len(json.dumps(w["input"])), cap + 100)
+        self.assertLessEqual(len(json.dumps(w["input"], ensure_ascii=False)), cap)
         self.assertEqual(set(w["input"]), {"file_path", "content"})
         self.assertEqual((r["input"], r["input_truncated"]), ({"file_path": "a"}, False))
 
-    def test_symlink_refused_and_failure_counted_not_raised(self):
+    def test_input_cap_holds_on_final_json_for_huge_keys_and_structure(self):
+        cap = 20000
+        for inp in ({("k" * 30000): 1},                                  # one giant key
+                    {f"k{i}": "v" * 50 for i in range(5000)},            # many keys
+                    {"a": [{"b": ["\"" * 100] * 50}] * 50},             # deep structure, escaping
+                    {"q": "\"" * 50000}):                               # escaping doubles the length
+            out, n, cut = store.cap_input(inp, cap)
+            self.assertTrue(cut)
+            self.assertGreater(n, cap)
+            self.assertLessEqual(len(json.dumps(out, ensure_ascii=False)), cap, list(out)[:1])
+
+    def test_symlinked_file_refused_failure_counted_not_raised(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):
-            store.ensure_dir(store.sessions_dir())
+            os.makedirs(store.sessions_dir(), mode=0o700)
             target = os.path.join(self.home, "elsewhere")
             Path(target).write_text("")
             os.symlink(target, store.session_path("conv"))
-            self.assertFalse(self.s.record_turn("conv", **turn()))
+            self.assertTrue(self.rec("conv"))                    # queued; the writer refuses it
         self.assertEqual(self.s.write_failures, 1)
         self.assertIn("OSError", self.s.last_failure)
         self.assertEqual(Path(target).read_text(), "")
 
-    def test_symlinked_dir_refused(self):
+    def test_symlinked_sessions_and_compaction_dirs_refused(self):
+        for link in ("sessions", "compaction"):
+            with self.subTest(link=link), Env(CORTADOS_HOME=tempfile.mkdtemp(), CORTADOS_COMPACTION_STORE="1"):
+                s = store.Store()
+                elsewhere = tempfile.mkdtemp()
+                if link == "sessions":
+                    os.makedirs(store.root(), mode=0o700)
+                    os.symlink(elsewhere, store.sessions_dir())
+                else:
+                    os.symlink(elsewhere, store.root())
+                s.record_turn("conv", **turn())
+                s.flush()
+                self.assertEqual(os.listdir(elsewhere), [])
+                self.assertEqual(s.write_failures, 2)               # the turn and its retention pass, both refused
+
+    def test_fifo_at_session_path_does_not_block(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):
-            os.makedirs(store.root(), mode=0o700)
-            elsewhere = tempfile.mkdtemp()
-            os.symlink(elsewhere, store.sessions_dir())
-            self.assertFalse(self.s.record_turn("conv", **turn()))
-        self.assertEqual(os.listdir(elsewhere), [])
+            os.makedirs(store.sessions_dir(), mode=0o700)
+            os.mkfifo(store.session_path("conv"))
+            t0 = time.time()
+            self.assertTrue(self.s.record_turn("conv", **turn()))
+            self.assertLess(time.time() - t0, 0.5)               # the request path only enqueued
+            self.assertTrue(self.s.flush(3))                     # and the writer did not hang on the FIFO
         self.assertEqual(self.s.write_failures, 1)
+
+    def test_queue_overflow_drops_and_counts(self):
+        s = store.Store(queue_max=1)
+        gate = threading.Event()
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            self.assertTrue(s.submit("block", gate.wait))       # the writer holds this job
+            time.sleep(0.05)
+            self.assertTrue(s.submit("one", lambda: None))       # fills the queue
+            t0 = time.time()
+            self.assertFalse(s.submit("two", lambda: None))      # full: dropped at once, never blocks
+            self.assertLess(time.time() - t0, 0.5)
+            gate.set()
+            s.flush()
+        self.assertEqual(s.dropped, 1)
+
+    def test_writer_start_failure_contained(self):
+        with Env(CORTADOS_COMPACTION_STORE="1"), \
+             mock.patch.object(self.s, "_ensure_writer", side_effect=RuntimeError("can't start new thread")):
+            self.assertFalse(self.s.record_turn("conv", **turn()))
+            self.assertFalse(self.s.maybe_prune_async(10_000.0))
+            self.assertEqual(self.s._last_prune, 0.0)            # throttle reset: the next call retries
+        self.assertEqual(self.s.schedule_failures, 3)            # the turn, its prune attempt, the direct prune
 
     def test_retention_and_size_cap(self):
         with Env(CORTADOS_COMPACTION_STORE="1", CORTADOS_COMPACTION_RETENTION_DAYS="14",
                  CORTADOS_COMPACTION_MAX_MB=str(1500 / 1024 / 1024)):
-            store.ensure_dir(store.root())
-            store.ensure_dir(store.sessions_dir())
+            os.makedirs(store.sessions_dir(), mode=0o700)
             now = time.time()
             for name, age_days in (("old", 20), ("mid", 3), ("new", 1)):
                 p = store.sessions_dir() / f"{name}.jsonl"
@@ -125,21 +177,56 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(removed, ["old.jsonl", "mid.jsonl"])     # expired, then oldest until under 1500 bytes
         self.assertEqual(os.listdir(store.sessions_dir()), ["new.jsonl"])
 
-    def test_read_session_round_trip(self):
+    def test_retention_never_leaves_the_store_through_a_symlinked_parent(self):
+        outside = tempfile.mkdtemp()
+        os.makedirs(os.path.join(outside, "sessions"))
+        victim = os.path.join(outside, "sessions", "victim.jsonl")
+        Path(victim).write_text("keep me")
+        os.utime(victim, (1, 1))
+        os.symlink(outside, store.root())                         # compaction/ -> outside
         with Env(CORTADOS_COMPACTION_STORE="1"):
-            self.s.record_turn("c", **turn())
-            self.s.record_turn("c", **turn(user_content=[], tool_results={
+            with self.assertRaises(OSError):
+                store.prune_expired(time.time())
+        self.assertTrue(os.path.exists(victim))
+
+    def test_retention_rechecks_before_unlink(self):
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            os.makedirs(store.sessions_dir(), mode=0o700)
+            p = store.sessions_dir() / "old.jsonl"
+            p.write_text("z")
+            os.utime(p, (1, 1))
+            real_stat, calls = os.stat, []
+
+            def stat_then_touch(name, *a, **k):                   # a write lands between scan and unlink
+                st = real_stat(name, *a, **k)
+                calls.append(name)
+                if len(calls) == 1:
+                    os.utime(p, None)
+                return st
+            with mock.patch.object(store.os, "stat", stat_then_touch):
+                self.assertEqual(store.prune_expired(time.time()), [])
+        self.assertTrue(p.exists())
+
+    def test_read_session_round_trip_and_refuses_symlink(self):
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            self.rec("c")
+            self.rec("c", user_content=[], tool_results={
                 "t1": {"content": [{"type": "text", "text": "print(1)"}], "isError": False}},
-                assistant_blocks=[{"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "rm x"}}]))
-        sess = store.read_session(store.session_path("c"))
-        self.assertIsInstance(sess, Session)
-        self.assertEqual([m.role for m in sess.messages], ["user", "assistant", "assistant"])
-        self.assertEqual(len(sess.events), 2)
-        e0, e1 = sess.events
-        self.assertEqual((e0.name, e0.result_text, e0.result_chars, e0.interrupted, e0.message_index),
-                         ("Read", "print(1)", 8, False, 1))
-        self.assertTrue(e1.interrupted)
-        self.assertEqual(sess.messages[1].tool_event_indexes, (0,))
+                assistant_blocks=[{"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "rm x"}}])
+            sess = store.read_session(store.session_path("c"))
+            self.assertIsInstance(sess, Session)
+            self.assertEqual(sess.source, "claude-code")
+            self.assertEqual([m.role for m in sess.messages], ["user", "assistant", "assistant"])
+            e0, e1 = sess.events
+            self.assertEqual((e0.name, e0.result_text, e0.result_chars, e0.interrupted, e0.message_index),
+                             ("Read", "print(1)", 8, False, 1))
+            self.assertTrue(e1.interrupted)
+            self.assertEqual(sess.messages[1].tool_event_indexes, (0,))
+            outside = os.path.join(self.home, "outside.jsonl")
+            Path(outside).write_text("")
+            os.symlink(outside, store.session_path("link"))
+            with self.assertRaises(OSError):
+                store.read_session(store.session_path("link"))
 
 
 class FakeSession:
@@ -194,22 +281,14 @@ class PruneThrottleTests(unittest.TestCase):
         self.p.stop()
         self.env.stop()
 
-    def wait_idle(self, s):
-        for _ in range(200):
-            if not s._prune_running:
-                return
-            time.sleep(0.01)
-        self.fail("prune thread did not finish")
-
     def test_hourly(self):
         s = store.Store()
         t0 = 1_000_000.0
         self.assertTrue(s.maybe_prune_async(t0))
-        self.wait_idle(s)
         self.assertFalse(s.maybe_prune_async(t0 + 60))
         self.assertFalse(s.maybe_prune_async(t0 + store.PRUNE_INTERVAL_S - 1))
         self.assertTrue(s.maybe_prune_async(t0 + store.PRUNE_INTERVAL_S))
-        self.wait_idle(s)
+        self.assertTrue(s.flush())
         self.assertEqual(self.ran, [t0, t0 + store.PRUNE_INTERVAL_S])
 
     def test_off_never_prunes(self):
@@ -238,7 +317,9 @@ class ProviderHookTests(unittest.TestCase):
             s.send_user = lambda c, **k: (sent.append(json.dumps(c, sort_keys=True)), su(c, **k))[1]
             s.deliver = lambda r, **k: (sent.append(json.dumps(r, sort_keys=True)), dl(r, **k))[1]
             return s
-        self.patch = mock.patch.object(server, "_claude_session", wrapped)
+        # Registry builds sessions through SESSION_FACTORIES, so the wrapper goes there (patching the module
+        # function would leave the dict's reference untouched and record nothing).
+        self.patch = mock.patch.dict(server.SESSION_FACTORIES, {"claude-cli": wrapped})
         self.patch.start()
         route = {"provider": "claude-cli", "model": "claude-test-model", "band": "R1", "route_id": "r1"}
         self.reg = server.Registry(gateway_url="", token="t", claude_bin=[sys.executable, str(FIXTURES / "fake_claude_cli.py")],
@@ -286,6 +367,8 @@ class ProviderHookTests(unittest.TestCase):
         self.sent.clear()
         with Env(CORTADOS_COMPACTION_STORE="1"):
             on = self.both_wires()
+            store.STORE.flush()
+        self.assertEqual(len(sent_off), 2)                      # one send_user per wire: the wrapper saw them
         self.assertEqual(self.sent, sent_off)
         self.assertEqual(self.strip_ids(on), self.strip_ids(off))
         files = sorted(store.sessions_dir().glob("*.jsonl"))
@@ -298,6 +381,51 @@ class ProviderHookTests(unittest.TestCase):
         texts = [r["text"] for r in recs if r["kind"] == "message" and r["role"] == "user"]
         self.assertTrue(any("hello store" in t for t in texts) and any("hello codex" in t for t in texts))
         self.assertEqual(store.STORE.write_failures, 0)
+
+    def tool_round_trip(self):
+        """use tool -> tool_use -> the client's tool_result, which the provider hands to deliver()."""
+        read = {"name": "Read", "description": "Read a file", "input_schema": {
+            "type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
+        history = [{"role": "user", "content": "use tool"}]
+        first = self.post("/v1/messages", {"model": "cortados", "max_tokens": 50, "tools": [read],
+                                           "messages": history}, "claude-cli/2.0")
+        use = first["content"][-1]
+        self.assertEqual(use["type"], "tool_use")
+        history += [{"role": "assistant", "content": first["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"],
+                                                  "content": [{"type": "text", "text": "file body " * 50}]}]}]
+        second = self.post("/v1/messages", {"model": "cortados", "max_tokens": 50, "tools": [read],
+                                            "messages": history}, "claude-cli/2.0")
+        return use["id"], self.strip_ids([first, second])
+
+    def test_deliver_bytes_identical_on_and_off(self):
+        id_off, out_off = self.tool_round_trip()
+        sent_off = [x.replace(id_off, "ID") for x in self.sent]
+        self.sent.clear()
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            id_on, out_on = self.tool_round_trip()
+            store.STORE.flush()
+        sent_on = [x.replace(id_on, "ID") for x in self.sent]
+        self.assertTrue(any("file body" in x for x in sent_on))   # deliver() carried the tool result
+        self.assertEqual(sent_on, sent_off)
+        self.assertEqual(json.dumps(out_on).replace(id_on, "ID"), json.dumps(out_off).replace(id_off, "ID"))
+        recs = [json.loads(l) for f in store.sessions_dir().glob("*.jsonl") for l in f.read_text().splitlines()]
+        res = [r for r in recs if r["kind"] == "tool_result"]
+        self.assertEqual(len(res), 1)
+        self.assertIn("file body", res[0]["text"])
+
+    def test_store_failures_never_break_the_turn_or_its_continuation(self):
+        for how in ("writer", "record"):
+            with self.subTest(how=how), Env(CORTADOS_COMPACTION_STORE="1"):
+                if how == "writer":
+                    p = mock.patch.object(store.STORE, "_ensure_writer", side_effect=RuntimeError("can't start new thread"))
+                else:
+                    p = mock.patch.object(store.STORE, "record_turn", side_effect=RuntimeError("boom"))
+                with p:
+                    before = store.STORE.schedule_failures
+                    _, (first, second) = self.tool_round_trip()     # the continuation must not 409
+                    self.assertEqual(second["stop_reason"], "end_turn")
+                    self.assertGreater(store.STORE.schedule_failures, before)
 
 
 if __name__ == "__main__":

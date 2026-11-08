@@ -47,6 +47,24 @@ class RuleTests(unittest.TestCase):
                 self.assertEqual((d.decided_by, d.keep_call, d.keep_result), ("rule:" + rule, kc, kr))
                 self.assertEqual(saved, 0 if kr else BIG - T["dropped_head_chars"])
 
+    def test_readonly_bash_allowlist(self):
+        reads = ["cat a.py", "ls -la", "ls", "git log -5 --oneline", "git status --short", "git diff --stat HEAD~1",
+                 "grep -rn foo .", "rg -n foo src", "find . -name '*.py' -type f", "head -n 20 a", "tail -5 a",
+                 "git branch", "git branch -a", "wc -l a b", "pwd"]
+        writes = ["find . -delete", "find . -name x -exec rm {} \\;", "find . -name x -execdir rm {} +", "find . -ok rm {} ;",
+                  "git branch -D x", "git branch -d x", "git branch -m a b", "git branch newbranch", "git checkout main",
+                  "git switch -c x", "git reset --hard", "git diff --output=x", "git log --output=x",
+                  "sed -i s/a/b/ f", "sed -n 1p f", "rg --pre=sh x", "tail -f log", "cat a > b", "ls; rm x",
+                  "ls && rm x", "cat $(rm x)", "echo `rm x`", "git", "rm -rf build", "/bin/cat a", "cat 'unterminated",
+                  "FOO=1 cat a", "xargs rm", "ls | xargs rm"]
+        for c in reads:
+            self.assertTrue(prune.readonly_bash(c, T), c)
+        for c in writes:
+            self.assertFalse(prune.readonly_bash(c, T), c)
+            ev = ToolEvent(session="s", index=0, message_index=3, name="Bash", input={"command": c}, result_text="",
+                           result_chars=0, is_error=False, interrupted=False)
+            self.assertTrue(prune.is_side_effect(ev, T), c)
+
     def test_superseded_read_dropped_even_if_small(self):
         out = prune.decide(session([(3, "Read", {"file_path": "a"}, 100, False),
                                     (5, "Read", {"file_path": "a"}, 100, False)] + FILLER), table=T)
@@ -106,6 +124,7 @@ class ShadowDecideTests(unittest.TestCase):
                       assistant_blocks=[{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a"}}])
         s.record_turn("c", source="claude-code", user_content=[], assistant_blocks=[{"type": "text", "text": "ok"}],
                       tool_results={"t1": {"content": [{"type": "text", "text": "x" * 900}]}})
+        self.assertTrue(s.flush())
         ds = prune.shadow_decide(store.session_path("c"))
         self.assertEqual(len(ds), 1)
         p = prune.decisions_path()
@@ -118,15 +137,24 @@ class ShadowDecideTests(unittest.TestCase):
         self.assertEqual((row["gate"]["would_start"], row["gate"]["would_prune"]), (False, False))
 
     def test_async_is_noop_when_off_or_missing(self):
-        self.assertIsNone(prune.shadow_decide_async("nope"))
+        self.assertTrue(prune.shadow_decide_async("nope"))       # queued; the writer skips a missing file
+        self.assertTrue(store.STORE.flush())
+        self.assertFalse(prune.decisions_path().exists())
         with mock.patch.dict(os.environ, {"CORTADOS_COMPACTION_STORE": "0"}):
-            self.assertIsNone(prune.shadow_decide_async("c"))
+            self.assertFalse(prune.shadow_decide_async("c"))
+
+    def test_async_scheduling_failure_contained(self):
+        with mock.patch.object(store.STORE, "_ensure_writer", side_effect=RuntimeError("no thread")):
+            self.assertFalse(prune.shadow_decide_async("c"))
+        with mock.patch.object(store, "session_file_name", side_effect=RuntimeError("bad")):
+            self.assertFalse(prune.shadow_decide_async("c"))
 
     def test_async_runs_in_background(self):
-        store.Store().record_turn("c", source="codex", user_content=[{"type": "text", "text": "go"}], tool_results={},
+        store.STORE.record_turn("c", source="codex", user_content=[{"type": "text", "text": "go"}], tool_results={},
                                   assistant_blocks=[{"type": "tool_use", "id": "t1", "name": "LS", "input": {}}])
-        th = prune.shadow_decide_async("c")
-        th.join(5)
+        self.assertTrue(store.STORE.flush())
+        self.assertTrue(prune.shadow_decide_async("c"))
+        self.assertTrue(store.STORE.flush())
         self.assertTrue(prune.decisions_path().exists())
 
 
