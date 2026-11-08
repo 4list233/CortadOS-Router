@@ -575,21 +575,29 @@ approved this with a retention limit. Nothing it does changes what any backend r
 `tests/test_compaction_store.py`, which compares the bytes delivered to the fake backend with the store on and off).
 
 - Switch: `CORTADOS_COMPACTION_STORE=1` (off by default: no files are created).
-- Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600, opened with O_NOFOLLOW;
-  symlinks are refused). Code: `cortados_router/compaction/store.py`.
+- Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600). Every file operation
+  is anchored to directory fds opened one component at a time from `$CORTADOS_HOME` down with O_NOFOLLOW, and files
+  are opened relative to them with O_NOFOLLOW | O_NONBLOCK and an fstat regular-file check: a symlinked home,
+  `compaction/` or `sessions/`, a symlinked session file or a FIFO is refused, for writes, reads and retention alike. Code: `cortados_router/compaction/store.py`.
 - What: per provider turn, a `turn` header (source `claude-code` / `codex`, `x-cortados-run-id`, `x-cortados-session`,
   client), the tool results answering earlier calls, the new user text, the assistant text and the tool calls it
   issued. Each result text and each tool input is capped at `provider_tool_result_cap_tokens` x `chars_per_token` for
   the conversation's source, both from `tables/compaction.json` (8000 x 2.5 = 20000 chars for Claude Code, 8000 x 4 =
   32000 for Codex); the original length and a truncated flag are kept (labels need the content, one huge output or a
-  giant Write content must not fill the disk). Read back with `store.read_session(path) -> events.Session`.
+  giant Write content must not fill the disk). The input cap holds on the final serialized JSON: an input that
+  cannot fit even with its values shortened is stored as `{"_truncated_json": <head>}`. Read back with `store.read_session(path) -> events.Session`.
 - Retention: `CORTADOS_COMPACTION_RETENTION_DAYS` (default 14: nightly harvest plus a week of review; tools can print
   secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest sessions first.
-  Pruned at provider start and at most hourly after, in a background thread.
-- Failures: a write failure is logged with its reason and counted in `store.STORE.write_failures`; it never fails the
-  user's request (the reply is already in hand).
+  Pruned at provider start and at most hourly after. Each candidate is re-stat'ed just before deletion.
+- One writer: all store I/O (turn appends, shadow decisions, retention) runs on a single background writer thread
+  fed by a bounded queue (`QUEUE_MAX` = 1024 jobs), so retention never races a write and the request path only
+  enqueues. A full queue drops the record and counts it (`dropped`); it never blocks a request.
+- Failures: I/O failures (`write_failures`), drops (`dropped`) and jobs that could not be scheduled, such as a
+  writer thread that will not start (`schedule_failures`), are each logged with the reason and counted in
+  `store.STORE.stats()`. None of them is raised into the request, turn finalization or Registry cleanup (the reply
+  is already in hand).
 - Shadow pruning: when a conversation closes (drop, failure, idle reap) `compaction/prune.py` decides keep/drop for
-  every past tool call in a background thread and appends the decisions, with the chars/tokens they would have saved,
+  every past tool call on the store's writer thread and appends the decisions, with the chars/tokens they would have saved,
   to `$CORTADOS_HOME/compaction/decisions.jsonl` (0600). Each row carries a `gate`: the session's estimated tokens
   against the pruning start min(`start_cap_tokens`, `start_pct` x W) (`would_start`) and whether the drops free at
   least `min_freed_tokens` (`would_prune`), so labels can be joined later. W is `assumed_window_tokens` (200k) because
