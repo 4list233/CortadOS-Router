@@ -185,27 +185,141 @@ def holdout_key(holdout: list, fail_up: float, outward_at: float) -> str:
     return h.hexdigest()[:12]
 
 
-def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
-                     holdout_rows: int | None = None) -> tuple[bool, bool]:
-    """(promote, outcome_regression_checked). No bar → never promote (nothing beats nothing). Band accuracy may give up
-    to 3 points when under-routing improves, else holds within one request of noise; under-routing and outward recall
-    never regress. When held-out outcomes exist a valid outcome bar is REQUIRED, and on the SAME outcome holdout the
-    candidate may regress on neither outcome band accuracy nor outcome under-routing (strict, no slack — these are the
-    actual-task ground truth, so no degradation is allowed; Forest/Codex review 2026-10-25). A missing/failed outcome
-    baseline blocks promotion rather than defaulting to OK. A teacher holdout under MIN_TEACHER_HOLDOUT rows blocks promotion."""
-    if not bar:
-        return False, False
-    if holdout_rows is not None and holdout_rows < MIN_TEACHER_HOLDOUT:
-        return False, False
+# --- Promotion rule (Forest 2026-11-07: real-task outcomes count most) ---------------------------------------------
+# The smallest outcome holdout the outcome-led rule may rest on. At 50 tasks one task is 2 points, so the 5-point over-routing
+# drop below is at least three tasks, not one task of noise. Below it (or with no outcome holdout) the OLD rule applies unchanged:
+# never promote on teacher data alone under the looser teacher tolerance.
+MIN_OUTCOME_HOLDOUT = int(os.environ.get("CORTADOS_S1_MIN_OUTCOME_HOLDOUT", "50"))
+# The candidate must cut over-routing on real tasks by at least 5 points: the new rule trades teacher-holdout tolerance for a
+# real-task gain, so it needs a real gain, not a tie.
+OUTCOME_OVER_MIN_DROP = 0.05
+# Teacher under-routing may rise by at most 7 points over the live adapter (owner decision, Forest 2026-11-07: real-task outcomes
+# lead). The teacher's reading is a proxy that drifts from real outcomes, so it is tolerated up to a bound, not ignored (a bigger
+# rise is a real regression, whatever the outcomes say). 7, not 5: the Nov 5 candidate rose 6.4 points on teacher labels while
+# cutting real-task over-routing 51% -> 32% with no extra real-task under-routing.
+TEACHER_UNDER_MAX_RISE = 0.07
+# Outward recall is a fixed floor, not "never below live": core.resolve's hard rules already raise outward tasks regardless of S1,
+# so a small dip costs nothing; a floor still catches a collapse.
+OUTWARD_RECALL_FLOOR = 0.85
+# Float comparison tolerance only (rounded ratios like 0.116 - 0.066 must not miss a bound by 1e-17); not a policy slack.
+_EPS = 1e-9
+
+
+def _old_rule(c: dict, bar: dict, obar: dict | None, co: dict | None, has_outcome_holdout: bool) -> tuple[bool, list[dict]]:
+    """The rule before 2026-11-07, unchanged: band accuracy may give up 3 points when teacher under-routing improves, else
+    holds within one request of noise; teacher under-routing (1/n slack) and outward recall never regress vs live; when held-out
+    outcomes exist a valid outcome bar is REQUIRED and the candidate may regress on neither outcome band accuracy nor outcome
+    under-routing (strict, raw counts; Forest/Codex review 2026-10-25)."""
     slack = 1.0 / max(c["n"], 1)
     better_under = c["under_routed"] < bar["under_routed"]
-    acc_ok = c["band_accuracy"] >= bar["band_accuracy"] - (0.03 if better_under else slack)
+    acc_slack = 0.03 if better_under else slack
+    checks = [
+        {"check": "teacher band accuracy", "candidate": c["band_accuracy"], "live": bar["band_accuracy"],
+         "rule": f"candidate >= live - {acc_slack:.4f}", "ok": c["band_accuracy"] >= bar["band_accuracy"] - acc_slack},
+        {"check": "teacher under-routing", "candidate": c["under_routed"], "live": bar["under_routed"],
+         "rule": f"candidate <= live + {slack:.4f} (1/n)", "ok": c["under_routed"] <= bar["under_routed"] + slack},
+        {"check": "outward recall", "candidate": c["outward_recall"], "live": bar["outward_recall"],
+         "rule": "candidate >= live", "ok": c["outward_recall"] >= bar["outward_recall"]},
+    ]
     if has_outcome_holdout:
-        outcome_ok = bool(obar and co and co.get("n")) and _no_outcome_regression(co, obar)
+        ok = bool(obar and co and co.get("n")) and _no_outcome_regression(co, obar)
+        checks.append({"check": "outcome band accuracy and under-routing (raw counts)",
+                       "candidate": {k: (co or {}).get(k) for k in ("n", "band_hits", "under")},
+                       "live": {k: (obar or {}).get(k) for k in ("n", "band_hits", "under")},
+                       "rule": "no regression on either (strict); a missing outcome bar blocks", "ok": ok})
+    return all(ch["ok"] for ch in checks), checks
+
+
+def _new_rule(c: dict, bar: dict, obar: dict, co: dict) -> tuple[bool, list[dict]]:
+    """Outcome-led rule (Forest 2026-11-07). Callers guarantee both outcome grades carry raw counts and n >= MIN_OUTCOME_HOLDOUT."""
+    on, ln = co["n"], obar["n"]
+    c_under, l_under = co["under"] / on, obar["under"] / ln
+    c_over, l_over = co["over"] / on, obar["over"] / ln
+    o_slack = 1.0 / on
+    t_slack = 1.0 / max(c["n"], 1)
+    acc_slack = 0.03 if c["under_routed"] < bar["under_routed"] else t_slack   # the existing teacher accuracy slack
+    checks = [
+        {"check": "outcome under-routing", "candidate": round(c_under, 4), "live": round(l_under, 4),
+         "rule": f"candidate <= live + {o_slack:.4f} (1/n)", "ok": c_under <= l_under + o_slack + _EPS},
+        {"check": "outcome over-routing", "candidate": round(c_over, 4), "live": round(l_over, 4),
+         "rule": f"live - candidate >= OUTCOME_OVER_MIN_DROP {OUTCOME_OVER_MIN_DROP}", "ok": l_over - c_over >= OUTCOME_OVER_MIN_DROP - _EPS},
+        {"check": "outcome band accuracy", "candidate": round(co["band_hits"] / on, 4), "live": round(obar["band_hits"] / ln, 4),
+         "rule": "candidate >= live (raw counts, exact)", "ok": co["band_hits"] * ln >= obar["band_hits"] * on},
+        {"check": "teacher under-routing", "candidate": c["under_routed"], "live": bar["under_routed"],
+         "rule": f"candidate - live <= TEACHER_UNDER_MAX_RISE {TEACHER_UNDER_MAX_RISE}",
+         "ok": c["under_routed"] - bar["under_routed"] <= TEACHER_UNDER_MAX_RISE + _EPS},
+        {"check": "teacher band accuracy", "candidate": c["band_accuracy"], "live": bar["band_accuracy"],
+         "rule": f"candidate >= live - {acc_slack:.4f}", "ok": c["band_accuracy"] >= bar["band_accuracy"] - acc_slack - _EPS},
+        {"check": "outward recall", "candidate": c["outward_recall"], "live": bar["outward_recall"],
+         "rule": f"candidate >= OUTWARD_RECALL_FLOOR {OUTWARD_RECALL_FLOOR}", "ok": c["outward_recall"] >= OUTWARD_RECALL_FLOOR - _EPS},
+    ]
+    return all(ch["ok"] for ch in checks), checks
+
+
+def promotion_report(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
+                     holdout_rows: int | None = None) -> dict:
+    """The full promotion decision for the owner to read: {"promote", "outcome_regression_checked", "rule", "reason", "checks"}.
+    rule is "new" (outcome-led), "fallback" (the old rule, unchanged) or "blocked" (no bar / teacher holdout too small /
+    outcome holdout present but its metrics missing or invalid). The outward-recall floor is checked on every non-blocked path."""
+    if not bar:
+        return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
+                "reason": "no live bar to compare against (nothing beats nothing)", "checks": []}
+    if holdout_rows is not None and holdout_rows < MIN_TEACHER_HOLDOUT:
+        return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
+                "reason": f"teacher holdout {holdout_rows} rows < MIN_TEACHER_HOLDOUT {MIN_TEACHER_HOLDOUT}", "checks": []}
+    if has_outcome_holdout:
+        # Invalid outcome metrics block; they never fall back silently (Codex review 2026-11-08): a missing or None metric is a
+        # broken grade, not a small sample, and the teacher-only rule must not quietly decide in its place.
+        bad = _invalid_outcome_metrics(obar, co)
+        if bad:
+            return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
+                    "reason": f"outcome holdout present but outcome metrics invalid ({bad}): no promotion", "checks": []}
+    usable = bool(has_outcome_holdout and co["n"] >= MIN_OUTCOME_HOLDOUT and obar["n"] >= MIN_OUTCOME_HOLDOUT)
+    if usable:
+        promote, checks = _new_rule(c, bar, obar, co)
+        rule, reason = "new", f"outcome holdout n={co['n']} >= MIN_OUTCOME_HOLDOUT {MIN_OUTCOME_HOLDOUT}: real-task outcomes decide"
     else:
-        outcome_ok = True
-    promote = acc_ok and c["under_routed"] <= bar["under_routed"] + slack and c["outward_recall"] >= bar["outward_recall"] and outcome_ok
-    return promote, bool(has_outcome_holdout and obar and co and co.get("n"))
+        promote, checks = _old_rule(c, bar, obar, co, has_outcome_holdout)
+        if not has_outcome_holdout:
+            why = "no outcome holdout"
+        else:
+            why = f"outcome holdout n={co['n']} (live n={obar['n']}) < MIN_OUTCOME_HOLDOUT {MIN_OUTCOME_HOLDOUT}"
+        rule, reason = "fallback", why + ": old rule applied unchanged"
+    # The outward-recall floor holds on EVERY path (Codex review 2026-11-08): the old rule only compared against live, so a
+    # live adapter already below the floor let an equally weak candidate through.
+    if not any(ch["check"] == "outward recall" and "OUTWARD_RECALL_FLOOR" in ch["rule"] for ch in checks):
+        checks.append({"check": "outward recall floor", "candidate": c["outward_recall"], "live": bar["outward_recall"],
+                       "rule": f"candidate >= OUTWARD_RECALL_FLOOR {OUTWARD_RECALL_FLOOR}",
+                       "ok": c["outward_recall"] >= OUTWARD_RECALL_FLOOR - _EPS})
+    promote = promote and all(ch["ok"] for ch in checks)
+    return {"promote": promote, "outcome_regression_checked": bool(has_outcome_holdout),
+            "rule": rule, "reason": reason, "checks": checks}
+
+
+def _invalid_outcome_metrics(obar: dict | None, co: dict | None) -> str:
+    """'' when both outcome grades carry what their rule needs, else which metric is missing or invalid. n decides the rule;
+    the outcome-led rule (n >= MIN_OUTCOME_HOLDOUT on both) also needs `over`, the old rule only n, band_hits and under."""
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    for name, g in (("outcome bar", obar), ("candidate outcome grade", co)):
+        if not g:
+            return f"{name} missing"
+        # n must be a positive count: zero rows grades nothing, and every ratio divides by it.
+        if not (num(g.get("n")) and g["n"] > 0):
+            return f"{name} n={g.get('n')!r}"
+    need = ("band_hits", "under", "over") if min(obar["n"], co["n"]) >= MIN_OUTCOME_HOLDOUT else ("band_hits", "under")
+    for name, g in (("outcome bar", obar), ("candidate outcome grade", co)):
+        for k in need:
+            if not num(g.get(k)):
+                return f"{name} {k}={g.get(k)!r}" if k in g else f"{name} {k} missing"
+    return ""
+
+
+def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
+                     holdout_rows: int | None = None) -> tuple[bool, bool]:
+    """(promote, outcome_regression_checked); the rule and every check live in promotion_report."""
+    r = promotion_report(c, bar, obar, co, has_outcome_holdout, holdout_rows)
+    return r["promote"], r["outcome_regression_checked"]
 
 
 def promoted_bar_for_laya(holdout: list, fail_up: float) -> tuple[dict | None, str | None]:
@@ -353,8 +467,9 @@ def main() -> int:
     # Auto-promote purely on the no-regression bar (Forest 2026-10-25): a candidate goes live only if it does not regress
     # against the CURRENTLY PROMOTED model on under-routing, outward recall, band accuracy AND the outcome band, so the
     # live scorer can never get worse. No hold-first/arm ceremony — the bar alone guards every promotion.
-    report["promote"], report["outcome_regression_checked"] = promote_decision(
-        c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout), holdout_rows=len(holdout))
+    decision = promotion_report(c, bar, report.get("outcome_bar"), report.get("outcome"), bool(o_holdout), holdout_rows=len(holdout))
+    report["promote"], report["outcome_regression_checked"] = decision["promote"], decision["outcome_regression_checked"]
+    report["promotion_rule"] = {k: decision[k] for k in ("rule", "reason", "checks")}   # every check, value and rule, for the owner
     if len(holdout) < MIN_TEACHER_HOLDOUT:
         report["promote_blocked"] = (f"teacher holdout has {len(holdout)} Claude-labelled rows < {MIN_TEACHER_HOLDOUT} "
                                      "(CORTADOS_S1_MIN_HOLDOUT): too few to compare models; finish the holdout backfill")
@@ -367,7 +482,7 @@ def main() -> int:
         report["evaluation_unavailable"] = "; ".join(f"{k}: {v}" for k, v in errors.items())
     (out / "report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({k: report[k] for k in ("evaluation_status", "holdout_rows", "outcome_holdout_rows", "teacher_band_mix", "candidate",
-                                              "outcome", "outcome_bar", "incumbent", "promote") if k in report}, indent=1))
+                                              "outcome", "outcome_bar", "incumbent", "promote", "promotion_rule") if k in report}, indent=1))
     return 0
 
 
