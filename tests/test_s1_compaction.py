@@ -294,5 +294,97 @@ class DeadlineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 10)
 
 
+GRANDCHILD = """
+import fcntl, os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)      # a stubborn trainer: only the KILL after the grace stops it
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "a").write("%d\\n" % os.getpid())
+time.sleep(120)
+"""
+
+GATE_LIKE = """
+import os, subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", sys.argv[3], sys.argv[1], sys.argv[2]])
+open(sys.argv[2], "a").write("%d\\n" % os.getpid())
+time.sleep(120)
+"""
+
+DRIVER = """
+import sys
+from datetime import datetime
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import compaction_train as ct
+cmd = [sys.executable, "-c", sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[6]]
+sys.exit(ct.supervise(cmd, None, Path(sys.argv[5]), now_fn=datetime.now, poll_s=0.05, grace=2.0))
+"""
+
+
+class SignalTests(unittest.TestCase):
+    def test_sigterm_to_supervisor_stops_and_reaps_the_group(self):
+        import fcntl
+        import signal
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            lock, pids = os.path.join(d, "node.lock"), os.path.join(d, "pids")
+            sup = subprocess.Popen([sys.executable, "-B", "-c", DRIVER, str(S1), GATE_LIKE, lock, pids, d, GRANDCHILD])
+            try:
+                end = time.monotonic() + 15
+                while time.monotonic() < end:
+                    if os.path.exists(pids) and len(open(pids).read().split()) == 2:
+                        break
+                    time.sleep(0.05)
+                held = [int(x) for x in open(pids).read().split()]
+                self.assertEqual(len(held), 2)
+                fd = os.open(lock, os.O_RDWR)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                sup.send_signal(signal.SIGTERM)
+                self.assertEqual(sup.wait(timeout=30), 128 + signal.SIGTERM)
+                end = time.monotonic() + 10
+                alive = list(held)
+                while alive and time.monotonic() < end:
+                    alive = []
+                    for pid in held:
+                        try:
+                            os.kill(pid, 0)
+                            alive.append(pid)
+                        except ProcessLookupError:
+                            pass
+                    time.sleep(0.05)
+                self.assertEqual(alive, [], "descendants survived the supervisor's SIGTERM")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)    # acquirable now: no orphan holds the lock
+                os.close(fd)
+            finally:
+                if sup.poll() is None:
+                    sup.kill()
+                    sup.wait()
+
+    def test_second_signal_during_cleanup_still_reaps(self):
+        import signal
+        before = signal.getsignal(signal.SIGTERM)
+        child = FakeChild()
+        events = []
+
+        def fake_sleep(_s):
+            os.kill(os.getpid(), signal.SIGTERM)          # first stop request
+
+        def stop(c, *, grace):
+            os.kill(os.getpid(), signal.SIGTERM)          # more stop requests mid-cleanup must not abort it
+            os.kill(os.getpid(), signal.SIGINT)
+            events.append("stopped")
+            c.returncode = -15
+
+        child.wait = lambda timeout=None: events.append("reaped") or child.returncode
+        with redirect_stderr(StringIO()):
+            rc = ct.supervise(["gate"], None, Path("/nonexistent"), now_fn=datetime.now, popen=lambda *a, **k: child,
+                              stop=stop, sleep=fake_sleep, grace=1.0)
+        self.assertEqual(rc, 128 + signal.SIGTERM)
+        self.assertEqual(events, ["stopped", "reaped"])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+
 if __name__ == "__main__":
     unittest.main()

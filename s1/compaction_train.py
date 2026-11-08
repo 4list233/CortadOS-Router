@@ -11,6 +11,9 @@ Safety rails, each with its reason:
   At the deadline the child's process group gets overnight.stop_group_drained (CONT+TERM, re-sent TERMs, drain for
   TRAIN_STOP_GRACE_S, then KILL) and is reaped; checkpointed adapter files are kept; exit 124 with the reason. Without
   it a run started near 07:00, or queued behind the gate across it, would train into the day holding the Studio lock.
+- SIGTERM/SIGINT to this supervisor are latched by plain-flag handlers installed before the child is spawned; on a
+  stop the group gets the same stop_group_drained + reap (further signals during cleanup are ignored), exit
+  128+signum. Without them a launchd stop killed only the supervisor and orphaned the gate/trainer with the lock.
 - --data / --out are resolved to absolute paths once, before validation: the child runs with cwd=s1/, so a relative
   path validated against the caller's cwd would name a different directory there.
 - --dry-run prints the policy decision and the exact command, and trains nothing.
@@ -20,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -35,9 +39,38 @@ DEADLINE_RC = 124          # same code overnight.run_bounded returns for a windo
 POLL_S = 5.0               # deadline check interval: small against the 60 s stop grace, cheap
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+SIGNAL_POLL_S = 0.2        # how soon a latched stop signal is acted on
+
+
+class StopLatch:
+    """Plain-flag SIGTERM/SIGINT handlers, installed BEFORE the child is spawned. The handler only records the first
+    signal: it raises nothing, so a second signal during cleanup cannot interrupt stop_group_drained half way and orphan
+    the trainer with the Studio lock (the default SIGTERM action would kill this supervisor and leave the group running)."""
+
+    def __init__(self):
+        self.signum = None
+        self._old = {}
+
+    def _handler(self, signum, _frame):
+        if self.signum is None:
+            self.signum = signum
+
+    def __enter__(self):
+        for sig in STOP_SIGNALS:
+            self._old[sig] = signal.signal(sig, self._handler)
+        return self
+
+    def __exit__(self, *exc):
+        for sig, old in self._old.items():
+            signal.signal(sig, old)
+        return False
+
+
 def supervise(cmd: list[str], deadline: datetime | None, out: Path, *, now_fn, env=None, cwd=None,
               popen=subprocess.Popen, stop=None, sleep=None, poll_s: float = POLL_S, grace: float | None = None) -> int:
-    """Run the gated trainer in its own process group, bounded by `deadline` (None = unbounded, policy switch off)."""
+    """Run the gated trainer in its own process group, bounded by `deadline` (None = unbounded, policy switch off) and
+    by stop signals to this supervisor (exit 128+signum after the group is stopped and reaped)."""
     import time as _t
     import overnight
     stop = stop or overnight.stop_group_drained
@@ -46,25 +79,35 @@ def supervise(cmd: list[str], deadline: datetime | None, out: Path, *, now_fn, e
     if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
         print(f"compaction_train refused: window ended at {deadline}; nothing started", file=sys.stderr)
         return REFUSED
-    child = popen(cmd, cwd=cwd, env=env, start_new_session=True)
-    try:
-        while True:
-            rc = child.poll()
-            if rc is not None:
-                return rc
-            if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
-                break
-            sleep(poll_s)
-    except BaseException:
-        stop(child, grace=grace)   # SIGTERM/KeyboardInterrupt here must not orphan a trainer holding the lock
-        child.wait()
-        raise
-    stop(child, grace=grace)
-    child.wait()
-    kept = sorted(p.name for p in (out / "adapter").glob("*.safetensors")) if (out / "adapter").is_dir() else []
-    print(f"compaction_train stopped: night window ended at {deadline}; whole group stopped and reaped; "
-          f"checkpoints kept: {', '.join(kept) or 'none'}", file=sys.stderr)
-    return DEADLINE_RC
+    with StopLatch() as latch:
+        if latch.signum is not None:
+            return 128 + latch.signum
+        child = popen(cmd, cwd=cwd, env=env, start_new_session=True)
+        why = None
+        try:
+            while True:
+                rc = child.poll()
+                if rc is not None:
+                    return rc
+                if latch.signum is not None:
+                    why = "signal"
+                    break
+                if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
+                    why = "deadline"
+                    break
+                sleep(min(poll_s, SIGNAL_POLL_S))
+        finally:
+            if child.poll() is None or why is not None:
+                stop(child, grace=grace)   # also on an unexpected exception: never leave the group holding the lock
+                child.wait()
+        kept = sorted(p.name for p in (out / "adapter").glob("*.safetensors")) if (out / "adapter").is_dir() else []
+        if why == "signal":
+            print(f"compaction_train stopped: signal {latch.signum}; whole group stopped and reaped; "
+                  f"checkpoints kept: {', '.join(kept) or 'none'}", file=sys.stderr)
+            return 128 + latch.signum
+        print(f"compaction_train stopped: night window ended at {deadline}; whole group stopped and reaped; "
+              f"checkpoints kept: {', '.join(kept) or 'none'}", file=sys.stderr)
+        return DEADLINE_RC
 
 
 def plan(data: Path, out: Path, cfg: dict, *, base: str, py: str) -> list[str]:
