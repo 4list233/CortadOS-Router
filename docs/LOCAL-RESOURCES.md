@@ -149,7 +149,7 @@ stale capacity.
 
 A node with an `ollama` block offers its Ollama models to the provider as `sub/<alias or tag>` pins
 (`cortados_router/provider/local_lane.py`). The provider reads the same file as the sampler,
-`CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's block.
+`CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's and the Studio's blocks (placeholders).
 
 | key | meaning |
 | --- | --- |
@@ -193,6 +193,23 @@ tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
   connect (3 s), each read (300 s), an idle client socket (30 s) and, as absolute deadlines a trickling client cannot extend, the
   headers (10 s), the body (120 s) and the drain of a refused body (5 s, then closed without the 401); every limit must
   be a finite positive number; logs method, path and status only, never the token or a body.
+
+**Power and switch check on every node.** Before forwarding, the gate calls `pro_local_allowed()` (AC power + the
+local-enabled flag). Despite the name it runs on any node that runs the gate, the Studio included: a Studio on AC with
+the flag on passes it; turning the flag off takes that node's lane down.
+
+**S1 training hold (Studio).** S1 training holds the node through the lease/ack handshake of
+`cortados_router/studio_capacity.py` (`training_gate` writes intents in `$CORTADOS_HOME/studio-gate`). While any live
+intent exists there, the gate refuses every forwarded request with a 503 ("S1 training in progress"), so a pin never
+loads a model beside the trainer; it serves again once the intent is removed or expires. A missing directory means no
+trainer has run (free); a directory the gate cannot read is a 503 (fail closed). The reason names no path or pid.
+Override the directory with `--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. On the trainer side, when the
+capacity daemon does not ack in time, `training_gate` itself unloads EVERY model `/api/ps` lists (`keep_alive=0` each)
+and refuses to start training if any remains.
+
+**Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
+uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the
+provider admits get truncated by Ollama. The gate does not check this at startup.
 
 A launchd template is `integrations/local-gate/com.cortados.local-gate.plist` (RunAtLoad + KeepAlive; placeholders
 only). Check a setup with `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` (validates the
