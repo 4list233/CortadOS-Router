@@ -82,11 +82,23 @@ def has_side_effect(e: ToolEvent) -> bool:
     return bool(c and SIDE_EFFECT_COMMAND.search(c))
 
 
+def _strings(v: Any) -> Iterable[str]:
+    """Every string leaf of a tool input, decoded. Searching the JSON dump instead would hide reuse behind escapes:
+    an Edit old_string quoting a line with `"` or `\\` appears as `\\"` / `\\\\` in JSON and no longer matches."""
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for k in sorted(v, key=str):
+            yield from _strings(v[k])
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            yield from _strings(x)
+    elif v is not None and not isinstance(v, bool):
+        yield str(v)
+
+
 def _input_text(e: ToolEvent) -> str:
-    try:
-        return json.dumps(e.input, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(e.input)
+    return "\n".join(_strings(e.input))
 
 
 def distinctive_lines(text: str) -> list[str]:

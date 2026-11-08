@@ -101,6 +101,21 @@ class LabelTests(unittest.TestCase):
                       [("user", "u"), ("assistant", "a"), ("assistant", "b")] + FILLER)
         self.assertFalse(r[0]["needed_result"])
 
+    def test_quote_with_quotes_and_backslashes_in_edit_input(self):
+        line = 'pattern = re.compile(r"\\d+\\s*\"quoted\"")  # a regex line with escapes in it'
+        r = self.rows([ev(0, 1, "Read", {"file_path": "/a/re.py"}, "x\n" + line + "\n"),
+                       ev(1, 2, "Edit", {"file_path": "/a/re.py", "old_string": line, "new_string": "y"}, "ok")],
+                      [("user", "u"), ("assistant", "a"), ("assistant", "b")] + FILLER)
+        self.assertTrue(r[0]["needed_result"])
+        self.assertEqual(r[0]["evidence"][0]["rule"], "quote")
+        self.assertEqual(r[0]["evidence"][0]["index"], 1)
+
+    def test_identifier_in_nested_input_list(self):
+        r = self.rows([ev(0, 1, "Bash", {"command": "git log -1"}, 'commit "9fe1b29c0ffee"'),
+                       ev(1, 2, "Tool", {"args": [{"ref": "9fe1b29c0ffee\\x"}]}, "ok")],
+                      [("user", "u"), ("assistant", "a"), ("assistant", "b")] + FILLER)
+        self.assertEqual(r[0]["evidence"][0]["rule"], "identifier")
+
     def test_target_kinds(self):
         self.assertEqual(target(ev(0, 0, "Grep", {"pattern": " a  b "})), ("query", "grep:a b"))
         self.assertIsNone(target(ev(0, 0, "Other", {"x": 1})))
