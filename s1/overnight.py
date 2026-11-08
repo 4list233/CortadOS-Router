@@ -11,10 +11,21 @@ gpu_alone under CORTADOS_S1_CONTINUOUS=1); a guard SIGSTOPs the work process gro
   - free memory (vm_stat free+inactive+speculative) < CORTADOS_S1_MIN_FREE_GB (default 8),
 and SIGCONTs it after RESUME_AFTER consecutive good probes. Latency = wall time of a fixed short POST /score probe (serve.py does
 not log per-request latency), at most every CORTADOS_S1_PROBE_S (default 30) s; the baseline is the median of probes taken while
-the tree is paused or no cycle is running."""
+the tree is paused or no cycle is running.
+
+Training only in the night window (Forest 2026-11-08): CORTADOS_S1_TRAIN_ONLY_IN_WINDOW (default "1"; "0" = train any time).
+Labeling and the dataset refresh run all day; the Studio-heavy gated steps (LoRA, MLX preflight, Laya, evaluation) run only
+inside CORTADOS_S1_NIGHT_WINDOW, so the Studio's local Ollama model is free during the day. Each cycle gets
+CORTADOS_S1_TRAIN_ALLOWED=1/0 (+ CORTADOS_S1_TRAIN_SKIP_REASON); nightly.sh skips every gated step when it is 0, ends rc 0, and
+the cycle is idle (sleeps CORTADOS_S1_CYCLE_IDLE_S) unless labels were added. An invalid window, or "off", means no training
+(fail closed). A cycle allowed to train is stopped when the window ends (group SIGTERM, TRAIN_STOP_GRACE_S, then SIGKILL); the
+trainer's checkpoints stay, and the next cycle starts at once (it labels, then skips training until the next window); nightly.sh
+carries that run folder across nights and resumes it from its newest checkpoint (cross-night resume).
+The window-end stop ends the whole cycle, including any labeling still running; the next cycle redoes it at once.
+The window is read once per cycle at its start: a cycle begun just before the window opens does not train; the next one does."""
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 import os
 from pathlib import Path
 import signal
@@ -49,7 +60,13 @@ def signal_group(pid: int, sig: int) -> None:
         pass
 
 
-def run_bounded(command: list[str], seconds: float, *, grace: float = 20, pidfile: Path | None = None) -> int:
+# Grace between any supervisor SIGTERM (window end, deadline, launchd stop/restart) and SIGKILL. Longer than studio_capacity's
+# TRAINING_STOP_GRACE_SECONDS (30 s), so the gate can TERM/KILL its own training group and nightly.sh's EXIT trap can run
+# before this supervisor escalates to KILL (a shorter grace orphans the trainer with the node lock held).
+TRAIN_STOP_GRACE_S = 60.0
+
+
+def run_bounded(command: list[str], seconds: float, *, grace: float = TRAIN_STOP_GRACE_S, pidfile: Path | None = None) -> int:
     if seconds <= 0:
         print("nightly: outside 01:30–07:00 Toronto; nothing started", flush=True)
         return 0
@@ -60,22 +77,13 @@ def run_bounded(command: list[str], seconds: float, *, grace: float = 20, pidfil
             return child.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
             print("nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints", flush=True)
-            signal_group(child.pid, signal.SIGTERM)
-            try:
-                child.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                signal_group(child.pid, signal.SIGKILL)
-                child.wait()
-            # The shell can exit before its grandchildren; never leave the trainer behind.
-            signal_group(child.pid, signal.SIGKILL)
+            # Drain the whole group (the shell can exit before its grandchildren, e.g. the studio gate stopping its trainer).
+            stop_group_drained(child, grace=grace)
             return 124
     except BaseException:
-        signal_group(child.pid, signal.SIGTERM)
-        try:
-            child.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            signal_group(child.pid, signal.SIGKILL)
-            child.wait()
+        # launchd unload/restart (SIGTERM -> KeyboardInterrupt): same drain, or the gate is killed mid-stop and its trainer
+        # is orphaned holding the studio lock.
+        stop_group_drained(child, grace=grace)
         raise
     finally:
         if pidfile is not None and child.poll() is not None:
@@ -112,12 +120,30 @@ def parse_night_window(text: str) -> tuple[time, time] | None:
     return start, end
 
 
-def in_night_window(window: tuple[time, time] | None, now: datetime) -> bool:
-    """True when the local wall time of `now` is in [start, end); handles windows crossing midnight."""
+# The zone the night window is read in. A named zone (not datetime.now().astimezone(), which is a FIXED offset) so window starts,
+# ends and deadlines follow DST: with a fixed offset a 01:30 EST start on 2027-03-14 got an 08:00 EDT deadline, and a fall-back
+# night stopped an hour early. The Studio is in Toronto. Tests inject another zone through the `zone` keyword arguments.
+NIGHT_ZONE = TORONTO
+
+
+def _wall(now: datetime, zone) -> datetime:
+    """`now` as local wall time in `zone`: aware datetimes are converted; naive ones are already local wall time."""
+    return now.astimezone(zone) if now.tzinfo is not None else now
+
+
+def _at(day, t: time, zone, aware: bool) -> datetime:
+    """Local wall time `t` on `day` in `zone`, aware (absolute instant) when the caller works in aware datetimes."""
+    dt = datetime.combine(day, t)
+    return dt.replace(tzinfo=zone) if aware else dt
+
+
+def in_night_window(window: tuple[time, time] | None, now: datetime, *, zone=None) -> bool:
+    """True when the local wall time of `now` (in `zone`, default NIGHT_ZONE) is in [start, end); handles windows crossing
+    midnight."""
     if window is None:
         return False
     start, end = window
-    t = now.time().replace(tzinfo=None)
+    t = _wall(now, zone or NIGHT_ZONE).time().replace(tzinfo=None)
     return start <= t < end if start < end else (t >= start or t < end)
 
 
@@ -151,8 +177,55 @@ def _env_night_window() -> tuple[time, time] | None:
         return parse_night_window(DEFAULT_NIGHT_WINDOW)
 
 
+def _next_start(window: tuple[time, time], now: datetime, *, zone=None) -> datetime:
+    """The next time `window` starts (today or tomorrow, local wall time in `zone`). Aware `now` -> aware result in `zone`."""
+    zone = zone or NIGHT_ZONE
+    local = _wall(now, zone)
+    day = local.date() if local.time().replace(tzinfo=None) < window[0] else local.date() + timedelta(days=1)
+    return _at(day, window[0], zone, now.tzinfo is not None)
+
+
+def _window_end(window: tuple[time, time], now: datetime, *, zone=None) -> datetime:
+    """The end of the window `now` is inside (assumes in_night_window(window, now)): the end's local wall time in `zone` on the
+    right date (tomorrow when the window crosses midnight and `now` is before it), built on that date so it carries that date's
+    UTC offset. Aware `now` -> aware result, so the caller compares absolute instants."""
+    zone = zone or NIGHT_ZONE
+    local = _wall(now, zone)
+    day = local.date() if local.time().replace(tzinfo=None) < window[1] else local.date() + timedelta(days=1)
+    return _at(day, window[1], zone, now.tzinfo is not None)
+
+
+def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: str | None = None, zone=None
+                 ) -> tuple[bool, str, datetime | None]:
+    """(training allowed, reason, deadline) for a cycle starting at local wall time `now`. Reuses parse_night_window /
+    in_night_window (one window implementation). Unlike the latency budget, an invalid window FAILS CLOSED here: training
+    all day on a typo is exactly what the switch exists to prevent. deadline is the window end (None = no deadline)."""
+    switch = (os.environ.get("CORTADOS_S1_TRAIN_ONLY_IN_WINDOW", "1") if switch_raw is None else switch_raw).strip()
+    if switch == "0":
+        return True, "CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=0: training allowed any time", None
+    if switch != "1":
+        print(f"overnight: CORTADOS_S1_TRAIN_ONLY_IN_WINDOW={switch!r} is not 0 or 1; using 1 (train only in the window)",
+              flush=True)
+    raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW", "") if window_raw is None else window_raw
+    raw = raw.strip() or DEFAULT_NIGHT_WINDOW
+    try:
+        window = parse_night_window(raw)
+    except ValueError as e:
+        return False, f"training skipped: CORTADOS_S1_NIGHT_WINDOW invalid ({e}); no training until it is fixed", None
+    if window is None:
+        return False, ("training skipped: CORTADOS_S1_NIGHT_WINDOW is off and CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=1; "
+                       "set CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=0 to train any time"), None
+    s, e = window
+    if in_night_window(window, now, zone=zone):
+        return True, f"inside night window {s:%H:%M}-{e:%H:%M}: training allowed", _window_end(window, now, zone=zone)
+    return False, (f"training skipped: outside night window {s:%H:%M}-{e:%H:%M}; "
+                   f"next window starts {_next_start(window, now, zone=zone).strftime('%Y-%m-%d %H:%M %Z').strip()}"), None
+
+
+
+
 def _local_now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(NIGHT_ZONE)   # aware, named zone; compare deadlines with deadline_reached (UTC), not >= (wall time)
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None, above: float | None = None) -> float:
@@ -521,16 +594,97 @@ class Guard:
                          + (f", free memory {mem:.1f} GB" if mem is not None else ""))
 
 
-def stop_tree(child, *, grace: float = 20) -> None:
-    """SIGCONT first (a stopped process cannot handle TERM), then TERM so nightly.sh/the trainer save checkpoints, then KILL."""
-    signal_group(child.pid, signal.SIGCONT)
-    signal_group(child.pid, signal.SIGTERM)
+def stop_tree(child, *, grace: float = TRAIN_STOP_GRACE_S) -> None:
+    """SIGCONT first (a stopped process cannot handle TERM), then TERM so nightly.sh/the trainer save checkpoints, then KILL
+    whatever of the group is left after `grace`. One implementation: stop_group_drained (waits for the whole group, not just
+    the shell leader)."""
+    stop_group_drained(child, grace=grace)
+
+
+# Poll interval while waiting for a TERMed group to drain: short against the 60 s grace, cheap (one kill(2) per poll).
+DRAIN_POLL_S = 0.1
+
+
+# Seen on Darwin: killpg answers EPERM for a group whose leader is exiting but not yet waitable; that window is milliseconds.
+EPERM_SETTLE_S = 1.0
+
+
+def _zombie_only(child, err: PermissionError) -> bool:
+    """The one EPERM rule for every killpg on a cycle group. Darwin answers EPERM (not ESRCH) when every remaining member is a
+    zombie (seen with the just-exited leader not yet reaped): nothing in the group can run any more, so it has drained. Same uid,
+    so EPERM cannot hide a live member of ours; but if the leader is still running the group is NOT zombie-only and the EPERM is
+    a genuine error, so it is re-raised. A leader that is mid-exit (TERM just landed) also answers EPERM before it is
+    reapable, so the leader gets EPERM_SETTLE_S to become a zombie before the EPERM counts as genuine. On True it is reaped."""
     try:
-        child.wait(timeout=grace)
+        child.wait(timeout=EPERM_SETTLE_S)
     except subprocess.TimeoutExpired:
-        signal_group(child.pid, signal.SIGKILL)
+        raise err from None
+    # The leader exiting does not prove the rest of the group is zombie-only: a live member we cannot signal also answers EPERM.
+    # Ask ps for the group's members and treat the EPERM as "drained" only when every one left is a zombie (Codex review r3).
+    live = _live_group_members(child.pid)
+    if live:
+        raise PermissionError(err.errno, f"{err.strerror}: group {child.pid} still has live members {live}") from err
+    return True
+
+
+def _live_group_members(pgid: int) -> list[int]:
+    """Pids in process group `pgid` that are not zombies, from `ps -A -o pid=,pgid=,stat=`. A ps failure raises: guessing
+    "drained" here could leave training running with the node lock held."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True, timeout=10).stdout
+    live = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == str(pgid) and not parts[2].startswith("Z"):
+            live.append(int(parts[0]))
+    return live
+
+
+def send_group_drained(child, sig: int) -> bool:
+    """killpg(child's group, sig). Returns True when the group has already drained (ESRCH, or EPERM on a zombie-only group,
+    see _zombie_only), with the leader reaped; False when the signal was delivered. Any other error propagates."""
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
         child.wait()
-    signal_group(child.pid, signal.SIGKILL)   # grandchildren can outlive the shell
+        return True
+    except PermissionError as e:
+        return _zombie_only(child, e)
+    return False
+
+
+def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clock=_time.monotonic,
+                       sleep=_time.sleep) -> bool:
+    """Window-end stop: SIGCONT + SIGTERM the cycle's group, then wait for the WHOLE group to drain (not just the shell leader)
+    for up to `grace`, and only then SIGKILL survivors. stop_tree's KILL right after the leader exits killed studio_capacity's gate
+    wrapper while it was still stopping its separately grouped trainer: the trainer was orphaned and kept the inherited LOCK_EX.
+    Every send (CONT, TERM, the 0 probe, the final CONT/KILL) goes through send_group_drained, so a group that is already
+    zombie-only at any point ends the stop normally instead of raising.
+    Returns True when the group drained within the grace, False when survivors were killed."""
+    pgid = child.pid
+    if send_group_drained(child, signal.SIGCONT) or send_group_drained(child, signal.SIGTERM):
+        return True
+    end = clock() + grace
+    while True:
+        child.poll()   # reap the leader: an unreaped zombie leader would keep the group "alive" to kill(pgid, 0)
+        if send_group_drained(child, 0):
+            return True
+        if clock() >= end:
+            break
+        sleep(poll_s)
+    print(f"overnight: cycle group {pgid} still running {grace:g}s after TERM; sending KILL", flush=True)
+    if send_group_drained(child, signal.SIGKILL):
+        return True
+    child.wait()
+    return False
+
+
+def deadline_reached(now: datetime, deadline: datetime) -> bool:
+    """now >= deadline as instants. Aware datetimes sharing one ZoneInfo compare by WALL time and ignore fold, so during the
+    repeated fall-back hour 01:30 EDT (fold=0) and 01:30 EST (fold=1) compare equal; going through UTC compares real instants.
+    Naive datetimes (tests' fixed clocks) compare as they are; mixing naive and aware still raises TypeError."""
+    if now.tzinfo is None or deadline.tzinfo is None:
+        return now >= deadline
+    return now.astimezone(timezone.utc) >= deadline.astimezone(timezone.utc)
 
 
 RESULT_MARKERS = ("worked", "quota")
@@ -552,8 +706,9 @@ def _read_result(result_file: Path) -> str:
     return "idle"
 
 
-def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
-              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None) -> tuple[int, str]:
+def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = TRAIN_STOP_GRACE_S,
+              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
+              grace_end: float = TRAIN_STOP_GRACE_S) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
     guard.stop_seen is set when stopflag existed at any poll of this cycle (and after the child exits), so an operator who
     removes it during the TERM grace (to resume) is still read as a stop, not as a failure. Residual race: a flag created
@@ -578,22 +733,39 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
             # The file name only: status alerts reach the dashboard and handbacks; the full path (account name) is logged above.
             guard.alerter("cycle_result_stuck", f"cannot remove {result_file.name} ({type(e).__name__}); cycle results may be a "
                           "cycle old: 'worked' is read as idle, 'quota' still cools down")
+    allowed, why, deadline = train_policy(guard.wall())
+    print(f"overnight: {why}", flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
-               CORTADOS_S1_CYCLE_RESULT=str(result_file))
+               CORTADOS_S1_CYCLE_RESULT=str(result_file), CORTADOS_S1_TRAIN_ALLOWED="1" if allowed else "0",
+               CORTADOS_S1_TRAIN_SKIP_REASON="" if allowed else why)
     guard.new_cycle()
     child = subprocess.Popen(command, env=env, start_new_session=True)
+    window_ended = False
     try:
         while child.poll() is None:
             watch_stop()
+            if deadline is not None and deadline_reached(guard.wall(), deadline):
+                # The deadline lives here, not in nightly.sh: this supervisor already owns the window and group signalling, and
+                # the gate (studio_capacity) forwards our TERM to its own training group. The whole cycle ends; the next one
+                # starts at once, labels, and skips training until the next window. mlx_lm checkpoints (save-every 100) stay.
+                print(f"overnight: night window ended at {deadline:%H:%M}; stopping this cycle's training "
+                      f"(TERM, {grace_end:g}s grace, then KILL); checkpoints are kept", flush=True)
+                window_ended = True
+                stop_group_drained(child, grace=grace_end)
+                break
             guard.tick(child.pid)
             sleep(poll_s)
         watch_stop()
     except BaseException:
-        stop_tree(child, grace=grace)
+        # launchd stop/restart of com.cortados.s1-continuous (every deploy) arrives here as SIGTERM -> KeyboardInterrupt.
+        stop_group_drained(child, grace=grace)
         raise
     finally:
         # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped.
-        guard.signaller(child.pid, signal.SIGCONT)
+        try:
+            guard.signaller(child.pid, signal.SIGCONT)
+        except PermissionError as e:
+            _zombie_only(child, e)   # zombie-only group (leader gone): nothing left to continue; a live leader re-raises
         guard.new_cycle()
         if pidfile is not None and child.poll() is not None:
             try:
@@ -603,6 +775,8 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 pass
             except OSError as e:
                 print(f"overnight: cannot clear pidfile {pidfile} ({e})", flush=True)
+    if window_ended:
+        return child.returncode, "window_end"
     result = _read_result(result_file)
     if stale and result == "worked":
         # A stale 'worked' would relaunch at once forever: degrade it to idle. 'quota' is honoured even if stale, because
@@ -731,6 +905,12 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
         if rc == 130 and (stopflag is None or guard.stop_seen or stopflag.exists()):
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
+        if result == "window_end":
+            # Not a failure: we stopped it on purpose. No sleep: the next cycle sees the window closed and only labels.
+            print(f"overnight: cycle {n} stopped at the night-window end (rc {rc}); next cycle at once", flush=True)
+            _save_failures(result_file, 0)
+            failures = 0
+            continue
         if rc == 130:   # TERM from someone other than --stop (e.g. pkill -f nightly.sh): a hand-run supervisor must survive it
             print(f"overnight: cycle {n} ended 130 without a stop flag (external TERM); treating as a failure", flush=True)
         delay, failures = next_delay(rc, result, idle_s, failures, quota_s)

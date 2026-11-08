@@ -37,6 +37,9 @@
 #   python3 <repo>/s1/overnight.py --continuous -- /bin/bash <repo>/s1/nightly.sh
 # which loops cycles with no window/deadline, keeps the scorer up, and pauses this tree on scorer latency / low memory.
 #   CORTADOS_S1_MIN_LEFT_PCT    label.py --min-left-pct per-account quota floor (default 15, Forest 2026-11-03)
+#   CORTADOS_S1_TRAIN_ONLY_IN_WINDOW  continuous mode: gated training/eval only inside CORTADOS_S1_NIGHT_WINDOW (default 1;
+#                               0 = any time; Forest 2026-11-08). overnight.py decides per cycle and passes CORTADOS_S1_TRAIN_ALLOWED
+#                               (0 = label/dataset only, every gated step skipped, rc 0) and stops the cycle at the window end.
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -197,11 +200,15 @@ trained_unevaluated_runs() {   # runs whose training completed but that have no 
     [ -f "$d/segment-target" ] && [ -f "$d/adapter/adapters.safetensors" ] && [ ! -f "$d/report.json" ] && echo "$d"
   done
 }
-newest_unfinished_run() {   # most recent run that began a training segment but never wrote a report
+newest_unfinished_run() {   # most recent run stopped mid-training: a segment began, checkpoints exist, no final adapter, no report
+  # A run with the final adapters.safetensors is trained-but-unevaluated (the pending/recovery path's, see trained_unevaluated_runs),
+  # not resumable. It is skipped HERE, inside the search, so an older interrupted run behind it is still found; rejecting it after
+  # the search (as before) returned nothing, the older run was not carried, and the retention pass deleted its checkpoints.
   local d
   for d in $(ls -td runs/20*/ 2>/dev/null); do
     d=${d%/}
-    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
+    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && [ ! -f "$d/adapter/adapters.safetensors" ] \
+      && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
   done
 }
 prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfinished runs' checkpoints (~0.65 GB each) are dead weight
@@ -223,9 +230,22 @@ if [ -d "$RUN/adapter" ] && [ -f "$RUN/report.json" ]; then   # a finished run i
   # steps; resume the newest unfinished run instead, and start a new folder only when there is none.
   RUN=$(newest_unfinished_run); [ -n "$RUN" ] || RUN="runs/$(date +%Y-%m-%d)-$(date +%H%M)"
 fi
+# Cross-night resume (continuous mode, Forest 2026-11-08): training only runs in the night window and overnight.py stops it at the
+# window end, so a LoRA segment longer than one window spans nights. Each night gets a new runs/<date> folder, and without this the
+# retention pass below would delete the previous night's checkpoints, so such a run would never finish. When CORTADOS_S1_RUN is unset
+# and today's folder has not started training, carry on in the newest run stopped mid-LoRA (checkpoints, segment-target, no final
+# adapters.safetensors, no report: a completed-but-unevaluated run is the pending/recovery path's, not this one's). It becomes $RUN,
+# which prune_unresumable_runs always keeps. Rule for older unfinished runs: only the newest is resumed (no age limit); every
+# other unfinished, unpromoted, non-pending run loses its checkpoints in the retention pass, as before.
+CARRIED=""
+if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && [ -z "${CORTADOS_S1_RUN:-}" ] && [ ! -d "$RUN/adapter" ] && [ ! -f "$RUN/report.json" ]; then
+  carry=$(newest_unfinished_run)
+  if [ -n "$carry" ] && [ "$carry" != "$RUN" ]; then CARRIED="$RUN"; RUN="$carry"; fi
+fi
 mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
+[ -n "$CARRIED" ] && echo "cross-night resume: $CARRIED has not started; continuing the unfinished run $RUN from its checkpoints"
 [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 # Recovery (2026-11-03: evaluation TERMed at 07:00 left runs/2026-11-03 trained, unevaluated and unmarked, so the next night pruned
 # it and retrained from step 0, forever). A trained, unevaluated run with no pending marker is adopted as evaluation_pending BEFORE
@@ -293,7 +313,12 @@ GATE_ROOT="$(cd .. && pwd)"   # repo root, fixed here: gated also runs from insi
 case "$PY" in /*) GATE_PY="$PY" ;; */*) GATE_PY="$(cd "$(dirname "$PY")" 2>/dev/null && pwd)/$(basename "$PY")" || GATE_PY="$PY" ;; *) GATE_PY="$PY" ;; esac
 # Test-only: CORTADOS_STUDIO_ACK_WAIT / CORTADOS_STUDIO_OLLAMA_PORT (see studio_capacity.py) pass through the environment.
 # Exit 75 = the gate refused (model residency could not be confirmed absent); the command did not run.
-gated() { PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"; }
+# CORTADOS_S1_TRAIN_ALLOWED=0 (set by overnight.py outside the night window) is enforced again here so no gated step can slip
+# through a future code path; the main flow exits before the first gated step, so reaching this refusal is a bug, not a skip.
+gated() {
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ] && { echo "gated step refused: ${CORTADOS_S1_TRAIN_SKIP_REASON:-training not allowed now}"; return 75; }
+  PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"
+}
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
@@ -476,6 +501,12 @@ fi
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
 # Re-evaluation always grades against today's holdout and incumbent (an earlier approval may be stale). New SFT data supersedes it.
+# Night-window training (Forest 2026-11-08): everything below may run a gated (Studio-heavy) step, so outside the window the cycle
+# ends here with rc 0 after labeling and the dataset refresh. Not a failure; overnight.py sleeps the idle interval unless labels grew.
+if [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ]; then
+  echo "${CORTADOS_S1_TRAIN_SKIP_REASON:-training skipped: outside the night window}"
+  echo "=== $(date) nightly end"; exit 0
+fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
   # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one
@@ -490,8 +521,8 @@ if read_pending; then
   elif [ "$p_sft" = "$sft_hash" ] || [ "$p_reason" = evaluation_pending ]; then
     # Convergence: a night with an evaluation_pending candidate spends itself on that evaluation (it starts right after labeling,
     # ~02:45, so 110 min fits) and ends; the next night trains on the newer data. Only a run whose training COMPLETED is protected
-    # this way: mid-training progress on a non-completed run resumes only within its own run folder (segment-target / iters-base),
-    # not across date folders, so a training run cut off before completion is redone by a later night's run.
+    # this way. Mid-training progress on a non-completed run resumes within its own run folder (segment-target / iters-base); in
+    # continuous mode that folder is carried across nights (cross-night resume above), in window mode it is not.
     # Only when the data is unchanged does a verdict mark it trained (mark_trained): newer labels were never trained on.
     # Every rewrite of this marker below keeps "$p_sft", the data the candidate was TRAINED on (or recovery's deliberate
     # "unknown"): stamping tonight's hash would claim it saw labels it never trained on, and a later verdict would then mark them trained.
