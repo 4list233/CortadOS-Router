@@ -1,9 +1,15 @@
+import fcntl
 import json
 import os
+import signal
+import sys
+import stat
 import time
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 import urllib.error
 from unittest.mock import patch
 
@@ -380,7 +386,7 @@ class HandshakeTests(unittest.TestCase):
         self.intent()
         (self.gate / ("ack-%s.json" % N1)).write_text("{}")
         self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: p not in self.dead), [])
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_invalid_intent_schema_takes_malformed_path(self):
         good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
@@ -430,6 +436,10 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(len(c.live_intents(self.gate, time.time())), 1)
         self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1), [])
 
+    def leftovers(self):
+        """Handshake files left in the gate dir; node.lock is permanent by design."""
+        return sorted(p.name for p in self.gate.iterdir() if p.name != c.NODE_LOCK_NAME) if self.gate.exists() else []
+
     def gate_ctx(self, **kw):
         clock = [0.0]
         def sleep(seconds):
@@ -450,9 +460,10 @@ class HandshakeTests(unittest.TestCase):
         with ctx as intent_path:
             self.assertFalse(self.loaded)
             self.assertTrue(intent_path.exists())
-        self.assertIn("daemon acked", self.logs[-1])
+        self.assertTrue(any("daemon acked" in line for line in self.logs))
+        self.assertIn("confirmed no model resident", self.logs[-1])
         self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
-        self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
+        self.assertEqual(self.leftovers(), [])  # intent + ack removed
 
     def test_daemon_dead_model_resident_trainer_unloads(self):
         # A daemon killed right after a renewal leaves the model resident for a
@@ -464,7 +475,7 @@ class HandshakeTests(unittest.TestCase):
         self.assertGreaterEqual(clock[0], c.ACK_WAIT_SECONDS)
         self.assertTrue(any("not running" in line for line in self.logs))
         self.assertIn("confirmed", self.logs[-1])
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_daemon_dead_unload_unconfirmed_refuses(self):
         def stuck(path, payload=None):
@@ -473,7 +484,7 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(c.GateRefused):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_ollama_not_running_proceeds_with_log(self):
         def refused(path, payload=None):
@@ -490,7 +501,7 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(c.GateRefused):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_live_daemon_without_ack_trainer_unloads_itself(self):
         c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
@@ -508,14 +519,152 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_fallback_unloads_every_loaded_model(self):
+        resident = {c.MODEL, "huihui-other:latest", "third:q4"}
+        def api(path, payload=None):
+            self.calls.append((path, payload))
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["keep_alive"] == 0:
+                resident.discard(payload["model"])
+            return {}
+        ctx, _ = self.gate_ctx(api=api)
+        with ctx:
+            self.assertEqual(resident, set())
+        unloaded = {p["model"] for path, p in self.calls if path == "/api/generate"}
+        self.assertEqual(unloaded, {c.MODEL, "huihui-other:latest", "third:q4"})
+        self.assertIn("confirmed", self.logs[-1])
+
+    def test_fallback_refuses_if_any_model_remains(self):
+        resident = {c.MODEL, "stuck:latest"}
+        def api(path, payload=None):
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["model"] != "stuck:latest":
+                resident.discard(payload["model"])
+            return {}
+        ctx, _ = self.gate_ctx(api=api)
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("stuck:latest", str(cm.exception))
+        self.assertEqual(self.leftovers(), [])
+
+    def ack_on_sleep(self):
+        """Fake daemon: acks every live intent at the first poll, unloading only its own model."""
+        def tick():
+            for intent in c.live_intents(self.gate, 0.0, alive=lambda p: True):
+                c.write_ack(self.gate, intent, c.MODEL, 0.0)
+        return tick
+
+    def multi_api(self, resident, stuck=()):
+        def api(path, payload=None):
+            self.calls.append((path, payload))
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["keep_alive"] == 0 and payload["model"] not in stuck:
+                resident.discard(payload["model"])
+            return {}
+        return api
+
+    def test_after_ack_every_other_model_is_unloaded(self):
+        # The daemon only unloads its own model; another pinned model must not stay beside training.
+        resident = {"huihui-9b:latest", "third:q4"}
+        ctx, _ = self.gate_ctx(api=self.multi_api(resident), on_sleep=self.ack_on_sleep())
+        with ctx:
+            self.assertEqual(resident, set())
+        self.assertTrue(any("daemon acked" in line for line in self.logs))
+        self.assertEqual({p["model"] for path, p in self.calls if path == "/api/generate"},
+                         {"huihui-9b:latest", "third:q4"})
+
+    def test_after_ack_survivor_refuses(self):
+        resident = {"huihui-9b:latest", "stuck:latest"}
+        ctx, _ = self.gate_ctx(api=self.multi_api(resident, stuck={"stuck:latest"}), on_sleep=self.ack_on_sleep())
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("stuck:latest", str(cm.exception))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_malformed_ps_reply_refuses(self):
+        for reply in ({"models": {}}, {"models": ""}, {}, {"models": [{"size": 1}]}, {"models": [{"name": ""}]},
+                      {"models": ["x"]}, []):
+            with self.subTest(reply=reply):
+                ctx, _ = self.gate_ctx(api=lambda path, payload=None, r=reply: r, wait_seconds=0)
+                with self.assertRaises(c.GateRefused):
+                    with ctx:
+                        self.fail("training must not start")
+                self.assertEqual(self.leftovers(), [])
+
+    # Node lock (local_gate <-> training_gate), deterministic: injected clock and sleep.
+
+    def holder(self, kind=fcntl.LOCK_SH):
+        fd = c.open_node_lock(self.gate)
+        fcntl.flock(fd, kind | fcntl.LOCK_NB)
+        return fd
+
+    def exclusive_free(self):
+        fd = c.open_node_lock(self.gate)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_node_lock_path_shared_and_private(self):
+        self.assertEqual(c.node_lock_path(self.gate), self.gate / "node.lock")
+        os.close(c.open_node_lock(self.gate))
+        self.assertEqual(stat.S_IMODE((self.gate / "node.lock").stat().st_mode), 0o600)
+
+    def test_trainer_waits_for_in_flight_request_then_proceeds(self):
+        self.loaded = False
+        fd = self.holder()
+        def on_sleep():  # gate_ctx runs this at the first poll only: the request ends while the trainer waits
+            os.close(fd)
+        ctx, clock = self.gate_ctx(on_sleep=on_sleep, wait_seconds=0)
+        with ctx as intent_path:
+            self.assertTrue(intent_path.exists())
+            self.assertFalse(self.exclusive_free())  # LOCK_EX held for the whole block
+            with self.assertRaises(BlockingIOError):
+                self.holder()                         # a gate request cannot take LOCK_SH
+        self.assertEqual(clock[0], c.TRAINER_LOCK_POLL_SECONDS)  # waited exactly one poll
+        self.assertIn("confirmed no model resident", self.logs[-1])
+        self.assertTrue(self.exclusive_free())
+
+    def test_trainer_times_out_on_in_flight_request(self):
+        fd = self.holder()
+        self.addCleanup(os.close, fd)
+        ctx, clock = self.gate_ctx(lock_wait_seconds=5)
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("in flight", str(cm.exception))
+        self.assertGreaterEqual(clock[0], 5)
+        self.assertEqual(self.leftovers(), [])        # no intent written
+        self.assertEqual(self.calls, [])               # no residency query, no unload attempted
+
+    def test_lock_released_when_block_raises_or_gate_refuses(self):
+        ctx, _ = self.gate_ctx()
+        with self.assertRaises(ValueError):
+            with ctx:
+                raise ValueError("trainer crashed")
+        self.assertTrue(self.exclusive_free())
+        ctx, _ = self.gate_ctx(api=lambda path, payload=None: {"bad": 1}, wait_seconds=0)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
+        self.assertTrue(self.exclusive_free())
 
     def test_crash_in_block_removes_intent(self):
         ctx, _ = self.gate_ctx()
         with self.assertRaises(ValueError):
             with ctx:
                 raise ValueError("trainer crashed")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_intent_refreshed_while_held(self):
         ctx, _ = self.gate_ctx(refresh_seconds=0.01)
@@ -559,7 +708,313 @@ class AckWaitConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     c.ack_wait_from_env(raw)
                 with patch.dict(os.environ, {c.ACK_WAIT_ENV: raw}), \
-                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "call") as call:
+                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "Popen") as call:
                     self.assertEqual(c.gate_main(["--", "true"]), c.GATE_REFUSED_EXIT)
                 gate.assert_not_called()
                 call.assert_not_called()
+
+
+class NodeLockSafetyTests(unittest.TestCase):
+    """open_node_lock refuses anything but a private, real, owned dir and lock file (temp dirs only)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.gate = self.root / "studio-gate"
+
+    def test_symlinked_lock_file_refused(self):
+        os.close(c.open_node_lock(self.gate))
+        (self.gate / "node.lock").unlink()
+        os.symlink(self.root / "elsewhere", self.gate / "node.lock")
+        with self.assertRaises(OSError):
+            os.close(c.open_node_lock(self.gate))
+        with self.assertRaises(c.GateRefused):
+            os.close(c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0))
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_symlinked_dir_refused(self):
+        real = self.root / "real"
+        real.mkdir(mode=0o700)
+        os.symlink(real, self.gate)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.gate)
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        self.assertFalse((real / "node.lock").exists())
+
+    def test_group_writable_dir_refused(self):
+        self.gate.mkdir()
+        os.chmod(self.gate, 0o770)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.gate)
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+
+    def test_group_writable_parent_refused(self):
+        parent = self.root / "home"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o770)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(parent / "studio-gate")
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(parent / "studio-gate", sleep=lambda s: None, wait_seconds=0)
+        self.assertFalse((parent / "studio-gate").exists())
+
+    def test_symlinked_parent_refused(self):
+        real = self.root / "real-home"
+        real.mkdir(mode=0o700)
+        os.symlink(real, self.root / "home")
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.root / "home" / "studio-gate")
+        self.assertFalse((real / "studio-gate").exists())
+
+    def test_renamed_gate_dir_cannot_be_recreated_by_request(self):
+        trainer = c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        self.addCleanup(os.close, trainer)
+        os.rename(self.gate, self.root / "moved-away")
+        with self.assertRaises(FileNotFoundError):        # request side: never recreates, so never a fresh inode
+            c.open_node_lock(self.gate, create=False)
+        self.assertFalse(self.gate.exists())
+
+    def test_rename_between_open_and_lock_is_refused(self):
+        fd = c.open_node_lock(self.gate)
+        self.addCleanup(os.close, fd)
+        os.rename(self.gate, self.root / "moved-away")
+        os.close(c.open_node_lock(self.gate))             # a fresh dir and inode now sit at the path
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)    # locks the moved-away inode
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.verify_node_lock(self.gate, fd)
+
+    def test_verify_passes_on_unchanged_path(self):
+        fd = c.open_node_lock(self.gate)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        c.verify_node_lock(self.gate, fd)
+
+    def test_trainer_created_dir_is_0700_under_umask_0002(self):
+        old = os.umask(0o002)
+        try:
+            fd = c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        finally:
+            os.umask(old)
+        os.close(fd)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.gate).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.gate / "node.lock").st_mode), 0o600)
+
+
+class StopRequestReentrancyTests(unittest.TestCase):
+    """The signal handler must never take a lock: a signal landing inside sleep() or inside a first handler call
+    used to deadlock on threading.Event's internal lock."""
+
+    def run_guarded(self, fn, seconds=5):
+        # Bounded: a regression would hang the thread, never the suite.
+        result = {}
+
+        def target():
+            try:
+                fn()
+            except BaseException as exc:  # recorded and asserted on below, never swallowed
+                result["exc"] = exc
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(seconds)
+        self.assertFalse(t.is_alive(), "StopRequest hung (lock taken in the handler?)")
+        return result.get("exc")
+
+    def test_no_lock_primitives(self):
+        stop = c.StopRequest()
+        lock_types = (type(threading.Lock()), type(threading.RLock()), threading.Event, threading.Condition)
+        for name, value in vars(stop).items():
+            self.assertNotIsInstance(value, lock_types, name)
+
+    def test_handler_mid_sleep_and_nested_handler_complete(self):
+        stop = c.StopRequest()
+        calls = []
+
+        def nested_trace(frame, event, arg):
+            # Re-enter the handler from inside the first handler's body (after it recorded its signum, before it
+            # sets the flag), as a second signal would.
+            code = c.StopRequest.handle.__code__
+            if event == "line" and frame.f_code is code and frame.f_lineno == code.co_firstlineno + 3 \
+                    and "nested" not in calls:
+                calls.append("nested")
+                stop.handle(signal.SIGINT, None)
+            return nested_trace
+
+        def fake_sleep(seconds):
+            self.assertLessEqual(seconds, c.STOP_POLL_SECONDS)
+            calls.append("slice")
+            sys.settrace(lambda f, e, a: nested_trace if f.f_code is c.StopRequest.handle.__code__ else None)
+            try:
+                stop.handle(signal.SIGTERM, None)  # the signal arrives mid-slice
+            finally:
+                sys.settrace(None)
+
+        def body():
+            with mock.patch.object(c.time, "sleep", fake_sleep):
+                stop.sleep(30)
+        exc = self.run_guarded(body)
+        self.assertIsInstance(exc, SystemExit)
+        self.assertEqual(exc.code, 128 + signal.SIGTERM)  # first signal fixes the code
+        self.assertIn("nested", calls)
+        self.assertEqual(calls.count("slice"), 1)          # stopped right after the slice that saw the signal
+        self.assertTrue(stop.is_set())
+
+    def test_sleep_without_signal_returns_after_bounded_slices(self):
+        stop = c.StopRequest()
+        slices = []
+        with mock.patch.object(c.time, "sleep", lambda s: slices.append(s)), \
+                mock.patch.object(c.time, "monotonic", side_effect=[0.0] + [0.1 * i for i in range(1, 50)]):
+            stop.sleep(0.35)
+        self.assertTrue(slices)
+        self.assertTrue(all(0 < s <= c.STOP_POLL_SECONDS for s in slices))
+        self.assertFalse(stop.is_set())
+
+
+# Subprocess harness: runs the real gate_main with training_gate bound to a temp gate dir and a fake, empty Ollama
+# (never the real one: the real check would unload models on this machine).
+HARNESS = r'''
+import functools, sys
+sys.path.insert(0, sys.argv[1])
+from cortados_router import studio_capacity as c
+c.training_gate = functools.partial(c.training_gate, gate=sys.argv[2], api=lambda path, payload=None: {"models": []},
+                                    log=lambda m: None)
+import os, signal
+if os.environ.get("TEST_GATE_GRACE"):
+    c.TRAINING_STOP_GRACE_SECONDS = float(os.environ["TEST_GATE_GRACE"])
+if os.environ.get("TEST_GATE_TERM_AFTER_SPAWN"):
+    _orig = c.run_holding_lock
+    def _hook(child):
+        open(os.environ["TEST_GATE_TERM_AFTER_SPAWN"], "w").write(str(child.pid))
+        os.kill(os.getpid(), signal.SIGTERM)          # the race: SIGTERM right after the child exists
+    c.run_holding_lock = lambda *a, **k: _orig(*a, after_spawn=_hook, **k)
+sys.exit(c.gate_main(["--"] + sys.argv[3:]))
+'''
+
+
+class GateMainProcessTests(unittest.TestCase):
+    """Real processes: the training command keeps the node lock past its wrapper, and its group is stopped."""
+
+    ROOT = str(Path(__file__).resolve().parents[1])
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.gate = self.root / "studio-gate"
+        self.marker = self.root / "started"
+
+    def start(self, *cmd, extra_env=None):
+        env = dict(os.environ, CORTADOS_HOME=str(self.root), **{c.ACK_WAIT_ENV: "0"}, **(extra_env or {}))
+        proc = self.subprocess.Popen([sys.executable, "-c", HARNESS, self.ROOT, str(self.gate)] + list(cmd), env=env)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+    def wait_for(self, cond, seconds=10):
+        deadline = time.monotonic() + seconds
+        while not cond():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached in %ss" % seconds)
+            time.sleep(0.02)
+
+    def shared_free(self):
+        fd = c.open_node_lock(self.gate)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def pid_from(self, path):
+        self.wait_for(lambda: path.exists() and path.read_text().strip())
+        return int(path.read_text())
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def test_sigkilled_wrapper_lock_held_until_child_exits(self):
+        script = ("import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                  "time.sleep(0.8)")
+        proc = self.start(sys.executable, "-c", script, str(self.marker))
+        child = self.pid_from(self.marker)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(5)
+        self.assertTrue(self.alive(child))
+        self.assertFalse(self.shared_free())          # the training child still holds LOCK_EX
+        self.wait_for(lambda: not self.alive(child))  # orphaned child, reaped by init
+        self.wait_for(self.shared_free)
+
+    def test_sigterm_stops_whole_group_then_releases(self):
+        grand = self.root / "grand"
+        grand_script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+        shell = '"%s" -c "%s" "%s" & echo $$ > "%s"; wait' % (sys.executable, grand_script, grand, self.marker)
+        proc = self.start("/bin/sh", "-c", shell)
+        sh_pid = self.pid_from(self.marker)
+        grand_pid = self.pid_from(grand)
+        self.assertFalse(self.shared_free())
+        os.kill(proc.pid, signal.SIGTERM)
+        self.assertEqual(proc.wait(10), 128 + signal.SIGTERM)
+        self.assertFalse(self.alive(sh_pid))
+        self.wait_for(lambda: not self.alive(grand_pid), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_sigterm_right_after_spawn_stops_group(self):
+        spawned = self.root / "spawned"
+        script = "import time; time.sleep(30)"
+        proc = self.start(sys.executable, "-c", script, extra_env={"TEST_GATE_TERM_AFTER_SPAWN": str(spawned)})
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)
+        child = int(spawned.read_text())
+        self.wait_for(lambda: not self.alive(child), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_second_sigterm_during_grace_still_completes_teardown(self):
+        script = ("import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                  "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+        proc = self.start(sys.executable, "-c", script, str(self.marker), extra_env={"TEST_GATE_GRACE": "1.5"})
+        child = self.pid_from(self.marker)
+        self.assertFalse(self.shared_free())
+        os.kill(proc.pid, signal.SIGTERM)
+        time.sleep(0.5)                               # inside the 1.5 s grace: the child ignores SIGTERM
+        self.assertTrue(self.alive(child))
+        os.kill(proc.pid, signal.SIGTERM)
+        os.kill(proc.pid, signal.SIGINT)
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)   # first signal fixes the code
+        self.wait_for(lambda: not self.alive(child), 5)          # SIGKILLed after grace
+        self.assertTrue(self.shared_free())
+
+    def test_sigterm_during_cleanup_after_leader_exit_0_reports_143(self):
+        grand = self.root / "grand"
+        grand_script = ("import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+        # Leader: start a SIGTERM-ignoring descendant, wait until it has ignored SIGTERM, then exit 0.
+        leader = ("import os, subprocess, sys, time; "
+                  "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+                  "[time.sleep(0.02) for _ in range(500) if not (os.path.exists(sys.argv[2]) and "
+                  "open(sys.argv[2]).read().strip())]; "
+                  "open(sys.argv[3], 'w').write(str(os.getpid())); sys.exit(0)")
+        proc = self.start(sys.executable, "-c", leader, grand_script, str(grand), str(self.marker),
+                          extra_env={"TEST_GATE_GRACE": "3"})
+        leader_pid = self.pid_from(self.marker)
+        grand_pid = self.pid_from(grand)
+        self.wait_for(lambda: not self.alive(leader_pid), 5)  # leader exited 0; wrapper now in the 3 s grace
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll())
+        self.assertTrue(self.alive(grand_pid))
+        os.kill(proc.pid, signal.SIGTERM)
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)
+        self.wait_for(lambda: not self.alive(grand_pid), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_normal_completion_releases(self):
+        proc = self.start(sys.executable, "-c", "import sys; sys.exit(3)")
+        self.assertEqual(proc.wait(10), 3)
+        self.assertTrue(self.shared_free())

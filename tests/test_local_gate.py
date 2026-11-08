@@ -1,16 +1,21 @@
 """The node-side token gate (local_gate.py) and the provider's local lane through it. In-thread fakes only."""
+import fcntl
+import http.client
 import json
 import os
+import shutil
+import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from cortados_router import local_gate
+from cortados_router import local_gate, studio_capacity
 from cortados_router.provider import local_lane
 from tests.test_provider_local import FakeOllama, LocalHarness, TAG, write_config
 
@@ -315,6 +320,215 @@ class GateTests(GateHarness):
         self.ollama.shutdown()
         self.ollama.server_close()
         self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 502)
+
+
+class TrainingHoldTests(GateHarness):
+    """A live S1 training intent in the studio-gate dir refuses every forwarded request (temp dirs only)."""
+    NONCE = "a" * 32
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name) / "studio-gate"
+        os.close(studio_capacity.open_node_lock(self.dir))   # what local_gate.main does at startup
+        self.gate.studio_gate_dir = self.dir
+
+    def write_intent(self, expires_in):
+        import time
+        self.dir.mkdir(exist_ok=True)
+        now = time.time()
+        (self.dir / f"intent-{os.getpid()}-{self.NONCE}.json").write_text(json.dumps(
+            dict(version=1, pid=os.getpid(), nonce=self.NONCE, created_at=now - 1, expires_at=now + expires_in)))
+
+    def test_no_dir_passes(self):
+        code, _ = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 200)
+
+    def test_live_intent_503_then_passes_after_expiry(self):
+        import time
+        self.write_intent(1.0)
+        code, raw = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 503)
+        self.assertIn("S1 training in progress", raw)
+        self.assertNotIn(self.NONCE, raw)
+        self.assertNotIn(str(self.dir), raw)
+        n = len(FakeOllama.seen)
+        code, _ = self.call("/v1/messages", GateTests.MSG, headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 503)
+        self.assertEqual(len(FakeOllama.seen), n)          # nothing reached Ollama
+        time.sleep(1.2)
+        code, _ = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 200)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any directory")
+    def test_unreadable_dir_fails_closed(self):
+        self.dir.mkdir(exist_ok=True)
+        os.chmod(self.dir, 0)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        code, raw = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 503)
+        self.assertNotIn(str(self.dir), raw)
+        self.assertEqual(FakeOllama.seen, [])
+
+    def test_unopenable_lock_dir_is_503(self):
+        shutil.rmtree(self.dir)
+        self.dir.write_text("not a directory")     # mkdir/open of <dir>/node.lock fails
+        with self.assertLogs("cortados.local_gate", "WARNING"):
+            code, raw = self.call("/v1/messages", GateTests.MSG, headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 503)
+        self.assertNotIn(str(self.dir), raw)
+        self.assertEqual(FakeOllama.seen, [])
+
+    # Node lock (fcntl.flock on <studio-gate>/node.lock): the guarantee, independent of intents.
+
+    def other_fd(self):
+        fd = studio_capacity.open_node_lock(self.dir)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def exclusive_free(self):
+        fd = studio_capacity.open_node_lock(self.dir)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def wait_exclusive_free(self):
+        for _ in range(200):                       # 2 s: the handler's finally runs right after the reply
+            if self.exclusive_free():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_trainer_lock_refuses_and_nothing_reaches_ollama(self):
+        fd = self.other_fd()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for path, body in (("/api/tags", None), ("/v1/messages", GateTests.MSG)):
+            code, raw = self.call(path, body, headers={"x-api-key": TOKEN})
+            self.assertEqual(code, 503)
+            self.assertIn("S1 training in progress", raw)
+            self.assertNotIn(str(self.dir), raw)
+            self.assertNotIn(str(os.getpid()), raw)
+        self.assertEqual(FakeOllama.seen, [])
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 200)
+
+    def test_shared_lock_held_mid_stream_and_released_after(self):
+        release = threading.Event()
+        first_line = threading.Event()
+
+        class SlowSSE(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["content-length"]))
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: one\n\n")
+                self.wfile.flush()
+                release.wait(5)
+                self.wfile.write(b"data: two\n\n")
+                self.wfile.flush()
+            def log_message(self, *a):
+                pass
+
+        slow = ThreadingHTTPServer(("127.0.0.1", 0), SlowSSE)
+        threading.Thread(target=slow.serve_forever, daemon=True).start()
+        self.addCleanup(slow.server_close)
+        self.addCleanup(slow.shutdown)
+        self.gate.upstream_port = slow.server_port
+        out = {}
+
+        def client():
+            conn = http.client.HTTPConnection("127.0.0.1", self.gate.server_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=json.dumps(GateTests.MSG),
+                         headers={"x-api-key": TOKEN, "content-type": "application/json"})
+            resp = conn.getresponse()
+            out["first"] = resp.readline()
+            first_line.set()
+            out["rest"] = resp.read()
+            conn.close()
+
+        t = threading.Thread(target=client)
+        t.start()
+        self.assertTrue(first_line.wait(5))
+        self.assertFalse(self.exclusive_free())      # mid-stream: a trainer's LOCK_EX|LOCK_NB fails
+        release.set()
+        t.join(10)
+        self.assertIn(b"two", out["rest"])
+        self.assertTrue(self.wait_exclusive_free())  # fully relayed: released
+
+    def test_client_disconnect_mid_stream_releases_lock(self):
+        release = threading.Event()
+
+        class SlowSSE(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["content-length"]))
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: one\n\n")
+                self.wfile.flush()
+                release.wait(5)
+                for _ in range(50):                  # keep writing so the gate hits the closed client socket
+                    self.wfile.write(b"data: more\n\n")
+                    self.wfile.flush()
+            def log_message(self, *a):
+                pass
+
+        slow = ThreadingHTTPServer(("127.0.0.1", 0), SlowSSE)
+        threading.Thread(target=slow.serve_forever, daemon=True).start()
+        self.addCleanup(slow.server_close)
+        self.addCleanup(slow.shutdown)
+        self.gate.upstream_port = slow.server_port
+        sock = socket.create_connection(("127.0.0.1", self.gate.server_port), timeout=5)
+        body = json.dumps(GateTests.MSG).encode()
+        sock.sendall(b"POST /v1/messages HTTP/1.1\r\nhost: x\r\nx-api-key: " + TOKEN.encode()
+                     + b"\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(body) + body)
+        got = b""
+        while b"one" not in got:                     # headers and first event may arrive in one or more segments
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk)
+            got += chunk
+        self.assertFalse(self.exclusive_free())
+        sock.close()
+        release.set()
+        self.assertTrue(self.wait_exclusive_free())
+
+    def test_upstream_error_and_handler_exception_release_lock(self):
+        self.ollama.shutdown()
+        self.ollama.server_close()
+        self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 502)
+        self.assertTrue(self.wait_exclusive_free())
+
+        def boom(handler, *a):
+            self.assertFalse(self.exclusive_free())  # held at the moment of forwarding
+            raise OSError("upstream exploded")
+        with patch.object(local_gate.GateHandler, "_forward", boom):
+            try:
+                self.call("/api/tags", headers={"x-api-key": TOKEN})
+            except (OSError, http.client.HTTPException):
+                pass                                 # the gate closes without a reply; only the lock matters here
+        self.assertTrue(self.wait_exclusive_free())
+
+    def test_gate_never_deletes_an_expired_intent(self):
+        self.dir.mkdir(exist_ok=True)
+        now = time.time()
+        path = self.dir / f"intent-{os.getpid()}-{self.NONCE}.json"
+        path.write_text(json.dumps(dict(version=1, pid=os.getpid(), nonce=self.NONCE,
+                                        created_at=now - 400, expires_at=now - 100)))   # expired before the request
+        before = path.read_bytes()
+        code, _ = self.call("/api/tags", headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 200)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_unauthorized_still_401_not_hold(self):
+        self.write_intent(60)
+        code, _ = self.call("/api/tags", headers={"authorization": "Bearer wrong"})
+        self.assertEqual(code, 401)
 
 
 class GateConfigTests(unittest.TestCase):

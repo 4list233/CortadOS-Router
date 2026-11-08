@@ -149,7 +149,7 @@ stale capacity.
 
 A node with an `ollama` block offers its Ollama models to the provider as `sub/<alias or tag>` pins
 (`cortados_router/provider/local_lane.py`). The provider reads the same file as the sampler,
-`CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's block.
+`CORTADOS_LOCAL_RESOURCES_CONFIG`; `tables/resources.example.json` shows the Pro's and the Studio's blocks (placeholders).
 
 | key | meaning |
 | --- | --- |
@@ -193,6 +193,26 @@ tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
   connect (3 s), each read (300 s), an idle client socket (30 s) and, as absolute deadlines a trickling client cannot extend, the
   headers (10 s), the body (120 s) and the drain of a refused body (5 s, then closed without the 401); every limit must
   be a finite positive number; logs method, path and status only, never the token or a body.
+
+**Power and switch check on every node.** Before forwarding, the gate calls `pro_local_allowed()` (AC power + the
+local-enabled flag). Despite the name it runs on any node that runs the gate, the Studio included: a Studio on AC with
+the flag on passes it; turning the flag off takes that node's lane down.
+
+**S1 training hold (Studio).** The guarantee is a kernel file lock on `$CORTADOS_HOME/studio-gate/node.lock`
+(created 0600; `studio_capacity.node_lock_path`). Every forwarded gate request takes `flock(LOCK_SH|LOCK_NB)` before it
+reaches Ollama and holds it until the response (streamed or not) is fully relayed or fails; `training_gate` takes
+`flock(LOCK_EX)` before writing its intent, polling 1 s for at most 120 s while in-flight requests drain (then
+`GateRefused`, retry later), and holds it for the whole training block. A gate request that finds the exclusive lock
+gets a 503 ("S1 training in progress"; no path, pid or nonce); a lock file it cannot open or create is a 503 with a
+logged warning (fail closed). The kernel drops a dead holder's lock, so there is no expiry or pid logic. The gate's
+intent check is a read-only advisory fast path and never deletes an intent. Override the directory with
+`--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. Inside the lock, after the daemon's ack or its timeout,
+`training_gate` unloads EVERY model `/api/ps` lists (`keep_alive=0` each) and refuses to start if any remains or the
+reply is malformed. Writer starvation is accepted: a steady stream of overlapping gate requests can keep LOCK_EX from ever being granted, in which case the trainer refuses after the 120 s cap and retries on its next run. The gate directory must be a real directory (not a symlink) owned by the running user and not group/world-writable (a created one is chmod'ed 0700 regardless of umask), and `node.lock` is opened with `O_NOFOLLOW` and must be a regular file the user owns; otherwise the gate answers 503 and the trainer refuses. `gate` passes its LOCK_EX fd to the training command and runs it in its own process group: the lock stays held until every holder exits (a SIGKILLed wrapper does not release it), and on SIGTERM/SIGINT or any exit the whole group gets SIGTERM, 30 s grace, then SIGKILL before the lock is released.
+
+**Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
+uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the
+provider admits get truncated by Ollama. The gate does not check this at startup.
 
 A launchd template is `integrations/local-gate/com.cortados.local-gate.plist` (RunAtLoad + KeepAlive; placeholders
 only). Check a setup with `python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config` (validates the

@@ -4,7 +4,14 @@
   "nodes": [
     {"id": "studio", "role": "coordinator", "target": "owner@studio.local", "pool_eligible": true,
      "metal_probe": "/absolute/path/to/metal-budget", "reserve_gib": 4,
-     "inventory": {"chip": "M1 Max", "unified_gib": 32, "memory_scope": "unified"}},
+     "inventory": {"chip": "M1 Max", "unified_gib": 32, "memory_scope": "unified"},
+     "ollama": {"_comment": "Pin-only, as on the Pro. The Studio's local gate also refuses (503) while S1 training holds an intent in $CORTADOS_HOME/studio-gate. context_length must equal the node's OLLAMA_CONTEXT_LENGTH. Placeholders only: never commit a real address or token.",
+                "base_url_env": "CORTADOS_LOCAL_STUDIO_OLLAMA_URL", "token_file_env": "CORTADOS_LOCAL_STUDIO_GATE_TOKEN_FILE",
+                "label": "Studio", "auto_route": false,
+                "probe_timeout_s": 2, "connect_timeout_s": 3, "read_timeout_s": 300,
+                "models": [
+                  {"id": "hf.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF:Q4_K_M", "alias": "huihui-9b", "name": "Huihui Qwen3.5 9B", "context_length": 32768}
+                ]}},
     {"id": "pc3060", "role": "worker", "target": "owner@wsl-host", "pool_eligible": true, "reserve_gib": 2,
      "inventory": {"gpu": "RTX 3060", "vram_gib": 12, "host_ram_gib": 32, "memory_scope": "wsl_vm"}},
     {"id": "air", "role": "optional", "target": "owner@air.local", "pool_eligible": false,
