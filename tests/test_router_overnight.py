@@ -1137,6 +1137,25 @@ class WindowEndDrainAndDst(unittest.TestCase):
         with patch.object(night.os, 'killpg', eperm), self.assertRaises(PermissionError):
             night.stop_group_drained(child, grace=1)
 
+    def test_eperm_with_exited_leader_but_live_member_is_a_genuine_error(self):
+        # Leader gone, but ps still lists a non-zombie member of the group that we cannot signal: not drained (Codex r3).
+        child = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        child.wait()
+        def eperm(pgid, sig):
+            raise PermissionError(1, 'Operation not permitted')
+        ps = f"  {child.pid} {child.pid} Z\n  424242 {child.pid} S\n  1 1 Ss\n"
+        fake = subprocess.CompletedProcess(['ps'], 0, stdout=ps, stderr='')
+        with patch.object(night.os, 'killpg', eperm), patch.object(night.subprocess, 'run', return_value=fake), \
+                self.assertRaises(PermissionError) as cm:
+            night.stop_group_drained(child, grace=1)
+        self.assertIn('424242', str(cm.exception))
+
+    def test_live_group_members_ignores_zombies_and_other_groups(self):
+        ps = "  10 10 Z\n  11 10 Z+\n  12 10 R\n  13 99 S\n"
+        fake = subprocess.CompletedProcess(['ps'], 0, stdout=ps, stderr='')
+        with patch.object(night.subprocess, 'run', return_value=fake):
+            self.assertEqual(night._live_group_members(10), [12])
+
     def test_deadline_compares_instants_in_the_repeated_fall_back_hour(self):
         from zoneinfo import ZoneInfo
         tz = ZoneInfo('America/Toronto')

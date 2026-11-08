@@ -619,7 +619,24 @@ def _zombie_only(child, err: PermissionError) -> bool:
         child.wait(timeout=EPERM_SETTLE_S)
     except subprocess.TimeoutExpired:
         raise err from None
+    # The leader exiting does not prove the rest of the group is zombie-only: a live member we cannot signal also answers EPERM.
+    # Ask ps for the group's members and treat the EPERM as "drained" only when every one left is a zombie (Codex review r3).
+    live = _live_group_members(child.pid)
+    if live:
+        raise PermissionError(err.errno, f"{err.strerror}: group {child.pid} still has live members {live}") from err
     return True
+
+
+def _live_group_members(pgid: int) -> list[int]:
+    """Pids in process group `pgid` that are not zombies, from `ps -A -o pid=,pgid=,stat=`. A ps failure raises: guessing
+    "drained" here could leave training running with the node lock held."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True, timeout=10).stdout
+    live = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == str(pgid) and not parts[2].startswith("Z"):
+            live.append(int(parts[0]))
+    return live
 
 
 def send_group_drained(child, sig: int) -> bool:
