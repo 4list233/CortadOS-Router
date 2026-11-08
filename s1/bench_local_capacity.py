@@ -87,16 +87,22 @@ def bounded_request(url, payload=None, limit_s=10, headers=None, on_line=None, c
     deadline = clock() + limit_s
     conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=limit_s)
     fired = []
+    transport = {}  # the connected socket, saved before getresponse(): for a `Connection: close` reply http.client
+                    # clears conn.sock while the response is still being read, so conn.sock cannot be shut down then
 
     def expire():
         fired.append(True)
-        sock = conn.sock
+        sock = transport.get("sock")
         if sock is None:
-            return  # not connected yet or already closed: the clock check in the read loop ends the request
+            return  # not connected yet: the fired check right after connect ends the request
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError as exc:  # socket closed between the check and the shutdown: the read already ended
             fired.append(exc)
+
+    def check_deadline():
+        if fired or clock() >= deadline:
+            raise DeadlineExceeded("no complete reply within %.1fs" % limit_s)
 
     timer = threading.Timer(limit_s, expire)
     timer.daemon = True
@@ -104,14 +110,17 @@ def bounded_request(url, payload=None, limit_s=10, headers=None, on_line=None, c
     try:
         body = None if payload is None else json.dumps(payload).encode()
         try:
+            conn.connect()
+            transport["sock"] = conn.sock
+            check_deadline()  # the watchdog fired before the socket was saved: it shut nothing down, so stop here
             conn.request("GET" if body is None else "POST", (u.path or "/") + ("?" + u.query if u.query else ""),
                          body=body, headers={"Content-Type": "application/json", **(headers or {})})
             resp = conn.getresponse()
+            check_deadline()
             buf = b""
             while True:
-                if fired or clock() >= deadline:
-                    raise DeadlineExceeded("no complete reply within %.1fs" % limit_s)
                 chunk = resp.read1(65536)
+                check_deadline()  # after every read: a late complete message is still a deadline miss
                 if not chunk:
                     break
                 buf += chunk
@@ -121,13 +130,13 @@ def bounded_request(url, payload=None, limit_s=10, headers=None, on_line=None, c
                         if line.strip():
                             result = on_line(json.loads(line))
                             if result is not None:
+                                check_deadline()
                                 return result
         except OSError as exc:
             if fired or clock() >= deadline:  # the watchdog's shutdown surfaces as a read error: report the cause
                 raise DeadlineExceeded("no complete reply within %.1fs" % limit_s) from exc
             raise
-        if fired or clock() >= deadline:
-            raise DeadlineExceeded("no complete reply within %.1fs" % limit_s)
+        check_deadline()
         if resp.status >= 400:
             raise OSError("HTTP %d from %s: %s" % (resp.status, url, buf[:200].decode("utf-8", "replace")))
         if on_line is not None:
@@ -138,6 +147,9 @@ def bounded_request(url, payload=None, limit_s=10, headers=None, on_line=None, c
     finally:
         timer.cancel()
         conn.close()
+        sock = transport.get("sock")
+        if sock is not None:
+            sock.close()  # conn.close() skips it once a `Connection: close` reply detached it; closing twice is a no-op
 
 
 def _http_json(url, payload=None, timeout=10, headers=None):
@@ -368,7 +380,8 @@ def run_round(url, model, n, prompt_words, gen_tokens, round_index, session=run_
 
     def work(i):
         try:
-            results[i] = session(url, model, synthetic_prompt(round_index * 1000 + i, prompt_words), gen_tokens)
+            results[i] = session(url, model, synthetic_prompt(round_index * 1000 + i, prompt_words), gen_tokens,
+                                 timeout=request_timeout)
         except BaseException as exc:  # re-raised in the caller below so the step's finally stops the server
             crashed.append(exc)
 

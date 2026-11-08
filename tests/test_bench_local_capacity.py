@@ -306,6 +306,30 @@ class TrickleHandler(http.server.BaseHTTPRequestHandler):
             self.server.closed.append(exc)
 
 
+class DelayedCloseHandler(http.server.BaseHTTPRequestHandler):
+    """Waits header_delay, sends headers with Connection: close, waits body_delay, then one complete `done` line."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        time.sleep(self.server.header_delay)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(self.server.body_delay)
+            self.wfile.write(json.dumps({"message": {"content": "x"}, "done": True, "eval_count": 1,
+                                         "eval_duration": 1000}).encode() + b"\n")
+            self.wfile.flush()
+        except OSError as exc:  # the client closed at its deadline: expected, record it
+            self.server.finished.append(exc)
+        self.close_connection = True
+
+
 class Deadlines(unittest.TestCase):
     def test_trickling_response_stops_at_deadline_as_error(self):
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TrickleHandler)
@@ -325,7 +349,7 @@ class Deadlines(unittest.TestCase):
         release = threading.Event()
         self.addCleanup(release.set)
 
-        def hang(*a):
+        def hang(*a, **kw):
             release.wait(30)
             return dict(ok=True)
 
@@ -335,6 +359,43 @@ class Deadlines(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, b.JOIN_SLACK_S + 2)
         self.assertEqual([r["ok"] for r in results], [False, False])
         self.assertIn("round deadline", results[0]["error"])
+
+    def delayed_server(self, header_delay, body_delay):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DelayedCloseHandler)
+        srv.daemon_threads = True
+        srv.header_delay, srv.body_delay = header_delay, body_delay
+        srv.finished = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def test_connection_close_reply_past_deadline_is_error(self):
+        # headers at 0.15 s and a complete `done` line at 0.30 s, Connection: close; the deadline is 0.2 s
+        _, url = self.delayed_server(0.15, 0.15)
+        t0 = time.monotonic()
+        res = b.run_session(url, "m", "p", 1, timeout=0.2)
+        took = time.monotonic() - t0
+        self.assertFalse(res["ok"], res)
+        self.assertIn("DeadlineExceeded", res["error"])
+        self.assertLess(took, 2.0)
+
+    def test_connection_close_reply_within_deadline_is_ok(self):
+        _, url = self.delayed_server(0.0, 0.0)
+        res = b.run_session(url, "m", "p", 1, timeout=2.0)
+        self.assertTrue(res["ok"], res)
+
+    def test_run_round_passes_request_timeout_to_sessions(self):
+        # the server holds headers 3 s: without timeout=request_timeout the real session keeps the 900 s default and
+        # is abandoned, still running, only at the round deadline (0.2 + JOIN_SLACK_S)
+        _, url = self.delayed_server(3.0, 0.0)
+        t0 = time.monotonic()
+        results, _ = b.run_round(url, "m", 2, 10, 1, 0, request_timeout=0.2, stop=sc.StopRequest())
+        took = time.monotonic() - t0
+        self.assertEqual([r["ok"] for r in results], [False, False])
+        for r in results:  # ended by the session's own deadline (thread finished), not abandoned at the round deadline
+            self.assertIn("DeadlineExceeded", r["error"])
+        self.assertLess(took, 1.5)
 
 
 class OccupiedPort(Base):
@@ -388,7 +449,7 @@ class Signals(Base):
             events.append(("release", [p.returncode for p in self.procs]))
             real_release(fd)
 
-        def session(*a):
+        def session(*a, **kw):
             signal.raise_signal(signal.SIGINT)  # Ctrl-C mid-round: only sets the flag
             return dict(ok=True, ttft_s=0.1, tokens=1, decode_tps=1.0)
 
