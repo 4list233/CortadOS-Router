@@ -11,14 +11,18 @@ O_NOFOLLOW (a planted symlink is refused, not followed). One JSON object per lin
   {"kind": "tool_result", "tool_use_id", "text", "chars", "truncated", "is_error"}
   {"kind": "message", "role": "user" | "assistant", "text"}
   {"kind": "tool_call", "tool_use_id", "name", "input"}
-`read_session` turns a file back into the shared `events.Session`.
+`read_session` turns a file back into the shared `events.Session`; it accepts only a path under sessions/.
 
-Retention: files untouched for CORTADOS_COMPACTION_RETENTION_DAYS (default 14) are deleted, then the oldest sessions
-go until the total is under CORTADOS_COMPACTION_MAX_MB (default 2048). `prune_expired` runs at provider start and at
-most hourly after, in a background thread.
+Shadow decisions (prune.py) go to $CORTADOS_HOME/compaction/decisions/decisions-<UTC day>.<n>.jsonl, a new shard
+per day and whenever the current one passes DECISIONS_SHARD_MAX_BYTES, so no single file grows without bound.
+
+Retention covers both directories: files untouched for CORTADOS_COMPACTION_RETENTION_DAYS (default 14) are deleted,
+then the oldest files go until the total is under CORTADOS_COMPACTION_MAX_MB (default 2048). `prune_expired` runs at
+provider start and at most hourly after, on the store's writer thread.
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
@@ -50,6 +54,12 @@ DEFAULT_MAX_MB = 2048.0
 # Why hourly: retention is measured in days, so pruning more often only costs directory scans.
 PRUNE_INTERVAL_S = 3600.0
 FORMAT_VERSION = 1
+
+SESSIONS_DIR = ("compaction", "sessions")
+DECISIONS_DIR = ("compaction", "decisions")
+# Why 16 MiB: a decisions shard is the unit retention deletes and the harvest reads whole. 16 MiB holds a few hundred
+# closed conversations, so one deletion never removes more than that and no single file grows without bound.
+DECISIONS_SHARD_MAX_BYTES = 16 * 1024 * 1024
 
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -107,6 +117,10 @@ def root() -> Path:
 
 def sessions_dir() -> Path:
     return root() / "sessions"
+
+
+def decisions_dir() -> Path:
+    return root() / "decisions"
 
 
 def session_file_name(conversation_id: str) -> str:
@@ -194,20 +208,51 @@ def _open_file(name: str, dir_fd: int, flags: int, mode: int = 0o600) -> int:
     return fd
 
 
+def _append_at(dfd: int, name: str, data: str) -> None:
+    fd = _open_file(name, dfd, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    try:
+        buf = data.encode("utf-8")
+        while buf:
+            n = os.write(fd, buf)
+            buf = buf[n:]
+    finally:
+        os.close(fd)
+
+
 def append_in(parts: tuple, name: str, data: str) -> None:
     """Append `data` to $CORTADOS_HOME/<parts>/<name> (0600), never through a symlink, a FIFO or a non-file."""
     dfd = open_store_dir(*parts, create=True)
     try:
-        fd = _open_file(name, dfd, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        try:
-            buf = data.encode("utf-8")
-            while buf:
-                n = os.write(fd, buf)
-                buf = buf[n:]
-        finally:
-            os.close(fd)
+        _append_at(dfd, name, data)
     finally:
         os.close(dfd)
+
+
+SHARD_NAME = re.compile(r"^decisions-(\d{4}-\d{2}-\d{2})\.(\d+)\.jsonl$")     # (UTC day, sequence)
+
+
+def append_decisions(data: str, now: float | None = None) -> str:
+    """Append decision rows to the current shard, decisions/decisions-<UTC day>.<n>.jsonl, and return its name. A
+    new day starts shard 0; the shard rolls to n+1 once it is DECISIONS_SHARD_MAX_BYTES or more, so retention can
+    delete decisions by age and size in bounded pieces. Runs on the writer thread (the listing and the append are
+    serialized with retention)."""
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() if now is None else now))
+    dfd = open_store_dir(*DECISIONS_DIR, create=True)
+    try:
+        seqs = [int(m.group(2)) for m in map(SHARD_NAME.match, os.listdir(dfd)) if m and m.group(1) == day]
+        seq = max(seqs, default=0)
+        name = f"decisions-{day}.{seq}.jsonl"
+        if seqs:
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+            if st is not None and st.st_size >= DECISIONS_SHARD_MAX_BYTES:
+                name = f"decisions-{day}.{seq + 1}.jsonl"
+        _append_at(dfd, name, data)
+    finally:
+        os.close(dfd)
+    return name
 
 
 def read_in(parts: tuple, name: str) -> str:
@@ -296,22 +341,46 @@ def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any]
 # Why 1024: the writer drains a turn in well under a millisecond, so 1024 queued turns only happen when the disk is
 # stuck; past that, records are dropped and counted rather than holding memory or ever blocking a request.
 QUEUE_MAX = 1024
+# Why 64 MiB: the job count alone does not bound memory (1024 turns of several MB each would). The queue only fills
+# when the disk is stuck, and then it must not grow toward the RAM the live conversations need; 64 MiB is about
+# 3000 capped Claude Code results and drains in well under a second on a healthy disk. Each job is admitted with its
+# serialized size, so the budget counts the bytes the queue really retains.
+QUEUE_MAX_BYTES = 64 * 1024 * 1024
+# Why 5 s: a turn append is sub-millisecond and one conversation's shadow decisions take tens of milliseconds, so
+# 5 s drains a thousand queued jobs on a healthy disk; a stuck disk must not hold the provider's exit longer than
+# that. What is still queued after it is counted lost, never silently discarded.
+SHUTDOWN_DRAIN_S = 5.0
+
+_STOP = object()        # queue sentinel: the writer exits its get() on it instead of blocking forever at shutdown
 
 
 class Store:
     """All store I/O (session appends, shadow decisions, retention) runs on ONE background writer thread fed by a
     bounded queue, so it is serialized (retention can never race a write) and the request path only enqueues. Every
-    failure (I/O, a full queue, a thread that cannot start) is logged with its reason and counted, never raised:
-    this is the one place a failure must not propagate, because the user's request has already been answered by the
-    backend and a local logging store must never turn that into an error or stall turn finalization."""
+    failure (I/O, a full queue, an over-budget record, a thread that cannot start, a store that is shut down) is
+    logged with its reason and counted, never raised: this is the one place a failure must not propagate, because
+    the user's request has already been answered by the backend and a local logging store must never turn that into
+    an error or stall turn finalization.
 
-    def __init__(self, queue_max: int = QUEUE_MAX):
-        self._lock = threading.Lock()           # guards counters, throttle state and the thread handle only
+    Admission is bounded twice, by job count (QUEUE_MAX) and by retained bytes (QUEUE_MAX_BYTES): a turn is
+    serialized on the request path, so its size is known and capped before it is queued, and the closure holds only
+    the capped text, never the request's own content. Lifecycle: `shutdown` (provider exit, atexit) refuses new
+    jobs, drains what was accepted for SHUTDOWN_DRAIN_S, stops the writer and counts the rest in `lost`.
+    Locks: `_lock` guards counters, the throttle and the thread handle; the queue's own mutex guards admission,
+    `_closed`, `_queued_bytes` and `_inflight`. `_lock` is taken before the queue mutex, never after it."""
+
+    def __init__(self, queue_max: int = QUEUE_MAX, queue_max_bytes: int = QUEUE_MAX_BYTES):
+        self._lock = threading.Lock()
         self._q: "queue.Queue" = queue.Queue(maxsize=queue_max)
+        self._queue_max_bytes = int(queue_max_bytes)
+        self._queued_bytes = 0                  # serialized bytes held by queued and in-flight jobs (queue mutex)
+        self._inflight: Optional[str] = None    # the job the writer is executing (queue mutex)
+        self._closed = False                    # set once by shutdown (queue mutex)
         self._thread: Optional[threading.Thread] = None
         self.write_failures = 0                 # I/O or job failures inside the writer
-        self.dropped = 0                        # jobs refused because the queue was full
-        self.schedule_failures = 0              # the writer thread could not be started
+        self.dropped = 0                        # jobs refused at admission: full queue, byte budget, shut down
+        self.schedule_failures = 0              # the writer thread could not be started, or a record could not be built
+        self.lost = 0                           # jobs accepted but never run because the store shut down
         self.last_failure: Optional[str] = None
         self._last_prune = 0.0
 
@@ -324,9 +393,11 @@ class Store:
         logger.warning("compaction store: %s (%s total: %d)", why, attr, n)
 
     def stats(self) -> dict[str, Any]:
+        with self._q.mutex:
+            queued, qbytes, closed = self._q._qsize(), self._queued_bytes, self._closed
         return {"enabled": enabled(), "write_failures": self.write_failures, "dropped": self.dropped,
-                "schedule_failures": self.schedule_failures, "last_failure": self.last_failure,
-                "queued": self._q.qsize()}
+                "schedule_failures": self.schedule_failures, "lost": self.lost, "last_failure": self.last_failure,
+                "queued": queued, "queued_bytes": qbytes, "closed": closed}
 
     # -- the writer
     def _ensure_writer(self) -> None:
@@ -339,46 +410,123 @@ class Store:
 
     def _run(self) -> None:
         while True:
-            name, job = self._q.get()
+            with self._q.mutex:
+                if self._closed and not self._q._qsize():
+                    return                      # shut down and nothing left: do not block in get() forever
+            item = self._q.get()
+            if item is _STOP:
+                self._q.task_done()
+                return
+            name, job, nbytes = item
+            with self._q.mutex:
+                self._inflight = name
             try:
                 job()
             except Exception as exc:  # deliberately broad: see the class docstring
                 self._count("write_failures", f"{name} failed: {type(exc).__name__}: {exc}")
             finally:
+                with self._q.mutex:
+                    self._queued_bytes -= nbytes
+                    self._inflight = None
                 self._q.task_done()
 
-    def submit(self, name: str, job) -> bool:
-        """Queue `job` for the writer; never blocks and never raises. False when it was not queued."""
+    def submit(self, name: str, job, nbytes: int = 0) -> bool:
+        """Queue `job`, which retains `nbytes` of serialized content, for the writer; never blocks and never raises.
+        False when it was not queued (full queue, byte budget, shut down, writer start failure), each counted."""
         try:
-            self._ensure_writer()
-            self._q.put_nowait((name, job))
-            return True
-        except queue.Full:
-            self._count("dropped", f"{name} dropped: writer queue full ({self._q.maxsize})")
+            with self._q.mutex:
+                closed = self._closed
+            if not closed:
+                self._ensure_writer()
+            # The queue's nonblocking put protocol with the closed and budget checks in the SAME critical section:
+            # nothing can be admitted behind shutdown's drain, and the byte count is exact.
+            with self._q.not_full:
+                if self._closed:
+                    why = "store shut down"
+                elif self._q.maxsize > 0 and self._q._qsize() >= self._q.maxsize:
+                    why = f"writer queue full ({self._q.maxsize} jobs)"
+                elif self._queued_bytes + nbytes > self._queue_max_bytes:
+                    why = (f"writer queue byte budget ({self._queue_max_bytes} bytes) would be exceeded: "
+                           f"{self._queued_bytes} held, {nbytes} offered")
+                else:
+                    self._q._put((name, job, nbytes))
+                    self._q.unfinished_tasks += 1
+                    self._queued_bytes += nbytes
+                    self._q.not_empty.notify()
+                    return True
+            self._count("dropped", f"{name} dropped: {why}")
         except Exception as exc:  # thread start failure and anything else: contained, counted
             self._count("schedule_failures", f"{name} not scheduled: {type(exc).__name__}: {exc}")
         return False
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait until the queue is drained (tests, shutdown). True when drained."""
-        deadline = time.time() + timeout
-        while self._q.unfinished_tasks and time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while self._q.unfinished_tasks and time.monotonic() < deadline:
             time.sleep(0.005)
         return not self._q.unfinished_tasks
 
+    def shutdown(self, timeout: Optional[float] = None) -> int:
+        """Refuse new jobs, give the writer `timeout` (SHUTDOWN_DRAIN_S) to finish what was accepted, stop it, then
+        count exactly once what did not run: whatever is still queued plus a job the writer is still stuck in.
+        Returns that number (also added to `lost`). Idempotent; a second call only re-counts nothing."""
+        timeout = SHUTDOWN_DRAIN_S if timeout is None else timeout
+        until = time.monotonic() + timeout
+        with self._lock:
+            with self._q.mutex:
+                self._closed = True             # from here on submit() drops; the queue holds only earlier work
+            t = self._thread
+        self.flush(max(0.0, until - time.monotonic()))
+        if t is not None and t.is_alive():
+            with self._q.mutex:                 # the sentinel bypasses admission: the writer must see it
+                self._q._put(_STOP)
+                self._q.unfinished_tasks += 1
+                self._q.not_empty.notify()
+            t.join(max(0.0, until - time.monotonic()))
+        n, names = 0, []
+        with self._lock:
+            with self._q.mutex:
+                while self._q._qsize():
+                    it = self._q._get()
+                    self._q.unfinished_tasks -= 1
+                    if it is not _STOP:
+                        n += 1
+                        names.append(it[0])
+                        self._queued_bytes -= it[2]
+                stuck = self._inflight if (t is not None and t.is_alive()) else None
+                if stuck is not None:
+                    n += 1
+                    names.append(stuck + " (writer still in it)")
+                    self._inflight = None       # counted once; a second shutdown() must not count it again
+                if not self._q.unfinished_tasks:
+                    self._q.all_tasks_done.notify_all()
+                self.lost += n
+                total = self.lost
+                if n:
+                    self.last_failure = f"{n} job(s) lost at shutdown"
+        if n:
+            logger.warning("compaction store: %d job(s) lost at shutdown after %.1fs (lost total: %d): %s", n,
+                           timeout, total, "; ".join(names[:5]) + (" ..." if len(names) > 5 else ""))
+        return n
+
     # -- jobs
     def record_turn(self, conversation_id: str, **kw) -> bool:
-        """Queue one turn for the writer. Returns True when queued; building and writing the records happen on the
-        writer thread, off the request path."""
-        if not enabled():
-            return False
-        cid = str(conversation_id)
-
-        def job():
+        """Queue one turn for the writer. Returns True when queued. The records are built and serialized HERE, on
+        the request path, so the turn's size is known and capped before admission and the queued closure retains the
+        capped text only, never the request's content; building is bounded work (every result and input is cut to
+        the policy cap first). Never raises: a record that cannot be built is counted as a scheduling failure."""
+        try:
+            if not enabled():
+                return False
+            cid = str(conversation_id)
             lines = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in turn_records(**kw))
-            append_in(("compaction", "sessions"), session_file_name(cid), lines)
-
-        ok = self.submit(f"turn of conversation {cid[:8]}", job)
+            name = session_file_name(cid)
+            ok = self.submit(f"turn of conversation {cid[:8]}", lambda: append_in(SESSIONS_DIR, name, lines),
+                             nbytes=len(lines.encode("utf-8")))
+        except Exception as exc:  # contained like every scheduling failure
+            self._count("schedule_failures", f"turn of conversation {str(conversation_id)[:8]} not built: "
+                                             f"{type(exc).__name__}: {exc}")
+            ok = False
         self.maybe_prune_async()
         return ok
 
@@ -406,85 +554,97 @@ class Store:
             return False
 
 
+RETAINED_DIRS = (SESSIONS_DIR, DECISIONS_DIR)
+
+
 def prune_expired(now: float | None = None) -> list[str]:
-    """Delete session files older than the retention, then the oldest until the total fits the size cap. Returns
-    the deleted file names. Runs on the writer thread (serialized with appends). Everything is relative to a dir fd
-    opened through verified, non-symlink components; only regular *.jsonl files are touched, and each candidate is
-    re-stat'ed just before unlinking (same inode, still past its criterion) so a changed file is left alone."""
+    """Delete session files and decisions shards older than the retention, then the oldest of either until their
+    total fits the size cap (one budget for the whole store: decisions must not grow outside it). Returns the
+    deleted files as "<dir>/<name>". Runs on the writer thread (serialized with appends). Everything is relative to
+    dir fds opened through verified, non-symlink components; only regular *.jsonl files are touched, and each
+    candidate is re-stat'ed just before unlinking (same inode, still past its criterion) so a changed file is left
+    alone."""
     now = time.time() if now is None else now
-    try:
-        dfd = open_store_dir("compaction", "sessions", create=False)
-    except FileNotFoundError:
-        return []
+    dfds: dict[tuple, int] = {}
+    removed: list[str] = []
     try:
         files = []
-        for name in os.listdir(dfd):
-            if not name.endswith(".jsonl"):
-                continue
+        for parts in RETAINED_DIRS:
             try:
-                est = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                dfds[parts] = dfd = open_store_dir(*parts, create=False)
             except FileNotFoundError:
                 continue
-            if stat.S_ISREG(est.st_mode):
-                files.append((est.st_mtime, est.st_size, name, est.st_ino))
+            for name in os.listdir(dfd):
+                if not name.endswith(".jsonl"):
+                    continue
+                try:
+                    est = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(est.st_mode):
+                    files.append((est.st_mtime, est.st_size, parts, name, est.st_ino))
         files.sort()
-        removed: list[str] = []
         cutoff = now - retention_days() * 86400
         keep = []
-        for mtime, size, name, ino in files:
+        for mtime, size, parts, name, ino in files:
             if mtime < cutoff:
-                _unlink_if(dfd, name, ino, lambda st: st.st_mtime < cutoff, removed)
+                _unlink_if(dfds[parts], parts, name, ino, lambda st: st.st_mtime < cutoff, removed)
             else:
-                keep.append((mtime, size, name, ino))
+                keep.append((mtime, size, parts, name, ino))
         total, cap = sum(k[1] for k in keep), max_bytes()
-        for mtime, size, name, ino in keep:
+        for mtime, size, parts, name, ino in keep:
             if total <= cap:
                 break
-            if _unlink_if(dfd, name, ino, lambda st, m=mtime: st.st_mtime <= m, removed):
+            if _unlink_if(dfds[parts], parts, name, ino, lambda st, m=mtime: st.st_mtime <= m, removed):
                 total -= size
     finally:
-        os.close(dfd)
+        for dfd in dfds.values():
+            os.close(dfd)
     if removed:
-        logger.info("compaction store: pruned %d session file(s)", len(removed))
+        logger.info("compaction store: pruned %d file(s)", len(removed))
     return removed
 
 
-def _unlink_if(dfd: int, name: str, ino: int, still, removed: list[str]) -> bool:
+def _unlink_if(dfd: int, parts: tuple, name: str, ino: int, still, removed: list[str]) -> bool:
     try:
         st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
         if not stat.S_ISREG(st.st_mode) or st.st_ino != ino or not still(st):
             return False
         os.unlink(name, dir_fd=dfd)
-        removed.append(name)
+        removed.append(f"{parts[-1]}/{name}")
         return True
     except FileNotFoundError:
         return False
 
 
+def session_file_of(path: str | os.PathLike) -> str:
+    """The session file name `path` denotes, or ValueError. Only a path that lexically names a file directly under
+    sessions/ is accepted (both sides normalized the same way, no symlink followed to decide); the caller then opens
+    THAT name through the anchored dir fds. There is no fallback for other paths: an alias such as
+    sessions/../sessions/x.jsonl or a path outside the store would otherwise be opened directly and follow
+    intermediate symlinks."""
+    p = os.path.normpath(os.path.abspath(os.fspath(path)))
+    want = os.path.normpath(os.path.abspath(os.fspath(sessions_dir())))
+    head, name = os.path.split(p)
+    if head != want or not name or name in (".", "..") or not name.endswith(".jsonl"):
+        raise ValueError(f"compaction store: {os.fspath(path)!r} is not a session file under {want}; refusing it")
+    return name
+
+
 def read_session(path: str | os.PathLike) -> Session:
     """Read one session file into events.Session. Its source is the conversation's wire as the first turn header
     recorded it ("claude-code" / "codex"; "provider" when there is none), so token estimates use the right ratio.
-    Calls without a result are interrupted."""
-    p = Path(path)
+    Calls without a result are interrupted. `path` must be a file under sessions/ (session_file_of); it is read
+    through the anchored dir fds, never opened by path."""
+    name = session_file_of(path)
+    p = Path(name)
     sid = p.stem
     messages: list[dict[str, Any]] = []
     calls: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     turn_ts: Optional[str] = None
     source: Optional[str] = None
-    if p.parent == sessions_dir():
-        text = read_in(("compaction", "sessions"), p.name)       # anchored to verified dir fds
-    else:                                                         # an explicit path elsewhere: still no symlink/FIFO
-        fd = os.open(p, os.O_RDONLY | _FILE_FLAGS)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(f"{p} is not a regular file; refusing it")
-            os.set_blocking(fd, True)
-        except BaseException:
-            os.close(fd)
-            raise
-        with os.fdopen(fd, encoding="utf-8") as f:
-            text = f.read()
+    text = read_in(SESSIONS_DIR, name)
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -523,3 +683,12 @@ def read_session(path: str | os.PathLike) -> Session:
 
 
 STORE = Store()
+
+
+def _at_exit() -> None:
+    """Interpreter exit: daemon threads are frozen at teardown, so without this drain the turns and decisions
+    accepted in the last moments (Registry.drop enqueues decisions right before exit) would vanish uncounted."""
+    STORE.shutdown()
+
+
+atexit.register(_at_exit)

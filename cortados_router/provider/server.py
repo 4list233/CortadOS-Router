@@ -2243,7 +2243,8 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         httpd.serve_forever()
     finally:
         for s in list(registry.sessions.values()):
-            registry.drop(s)
+            registry.drop(s)                                # each drop enqueues that conversation's shadow decisions
+        compaction_store.STORE.shutdown()                   # then drain them (bounded) and count what did not run
 
 
 def main(argv=None) -> None:

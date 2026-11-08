@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -156,6 +157,94 @@ class StoreTests(unittest.TestCase):
             s.flush()
         self.assertEqual(s.dropped, 1)
 
+    def test_queue_budget_bounds_retained_bytes_not_just_jobs(self):
+        """A stalled writer used to hold every queued turn's UNCAPPED content (the closure kept the request's kw
+        until it ran): one 10 MB result retained 10 MB despite its 20,000-char cap. Now the turn is serialized and
+        capped before admission, the closure holds only the capped text, and admission is bounded in bytes."""
+        gate = threading.Event()
+        big = "x" * (10 * 1024 * 1024)
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            self.assertTrue(self.s.submit("block", gate.wait))           # the writer is stuck on this job
+            time.sleep(0.05)
+            rc0 = sys.getrefcount(big)                                     # CPython: a retained reference shows here
+            self.assertTrue(self.s.record_turn("c", **turn(tool_results={
+                "t": {"content": [{"type": "text", "text": big}]}})))
+            self.assertEqual(sys.getrefcount(big), rc0)                    # the queue does not reference the payload
+            st = self.s.stats()
+            self.assertEqual(st["queued"], 2)                              # the turn and its retention pass (0 bytes)
+            self.assertLessEqual(st["queued_bytes"], store.cap_chars("claude-code") + 2000)   # capped text + headers
+            self.assertGreater(st["queued_bytes"], store.cap_chars("claude-code"))
+            # an unbuildable turn is counted, never raised into the request
+            self.assertFalse(self.s.record_turn("c", **turn(assistant_blocks=5)))
+            self.assertEqual(self.s.schedule_failures, 1)
+            self.assertIn("not built", self.s.last_failure)
+            gate.set()
+            self.assertTrue(self.s.flush())
+        self.assertEqual(self.s.stats()["queued_bytes"], 0)
+        self.assertEqual(self.s.write_failures, 0)
+
+    def test_queue_byte_budget_drops_and_counts(self):
+        s = store.Store(queue_max_bytes=100)
+        gate = threading.Event()
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            self.assertTrue(s.submit("block", gate.wait))
+            time.sleep(0.05)
+            self.assertTrue(s.submit("a", lambda: None, nbytes=60))
+            self.assertFalse(s.submit("b", lambda: None, nbytes=60))      # 120 > 100: dropped at once
+            self.assertTrue(s.submit("c", lambda: None, nbytes=40))       # exactly the budget: admitted
+            self.assertFalse(s.submit("huge", lambda: None, nbytes=101))  # over the whole budget even when empty
+            self.assertEqual(s.stats()["queued_bytes"], 100)
+            gate.set()
+            self.assertTrue(s.flush())
+        self.assertEqual(s.dropped, 2)
+        self.assertIn("byte budget", s.last_failure)
+        self.assertEqual(s.stats()["queued_bytes"], 0)
+
+    def test_shutdown_counts_unfinished_and_refuses_new_jobs(self):
+        s = store.Store()
+        gate = threading.Event()
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            self.assertTrue(s.submit("stuck", gate.wait))                 # the writer never finishes this one
+            time.sleep(0.05)
+            self.assertTrue(s.submit("one", lambda: None, nbytes=10))
+            self.assertTrue(s.submit("two", lambda: None, nbytes=10))
+            t0 = time.monotonic()
+            self.assertEqual(s.shutdown(timeout=0.2), 3)                   # two queued + the one the writer is in
+            self.assertLess(time.monotonic() - t0, 2.0)                    # bounded: the stuck disk does not hold exit
+            self.assertEqual(s.lost, 3)
+            self.assertIn("lost at shutdown", s.last_failure)
+            self.assertFalse(s.submit("late", lambda: None))               # refused, counted, never queued
+            self.assertEqual(s.dropped, 1)
+            self.assertIn("shut down", s.last_failure)
+            self.assertEqual(s.shutdown(timeout=0.05), 0)                  # idempotent: nothing counted twice
+            st = s.stats()
+            self.assertEqual((st["closed"], st["queued"], st["queued_bytes"], st["lost"]), (True, 0, 0, 3))
+            gate.set()
+            time.sleep(0.1)
+            self.assertFalse(s._thread.is_alive())                         # closed and empty: the writer exits
+
+    def test_shutdown_drains_accepted_writes_at_process_exit(self):
+        """The writer is a daemon thread, which the interpreter freezes at exit: a turn accepted right before the
+        process ends (Registry.drop enqueues decisions on the way out) used to vanish. A real process, not flush()."""
+        code = (
+            "import time\n"
+            "from cortados_router.compaction import store\n"
+            "def late():\n"
+            "    time.sleep(0.3)\n"
+            "    store.append_in(('compaction',), 'late.jsonl', 'late\\n')\n"
+            "assert store.STORE.submit('late', late)\n"
+            "assert store.STORE.record_turn('conv', source='claude-code', user_content=[{'type': 'text', 'text': 'hi'}],"
+            " tool_results={}, assistant_blocks=[{'type': 'text', 'text': 'ok'}])\n")
+        env = dict(os.environ, CORTADOS_HOME=self.home, CORTADOS_COMPACTION_STORE="1",
+                   PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+        t0 = time.monotonic()
+        r = subprocess.run([sys.executable, "-B", "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertEqual(Path(self.home, "compaction", "late.jsonl").read_text(), "late\n")
+        self.assertTrue(store.session_path("conv").exists(), os.listdir(os.path.join(self.home, "compaction")))
+        self.assertNotIn("lost at shutdown", r.stderr)
+
     def test_writer_start_failure_contained(self):
         with Env(CORTADOS_COMPACTION_STORE="1"), \
              mock.patch.object(self.s, "_ensure_writer", side_effect=RuntimeError("can't start new thread")):
@@ -174,8 +263,48 @@ class StoreTests(unittest.TestCase):
                 p.write_text("z" * 1000)
                 os.utime(p, (now - age_days * 86400,) * 2)
             removed = store.prune_expired(now)
-        self.assertEqual(removed, ["old.jsonl", "mid.jsonl"])     # expired, then oldest until under 1500 bytes
+        self.assertEqual(removed, ["sessions/old.jsonl", "sessions/mid.jsonl"])   # expired, then oldest until under 1500 B
         self.assertEqual(os.listdir(store.sessions_dir()), ["new.jsonl"])
+
+    def test_retention_covers_decisions_shards(self):
+        """Decisions used to live outside retention (one unbounded decisions.jsonl). Now the shards age out and
+        share the size budget with the sessions, oldest first across both directories."""
+        with Env(CORTADOS_COMPACTION_STORE="1", CORTADOS_COMPACTION_RETENTION_DAYS="14",
+                 CORTADOS_COMPACTION_MAX_MB=str(1 / 1024 / 1024)):                 # the review's one-byte budget
+            ddir = store.root() / "decisions"
+            os.makedirs(store.sessions_dir(), mode=0o700)
+            os.makedirs(ddir, mode=0o700)
+            now = time.time()
+            for p, age_days in ((ddir / "decisions-2026-10-01.0.jsonl", 20),
+                                (ddir / "decisions-2026-11-07.0.jsonl", 1),
+                                (store.sessions_dir() / "s.jsonl", 2)):
+                p.write_text("z" * 10_000)
+                os.utime(p, (now - age_days * 86400,) * 2)
+            removed = store.prune_expired(now)
+        self.assertEqual(removed, ["decisions/decisions-2026-10-01.0.jsonl", "sessions/s.jsonl",
+                                   "decisions/decisions-2026-11-07.0.jsonl"])
+        self.assertEqual(os.listdir(ddir), [])
+        with Env(CORTADOS_COMPACTION_STORE="1", CORTADOS_COMPACTION_MAX_MB=str(15_000 / 1024 / 1024)):
+            (ddir / "decisions-2026-11-08.0.jsonl").write_text("z" * 10_000)
+            (store.sessions_dir() / "s2.jsonl").write_text("z" * 10_000)
+            os.utime(store.sessions_dir() / "s2.jsonl", (now - 3600,) * 2)        # the older of the two goes
+            self.assertEqual(store.prune_expired(now), ["sessions/s2.jsonl"])
+
+    def test_decisions_shards_roll_by_day_and_size(self):
+        with Env(CORTADOS_COMPACTION_STORE="1"), mock.patch.object(store, "DECISIONS_SHARD_MAX_BYTES", 100):
+            day1, day2 = 1_762_560_000.0, 1_762_560_000.0 + 86400                  # 2025-11-08 and the next UTC day
+            names = [store.append_decisions("r" * 60 + "\n", day1) for _ in range(4)]
+            names.append(store.append_decisions("x\n", day2))
+        self.assertEqual(names, ["decisions-2025-11-08.0.jsonl", "decisions-2025-11-08.0.jsonl",   # 61 B, then 122 B
+                                 "decisions-2025-11-08.1.jsonl", "decisions-2025-11-08.1.jsonl",   # rolled at >= 100
+                                 "decisions-2025-11-09.0.jsonl"])                                  # a new day: shard 0
+        shards = sorted(os.listdir(store.decisions_dir()))
+        self.assertEqual(shards, ["decisions-2025-11-08.0.jsonl", "decisions-2025-11-08.1.jsonl",
+                                  "decisions-2025-11-09.0.jsonl"])
+        sizes = [os.path.getsize(store.decisions_dir() / s) for s in shards]
+        self.assertEqual(sizes, [122, 122, 2])                      # each shard stops once it reaches the cap
+        for s in shards:
+            self.assertEqual(stat.S_IMODE(os.stat(store.decisions_dir() / s).st_mode), 0o600)
 
     def test_retention_never_leaves_the_store_through_a_symlinked_parent(self):
         outside = tempfile.mkdtemp()
@@ -227,6 +356,27 @@ class StoreTests(unittest.TestCase):
             os.symlink(outside, store.session_path("link"))
             with self.assertRaises(OSError):
                 store.read_session(store.session_path("link"))
+            # an alias of a legitimate file names the same file and is read through the anchored fds
+            alias = store.sessions_dir() / ".." / "sessions" / store.session_file_name("c")
+            self.assertEqual(store.read_session(alias).events, sess.events)
+
+    def test_read_session_refuses_aliased_paths_through_symlinked_parents_and_outside_paths(self):
+        """Only an exact parent match used to take the anchored read; sessions/../sessions/x.jsonl fell to a direct
+        os.open that followed a symlinked compaction/ and returned content from outside the store."""
+        outside = tempfile.mkdtemp()
+        os.makedirs(os.path.join(outside, "sessions"))
+        Path(outside, "sessions", "f.jsonl").write_text(json.dumps({"kind": "turn", "source": "codex"}) + "\n")
+        os.symlink(outside, store.root())                                  # compaction/ -> outside
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            for p in (store.sessions_dir() / "f.jsonl",
+                      store.sessions_dir() / ".." / "sessions" / "f.jsonl",
+                      Path(self.home) / "compaction" / "." / "sessions" / "f.jsonl"):
+                with self.subTest(path=str(p)), self.assertRaises(OSError):
+                    store.read_session(p)
+            for p in (Path(outside) / "sessions" / "f.jsonl", Path(self.home) / "f.jsonl",
+                      store.sessions_dir() / "sub" / "f.jsonl", store.sessions_dir() / "f.txt", store.sessions_dir()):
+                with self.subTest(path=str(p)), self.assertRaises(ValueError):
+                    store.read_session(p)
 
 
 class FakeSession:

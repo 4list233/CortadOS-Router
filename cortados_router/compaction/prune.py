@@ -1,7 +1,8 @@
 """Deterministic shadow pruning rules (phase 1): a KeepDecision for every past tool event of a session.
 
-SHADOW ONLY: decisions are appended to $CORTADOS_HOME/compaction/decisions.jsonl with the chars/tokens they WOULD have
-saved; nothing here edits what any backend sees. Shared thresholds (keep the last N results, the pruning start
+SHADOW ONLY: decisions are appended to $CORTADOS_HOME/compaction/decisions/decisions-<UTC day>.<n>.jsonl (day shards,
+rolled at store.DECISIONS_SHARD_MAX_BYTES, deleted by the store's retention like session files) with the chars/tokens
+they WOULD have saved; nothing here edits what any backend sees. Shared thresholds (keep the last N results, the pruning start
 min(cap, pct x W), the minimum tokens freed, chars per token by source) come from tables/compaction.json through
 compaction/policy.py (one source of truth with phase 0); tables/compaction-prune.json holds only this phase's rule data
 (tool lists, read-only Bash command shapes, MCP side-effect words, small-result N, dropped-result head H, assumed window).
@@ -35,7 +36,9 @@ from cortados_router.compaction.events import KeepDecision, Session, ToolEvent
 logger = logging.getLogger(__name__)
 
 TABLE_PATH = Path(__file__).resolve().parents[2] / "tables" / "compaction-prune.json"
-_CHAIN = re.compile(r"[;&|<>`]|\$\(")      # chains, pipes, redirections, substitutions: not obviously read-only
+# Chains, pipes, redirections, substitutions and line breaks: not obviously read-only. Newline and CR are separators
+# to the shell but whitespace to shlex.split, which would turn "ls\nrm x" into the tokens of one ls call.
+_CHAIN = re.compile(r"[;&|<>`\n\r]|\$\(")
 
 
 @lru_cache(maxsize=4)
@@ -63,7 +66,8 @@ def _bash_command(ev: ToolEvent) -> Optional[str]:
 def readonly_bash(cmd: str, table: dict[str, Any]) -> bool:
     """True only when the command matches an allowlisted shape (tables/compaction-prune.json readonly_bash): the
     shlex tokens start with a listed command ("git log" takes two tokens), every flag is listed, and positionals
-    appear only where the shape allows them. Everything else is not read-only."""
+    appear only where the shape allows them. Everything else, including any command holding a shell separator or a
+    line break (a second command may hide after it), is not read-only."""
     if not cmd or _CHAIN.search(cmd):
         return False
     try:
@@ -166,8 +170,21 @@ def decide(session: Session, *, upto_message: Optional[int] = None,
     return out
 
 
-def decisions_path() -> Path:
-    return store.root() / "decisions.jsonl"
+def decisions_dir() -> Path:
+    return store.decisions_dir()
+
+
+def decision_files() -> list[Path]:
+    """The decisions shards, oldest day and lowest sequence first (the harvest reads them in this order)."""
+    d = decisions_dir()
+    if not d.is_dir():
+        return []
+    found = []
+    for p in d.iterdir():
+        m = store.SHARD_NAME.match(p.name)
+        if m:
+            found.append((m.group(1), int(m.group(2)), p))
+    return [p for _, _, p in sorted(found)]
 
 
 def session_chars(sess: Session) -> int:
@@ -205,7 +222,7 @@ def shadow_decide(session_path, *, now: Optional[float] = None) -> list[KeepDeci
                                 "saved_tokens_est": math.ceil(saved / cpt), "mode": "shadow", "gate": g}) + "\n"
                     for d, saved in pairs)
     if lines:
-        store.append_in(("compaction",), "decisions.jsonl", lines)
+        store.append_decisions(lines, now)
     return [d for d, _ in pairs]
 
 

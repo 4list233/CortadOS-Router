@@ -56,7 +56,9 @@ class RuleTests(unittest.TestCase):
                   "git switch -c x", "git reset --hard", "git diff --output=x", "git log --output=x",
                   "sed -i s/a/b/ f", "sed -n 1p f", "rg --pre=sh x", "tail -f log", "cat a > b", "ls; rm x",
                   "ls && rm x", "cat $(rm x)", "echo `rm x`", "git", "rm -rf build", "/bin/cat a", "cat 'unterminated",
-                  "FOO=1 cat a", "xargs rm", "ls | xargs rm"]
+                  "FOO=1 cat a", "xargs rm", "ls | xargs rm",
+                  # line breaks separate commands to the shell but are whitespace to shlex: never read-only
+                  "ls\nrm victim", "echo harmless\nrm victim", "ls\rrm victim", "cat a\n\nrm b", "ls \\\n -la"]
         for c in reads:
             self.assertTrue(prune.readonly_bash(c, T), c)
         for c in writes:
@@ -125,9 +127,10 @@ class ShadowDecideTests(unittest.TestCase):
         s.record_turn("c", source="claude-code", user_content=[], assistant_blocks=[{"type": "text", "text": "ok"}],
                       tool_results={"t1": {"content": [{"type": "text", "text": "x" * 900}]}})
         self.assertTrue(s.flush())
-        ds = prune.shadow_decide(store.session_path("c"))
+        ds = prune.shadow_decide(store.session_path("c"), now=1_762_560_000.0)
         self.assertEqual(len(ds), 1)
-        p = prune.decisions_path()
+        p, = prune.decision_files()
+        self.assertEqual((p.parent, p.name), (store.decisions_dir(), "decisions-2025-11-08.0.jsonl"))
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
         row = json.loads(p.read_text().splitlines()[0])
         self.assertEqual((row["mode"], row["event_index"], row["decided_by"]), ("shadow", 0, "rule:pinned"))
@@ -139,7 +142,7 @@ class ShadowDecideTests(unittest.TestCase):
     def test_async_is_noop_when_off_or_missing(self):
         self.assertTrue(prune.shadow_decide_async("nope"))       # queued; the writer skips a missing file
         self.assertTrue(store.STORE.flush())
-        self.assertFalse(prune.decisions_path().exists())
+        self.assertEqual(prune.decision_files(), [])
         with mock.patch.dict(os.environ, {"CORTADOS_COMPACTION_STORE": "0"}):
             self.assertFalse(prune.shadow_decide_async("c"))
 
@@ -155,7 +158,7 @@ class ShadowDecideTests(unittest.TestCase):
         self.assertTrue(store.STORE.flush())
         self.assertTrue(prune.shadow_decide_async("c"))
         self.assertTrue(store.STORE.flush())
-        self.assertTrue(prune.decisions_path().exists())
+        self.assertEqual(len(prune.decision_files()), 1)
 
 
 if __name__ == "__main__":

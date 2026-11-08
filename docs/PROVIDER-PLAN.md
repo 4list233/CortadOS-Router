@@ -587,18 +587,28 @@ approved this with a retention limit. Nothing it does changes what any backend r
   giant Write content must not fill the disk). The input cap holds on the final serialized JSON: an input that
   cannot fit even with its values shortened is stored as `{"_truncated_json": <head>}`. Read back with `store.read_session(path) -> events.Session`.
 - Retention: `CORTADOS_COMPACTION_RETENTION_DAYS` (default 14: nightly harvest plus a week of review; tools can print
-  secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest sessions first.
-  Pruned at provider start and at most hourly after. Each candidate is re-stat'ed just before deletion.
+  secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest files first. Both
+  cover `sessions/` AND the decisions shards under `decisions/` (one budget for the whole store). Pruned at provider
+  start and at most hourly after. Each candidate is re-stat'ed just before deletion. `read_session` accepts only a
+  path that names a file directly under `sessions/` and reads it through the anchored fds; an alias such as
+  `sessions/../sessions/x.jsonl` through a symlinked parent, or a path elsewhere, is refused (no direct `open` fallback).
 - One writer: all store I/O (turn appends, shadow decisions, retention) runs on a single background writer thread
-  fed by a bounded queue (`QUEUE_MAX` = 1024 jobs), so retention never races a write and the request path only
-  enqueues. A full queue drops the record and counts it (`dropped`); it never blocks a request.
-- Failures: I/O failures (`write_failures`), drops (`dropped`) and jobs that could not be scheduled, such as a
-  writer thread that will not start (`schedule_failures`), are each logged with the reason and counted in
-  `store.STORE.stats()`. None of them is raised into the request, turn finalization or Registry cleanup (the reply
-  is already in hand).
+  fed by a queue bounded twice: `QUEUE_MAX` = 1024 jobs and `QUEUE_MAX_BYTES` = 64 MiB of retained content. A turn
+  is serialized (and capped) on the request path so its size is known before admission and the queued closure holds
+  only the capped text, never the request's own content; a job over either bound is dropped and counted (`dropped`),
+  never blocking a request. Retention never races a write.
+- Shutdown: `STORE.shutdown()` (provider exit and `atexit`) refuses new jobs, drains what was accepted for
+  `SHUTDOWN_DRAIN_S` = 5 s, stops the writer and counts what did not run in `lost` (the writer is a daemon thread,
+  which the interpreter would otherwise freeze with accepted turns and decisions still queued).
+- Failures: I/O failures (`write_failures`), drops (`dropped`), jobs lost at shutdown (`lost`) and jobs that could
+  not be scheduled, such as a writer thread that will not start or a turn that could not be built
+  (`schedule_failures`), are each logged with the reason and counted in `store.STORE.stats()`. None of them is
+  raised into the request, turn finalization or Registry cleanup (the reply is already in hand).
 - Shadow pruning: when a conversation closes (drop, failure, idle reap) `compaction/prune.py` decides keep/drop for
   every past tool call on the store's writer thread and appends the decisions, with the chars/tokens they would have saved,
-  to `$CORTADOS_HOME/compaction/decisions.jsonl` (0600). Each row carries a `gate`: the session's estimated tokens
+  to `$CORTADOS_HOME/compaction/decisions/decisions-<UTC day>.<n>.jsonl` (0600; a new shard per day and whenever the
+  current one reaches `DECISIONS_SHARD_MAX_BYTES` = 16 MiB, so retention deletes decisions in bounded pieces;
+  `prune.decision_files()` lists them in order). Each row carries a `gate`: the session's estimated tokens
   against the pruning start min(`start_cap_tokens`, `start_pct` x W) (`would_start`) and whether the drops free at
   least `min_freed_tokens` (`would_prune`), so labels can be joined later. W is `assumed_window_tokens` (200k) because
   the provider does not learn the backend window. Shared thresholds (keep the last 4 results, start, min freed, result
