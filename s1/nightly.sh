@@ -319,6 +319,37 @@ gated() {
   [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ] && { echo "gated step refused: ${CORTADOS_S1_TRAIN_SKIP_REASON:-training not allowed now}"; return 75; }
   PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"
 }
+# Calibration sweep (evaluation only, never promotes): when data/sweep-request.json exists
+#   {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...]}
+# calibrate.py grades the requested tilt/blend settings and writes runs/<c>/sweep.json (+ sweep.md). Gated, so it holds the
+# training lock and refuses when CORTADOS_S1_TRAIN_ALLOWED=0. Order: it runs AFTER the night's normal training and evaluation
+# (the last step before "nightly end"), so it can only delay, never replace, the night's training. A failed sweep keeps the
+# request for the next night (logged); a finished one renames it sweep-request.done-<stamp>.json.
+sweep_request() {
+  local req=data/sweep-request.json args sweep_out rc
+  [ -f "$req" ] || return 0
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 0; }
+  if ! args=$(python3 - "$req" <<'PY'
+import json, sys
+from pathlib import Path
+r = json.load(open(sys.argv[1]))
+if not isinstance(r.get("candidate"), str) or not isinstance(r.get("live"), str):
+    sys.exit("sweep request needs string candidate and live")
+for k in ("tilts", "alphas"):
+    if not isinstance(r.get(k, []), list) or not all(isinstance(x, (int, float)) for x in r.get(k, [])):
+        sys.exit(f"sweep request {k} must be a list of numbers")
+out = Path(r["candidate"]).parent / "sweep.json"
+print("\n".join(["--candidate", r["candidate"], "--live", r["live"], "--out", str(out),
+                  "--tilts", *map(str, r.get("tilts", [0])), "--alphas", *map(str, r.get("alphas", [1.0]))]))
+PY
+  ); then echo "SWEEP REQUEST INVALID ($req); left in place"; return 0; fi
+  local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
+  sweep_out=$(HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
+    gated "$PY" calibrate.py --base "$BASE" "${argv[@]}" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then echo "SWEEP FAILED rc=$rc: $(printf '%s\n' "$sweep_out" | tail -1 | cut -c1-200); request kept for next night"; return 0; fi
+  echo "$(printf '%s\n' "$sweep_out" | grep '^sweep:' | tail -1)"
+  mv "$req" "data/sweep-request.done-$(date +%Y%m%d-%H%M%S).json"
+}
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
@@ -802,4 +833,5 @@ else
   rm -f data/pending-candidate; mark_trained; holdout_clear
   echo "not promoted (see $RUN/report.json); incumbent stays"
 fi
+sweep_request
 echo "=== $(date) nightly end"
