@@ -7,6 +7,12 @@ Safety rails, each with its reason:
   uses: it holds the node training lock, so the local model gate and other trainers yield.
 - Never reads or writes current.json or the routing run dirs (runs/20*): the output dir is runs/compaction-<stamp>,
   which nightly.sh's runs/20*/ globs never match, and the script refuses any --out outside runs/compaction-*.
+- The policy's deadline (the window end) bounds the WHOLE gated child: the wait for the gate's lock and the training.
+  At the deadline the child's process group gets overnight.stop_group_drained (CONT+TERM, re-sent TERMs, drain for
+  TRAIN_STOP_GRACE_S, then KILL) and is reaped; checkpointed adapter files are kept; exit 124 with the reason. Without
+  it a run started near 07:00, or queued behind the gate across it, would train into the day holding the Studio lock.
+- --data / --out are resolved to absolute paths once, before validation: the child runs with cwd=s1/, so a relative
+  path validated against the caller's cwd would name a different directory there.
 - --dry-run prints the policy decision and the exact command, and trains nothing.
 """
 from __future__ import annotations
@@ -25,6 +31,40 @@ sys.path.insert(0, str(S1))
 CONFIG = S1 / "compaction_train.json"
 DEFAULT_BASE = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 REFUSED = 75
+DEADLINE_RC = 124          # same code overnight.run_bounded returns for a window-end stop
+POLL_S = 5.0               # deadline check interval: small against the 60 s stop grace, cheap
+
+
+def supervise(cmd: list[str], deadline: datetime | None, out: Path, *, now_fn, env=None, cwd=None,
+              popen=subprocess.Popen, stop=None, sleep=None, poll_s: float = POLL_S, grace: float | None = None) -> int:
+    """Run the gated trainer in its own process group, bounded by `deadline` (None = unbounded, policy switch off)."""
+    import time as _t
+    import overnight
+    stop = stop or overnight.stop_group_drained
+    sleep = sleep or _t.sleep
+    grace = overnight.TRAIN_STOP_GRACE_S if grace is None else grace
+    if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
+        print(f"compaction_train refused: window ended at {deadline}; nothing started", file=sys.stderr)
+        return REFUSED
+    child = popen(cmd, cwd=cwd, env=env, start_new_session=True)
+    try:
+        while True:
+            rc = child.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and overnight.deadline_reached(now_fn(), deadline):
+                break
+            sleep(poll_s)
+    except BaseException:
+        stop(child, grace=grace)   # SIGTERM/KeyboardInterrupt here must not orphan a trainer holding the lock
+        child.wait()
+        raise
+    stop(child, grace=grace)
+    child.wait()
+    kept = sorted(p.name for p in (out / "adapter").glob("*.safetensors")) if (out / "adapter").is_dir() else []
+    print(f"compaction_train stopped: night window ended at {deadline}; whole group stopped and reaped; "
+          f"checkpoints kept: {', '.join(kept) or 'none'}", file=sys.stderr)
+    return DEADLINE_RC
 
 
 def plan(data: Path, out: Path, cfg: dict, *, base: str, py: str) -> list[str]:
@@ -46,7 +86,7 @@ def check_out(out: Path) -> str | None:
     return None
 
 
-def main(argv=None, *, now: datetime | None = None, policy=None) -> int:
+def main(argv=None, *, now: datetime | None = None, policy=None, now_fn=None, **supervise_kw) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--data", type=Path, required=True, help="dir with train.jsonl / valid.jsonl from compaction_dataset.py")
     ap.add_argument("--out", type=Path, default=None, help="default s1/runs/compaction-<YYYYmmdd-HHMM>")
@@ -57,17 +97,23 @@ def main(argv=None, *, now: datetime | None = None, policy=None) -> int:
         import overnight
         policy = overnight.train_policy
         now = now or overnight._local_now()
+        now_fn = now_fn or overnight._local_now
     now = now or datetime.now()
+    now_fn = now_fn or (lambda: now)
+    a.data = a.data.resolve()
+    if a.out is not None:
+        a.out = a.out.resolve()
     cfg = json.loads(a.config.read_text())
     out = a.out or S1 / "runs" / f"compaction-{now:%Y%m%d-%H%M}"
     base = os.environ.get("CORTADOS_S1_BASE", DEFAULT_BASE)
     py = os.environ.get("CORTADOS_S1_PY", str(REPO / ".venv-mlx/bin/python"))
-    allowed, reason, _deadline = policy(now)
+    allowed, reason, deadline = policy(now)
     cmd = plan(a.data, out, cfg, base=base, py=py)
     bad = check_out(out)
     missing = [n for n in ("train.jsonl", "valid.jsonl") if not (a.data / n).is_file()]
     if a.dry_run:
-        print(json.dumps({"policy": {"allowed": allowed, "reason": reason}, "out": str(out), "out_problem": bad,
+        print(json.dumps({"policy": {"allowed": allowed, "reason": reason,
+                                     "deadline": None if deadline is None else str(deadline)}, "out": str(out), "out_problem": bad,
                           "missing_data": missing, "command": cmd}, indent=2))
         return 0
     if os.environ.get("CORTADOS_S1_TRAIN_ALLOWED") == "0":
@@ -82,7 +128,7 @@ def main(argv=None, *, now: datetime | None = None, policy=None) -> int:
     (out / "plan.json").write_text(json.dumps({"config": cfg, "command": cmd, "data": str(a.data)}, indent=2))
     env = {**os.environ, "HF_HUB_OFFLINE": "1",
            "PYTHONPATH": str(REPO) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
-    return subprocess.call(cmd, cwd=str(S1), env=env)
+    return supervise(cmd, deadline, out, now_fn=now_fn, env=env, cwd=str(S1), **supervise_kw)
 
 
 if __name__ == "__main__":

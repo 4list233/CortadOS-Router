@@ -43,13 +43,17 @@ and repetitions per split and head.
   `s1/runs/compaction-<stamp>/`, refuses any other output dir, and nightly.sh's `runs/20*/` globs never see it.
 - Compaction can be trained, evaluated and rolled back on its own clock; a bad compaction adapter cannot move a
   routing band, and a routing promotion cannot change what compaction keeps.
-- The heads are only switched on at thresholds where `compaction_eval` shows them beating the phase-1 rules on both
-  axes (no higher wrong-drop rate, at least as many chars saved). AUC alone never switches them on.
+- The heads are only switched on at thresholds where `compaction_eval` shows them no worse than the phase-1 rules on
+  BOTH safety metrics (needed results dropped, needed calls dropped, counted separately) while saving at least as
+  many chars, on at least 50 test events with at least 5 needed results ("insufficient evidence" otherwise). AUC
+  alone never switches them on.
 
 ## Training
 `python3 s1/compaction_train.py --data <dir> [--dry-run]`. It asks `overnight.train_policy` (night window,
 `CORTADOS_S1_TRAIN_ONLY_IN_WINDOW`, `CORTADOS_S1_NIGHT_WINDOW`) and honours `CORTADOS_S1_TRAIN_ALLOWED=0`; refused,
-it exits 75 with the reason. Allowed, it runs `mlx_lm lora` under `python -m cortados_router.studio_capacity gate`,
+it exits 75 with the reason. The policy's deadline (window end) bounds the gate wait and the training together: at
+the deadline the process group is stopped with `overnight.stop_group_drained` and reaped, checkpoints are kept, and
+it exits 124. Allowed, it runs `mlx_lm lora` under `python -m cortados_router.studio_capacity gate`,
 the same gate as nightly.sh's `gated()`, so it holds the node training lock and the local model gate yields. Not yet
 wired into nightly.sh: it should run after the routing steps in the same window, never instead of them.
 
