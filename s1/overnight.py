@@ -121,6 +121,24 @@ def in_night_window(window: tuple[time, time] | None, now: datetime) -> bool:
     return start <= t < end if start < end else (t >= start or t < end)
 
 
+def _check_night_window(window) -> tuple[time, time] | None:
+    """Validate an injected window with the same rules parse_night_window applies to text. Without this, equal endpoints
+    (time(1), time(1)) fall through in_night_window's midnight branch as all-day and silently apply the night budget in
+    daytime. Raises ValueError for anything but None or a (start, end) pair of distinct naive datetime.time values."""
+    if window is None:
+        return None
+    if not isinstance(window, tuple) or len(window) != 2:
+        raise ValueError(f"night window {window!r} is not None or a (start, end) tuple")
+    start, end = window
+    if not (isinstance(start, time) and isinstance(end, time)):
+        raise ValueError(f"night window {window!r} endpoints must be datetime.time values")
+    if start.tzinfo is not None or end.tzinfo is not None:
+        raise ValueError(f"night window {window!r} endpoints must be naive local times")
+    if start == end:
+        raise ValueError(f"night window {window!r} starts and ends at the same time")
+    return start, end
+
+
 def _env_night_window() -> tuple[time, time] | None:
     """CORTADOS_S1_NIGHT_WINDOW, reported and replaced by the default when invalid (the _env_float convention)."""
     raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW")
@@ -337,7 +355,7 @@ class Guard:
         # window means a test pinned the budget, and the real wall clock must not loosen it between 01:00 and 07:00).
         if night_window == "env":
             night_window = _env_night_window() if budget_s is None else None
-        self.night_window = night_window
+        self.night_window = _check_night_window(night_window)
         self.wall = wall
         night = (_env_float("CORTADOS_S1_NIGHT_LATENCY_BUDGET_S", DEFAULT_NIGHT_BUDGET_S, minimum=0)
                  if night_budget_s is None else night_budget_s)

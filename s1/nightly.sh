@@ -260,7 +260,8 @@ rotate_logs() {   # keep the newest $LOG_KEEP nightly logs; run folders (adapter
 rotate_logs
 gpu_alone() {   # called only right before training starts, so it marks the cycle worked. Forest 2026-09-27: per-turn extraction must never stop, so ollama (the 8B) and the memory gateway STAY UP during training.
   # Forest 2026-11-03: in continuous mode the live scorer has priority and STAYS UP; overnight.py pauses this tree instead when
-  # scorer latency rises more than CORTADOS_S1_LATENCY_BUDGET_S above baseline.
+  # scorer latency rises more than CORTADOS_S1_LATENCY_BUDGET_S above baseline (inside CORTADOS_S1_NIGHT_WINDOW, local time,
+  # default 01:00-07:00, the looser CORTADOS_S1_NIGHT_LATENCY_BUDGET_S applies instead, default 6 s; free-memory guard unchanged).
   worked_cycle
   [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && { echo "continuous mode: scorer stays up during training (overnight.py latency guard)"; return 0; }
   launchctl unload "$SCORER_PLIST" 2>/dev/null; sleep "$GPU_SETTLE"; echo "scorer stopped for training; ollama + memory gateway stay up"

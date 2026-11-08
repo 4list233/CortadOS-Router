@@ -660,9 +660,6 @@ class ReviewFixesRound4(unittest.TestCase):
                 g.idle_probe()
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class NightWindowBudget(unittest.TestCase):
     """Forest 2026-11-07 option (a): a local-time night window with a looser latency budget; memory guard unchanged."""
@@ -769,3 +766,20 @@ class NightWindowBudget(unittest.TestCase):
             g.tick(42)
         self.assertEqual(sig, [signal.SIGSTOP, signal.SIGCONT])
         self.assertIn('RESUME', logs[-1]); self.assertIn('day budget 1s', logs[-1])
+
+    def test_injected_window_validated_in_constructor(self):
+        bad = ((night.time(1), night.time(1)), (night.time(1),), [night.time(1), night.time(7)], ('01:00', '07:00'),
+               (1, 7), (night.time(1, tzinfo=timezone.utc), night.time(7)), '01:00-07:00')
+        for w in bad:
+            with self.subTest(window=w), self.assertRaises(ValueError):
+                night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, night_budget_s=6.0, night_window=w,
+                            log=lambda m: None, alerter=lambda n, d: None)
+        for w in (None, (night.time(1), night.time(7)), (night.time(23), night.time(5))):
+            with self.subTest(window=w):
+                g = night.Guard(latency=lambda: 1.0, memory=lambda: 100.0, budget_s=1, night_budget_s=6.0, night_window=w,
+                                log=lambda m: None, alerter=lambda n, d: None)
+                self.assertEqual(g.night_window, w)
+
+
+if __name__ == '__main__':
+    unittest.main()
