@@ -37,6 +37,9 @@
 #   python3 <repo>/s1/overnight.py --continuous -- /bin/bash <repo>/s1/nightly.sh
 # which loops cycles with no window/deadline, keeps the scorer up, and pauses this tree on scorer latency / low memory.
 #   CORTADOS_S1_MIN_LEFT_PCT    label.py --min-left-pct per-account quota floor (default 15, Forest 2026-11-03)
+#   CORTADOS_S1_TRAIN_ONLY_IN_WINDOW  continuous mode: gated training/eval only inside CORTADOS_S1_NIGHT_WINDOW (default 1;
+#                               0 = any time; Forest 2026-11-08). overnight.py decides per cycle and passes CORTADOS_S1_TRAIN_ALLOWED
+#                               (0 = label/dataset only, every gated step skipped, rc 0) and stops the cycle at the window end.
 # Exit codes: 0 ok / skipped, 3 labeling failed, 1 other failure, 2 base model missing, 130 stopped.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -293,7 +296,12 @@ GATE_ROOT="$(cd .. && pwd)"   # repo root, fixed here: gated also runs from insi
 case "$PY" in /*) GATE_PY="$PY" ;; */*) GATE_PY="$(cd "$(dirname "$PY")" 2>/dev/null && pwd)/$(basename "$PY")" || GATE_PY="$PY" ;; *) GATE_PY="$PY" ;; esac
 # Test-only: CORTADOS_STUDIO_ACK_WAIT / CORTADOS_STUDIO_OLLAMA_PORT (see studio_capacity.py) pass through the environment.
 # Exit 75 = the gate refused (model residency could not be confirmed absent); the command did not run.
-gated() { PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"; }
+# CORTADOS_S1_TRAIN_ALLOWED=0 (set by overnight.py outside the night window) is enforced again here so no gated step can slip
+# through a future code path; the main flow exits before the first gated step, so reaching this refusal is a bug, not a skip.
+gated() {
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ] && { echo "gated step refused: ${CORTADOS_S1_TRAIN_SKIP_REASON:-training not allowed now}"; return 75; }
+  PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"
+}
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
@@ -476,6 +484,12 @@ fi
 #                            SFT marker cannot notice the backfill; the run waits and is re-evaluated when the eval fingerprint
 #                            (effective holdout labels + settings + serving incumbent) changes.
 # Re-evaluation always grades against today's holdout and incumbent (an earlier approval may be stale). New SFT data supersedes it.
+# Night-window training (Forest 2026-11-08): everything below may run a gated (Studio-heavy) step, so outside the window the cycle
+# ends here with rc 0 after labeling and the dataset refresh. Not a failure; overnight.py sleeps the idle interval unless labels grew.
+if [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ]; then
+  echo "${CORTADOS_S1_TRAIN_SKIP_REASON:-training skipped: outside the night window}"
+  echo "=== $(date) nightly end"; exit 0
+fi
 force="${1:-}"; [ -f data/force-train ] && force="--train" && rm -f data/force-train
 if [ -f data/pending-candidate ] && [ "$force" = "--train" ]; then
   # an explicit --train / data/force-train is a request for a fresh candidate: it never waits behind a pending one

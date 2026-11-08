@@ -11,10 +11,18 @@ gpu_alone under CORTADOS_S1_CONTINUOUS=1); a guard SIGSTOPs the work process gro
   - free memory (vm_stat free+inactive+speculative) < CORTADOS_S1_MIN_FREE_GB (default 8),
 and SIGCONTs it after RESUME_AFTER consecutive good probes. Latency = wall time of a fixed short POST /score probe (serve.py does
 not log per-request latency), at most every CORTADOS_S1_PROBE_S (default 30) s; the baseline is the median of probes taken while
-the tree is paused or no cycle is running."""
+the tree is paused or no cycle is running.
+
+Training only in the night window (Forest 2026-11-08): CORTADOS_S1_TRAIN_ONLY_IN_WINDOW (default "1"; "0" = train any time).
+Labeling and the dataset refresh run all day; the Studio-heavy gated steps (LoRA, MLX preflight, Laya, evaluation) run only
+inside CORTADOS_S1_NIGHT_WINDOW, so the Studio's local Ollama model is free during the day. Each cycle gets
+CORTADOS_S1_TRAIN_ALLOWED=1/0 (+ CORTADOS_S1_TRAIN_SKIP_REASON); nightly.sh skips every gated step when it is 0, ends rc 0, and
+the cycle is idle (sleeps CORTADOS_S1_CYCLE_IDLE_S) unless labels were added. An invalid window, or "off", means no training
+(fail closed). A cycle allowed to train is stopped when the window ends (group SIGTERM, TRAIN_STOP_GRACE_S, then SIGKILL); the
+trainer's checkpoints stay, and the next cycle starts at once (it labels, then skips training until the next window)."""
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import os
 from pathlib import Path
 import signal
@@ -149,6 +157,50 @@ def _env_night_window() -> tuple[time, time] | None:
     except ValueError as e:
         print(f"overnight: CORTADOS_S1_NIGHT_WINDOW: {e}; using {DEFAULT_NIGHT_WINDOW}", flush=True)
         return parse_night_window(DEFAULT_NIGHT_WINDOW)
+
+
+def _next_start(window: tuple[time, time], now: datetime) -> datetime:
+    """The next local wall time at which `window` starts (today or tomorrow)."""
+    start = now.replace(hour=window[0].hour, minute=window[0].minute, second=0, microsecond=0)
+    return start if start > now else start + timedelta(days=1)
+
+
+def _window_end(window: tuple[time, time], now: datetime) -> datetime:
+    """The end of the window `now` is inside (assumes in_night_window(window, now))."""
+    end = now.replace(hour=window[1].hour, minute=window[1].minute, second=0, microsecond=0)
+    return end if end > now else end + timedelta(days=1)
+
+
+def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: str | None = None
+                 ) -> tuple[bool, str, datetime | None]:
+    """(training allowed, reason, deadline) for a cycle starting at local wall time `now`. Reuses parse_night_window /
+    in_night_window (one window implementation). Unlike the latency budget, an invalid window FAILS CLOSED here: training
+    all day on a typo is exactly what the switch exists to prevent. deadline is the window end (None = no deadline)."""
+    switch = (os.environ.get("CORTADOS_S1_TRAIN_ONLY_IN_WINDOW", "1") if switch_raw is None else switch_raw).strip()
+    if switch == "0":
+        return True, "CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=0: training allowed any time", None
+    if switch != "1":
+        print(f"overnight: CORTADOS_S1_TRAIN_ONLY_IN_WINDOW={switch!r} is not 0 or 1; using 1 (train only in the window)",
+              flush=True)
+    raw = os.environ.get("CORTADOS_S1_NIGHT_WINDOW", "") if window_raw is None else window_raw
+    raw = raw.strip() or DEFAULT_NIGHT_WINDOW
+    try:
+        window = parse_night_window(raw)
+    except ValueError as e:
+        return False, f"training skipped: CORTADOS_S1_NIGHT_WINDOW invalid ({e}); no training until it is fixed", None
+    if window is None:
+        return False, ("training skipped: CORTADOS_S1_NIGHT_WINDOW is off and CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=1; "
+                       "set CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=0 to train any time"), None
+    s, e = window
+    if in_night_window(window, now):
+        return True, f"inside night window {s:%H:%M}-{e:%H:%M}: training allowed", _window_end(window, now)
+    return False, (f"training skipped: outside night window {s:%H:%M}-{e:%H:%M}; "
+                   f"next window starts {_next_start(window, now):%Y-%m-%d %H:%M %Z}"), None
+
+
+# Grace between the window-end SIGTERM and SIGKILL. Longer than studio_capacity's TRAINING_STOP_GRACE_SECONDS (30 s), so the gate
+# can TERM/KILL its own training group and nightly.sh's EXIT trap can run before this supervisor escalates to KILL.
+TRAIN_STOP_GRACE_S = 60.0
 
 
 def _local_now() -> datetime:
@@ -553,7 +605,8 @@ def _read_result(result_file: Path) -> str:
 
 
 def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
-              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None) -> tuple[int, str]:
+              sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
+              grace_end: float = TRAIN_STOP_GRACE_S) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
     guard.stop_seen is set when stopflag existed at any poll of this cycle (and after the child exits), so an operator who
     removes it during the TERM grace (to resume) is still read as a stop, not as a failure. Residual race: a flag created
@@ -578,13 +631,26 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
             # The file name only: status alerts reach the dashboard and handbacks; the full path (account name) is logged above.
             guard.alerter("cycle_result_stuck", f"cannot remove {result_file.name} ({type(e).__name__}); cycle results may be a "
                           "cycle old: 'worked' is read as idle, 'quota' still cools down")
+    allowed, why, deadline = train_policy(guard.wall())
+    print(f"overnight: {why}", flush=True)
     env = dict(os.environ, CORTADOS_NIGHTLY_SUPERVISED="1", TZ="America/Toronto", CORTADOS_S1_CONTINUOUS="1",
-               CORTADOS_S1_CYCLE_RESULT=str(result_file))
+               CORTADOS_S1_CYCLE_RESULT=str(result_file), CORTADOS_S1_TRAIN_ALLOWED="1" if allowed else "0",
+               CORTADOS_S1_TRAIN_SKIP_REASON="" if allowed else why)
     guard.new_cycle()
     child = subprocess.Popen(command, env=env, start_new_session=True)
+    window_ended = False
     try:
         while child.poll() is None:
             watch_stop()
+            if deadline is not None and guard.wall() >= deadline:
+                # The deadline lives here, not in nightly.sh: this supervisor already owns the window and group signalling, and
+                # the gate (studio_capacity) forwards our TERM to its own training group. The whole cycle ends; the next one
+                # starts at once, labels, and skips training until the next window. mlx_lm checkpoints (save-every 100) stay.
+                print(f"overnight: night window ended at {deadline:%H:%M}; stopping this cycle's training "
+                      f"(TERM, {grace_end:g}s grace, then KILL); checkpoints are kept", flush=True)
+                window_ended = True
+                stop_tree(child, grace=grace_end)
+                break
             guard.tick(child.pid)
             sleep(poll_s)
         watch_stop()
@@ -603,6 +669,8 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 pass
             except OSError as e:
                 print(f"overnight: cannot clear pidfile {pidfile} ({e})", flush=True)
+    if window_ended:
+        return child.returncode, "window_end"
     result = _read_result(result_file)
     if stale and result == "worked":
         # A stale 'worked' would relaunch at once forever: degrade it to idle. 'quota' is honoured even if stale, because
@@ -731,6 +799,12 @@ def run_continuous(command: list[str], guard: Guard | None = None, *, result_fil
         if rc == 130 and (stopflag is None or guard.stop_seen or stopflag.exists()):
             print(f"overnight: cycle {n} ended rc 130 (stop requested); not relaunching", flush=True)
             return rc   # nightly.sh was stopped by request (--stop): do not relaunch
+        if result == "window_end":
+            # Not a failure: we stopped it on purpose. No sleep: the next cycle sees the window closed and only labels.
+            print(f"overnight: cycle {n} stopped at the night-window end (rc {rc}); next cycle at once", flush=True)
+            _save_failures(result_file, 0)
+            failures = 0
+            continue
         if rc == 130:   # TERM from someone other than --stop (e.g. pkill -f nightly.sh): a hand-run supervisor must survive it
             print(f"overnight: cycle {n} ended 130 without a stop flag (external TERM); treating as a failure", flush=True)
         delay, failures = next_delay(rc, result, idle_s, failures, quota_s)
