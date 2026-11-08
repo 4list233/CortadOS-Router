@@ -208,7 +208,7 @@ logged warning (fail closed). The kernel drops a dead holder's lock, so there is
 intent check is a read-only advisory fast path and never deletes an intent. Override the directory with
 `--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. Inside the lock, after the daemon's ack or its timeout,
 `training_gate` unloads EVERY model `/api/ps` lists (`keep_alive=0` each) and refuses to start if any remains or the
-reply is malformed.
+reply is malformed. Writer starvation is accepted: a steady stream of overlapping gate requests can keep LOCK_EX from ever being granted, in which case the trainer refuses after the 120 s cap and retries on its next run. The gate directory must be a real directory (not a symlink) owned by the running user and not group/world-writable (a created one is chmod'ed 0700 regardless of umask), and `node.lock` is opened with `O_NOFOLLOW` and must be a regular file the user owns; otherwise the gate answers 503 and the trainer refuses. `gate` passes its LOCK_EX fd to the training command and runs it in its own process group: the lock stays held until every holder exits (a SIGKILLed wrapper does not release it), and on SIGTERM/SIGINT or any exit the whole group gets SIGTERM, 30 s grace, then SIGKILL before the lock is released.
 
 **Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
 uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the

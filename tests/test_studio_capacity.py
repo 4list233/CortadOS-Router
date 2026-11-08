@@ -1,6 +1,8 @@
 import fcntl
 import json
 import os
+import signal
+import sys
 import stat
 import time
 from pathlib import Path
@@ -704,7 +706,147 @@ class AckWaitConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     c.ack_wait_from_env(raw)
                 with patch.dict(os.environ, {c.ACK_WAIT_ENV: raw}), \
-                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "call") as call:
+                        patch.object(c, "training_gate") as gate, patch.object(c.subprocess, "Popen") as call:
                     self.assertEqual(c.gate_main(["--", "true"]), c.GATE_REFUSED_EXIT)
                 gate.assert_not_called()
                 call.assert_not_called()
+
+
+class NodeLockSafetyTests(unittest.TestCase):
+    """open_node_lock refuses anything but a private, real, owned dir and lock file (temp dirs only)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.gate = self.root / "studio-gate"
+
+    def test_symlinked_lock_file_refused(self):
+        os.close(c.open_node_lock(self.gate))
+        (self.gate / "node.lock").unlink()
+        os.symlink(self.root / "elsewhere", self.gate / "node.lock")
+        with self.assertRaises(OSError):
+            os.close(c.open_node_lock(self.gate))
+        with self.assertRaises(c.GateRefused):
+            os.close(c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0))
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_symlinked_dir_refused(self):
+        real = self.root / "real"
+        real.mkdir(mode=0o700)
+        os.symlink(real, self.gate)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.gate)
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        self.assertFalse((real / "node.lock").exists())
+
+    def test_group_writable_dir_refused(self):
+        self.gate.mkdir()
+        os.chmod(self.gate, 0o770)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.gate)
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+
+    def test_trainer_created_dir_is_0700_under_umask_0002(self):
+        old = os.umask(0o002)
+        try:
+            fd = c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        finally:
+            os.umask(old)
+        os.close(fd)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.gate).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.gate / "node.lock").st_mode), 0o600)
+
+
+# Subprocess harness: runs the real gate_main with training_gate bound to a temp gate dir and a fake, empty Ollama
+# (never the real one: the real check would unload models on this machine).
+HARNESS = r'''
+import functools, sys
+sys.path.insert(0, sys.argv[1])
+from cortados_router import studio_capacity as c
+c.training_gate = functools.partial(c.training_gate, gate=sys.argv[2], api=lambda path, payload=None: {"models": []},
+                                    log=lambda m: None)
+sys.exit(c.gate_main(["--"] + sys.argv[3:]))
+'''
+
+
+class GateMainProcessTests(unittest.TestCase):
+    """Real processes: the training command keeps the node lock past its wrapper, and its group is stopped."""
+
+    ROOT = str(Path(__file__).resolve().parents[1])
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.gate = self.root / "studio-gate"
+        self.marker = self.root / "started"
+
+    def start(self, *cmd):
+        env = dict(os.environ, CORTADOS_HOME=str(self.root), **{c.ACK_WAIT_ENV: "0"})
+        proc = self.subprocess.Popen([sys.executable, "-c", HARNESS, self.ROOT, str(self.gate)] + list(cmd), env=env)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+    def wait_for(self, cond, seconds=10):
+        deadline = time.monotonic() + seconds
+        while not cond():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached in %ss" % seconds)
+            time.sleep(0.02)
+
+    def shared_free(self):
+        fd = c.open_node_lock(self.gate)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def pid_from(self, path):
+        self.wait_for(lambda: path.exists() and path.read_text().strip())
+        return int(path.read_text())
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def test_sigkilled_wrapper_lock_held_until_child_exits(self):
+        script = ("import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                  "time.sleep(0.8)")
+        proc = self.start(sys.executable, "-c", script, str(self.marker))
+        child = self.pid_from(self.marker)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(5)
+        self.assertTrue(self.alive(child))
+        self.assertFalse(self.shared_free())          # the training child still holds LOCK_EX
+        self.wait_for(lambda: not self.alive(child))  # orphaned child, reaped by init
+        self.wait_for(self.shared_free)
+
+    def test_sigterm_stops_whole_group_then_releases(self):
+        grand = self.root / "grand"
+        grand_script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+        shell = '"%s" -c "%s" "%s" & echo $$ > "%s"; wait' % (sys.executable, grand_script, grand, self.marker)
+        proc = self.start("/bin/sh", "-c", shell)
+        sh_pid = self.pid_from(self.marker)
+        grand_pid = self.pid_from(grand)
+        self.assertFalse(self.shared_free())
+        os.kill(proc.pid, signal.SIGTERM)
+        self.assertEqual(proc.wait(10), 128 + signal.SIGTERM)
+        self.assertFalse(self.alive(sh_pid))
+        self.wait_for(lambda: not self.alive(grand_pid), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_normal_completion_releases(self):
+        proc = self.start(sys.executable, "-c", "import sys; sys.exit(3)")
+        self.assertEqual(proc.wait(10), 3)
+        self.assertTrue(self.shared_free())

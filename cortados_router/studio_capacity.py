@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -484,16 +485,73 @@ def node_lock_path(gate):
     return Path(gate) / NODE_LOCK_NAME
 
 
-def open_node_lock(gate):
-    """Open (creating, mode 0600) the node lock file; returns an fd. OSError propagates: callers fail closed."""
+class NodeLockUnsafe(PermissionError):
+    """The gate dir or lock file is not the private, real, owned object the lock relies on."""
+
+
+def ensure_gate_dir(gate):
+    """Create (0700) or validate the studio-gate dir; returns an O_DIRECTORY fd. NodeLockUnsafe/OSError: fail closed.
+
+    Reason: the lock only excludes if gate and trainer flock the SAME inode. A symlinked dir, or a dir another user or
+    group can write, lets the lock file be swapped so one side locks a different file. mkdir's mode is masked by the
+    umask (0002 would leave 0775), so a dir we create is chmod'ed to 0700 explicitly."""
     gate = Path(gate)
-    gate.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return os.open(node_lock_path(gate), os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(gate, 0o700)
+    except FileExistsError:
+        pass  # pre-existing: validated below like any other
+    else:
+        os.chmod(gate, 0o700)
+    st = os.lstat(gate)
+    if not stat.S_ISDIR(st.st_mode):
+        raise NodeLockUnsafe("studio-gate dir is not a real directory (symlink or other)")
+    if st.st_uid != os.geteuid():
+        raise NodeLockUnsafe("studio-gate dir is not owned by this user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise NodeLockUnsafe("studio-gate dir is group/world-writable")
+    dir_fd = os.open(gate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st2 = os.fstat(dir_fd)
+        if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+            raise NodeLockUnsafe("studio-gate dir changed while being opened")
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
+def open_node_lock(gate):
+    """Open (creating, mode 0600) the node lock file in a validated gate dir; returns an fd.
+
+    NodeLockUnsafe / OSError propagate: callers fail closed (gate: 503 + warning; trainer: GateRefused).
+    O_NOFOLLOW relative to the dir fd means a symlinked lock file is refused, and fstat proves the fd is a
+    regular file we own, so gate and trainer lock the same inode."""
+    dir_fd = ensure_gate_dir(gate)
+    try:
+        fd = os.open(NODE_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NodeLockUnsafe("node lock is not a regular file")
+        if st.st_uid != os.geteuid():
+            raise NodeLockUnsafe("node lock is not owned by this user")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def acquire_trainer_lock(gate, clock=time.time, sleep=time.sleep, wait_seconds=TRAINER_LOCK_WAIT_SECONDS):
-    """Take LOCK_EX on the node lock, polling until wait_seconds; returns the held fd. GateRefused on timeout."""
-    fd = open_node_lock(gate)
+    """Take LOCK_EX on the node lock, polling until wait_seconds; returns the held fd. GateRefused on timeout
+    or when the lock cannot be opened safely (never trains without the exclusive lock)."""
+    try:
+        fd = open_node_lock(gate)
+    except OSError as exc:
+        raise GateRefused("studio_gate: node lock unusable (%s: %s); refusing to start"
+                          % (type(exc).__name__, exc)) from exc
     try:
         deadline = clock() + wait_seconds
         while True:
@@ -534,7 +592,7 @@ def _daemon_alive(status_path, now):
 def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=time.time,
                   sleep=time.sleep, log=None, pid=None, wait_seconds=ACK_WAIT_SECONDS,
                   refresh_seconds=INTENT_REFRESH_SECONDS,
-                  lock_wait_seconds=TRAINER_LOCK_WAIT_SECONDS):
+                  lock_wait_seconds=TRAINER_LOCK_WAIT_SECONDS, lock_sink=None):
     """Hold an S1 training intent for the duration of the block.
 
     First takes the node lock exclusively (bounded wait for in-flight local gate
@@ -543,18 +601,20 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
     ack or its timeout alike it queries /api/ps itself, unloads EVERY resident
     model and confirms none remain, raising GateRefused if that cannot be confirmed.
     Only a refused connection (Ollama not running) proceeds without a query
-    result, with a log line."""
+    result, with a log line. lock_sink, if given, is called with the held LOCK_EX fd (gate_main passes it on to
+    the training command so the lock outlives a killed wrapper)."""
     log = log or (lambda message: print("studio_gate: " + message, file=sys.stderr))
     gate = Path(gate) if gate is not None else gate_dir()
     status_path = Path(status_path or os.environ.get("CORTADOS_STUDIO_STATUS") or DEFAULT_STATUS)
-    gate.mkdir(parents=True, exist_ok=True)
     pid = os.getpid() if pid is None else pid
     nonce = uuid.uuid4().hex
     intent_path = gate / ("intent-%d-%s.json" % (pid, nonce))
     ack_path = gate / ("ack-" + nonce + ".json")
 
-    lock_fd = acquire_trainer_lock(gate, clock=clock, sleep=sleep, wait_seconds=lock_wait_seconds)
+    lock_fd = acquire_trainer_lock(gate, clock=clock, sleep=sleep, wait_seconds=lock_wait_seconds)  # also creates gate
     try:
+        if lock_sink is not None:
+            lock_sink(lock_fd)
         yield from _hold_intent(gate, status_path, model, api, clock, sleep, log, pid, wait_seconds,
                                 refresh_seconds, intent_path, ack_path, nonce)
     finally:
@@ -677,17 +737,85 @@ def gate_main(argv):
     except ValueError as exc:
         print("studio gate configuration error: %s; refusing" % exc, file=sys.stderr)
         return GATE_REFUSED_EXIT
+    held = []
+    # SIGTERM/SIGINT become SystemExit so the finally below stops the child's whole group before the lock goes.
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
     try:
-        gate = training_gate(wait_seconds=wait)
+        gate = training_gate(wait_seconds=wait, lock_sink=held.append)
         gate.__enter__()
     except GateRefused as exc:
         print(str(exc), file=sys.stderr)
         return GATE_REFUSED_EXIT
     try:
-        return subprocess.call(argv)
+        return run_holding_lock(argv, held[0])
     finally:
         gate.__exit__(None, None, None)
+
+
+# A trainer asked to stop gets this long to checkpoint and exit before SIGKILL: S1 SFT writes a checkpoint of a few
+# hundred MB to local SSD in seconds, so 30 s is ample, and short enough that a stop (launchd, Ctrl-C) is not held up.
+TRAINING_STOP_GRACE_SECONDS = 30
+# After SIGKILL the kernel tears the group down in milliseconds; 5 s bounds the wait before we report and give up.
+KILL_REAP_SECONDS = 5
+# Poll interval while waiting for the group to empty: grandchildren are not our children, so there is no wait() for them.
+GROUP_POLL_SECONDS = 0.05
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # a member exists that we may not signal: still alive, keep the lock
+
+
+def _wait_group(child, pgid, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        child.poll()  # reap the leader so its zombie does not keep the group "alive"
+        if not _group_alive(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(GROUP_POLL_SECONDS)
+
+
+def _stop_group(child, pgid, grace_seconds):
+    """SIGTERM the whole group, wait grace_seconds, SIGKILL what is left, reap. True once the group is empty."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        child.poll()
+        return True
+    if _wait_group(child, pgid, grace_seconds):
+        return True
+    print("studio gate: training group %d ignored SIGTERM for %ss; sending SIGKILL" % (pgid, grace_seconds),
+          file=sys.stderr)
+    with contextlib.suppress(ProcessLookupError):  # emptied between the check and the kill: nothing to kill
+        os.killpg(pgid, signal.SIGKILL)
+    if _wait_group(child, pgid, KILL_REAP_SECONDS):
+        return True
+    print("studio gate: training group %d still present after SIGKILL" % pgid, file=sys.stderr)
+    return False
+
+
+def run_holding_lock(argv, lock_fd, grace_seconds=TRAINING_STOP_GRACE_SECONDS):
+    """Run argv in its own process group with the node-lock fd passed down; return its exit status.
+
+    Reason: flock belongs to the open file description, not the process. pass_fds gives the child (and everything it
+    forks) the same description, so LOCK_EX stays held until the LAST holder closes it: a SIGKILLed wrapper can no
+    longer release the lock while training runs on. start_new_session puts the command and its descendants in one
+    group, so every exit path here (normal end, exception, SIGTERM/SIGINT -> SystemExit) stops the whole group
+    before the caller closes its own fd."""
+    child = subprocess.Popen(argv, pass_fds=(lock_fd,), start_new_session=True)
+    pgid = child.pid  # start_new_session: the child leads a new session and group with its own pid
+    try:
+        return child.wait()
+    finally:
+        _stop_group(child, pgid, grace_seconds)
 
 
 def serve(runner, status_path, sleep=time.sleep, polls=None):
