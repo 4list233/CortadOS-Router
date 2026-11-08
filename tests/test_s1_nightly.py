@@ -680,6 +680,59 @@ PY
         self.assertNotIn("not evaluating", log)
         self.assertTrue((run / "report.json").exists(), log)
 
+    # --- calibration sweep request (s1/calibrate.py), run from the EXIT trap of any in-window cycle ---------------------
+    CALIBRATE_STUB = (
+        "import os, signal, sys, time\n"
+        "open('data/sweep-count', 'a').write('x')\n"
+        "open('data/sweep-args', 'w').write(' '.join(sys.argv[1:]))\n"
+        "if os.environ.get('STUB_SWEEP_TERM'):\n"
+        "    os.kill(int(open('data/nightly.pid').read()), signal.SIGTERM); time.sleep(20)\n"
+        "print('sweep: 4 settings; chosen on teacher: cand-t0.1; would promote: False')\n"
+    )
+
+    def _sweep_request(self):
+        (self.s1 / "calibrate.py").write_text(self.CALIBRATE_STUB)
+        req = self.s1 / "data/sweep-request.json"
+        req.write_text(json.dumps({"candidate": "runs/2026-11-08/adapter", "live": "runs/2026-10-16-0130/adapter",
+                                   "tilts": [0, 0.1], "alphas": [1.0, 0.7]}))
+        return req
+
+    def test_sweep_runs_once_on_no_new_labels_exit_inside_window(self):
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=5)                  # first night trains; no request yet
+        self.assertEqual(rc, 0, log)
+        req = self._sweep_request()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, CORTADOS_S1_TRAIN_ALLOWED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("skipped: no new labels", log)                   # the early-exit path, not the train+evaluate path
+        self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
+        self.assertIn("--out runs/2026-11-08/sweep.json --tilts 0 0.1 --alphas 1.0 0.7", (self.s1 / "data/sweep-args").read_text())
+        self.assertIn("sweep: 4 settings", log)
+        self.assertFalse(req.exists())
+        self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.done-*.json"))), 1)
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0)                  # request consumed: no second sweep
+        self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
+
+    def test_sweep_never_runs_when_training_not_allowed(self):
+        req = self._sweep_request()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=0)
+        self.assertEqual(rc, 0, log)
+        self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
+        self.assertTrue(req.exists())
+
+    def test_sigterm_during_cycle_does_not_start_sweep(self):
+        req = self._sweep_request()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=3, STUB_EVAL_TERM=1)  # window-end TERM mid-evaluation
+        self.assertIn("stop requested", log)
+        self.assertFalse((self.s1 / "data/sweep-count").exists(), log)
+        self.assertTrue(req.exists())
+
+    def test_stop_during_sweep_keeps_request(self):
+        req = self._sweep_request()
+        rc, log, _ = self.run_night(STUB_NEW_LABELS=0, STUB_SWEEP_TERM=1)
+        self.assertEqual((self.s1 / "data/sweep-count").read_text(), "x", log)
+        self.assertIn("SWEEP INTERRUPTED", log)
+        self.assertTrue(req.exists(), log)
+
     def test_no_new_labels_skips_training(self):
         rc, log, run = self.run_night(STUB_NEW_LABELS=5)
         self.assertEqual(rc, 0, log)

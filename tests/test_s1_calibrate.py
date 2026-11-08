@@ -248,9 +248,9 @@ class NightlySweepStep(unittest.TestCase):
         self.assertEqual(out.returncode, 0)
         self.assertFalse((tmp / "data/gated.log").exists())
 
-    def test_runs_after_normal_evaluation(self):
+    def test_runs_from_the_exit_trap_before_teardown(self):
         src = (S1 / "nightly.sh").read_text()
-        self.assertGreater(src.rindex("\nsweep_request\n"), src.rindex('if ! evaluate_run "$RUN"'))
+        self.assertIn('cleanup() { local rc=$?; sweep_on_exit "$rc"; stop_deadline;', src)
 
 
 if __name__ == "__main__":
