@@ -319,6 +319,71 @@ gated() {
   [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 0 ] && { echo "gated step refused: ${CORTADOS_S1_TRAIN_SKIP_REASON:-training not allowed now}"; return 75; }
   PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$@"
 }
+# Calibration sweep (evaluation only, never promotes): when data/sweep-request.json exists
+#   {"candidate": "runs/<c>/adapter", "live": "runs/<l>/adapter", "tilts": [...], "alphas": [...]}
+# calibrate.py grades the requested tilt/blend settings and writes runs/<c>/sweep.json (+ sweep.md). Gated, so it holds the
+# training lock and refuses when CORTADOS_S1_TRAIN_ALLOWED=0. When: from the EXIT trap (sweep_on_exit), so it runs on EVERY
+# in-window cycle whatever path ended it (no new labels, pending candidate, laya night, resume, full train+evaluate), always
+# AFTER that cycle's own work: it can delay the next cycle, never replace this one's training. A failed or interrupted sweep
+# keeps the request for the next cycle (logged); a finished one renames it sweep-request.done-<stamp>.json.
+# Stops need no bash process management here: the sweep runs in the FOREGROUND through gated(), like every other gated step.
+# A stop (overnight.py's stop_group_drained) TERMs the whole cycle process group, which includes the gate wrapper; the gate
+# stops its own command group (own session, inherited lock fd) within its 30 s grace and exits 128+signum, and bash runs the
+# TERM/INT trap only after that foreground gate has returned. So a stopped sweep always returns nonzero and keeps the request.
+sweep_request() {
+  local req=data/sweep-request.json args prc rc
+  [ -f "$req" ] || return 0
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 0; }
+  args=$(python3 - "$req" <<'PY'
+import json, sys
+from pathlib import Path
+r = json.load(open(sys.argv[1]))
+if not isinstance(r.get("candidate"), str) or not isinstance(r.get("live"), str):
+    sys.exit("sweep request needs string candidate and live")
+for k in ("tilts", "alphas"):
+    if not isinstance(r.get(k, []), list) or not all(isinstance(x, (int, float)) for x in r.get(k, [])):
+        sys.exit(f"sweep request {k} must be a list of numbers")
+out = Path(r["candidate"]).parent / "sweep.json"
+print("\n".join(["--candidate", r["candidate"], "--live", r["live"], "--out", str(out),
+                  "--tilts", *map(str, r.get("tilts", [0])), "--alphas", *map(str, r.get("alphas", [1.0]))]))
+PY
+  ); prc=$?
+  # A TERM/INT during parsing also kills the parser (same process group); the latch is checked first so that is logged as a
+  # stop, not as an invalid request. Checked once more right before the launch.
+  [ "$SWEEP_CANCELLED" = 1 ] && { echo "SWEEP NOT STARTED: stop requested; request kept for the next cycle"; return 0; }
+  [ $prc -eq 0 ] || { echo "SWEEP REQUEST INVALID ($req, parse rc=$prc); left in place"; return 0; }
+  local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
+  HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
+    gated "$PY" calibrate.py --base "$BASE" "${argv[@]}" > data/sweep-last.log 2>&1
+  rc=$?
+  # The rename depends on rc ALONE, decided before any logging. rc 0 means the gate returned success, so the sweep finished;
+  # a TERM arriving after that (even one whose trap already set SWEEP_CANCELLED) is harmless and renaming is correct.
+  # A TERM during the sweep makes the gate exit 143, so the request is kept.
+  if [ $rc -ne 0 ]; then
+    echo "SWEEP FAILED or interrupted rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200); request kept for the next cycle"
+    return 0
+  fi
+  mv "$req" "data/sweep-request.done-$(date +%Y%m%d-%H%M%S).json" || { echo "SWEEP DONE but rename of $req failed"; return 0; }
+  grep '^sweep:' data/sweep-last.log | tail -1   # summary only; the rename above is already decided by rc
+}
+# Armed once the cycle's traps are in place and only when CORTADOS_S1_TRAIN_ALLOWED=1; the TERM/INT trap disarms it, so a stop
+# (window end, supervisor, --stop) never starts a sweep. Runs at most once (disarmed before it starts). Not after exit 130
+# (stop requested) or a signal death (>128), nor while the stop flag is present. During the sweep TERM/INT only latch
+# SWEEP_CANCELLED (no exit inside the EXIT handler): the gate stops itself on the same group TERM, the request is kept, and
+# cleanup finishes normally.
+SWEEP_ARMED=0; SWEEP_CANCELLED=0
+sweep_on_exit() {
+  local rc=$1
+  [ "$SWEEP_ARMED" = 1 ] || return 0
+  SWEEP_ARMED=0
+  [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || return 0
+  [ "$rc" -lt 128 ] || return 0
+  [ -f "${STOPFLAG:-/nonexistent}" ] && return 0
+  [ -f data/sweep-request.json ] || return 0
+  trap 'echo "stop requested during sweep"; SWEEP_CANCELLED=1' TERM INT
+  echo "=== $(date) sweep request (after this cycle's work)"
+  sweep_request
+}
 evaluate_run() {   # grade <run>/adapter against the CURRENT incumbent and holdout; writes <run>/report.json
   worked_cycle
   HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
@@ -383,13 +448,22 @@ stop_deadline() {
     deadline=""
   fi
 }
-cleanup() { stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
+# TERM/INT are ignored only AFTER sweep_on_exit returns: the sweep itself must stay stoppable, but overnight.py re-sends TERM to
+# the cycle group every 5 s while draining, and one landing in the tail would run the exit-130 trap (or kill a step) and cut
+# cleanup short: watcher not reaped, scorer not reloaded, pidfile left behind. The tail is short and bounded, so it finishes.
+cleanup() {
+  local rc=$?
+  sweep_on_exit "$rc"
+  trap '' TERM INT
+  stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"
+}
 trap cleanup EXIT
 # Continuous mode: the stop flag means "the operator ran nightly.sh --stop" (only --stop creates it) and overnight.py will not
 # relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
 # shutdown): flagging that would leave continuous training stopped for good after a reboot, so the trap does not touch it.
 # Window mode keeps the old behaviour (a TERM is a stop for tonight; the next night clears the flag).
-trap 'echo "stop requested"; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
+trap 'echo "stop requested"; SWEEP_ARMED=0; [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] || touch "$STOPFLAG"; exit 130' TERM INT
+[ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] && SWEEP_ARMED=1   # the sweep request runs from cleanup on a normal end of this cycle
 # unitcost / refresh-tiers live in the router checkout; a missing one is logged, never fatal (labelling and training do not need them)
 if [ -f "$REPO_ROOT/cortados_router/unitcost.py" ]; then python3 "$REPO_ROOT/cortados_router/unitcost.py" > /dev/null 2>&1 || echo "unitcost.py failed (rc $?)"   # daily re-normalisation: tokens per percent per pool
 else echo "unitcost.py not found under $REPO_ROOT: skipped"; fi
