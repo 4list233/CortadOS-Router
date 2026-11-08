@@ -326,36 +326,15 @@ gated() {
 # in-window cycle whatever path ended it (no new labels, pending candidate, laya night, resume, full train+evaluate), always
 # AFTER that cycle's own work: it can delay the next cycle, never replace this one's training. A failed or interrupted sweep
 # keeps the request for the next cycle (logged); a finished one renames it sweep-request.done-<stamp>.json.
-# Bound on waiting for the gate after the stop TERM: the gate's own TRAINING_STOP_GRACE_SECONDS (30 s, studio_capacity.py)
-# for its group plus 15 s margin for its own exit. Stays under the supervisor's 60 s TRAIN_STOP_GRACE_S, so nightly.sh
-# finishes its cleanup before it could be SIGKILLed itself. Overridable only so tests do not wait 45 s.
-SWEEP_STOP_WAIT_S="${CORTADOS_S1_SWEEP_STOP_WAIT_S:-45}"
-sweep_alive() {   # running and not yet a zombie (an unreaped child keeps its pid, so kill -0 alone would say alive)
-  local st; st=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
-  case "$st" in *Z*) return 1 ;; esac
-}
-# TERM the gate only (it stops its own group with a bounded grace), wait up to SWEEP_STOP_WAIT_S; if it still lives, SIGKILL
-# the gate and its command's group (the gate's direct children lead their own groups: start_new_session) and log it. The pid
-# stays reserved until the final wait reaps it, so no signal here can reach a recycled pid.
-stop_sweep() {
-  local pid=$SWEEP_PID kids k end=$((SECONDS + SWEEP_STOP_WAIT_S))
-  [ -n "$pid" ] || return 0
-  kill -TERM "$pid" 2>/dev/null || echo "sweep stop: TERM to gate $pid failed (already gone)"
-  while sweep_alive "$pid" && [ $SECONDS -lt $end ]; do sleep 0.2; done
-  if sweep_alive "$pid"; then
-    kids=$(pgrep -P "$pid")
-    echo "SWEEP STOP: gate $pid still running ${SWEEP_STOP_WAIT_S}s after TERM; SIGKILL to the gate and groups: ${kids:-none}"
-    kill -KILL "$pid" 2>/dev/null || echo "sweep stop: SIGKILL to gate $pid failed"
-    for k in $kids; do kill -KILL -- "-$k" 2>/dev/null || echo "sweep stop: SIGKILL to group $k failed (gone)"; done
-  fi
-  wait "$pid" 2>/dev/null
-  SWEEP_PID=""
-}
+# Stops need no bash process management here: the sweep runs in the FOREGROUND through gated(), like every other gated step.
+# A stop (overnight.py's stop_group_drained) TERMs the whole cycle process group, which includes the gate wrapper; the gate
+# stops its own command group (own session, inherited lock fd) within its 30 s grace and exits 128+signum, and bash runs the
+# TERM/INT trap only after that foreground gate has returned. So a stopped sweep always returns nonzero and keeps the request.
 sweep_request() {
-  local req=data/sweep-request.json args rc
+  local req=data/sweep-request.json args prc rc
   [ -f "$req" ] || return 0
   [ "${CORTADOS_S1_TRAIN_ALLOWED:-1}" = 1 ] || { echo "sweep request waits: training not allowed now"; return 0; }
-  if ! args=$(python3 - "$req" <<'PY'
+  args=$(python3 - "$req" <<'PY'
 import json, sys
 from pathlib import Path
 r = json.load(open(sys.argv[1]))
@@ -368,36 +347,31 @@ out = Path(r["candidate"]).parent / "sweep.json"
 print("\n".join(["--candidate", r["candidate"], "--live", r["live"], "--out", str(out),
                   "--tilts", *map(str, r.get("tilts", [0])), "--alphas", *map(str, r.get("alphas", [1.0]))]))
 PY
-  ); then echo "SWEEP REQUEST INVALID ($req); left in place"; return 0; fi
-  local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
-  # The GATE ITSELF is the background job (an external simple command with `&`: bash forks and execs it, so $! is the gate's
-  # pid, not a bash wrapper's). A stop then signals that pid and the gate stops its own process group (the calibrate run
-  # holding the inherited lock fd); a wrapper pid could die first and orphan the gate with the lock held.
-  # SWEEP_CANCELLED is latched by the TERM/INT trap set in sweep_on_exit; it is checked before the launch, after the pid is
-  # known (a trap that fired between the check and the assignment still stops the new gate) and before the rename.
+  ); prc=$?
+  # A TERM/INT during parsing also kills the parser (same process group); the latch is checked first so that is logged as a
+  # stop, not as an invalid request. Checked once more right before the launch.
   [ "$SWEEP_CANCELLED" = 1 ] && { echo "SWEEP NOT STARTED: stop requested; request kept for the next cycle"; return 0; }
-  PYTHONPATH="$GATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" \
-    CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
-    "$GATE_PY" -B -m cortados_router.studio_capacity gate -- "$PY" calibrate.py --base "$BASE" "${argv[@]}" > data/sweep-last.log 2>&1 &
-  SWEEP_PID=$!
-  while :; do
-    [ "$SWEEP_CANCELLED" = 1 ] && { stop_sweep; echo "SWEEP INTERRUPTED by a stop; request kept for the next cycle"; return 0; }
-    wait "$SWEEP_PID"; rc=$?
-    # wait also returns (>128) when the TERM/INT trap ran; the gate is then still running: loop to stop it.
-    [ "$SWEEP_CANCELLED" = 1 ] && continue
-    break
-  done
-  SWEEP_PID=""
-  if [ $rc -ne 0 ]; then echo "SWEEP FAILED rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200); request kept for next night"; return 0; fi
-  [ "$SWEEP_CANCELLED" = 1 ] && { echo "SWEEP INTERRUPTED by a stop after it finished; request kept for the next cycle"; return 0; }
-  grep '^sweep:' data/sweep-last.log | tail -1
-  mv "$req" "data/sweep-request.done-$(date +%Y%m%d-%H%M%S).json"
+  [ $prc -eq 0 ] || { echo "SWEEP REQUEST INVALID ($req, parse rc=$prc); left in place"; return 0; }
+  local IFS=$'\n'; set -f; local -a argv=($args); set +f; unset IFS
+  HF_HUB_OFFLINE=1 CORTADOS_S1_FAIL_UP="${CORTADOS_S1_FAIL_UP:-0.75}" CORTADOS_S1_OUTWARD_AT="${CORTADOS_S1_OUTWARD_AT:-0.25}" \
+    gated "$PY" calibrate.py --base "$BASE" "${argv[@]}" > data/sweep-last.log 2>&1
+  rc=$?
+  # The rename depends on rc ALONE, decided before any logging. rc 0 means the gate returned success, so the sweep finished;
+  # a TERM arriving after that (even one whose trap already set SWEEP_CANCELLED) is harmless and renaming is correct.
+  # A TERM during the sweep makes the gate exit 143, so the request is kept.
+  if [ $rc -ne 0 ]; then
+    echo "SWEEP FAILED or interrupted rc=$rc: $(tail -1 data/sweep-last.log | cut -c1-200); request kept for the next cycle"
+    return 0
+  fi
+  mv "$req" "data/sweep-request.done-$(date +%Y%m%d-%H%M%S).json" || { echo "SWEEP DONE but rename of $req failed"; return 0; }
+  grep '^sweep:' data/sweep-last.log | tail -1   # summary only; the rename above is already decided by rc
 }
 # Armed once the cycle's traps are in place and only when CORTADOS_S1_TRAIN_ALLOWED=1; the TERM/INT trap disarms it, so a stop
 # (window end, supervisor, --stop) never starts a sweep. Runs at most once (disarmed before it starts). Not after exit 130
-# (stop requested) or a signal death (>128), nor while the stop flag is present. During the sweep TERM/INT latch
-# SWEEP_CANCELLED; sweep_request stops and reaps the gate (stop_sweep), keeps the request, and cleanup finishes normally.
-SWEEP_ARMED=0; SWEEP_PID=""; SWEEP_CANCELLED=0
+# (stop requested) or a signal death (>128), nor while the stop flag is present. During the sweep TERM/INT only latch
+# SWEEP_CANCELLED (no exit inside the EXIT handler): the gate stops itself on the same group TERM, the request is kept, and
+# cleanup finishes normally.
+SWEEP_ARMED=0; SWEEP_CANCELLED=0
 sweep_on_exit() {
   local rc=$1
   [ "$SWEEP_ARMED" = 1 ] || return 0
@@ -406,7 +380,6 @@ sweep_on_exit() {
   [ "$rc" -lt 128 ] || return 0
   [ -f "${STOPFLAG:-/nonexistent}" ] && return 0
   [ -f data/sweep-request.json ] || return 0
-  # Latch only: sweep_request acts on it at its checkpoints (before launch, after the pid is known, after wait, before rename).
   trap 'echo "stop requested during sweep"; SWEEP_CANCELLED=1' TERM INT
   echo "=== $(date) sweep request (after this cycle's work)"
   sweep_request

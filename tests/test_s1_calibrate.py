@@ -211,8 +211,10 @@ class RowsReport(unittest.TestCase):
 
 def sweep_fn() -> str:
     src = (S1 / "nightly.sh").read_text()
-    start = src.index("SWEEP_STOP_WAIT_S=")   # stop_sweep and its helpers precede sweep_request
-    return src[start:src.index("\n}\n", src.index("sweep_request() {")) + 3]
+    start = src.index("gated() {")   # sweep_request runs its step through gated(), so extract both
+    end = src.index("\n}\n", src.index("sweep_request() {")) + 3
+    gated = src[start:src.index("\n}\n", start) + 3]
+    return gated + src[src.index("sweep_request() {"):end]
 
 
 class NightlySweepStep(unittest.TestCase):
@@ -225,7 +227,7 @@ class NightlySweepStep(unittest.TestCase):
         # stand-in for the gate interpreter: sweep_request runs "$GATE_PY" -B -m cortados_router.studio_capacity gate -- ...
         (tmp / "fake-gate").write_text("#!/bin/bash\necho \"$*\" > data/gated.log; echo 'sweep: 4 settings'\n")
         (tmp / "fake-gate").chmod(0o755)
-        script = ("GATE_PY=./fake-gate; GATE_ROOT=.; SWEEP_PID=''; SWEEP_CANCELLED=0\n"
+        script = ("GATE_PY=./fake-gate; GATE_ROOT=.; SWEEP_CANCELLED=0\n"
                   "PY=fake-py; BASE=base\n" + sweep_fn() + "sweep_request\n")
         out = subprocess.run(["/bin/bash", "-c", script], cwd=tmp, capture_output=True, text=True, timeout=30,
                              env={"PATH": os.environ["PATH"], "CORTADOS_S1_TRAIN_ALLOWED": allowed})
