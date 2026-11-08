@@ -1,0 +1,21 @@
+{
+  "status": "provisional",
+  "version": 1,
+  "why": "Checkpoint policy for long-living orchestrating sessions (phase 0). Provisional: a research task is producing measured values; every number below is a starting point, not a finding.",
+  "warn_pct": {"value": 60, "why": "Tell the session early that a checkpoint is coming, so it can reach a clean turn boundary instead of being cut mid-task."},
+  "checkpoint_pct": {"value": 70, "why": "Checkpoint while there is still room to write a good handoff; quality of long-context recall degrades well before the window is full."},
+  "force_pct": {"value": 85, "why": "Past this the client's own auto-compaction (lossy, uncontrolled) is close; force the handoff before it fires."},
+  "ceiling_200k_class": {"value": {"max_window_tokens": 250000, "checkpoint_tokens": 140000}, "why": "Windows up to ~250k tokens are the 200k class; checkpoint at 140k absolute (70%) regardless of the reported percentage."},
+  "ceiling_1m_class": {"value": {"max_window_tokens": 2000000, "checkpoint_tokens": 300000}, "why": "1M-class windows: quality, not capacity, is the limit; reasoning over 300k+ tokens of history degrades, so checkpoint at 300k even though the window could hold more."},
+  "velocity_turns": {"value": 2, "why": "Checkpoint now if the last turn's growth, repeated this many times, would cross force_pct: one big tool result can jump past the thresholds between two checks."},
+  "idle_boundary_only": {"value": true, "why": "Only checkpoint at an idle turn boundary (no tool call in flight), so no result is lost between the old and the new session."},
+  "self_handoff_deadline_s": {"value": 300, "why": "The session writing its own handoff gets 5 minutes; after that the deterministic builder's handoff is used instead so a stuck session cannot block the restart."},
+  "handoff_total_tokens": {"value": 10000, "why": "The handoff must be small next to the fresh window (5% of 200k) so the restarted session starts with room to work."},
+  "section_budgets": {"value": {"goal": 1000, "rules": 1500, "decisions": 1500, "in_flight": 1500, "files": 500, "excerpts": 4000}, "why": "Per-section token budgets: excerpts get the most because they carry the working detail; files are a short list; the sum equals handoff_total_tokens."},
+  "goal_prompts": {"value": 3, "why": "The last 3 user prompts, verbatim, state the current goal better than any summary."},
+  "recency_pin_messages": {"value": 8, "why": "The last 8 messages are where in-flight identifiers live and get a recency bonus in the excerpt ranking: the newest turns matter most after a restart."},
+  "recency_bonus": {"value": 4, "why": "Score bonus for excerpts inside the recency pin: larger than one shared goal word (+3) so recent context wins ties, smaller than two."},
+  "tool_result_truncation_chars": {"value": 400, "why": "Tool results in excerpts are shown truncated: their head identifies the result; the full text can be re-read with the tool."},
+  "excerpt_message_truncation_chars": {"value": 1200, "why": "Long messages are cut so one wall of text cannot take the whole excerpt budget."},
+  "circuit_breaker": {"value": {"max_restarts": 3, "window_s": 1200, "pause_s": 1800}, "why": "3 restarts within 20 minutes means the handoff itself is too big or the task loops; pause 30 minutes and tell the owner instead of restarting forever."}
+}
