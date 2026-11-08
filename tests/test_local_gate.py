@@ -317,6 +317,60 @@ class GateTests(GateHarness):
         self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 502)
 
 
+class TrainingHoldTests(GateHarness):
+    """A live S1 training intent in the studio-gate dir refuses every forwarded request (temp dirs only)."""
+    NONCE = "a" * 32
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name) / "studio-gate"
+        self.gate.studio_gate_dir = self.dir
+
+    def write_intent(self, expires_in):
+        import time
+        self.dir.mkdir(exist_ok=True)
+        now = time.time()
+        (self.dir / f"intent-{os.getpid()}-{self.NONCE}.json").write_text(json.dumps(
+            dict(version=1, pid=os.getpid(), nonce=self.NONCE, created_at=now - 1, expires_at=now + expires_in)))
+
+    def test_no_dir_passes(self):
+        code, _ = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 200)
+
+    def test_live_intent_503_then_passes_after_expiry(self):
+        import time
+        self.write_intent(1.0)
+        code, raw = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 503)
+        self.assertIn("S1 training in progress", raw)
+        self.assertNotIn(self.NONCE, raw)
+        self.assertNotIn(str(self.dir), raw)
+        n = len(FakeOllama.seen)
+        code, _ = self.call("/v1/messages", GateTests.MSG, headers={"x-api-key": TOKEN})
+        self.assertEqual(code, 503)
+        self.assertEqual(len(FakeOllama.seen), n)          # nothing reached Ollama
+        time.sleep(1.2)
+        code, _ = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 200)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any directory")
+    def test_unreadable_dir_fails_closed(self):
+        self.dir.mkdir()
+        os.chmod(self.dir, 0)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        code, raw = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(code, 503)
+        self.assertIn("unreadable", raw)
+        self.assertNotIn(str(self.dir), raw)
+
+    def test_unauthorized_still_401_not_hold(self):
+        self.write_intent(60)
+        code, _ = self.call("/api/tags", headers={"authorization": "Bearer wrong"})
+        self.assertEqual(code, 401)
+
+
 class GateConfigTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

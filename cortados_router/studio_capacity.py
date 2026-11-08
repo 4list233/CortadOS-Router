@@ -491,8 +491,8 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
 
     Writes an intent, waits (bounded) for the daemon's ack that the model is
     confirmed unloaded, and never proceeds silently: on timeout, whatever the
-    daemon's status says, it queries /api/ps itself, unloads a resident model
-    and confirms absence, raising GateRefused if that cannot be confirmed.
+    daemon's status says, it queries /api/ps itself, unloads EVERY resident model
+    and confirms none remain, raising GateRefused if that cannot be confirmed.
     Only a refused connection (Ollama not running) proceeds without a query
     result, with a log line."""
     log = log or (lambda message: print("studio_gate: " + message, file=sys.stderr))
@@ -545,9 +545,16 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
                 path.unlink()
 
 
+def loaded_models(api):
+    """Every model name /api/ps reports resident (any model, not just ours)."""
+    return [m.get("name") or m.get("model") for m in api("/api/ps")["models"]]
+
+
 def _confirm_unloaded(api, model, log):
+    """Unload EVERY resident model, not only `model`: a model pinned through the local gate (or loaded by hand)
+    competes for the same unified memory as training, whatever its name."""
     try:
-        loaded = resident(api, model)
+        loaded = loaded_models(api)
     except Exception as exc:
         if _connection_refused(exc):
             log("Ollama not running (connection refused): nothing resident; proceeding")
@@ -555,16 +562,17 @@ def _confirm_unloaded(api, model, log):
         raise GateRefused("studio_gate: residency query failed (%s); refusing to start" %
                           type(exc).__name__) from exc
     if loaded:
-        log("%s resident; unloading (keep_alive=0)" % model)
+        log("%d model(s) resident (%s); unloading each (keep_alive=0)" % (len(loaded), ", ".join(map(str, loaded))))
         try:
-            api("/api/generate", {"model": model, "stream": False, "keep_alive": 0})
-            loaded = resident(api, model)
+            for name in loaded:
+                api("/api/generate", {"model": name, "stream": False, "keep_alive": 0})
+            loaded = loaded_models(api)
         except Exception as exc:
-            raise GateRefused("studio_gate: unload of %s unconfirmed (%s); refusing to start" % (
-                model, type(exc).__name__)) from exc
+            raise GateRefused("studio_gate: unload of resident models unconfirmed (%s); refusing to start" %
+                              type(exc).__name__) from exc
         if loaded:
-            raise GateRefused("studio_gate: %s still resident after keep_alive=0" % model)
-    log("confirmed %s not resident; proceeding" % model)
+            raise GateRefused("studio_gate: still resident after keep_alive=0: %s" % ", ".join(map(str, loaded)))
+    log("confirmed no model resident (expected %s); proceeding" % model)
 
 
 # Exit status of `gate` when it refuses (EX_TEMPFAIL): callers can tell a

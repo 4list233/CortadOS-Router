@@ -12,7 +12,8 @@ Ollama has no authentication, so it listens on 127.0.0.1 only and this gate is t
 Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
 Env equivalents: CORTADOS_LOCAL_GATE_LISTEN, CORTADOS_LOCAL_GATE_PORT, CORTADOS_LOCAL_GATE_UPSTREAM,
-CORTADOS_LOCAL_GATE_TOKEN_FILE. Stdlib only.
+CORTADOS_LOCAL_GATE_TOKEN_FILE, CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR. Stdlib only.
+While S1 training holds the node (a live intent in the studio-gate dir), every forwarded request is a 503.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cortados_router.local_resources import pro_local_allowed
+from cortados_router.studio_capacity import gate_dir as default_studio_gate_dir, live_intents
 
 logger = logging.getLogger("cortados.local_gate")
 
@@ -76,6 +78,30 @@ _UNAUTHORIZED = json.dumps({"type": "error", "error": {"type": "authentication_e
 
 class GateConfigError(ValueError):
     pass
+
+
+def training_hold(gate_dir: str | os.PathLike | None, now: float | None = None) -> str | None:
+    """Why the node must not serve now because S1 training holds it, or None when it is free.
+
+    A pinned request loads a model; during training that would compete with the trainer for unified memory, so any
+    live intent in the studio-gate handshake directory (studio_capacity.training_gate writes them) refuses the request.
+    A missing directory means no trainer has ever run here (training_gate creates it): free. A directory that exists
+    but cannot be read fails closed, because an intent we cannot see is still an intent. The returned reason names
+    no path, pid or nonce: it goes back to the remote client."""
+    if gate_dir is None:
+        return None
+    gate = Path(gate_dir)
+    try:
+        if not gate.exists():
+            return None
+        os.listdir(gate)                          # Path.glob swallows a permission error; listdir raises it
+        live = live_intents(gate, time.time() if now is None else now)
+    except OSError as exc:
+        logger.warning("studio-gate dir unreadable (%s): refusing local requests", type(exc).__name__)
+        return "S1 training state unreadable; local model refused"
+    if live:
+        return "S1 training in progress on this node; local model refused until it ends"
+    return None
 
 
 def read_token(path: str | os.PathLike) -> str:
@@ -144,7 +170,7 @@ class GateServer(ThreadingHTTPServer):
                  max_connections: int = MAX_CONNECTIONS, connect_timeout: float = CONNECT_TIMEOUT_S,
                  read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S,
                  header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
-                 drain_deadline: float = DRAIN_DEADLINE_S):
+                 drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None):
         check_limits(max_body=max_body, max_connections=max_connections, connect_timeout=connect_timeout,
                      read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
                      body_deadline=body_deadline, drain_deadline=drain_deadline)
@@ -159,6 +185,8 @@ class GateServer(ThreadingHTTPServer):
         self.idle_timeout = idle_timeout
         self.header_deadline, self.body_deadline, self.drain_deadline = header_deadline, body_deadline, drain_deadline
         self.slots = threading.BoundedSemaphore(max_connections)
+        # The S1 training handshake dir (None: no training check, e.g. a node that never trains).
+        self.studio_gate_dir = studio_gate_dir
         super().__init__(addr, GateHandler)
 
     def process_request(self, request, client_address):
@@ -272,6 +300,15 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._read_body(n, self.server.drain_deadline) is not None
         return True
 
+    def _node_free(self) -> tuple[bool, str]:
+        """pro_local_allowed (AC power + local switch; applies on every node running the gate, not only the Pro),
+        then the S1 training hold."""
+        allowed, reason = pro_local_allowed()
+        if not allowed:
+            return allowed, reason
+        hold = training_hold(self.server.studio_gate_dir)
+        return (False, hold) if hold else (True, "")
+
     def do_GET(self):
         self._handle("GET")
 
@@ -302,7 +339,7 @@ class GateHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if (method, path) not in ROUTES:
             return self._error(404, "not_found_error", "not a forwarded path")
-        allowed, reason = pro_local_allowed()
+        allowed, reason = self._node_free()
         if not allowed:
             if self._drain():
                 self._error(503, "overloaded_error", reason)
@@ -320,8 +357,8 @@ class GateHandler(BaseHTTPRequestHandler):
             body = self._read_body(n, self.server.body_deadline)
             if body is None:                     # too slow or gone: close, freeing the slot
                 return
-        # Body upload can outlast the power cache or a switch change: check at admission too.
-        allowed, reason = pro_local_allowed()
+        # Body upload can outlast the power cache, a switch change or a trainer's intent: check at admission too.
+        allowed, reason = self._node_free()
         if not allowed:
             return self._error(503, "overloaded_error", reason)
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
@@ -369,6 +406,9 @@ def _settings(argv=None) -> argparse.Namespace:
     ap.add_argument("--port", type=int, default=int(env("CORTADOS_LOCAL_GATE_PORT") or DEFAULT_PORT))
     ap.add_argument("--upstream", default=env("CORTADOS_LOCAL_GATE_UPSTREAM") or DEFAULT_UPSTREAM)
     ap.add_argument("--token-file", default=env("CORTADOS_LOCAL_GATE_TOKEN_FILE") or DEFAULT_TOKEN_FILE)
+    ap.add_argument("--studio-gate-dir", default=env("CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR") or str(default_studio_gate_dir()),
+                    help="S1 training handshake dir; a live intent there refuses requests with 503 "
+                         "(default $CORTADOS_HOME/studio-gate)")
     ap.add_argument("--allow-any", action="store_true", help="permit 0.0.0.0 / :: (only on a trusted-only machine)")
     ap.add_argument("--max-body-bytes", type=int, default=MAX_BODY_BYTES)
     ap.add_argument("--max-connections", type=int, default=MAX_CONNECTIONS)
@@ -393,12 +433,13 @@ def main(argv=None) -> int:
         print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
                           "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections,
-                          "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout}, indent=1))
+                          "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout,
+                          "studio_gate_dir": a.studio_gate_dir}, indent=1))
         return 0
     try:
         srv = GateServer((listen, a.port), token=token, upstream=a.upstream, max_body=a.max_body_bytes,
                          max_connections=a.max_connections, connect_timeout=a.connect_timeout,
-                         read_timeout=a.read_timeout)
+                         read_timeout=a.read_timeout, studio_gate_dir=a.studio_gate_dir)
     except (GateConfigError, OSError) as exc:
         print(f"local_gate: cannot start: {exc}", file=sys.stderr)
         return 2

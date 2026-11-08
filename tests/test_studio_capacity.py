@@ -510,6 +510,37 @@ class HandshakeTests(unittest.TestCase):
                 self.fail("training must not start")
         self.assertFalse(list(self.gate.iterdir()))
 
+    def test_fallback_unloads_every_loaded_model(self):
+        resident = {c.MODEL, "huihui-other:latest", "third:q4"}
+        def api(path, payload=None):
+            self.calls.append((path, payload))
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["keep_alive"] == 0:
+                resident.discard(payload["model"])
+            return {}
+        ctx, _ = self.gate_ctx(api=api)
+        with ctx:
+            self.assertEqual(resident, set())
+        unloaded = {p["model"] for path, p in self.calls if path == "/api/generate"}
+        self.assertEqual(unloaded, {c.MODEL, "huihui-other:latest", "third:q4"})
+        self.assertIn("confirmed", self.logs[-1])
+
+    def test_fallback_refuses_if_any_model_remains(self):
+        resident = {c.MODEL, "stuck:latest"}
+        def api(path, payload=None):
+            if path == "/api/ps":
+                return {"models": [{"name": n} for n in sorted(resident)]}
+            if payload["model"] != "stuck:latest":
+                resident.discard(payload["model"])
+            return {}
+        ctx, _ = self.gate_ctx(api=api)
+        with self.assertRaises(c.GateRefused) as cm:
+            with ctx:
+                self.fail("training must not start")
+        self.assertIn("stuck:latest", str(cm.exception))
+        self.assertFalse(list(self.gate.iterdir()))
+
     def test_crash_in_block_removes_intent(self):
         ctx, _ = self.gate_ctx()
         with self.assertRaises(ValueError):
