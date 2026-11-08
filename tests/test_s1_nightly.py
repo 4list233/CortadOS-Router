@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time as _time
 import shutil
 import signal
 import stat
@@ -91,6 +92,7 @@ if [ "$1 $2 $3 $4" = "-B -m cortados_router.studio_capacity gate" ]; then
 fi
 [ "$1" = "-c" ] && exit 0
 if [ "$1" = "-m" ]; then
+  echo "$*" >> "$HOME/lora.log"
   while [ $# -gt 0 ]; do [ "$1" = "--adapter-path" ] && out="$2"; shift; done
   mkdir -p "$out"; echo w > "$out/0000100_adapters.safetensors"; echo w > "$out/adapters.safetensors"; exit 0
 fi
@@ -406,6 +408,48 @@ PY
         rc, log, run, res = self._cycle(STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=1)
         self.assertEqual(rc, 0, log)
         self.assertIn("training tonight", log)
+
+    def _stopped_mid_lora(self, name, age_s=0):
+        """A run as overnight.py leaves it when the night window ends mid-LoRA: checkpoint 0000100, segment-target, no final
+        adapters.safetensors, no report.json."""
+        run = self.s1 / "runs" / name
+        (run / "adapter").mkdir(parents=True)
+        (run / "adapter/0000100_adapters.safetensors").write_text("w")
+        (run / "segment-target").write_text("300\n")
+        if age_s:
+            old = _time.time() - age_s
+            for p in (run / "adapter/0000100_adapters.safetensors", run / "adapter", run):
+                os.utime(p, (old, old))
+        return run
+
+    def test_continuous_cross_night_resume_keeps_and_resumes_the_stopped_run(self):
+        run = self._stopped_mid_lora("2026-01-01")   # night 1; the cycle below runs on the real (later) date
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5)
+        log = (run / "nightly.log").read_text()
+        self.assertEqual(out.returncode, 0, log)
+        self.assertIn("cross-night resume", log)
+        self.assertNotIn("retention: removed", log)
+        lora = (Path(self.env["HOME"]) / "lora.log").read_text()
+        self.assertIn(f"--resume-adapter-file runs/2026-01-01/adapter/resume_100_adapters.safetensors", lora)
+        self.assertIn("--iters 200", lora)   # 300 target - 100 checkpointed
+        self.assertTrue((run / "adapter/resume_100_adapters.safetensors").exists())
+
+    def test_cross_night_resume_takes_only_the_newest_unfinished_run(self):
+        # Rule (unchanged retention): only the newest unfinished run is resumed, with no age limit; any older unfinished,
+        # unpromoted, non-pending run loses its checkpoints (logs kept) in prune_unresumable_runs.
+        old = self._stopped_mid_lora("2025-06-01", age_s=200 * 86400)
+        new = self._stopped_mid_lora("2026-01-01")
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5)
+        log = (new / "nightly.log").read_text()
+        self.assertEqual(out.returncode, 0, log)
+        self.assertIn("retention: removed checkpoints of unfinished runs/2025-06-01", log)
+        self.assertFalse((old / "adapter").exists())
+        self.assertIn("--resume-adapter-file runs/2026-01-01/", (Path(self.env["HOME"]) / "lora.log").read_text())
+
+    def test_window_mode_does_not_carry_runs_across_nights(self):
+        run = self._stopped_mid_lora("2026-01-01")
+        self._bare(STUB_NEW_LABELS=5)
+        self.assertFalse((run / "adapter").exists(), "window mode keeps its old rule: only tonight's run resumes")
 
     def test_cycle_result_absent_on_label_failure(self):
         rc, log, _, res = self._cycle(STUB_LABEL_RC=1)

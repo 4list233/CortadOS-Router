@@ -226,9 +226,22 @@ if [ -d "$RUN/adapter" ] && [ -f "$RUN/report.json" ]; then   # a finished run i
   # steps; resume the newest unfinished run instead, and start a new folder only when there is none.
   RUN=$(newest_unfinished_run); [ -n "$RUN" ] || RUN="runs/$(date +%Y-%m-%d)-$(date +%H%M)"
 fi
+# Cross-night resume (continuous mode, Forest 2026-11-08): training only runs in the night window and overnight.py stops it at the
+# window end, so a LoRA segment longer than one window spans nights. Each night gets a new runs/<date> folder, and without this the
+# retention pass below would delete the previous night's checkpoints, so such a run would never finish. When CORTADOS_S1_RUN is unset
+# and today's folder has not started training, carry on in the newest run stopped mid-LoRA (checkpoints, segment-target, no final
+# adapters.safetensors, no report: a completed-but-unevaluated run is the pending/recovery path's, not this one's). It becomes $RUN,
+# which prune_unresumable_runs always keeps. Rule for older unfinished runs: only the newest is resumed (no age limit); every
+# other unfinished, unpromoted, non-pending run loses its checkpoints in the retention pass, as before.
+CARRIED=""
+if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && [ -z "${CORTADOS_S1_RUN:-}" ] && [ ! -d "$RUN/adapter" ] && [ ! -f "$RUN/report.json" ]; then
+  carry=$(newest_unfinished_run)
+  if [ -n "$carry" ] && [ "$carry" != "$RUN" ] && [ ! -f "$carry/adapter/adapters.safetensors" ]; then CARRIED="$RUN"; RUN="$carry"; fi
+fi
 mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1
 echo "=== $(date) nightly start (base $BASE, run $RUN)"
+[ -n "$CARRIED" ] && echo "cross-night resume: $CARRIED has not started; continuing the unfinished run $RUN from its checkpoints"
 [ -n "${SETTING_NOTES:-}" ] && echo "settings: $SETTING_NOTES" && SETTING_NOTES=""
 # Recovery (2026-11-03: evaluation TERMed at 07:00 left runs/2026-11-03 trained, unevaluated and unmarked, so the next night pruned
 # it and retrained from step 0, forever). A trained, unevaluated run with no pending marker is adopted as evaluation_pending BEFORE
@@ -504,8 +517,8 @@ if read_pending; then
   elif [ "$p_sft" = "$sft_hash" ] || [ "$p_reason" = evaluation_pending ]; then
     # Convergence: a night with an evaluation_pending candidate spends itself on that evaluation (it starts right after labeling,
     # ~02:45, so 110 min fits) and ends; the next night trains on the newer data. Only a run whose training COMPLETED is protected
-    # this way: mid-training progress on a non-completed run resumes only within its own run folder (segment-target / iters-base),
-    # not across date folders, so a training run cut off before completion is redone by a later night's run.
+    # this way. Mid-training progress on a non-completed run resumes within its own run folder (segment-target / iters-base); in
+    # continuous mode that folder is carried across nights (cross-night resume above), in window mode it is not.
     # Only when the data is unchanged does a verdict mark it trained (mark_trained): newer labels were never trained on.
     # Every rewrite of this marker below keeps "$p_sft", the data the candidate was TRAINED on (or recovery's deliberate
     # "unknown"): stamping tonight's hash would claim it saw labels it never trained on, and a later verdict would then mark them trained.

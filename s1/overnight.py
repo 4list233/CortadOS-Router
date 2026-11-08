@@ -19,7 +19,10 @@ inside CORTADOS_S1_NIGHT_WINDOW, so the Studio's local Ollama model is free duri
 CORTADOS_S1_TRAIN_ALLOWED=1/0 (+ CORTADOS_S1_TRAIN_SKIP_REASON); nightly.sh skips every gated step when it is 0, ends rc 0, and
 the cycle is idle (sleeps CORTADOS_S1_CYCLE_IDLE_S) unless labels were added. An invalid window, or "off", means no training
 (fail closed). A cycle allowed to train is stopped when the window ends (group SIGTERM, TRAIN_STOP_GRACE_S, then SIGKILL); the
-trainer's checkpoints stay, and the next cycle starts at once (it labels, then skips training until the next window)."""
+trainer's checkpoints stay, and the next cycle starts at once (it labels, then skips training until the next window); nightly.sh
+carries that run folder across nights and resumes it from its newest checkpoint (cross-night resume).
+The window-end stop ends the whole cycle, including any labeling still running; the next cycle redoes it at once.
+The window is read once per cycle at its start: a cycle begun just before the window opens does not train; the next one does."""
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
