@@ -578,9 +578,11 @@ approved this with a retention limit. Nothing it does changes what any backend r
 - Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600, opened with O_NOFOLLOW;
   symlinks are refused). Code: `cortados_router/compaction/store.py`.
 - What: per provider turn, a `turn` header (source `claude-code` / `codex`, `x-cortados-run-id`, `x-cortados-session`,
-  client), the tool results answering earlier calls (text capped at 64k chars per result, original length and error
-  flag kept: labels need the content, one huge output must not fill the disk), the new user text, the assistant text
-  and the tool calls it issued. Read back with `store.read_session(path) -> events.Session`.
+  client), the tool results answering earlier calls, the new user text, the assistant text and the tool calls it
+  issued. Each result text and each tool input is capped at `provider_tool_result_cap_tokens` x `chars_per_token` for
+  the conversation's source, both from `tables/compaction.json` (8000 x 2.5 = 20000 chars for Claude Code, 8000 x 4 =
+  32000 for Codex); the original length and a truncated flag are kept (labels need the content, one huge output or a
+  giant Write content must not fill the disk). Read back with `store.read_session(path) -> events.Session`.
 - Retention: `CORTADOS_COMPACTION_RETENTION_DAYS` (default 14: nightly harvest plus a week of review; tools can print
   secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest sessions first.
   Pruned at provider start and at most hourly after, in a background thread.
@@ -588,5 +590,11 @@ approved this with a retention limit. Nothing it does changes what any backend r
   user's request (the reply is already in hand).
 - Shadow pruning: when a conversation closes (drop, failure, idle reap) `compaction/prune.py` decides keep/drop for
   every past tool call in a background thread and appends the decisions, with the chars/tokens they would have saved,
-  to `$CORTADOS_HOME/compaction/decisions.jsonl` (0600). Thresholds: `tables/compaction-prune.json` (provisional).
+  to `$CORTADOS_HOME/compaction/decisions.jsonl` (0600). Each row carries a `gate`: the session's estimated tokens
+  against the pruning start min(`start_cap_tokens`, `start_pct` x W) (`would_start`) and whether the drops free at
+  least `min_freed_tokens` (`would_prune`), so labels can be joined later. W is `assumed_window_tokens` (200k) because
+  the provider does not learn the backend window. Shared thresholds (keep the last 4 results, start, min freed, result
+  cap, chars per token) are read from `tables/compaction.json` through `compaction/policy.py`, the one source shared
+  with phase 0; `tables/compaction-prune.json` holds only this phase's rule data (tool lists, read-only Bash prefixes,
+  MCP side-effect words, small-result N, dropped-result head H, assumed window), provisional.
 - The Office view (`office.py`) stays metadata-only; it never reads this store.

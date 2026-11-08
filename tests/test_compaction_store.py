@@ -142,6 +142,82 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(sess.messages[1].tool_event_indexes, (0,))
 
 
+class FakeSession:
+    def __init__(self, sid):
+        self.id, self.lock, self.history, self.closed = sid, threading.Lock(), ["fp"], False
+        self.last_used, self.awaiting_tool_result = time.time(), False
+
+    def close(self):
+        self.closed = True
+
+
+class TriggerTests(unittest.TestCase):
+    """Registry close / reap start the shadow pass (direct calls, fake sessions); the store's prune is hourly."""
+
+    def setUp(self):
+        from cortados_router.provider import server
+        self.server = server
+        self.reg = server.Registry(gateway_url="", token="t", claude_bin="false")
+        self.calls = []
+        self.p = mock.patch.object(server.compaction_prune, "shadow_decide_async", self.calls.append)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_drop_and_fail_trigger(self):
+        a, b = FakeSession("conv-a"), FakeSession("conv-b")
+        self.reg.sessions.update({a.id: a, b.id: b})
+        self.reg.drop(a)
+        self.reg.fail(b, RuntimeError("x"), None)
+        self.assertEqual(self.calls, ["conv-a", "conv-b"])
+        self.assertTrue(a.closed and b.closed)
+
+    def test_reap_triggers_only_expired(self):
+        old, fresh = FakeSession("conv-old"), FakeSession("conv-fresh")
+        old.last_used = time.time() - 10_000
+        self.reg.sessions.update({old.id: old, fresh.id: fresh})
+        self.reg.reap(60)
+        self.assertEqual(self.calls, ["conv-old"])
+        self.assertIn("conv-fresh", self.reg.sessions)
+
+
+class PruneThrottleTests(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"CORTADOS_HOME": tempfile.mkdtemp(), "CORTADOS_COMPACTION_STORE": "1"})
+        self.env.start()
+        self.ran = []
+        self.p = mock.patch.object(store, "prune_expired", self.ran.append)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        self.env.stop()
+
+    def wait_idle(self, s):
+        for _ in range(200):
+            if not s._prune_running:
+                return
+            time.sleep(0.01)
+        self.fail("prune thread did not finish")
+
+    def test_hourly(self):
+        s = store.Store()
+        t0 = 1_000_000.0
+        self.assertTrue(s.maybe_prune_async(t0))
+        self.wait_idle(s)
+        self.assertFalse(s.maybe_prune_async(t0 + 60))
+        self.assertFalse(s.maybe_prune_async(t0 + store.PRUNE_INTERVAL_S - 1))
+        self.assertTrue(s.maybe_prune_async(t0 + store.PRUNE_INTERVAL_S))
+        self.wait_idle(s)
+        self.assertEqual(self.ran, [t0, t0 + store.PRUNE_INTERVAL_S])
+
+    def test_off_never_prunes(self):
+        with mock.patch.dict(os.environ, {"CORTADOS_COMPACTION_STORE": "0"}):
+            self.assertFalse(store.Store().maybe_prune_async(1.0))
+        self.assertEqual(self.ran, [])
+
+
 class ProviderHookTests(unittest.TestCase):
     """Both wires through the real server with the fake claude CLI: records on, identical client bytes on/off."""
 
