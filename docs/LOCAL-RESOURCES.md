@@ -189,10 +189,15 @@ tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
 - requires `Authorization: Bearer <token>` or `x-api-key: <token>`, compared in constant time with the token in a
   0600 file (default `~/.config/cortados/local-gate-token`); it refuses to start when the file is missing, shorter than
   32 characters or readable by group/others. A wrong token is a fixed 401 that echoes nothing;
-- streams SSE through line by line; bounds the body (32 MiB), concurrent connections (8, then 503), the loopback
+- does not cap concurrent connections by default (`--max-connections 0` / `CORTADOS_LOCAL_GATE_MAX_CONNECTIONS`,
+  owner decision 2026-11-08): several orchestrating sessions may each run many local-model subagents at once, and
+  Ollama's `OLLAMA_NUM_PARALLEL` (how many run) and `OLLAMA_MAX_QUEUE` (how many wait) are the real limits, so a
+  request beyond `NUM_PARALLEL` queues inside Ollama instead of getting a 503 from the gate. A positive value caps
+  (over it: an immediate 503) for an operator who wants a thread bound;
+- streams SSE through line by line; bounds the body (32 MiB), the loopback
   connect (3 s), each read (300 s), an idle client socket (30 s) and, as absolute deadlines a trickling client cannot extend, the
-  headers (10 s), the body (120 s) and the drain of a refused body (5 s, then closed without the 401); every limit must
-  be a finite positive number; logs method, path and status only, never the token or a body.
+  headers (10 s), the body (120 s) and the drain of a refused body (5 s, then closed without the 401); every timeout and
+  size limit must be a finite positive number; logs method, path and status only, never the token or a body.
 
 **Power and switch check on every node.** Before forwarding, the gate calls `pro_local_allowed()` (AC power + the
 local-enabled flag). Despite the name it runs on any node that runs the gate, the Studio included: a Studio on AC with
