@@ -11,8 +11,9 @@ The manifest records exactly which message (`m`) / tool event (`e`) indexes went
 phase 2 can turn later reuse into labels. Same Session + same policy -> byte-identical output.
 
 Over the total budget, sections are trimmed lowest priority first: excerpts, files, decisions, recency pin. Goal and
-Standing rules are never trimmed: if they alone exceed the total budget, HandoffBudgetError is raised (a handoff
-without its goal or rules would restart the session wrong, which is worse than not restarting).
+Standing rules are never dropped: over their cap, the full text goes to a sibling file (handoff.goal-full.md /
+handoff.rules-full.md, returned by build_handoff_files) and the section shows head + tail and a "full text: <file>"
+pointer. HandoffBudgetError only when a cap cannot hold even that (pathological policy).
 """
 from __future__ import annotations
 
@@ -280,7 +281,35 @@ def _victim(key: str, items: List[dict]) -> dict:
     return items[0]
 
 
+OVERFLOW_FILES = {"goal": "handoff.goal-full.md", "rules": "handoff.rules-full.md"}
+
+
 def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
+    """(markdown, manifest). When Goal or Standing rules overflow their cap, the full text goes to a sibling file
+    (see build_handoff_files, which also returns those files' contents for the caller to write)."""
+    md, manifest, _files_out = build_handoff_files(session, policy)
+    return md, manifest
+
+
+def _overflow_render(title: str, full_body: str, file_name: str, budget: int) -> str:
+    """Head + tail of an overflowing section within `budget` tokens, plus a pointer to the full text."""
+    pointer = "full text: %s (%d tokens) — read it before acting" % (file_name, est_tokens(full_body))
+    marker = "\n[... middle cut; see the full text ...]\n"
+    shell = _render(title, ["", marker, "", pointer])
+    room = int(budget * _CPT[0]) - len(shell) - 4  # chars left for head + tail (4: rounding slack)
+    if room < 80:
+        raise HandoffBudgetError("%s cap of %d tokens cannot hold even a head/tail excerpt and the pointer to %s"
+                                 % (title, budget, file_name))
+    head = full_body[:room * 6 // 10]
+    tail = full_body[-(room - len(head)):] if room - len(head) > 0 else ""
+    text = _render(title, [head, marker, tail, pointer])
+    while est_tokens(text) > budget and head:  # ceil rounding: shave until it fits
+        head = head[:-8]
+        text = _render(title, [head, marker, tail, pointer])
+    return text
+
+
+def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict[str, str]]:
     b = policy["section_budgets"]
     total_budget = policy["handoff_total_tokens"]
     sections: Dict[str, List[dict]] = {}
@@ -305,24 +334,34 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
               "estimates (ceil(chars/%s)). Resume from this document; re-read files before editing them.\n"
               % (hid, session.session, session.source, len(session.messages), len(session.events), _CPT[0]))
     titles = dict(SECTION_TITLES)
+    override: Dict[str, str] = {}      # rendered text replacing a section (Goal / rules overflow)
+    extra_files: Dict[str, str] = {}   # sibling file name -> full section text
+    overflow: Dict[str, dict] = {}
+
+    def sec_text(key: str) -> str:
+        return override.get(key) or _render(titles[key], [it["line"] for it in sections[key]])
 
     def sec_tokens(key: str) -> int:
-        return est_tokens(_render(titles[key], [it["line"] for it in sections[key]]))
+        return est_tokens(sec_text(key))
 
     def render_all() -> Tuple[str, Dict[str, int]]:
         parts, toks = [header], {}
-        for key, title in SECTION_TITLES:
-            text = _render(title, [it["line"] for it in sections[key]])
+        for key, _title in SECTION_TITLES:
+            text = sec_text(key)
             toks[key] = est_tokens(text)
             parts.append(text)
         return "\n".join(parts), toks
 
-    # Caps count the complete rendered section, heading included. Goal and rules are never trimmed: over their cap
-    # the build is refused rather than silently exceeding it or dropping an instruction.
+    # Caps count the complete rendered section, heading included. Goal and rules are never dropped: over their cap
+    # the full text goes to a sibling file and the section shows head + tail and a pointer to it, so a long prompt or
+    # many rules can never make the checkpoint fail. Only a cap too small for even that raises HandoffBudgetError.
     for key in ("goal", "rules"):
         if sec_tokens(key) > b[key]:
-            raise HandoffBudgetError("%s section needs ~%d tokens, over its %d-token cap; refusing to trim it"
-                                     % (key, sec_tokens(key), b[key]))
+            full_body = "\n".join(it["line"] for it in sections[key])
+            name = OVERFLOW_FILES[key]
+            extra_files[name] = "# %s (full text)\n\n%s\n" % (titles[key], full_body)
+            override[key] = _overflow_render(titles[key], full_body, name, b[key])
+            overflow[key] = {"file": name, "full_tokens": est_tokens(full_body)}
     for key in ("recency_pin", "decisions", "in_flight", "files", "excerpts"):
         while sec_tokens(key) > b[key] and sections[key]:
             items = sections[key]
@@ -341,7 +380,7 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
             items.remove(_victim(key, items))
             dropped[key] += 1
             md, toks = render_all()
-    real_id = handoff_id(md, policy)
+    real_id = handoff_id(md + "".join("\0%s\0%s" % kv for kv in sorted(extra_files.items())), policy)
     md = md.replace("handoff-id: " + ID_PLACEHOLDER, "handoff-id: " + real_id, 1)
     hid = real_id
     if est_tokens(md) > total_budget:
@@ -368,5 +407,6 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
                 ent["score"] = it["score"]
             entries.append(ent)
         manifest["sections"][key] = {"tokens": toks[key], "budget": b[key], "over_budget": toks[key] > b[key],
-                                     "dropped": dropped[key], "items": entries}
-    return md, manifest
+                                     "dropped": dropped[key], "items": entries,
+                                     "overflow": overflow.get(key)}
+    return md, manifest, extra_files

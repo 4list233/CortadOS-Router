@@ -420,17 +420,55 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(_read(target), "keep")
 
     def test_4_goal_and_rules_caps_include_heading(self):
-        long_goal = Session("s", "claude-code", (Message("s", 0, "user", "x" * 1100),), ())
-        with self.assertRaisesRegex(handoff.HandoffBudgetError, "goal section"):
-            handoff.build_handoff(long_goal, self.pol)  # ~440 tokens + heading > 400
-        rules = " ".join("Never do thing number %d ever." % i for i in range(300))
-        with self.assertRaisesRegex(handoff.HandoffBudgetError, "rules section"):
-            handoff.build_handoff(Session("s", "claude-code", (Message("s", 0, "user", rules),
-                                                               Message("s", 1, "user", "go")), ()), self.pol)
         md, man = handoff.build_handoff(synthetic_session(n_filler=60), self.pol)
         for key, sec in man["sections"].items():
             self.assertLessEqual(sec["tokens"], sec["budget"], key)
             self.assertFalse(sec["over_budget"], key)
+            self.assertIsNone(sec["overflow"], key)
+
+    def test_goal_overflow_goes_to_sibling_file(self):
+        prompt = "START " + "goal words " * 300 + " END"
+        s = Session("s", "claude-code", (Message("s", 0, "user", prompt),), ())
+        md, man, extra = handoff.build_handoff_files(s, self.pol)
+        sec = man["sections"]["goal"]
+        self.assertLessEqual(sec["tokens"], sec["budget"])
+        self.assertEqual(sec["overflow"]["file"], "handoff.goal-full.md")
+        self.assertGreater(sec["overflow"]["full_tokens"], sec["budget"])
+        goal = md[md.index("## Goal"):md.index("## Recency pin")]
+        self.assertIn("START", goal)
+        self.assertIn("END", goal)
+        self.assertIn("full text: handoff.goal-full.md (%d tokens)" % sec["overflow"]["full_tokens"], goal)
+        self.assertIn("read it before acting", goal)
+        self.assertIn(prompt.strip(), extra["handoff.goal-full.md"])
+        self.assertEqual([it["index"] for it in sec["items"]], [0])
+
+    def test_rules_overflow_goes_to_sibling_file_via_cli(self):
+        rules = " ".join("Never do thing number %d ever." % i for i in range(300))
+        lines = [cc_line("user", rules), cc_line("user", "go")]
+        d = tempfile.mkdtemp()
+        rc, _, err = self.run_cli("build", "--transcript", _write(lines), "--out", d)
+        self.assertEqual(rc, 0, err)
+        full = os.path.join(d, "handoff.rules-full.md")
+        self.assertEqual(stat.S_IMODE(os.stat(full).st_mode), 0o600)
+        self.assertIn("Never do thing number 299 ever.", _read(full))
+        self.assertIn("Never do thing number 150 ever.", _read(full))
+        man = json.loads(_read(os.path.join(d, "handoff.manifest.json")))
+        self.assertEqual(man["sections"]["rules"]["overflow"]["file"], "handoff.rules-full.md")
+        self.assertLessEqual(man["sections"]["rules"]["tokens"], man["sections"]["rules"]["budget"])
+        self.assertIn("full text: handoff.rules-full.md", _read(os.path.join(d, "handoff.md")))
+        # a rebuild without --force refuses (overflow file exists too); with --force a short build drops the stale file
+        rc, _, _ = self.run_cli("build", "--transcript", _write(lines), "--out", d)
+        self.assertEqual(rc, 3)
+        rc, _, _ = self.run_cli("build", "--transcript", _write(CLAUDE_LINES), "--out", d, "--force")
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(full))
+
+    def test_overflow_pathological_cap_raises(self):
+        pol = copy.deepcopy(self.pol)
+        pol["section_budgets"]["goal"] = 10
+        s = Session("s", "claude-code", (Message("s", 0, "user", "x" * 2000),), ())
+        with self.assertRaisesRegex(handoff.HandoffBudgetError, "cannot hold"):
+            handoff.build_handoff(s, pol)
 
     def test_5_caps_apply_without_window(self):
         level, _ = checkpoint.classify(self.pol, 31, 310000, None)

@@ -29,7 +29,9 @@ uncontrolled auto-compaction of either client. Three phases share the record sha
   worktrees from the last 8 messages, 2000), Files touched (<= 40 paths with edit counts and tools, 800), Ranked
   excerpts (+3 per shared goal word, +2 per load-bearing signal, recency bonus; greedy fill, then chronological; tool
   results head + tail with their char count, 6000). Over the total: trim excerpts, files, decisions, then recency
-  pin; Goal and rules are never trimmed — the build fails instead. The manifest lists every message / event index
+  pin. Goal and rules are never dropped: over their cap the full text goes to a 0600 sibling file
+  (`handoff.goal-full.md` / `handoff.rules-full.md`) and the section shows head + tail plus "full text: <file> (N
+  tokens) — read it before acting" (recorded as `overflow` in the manifest); only a cap too small for even that fails. The manifest lists every message / event index
   per section with scores. Same input -> same bytes.
 - **CLI** (`compaction/checkpoint.py`): `build` writes `handoff.md` + `handoff.manifest.json` (0600, no overwrite
   without `--force`); `check` reads a Claude Code status-line JSON (plus optional turn history, model id, idle time

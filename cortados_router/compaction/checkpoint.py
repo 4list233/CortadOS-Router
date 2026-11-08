@@ -65,17 +65,25 @@ def _write_private(path: str, text: str, force: bool) -> None:
 def cmd_build(args) -> int:
     pol = policy_mod.load(args.policy)
     session, stats = transcript.parse(args.transcript, args.format)
-    md, manifest = handoff.build_handoff(session, pol)
+    md, manifest, extra = handoff.build_handoff_files(session, pol)
     manifest["parse_stats"] = stats
     os.makedirs(args.out, mode=0o700, exist_ok=True)
     md_path = os.path.join(args.out, "handoff.md")
     man_path = os.path.join(args.out, "handoff.manifest.json")
-    for p in (md_path, man_path):  # check both first so a refusal leaves neither file half-updated
+    extra_paths = {os.path.join(args.out, name): text for name, text in sorted(extra.items())}
+    # A stale overflow file from an earlier build would point a reader at the wrong text: refuse/replace it too.
+    stale = [os.path.join(args.out, n) for n in handoff.OVERFLOW_FILES.values()
+             if os.path.join(args.out, n) not in extra_paths and os.path.lexists(os.path.join(args.out, n))]
+    for p in [md_path, man_path] + list(extra_paths) + stale:  # check all first so a refusal leaves neither file half-updated
         if os.path.islink(p) or (os.path.exists(p) and not args.force):
             print("refusing to overwrite %s (%s)" % (p, "symlink" if os.path.islink(p) else "use --force"),
                   file=sys.stderr)
             return 3
     try:
+        for p, text in extra_paths.items():  # sibling files first: handoff.md must never point at a missing file
+            _write_private(p, text, args.force)
+        for p in stale:
+            os.unlink(p)
         _write_private(md_path, md, args.force)
         _write_private(man_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", args.force)
     except WriteRefused as exc:
