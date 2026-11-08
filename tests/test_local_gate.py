@@ -29,7 +29,13 @@ def token_file(directory, token=TOKEN, mode=0o600):
     return str(p)
 
 
+# The slot tests below exercise an explicit positive cap; the default (unlimited) is covered by UncappedGateTests.
+CAP = 8
+
+
 class GateHarness(unittest.TestCase):
+    MAX_CONNECTIONS = CAP
+
     def setUp(self):
         allowed = patch.object(local_gate, "pro_local_allowed", return_value=(True, "test AC + on"))
         allowed.start()
@@ -38,7 +44,8 @@ class GateHarness(unittest.TestCase):
         threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
         FakeOllama.seen = []
         self.gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
-                                          upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5)
+                                          upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=5,
+                                          max_connections=self.MAX_CONNECTIONS)
         threading.Thread(target=self.gate.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.gate.server_port}"
 
@@ -129,7 +136,7 @@ class GateTests(GateHarness):
         import time
         self.gate.idle_timeout = 0.5
         idle = []
-        for _ in range(local_gate.MAX_CONNECTIONS):       # every slot taken by a socket that sends nothing
+        for _ in range(CAP):       # every slot taken by a socket that sends nothing
             idle.append(socket.create_connection(("127.0.0.1", self.gate.server_port)))
         time.sleep(0.2)
         try:
@@ -166,7 +173,7 @@ class GateTests(GateHarness):
         import time
         self.gate.idle_timeout = 0.5                      # each trickled byte arrives well inside this
         stop = threading.Event()
-        socks = [self._trickle(payload, 0.1, stop) for _ in range(local_gate.MAX_CONNECTIONS)]
+        socks = [self._trickle(payload, 0.1, stop) for _ in range(CAP)]
         try:
             time.sleep(0.3)
             self.assertEqual(self.call("/api/tags", headers={"x-api-key": TOKEN})[0], 503)
@@ -239,7 +246,7 @@ class GateTests(GateHarness):
         self.gate.idle_timeout = 0.5
         stop = threading.Event()
         socks = []
-        for _ in range(local_gate.MAX_CONNECTIONS):
+        for _ in range(CAP):
             sock = socket.create_connection(("127.0.0.1", self.gate.server_port))
             sock.sendall(head)
             socks.append(sock)
@@ -531,6 +538,113 @@ class TrainingHoldTests(GateHarness):
         self.assertEqual(code, 401)
 
 
+class SlowOllama(BaseHTTPRequestHandler):
+    """Answers /v1/messages after a delay and counts how many requests are in flight at once."""
+    lock = threading.Lock()
+    inflight = peak = served = 0
+    delay = 0.5
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["content-length"]))
+        with SlowOllama.lock:
+            SlowOllama.inflight += 1
+            SlowOllama.peak = max(SlowOllama.peak, SlowOllama.inflight)
+        time.sleep(SlowOllama.delay)
+        with SlowOllama.lock:
+            SlowOllama.inflight -= 1
+            SlowOllama.served += 1
+        raw = json.dumps({"type": "message", "stop_reason": "end_turn", "content": []}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+class UncappedGateTests(unittest.TestCase):
+    """The default gate has no connection cap: concurrency is Ollama's NUM_PARALLEL / MAX_QUEUE, not the gate's."""
+    N = 20
+
+    def setUp(self):
+        allowed = patch.object(local_gate, "pro_local_allowed", return_value=(True, "test AC + on"))
+        allowed.start()
+        self.addCleanup(allowed.stop)
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        env = patch.dict(os.environ, {"CORTADOS_HOME": home})
+        env.start()
+        self.addCleanup(env.stop)
+        SlowOllama.inflight = SlowOllama.peak = SlowOllama.served = 0
+        self.ollama = type("BurstServer", (ThreadingHTTPServer,), {"request_queue_size": 128})(
+            ("127.0.0.1", 0), SlowOllama)                 # the fake upstream must take the burst too
+        threading.Thread(target=self.ollama.serve_forever, daemon=True).start()
+        self.addCleanup(self.ollama.server_close)
+        self.addCleanup(self.ollama.shutdown)
+
+    def _gate(self, **kw):
+        gate = local_gate.GateServer(("127.0.0.1", 0), token=TOKEN,
+                                     upstream=f"http://127.0.0.1:{self.ollama.server_port}", read_timeout=10, **kw)
+        threading.Thread(target=gate.serve_forever, daemon=True).start()
+        self.addCleanup(gate.server_close)
+        self.addCleanup(gate.shutdown)
+        return gate
+
+    def _burst(self, gate, n):
+        codes, lock, start = [], threading.Lock(), threading.Barrier(n)
+
+        def one():
+            req = urllib.request.Request(f"http://127.0.0.1:{gate.server_port}/v1/messages",
+                                         data=json.dumps(GateTests.MSG).encode(),
+                                         headers={"content-type": "application/json", "x-api-key": TOKEN})
+            start.wait()
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    r.read()
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            with lock:
+                codes.append(code)
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        return sorted(codes)
+
+    def test_default_is_unlimited(self):
+        self.assertEqual(local_gate.MAX_CONNECTIONS, 0)
+        self.assertIsNone(self._gate().slots)
+
+    def test_many_concurrent_slow_requests_all_reach_upstream(self):
+        gate = self._gate()
+        self.assertEqual(self._burst(gate, self.N), [200] * self.N)
+        self.assertEqual(SlowOllama.served, self.N)
+        self.assertGreater(SlowOllama.peak, 8)            # more in flight at once than the old cap of 8 allowed
+        # Unlimited mode leaves nothing behind: a second burst is served the same way.
+        self.assertEqual(self._burst(gate, self.N), [200] * self.N)
+        self.assertEqual(SlowOllama.served, 2 * self.N)
+
+    def test_explicit_positive_cap_still_refuses_beyond_it(self):
+        gate = self._gate(max_connections=4)
+        codes = self._burst(gate, 10)
+        self.assertEqual(len(codes), 10)
+        self.assertEqual(codes.count(200) + codes.count(503), 10)
+        self.assertGreaterEqual(codes.count(503), 1)
+        self.assertLessEqual(SlowOllama.peak, 4)
+        # Every slot comes back once the requests end.
+        self.assertEqual(self._burst(gate, 4), [200] * 4)
+
+    def test_negative_or_non_integer_cap_is_refused(self):
+        for bad in (-1, 1.5, True, "8"):
+            with self.assertRaises(local_gate.GateConfigError, msg=bad):
+                local_gate.GateServer(("127.0.0.1", 0), token=TOKEN, upstream="http://127.0.0.1:9",
+                                      max_connections=bad)
+
+
 class GateConfigTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -570,6 +684,8 @@ class GateConfigTests(unittest.TestCase):
             for bad in ("-1", "0", "nan", "inf"):
                 if flag.startswith("--max") and bad in ("nan", "inf"):
                     continue                              # int flags: argparse refuses those itself
+                if flag == "--max-connections" and bad == "0":
+                    continue                              # 0 is unlimited, the default (UncappedGateTests)
                 self.assertEqual(local_gate.main(["--listen", "127.0.0.1", "--token-file", tf, "--print-config",
                                                   flag, bad]), 2, (flag, bad))
         for key in ("connect_timeout", "read_timeout", "idle_timeout", "header_deadline", "body_deadline",
@@ -587,6 +703,12 @@ class GateConfigTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(TOKEN, out.getvalue())
         self.assertIn("ok (40 chars", out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["max_connections"], "unlimited")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = local_gate.main(["--listen", "127.0.0.1", "--token-file", token_file(self.dir), "--print-config",
+                                  "--max-connections", "12"])
+        self.assertEqual((rc, json.loads(out.getvalue())["max_connections"]), (0, 12))
         self.assertEqual(local_gate.main(["--listen", "127.0.0.1", "--print-config",
                                           "--token-file", token_file(self.dir, mode=0o644)]), 2)
 

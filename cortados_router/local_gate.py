@@ -51,17 +51,21 @@ MIN_TOKEN_CHARS = 32
 # A Claude Code conversation is resent whole every turn, tool results included; several MB is normal, tens is not.
 # The bound keeps one request from holding the laptop's memory hostage.
 MAX_BODY_BYTES = 32 * 2 ** 20
-# The node runs one model and Ollama queues requests anyway; more parallel connections than this only add threads
-# a sleeping-then-woken laptop has to carry. A connection over the limit gets an immediate 503.
-MAX_CONNECTIONS = 8
+# Concurrent connections: 0 = unlimited, the default (owner decision 2026-11-08). Several orchestrating sessions may
+# each run many local-model subagents at once (3 x 10 = 30 is normal), and the gate is not where concurrency belongs:
+# Ollama's OLLAMA_NUM_PARALLEL decides how many requests run at once and its OLLAMA_MAX_QUEUE how many wait, and a
+# request beyond both gets Ollama's own error back. A gate cap below those would turn a queued, eventually-served
+# request into a 503. Idle and trickling sockets are still bounded per connection by the timeouts and deadlines below.
+# A positive --max-connections still caps (over the cap: an immediate 503), for an operator who wants a thread bound.
+MAX_CONNECTIONS = 0
 # Loopback connects in microseconds: a short connect wait tells "Ollama is not running" quickly. Reads wait long
 # because a first model load (16 GB) can take a minute before the first byte, but are bounded so a hung Ollama never
 # pins a gate thread forever.
 CONNECT_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 300.0
-# A connection holds one of the MAX_CONNECTIONS slots from accept, before it has sent anything. Without a socket
-# timeout, a few idle sockets (or Tailscale links dropped mid-request, which never send a FIN) would hold every slot
-# forever and lock the lane out. 30 s is far more than a provider needs to send its request line and body.
+# A connection holds a gate thread (and, under a positive max_connections, one of its slots) from accept, before it
+# has sent anything. Without a socket timeout, idle sockets (or Tailscale links dropped mid-request, which never send
+# a FIN) would pile up threads forever, and under a cap hold every slot and lock the lane out. 30 s is far more than a provider needs to send its request line and body.
 IDLE_TIMEOUT_S = 30.0
 # The idle timeout only measures silence: a client trickling one byte every few seconds never trips it. So each phase
 # of reading a request also has an absolute deadline, after which the connection is closed and its slot freed.
@@ -159,6 +163,14 @@ def check_listen(host: str, allow_any: bool) -> str:
     return str(ip)
 
 
+def check_max_connections(n) -> int:
+    """max_connections: 0 is unlimited (MAX_CONNECTIONS explains why that is the default), a positive integer caps.
+    Negative, non-integer and bool values are refused rather than read as "unlimited"."""
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise GateConfigError(f"max_connections must be 0 (unlimited) or a positive integer, got {n!r}")
+    return n
+
+
 def check_limits(**limits: float) -> None:
     """Every timeout, deadline and size limit must be a finite positive number: 0 makes a socket non-blocking,
     a negative one raises mid-request, NaN compares false everywhere and inf is no bound at all."""
@@ -169,13 +181,18 @@ def check_limits(**limits: float) -> None:
 
 class GateServer(ThreadingHTTPServer):
     daemon_threads = True
+    # The listen backlog. socketserver's default of 5 resets connects beyond it when a burst arrives faster than the
+    # accept loop drains it; uncapped, a burst of many subagents (3 sessions x 10) is the expected load, and a reset is
+    # a refusal the gate must not make. 128 is macOS's default somaxconn, so asking for more would gain nothing.
+    request_queue_size = 128
 
     def __init__(self, addr, *, token: str, upstream: str, max_body: int = MAX_BODY_BYTES,
                  max_connections: int = MAX_CONNECTIONS, connect_timeout: float = CONNECT_TIMEOUT_S,
                  read_timeout: float = READ_TIMEOUT_S, idle_timeout: float = IDLE_TIMEOUT_S,
                  header_deadline: float = HEADER_DEADLINE_S, body_deadline: float = BODY_DEADLINE_S,
                  drain_deadline: float = DRAIN_DEADLINE_S, studio_gate_dir: str | os.PathLike | None = None):
-        check_limits(max_body=max_body, max_connections=max_connections, connect_timeout=connect_timeout,
+        check_max_connections(max_connections)
+        check_limits(max_body=max_body, connect_timeout=connect_timeout,
                      read_timeout=read_timeout, idle_timeout=idle_timeout, header_deadline=header_deadline,
                      body_deadline=body_deadline, drain_deadline=drain_deadline)
         if ":" in addr[0]:
@@ -188,12 +205,16 @@ class GateServer(ThreadingHTTPServer):
         self.max_body, self.connect_timeout, self.read_timeout = max_body, connect_timeout, read_timeout
         self.idle_timeout = idle_timeout
         self.header_deadline, self.body_deadline, self.drain_deadline = header_deadline, body_deadline, drain_deadline
-        self.slots = threading.BoundedSemaphore(max_connections)
+        # None when unlimited: no slot is taken at accept and none is released after the request.
+        self.slots = threading.BoundedSemaphore(max_connections) if max_connections > 0 else None
         # The S1 training handshake dir (None: no training check, e.g. a node that never trains).
         self.studio_gate_dir = studio_gate_dir
         super().__init__(addr, GateHandler)
 
     def process_request(self, request, client_address):
+        if self.slots is None:                      # unlimited: no slot to take or give back
+            super().process_request(request, client_address)
+            return
         if not self.slots.acquire(blocking=False):
             try:
                 body = b'{"type":"error","error":{"type":"overloaded_error","message":"local gate: too many connections"}}'
@@ -213,7 +234,8 @@ class GateServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            if self.slots is not None:
+                self.slots.release()
 
 
 class GateHandler(BaseHTTPRequestHandler):
@@ -445,7 +467,10 @@ def _settings(argv=None) -> argparse.Namespace:
                          "(default $CORTADOS_HOME/studio-gate)")
     ap.add_argument("--allow-any", action="store_true", help="permit 0.0.0.0 / :: (only on a trusted-only machine)")
     ap.add_argument("--max-body-bytes", type=int, default=MAX_BODY_BYTES)
-    ap.add_argument("--max-connections", type=int, default=MAX_CONNECTIONS)
+    ap.add_argument("--max-connections", type=int,
+                    default=env("CORTADOS_LOCAL_GATE_MAX_CONNECTIONS") or MAX_CONNECTIONS,   # argparse applies int to an env string
+                    help="concurrent connections; 0 (default) is unlimited: Ollama's OLLAMA_NUM_PARALLEL / "
+                         "OLLAMA_MAX_QUEUE are the real limits")
     ap.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT_S)
     ap.add_argument("--read-timeout", type=float, default=READ_TIMEOUT_S)
     ap.add_argument("--print-config", action="store_true", help="check the settings and token file, print them, exit")
@@ -457,7 +482,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     try:
         listen = check_listen(a.listen, a.allow_any)
-        check_limits(max_body_bytes=a.max_body_bytes, max_connections=a.max_connections,
+        check_max_connections(a.max_connections)
+        check_limits(max_body_bytes=a.max_body_bytes,
                      connect_timeout=a.connect_timeout, read_timeout=a.read_timeout)
         token = read_token(a.token_file)
     except GateConfigError as exc:
@@ -466,7 +492,7 @@ def main(argv=None) -> int:
     if a.print_config:
         print(json.dumps({"listen": f"{listen}:{a.port}", "upstream": a.upstream, "token_file": a.token_file,
                           "token": f"ok ({len(token)} chars, mode 0600)", "routes": sorted(f"{m} {p}" for m, p in ROUTES),
-                          "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections,
+                          "max_body_bytes": a.max_body_bytes, "max_connections": a.max_connections or "unlimited",
                           "connect_timeout_s": a.connect_timeout, "read_timeout_s": a.read_timeout,
                           "studio_gate_dir": a.studio_gate_dir}, indent=1))
         return 0
