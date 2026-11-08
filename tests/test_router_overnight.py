@@ -56,12 +56,13 @@ class Overnight(unittest.TestCase):
     def test_stubborn_child_gets_group_kill(self):
         # the group never drains (killpg(pgid, 0) keeps succeeding), so the grace runs out and the group is KILLed
         proc=Mock(pid=123);proc.wait.side_effect=[subprocess.TimeoutExpired('x',1),-9]
-        with patch.object(night.subprocess,'Popen',return_value=proc) as start,patch.object(night,'signal_group') as kill, \
-                patch.object(night.os,'killpg',lambda pgid,sig: None):
+        sent=[]
+        with patch.object(night.subprocess,'Popen',return_value=proc) as start, \
+                patch.object(night.os,'killpg',lambda pgid,sig: sent.append((pgid,sig))):
             self.assertEqual(night.run_bounded(['owned'],1,grace=.1),124)
         self.assertTrue(start.call_args.kwargs['start_new_session'])
-        self.assertIn(((123,signal.SIGTERM),),[(c.args,) for c in kill.call_args_list])
-        self.assertIn(((123,signal.SIGKILL),),[(c.args,) for c in kill.call_args_list])
+        self.assertIn((123,signal.SIGTERM),sent)
+        self.assertIn((123,signal.SIGKILL),sent)
 
     def test_resume_interrupted_before_first_save_does_not_double_count(self):
         source=(Path(__file__).resolve().parents[1]/'s1/nightly.sh').read_text()
@@ -227,9 +228,10 @@ class Continuous(unittest.TestCase):
 
     def test_term_while_paused_conts_first(self):
         proc = Mock(pid=7); proc.wait.return_value = 0
-        with patch.object(night, 'signal_group') as kill:
+        sent = []   # every stop send goes through os.killpg (send_group_drained); stub it so pid 7 is never signalled
+        with patch.object(night.os, 'killpg', lambda pgid, sig: sent.append(sig)):
             night.stop_tree(proc, grace=.1)
-        self.assertEqual([c.args[1] for c in kill.call_args_list][:2], [signal.SIGCONT, signal.SIGTERM])
+        self.assertEqual(sent[:2], [signal.SIGCONT, signal.SIGTERM])
 
     def test_real_stopped_child_terminates(self):
         p = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'], start_new_session=True)
@@ -915,9 +917,55 @@ class WindowEndDrainAndDst(unittest.TestCase):
     def test_local_now_is_a_named_zone(self):
         self.assertIs(night._local_now().tzinfo, night.NIGHT_ZONE)
 
+    # Hard bounds for the real-process fixtures: a slow machine FAILS the test, never hangs it or skips silently.
+    READY_TIMEOUT_S = 30.0   # gate + trainer start (two Python interpreters) must be ready within this
+    BACKSTOP_S = 30.0        # after the SIGTERM, the supervisor call must have returned within this (grace is 5 s)
+
+    def _fixture_dir(self):
+        """A temp dir that outlives the test body: cleanups (LIFO) kill the fixture groups first, then remove it."""
+        import shutil
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.addCleanup(self._kill_fixture_groups, tmp)
+        return tmp
+
+    @staticmethod
+    def _kill_fixture_groups(tmp, reap=True):
+        """SIGKILL both fixture groups whatever the outcome: the cycle group (gate's pgid = the bash leader's pid) and the
+        trainer's own session. Reaps the bash leader when it is still our unreaped child. A trainer that survives KILL fails."""
+        for name in ('cycle.pgid', 'child.pid'):
+            try:
+                pgid = int((tmp / name).read_text())
+            except FileNotFoundError:
+                continue   # the fixture never got that far: there is no such group to kill
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue   # already drained: the normal outcome of a passing test
+            except PermissionError:
+                pass       # Darwin: zombie-only group; still reap below
+            if name == 'cycle.pgid' and reap:
+                try:
+                    os.waitpid(pgid, 0)
+                except ChildProcessError:
+                    pass   # run_cycle/run_bounded's Popen already reaped the leader
+            if name == 'child.pid':
+                end = _time.monotonic() + 5
+                while True:
+                    try:
+                        os.kill(pgid, 0)
+                    except ProcessLookupError:
+                        break
+                    except PermissionError:
+                        break   # zombie awaiting launchd's reap: it can no longer hold the lock
+                    if _time.monotonic() > end:
+                        raise AssertionError(f'fixture trainer {pgid} survived SIGKILL')
+                    _time.sleep(0.02)
+
     def _gate_cycle(self, tmp):
         """A cycle shaped like nightly.sh's gated(): bash leader -> gate (LOCK_EX) -> trainer in its own session holding the
-        inherited lock fd, which takes ~1 s to stop after TERM. Returns (cmd, lock, ready, released, child_pid)."""
+        inherited lock fd, which takes ~1 s to stop after TERM. Returns (cmd, lock, ready, released, child_pid).
+        The gate records the cycle group (cycle.pgid) and the trainer its own pid (child.pid) for _kill_fixture_groups."""
         lock, ready, released, child_pid = tmp / 'lock', tmp / 'ready', tmp / 'released', tmp / 'child.pid'
         # the "trainer": its own group, holds the inherited LOCK_EX fd, takes ~1 s to stop after TERM
         (tmp / 'trainer.py').write_text(
@@ -929,6 +977,7 @@ class WindowEndDrainAndDst(unittest.TestCase):
         # the "gate": takes LOCK_EX, starts the trainer in its own session with the fd, on TERM stops that group (3 s grace)
         (tmp / 'gate.py').write_text(
             "import fcntl, os, signal, subprocess, sys, time\n"
+            f"open({str(tmp / 'cycle.pgid')!r}, 'w').write(str(os.getpgrp()))\n"
             f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT)\n"
             "fcntl.flock(fd, fcntl.LOCK_EX)\n"
             f"p = subprocess.Popen([sys.executable, {str(tmp / 'trainer.py')!r}], pass_fds=(fd,), start_new_session=True)\n"
@@ -956,56 +1005,94 @@ class WindowEndDrainAndDst(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int(child_pid.read_text()), 0)
 
-    def _sigterm_when(self, ready):
-        """Deliver a real SIGTERM to this process once `ready` exists, with overnight.main's handler (-> KeyboardInterrupt)."""
+    def _sigterm_when(self, ready, tmp):
+        """Deliver a real SIGTERM to this process once `ready` exists, with overnight.main's handler (-> KeyboardInterrupt).
+        The SIGTERM must reach the main thread (that is where the handler raises), so the supervisor call stays on the main
+        thread and this watchdog bounds it instead: no readiness within READY_TIMEOUT_S -> SIGTERM anyway and mark the test
+        failed; call still running BACKSTOP_S later -> SIGKILL both fixture groups and mark it failed. Returns (state, done):
+        the test sets `done` when the call returns and must assert state is clean."""
         import threading
         def interrupted(signum, frame):
             raise KeyboardInterrupt
         old = signal.signal(signal.SIGTERM, interrupted)
         self.addCleanup(signal.signal, signal.SIGTERM, old)
+        state = {'ready_timeout': False, 'backstop': False}
+        done = threading.Event()
         def fire():
-            for _ in range(200):
-                if ready.exists():
-                    os.kill(os.getpid(), signal.SIGTERM)
-                    return
-                _time.sleep(0.02)
-        threading.Thread(target=fire, daemon=True).start()
+            end = _time.monotonic() + self.READY_TIMEOUT_S
+            while not ready.exists():
+                if done.is_set():
+                    return   # the call returned before readiness; the test's own assertions report it
+                if _time.monotonic() > end:
+                    state['ready_timeout'] = True
+                    break
+                done.wait(0.02)
+            if done.is_set():
+                return
+            os.kill(os.getpid(), signal.SIGTERM)
+            if not done.wait(self.BACKSTOP_S):
+                state['backstop'] = True
+                self._kill_fixture_groups(tmp, reap=False)   # the main thread's Popen.wait reaps the leader
+        t = threading.Thread(target=fire, daemon=True)
+        t.start()
+        self.addCleanup(t.join, self.BACKSTOP_S + self.READY_TIMEOUT_S + 5)
+        self.addCleanup(done.set)
+        return state, done
+
+    def _assert_watchdog_clean(self, state):
+        self.assertFalse(state['ready_timeout'], f'fixture not ready within {self.READY_TIMEOUT_S:g}s: test inconclusive, '
+                         'failing rather than skipping')
+        self.assertFalse(state['backstop'], f'supervisor call still running {self.BACKSTOP_S:g}s after SIGTERM')
 
     def test_sigterm_to_the_continuous_supervisor_drains_the_cycle_group(self):
         # launchd stop/restart on deploy: SIGTERM -> KeyboardInterrupt inside run_cycle's poll loop.
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
-                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
-            tmp = Path(tmp)
+        tmp = self._fixture_dir()
+        with patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1', 'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
             cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
             g = TrainOnlyInWindow._guard(self, lambda: datetime(2026, 11, 8, 3, 0))
-            self._sigterm_when(ready)
-            with self.assertRaises(KeyboardInterrupt):
-                night.run_cycle(cmd, g, result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.05), grace=5)
+            state, done = self._sigterm_when(ready, tmp)
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    night.run_cycle(cmd, g, result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.05), grace=5)
+            finally:
+                done.set()
+            self._assert_watchdog_clean(state)
             self._assert_gate_released(lock, released, child_pid)
 
     def test_sigterm_to_the_window_mode_supervisor_drains_the_group(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
-            self._sigterm_when(ready)
+        tmp = self._fixture_dir()
+        cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
+        state, done = self._sigterm_when(ready, tmp)
+        try:
             with self.assertRaises(KeyboardInterrupt):
-                night.run_bounded(cmd, 60, grace=5)
-            self._assert_gate_released(lock, released, child_pid)
+                night.run_bounded(cmd, 120, grace=5)
+        finally:
+            done.set()
+        self._assert_watchdog_clean(state)
+        self._assert_gate_released(lock, released, child_pid)
 
     def test_window_mode_deadline_drains_the_group(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
-            self.assertEqual(night.run_bounded(cmd, 1.0, grace=5), 124)
-            self._assert_gate_released(lock, released, child_pid)
+        tmp = self._fixture_dir()
+        cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
+        # The deadline must land after the fixture is up (gate handler installed, trainer started): 3 s covers two Python
+        # starts; if it did not, the assertion below FAILS (a TERM before the gate's handler would kill it unreleased).
+        self.assertEqual(night.run_bounded(cmd, 3.0, grace=5), 124)
+        self.assertTrue(ready.exists(), 'fixture not ready before the 3 s deadline: test inconclusive, failing rather than '
+                        'passing on a run that never exercised the gate')
+        self._assert_gate_released(lock, released, child_pid)
 
     def test_window_end_waits_for_the_gate_wrapper_to_stop_its_own_group(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
-                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
-            tmp = Path(tmp)
+        tmp = self._fixture_dir()
+        with patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1', 'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
             cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
-            # in the window until the gate is ready, then past the deadline
-            wall = lambda: datetime(2026, 11, 8, 7, 0) if ready.exists() else datetime(2026, 11, 8, 6, 59)
+            # in the window until the gate is ready, then past the deadline; a fixture that never gets ready fails the test
+            t_ready = _time.monotonic() + self.READY_TIMEOUT_S
+            def wall():
+                if ready.exists():
+                    return datetime(2026, 11, 8, 7, 0)
+                if _time.monotonic() > t_ready:
+                    raise AssertionError(f'fixture not ready within {self.READY_TIMEOUT_S:g}s')
+                return datetime(2026, 11, 8, 6, 59)
             g = TrainOnlyInWindow._guard(self, wall)
             first = [True]
             def clock_wall():
@@ -1019,6 +1106,60 @@ class WindowEndDrainAndDst(unittest.TestCase):
             self.assertEqual(res, 'window_end')
             self.assertLess(_time.monotonic() - t0, 20)
             self._assert_gate_released(lock, released, child_pid)
+
+    def test_stop_on_an_already_zombie_only_group_completes(self):
+        # P2-2-1: the leader has exited (unreaped zombie) before the stop starts. Darwin answers the initial CONT/TERM with
+        # EPERM; the stop must end normally with the leader reaped. Real killpg first, then a stub forcing EPERM on every send.
+        for stub in (False, True):
+            with self.subTest(stubbed_eperm=stub):
+                child = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+                self.addCleanup(lambda c=child: c.poll() is None and c.kill())
+                end = _time.monotonic() + 10   # wait until it has exited but is still an unreaped zombie (no waitid on macOS)
+                while subprocess.run(['ps', '-o', 'stat=', '-p', str(child.pid)], capture_output=True,
+                                     text=True).stdout.strip()[:1] != 'Z':
+                    self.assertLess(_time.monotonic(), end, 'fixture leader never became a zombie')
+                    _time.sleep(0.02)
+                sent = []
+                def eperm(pgid, sig):
+                    sent.append(sig)
+                    raise PermissionError(1, 'Operation not permitted')
+                with patch.object(night.os, 'killpg', eperm) if stub else patch.object(night, 'DRAIN_POLL_S', 0.05):
+                    self.assertTrue(night.stop_group_drained(child, grace=2))
+                self.assertIsNotNone(child.returncode)
+                if stub:
+                    self.assertEqual(sent, [signal.SIGCONT])   # the very first send already ends the stop
+
+    def test_eperm_with_a_live_leader_is_a_genuine_error(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        def eperm(pgid, sig):
+            raise PermissionError(1, 'Operation not permitted')
+        with patch.object(night.os, 'killpg', eperm), self.assertRaises(PermissionError):
+            night.stop_group_drained(child, grace=1)
+
+    def test_deadline_compares_instants_in_the_repeated_fall_back_hour(self):
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/Toronto')
+        # 2026-11-01 01:00-02:00 happens twice: fold=0 is EDT (earlier), fold=1 is EST (an hour later)
+        late_dl = datetime(2026, 11, 1, 1, 30, tzinfo=tz, fold=1)    # 06:30 UTC
+        early_dl = datetime(2026, 11, 1, 1, 30, tzinfo=tz, fold=0)   # 05:30 UTC
+        self.assertFalse(night.deadline_reached(datetime(2026, 11, 1, 1, 45, tzinfo=tz, fold=0), late_dl))  # 05:45 UTC
+        self.assertTrue(night.deadline_reached(datetime(2026, 11, 1, 1, 15, tzinfo=tz, fold=1), early_dl))  # 06:15 UTC
+        self.assertTrue(night.deadline_reached(late_dl, late_dl))
+        self.assertTrue(night.deadline_reached(datetime(2026, 11, 1, 1, 45, tzinfo=tz, fold=1), late_dl))
+        self.assertFalse(night.deadline_reached(datetime(2026, 11, 1, 1, 15, tzinfo=tz, fold=0), early_dl))
+        # wall-time >= would get the first two wrong (the bug this guards against)
+        self.assertTrue(datetime(2026, 11, 1, 1, 45, tzinfo=tz, fold=0) >= late_dl)
+        # and run_cycle uses it: a cycle at 01:45 EDT against a 01:30 EST deadline is not ended; 01:15 EST vs 01:30 EDT is
+        for now, dl, want in ((datetime(2026, 11, 1, 1, 45, tzinfo=tz, fold=0), late_dl, 'idle'),
+                              (datetime(2026, 11, 1, 1, 15, tzinfo=tz, fold=1), early_dl, 'window_end')):
+            with self.subTest(now=now.isoformat(), deadline=dl.isoformat()):
+                tmp = self._fixture_dir()
+                g = TrainOnlyInWindow._guard(self, lambda n=now: n)
+                with patch.object(night, 'train_policy', lambda w, dl=dl: (True, 'test window', dl)):
+                    _, res = night.run_cycle([sys.executable, '-c', 'import time; time.sleep(0.3)'], g,
+                                             result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.02), grace_end=2)
+                self.assertEqual(res, want)
 
     def test_drain_kills_survivors_after_the_grace(self):
         child = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '

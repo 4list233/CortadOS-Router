@@ -25,7 +25,7 @@ The window-end stop ends the whole cycle, including any labeling still running; 
 The window is read once per cycle at its start: a cycle begun just before the window opens does not train; the next one does."""
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 import os
 from pathlib import Path
 import signal
@@ -225,7 +225,7 @@ def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: st
 
 
 def _local_now() -> datetime:
-    return datetime.now(NIGHT_ZONE)   # aware, named zone: deadlines compare as absolute instants across DST
+    return datetime.now(NIGHT_ZONE)   # aware, named zone; compare deadlines with deadline_reached (UTC), not >= (wall time)
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None, above: float | None = None) -> float:
@@ -605,35 +605,69 @@ def stop_tree(child, *, grace: float = TRAIN_STOP_GRACE_S) -> None:
 DRAIN_POLL_S = 0.1
 
 
+# Seen on Darwin: killpg answers EPERM for a group whose leader is exiting but not yet waitable; that window is milliseconds.
+EPERM_SETTLE_S = 1.0
+
+
+def _zombie_only(child, err: PermissionError) -> bool:
+    """The one EPERM rule for every killpg on a cycle group. Darwin answers EPERM (not ESRCH) when every remaining member is a
+    zombie (seen with the just-exited leader not yet reaped): nothing in the group can run any more, so it has drained. Same uid,
+    so EPERM cannot hide a live member of ours; but if the leader is still running the group is NOT zombie-only and the EPERM is
+    a genuine error, so it is re-raised. A leader that is mid-exit (TERM just landed) also answers EPERM before it is
+    reapable, so the leader gets EPERM_SETTLE_S to become a zombie before the EPERM counts as genuine. On True it is reaped."""
+    try:
+        child.wait(timeout=EPERM_SETTLE_S)
+    except subprocess.TimeoutExpired:
+        raise err from None
+    return True
+
+
+def send_group_drained(child, sig: int) -> bool:
+    """killpg(child's group, sig). Returns True when the group has already drained (ESRCH, or EPERM on a zombie-only group,
+    see _zombie_only), with the leader reaped; False when the signal was delivered. Any other error propagates."""
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        child.wait()
+        return True
+    except PermissionError as e:
+        return _zombie_only(child, e)
+    return False
+
+
 def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clock=_time.monotonic,
                        sleep=_time.sleep) -> bool:
     """Window-end stop: SIGCONT + SIGTERM the cycle's group, then wait for the WHOLE group to drain (not just the shell leader)
     for up to `grace`, and only then SIGKILL survivors. stop_tree's KILL right after the leader exits killed studio_capacity's gate
     wrapper while it was still stopping its separately grouped trainer: the trainer was orphaned and kept the inherited LOCK_EX.
+    Every send (CONT, TERM, the 0 probe, the final CONT/KILL) goes through send_group_drained, so a group that is already
+    zombie-only at any point ends the stop normally instead of raising.
     Returns True when the group drained within the grace, False when survivors were killed."""
     pgid = child.pid
-    signal_group(pgid, signal.SIGCONT)
-    signal_group(pgid, signal.SIGTERM)
+    if send_group_drained(child, signal.SIGCONT) or send_group_drained(child, signal.SIGTERM):
+        return True
     end = clock() + grace
     while True:
         child.poll()   # reap the leader: an unreaped zombie leader would keep the group "alive" to kill(pgid, 0)
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            child.wait()
-            return True
-        except PermissionError:
-            # Darwin answers EPERM (not ESRCH) when every remaining member is a zombie (seen with the just-exited leader not yet
-            # reaped): nothing in the group can run any more, so it has drained. Same uid, so EPERM never hides a live member.
-            child.wait()
+        if send_group_drained(child, 0):
             return True
         if clock() >= end:
             break
         sleep(poll_s)
     print(f"overnight: cycle group {pgid} still running {grace:g}s after TERM; sending KILL", flush=True)
-    signal_group(pgid, signal.SIGKILL)
+    if send_group_drained(child, signal.SIGKILL):
+        return True
     child.wait()
     return False
+
+
+def deadline_reached(now: datetime, deadline: datetime) -> bool:
+    """now >= deadline as instants. Aware datetimes sharing one ZoneInfo compare by WALL time and ignore fold, so during the
+    repeated fall-back hour 01:30 EDT (fold=0) and 01:30 EST (fold=1) compare equal; going through UTC compares real instants.
+    Naive datetimes (tests' fixed clocks) compare as they are; mixing naive and aware still raises TypeError."""
+    if now.tzinfo is None or deadline.tzinfo is None:
+        return now >= deadline
+    return now.astimezone(timezone.utc) >= deadline.astimezone(timezone.utc)
 
 
 RESULT_MARKERS = ("worked", "quota")
@@ -693,7 +727,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
     try:
         while child.poll() is None:
             watch_stop()
-            if deadline is not None and guard.wall() >= deadline:
+            if deadline is not None and deadline_reached(guard.wall(), deadline):
                 # The deadline lives here, not in nightly.sh: this supervisor already owns the window and group signalling, and
                 # the gate (studio_capacity) forwards our TERM to its own training group. The whole cycle ends; the next one
                 # starts at once, labels, and skips training until the next window. mlx_lm checkpoints (save-every 100) stay.
@@ -711,7 +745,10 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
         raise
     finally:
         # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped.
-        guard.signaller(child.pid, signal.SIGCONT)
+        try:
+            guard.signaller(child.pid, signal.SIGCONT)
+        except PermissionError as e:
+            _zombie_only(child, e)   # zombie-only group (leader gone): nothing left to continue; a live leader re-raises
         guard.new_cycle()
         if pidfile is not None and child.poll() is not None:
             try:
