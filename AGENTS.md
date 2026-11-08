@@ -67,6 +67,19 @@ is the long form.
 After the suite passes, follow `.claude/skills/verify-router/SKILL.md` and paste its evidence block
 into the handback / PR. Codex and Cursor: read that file and follow it the same way.
 
+## Project todos
+- The "Live status" section at the top of issue #60 on 4list233/CortadOS-Router is the one todo list. Every item has
+  an issue; pause notes and memory link to #60 and hold no lists of their own (reason: separate lists drifted from
+  the tracker for five days in November 2026).
+- The top-level orchestrator is the only writer of #60. It updates the section when a branch merges, a review lands,
+  a decision is made or a session pauses. Delegates and child tasks report back; they do not edit it.
+- The drift check runs at session start and before any merge:
+  `python3 -B scripts/tracker_check.py`
+  It is read-only (`gh issue list` / `gh issue view` and local git refs) and reports open issues whose branch is
+  already merged, unmerged local branches that no open issue mentions, and the age of the Live status date (warning
+  past 2 days). Exit 0 clean, 1 drift, 2 the check could not run; a failed check is never a clean result. Tests:
+  `tests/test_tracker_check.py` (fakes only, no GitHub call).
+
 ## Delegating subtasks through the router (route_task)
 
 This repo ships a project MCP server, `cortados-route` (`.mcp.json` launches `cortados_router/subagent_mcp.py`), that
