@@ -29,6 +29,8 @@ td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); 
 th { color:var(--muted); font-weight:500; font-size:12px; }
 td.num { text-align:right; font-variant-numeric:tabular-nums; width:60px; }
 td.barcell { width:40%; }
+td.reason { font-size:12px; color:var(--muted); }
+.wide { overflow-x:auto; }
 .cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
 ul { margin:0; padding-left:18px; } .err { color:var(--bad); }
 .card.errors { border-color:var(--bad); } #status.err, #storage { color:var(--bad); }
@@ -41,7 +43,7 @@ body.stale main { opacity:.55; }
 <header><h1>CortadOS Router · usage</h1><span id="status"></span><span id="storage" hidden></span><button id="logout" hidden>Forget token</button></header>
 <form id="login" class="card" hidden>
   <div class="title">Provider token</div>
-  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/usage.</div>
+  <div class="sub">Kept in this tab's sessionStorage only; sent as a Bearer header to /v1/cortados/usage and /v1/cortados/tasks.</div>
   <input id="tok" type="password" autocomplete="off" required>
   <button type="submit">Open dashboard</button>
 </form>
@@ -50,7 +52,8 @@ body.stale main { opacity:.55; }
 "use strict";
 // EVERY: the scarcity cache behind the lane cards is refreshed every few minutes and the 7-day counts move slowly, so a
 // 30 s poll shows changes promptly while the server's 2 s collect memo keeps several open tabs from re-scanning its logs.
-const KEY = "cortados-usage-token", URL_ = "/v1/cortados/usage", EVERY = 30000;
+// TASKS_URL is fetched on the same poll, after the usage view: its row-limited read of router.db is bounded server-side.
+const KEY = "cortados-usage-token", URL_ = "/v1/cortados/usage", TASKS_URL = "/v1/cortados/tasks", EVERY = 30000;
 const $ = (id) => document.getElementById(id);
 let timer = null, lastOk = null;
 // sessionStorage can throw (storage disabled, some private modes). Then the token lives in memTok for this page only,
@@ -80,7 +83,7 @@ function table(rows, cols, maxOf) {
   if (!rows.length) { const tr = el("tr"); const td = el("td", "sub", "none"); td.colSpan = cols.length; add(t, add(tr, td)); }
   rows.forEach(r => { const tr = el("tr"); cols.forEach(c => {
     if (c.bar) { const td = el("td", "barcell"); const b = el("div", "bar"); const f = el("div"); f.style.width = (100 * (Number(c.bar(r)) || 0) / max) + "%"; add(tr, add(td, add(b, f))); }
-    else add(tr, el("td", c.num ? "num" : null, c.v(r)));
+    else add(tr, el("td", c.cls || (c.num ? "num" : null), c.v(r)));
   }); add(t, tr); });
   return t;
 }
@@ -101,7 +104,44 @@ function hwLine(c, name, v, fmt) {
 }
 function gb(b) { return (typeof b === "number") ? (b / 1073741824).toFixed(1) + " GB" : "–"; }
 function tok(n) { return (typeof n === "number") ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n)) : "–"; }
+function ms(v) { return (typeof v === "number") ? (v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms") : "–"; }
 function capped(o, keys) { return keys.some(k => o && o[k]) ? "list capped" : ""; }
+function short(id) { return (typeof id === "string" && id.length > 14) ? id.slice(0, 6) + "…" + id.slice(-6) : (id || "–"); }
+
+// Shape: cortados_router/provider/tasks.py collect(). Rendered into the card render() leaves in place (tasksBox), so a
+// failed tasks poll marks only this section (in red) and the usage view above it stays current. Tokens are not recorded per
+// task (the endpoint says so in tokens_status); the column shows the endpoint's words, never a number it did not send.
+let tasksBox = null;
+function renderTasks(t, failure) {
+  const box = tasksBox; if (!box) return;
+  box.replaceChildren();
+  if (failure) { add(box, el("div", "sub err", "tasks unavailable: " + failure)); return; }
+  const errors = t.errors || [];
+  errors.forEach(e => add(box, el("div", "sub err", errText(e))));
+  const tot = t.totals || {};
+  add(box, el("div", "sub", "latest " + (t.tasks || []).length + " of at most " + (t.row_limit || "?") + " logged decisions" +
+    (t.truncated ? " (older decisions not shown)" : "") + " · routed " + pct(tot.routed_pct) + " (" + (tot.routed || 0) + " routed, " +
+    (tot.pinned || 0) + " pinned, " + (tot.unselected || 0) + " unselected" + (t.unassigned_decisions ? ", " + t.unassigned_decisions + " without a session" : "") + ")"));
+  add(box, el("div", "sub", t.percentage_definition || ""));
+  const cols = el("div", "cols");
+  add(cols, add(card("% routed per session"), table(t.sessions || [], [
+    {h: "session", v: s => short(s.session_id)}, {h: "decisions", num: true, v: s => s.decisions},
+    {h: "routed", num: true, v: s => s.routed}, {h: "pinned", num: true, v: s => s.pinned}, {h: "unselected", num: true, v: s => s.unselected},
+    {h: "", bar: s => s.routed_pct}, {h: "% routed", num: true, v: s => pct(s.routed_pct)}], () => 100)));
+  add(box, cols);
+  const tc = card("Decisions", "tokens: " + (t.tokens_status || "not recorded"));
+  const wide = el("div", "wide");
+  add(wide, table(t.tasks || [], [
+    {h: "when", v: x => when(x.ts)}, {h: "session", v: x => short(x.session_id)}, {h: "kind", v: x => x.routing_kind || "–"},
+    {h: "band", v: x => x.band || "–"}, {h: "lane · model", v: x => (x.lane || "–") + " · " + (x.model || "–")},
+    {h: "ran on", v: x => x.actual_model || "–"}, {h: "elapsed", num: true, v: x => ms(x.elapsed_ms)},
+    {h: "req chars", num: true, v: x => tok(x.request_chars)}, {h: "resp chars", num: true, v: x => tok(x.response_chars)},
+    {h: "tokens", num: true, v: x => (typeof x.tokens === "number") ? tok(x.tokens) : (x.tokens_status || "not recorded")},
+    {h: "S1 reason", cls: "reason", v: x => x.s1_reason || "–"}]));
+  add(box, add(tc, wide));
+  const notes = el("ul"); (t.notes || []).forEach(n => add(notes, el("li", "sub", n)));
+  add(box, notes);
+}
 
 function render(d) {
   document.body.classList.remove("stale");
@@ -146,6 +186,11 @@ function render(d) {
   add(cols, add(card("Top S1 bands (7 d)", capped(r, ["bands_truncated"])), table(r.top_bands_7d || [], [{h: "band", v: x => x.band}, {h: "", bar: x => x.calls}, {h: "calls", num: true, v: x => x.calls}], x => x.calls)));
   add(cols, add(card("This provider since start"), countTable(r.provider_since_start, "lane/model")));
   add(m, cols);
+
+  add(m, section("Tasks (recent routing decisions)"));
+  tasksBox = el("div", "card");
+  add(tasksBox, el("div", "sub", "loading tasks…"));
+  add(m, tasksBox);
 
   const lg = d.ledger || {};
   add(m, section("Tokens (usage ledger)"));
@@ -218,6 +263,15 @@ function showLogin(msg) {
   $("main").hidden = true; $("logout").hidden = true; $("login").hidden = false;
   $("status").textContent = msg || ""; $("tok").value = ""; $("tok").focus();
 }
+// The tasks view is fetched after a good usage render, with the same token. Its failure never hides the usage view and
+// never forgets the token (a 401 here with a token the usage view just accepted is reported, not acted on).
+async function refreshTasks(t) {
+  try {
+    const res = await fetch(TASKS_URL, {headers: {"Authorization": "Bearer " + t}, cache: "no-store", credentials: "omit"});
+    if (!res.ok) return renderTasks(null, "error " + res.status);
+    renderTasks(await res.json());
+  } catch (e) { renderTasks(null, "fetch failed: " + (e && e.message ? e.message : e)); }
+}
 async function refresh() {
   const t = getTok(); if (!t) return showLogin();
   try {
@@ -225,7 +279,8 @@ async function refresh() {
     if (res.status === 401) { setTok(""); return showLogin("Token refused; enter it again."); }
     if (!res.ok) return failed("error " + res.status);
     render(await res.json());
-  } catch (e) { failed("fetch failed: " + (e && e.message ? e.message : e)); }
+  } catch (e) { return failed("fetch failed: " + (e && e.message ? e.message : e)); }
+  await refreshTasks(t);
 }
 // A failed poll leaves the last good view on screen, greyed, with the failure in red: never shown as current.
 function failed(msg) {

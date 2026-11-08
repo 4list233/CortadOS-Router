@@ -1254,6 +1254,15 @@ class Handler(BaseHTTPRequestHandler):
             from cortados_router import core, resources     # the resource-pool snapshot: cached usage + scarcity + local devices + model-fit
             snap = resources.snapshot(core, local_config=getenv("CORTADOS_LOCAL_RESOURCES_CONFIG"))
             return self._json(200, snap)
+        if self.path.split("?")[0] == "/v1/cortados/tasks":
+            if not self._authorized():
+                return self._error(401, "authentication_error", "bad or missing token")
+            try:
+                body = json.dumps(self.server.tasks_view(self.server.registry), allow_nan=False).encode()
+            except Exception as exc:
+                logger.warning("tasks: view failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: tasks view unavailable (see provider log)")
+            return self._json(200, body)
         if self.path.split("?")[0] == "/v1/cortados/usage":
             if not self._authorized():
                 return self._error(401, "authentication_error", "bad or missing token")
@@ -2160,6 +2169,12 @@ class ProviderServer(ThreadingHTTPServer):
             errors.append({"source": "child_tasks", "error": type(exc).__name__})
             events = []
         return registry.office.view(events, now=now, errors=errors)
+
+    def tasks_view(self, registry: Registry) -> dict[str, Any]:
+        """GET /v1/cortados/tasks: read-only recorded decisions; no registry/live routing lock."""
+        from cortados_router import paths
+        from cortados_router.provider import tasks
+        return tasks.collect(paths.state_dir())
 
     def usage_view(self, registry: Registry) -> dict[str, Any] | bytes:
         """GET /v1/cortados/usage (provider/usage.py): cache-only reads plus one short S1 health call. Tests replace it."""
