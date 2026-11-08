@@ -6,6 +6,7 @@ a stub training python; HOME is the temp dir (stub launchctl, no ~/.cortados), s
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time as _time
@@ -1513,6 +1514,137 @@ class AtomicPointer(unittest.TestCase):
                     ns.write_atomic(p, "new")
             self.assertEqual(p.read_text(), "old")
             self.assertEqual(sorted(x.name for x in Path(d).iterdir()), ["current.json"])
+
+
+# Stub gate for the sweep-stop tests: like studio_capacity's gate it takes the exclusive lock, starts the command in its own
+# session with the lock fd inherited, and on SIGTERM stops that group (bounded) and exits 143. Records its and the child's pids.
+SWEEP_GATE = r'''#!/usr/bin/env python3
+import fcntl, os, signal, subprocess, sys, time
+if sys.argv[1:5] != ["-B", "-m", "cortados_router.studio_capacity", "gate"]:
+    os.execv(os.environ["SWEEP_REAL_PY"], [os.environ["SWEEP_REAL_PY"]] + sys.argv[1:])
+argv = sys.argv[5:]; argv = argv[1:] if argv[:1] == ["--"] else argv
+fd = os.open(os.environ["SWEEP_LOCK"], os.O_RDWR | os.O_CREAT)
+fcntl.flock(fd, fcntl.LOCK_EX)
+stop = []
+signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
+child = subprocess.Popen(argv, pass_fds=(fd,), start_new_session=True)
+if any(a.endswith("calibrate.py") for a in argv):   # only the sweep's gate; the base-model probe also runs gated
+    open(os.environ["SWEEP_PIDS"], "w").write("%d %d\n" % (os.getpid(), child.pid))
+while child.poll() is None and not stop:
+    time.sleep(0.05)
+if stop:
+    os.killpg(child.pid, signal.SIGTERM)
+    end = time.time() + 5          # the real gate's grace is 30 s; 5 s keeps the test short
+    while child.poll() is None and time.time() < end:
+        time.sleep(0.05)
+    if child.poll() is None:
+        os.killpg(child.pid, signal.SIGKILL); child.wait()
+    sys.exit(143)
+sys.exit(child.returncode)
+'''
+
+# calibrate.py stand-in: long sleep when STUB_CAL_SLEEP is set (the sweep a stop interrupts), else a finished sweep line
+CALIBRATE_STUB = ("import os, time\n"
+                  "if os.environ.get('STUB_CAL_SLEEP'): time.sleep(float(os.environ['STUB_CAL_SLEEP']))\n"
+                  "print('sweep: 2 settings')\n")
+
+# python3 wrapper put first on PATH: when nightly.sh parses the sweep request (`python3 - data/sweep-request.json`) it marks
+# the moment and holds, so the test can deliver TERM during parsing, before the launch.
+PARSE_HOOK = """#!/bin/bash
+if [ "$1" = - ] && [ "${2:-}" = data/sweep-request.json ] && [ -n "${STUB_PARSE_MARK:-}" ]; then
+  touch "$STUB_PARSE_MARK"; /bin/sleep 2
+fi
+exec "$SWEEP_REAL_PY" "$@"
+"""
+
+
+def _alive(pid: int) -> bool:
+    """True while pid exists and is not a zombie (ps shows Z for those)."""
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return out.returncode == 0 and "Z" not in out.stdout
+
+
+class NightlySweepStop(unittest.TestCase):
+    setUp = NightlyEndToEnd.setUp
+
+    def _prepare(self, **env):
+        real_py = shutil.which("python3")
+        self.assertIsNotNone(real_py)
+        _exe(self.tmp / "sweep-py", SWEEP_GATE)
+        (self.s1 / "calibrate.py").write_text(CALIBRATE_STUB)
+        _exe(Path(self.env["HOME"]) / ".local/bin/python3", PARSE_HOOK)
+        (self.s1 / "data/sweep-request.json").write_text(json.dumps(
+            {"candidate": "runs/c/adapter", "live": "runs/l/adapter", "tilts": [0], "alphas": [1.0]}))
+        self.lock = self.tmp / "train.lock"; self.pids = self.tmp / "gate-pids"
+        self.run = "runs/2026-01-01"
+        return {**self.env, "CORTADOS_S1_PY": str(self.tmp / "sweep-py"), "SWEEP_REAL_PY": real_py,
+                "SWEEP_LOCK": str(self.lock), "SWEEP_PIDS": str(self.pids), "CORTADOS_S1_RUN": self.run,
+                "CORTADOS_S1_NOW": "0300", "CORTADOS_S1_NIGHT_DATE": "2026-01-02",
+                "CORTADOS_S1_SWEEP_STOP_WAIT_S": "10", **{k: str(v) for k, v in env.items()}}
+
+    def _start(self, env):
+        proc = subprocess.Popen(["/bin/bash", str(self.s1 / "nightly.sh")], cwd=self.tmp, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def reap():   # bounded teardown: never leave the shell or a stub gate/child running after a failure
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL); proc.wait(5)
+            if self.pids.exists():
+                gate, child = map(int, self.pids.read_text().split())
+                for kill, target in ((os.kill, gate), (os.killpg, child)):   # the child leads its own group
+                    try:
+                        kill(target, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass      # already gone: the expected case when the test passed
+        self.addCleanup(reap)
+        return proc
+
+    def _wait_for(self, cond, timeout=30):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return
+            time.sleep(0.05)
+        self.fail("timed out waiting; log:\n" + self._log())
+
+    def _log(self):
+        p = self.s1 / self.run / "nightly.log"
+        return p.read_text() if p.exists() else "<no log>"
+
+    def test_term_during_sweep_stops_gate_and_child_and_frees_the_lock(self):
+        env = self._prepare(STUB_CAL_SLEEP=300)
+        proc = self._start(env)
+        self._wait_for(lambda: self.pids.exists() and len(self.pids.read_text().split()) == 2)
+        gate, child = map(int, self.pids.read_text().split())
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(30)
+        for pid in (gate, child):
+            self.assertFalse(_alive(pid), "pid %d survived nightly.sh; log:\n%s" % (pid, self._log()))
+        fd = os.open(self.lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises BlockingIOError if anything still holds the lock
+        finally:
+            os.close(fd)
+        self.assertTrue((self.s1 / "data/sweep-request.json").exists())
+        self.assertIn("SWEEP INTERRUPTED", self._log())
+
+    def test_term_during_request_parsing_never_starts_the_sweep(self):
+        mark = self.tmp / "parsing"
+        env = self._prepare(STUB_CAL_SLEEP=300, STUB_PARSE_MARK=mark)
+        proc = self._start(env)
+        self._wait_for(mark.exists)
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(30)
+        self.assertFalse(self.pids.exists(), "the gate started after a stop; log:\n" + self._log())
+        self.assertTrue((self.s1 / "data/sweep-request.json").exists())
+        self.assertIn("SWEEP NOT STARTED", self._log())
+
+    def test_finished_sweep_renames_the_request(self):
+        proc = self._start(self._prepare())
+        proc.wait(30)
+        self.assertFalse((self.s1 / "data/sweep-request.json").exists(), self._log())
+        self.assertEqual(len(list((self.s1 / "data").glob("sweep-request.done-*.json"))), 1)
+        self.assertIn("sweep: 2 settings", self._log())
 
 
 if __name__ == "__main__":
