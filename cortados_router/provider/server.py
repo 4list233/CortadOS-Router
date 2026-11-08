@@ -1883,8 +1883,8 @@ class Handler(BaseHTTPRequestHandler):
                 _turn_ms = int((time.time() - _turn_t0) * 1000)
                 _remember_reply(session, turn, msg_id, model, outcome["turn"])
                 # Compaction content store (shadow, off unless CORTADOS_COMPACTION_STORE=1): the one point where the
-                # turn's new user content / tool results and the backend's reply are both known. It only reads them;
-                # record_turn never raises (failures are counted in compaction_store.STORE.write_failures).
+                # turn's new user content / tool results and the backend's reply are both known. It only reads them
+                # and enqueues for the store's background writer; it never raises or blocks (failures are counted).
                 self._compaction_record(session, turn, outcome["turn"][0], wire)
                 try:
                     _ledger_turn(session, outcome["turn"][2])
@@ -2082,20 +2082,21 @@ class Handler(BaseHTTPRequestHandler):
         return "\n".join(parts) or None
 
     def _compaction_record(self, session, turn, blocks, w: Wire) -> None:
-        if not compaction_store.enabled():
-            return
+        """Hand the turn to the compaction store (shadow). Only enqueues for its background writer; every failure is
+        contained here, so turn finalization (history, ledger, route log) always runs after it."""
         try:
+            if not compaction_store.enabled():
+                return
             rid, rid_ok = self._run_id()
             meta = {"run_id": rid if rid_ok else None,
                     "session": (self.headers.get("x-cortados-session") or "").strip()[:200] or None,
                     "client": self._client()}
-        except Exception as exc:   # metadata is optional; the content record still goes in
-            logger.warning("compaction store: turn metadata unreadable (%s)", type(exc).__name__)
-            meta = {}
-        compaction_store.STORE.record_turn(
-            str(session.id), source="codex" if w is RESPONSES else "claude-code",
-            user_content=turn.content, tool_results=turn.tool_results, assistant_blocks=blocks,
-            meta=meta)
+            compaction_store.STORE.record_turn(
+                str(session.id), source="codex" if w is RESPONSES else "claude-code",
+                user_content=turn.content, tool_results=turn.tool_results, assistant_blocks=blocks, meta=meta)
+        except Exception as exc:   # never interrupts the turn; counted like any store scheduling failure
+            compaction_store.STORE._count("schedule_failures",
+                                          f"turn not handed to the store: {type(exc).__name__}: {exc}")
 
     def _run_id(self) -> tuple[str | None, bool]:
         """The x-cortados-run-id header: (id or None when absent/empty, valid)."""

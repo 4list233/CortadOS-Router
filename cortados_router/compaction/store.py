@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import stat
 import threading
@@ -121,33 +122,102 @@ def session_path(conversation_id: str) -> Path:
 
 
 # ------------------------------------------------------------------ safe file primitives (shared with prune.py)
+#
+# Every file operation is anchored to directory fds opened one component at a time from $CORTADOS_HOME down, each with
+# O_NOFOLLOW + O_DIRECTORY and an fstat check, so a symlinked `compaction/` or `sessions/` (or a symlinked home) can
+# never redirect a write, a read or a deletion outside the store. Files are opened relative to those fds with
+# O_NOFOLLOW | O_NONBLOCK (a FIFO planted at a session path cannot block the open) and refused unless fstat says
+# they are regular files.
 
-def ensure_dir(path: Path) -> None:
-    """Create `path` (and parents) 0700; refuse it if it is a symlink or not a directory."""
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise OSError(f"{path} is not a plain directory (symlink or file); refusing to write there")
-    if stat.S_IMODE(st.st_mode) != 0o700:
-        os.chmod(path, 0o700)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
-def append_line(path: Path, line: str) -> None:
-    """Append one line to `path`, created 0600, never through a symlink (O_NOFOLLOW raises ELOOP on one)."""
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags, 0o600)
+def _home() -> str:
+    return getenv("CORTADOS_HOME") or os.path.expanduser("~/.cortados")
+
+
+def _open_dir(name: str, parent_fd: Optional[int], *, create: bool, own: bool) -> int:
+    """Open one directory component without following a symlink; `own` dirs (ours) are created and forced 0700."""
+    if create:
+        try:
+            if parent_fd is None:
+                os.mkdir(name, 0o700)
+            else:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    fd = os.open(name, _DIR_FLAGS) if parent_fd is None else os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{name} is not a directory; refusing it")
+        if own and stat.S_IMODE(st.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def open_store_dir(*parts: str, create: bool) -> int:
+    """An fd on $CORTADOS_HOME/<parts...>, every component opened with O_NOFOLLOW (a symlinked home, compaction/ or
+    sessions/ raises OSError). Raises FileNotFoundError when absent and not `create`. The caller closes it."""
+    home = _home()
+    if create:
+        os.makedirs(os.path.dirname(os.path.abspath(home)), exist_ok=True)
+    fd = _open_dir(os.path.abspath(home), None, create=create, own=False)
+    try:
+        for p in parts:
+            nfd = _open_dir(p, fd, create=create, own=True)
+            os.close(fd)
+            fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_file(name: str, dir_fd: int, flags: int, mode: int = 0o600) -> int:
+    fd = os.open(name, flags | _FILE_FLAGS, mode, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"{path} is not a regular file; refusing to write")
-        if stat.S_IMODE(st.st_mode) != 0o600:
+            raise OSError(f"{name} is not a regular file; refusing it")
+        if (flags & os.O_CREAT) and stat.S_IMODE(st.st_mode) != 0o600:
             os.fchmod(fd, 0o600)
-        data = line.encode("utf-8")
-        while data:
-            n = os.write(fd, data)
-            data = data[n:]
-    finally:
+        if flags & (os.O_WRONLY | os.O_RDWR) == 0:
+            os.set_blocking(fd, True)
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def append_in(parts: tuple, name: str, data: str) -> None:
+    """Append `data` to $CORTADOS_HOME/<parts>/<name> (0600), never through a symlink, a FIFO or a non-file."""
+    dfd = open_store_dir(*parts, create=True)
+    try:
+        fd = _open_file(name, dfd, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        try:
+            buf = data.encode("utf-8")
+            while buf:
+                n = os.write(fd, buf)
+                buf = buf[n:]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+def read_in(parts: tuple, name: str) -> str:
+    dfd = open_store_dir(*parts, create=False)
+    try:
+        fd = _open_file(name, dfd, os.O_RDONLY)
+    finally:
+        os.close(dfd)
+    with os.fdopen(fd, encoding="utf-8") as f:
+        return f.read()
 
 
 # ------------------------------------------------------------------ content extraction
@@ -174,18 +244,26 @@ def _result_record(tool_use_id: str, result: dict[str, Any], cap: int) -> dict[s
 
 
 def cap_input(inp: Any, cap: int) -> tuple[dict[str, Any], int, bool]:
-    """(stored input, original JSON length, truncated). Over the cap, every value is cut to an equal share of it
-    (non-strings as their JSON text), so the dict keeps its keys and a giant Write content cannot bypass the cap."""
+    """(stored input, original JSON length, truncated). The cap holds on the FINAL serialized form: an input whose
+    JSON fits is kept as is; over it, every value is cut to an equal share and the result re-measured; if it still
+    does not fit (huge keys, deep structure), the input is stored as {"_truncated_json": <head of its JSON>} with the
+    head shrunk until that dict's own JSON fits. A giant Write content can never bypass the cap."""
     inp = inp if isinstance(inp, dict) else {}
     raw = json.dumps(inp, ensure_ascii=False, default=str)
     if len(raw) <= cap:
         return inp, len(raw), False
-    share = max(1, cap // max(1, len(inp)))
+    share = max(1, cap // max(1, 2 * len(inp)))
     out = {}
     for k, v in inp.items():
         text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
         out[k] = text[:share] if len(text) > share else v
-    return out, len(raw), True
+    if len(json.dumps(out, ensure_ascii=False, default=str)) <= cap:
+        return out, len(raw), True
+    head = raw[:cap]
+    while head and len(json.dumps({"_truncated_json": head}, ensure_ascii=False)) > cap:
+        over = len(json.dumps({"_truncated_json": head}, ensure_ascii=False)) - cap
+        head = head[:len(head) - max(1, over)]
+    return {"_truncated_json": head}, len(raw), True
 
 
 def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any] | None,
@@ -215,108 +293,172 @@ def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any]
 
 # ------------------------------------------------------------------ the store
 
+# Why 1024: the writer drains a turn in well under a millisecond, so 1024 queued turns only happen when the disk is
+# stuck; past that, records are dropped and counted rather than holding memory or ever blocking a request.
+QUEUE_MAX = 1024
+
+
 class Store:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.write_failures = 0                  # exposed: a failing store is visible, never silent
+    """All store I/O (session appends, shadow decisions, retention) runs on ONE background writer thread fed by a
+    bounded queue, so it is serialized (retention can never race a write) and the request path only enqueues. Every
+    failure (I/O, a full queue, a thread that cannot start) is logged with its reason and counted, never raised:
+    this is the one place a failure must not propagate, because the user's request has already been answered by the
+    backend and a local logging store must never turn that into an error or stall turn finalization."""
+
+    def __init__(self, queue_max: int = QUEUE_MAX):
+        self._lock = threading.Lock()           # guards counters, throttle state and the thread handle only
+        self._q: "queue.Queue" = queue.Queue(maxsize=queue_max)
+        self._thread: Optional[threading.Thread] = None
+        self.write_failures = 0                 # I/O or job failures inside the writer
+        self.dropped = 0                        # jobs refused because the queue was full
+        self.schedule_failures = 0              # the writer thread could not be started
         self.last_failure: Optional[str] = None
         self._last_prune = 0.0
-        self._prune_running = False
 
-    def record_turn(self, conversation_id: str, **kw) -> bool:
-        """Append one turn. Returns True when written. A failure is logged with its reason and counted, and NOT
-        raised: this is the one place a failure must not propagate, because the user's request has already been
-        answered by the backend and a local logging store must never turn that into an error."""
-        if not enabled():
-            return False
-        try:
-            lines = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in turn_records(**kw))
-            with self._lock:
-                ensure_dir(root())
-                ensure_dir(sessions_dir())
-                append_line(session_path(conversation_id), lines)
-            return True
-        except Exception as exc:  # deliberately broad: see the docstring
-            with self._lock:
-                self.write_failures += 1
-                self.last_failure = f"{type(exc).__name__}: {exc}"
-            logger.warning("compaction store: turn of conversation %s not recorded (%s); %d failure(s) so far",
-                           str(conversation_id)[:8], self.last_failure, self.write_failures)
-            return False
-        finally:
-            self.maybe_prune_async()
+    # -- counters
+    def _count(self, attr: str, why: str) -> None:
+        with self._lock:
+            setattr(self, attr, getattr(self, attr) + 1)
+            self.last_failure = why
+            n = getattr(self, attr)
+        logger.warning("compaction store: %s (%s total: %d)", why, attr, n)
 
     def stats(self) -> dict[str, Any]:
-        return {"enabled": enabled(), "write_failures": self.write_failures, "last_failure": self.last_failure}
+        return {"enabled": enabled(), "write_failures": self.write_failures, "dropped": self.dropped,
+                "schedule_failures": self.schedule_failures, "last_failure": self.last_failure,
+                "queued": self._q.qsize()}
 
-    def maybe_prune_async(self, now: float | None = None) -> bool:
-        """Start a background prune when the last one is over PRUNE_INTERVAL_S old; never blocks the caller."""
+    # -- the writer
+    def _ensure_writer(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            t = threading.Thread(target=self._run, daemon=True, name="cortados-compaction-writer")
+            t.start()
+            self._thread = t
+
+    def _run(self) -> None:
+        while True:
+            name, job = self._q.get()
+            try:
+                job()
+            except Exception as exc:  # deliberately broad: see the class docstring
+                self._count("write_failures", f"{name} failed: {type(exc).__name__}: {exc}")
+            finally:
+                self._q.task_done()
+
+    def submit(self, name: str, job) -> bool:
+        """Queue `job` for the writer; never blocks and never raises. False when it was not queued."""
+        try:
+            self._ensure_writer()
+            self._q.put_nowait((name, job))
+            return True
+        except queue.Full:
+            self._count("dropped", f"{name} dropped: writer queue full ({self._q.maxsize})")
+        except Exception as exc:  # thread start failure and anything else: contained, counted
+            self._count("schedule_failures", f"{name} not scheduled: {type(exc).__name__}: {exc}")
+        return False
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until the queue is drained (tests, shutdown). True when drained."""
+        deadline = time.time() + timeout
+        while self._q.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.005)
+        return not self._q.unfinished_tasks
+
+    # -- jobs
+    def record_turn(self, conversation_id: str, **kw) -> bool:
+        """Queue one turn for the writer. Returns True when queued; building and writing the records happen on the
+        writer thread, off the request path."""
         if not enabled():
             return False
-        now = time.time() if now is None else now
-        with self._lock:
-            if self._prune_running or now - self._last_prune < PRUNE_INTERVAL_S:
+        cid = str(conversation_id)
+
+        def job():
+            lines = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in turn_records(**kw))
+            append_in(("compaction", "sessions"), session_file_name(cid), lines)
+
+        ok = self.submit(f"turn of conversation {cid[:8]}", job)
+        self.maybe_prune_async()
+        return ok
+
+    def maybe_prune_async(self, now: float | None = None) -> bool:
+        """Queue a retention pass when the last one is over PRUNE_INTERVAL_S old; never blocks, never raises. The
+        throttle is reset when the pass could not be queued, so the next call retries."""
+        try:
+            if not enabled():
                 return False
-            self._prune_running, self._last_prune = True, now
-
-        def run():
+            now = time.time() if now is None else now
+            with self._lock:
+                if now - self._last_prune < PRUNE_INTERVAL_S:
+                    return False
+                prev, self._last_prune = self._last_prune, now
+            queued = False
             try:
-                prune_expired(now)
-            except Exception:
-                logger.exception("compaction store: prune failed")
+                queued = self.submit("retention", lambda: prune_expired(now))
             finally:
-                with self._lock:
-                    self._prune_running = False
-
-        threading.Thread(target=run, daemon=True, name="cortados-compaction-prune").start()
-        return True
+                if not queued:
+                    with self._lock:
+                        self._last_prune = prev
+            return queued
+        except Exception as exc:  # contained like every scheduling failure
+            self._count("schedule_failures", f"retention not scheduled: {type(exc).__name__}: {exc}")
+            return False
 
 
 def prune_expired(now: float | None = None) -> list[str]:
     """Delete session files older than the retention, then the oldest until the total fits the size cap. Returns
-    the deleted file names. Only plain files ending in .jsonl directly under sessions/ are touched."""
+    the deleted file names. Runs on the writer thread (serialized with appends). Everything is relative to a dir fd
+    opened through verified, non-symlink components; only regular *.jsonl files are touched, and each candidate is
+    re-stat'ed just before unlinking (same inode, still past its criterion) so a changed file is left alone."""
     now = time.time() if now is None else now
-    d = sessions_dir()
     try:
-        st = os.lstat(d)
+        dfd = open_store_dir("compaction", "sessions", create=False)
     except FileNotFoundError:
         return []
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        logger.warning("compaction store: %s is not a plain directory; not pruning", d)
-        return []
-    files = []
-    for entry in os.scandir(d):
-        if not entry.name.endswith(".jsonl"):
-            continue
-        est = entry.stat(follow_symlinks=False)
-        if stat.S_ISREG(est.st_mode):
-            files.append((est.st_mtime, est.st_size, entry.name))
-    files.sort()
-    removed: list[str] = []
-    cutoff = now - retention_days() * 86400
-    keep = []
-    for mtime, size, name in files:
-        if mtime < cutoff:
-            _unlink(d / name, removed)
-        else:
-            keep.append((mtime, size, name))
-    total, cap = sum(s for _, s, _ in keep), max_bytes()
-    for mtime, size, name in keep:
-        if total <= cap:
-            break
-        _unlink(d / name, removed)
-        total -= size
+    try:
+        files = []
+        for name in os.listdir(dfd):
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                est = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(est.st_mode):
+                files.append((est.st_mtime, est.st_size, name, est.st_ino))
+        files.sort()
+        removed: list[str] = []
+        cutoff = now - retention_days() * 86400
+        keep = []
+        for mtime, size, name, ino in files:
+            if mtime < cutoff:
+                _unlink_if(dfd, name, ino, lambda st: st.st_mtime < cutoff, removed)
+            else:
+                keep.append((mtime, size, name, ino))
+        total, cap = sum(k[1] for k in keep), max_bytes()
+        for mtime, size, name, ino in keep:
+            if total <= cap:
+                break
+            if _unlink_if(dfd, name, ino, lambda st, m=mtime: st.st_mtime <= m, removed):
+                total -= size
+    finally:
+        os.close(dfd)
     if removed:
         logger.info("compaction store: pruned %d session file(s)", len(removed))
     return removed
 
 
-def _unlink(path: Path, removed: list[str]) -> None:
+def _unlink_if(dfd: int, name: str, ino: int, still, removed: list[str]) -> bool:
     try:
-        os.unlink(path)
-        removed.append(path.name)
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_ino != ino or not still(st):
+            return False
+        os.unlink(name, dir_fd=dfd)
+        removed.append(name)
+        return True
     except FileNotFoundError:
-        pass
+        return False
 
 
 def read_session(path: str | os.PathLike) -> Session:
@@ -330,34 +472,46 @@ def read_session(path: str | os.PathLike) -> Session:
     by_id: dict[str, dict[str, Any]] = {}
     turn_ts: Optional[str] = None
     source: Optional[str] = None
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except ValueError:
-                logger.warning("compaction store: unreadable line in %s skipped", p.name)
-                continue
-            kind = r.get("kind")
-            if kind == "turn":
-                turn_ts = r.get("ts")
-                source = source or r.get("source")
-            elif kind == "message":
-                messages.append({"role": r.get("role", ""), "text": r.get("text", ""), "ts": turn_ts, "events": []})
-            elif kind == "tool_call":
-                mi = next((i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"), 0)
-                c = {"name": r.get("name", ""), "input": r.get("input") or {}, "message_index": mi, "ts": turn_ts,
-                     "result": None, "index": len(calls)}
-                calls.append(c)
-                by_id[r.get("tool_use_id", "")] = c
-                if messages:
-                    messages[mi]["events"].append(c["index"])
-            elif kind == "tool_result":
-                c = by_id.get(r.get("tool_use_id", ""))
-                if c is not None:
-                    c["result"] = r
+    if p.parent == sessions_dir():
+        text = read_in(("compaction", "sessions"), p.name)       # anchored to verified dir fds
+    else:                                                         # an explicit path elsewhere: still no symlink/FIFO
+        fd = os.open(p, os.O_RDONLY | _FILE_FLAGS)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"{p} is not a regular file; refusing it")
+            os.set_blocking(fd, True)
+        except BaseException:
+            os.close(fd)
+            raise
+        with os.fdopen(fd, encoding="utf-8") as f:
+            text = f.read()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            logger.warning("compaction store: unreadable line in %s skipped", p.name)
+            continue
+        kind = r.get("kind")
+        if kind == "turn":
+            turn_ts = r.get("ts")
+            source = source or r.get("source")
+        elif kind == "message":
+            messages.append({"role": r.get("role", ""), "text": r.get("text", ""), "ts": turn_ts, "events": []})
+        elif kind == "tool_call":
+            mi = next((i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"), 0)
+            c = {"name": r.get("name", ""), "input": r.get("input") or {}, "message_index": mi, "ts": turn_ts,
+                 "result": None, "index": len(calls)}
+            calls.append(c)
+            by_id[r.get("tool_use_id", "")] = c
+            if messages:
+                messages[mi]["events"].append(c["index"])
+        elif kind == "tool_result":
+            c = by_id.get(r.get("tool_use_id", ""))
+            if c is not None:
+                c["result"] = r
     msgs = tuple(Message(session=sid, index=i, role=m["role"], text=m["text"],
                          tool_event_indexes=tuple(m["events"]), ts=m["ts"]) for i, m in enumerate(messages))
     events = tuple(ToolEvent(session=sid, index=c["index"], message_index=c["message_index"], name=c["name"],

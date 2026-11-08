@@ -23,7 +23,6 @@ import json
 import logging
 import math
 import re
-import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -172,26 +171,28 @@ def shadow_decide(session_path, *, now: Optional[float] = None) -> list[KeepDeci
                                 "saved_tokens_est": math.ceil(saved / cpt), "mode": "shadow", "gate": g}) + "\n"
                     for d, saved in pairs)
     if lines:
-        store.ensure_dir(store.root())
-        store.append_line(decisions_path(), lines)
+        store.append_in(("compaction",), "decisions.jsonl", lines)
     return [d for d, _ in pairs]
 
 
-def shadow_decide_async(conversation_id: str) -> Optional[threading.Thread]:
-    """Run shadow_decide for a closed conversation in a background thread, off the request path. No-op when the
-    store is off or the conversation left no file. A failure is logged, never raised into the caller."""
-    if not store.enabled():
-        return None
-    path = store.session_path(conversation_id)
-    if not path.exists():
-        return None
+def shadow_decide_async(conversation_id: str) -> bool:
+    """Queue shadow_decide for a closed conversation on the store's single writer thread (serialized with writes and
+    retention, off the request path). Never raises and never blocks: called from Registry cleanup, which must always
+    finish. No-op when the store is off; a conversation that left no file is skipped on the writer."""
+    try:
+        if not store.enabled():
+            return False
+        name = store.session_file_name(str(conversation_id))
 
-    def run():
-        try:
-            shadow_decide(path)
-        except Exception as exc:   # background shadow work: report it, never break the provider
-            logger.warning("compaction shadow decisions for %s failed: %s: %s", path.name, type(exc).__name__, exc)
+        def job():
+            path = store.sessions_dir() / name
+            try:
+                shadow_decide(path)
+            except FileNotFoundError:
+                return                      # the conversation recorded nothing (or retention removed it)
 
-    th = threading.Thread(target=run, daemon=True, name="cortados-compaction-shadow")
-    th.start()
-    return th
+        return store.STORE.submit(f"shadow decisions for {name}", job)
+    except Exception as exc:   # contained: Registry cleanup must not be interrupted
+        logger.warning("compaction shadow decisions for %s not scheduled: %s: %s",
+                       str(conversation_id)[:8], type(exc).__name__, exc)
+        return False
