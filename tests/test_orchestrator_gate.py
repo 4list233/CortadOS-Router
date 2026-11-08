@@ -43,35 +43,42 @@ class GateTests(unittest.TestCase):
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
 
-    def test_fork_denied_in_main_loop_without_budget(self):
+    def test_agent_and_task_denied_in_main_loop_without_spending_budget(self):
+        """The owner's rule: the top-level session never delegates with the Agent tool. Denied whatever the
+        subagent type or input shape, with a reason that names start_task and the no-router fallback."""
         for tool in ("Agent", "Task"):
-            for kind in ("fork", " Fork ", "FORK", "f_ork", "f-ork", "f ork", "F.o.r.k", "f2ork"):
-                out, err = self.call(dict(self.event, tool_name=tool,
-                                          tool_input={"subagent_type": kind, "prompt": "x"}))
+            for tool_input in ({"subagent_type": "general-purpose", "prompt": "x"}, {"subagent_type": "fork"},
+                               {"prompt": "x"}, "not a dict", None):
+                out, err = self.call(dict(self.event, tool_name=tool, tool_input=tool_input),
+                                     {"CORTADOS_DELEGATE_BUDGET": "3"})
                 self.assertEqual(err, "")
                 self.assertEqual(json.loads(out), {"hookSpecificOutput": {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                    "permissionDecisionReason": gate.FORK_DENY_REASON}})
+                    "permissionDecisionReason": gate.AGENT_DENY_REASON}})
+        self.assertIn("mcp__cortados-route__start_task", gate.AGENT_DENY_REASON)
+        self.assertIn("tell the owner in one line and do the work directly", gate.AGENT_DENY_REASON)
+        self.assertFalse(self.directory.exists(), "a refused Agent call spends no budget")
+        self.assertEqual(self.call(), ("", ""), "the budget is intact after the refusals")
+
+    def test_agent_allowed_inside_subagent(self):
+        for tool_input in ({"subagent_type": "fork"}, {"subagent_type": "general-purpose"}):
+            self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input, agent_id="child"),
+                                       {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
 
-    def test_non_ascii_agent_type_denied_without_budget(self):
-        for kind in ("f\u2014ork", "f\u2e5dork", "\U0001CCDBork", "\uff46\uff4f\uff52\uff4b", "g\u00e9n\u00e9ral"):
-            for tool in ("Agent", "Task"):
-                out, err = self.call(dict(self.event, tool_name=tool, tool_input={"subagent_type": kind}),
-                                     {"CORTADOS_DELEGATE_BUDGET": "0"})
-                self.assertEqual(err, "")
-                self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"],
-                                 gate.NON_ASCII_DENY_REASON)
-        self.assertFalse(self.directory.exists())
-
-    def test_fork_allowed_inside_subagent_and_other_agents_unbudgeted(self):
-        fork = dict(self.event, tool_name="Agent", tool_input={"subagent_type": "fork"})
-        self.assertEqual(self.call(dict(fork, agent_id="child")), ("", ""))
-        for tool_input in ({"subagent_type": "general-purpose"}, {"subagent_type": "forked"}, {"prompt": "x"}, "not a dict", None):
+    def test_cortados_route_tools_unlimited_and_exact_prefix(self):
+        for tool in ("mcp__cortados-route__start_task", "mcp__cortados-route__route_task",
+                     "mcp__cortados-route__wait_task", "mcp__cortados-route__task_status",
+                     "mcp__cortados-route__list_tasks", "mcp__cortados-route__cancel_task"):
             for _ in range(5):
-                self.assertEqual(self.call(dict(self.event, tool_name="Agent", tool_input=tool_input),
+                self.assertEqual(self.call(dict(self.event, tool_name=tool),
                                            {"CORTADOS_DELEGATE_BUDGET": "0"}), ("", ""))
         self.assertFalse(self.directory.exists())
+        # Another server's start_task (a workspace connector) is ordinary work and spends the budget.
+        for tool in ("mcp__velox-workspace__start_task", "mcp__cortados-routex__start_task", "mcp__cortados__route_task"):
+            out, err = self.call(dict(self.event, tool_name=tool), {"CORTADOS_DELEGATE_BUDGET": "0"})
+            self.assertEqual(err, "")
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny", tool)
 
     def test_budget_then_exact_deny(self):
         for _ in range(3):
@@ -80,8 +87,11 @@ class GateTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(json.loads(out), {"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": "orchestrator: you have used your 3 direct work calls for this prompt; "
-            "delegate this to a subagent with the Agent tool (subagents have every tool, MCP included)"}})
+            "permissionDecisionReason": gate.budget_deny_reason(3)}})
+        reason = gate.budget_deny_reason(3)
+        self.assertIn("used your 3 direct work calls", reason)
+        self.assertIn("mcp__cortados-route__start_task", reason)
+        self.assertNotIn("Agent tool", reason)
         self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
         path = gate.state_path(self.directory, "session")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)

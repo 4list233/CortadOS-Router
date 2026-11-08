@@ -37,7 +37,7 @@ test('a big main-session Edit warns and still runs unchanged', async ($, on) => 
   expect(w.ran[0].new_string).toBe(BIG) // input passed through untouched
   expect(w.toasts.length).toBe(1)
   expect(w.toasts[0]).toMatch(/main session did a large edit; delegate/)
-  expect(w.statuses.at(-1)).toBe('main did 1 big edit; delegate to routed subagents')
+  expect(w.statuses.at(-1)).toBe('main did 1 big edit; delegate with start_task')
 })
 
 test('a small main-session Edit is silent', async ($, on) => {
@@ -66,7 +66,7 @@ test('a main-session build/test Bash warns and runs; plain Bash is silent', asyn
   expect(w.ran[1].command).toBe('cd repo && npm run build')
   expect(w.toasts.length).toBe(1)
   expect(w.toasts[0]).toMatch(/build\/test/)
-  expect(w.statuses.at(-1)).toBe('main did 1 build/test run; delegate to routed subagents')
+  expect(w.statuses.at(-1)).toBe('main did 1 build/test run; delegate with start_task')
 })
 
 test('toasts are throttled to one per interval; the counter still counts every call', async ($, on) => {
@@ -76,14 +76,14 @@ test('toasts are throttled to one per interval; the counter still counts every c
   await $.tool.call({ tool: 'Write', file_path: '/tmp/y', content: 'z'.repeat(2500) } as any)
   expect(w.ran.length).toBe(3)
   expect(w.toasts.length).toBe(1)
-  expect(w.statuses.at(-1)).toBe('main did 3 big edits; delegate to routed subagents')
+  expect(w.statuses.at(-1)).toBe('main did 3 big edits; delegate with start_task')
   await w.clock.advance(GUARD_TOAST_INTERVAL_MS - 1)
   await $.tool.call(edit(BIG))
   expect(w.toasts.length).toBe(1)
   await w.clock.advance(1)
   await $.tool.call({ tool: 'Bash', command: 'pytest -q' } as any)
   expect(w.toasts.length).toBe(2)
-  expect(w.statuses.at(-1)).toBe('main did 4 big edits, 1 build/test run; delegate to routed subagents')
+  expect(w.statuses.at(-1)).toBe('main did 4 big edits, 1 build/test run; delegate with start_task')
 })
 
 test('userConfig mainSessionGuard off silences the guard; the call still runs', { options: { mainSessionGuard: false } } as any, async ($: any, on: any) => {
@@ -320,7 +320,7 @@ test('while a routed subagent runs the guard leaves its status line alone, then 
   child.resolve({ exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'm' }), stderr: '', isStdoutTruncated: false })
   const out: any = await agent
   expect(out.result.status).toBe('completed')
-  expect(statuses.at(-1)).toBe('main did 1 big edit; delegate to routed subagents')
+  expect(statuses.at(-1)).toBe('main did 1 big edit; delegate with start_task')
 })
 
 // ---- Review r2 regressions: the routed-child count and the status restore ---------------------------------------
@@ -358,7 +358,7 @@ function routedWorld(statusFails: (text: string | undefined, n: number) => boole
 const tick = () => new Promise((r) => setTimeout(r, 0))
 const nativeMustNotRun = async () => { throw new Error('native must not run') }
 const okNext: any = async () => ({ result: {} })
-const COUNTER = (n: number) => `main did ${n} big edit${n === 1 ? '' : 's'}; delegate to routed subagents`
+const COUNTER = (n: number) => `main did ${n} big edit${n === 1 ? '' : 's'}; delegate with start_task`
 
 test('a startup status failure still launches the child, is reported once, and leaves no routed count behind', async () => {
   const h = handlersOf()

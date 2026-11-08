@@ -8,23 +8,37 @@ import stat
 import sys
 import tempfile
 import time
-import unicodedata
 
 PLANNING_TOOLS = frozenset((
-    "Agent", "Task", "TodoWrite", "Read", "Grep", "Glob", "ToolSearch", "Skill",
+    "TodoWrite", "Read", "Grep", "Glob", "ToolSearch", "Skill",
     "AskUserQuestion", "ExitPlanMode", "EnterPlanMode",
 ))
+# The delegation path of a top-level session is the cortados-route MCP server (owner rule, CORTADOS-ORCHESTRATOR.md):
+# its tools never spend the budget. The prefix carries the whole server name plus the `__` separator, so no other
+# server's tool (a workspace connector's own `start_task`) can ride it.
+DELEGATION_TOOL_PREFIX = "mcp__cortados-route__"
+# Agent and Task are the native subagent tools. On the main loop they are refused outright, whatever the budget: the
+# owner's rule names start_task / route_task as the only delegation path, and a routed Agent child dies with the
+# session's hooks (2026-11-08: six builders aborted with `$.process.run(claude) aborted`). A fork subagent is covered
+# by this too (it used to be refused separately: it inherits the pinned orchestrator model and history, skips S1 and
+# collides with the parent's backend conversation, 409).
+SUBAGENT_TOOLS = frozenset(("Agent", "Task"))
 PRUNE_AGE = 7 * 24 * 3600
-FORK_DENY_REASON = (
-    "orchestrator: do not use fork subagents in this mode. A fork inherits this orchestrator's model and "
-    "conversation history, so it is not routed by S1 and it collides with this session's backend conversation "
-    "(the session then fails with a 409). Spawn a fresh subagent instead (e.g. subagent_type \"general-purpose\") "
-    "with a self-contained prompt."
+AGENT_DENY_REASON = (
+    "orchestrator: the Agent tool is not the delegation path on this session (owner rule, CORTADOS-ORCHESTRATOR.md; "
+    "a routed Agent subagent dies with this session's hooks). Delegate with mcp__cortados-route__start_task (a "
+    "CortadOS child session with files, shell and tools on this machine) or mcp__cortados-route__route_task (a text "
+    "answer, no tools); if they are deferred, load them with ToolSearch first. If cortados-route is not connected, "
+    "tell the owner in one line and do the work directly."
 )
-NON_ASCII_DENY_REASON = (
-    "orchestrator: subagent_type must be plain ASCII in this mode (every agent type is), so the fork check cannot "
-    "be bypassed by Unicode look-alikes; use the agent type's exact ASCII name, e.g. \"general-purpose\"."
-)
+
+
+def budget_deny_reason(budget):
+    return (
+        f"orchestrator: you have used your {budget} direct work calls for this prompt; delegate this with "
+        "mcp__cortados-route__start_task (a CortadOS child session with every tool, MCP included) or "
+        "mcp__cortados-route__route_task (a text answer). If cortados-route is not connected, tell the owner in one line."
+    )
 
 
 def state_path(directory, session_id):
@@ -60,35 +74,24 @@ def private_file(path, flags):
     return fd
 
 
-def agent_type_key(name):
-    # Claude Code 2.1.316 resolves an agent type after NFKC, lowercasing, and removing whitespace, Unicode dashes and
-    # underscores, so "f_ork", "f-ork" or a full-width "ｆｏｒｋ" all mean fork. Python's Unicode tables are older than
-    # Claude Code's ICU, so no local copy of that rule can be trusted on non-ASCII input. Non-ASCII names therefore get
-    # None (the caller denies them: every real agent type is ASCII), and ASCII names keep only their letters, which can
-    # only map more names to "fork", never fewer.
-    if not name.isascii():
-        return None
-    return "".join(c for c in name.lower() if c.isalpha())
+def deny(reason):
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
+    }}
 
 
 def decide(event, env, directory=None):
+    # A subagent (the hook input carries agent_id) is never gated: it does its work directly, with every tool. A
+    # CortadOS child task is launched with --no-gate (child_tasks._prepare), so this hook is not even installed there.
     if "agent_id" in event:
         return None
     tool = event["tool_name"]
-    tool_input = event.get("tool_input")
-    subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
-    # Forks are denied outright, whatever the budget and without spending it: a fork inherits the pinned orchestrator
-    # model and its full history, so it skips S1, and the provider matches its requests to the parent's held backend
-    # conversation by history fingerprint, advances it, and the parent's next request then gets a 409 (seen live, e2e C5).
-    if tool in ("Agent", "Task") and isinstance(subagent_type, str):
-        key = agent_type_key(subagent_type)
-        if key is None or key == "fork":
-            return {"hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": FORK_DENY_REASON if key == "fork" else NON_ASCII_DENY_REASON,
-            }}
+    # Native subagents are refused on the main loop, whatever the budget and without spending it (see SUBAGENT_TOOLS).
+    if tool in SUBAGENT_TOOLS:
+        return deny(AGENT_DENY_REASON)
     allowed_mcp = {name.strip() for name in env.get("CORTADOS_DELEGATE_ALLOW_MCP", "").split(",")}
-    if tool in PLANNING_TOOLS or (tool.startswith("mcp__") and tool in allowed_mcp):
+    if (tool in PLANNING_TOOLS or tool.startswith(DELEGATION_TOOL_PREFIX)
+            or (tool.startswith("mcp__") and tool in allowed_mcp)):
         return None
     budget = int(env.get("CORTADOS_DELEGATE_BUDGET", "3"))
     if budget < 0:
@@ -121,14 +124,7 @@ def decide(event, env, directory=None):
             raise ValueError("invalid gate counter state")
         count = counts.get(prompt_id, 0)
         if count >= budget:
-            return {"hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    f"orchestrator: you have used your {budget} direct work calls for this prompt; "
-                    "delegate this to a subagent with the Agent tool "
-                    "(subagents have every tool, MCP included)"
-                ),
-            }}
+            return deny(budget_deny_reason(budget))
         counts[prompt_id] = count + 1
         fd, name = tempfile.mkstemp(prefix=".counter-", dir=str(directory))
         try:

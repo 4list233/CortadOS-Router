@@ -1,12 +1,22 @@
 # cortados-routed-subagents
 
-A Claude Code mod that routes **every subagent** your session spawns through the CortadOS provider, while the
-main session keeps its own direct model.
+A Claude Code mod that makes the main session a **CortadOS orchestrator** — it plans and delegates through the
+`cortados-route` MCP tools (`start_task` / `route_task`) and its own Agent-tool calls are refused — and routes every
+**other** subagent (one spawned below the main loop, or any subagent with orchestrator mode off) through the CortadOS
+provider, while the main session keeps its own direct model.
 
 ## What it does
 
-When the session calls the Agent tool to spawn a subagent, this mod intercepts the call and instead runs the
-subagent as a headless `claude` process **on this machine**, pointed at the CortadOS provider
+**Orchestrator mode** (default, see below): the main session gets a standing directive to delegate through
+`mcp__cortados-route__start_task` (a CortadOS child session on this machine, with tools) or `route_task` (a text
+answer), and a gate that refuses the main session's own Agent-tool calls with a message naming `start_task`. Reason:
+the owner's rule (`~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md`) names cortados-route as the only delegation path of
+the top-level session, and a routed Agent child dies with the session's hooks (2026-11-08: six builders aborted with
+`HooksError: $.process.run(claude) aborted`). Only the top-level session is gated: subagents (any call carrying an
+`agentId`) and CortadOS child tasks (which run with this plugin disabled) do their work directly.
+
+**Routing**: when a loop that is not gated calls the Agent tool to spawn a subagent, this mod intercepts the call and
+instead runs the subagent as a headless `claude` process **on this machine**, pointed at the CortadOS provider
 (`ANTHROPIC_BASE_URL`). From there:
 
 1. The provider scores the task with **S1** and routes it to the cheapest capable model in the pool.
@@ -48,32 +58,50 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 
 Runs under the Claude desktop app as well as the CLI: the child is started with `CLAUDE_CODE_ENTRYPOINT=cli` so it authenticates with the provider token rather than the host's claude.ai session.
 The child starts with an empty MCP config (built-in tools only); the parent's MCP servers are never exposed to the provider.
-| `orchestratorMode` | `true` | Direct the main session to plan and delegate (see **Orchestrator mode**). Guidance by default; keeps full tool access. |
-| `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted. |
-| `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,Agent,mcp__cortados-route__route_task,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. `Agent` and `route_task` (both delegation primitives) are always allowed regardless. |
-| `excludeBuilderOnReview` | `true` | When a delegated Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
+| `orchestratorMode` | `true` | Direct the main session to plan and delegate through `mcp__cortados-route__start_task` / `route_task`, and **refuse its own Agent-tool calls** (see **Orchestrator mode**). Guidance for every other tool: the brain keeps them. |
+| `orchestratorEnforce` | `false` | Also **hard-block** every tool outside `orchestratorAllowedTools` on the main loop (a strict brain that cannot act even if it tried). Off by default — the directive is trusted, and with cortados-route not connected the brain must be able to do the work itself. |
+| `orchestratorAllowedTools` | `Read,Grep,Glob,TodoWrite,AskUserQuestion,ExitPlanMode,Skill,ToolSearch` | Allowlist used **only when `orchestratorEnforce` is on**: the tools the brain may run itself; everything else is refused and must be delegated. The cortados-route tools (`mcp__cortados-route__*`) are always allowed regardless; `Agent` is always refused. |
+| `excludeBuilderOnReview` | `true` | When a routed Agent call is a review (see **Independent reviews**), send `x-cortados-exclude-model` to the provider with the **main session's own model** plus the models routed (non-review) subagents built with since the last review (up to 3), so that review is kept off them on every lane. |
 | `mainSessionGuard` | `true` | Warn-only nudge when the **main session** does substantive work itself (see **Main-session guard**). Never blocks. `/cortados-guard on\|off` overrides it. |
 | `officeView` | `true` | Feed the CortadOS **Office view** (`GET /v1/cortados/office`): each routed request carries `x-cortados-session` (sha256 of a per-install salt kept in the mod's store and the session id, cut to 16 hex; never the raw id), `x-cortados-project` (the project folder's name), `x-cortados-device` (`hostname -s`) and `x-cortados-task-title` (the Agent call's description, 80 printable ASCII chars at most); the main session POSTs `/v1/cortados/office/heartbeat` with its status and current tool **name** on session start/end, turn end and tool calls (on change at most every 2 s, else every 30 s; serialized and coalesced with a trailing send; tool hooks never wait, session end flushes and awaits `ended`; a slow fetch is noted after 2 s but retains the send lock until it settles because the host HTTP API cannot cancel requests; a failure is noted once in the transcript). Metadata only: never prompt text, tool input or file contents. Takes effect after a Claude Code restart. |
 
 ## Orchestrator mode
 
-With `orchestratorMode` on (the default), the main session is directed to act as a **planning brain**: whatever
-top-tier model you run it on (e.g. `--model fable`) plans and decides, and substantive work is delegated to routed
-subagents. This is **guidance, not a cage** by default:
+With `orchestratorMode` on (the default), the main session is directed to act as the **planning brain** of the
+CortadOS router: whatever top-tier model you run it on (e.g. `--model fable`) plans and decides, and substantive work
+is delegated through the `cortados-route` MCP server. Three parts:
 
-- A standing **directive** is injected into the system prompt telling the model to decompose each request and
-  delegate via the Agent tool (or a text subtask via `route_task`), delegating by default for anything substantive —
-  but allowing it to act directly when delegating would clearly be wasteful (a trivial edit, its own bookkeeping, a
-  quick check). The brain keeps its full tool set; the directive is trusted to keep work flowing to the pool.
-- **Hard enforcement is opt-in.** Set `orchestratorEnforce: true` to additionally refuse, on the main loop, every
-  tool not in `orchestratorAllowedTools` — so a brain that forgets or hallucinates still cannot do the work itself.
-  An allowlist is used (not a denylist) precisely because a denylist would miss mutating tools like `Monitor`,
-  `memory_write`, or `ExitWorktree`; `Agent` and `route_task` are always allowed so delegation is never locked out.
-  Subagents are never gated — they run the full toolset (and are themselves routed).
+- A standing **directive** is injected into the system prompt (the same text as `integrations/orchestrator-directive.md`
+  minus its gate paragraph): decompose each request and delegate with `mcp__cortados-route__start_task` (a whole task
+  in a CortadOS child session on this machine: files, shell, connectors, MCP, Chrome on request) or
+  `mcp__cortados-route__route_task` (a text answer, no tools); load the `mcp__cortados-route__*` tools with ToolSearch
+  first if they are deferred; never delegate with the Agent tool; write every task to stand alone (goal, context,
+  scope and difficulty, outward effects, acceptance check, working folder); verify results before reporting. Act
+  directly only when the step is trivial, needs something only this session has, or delegating would clearly cost
+  more — and **if cortados-route is not connected, say so in one line and do the work directly**. **Precedence:** the
+  owner's `~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md` outranks the directive, and any conflicting instruction is
+  reported to the owner, never resolved silently. The directive is for the top-level session only.
+- The **Agent gate**: in orchestrator mode the main loop's Agent-tool calls are refused — before any routing or
+  pass-through, whatever the subagent type — with a message naming `mcp__cortados-route__start_task` /
+  `route_task` and the fallback above (tell the owner in one line, do the work directly). Reason: the owner's rule, and
+  the 2026-11-08 incident where six Agent-tool builders aborted with `HooksError: $.process.run(claude) aborted`. This
+  applies even with `orchestratorEnforce` off. It never applies to a call carrying an `agentId` (a subagent, teammate
+  or engine fork: those Agent calls are routed as before) nor to a CortadOS child task (it runs with this plugin
+  disabled via its settings file, and its directive says to do the work itself).
+- **Hard enforcement is opt-in.** Every tool other than Agent is **guidance, not a cage** by default: the brain keeps
+  Bash, edits, web and MCP tools and may use them (the warn-only guard below nudges it). This is why a session with
+  `orchestratorMode: true` and no `orchestratorEnforce` runs Bash on the main loop: the allowlist gate is only
+  registered when `orchestratorEnforce` is `true`. Set it to additionally refuse, on the main loop, every tool not in
+  `orchestratorAllowedTools` — so a brain that forgets or hallucinates still cannot do the work itself. An allowlist is
+  used (not a denylist) precisely because a denylist would miss mutating tools like `Monitor`, `memory_write`, or
+  `ExitWorktree`; the `mcp__cortados-route__*` tools are always allowed so delegation is never locked out. The refusal
+  names `start_task`. Be aware that enforce is a cage by choice: with it on and cortados-route not connected, the
+  brain cannot work until it is turned off, and the refusal says so. Subagents are never gated — they run the full
+  toolset (and are themselves routed).
 
-The result: the top model is the brain and work flows through routed subagents, while the brain can still handle the
-odd trivial thing itself unless you turn on strict enforcement. Turn the whole thing off with `orchestratorMode:
-false` (the mod then only routes subagents, without directing the main session at all).
+The result: the top model is the brain and work flows through CortadOS child tasks, while the brain can still handle
+the odd trivial thing itself unless you turn on strict enforcement. Turn the whole thing off with `orchestratorMode:
+false` (the mod then only routes Agent-tool subagents, the main session's included, without directing it at all).
 
 ## Main-session guard (warn only)
 
@@ -93,7 +121,7 @@ A call is substantive when:
   without `run`). A text heuristic, not a shell parse: `grep make Makefile` or `echo pytest` do not count.
 
 Each substantive call bumps a session counter shown on the mod's status line (`main did 3 big edits, 1 build/test
-run; delegate to routed subagents`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;
+run; delegate with start_task`) and shows a toast at most **once per 10 minutes** (one nudge per stretch of work;
 a toast per edit would be noise). The counters and the throttle live in memory and start over when the mod reloads.
 
 While a routed subagent is running, the status line stays its own (`↗ routed subagent (...)`): the guard keeps
@@ -110,7 +138,8 @@ network.
 
 ## Independent reviews
 
-With `excludeBuilderOnReview` on (the default), a delegated Agent call that looks like a review — its `description`
+With `excludeBuilderOnReview` on (the default), a routed Agent call (one the mod routes: below the main loop, or any
+with orchestrator mode off) that looks like a review — its `description`
 matches `/\breview/i`, or its `subagent_type` matches `/review/i` — is sent to the provider with
 `x-cortados-exclude-model: <models>` (comma-separated): the main session's own model plus the **worker models** — the
 backend models routed non-review subagents actually built with since the last review. The provider keeps that review's
@@ -160,6 +189,9 @@ unattended. That is the full-agentic setting. To narrow it, drop tools from `all
 unattended Bash) or `default`.
 
 ## What is not routed
+
+In orchestrator mode the **main session's own Agent calls are refused**, not routed (see above): the top-level
+session delegates with `mcp__cortados-route__start_task`.
 
 These pass through to a normal in-process subagent on your direct model:
 
