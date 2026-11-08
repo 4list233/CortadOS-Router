@@ -1,0 +1,17 @@
+{
+  "_reasons": {
+    "num_layers": "16, as the routing adapter: same base, same capacity; a yes/no head needs no more",
+    "batch_size": "4: prompts are ~700 tokens; fits beside a resident scorer on the 32 GB Studio",
+    "iters": "1200: about 3 epochs of a few thousand balanced examples; early stopping comes from valid loss in the log",
+    "learning_rate": "1e-5, the routing adapter's rate: higher rates overfit the few-session label set",
+    "max_seq_length": "1536: the compact state is sized to stay far under it (see compaction_dataset.py)",
+    "mask_prompt": "train only on the yes/no answer, as the routing SFT does"
+  },
+  "num_layers": 16,
+  "batch_size": 4,
+  "iters": 1200,
+  "learning_rate": 1e-5,
+  "max_seq_length": 1536,
+  "steps_per_eval": 100,
+  "save_every": 100
+}
