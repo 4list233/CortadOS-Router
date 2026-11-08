@@ -205,8 +205,10 @@ class TrainScriptTests(unittest.TestCase):
 
     def test_config_has_reasons(self):
         cfg = json.loads(ct.CONFIG.read_text())
-        for k in ("num_layers", "batch_size", "iters", "learning_rate"):
-            self.assertIn(k, cfg["_reasons"])
+        numeric = [k for k, v in cfg.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        self.assertGreaterEqual(len(numeric), 7)
+        for k in numeric:
+            self.assertTrue(cfg["_reasons"].get(k, "").strip(), f"no reason for {k}")
 
 
 class FakeChild:

@@ -5,7 +5,9 @@
     "iters": "1200: about 3 epochs of a few thousand balanced examples; early stopping comes from valid loss in the log",
     "learning_rate": "1e-5, the routing adapter's rate: higher rates overfit the few-session label set",
     "max_seq_length": "1536: the compact state is sized to stay far under it (see compaction_dataset.py)",
-    "mask_prompt": "train only on the yes/no answer, as the routing SFT does"
+    "mask_prompt": "train only on the yes/no answer, as the routing SFT does",
+    "steps_per_eval": "100: valid loss every 100 steps (12 points over a run) is enough to spot overfitting, and each eval pass costs GPU time in the window",
+    "save_every": "100: a checkpoint every 100 steps, so a window-end stop loses at most ~100 steps of work"
   },
   "num_layers": 16,
   "batch_size": 4,
