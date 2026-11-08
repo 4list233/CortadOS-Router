@@ -7,8 +7,9 @@ Per head: AUC, Brier score, a 5-bin calibration table. At each threshold t in TH
 chars_saved (result chars of dropped results + input chars of dropped calls), wrong_drop_rate (dropped results that
 were needed / dropped results), missed_needed (needed results dropped / needed results) and the decision mix
 (keep call+result, call only, drop both). The rules get the same decision metrics from their KeepDecisions.
-`switch_on` lists thresholds where the heads beat the rules on BOTH axes (no more wrong drops, at least as many chars
-saved): the heads replace the rules only where they are better, never on AUC alone.
+`switch_on` lists thresholds where neither head drops more needed items than the rules (results AND calls, counted
+separately) and at least as many chars are saved; it is empty with "insufficient evidence" below MIN_ROWS rows or
+MIN_NEEDED needed results. The heads replace the rules only where they are better, never on AUC alone.
 """
 from __future__ import annotations
 
@@ -21,6 +22,14 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 THRESHOLDS = (0.3, 0.5, 0.7)
 BINS = 5
 HEADS = {"call": "needed_call", "result": "needed_result"}
+# Switch-on needs enough evidence: below MIN_ROWS one event moves a rate by more than 2 points, and with fewer than
+# MIN_NEEDED needed results a "0 wrong drops" says nothing (an empty eval would otherwise approve every threshold).
+MIN_ROWS = 50
+MIN_NEEDED = 5
+
+
+def sufficient(rows: list[dict]) -> bool:
+    return len(rows) >= MIN_ROWS and sum(bool(r["needed_result"]) for r in rows) >= MIN_NEEDED
 
 
 def auc(scores: list[float], ys: list[bool]) -> Optional[float]:
@@ -49,22 +58,31 @@ def calibration(scores, ys, bins: int = BINS) -> list[dict[str, Any]]:
 
 
 def decision_metrics(rows: list[dict], keep: list[tuple[bool, bool]]) -> dict[str, Any]:
-    saved = dropped = wrong = needed = missed = 0
+    """Savings and the safety metric of EACH head: a dropped needed result (wrong_drops) and a dropped needed call
+    (wrong_call_drops, e.g. forgetting that an edit or a commit happened) are counted separately, so cheap call drops
+    cannot hide behind a clean result head."""
+    saved = dropped = wrong = needed = 0
+    cdropped = cwrong = cneeded = 0
     mix = {"keep_call_and_result": 0, "keep_call_only": 0, "drop_both": 0}
     for r, (kc, kr) in zip(rows, keep):
         kc = kc or kr          # a kept result implies the call is kept
         needed += r["needed_result"]
+        cneeded += r["needed_call"]
         if not kr:
             dropped += 1
             saved += r.get("result_chars", 0)
             wrong += r["needed_result"]
-            missed += r["needed_result"]
         if not kc:
+            cdropped += 1
             saved += r.get("input_chars", 0)
+            cwrong += r["needed_call"]
         mix["keep_call_and_result" if kr else "keep_call_only" if kc else "drop_both"] += 1
-    return {"chars_saved": saved, "dropped_results": dropped,
+    return {"chars_saved": saved, "dropped_results": dropped, "wrong_drops": wrong,
             "wrong_drop_rate": round(wrong / dropped, 4) if dropped else 0.0,
-            "missed_needed": round(missed / needed, 4) if needed else 0.0, "mix": mix}
+            "missed_needed": round(wrong / needed, 4) if needed else 0.0,
+            "dropped_calls": cdropped, "wrong_call_drops": cwrong,
+            "wrong_call_drop_rate": round(cwrong / cdropped, 4) if cdropped else 0.0,
+            "missed_needed_call": round(cwrong / cneeded, 4) if cneeded else 0.0, "mix": mix}
 
 
 def _key(d) -> tuple[str, int]:
@@ -95,9 +113,17 @@ def evaluate(rows: list[dict], scorer: Callable[[dict, str], float],
         rules = decision_metrics([r for r, _ in covered], [k for _, k in covered])
         rules["covered"] = len(covered)
         rep["rules"] = rules
-        if len(covered) == len(rows):
+        if not sufficient(rows):
+            rep["switch_on"] = []
+            rep["switch_on_note"] = (f"insufficient evidence: {len(rows)} rows, {sum(r['needed_result'] for r in rows)} "
+                                     f"needed results (need >= {MIN_ROWS} and >= {MIN_NEEDED})")
+        elif len(covered) == len(rows):
+            # Same rows, same denominators: comparing counts compares the heads' miss rates. Neither head may drop
+            # more needed items than the rules, and the heads must save at least as many chars.
             rep["switch_on"] = [t for t, m in rep["thresholds"].items()
-                                if m["wrong_drop_rate"] <= rules["wrong_drop_rate"] and m["chars_saved"] >= rules["chars_saved"]]
+                                if m["wrong_drops"] <= rules["wrong_drops"]
+                                and m["wrong_call_drops"] <= rules["wrong_call_drops"]
+                                and m["chars_saved"] >= rules["chars_saved"]]
         else:
             rep["switch_on"] = []
             rep["switch_on_note"] = "rules did not decide every test row; no comparison"
@@ -113,15 +139,18 @@ def markdown(rep: dict[str, Any]) -> str:
               "|---|---|---|---|"]
         L += [f"| {c['bin']} | {c['n']} | {c['mean_p']} | {c['frac_yes']} |" for c in m["calibration"]]
         L.append("")
-    L += ["## Decisions", "", "| who | chars saved | wrong-drop rate | missed needed | keep both / call only / drop |",
-          "|---|---|---|---|---|"]
+    L += ["## Decisions", "", "| who | chars saved | wrong result drops (rate) | wrong call drops (rate) | "
+          "keep both / call only / drop |", "|---|---|---|---|---|"]
     rowsm = [(f"S1 t={t}", m) for t, m in rep["thresholds"].items()] + ([("rules", rep["rules"])] if "rules" in rep else [])
     for who, m in rowsm:
         x = m["mix"]
-        L.append(f"| {who} | {m['chars_saved']} | {m['wrong_drop_rate']} | {m['missed_needed']} | "
+        L.append(f"| {who} | {m['chars_saved']} | {m['wrong_drops']} ({m['wrong_drop_rate']}) | "
+                 f"{m['wrong_call_drops']} ({m['wrong_call_drop_rate']}) | "
                  f"{x['keep_call_and_result']} / {x['keep_call_only']} / {x['drop_both']} |")
     if "switch_on" in rep:
         L += ["", f"Heads beat the rules at thresholds: {', '.join(rep['switch_on']) or 'none'}"]
+        if rep.get("switch_on_note"):
+            L += ["", rep["switch_on_note"]]
     return "\n".join(L) + "\n"
 
 

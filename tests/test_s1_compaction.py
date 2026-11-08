@@ -85,9 +85,13 @@ class DatasetTests(unittest.TestCase):
             self.assertIn("examples", json.loads((Path(d) / "stats.json").read_text()))
 
 
+def eval_rows(n):
+    return [{"session": "a", "event_index": i, "result_chars": 100, "input_chars": 10,
+             "needed_call": i % 2 == 0, "needed_result": i % 4 == 0} for i in range(n)]
+
+
 class EvalTests(unittest.TestCase):
-    rows = [{"session": "a", "event_index": i, "result_chars": 100, "input_chars": 10,
-             "needed_call": i % 2 == 0, "needed_result": i % 4 == 0} for i in range(8)]
+    rows = eval_rows(80)     # >= MIN_ROWS, 20 needed results
 
     def test_perfect_scorer(self):
         rep = ce.evaluate(self.rows, lambda r, h: 1.0 if r[ce.HEADS[h]] else 0.0)
@@ -95,21 +99,42 @@ class EvalTests(unittest.TestCase):
         self.assertEqual(rep["heads"]["result"]["brier"], 0.0)
         m = rep["thresholds"]["0.5"]
         self.assertEqual(m["wrong_drop_rate"], 0.0)
-        self.assertEqual(m["chars_saved"], 6 * 100 + 4 * 10)
-        self.assertEqual(sum(m["mix"].values()), 8)
+        self.assertEqual(m["wrong_call_drops"], 0)
+        self.assertEqual(m["chars_saved"], 60 * 100 + 40 * 10)
+        self.assertEqual(sum(m["mix"].values()), 80)
 
     def test_constant_scorer_and_rules_comparison(self):
-        rules = [KeepDecision("a", i, True, False, "rule:x", "r") for i in range(8)]
+        rules = [KeepDecision("a", i, True, False, "rule:x", "r") for i in range(80)]
         rep = ce.evaluate(self.rows, lambda r, h: 0.5, rules)
         self.assertEqual(rep["heads"]["call"]["auc"], 0.5)
-        self.assertEqual(rep["rules"]["dropped_results"], 8)
+        self.assertEqual(rep["rules"]["dropped_results"], 80)
         self.assertEqual(rep["rules"]["wrong_drop_rate"], 0.25)
-        self.assertIn("0.7", rep["switch_on"])       # drops everything: same wrong-drop, more chars saved
-        self.assertNotIn("0.3", rep["switch_on"])    # keeps everything: saves less than the rules
+        self.assertEqual(rep["switch_on"], [])       # 0.7 drops needed calls; 0.3/0.5 keep all, saving less
         with tempfile.TemporaryDirectory() as d:
             ce.write(rep, Path(d))
             self.assertIn("Heads beat the rules", (Path(d) / "eval.md").read_text())
-            self.assertEqual(json.loads((Path(d) / "eval.json").read_text())["n"], 8)
+            self.assertEqual(json.loads((Path(d) / "eval.json").read_text())["n"], 80)
+
+    def test_dropping_needed_side_effect_calls_blocks_switch_on(self):
+        # Regression: heads that drop every call but keep needed results had 0 wrong (result) drops and were approved.
+        rules = [KeepDecision("a", i, True, True, "rule:keep-all", "r") for i in range(80)]
+        scorer = lambda r, h: (0.0 if h == "call" else (1.0 if r["needed_result"] else 0.0))
+        rep = ce.evaluate(self.rows, scorer, rules)
+        m = rep["thresholds"]["0.5"]
+        self.assertEqual(m["wrong_drops"], 0)
+        self.assertEqual(m["wrong_call_drops"], 20)      # needed_call rows that are not needed_result
+        self.assertNotIn("0.5", rep["switch_on"])
+        # the same heads keeping needed calls are switched on: fewer wrong drops, at least as many chars
+        good = lambda r, h: 1.0 if r[ce.HEADS[h]] else 0.0
+        self.assertIn("0.5", ce.evaluate(self.rows, good, rules)["switch_on"])
+
+    def test_empty_or_small_eval_is_insufficient(self):
+        for rows in ([], eval_rows(ce.MIN_ROWS - 1)):
+            rules = [KeepDecision("a", r["event_index"], True, True, "rule:x", "r") for r in rows]
+            rep = ce.evaluate(rows, lambda r, h: 0.0, rules)
+            self.assertEqual(rep["switch_on"], [])
+            self.assertIn("insufficient evidence", rep["switch_on_note"])
+            self.assertIn("insufficient evidence", ce.markdown(rep))
 
     def test_auc_none_without_both_classes(self):
         self.assertIsNone(ce.auc([0.1, 0.2], [True, True]))
