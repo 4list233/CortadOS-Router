@@ -173,6 +173,9 @@ def _codex_text(content: Any) -> str:
     return "\n\n".join(parts)
 
 
+_CODEX_ENVELOPE_KEYS = frozenset({"output", "content", "metadata"})
+
+
 def _codex_output(out: Any) -> Tuple[str, bool]:
     """function_call_output.output is a string (sometimes JSON with output + metadata.exit_code) or an object."""
     data = out
@@ -181,10 +184,12 @@ def _codex_output(out: Any) -> Tuple[str, bool]:
             data = json.loads(out)
         except json.JSONDecodeError:
             return out, False
-    if isinstance(data, dict):
+    # Unwrap only the recognized envelope ({"output"|"content", optional "metadata"}); any other structured result
+    # (e.g. {"task_id": ..., "state": ...}) is a result in its own right and keeps its original JSON text.
+    if isinstance(data, dict) and set(data) <= _CODEX_ENVELOPE_KEYS and ("output" in data or "content" in data):
         meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         code = meta.get("exit_code")
-        text = data.get("output", data.get("content", ""))
+        text = data["output"] if "output" in data else data["content"]
         text = _result_text(text) if not isinstance(text, str) else text
         return text, isinstance(code, int) and code != 0
     return (out if isinstance(out, str) else json.dumps(out, sort_keys=True)), False

@@ -35,7 +35,19 @@ def _dict_of(keys, pred):
 
 
 _nonneg_int = lambda x: _int(x) and x >= 0  # noqa: E731
-_threshold = _dict_of(("pct", "cap_tokens"), lambda x: _num(x) and x > 0)
+_pos_int = lambda x: _int(x) and x >= 1  # noqa: E731
+_pct = lambda x: _num(x) and 0 < x < 100  # noqa: E731
+
+
+def _fields(spec):
+    """Dict with exactly these keys, each checked by its own predicate (counts must be ints: a fractional count would
+    truncate to 0 and, as a slice bound, select everything)."""
+    def check(v):
+        return isinstance(v, dict) and set(v) == set(spec) and all(spec[k](v[k]) for k in spec)
+    return check
+
+
+_threshold = _fields({"pct": _pct, "cap_tokens": _pos_int})
 
 SETTINGS = {
     "warn": _threshold,
@@ -44,8 +56,8 @@ SETTINGS = {
     "price_cliff_tokens": lambda v: isinstance(v, dict) and all(isinstance(k, str) and _int(x) and x > 0
                                                                  for k, x in v.items()),
     "price_cliff_margin_tokens": _nonneg_int,
-    "velocity": _dict_of(("lookback_turns", "projection_turns", "single_turn_pct_of_window"),
-                         lambda x: _num(x) and x > 0),
+    "velocity": _fields({"lookback_turns": _pos_int, "projection_turns": _pos_int,
+                         "single_turn_pct_of_window": _pct}),
     "idle_cache_ttl_s": lambda v: isinstance(v, dict) and v and all(_int(x) and x > 0 for x in v.values()),
     "self_handoff_deadline_s": _dict_of(("after_tool_end", "force"), lambda x: _int(x) and x > 0),
     "time_based_timer": lambda v: isinstance(v, bool),
@@ -61,10 +73,10 @@ SETTINGS = {
     "excerpt_tool_result_chars": _dict_of(("head", "tail"), _nonneg_int),
     "excerpt_message_truncation_chars": lambda v: _int(v) and v > 0,
     "provider_tool_result_cap_tokens": lambda v: _int(v) and v > 0,
-    "circuit_breaker": _dict_of(("max_forced_restarts", "window_s", "fresh_open_max_pct_of_checkpoint"),
-                                lambda x: _num(x) and x > 0),
-    "pruning": _dict_of(("start_cap_tokens", "start_pct", "keep_last_results", "min_freed_tokens"),
-                        lambda x: _num(x) and x >= 0),
+    "circuit_breaker": _fields({"max_forced_restarts": _pos_int, "window_s": _pos_int,
+                                "fresh_open_max_pct_of_checkpoint": _pct}),
+    "pruning": _fields({"start_cap_tokens": _pos_int, "start_pct": _pct, "keep_last_results": _nonneg_int,
+                        "min_freed_tokens": _nonneg_int}),
 }
 
 
@@ -92,8 +104,6 @@ def validate(raw: Dict[str, Any]) -> Dict[str, Any]:
     for part in ("pct", "cap_tokens"):
         if not out["warn"][part] < out["checkpoint"][part] < out["force"][part]:
             raise PolicyError("thresholds must satisfy warn.%s < checkpoint.%s < force.%s" % (part, part, part))
-    if out["force"]["pct"] >= 100:
-        raise PolicyError("force.pct must be below 100")
     # Section budgets are caps that may sum above the total (the total trims); a single section above the total
     # could never fit and is a typo.
     if max(out["section_budgets"].values()) > out["handoff_total_tokens"]:
@@ -101,10 +111,11 @@ def validate(raw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def thresholds(pol: Dict[str, Any], window_tokens: float, model: str = "") -> Dict[str, float]:
-    """Token thresholds for a window: min(pct of W, cap); force also <= price cliff - margin for a listed model."""
-    out = {name: min(pol[name]["pct"] * window_tokens / 100.0, pol[name]["cap_tokens"])
-           for name in ("warn", "checkpoint", "force")}
+def thresholds(pol: Dict[str, Any], window_tokens: Any, model: str = "") -> Dict[str, float]:
+    """Token thresholds: min(pct of W, cap); force also <= price cliff - margin for a listed model. With no window
+    size (None / 0) only the absolute caps and the price cliff apply."""
+    out = {name: (min(pol[name]["pct"] * window_tokens / 100.0, pol[name]["cap_tokens"]) if window_tokens
+                  else pol[name]["cap_tokens"]) for name in ("warn", "checkpoint", "force")}
     cliff = pol["price_cliff_tokens"].get(model) if model else None
     if cliff is not None:
         out["force"] = min(out["force"], cliff - pol["price_cliff_margin_tokens"])

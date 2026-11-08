@@ -17,6 +17,7 @@ without its goal or rules would restart the session wrong, which is worse than n
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter
@@ -48,7 +49,9 @@ PR_RE = re.compile(r"(?:\bPR\s*#?|#)(\d{1,6})\b")
 BRANCH_RE = re.compile(r"(?:\bbranch\s+|checkout\s+(?:-b\s+)?|switch\s+(?:-c\s+)?|worktree add\s+-b\s+)`?([\w][\w./-]+)")
 TASK_RE = re.compile(r"\b(?:task|agent|run)[_-]?(?:id)?[:= ]+`?([\w-]{6,})|\b((?:task|agent)[_-][0-9a-z]{4,})\b", re.I)
 WORKTREE_RE = re.compile(r"(?:~|/)[\w./-]*worktrees?/[\w./-]+")
-SENT_RE = re.compile(r"[^.!?\n]+[.!?]?")
+# Sentence boundary: . ! ? followed by whitespace (or the end of the line). A dot inside a path or a dotted command
+# ("~/.cortados/router.db", "python3 -m a.b") is not a boundary; each line is split separately.
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 WORD_RE = re.compile(r"[a-z][a-z0-9_]{2,}")
 PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.M)
 EDIT_TOOLS = {"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
@@ -59,7 +62,10 @@ new now get got let lets please want like know see yes okay done does did doing 
 
 
 def _sentences(text: str) -> List[str]:
-    return [s.strip() for s in SENT_RE.findall(text) if s.strip()]
+    out = []
+    for line in text.splitlines():
+        out.extend(s.strip() for s in SENT_SPLIT_RE.split(line) if s.strip())
+    return out
 
 
 def _cut(text: str, n: int) -> str:
@@ -170,7 +176,6 @@ def _in_flight(session: Session, policy: dict, budget: int) -> Tuple[List[dict],
 
 
 def _json(obj: Any) -> str:
-    import json
     return json.dumps(obj, sort_keys=True, ensure_ascii=False)
 
 
@@ -252,13 +257,27 @@ SECTION_TITLES = (("goal", "Goal"), ("recency_pin", "Recency pin (latest turns, 
 TRIM_ORDER = ("excerpts", "files", "decisions", "recency_pin")
 
 
-def handoff_id(session: Session) -> str:
+ID_PLACEHOLDER = "0" * 16  # same length as the real id, so token counts do not change when it is inserted
+
+
+def handoff_id(rendered: str, policy: dict) -> str:
+    """sha256 of the canonical rendered handoff (with the id placeholder) and the policy it was built under: two
+    handoffs share an id only if they say exactly the same thing under the same policy."""
     h = hashlib.sha256()
-    h.update(("%s\0%s\0%d\0%d" % (session.source, session.session, len(session.messages),
-                                    len(session.events))).encode())
-    for m in session.messages[-3:]:
-        h.update(m.text.encode())
+    h.update(json.dumps(policy, sort_keys=True, default=str).encode())
+    h.update(b"\0")
+    h.update(rendered.encode())
     return h.hexdigest()[:16]
+
+
+def _victim(key: str, items: List[dict]) -> dict:
+    """Lowest-priority item of a section: excerpts by score (then oldest), files the least edited (listed last),
+    in-flight the last listed, the others the oldest."""
+    if key == "excerpts":
+        return min(items, key=lambda it: (it.get("score", 0), it.get("index", 0)))
+    if key in ("files", "in_flight"):
+        return items[-1]
+    return items[0]
 
 
 def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
@@ -281,10 +300,14 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
         session, policy, {it["index"] for it in sections["goal"]},
         {(it["kind"], it["index"]) for k in ("goal", "recency_pin") for it in sections[k]}, b["excerpts"])
 
-    hid = handoff_id(session)
+    hid = ID_PLACEHOLDER
     header = ("# CortadOS handoff\n\nhandoff-id: %s\n\nsession %s (%s), %d messages, %d tool calls. Token counts are "
               "estimates (ceil(chars/%s)). Resume from this document; re-read files before editing them.\n"
               % (hid, session.session, session.source, len(session.messages), len(session.events), _CPT[0]))
+    titles = dict(SECTION_TITLES)
+
+    def sec_tokens(key: str) -> int:
+        return est_tokens(_render(titles[key], [it["line"] for it in sections[key]]))
 
     def render_all() -> Tuple[str, Dict[str, int]]:
         parts, toks = [header], {}
@@ -294,21 +317,33 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
             parts.append(text)
         return "\n".join(parts), toks
 
-    pinned = est_tokens(header) + sum(est_tokens(_render(t, [it["line"] for it in sections[k]]))
-                                      for k, t in SECTION_TITLES if k in ("goal", "rules"))
+    # Caps count the complete rendered section, heading included. Goal and rules are never trimmed: over their cap
+    # the build is refused rather than silently exceeding it or dropping an instruction.
+    for key in ("goal", "rules"):
+        if sec_tokens(key) > b[key]:
+            raise HandoffBudgetError("%s section needs ~%d tokens, over its %d-token cap; refusing to trim it"
+                                     % (key, sec_tokens(key), b[key]))
+    for key in ("recency_pin", "decisions", "in_flight", "files", "excerpts"):
+        while sec_tokens(key) > b[key] and sections[key]:
+            items = sections[key]
+            victim = _victim(key, items)
+            items.remove(victim)
+            dropped[key] += 1
+    md, toks = render_all()
+    pinned = est_tokens(header) + sec_tokens("goal") + sec_tokens("rules")
     if pinned > total_budget:
         raise HandoffBudgetError("goal + standing rules alone need ~%d tokens, over the %d-token handoff budget; "
                                  "refusing to trim them" % (pinned, total_budget))
-    md, toks = render_all()
     for key in TRIM_ORDER:
         # lowest-priority item first: excerpts by score, others oldest first
         while est_tokens(md) > total_budget and sections[key]:
             items = sections[key]
-            victim = min(items, key=lambda it: (it.get("score", 0), it.get("index", 0))) if key == "excerpts" \
-                else items[0]
-            items.remove(victim)
+            items.remove(_victim(key, items))
             dropped[key] += 1
             md, toks = render_all()
+    real_id = handoff_id(md, policy)
+    md = md.replace("handoff-id: " + ID_PLACEHOLDER, "handoff-id: " + real_id, 1)
+    hid = real_id
     if est_tokens(md) > total_budget:
         raise HandoffBudgetError("handoff needs ~%d tokens after trimming, over the %d-token budget"
                                  % (est_tokens(md), total_budget))
