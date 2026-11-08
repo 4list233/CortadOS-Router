@@ -31,6 +31,13 @@ def current_pointer() -> Path:
     return Path(os.environ.get("CORTADOS_S1_SERVE_POINTER") or Path(__file__).resolve().parent / "current.json")
 
 
+def incumbent_scorer(cur: dict) -> Scorer:
+    """The promoted (live) adapter exactly as it serves: its own base and the FROZEN temperatures from its pointer, never
+    refitted. Refitting would move per-question confidences across the fail-up / outward thresholds and grade a model that
+    is not the one serving. calibrate.py builds its live baseline through this same function."""
+    return Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
+
+
 def outcome_holdout() -> list[tuple[dict, str]]:
     """Held-out tasks the loop actually ran, as (request_row, outcome_band). 'above' (no band passed) is not a label,
     so it is dropped. Empty until the loop has judged holdout tasks."""
@@ -490,7 +497,7 @@ def main() -> int:
                     if not rows_p.exists():
                         report["bar_rows_note"] = f"cached bar {cache_p.name} predates per-row files; no live rows until the holdout key changes"
                 else:
-                    inc = Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
+                    inc = incumbent_scorer(cur)
                     bar = grade(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), holdout, rows_out=rows_p)
                     cache_p.write_text(json.dumps(bar))
                 report["bar_source"] = f"promoted adapter {cur['adapter']} re-graded on this holdout"
@@ -507,7 +514,7 @@ def main() -> int:
                     if cached and "band_hits" in cached:       # a legacy cache without raw counts is recomputed, not trusted
                         report["outcome_bar"] = cached
                     else:
-                        inc = inc or Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
+                        inc = inc or incumbent_scorer(cur)
                         obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout,
                                              rows_out=obar_p.with_suffix(".rows.jsonl"))
                         obar_p.write_text(json.dumps(obar))

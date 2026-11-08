@@ -167,6 +167,56 @@ class SweepNeverPromotes(unittest.TestCase):
         self.assertNotIn("promote\": true", (run / "sweep.json").read_text().replace(" ", ""))
 
 
+class TempScorer:
+    """Fake Scorer whose confidence depends on its temperatures: frozen T=1 gives max prob 0.9 on every feature (kept);
+    the refitted T=3 flattens it to 0.5, below fail_up 0.6, so failed_up rounds the features UP."""
+    built = []
+
+    def __init__(self, base, adapter=None, temperatures=None):
+        self.base, self.adapter, self.T = base, adapter, temperatures or {}
+        TempScorer.built.append(self)
+
+    def score(self, request, unit_kind):
+        top = 0.9 if self.T.get("all") == 1.0 else 0.5
+        probs = flat_probs()
+        for f in core.FEATURES:
+            probs[f] = [top, 1 - top] + [0.0] * (N_OPTIONS[f] - 2)
+        return {**scored(probs), "ms": 1}
+
+
+class LiveUsesFrozenTemperatures(unittest.TestCase):
+    def test_live_is_graded_with_frozen_serving_temperatures_like_evaluate(self):
+        tmp = Path(tempfile.mkdtemp(prefix="s1-cal-T-"))
+        live, cand = str(tmp / "live/adapter"), str(tmp / "cand/adapter")
+        pointer = {"base": "live-base", "adapter": live, "temperatures": {"all": 1.0}}
+        patches = {"Scorer": TempScorer, "fit_temperatures": lambda s, valid: {"all": 3.0}}
+        saved = {k: getattr(ev, k) for k in patches}
+        for k, v in patches.items():
+            setattr(ev, k, v)
+        try:
+            TempScorer.built.clear()
+            make = cal.scorer_factory(live=live, base="cand-base", valid=[], pointer=pointer)
+            tv = ev.teacher_view([scored(flat_probs())["answers"]])
+            holdout = [({"id": f"r{i}", "request": "x", "unit_kind": "interactive"}, tv) for i in range(3)]
+            sweep = cal.run_sweep(candidate=cand, live=live, tilts=[0], alphas=[1.0], scales=[], out=tmp / "run/sweep.json",
+                                  holdout=holdout, o_holdout=[], make_scorer=make, fail_up=0.6)
+            live_s = next(s for s in TempScorer.built if s.adapter == live)
+            cand_s = next(s for s in TempScorer.built if s.adapter == cand)
+            self.assertEqual((live_s.base, live_s.T), ("live-base", {"all": 1.0}))   # frozen, not refitted
+            self.assertEqual((cand_s.base, cand_s.T), ("cand-base", {"all": 3.0}))   # candidates are fitted
+            inc = ev.incumbent_scorer(pointer)                                       # evaluate.py's incumbent grading
+            bar = ev.grade(lambda r: ev.failed_up(inc.score(r["request"], r["unit_kind"]), 0.6), holdout)
+            self.assertEqual(sweep["live_teacher"], bar)
+            live_rows = (tmp / "run/sweep/live/holdout-rows.jsonl").read_text()
+            cand_rows = (tmp / "run/sweep/cand-t0/holdout-rows.jsonl").read_text()
+            self.assertNotEqual(live_rows, cand_rows)    # the refit really crosses fail_up: same model, other answers
+            with self.assertRaises(ValueError):          # a --live that is not the promoted adapter is refused
+                cal.scorer_factory(live=cand, base="b", valid=[], pointer=pointer)
+        finally:
+            for k, v in saved.items():
+                setattr(ev, k, v)
+
+
 class RowFiles(unittest.TestCase):
     def test_grade_writes_one_row_per_request_without_text(self):
         tmp = Path(tempfile.mkdtemp(prefix="s1-rows-"))
@@ -255,7 +305,7 @@ class NightlySweepStep(unittest.TestCase):
 
     def test_runs_from_the_exit_trap_before_teardown(self):
         src = (S1 / "nightly.sh").read_text()
-        self.assertIn('cleanup() { local rc=$?; sweep_on_exit "$rc"; stop_deadline;', src)
+        self.assertIn('cleanup() {\n  local rc=$?\n  sweep_on_exit "$rc"\n  trap \'\' TERM INT\n  stop_deadline;', src)
 
 
 if __name__ == "__main__":

@@ -683,7 +683,7 @@ PY
 
     # --- calibration sweep request (s1/calibrate.py), run from the EXIT trap of any in-window cycle ---------------------
     CALIBRATE_STUB = (
-        "import os, signal, sys, time\n"
+        "import sys\n"
         "open('data/sweep-count', 'a').write('x')\n"
         "open('data/sweep-args', 'w').write(' '.join(sys.argv[1:]))\n"
         "print('sweep: 4 settings; chosen on teacher: cand-t0.1; would promote: False')\n"
@@ -1649,6 +1649,36 @@ class NightlySweepStop(unittest.TestCase):
         self.assertTrue((self.s1 / "data/sweep-request.json").exists(), self._log())
         self.assertFalse(list((self.s1 / "data").glob("sweep-request.done-*.json")))
         self.assertIn("SWEEP FAILED or interrupted rc=3", self._log())
+
+    def test_repeated_group_term_during_cleanup_tail_still_finishes_cleanup(self):
+        # overnight.py re-sends TERM to the cycle group every 5 s while draining. Once sweep_on_exit has returned, cleanup
+        # ignores TERM/INT, so its tail (stop_deadline, pkill, gpu_share, rm pidfile) runs to the end. The stub launchctl
+        # holds gpu_share's `launchctl load` for ~2 s while the test keeps TERMing the whole group.
+        mark = self.tmp / "loading"
+        _exe(Path(self.env["HOME"]) / ".local/bin/launchctl",
+             '#!/bin/bash\necho "launchctl $*" >> "$HOME/launchctl.log"\n'
+             'if [ "$1" = load ] && [ -n "${STUB_LOAD_MARK:-}" ]; then touch "$STUB_LOAD_MARK"; '
+             'for i in 1 2 3 4 5 6 7 8 9 10; do /bin/sleep 0.2; done; echo loaded >> "$HOME/launchctl.log"; fi\n')
+        env = self._prepare(STUB_LOAD_MARK=mark)
+        (self.s1 / "data/sweep-request.json").unlink()    # no sweep: sweep_on_exit returns at once, the cycle's exit trap is live
+        proc = self._start(env)
+        self._wait_for(lambda: mark.exists() or proc.poll() is not None)
+        self.assertIsNone(proc.poll(), "cycle ended before gpu_share; log:\n" + self._log())
+        self.assertTrue((self.s1 / "data/nightly.pid").exists(), self._log())   # we are inside cleanup's tail
+        sent, end = 0, time.time() + 20
+        while proc.poll() is None and time.time() < end:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM); sent += 1
+            except ProcessLookupError:
+                break                                     # the group is gone: cleanup finished between checks
+            time.sleep(0.1)
+        proc.wait(10)
+        self.assertGreaterEqual(sent, 5)
+        self.assertFalse((self.s1 / "data/nightly.pid").exists(), "pidfile left behind; log:\n" + self._log())
+        calls = (self.tmp / "home/launchctl.log").read_text()
+        self.assertIn("loaded", calls)                    # the held launchctl load ran to the end (TERM ignored)
+        self.assertIn("scorer back", self._log())         # gpu_share's own tail ran
+        self.assertNotIn("stop requested", self._log())   # no trap fired during cleanup
 
 
 if __name__ == "__main__":

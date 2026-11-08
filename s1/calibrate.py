@@ -145,6 +145,25 @@ def markdown(sweep: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def scorer_factory(*, live: str, base: str, valid: list, pointer: dict):
+    """make_scorer for run_sweep. The LIVE adapter is built exactly as evaluate.py grades the incumbent
+    (evaluate.incumbent_scorer: the pointer's base and FROZEN serving temperatures); refitting it here could cross the
+    fail-up / outward thresholds, change the live bands and so corrupt selection and chosen_would_promote. Only candidate
+    variants (candidate, blends, scales) get temperatures fitted on the valid split, as evaluate.py does for a candidate.
+    The pointer must name the same adapter as --live: a sweep against some other baseline is refused, not guessed."""
+    import evaluate as ev
+    if not pointer.get("adapter") or Path(pointer["adapter"]).resolve() != Path(live).resolve():
+        raise ValueError(f"--live {live!r} is not the promoted adapter {pointer.get('adapter')!r} in {ev.current_pointer()}")
+
+    def make_scorer(adapter: str):
+        if Path(adapter).resolve() == Path(live).resolve():
+            return ev.incumbent_scorer(pointer)
+        s = ev.Scorer(base, adapter)
+        s.T = ev.fit_temperatures(s, valid)          # what evaluate.py does for the candidate it grades
+        return s
+    return make_scorer
+
+
 def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[float], scales: list[float], out: Path,
               holdout: list, o_holdout: list, make_scorer, fail_up: float) -> dict:
     """make_scorer(adapter_dir) -> object with .score(request, unit_kind) (temperatures already fitted). Each adapter is
@@ -212,14 +231,11 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"alpha/scale {x} outside [0, 1]")
     import evaluate as ev
     from common import DATA, read_jsonl, read_labels
-    from student import Scorer
     reqs = {r["id"]: r for r in read_jsonl(DATA / "requests.jsonl")}
     holdout, valid = ev.build_eval_sets(reqs, read_labels())
 
-    def make_scorer(adapter: str):
-        s = Scorer(a.base, adapter)
-        s.T = ev.fit_temperatures(s, valid)          # what evaluate.py does for every adapter it grades
-        return s
+    cur = json.loads(ev.current_pointer().read_text())   # unreadable or missing pointer: let it raise; there is no live baseline without it
+    make_scorer = scorer_factory(live=a.live, base=a.base, valid=valid, pointer=cur)
     sweep = run_sweep(candidate=a.candidate, live=a.live, tilts=a.tilts, alphas=a.alphas, scales=a.scales, out=Path(a.out),
                       holdout=holdout, o_holdout=ev.outcome_holdout(), make_scorer=make_scorer, fail_up=a.fail_up)
     print(f"sweep: {len(sweep['settings'])} settings; chosen on teacher: {sweep['chosen']}; would promote: {sweep['chosen_would_promote']}")

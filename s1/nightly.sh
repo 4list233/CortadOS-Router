@@ -448,7 +448,15 @@ stop_deadline() {
     deadline=""
   fi
 }
-cleanup() { local rc=$?; sweep_on_exit "$rc"; stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"; }
+# TERM/INT are ignored only AFTER sweep_on_exit returns: the sweep itself must stay stoppable, but overnight.py re-sends TERM to
+# the cycle group every 5 s while draining, and one landing in the tail would run the exit-130 trap (or kill a step) and cut
+# cleanup short: watcher not reaped, scorer not reloaded, pidfile left behind. The tail is short and bounded, so it finishes.
+cleanup() {
+  local rc=$?
+  sweep_on_exit "$rc"
+  trap '' TERM INT
+  stop_deadline; pkill -TERM -P $$ 2>/dev/null; gpu_share; rm -f "$PIDFILE"
+}
 trap cleanup EXIT
 # Continuous mode: the stop flag means "the operator ran nightly.sh --stop" (only --stop creates it) and overnight.py will not
 # relaunch while it exists. A TERM here can also be the supervisor's own stop_tree (launchctl unload/kickstart -k, logout,
