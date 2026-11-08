@@ -1,0 +1,18 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "REPO=$HOME/Ai/CortadOS-Router $HOME/Ai/CortadOS-Router/integrations/checkpoint/statusline.sh"
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $HOME/Ai/CortadOS-Router && python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"transcript_path\"]); print(d.get(\"session_id\",\"unknown\"))' | { read tp; read sid; python3 -B -m cortados_router.compaction.checkpoint build --transcript \"$tp\" --format claude-code --out \"$CORTADOS_HOME/checkpoint/$sid-$(date +%Y%m%d%H%M%S)\"; }"
+          }
+        ]
+      }
+    ]
+  }
+}
