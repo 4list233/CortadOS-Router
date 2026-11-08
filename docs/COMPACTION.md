@@ -10,21 +10,30 @@ uncontrolled auto-compaction of either client. Three phases share the record sha
   turn a Claude Code transcript or a Codex rollout into a `Session`. Tool calls are paired with results by id; a call
   without a result is `interrupted`. Sidechain, meta, injected-context and unknown lines are counted in
   `stats["skipped"]` by kind, never silently dropped.
-- **Policy** (`tables/compaction.json`, loaded by `compaction/policy.py`): every value has a `why`; unknown or missing
-  keys fail loudly. Status `provisional`: warn 60%, checkpoint 70%, force 85%; absolute ceilings 140k (200k-class
-  window) and 300k (1M-class, where quality, not capacity, is the limit); velocity rule (last turn's growth crossing
-  force within 2 turns); idle turn boundary only; 5-minute self-handoff deadline; 10k-token handoff with per-section
-  budgets; circuit breaker 3 restarts / 20 min then 30 min pause.
+- **Policy** (`tables/compaction.json`, loaded by `compaction/policy.py`): values from the research report
+  [COMPACTION-THRESHOLDS.md](COMPACTION-THRESHOLDS.md) (status `researched-2026-11-08`); every value has a `why` citing
+  its section / source id; unknown or missing keys fail loudly. Thresholds are min(% of W, absolute cap): warn
+  min(55%, 150k), checkpoint min(70%, 200k), force min(85%, 300k) — a 200k window binds on the percentages, a 1M
+  window on the caps — and force <= price cliff - 10k for API-billed models listed in `price_cliff_tokens`
+  (subscription sessions have none). Velocity: checkpoint if current + 2 x mean growth of the last 3 turns >= force,
+  or one turn adds >= 10% of W. At >= warn, checkpoint at the turn boundary, and before resuming after an idle gap
+  longer than the cache TTL. Self-handoff deadline 4 min after the current tool ends, forced at 6 min. No time-based
+  timer. Circuit breaker: 2 forced restarts in 30 min, or a fresh session opening above 50% of the checkpoint
+  threshold -> stop and escalate. The `pruning` and `provider_tool_result_cap_tokens` values are for phase 1, which
+  reads them from this file.
 - **Handoff** (`compaction/handoff.py`): `build_handoff(session, policy) -> (markdown, manifest)`. Sections in order,
-  each under its own budget (tokens estimated as ceil(chars/4)): Goal (last 3 user prompts verbatim), Standing rules
-  (rule-word sentences from user messages, deduped, newest wins), Decisions, In-flight (interrupted calls flagged
-  VERIFY; branches, PRs, hashes, task ids, worktrees from the last K messages), Files touched (Edit/Write/MultiEdit/
-  NotebookEdit and apply_patch paths with counts), Ranked excerpts (+3 per shared goal word, +2 per load-bearing
-  signal, recency bonus for the last K messages; greedy fill, then chronological; tool results truncated). Over the
-  total budget: trim excerpts, then files, then decisions; Goal and rules are never trimmed — the build fails instead.
-  The manifest lists every message / event index per section with scores. Same input -> same bytes.
+  each under its own cap (16k total; tokens estimated as ceil(chars / chars_per_token): 2.5 for Claude Code, 4 for
+  Codex, 2.5 when unknown): Goal (latest user prompt verbatim, 400), Recency pin (the 3 earlier recent user turns
+  verbatim + the last 2 tool calls raw, 4000), Standing rules (rule-word sentences from user messages, deduped,
+  newest wins, 1500), Decisions (1500), In-flight (interrupted calls flagged VERIFY; branches, PRs, hashes, task ids,
+  worktrees from the last 8 messages, 2000), Files touched (<= 40 paths with edit counts and tools, 800), Ranked
+  excerpts (+3 per shared goal word, +2 per load-bearing signal, recency bonus; greedy fill, then chronological; tool
+  results head + tail with their char count, 6000). Over the total: trim excerpts, files, decisions, then recency
+  pin; Goal and rules are never trimmed — the build fails instead. The manifest lists every message / event index
+  per section with scores. Same input -> same bytes.
 - **CLI** (`compaction/checkpoint.py`): `build` writes `handoff.md` + `handoff.manifest.json` (0600, no overwrite
-  without `--force`); `check` reads a Claude Code status-line JSON and prints ok / warn / checkpoint / force.
+  without `--force`); `check` reads a Claude Code status-line JSON (plus optional turn history, model id, idle time
+  and cache-TTL class, fresh-session flag) and prints ok / warn / checkpoint / force / escalate.
 - **Integration** (`integrations/checkpoint/`, templates only): status line + PreCompact hook, a `/checkpoint` skill,
   a Codex AGENTS.md rule, and the canary: the restarted session's first reply quotes the `handoff-id:` line.
 
