@@ -85,12 +85,49 @@ def failed_up(p: dict, below: float) -> dict:
         if pr and max(pr) < below:
             top2 = sorted(range(len(pr)), key=lambda i: -pr[i])[:2]
             ans[f] = max(top2)
-    return {**p, "answers": ans}
+    return {**p, "answers": ans, "raw_answers": p["answers"]}    # raw_answers: what the model said before rounding up (per-row files)
 
 
-def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
-    per_q, conf_bins, band_hits, under, over, lat = defaultdict(list), defaultdict(list), [], 0, 0, []
-    outward_tp = outward_fn = misses = 0
+def verdict(pred: str, truth: str) -> str:
+    return "under" if BANDS.index(pred) < BANDS.index(truth) else "over" if BANDS.index(pred) > BANDS.index(truth) else "hit"
+
+
+def grade_row(r: dict, p: dict, pred_band: str, truth: str, tv: dict | None = None) -> dict:
+    """One per-row record for the morning analysis (join candidate vs live by id). No request text: only its length, so the
+    files can be shared without the requests; join to requests.jsonl / the outcome store by id when the text is needed.
+    approx_tokens is chars/4, the usual English heuristic: a bucket, not a count."""
+    chars = len(r.get("request") or "")
+    probs = p.get("probs") or {}
+    row = {"id": r["id"], "source": r.get("source"), "unit_kind": r.get("unit_kind"), "chars": chars, "approx_tokens": chars // 4,
+           "true_band": truth, "pred_answers_raw": p.get("raw_answers", p["answers"]), "pred_answers": p["answers"],
+           "top_prob": {q: max(v) for q, v in probs.items() if v}, "pred_band": pred_band, "verdict": verdict(pred_band, truth)}
+    if tv is not None:
+        row["teacher_major"], row["teacher_dist"] = tv["major"], tv["dist"]
+    return row
+
+
+def _rows_writer(path):
+    """A line writer for path (None = no rows). The file is rewritten whole each grading: rows always match one grade."""
+    if path is None:
+        return None, lambda row: None
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    f = Path(path).open("w")
+    return f, lambda row: f.write(json.dumps(row, default=str) + "\n")
+
+
+def grade(predict, rows: list[tuple[dict, dict]], rows_out=None) -> dict:
+    """Teacher-holdout grade; rows_out (optional path) also writes one grade_row per graded request."""
+    per_q, conf_bins, band_hits, lat = defaultdict(list), defaultdict(list), [], []
+    fh, write = _rows_writer(rows_out)
+    try:
+        return _grade(predict, rows, per_q, conf_bins, band_hits, lat, write)
+    finally:
+        if fh:
+            fh.close()
+
+
+def _grade(predict, rows, per_q, conf_bins, band_hits, lat, write) -> dict:
+    under = over = outward_tp = outward_fn = misses = 0
     for r, tv in rows:
         p = predict(r)
         if p is None:
@@ -104,6 +141,7 @@ def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
             if p.get("probs"):
                 conf_bins[q].append((max(p["probs"][q]), ok, sum((p["probs"][q][i] - tv["dist"][q][i]) ** 2 for i in range(N_OPTIONS[q]))))
         b = band_of(p["answers"])
+        write(grade_row(r, p, b, tv["band"], tv))
         band_hits.append(b == tv["band"])
         under += BANDS.index(b) < BANDS.index(tv["band"])
         over += BANDS.index(b) > BANDS.index(tv["band"])
@@ -125,20 +163,26 @@ def grade(predict, rows: list[tuple[dict, dict]]) -> dict:
             "latency_ms_median": int(statistics.median(lat)) if lat else None}
 
 
-def grade_outcome(predict, rows: list[tuple[dict, str]]) -> dict:
+def grade_outcome(predict, rows: list[tuple[dict, str]], rows_out=None) -> dict:
     """Band accuracy against the band each held-out task ACTUALLY needed (its outcome band), not a teacher's reading.
     Rows are (request_row, outcome_band). Under-routing here is the costly error the whole loop exists to drive down."""
     hits = under = over = misses = n = 0
-    for r, truth in rows:
-        p = predict(r)
-        if p is None:
-            misses += 1
-            continue
-        n += 1
-        b = band_of(p["answers"])
-        hits += b == truth
-        under += BANDS.index(b) < BANDS.index(truth)
-        over += BANDS.index(b) > BANDS.index(truth)
+    fh, write = _rows_writer(rows_out)
+    try:
+        for r, truth in rows:
+            p = predict(r)
+            if p is None:
+                misses += 1
+                continue
+            n += 1
+            b = band_of(p["answers"])
+            write(grade_row(r, p, b, truth))
+            hits += b == truth
+            under += BANDS.index(b) < BANDS.index(truth)
+            over += BANDS.index(b) > BANDS.index(truth)
+    finally:
+        if fh:
+            fh.close()
     nn = max(n, 1)
     # Raw counts are kept alongside the rounded ratios so promote_decision compares exactly (no rounding can hide a
     # one-task regression on a large outcome holdout); the ratios are for display (Codex review 2026-10-25).
@@ -389,11 +433,13 @@ def main() -> int:
               "temperatures": T, "holdout_rows": len(holdout), "valid_rows": len(valid),
               "holdout_key": holdout_key(holdout, a.fail_up, OUTWARD_AT), "min_holdout_rows": MIN_TEACHER_HOLDOUT,
               "teacher_band_mix": dict(Counter(tv["band"] for _, tv in holdout)),
-              "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout)}
+              "fail_up_below": a.fail_up, "outward_at": OUTWARD_AT, "candidate": grade(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), holdout,
+                                                                         rows_out=out / "holdout-rows.jsonl")}
     o_holdout = outcome_holdout()                              # the loop's held-out tasks; truth = the band they needed
     if o_holdout:
         report["outcome_holdout_rows"] = len(o_holdout)
-        report["outcome"] = grade_outcome(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
+        report["outcome"] = grade_outcome(lambda r: failed_up(scorer.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout,
+                                           rows_out=out / "outcome-rows.jsonl")
     if a.baseline:
         cache_p = DATA / "baseline-incumbent.jsonl"
         cache = {x["id"]: x for x in read_jsonl(cache_p)}
@@ -435,11 +481,17 @@ def main() -> int:
             try:
                 hkey = holdout_key(holdout, a.fail_up, OUTWARD_AT)
                 cache_p = DATA / f"bar-{Path(cur['adapter']).parent.name}-{hkey}.json"
+                # Per-row bar files sit beside the cached summary (bar-<run>-<hkey>.rows.jsonl). A summary cached before rows
+                # existed is LEFT ALONE, with a note: re-grading the live adapter costs most of an evaluation and the summary is
+                # still the correct bar; the rows appear the next time the holdout key changes (any new holdout label).
+                rows_p = cache_p.with_suffix(".rows.jsonl")
                 if cache_p.exists():
                     bar = json.loads(cache_p.read_text())
+                    if not rows_p.exists():
+                        report["bar_rows_note"] = f"cached bar {cache_p.name} predates per-row files; no live rows until the holdout key changes"
                 else:
                     inc = Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
-                    bar = grade(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), holdout)
+                    bar = grade(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), holdout, rows_out=rows_p)
                     cache_p.write_text(json.dumps(bar))
                 report["bar_source"] = f"promoted adapter {cur['adapter']} re-graded on this holdout"
             except Exception as exc:
@@ -456,7 +508,8 @@ def main() -> int:
                         report["outcome_bar"] = cached
                     else:
                         inc = inc or Scorer(cur["base"], cur["adapter"], cur.get("temperatures"))
-                        obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout)
+                        obar = grade_outcome(lambda r: failed_up(inc.score(r["request"], r["unit_kind"]), a.fail_up), o_holdout,
+                                             rows_out=obar_p.with_suffix(".rows.jsonl"))
                         obar_p.write_text(json.dumps(obar))
                         report["outcome_bar"] = obar
                 except Exception as exc:

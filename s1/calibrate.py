@@ -161,8 +161,10 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
         return memo[key]
 
     scorers = {live: make_scorer(live)}
-    live_teacher = ev.grade(lambda r: scored(live, r), holdout)
-    live_outcome = ev.grade_outcome(lambda r: scored(live, r), o_holdout) if o_holdout else None
+    rows_dir = run_dir / "sweep"     # per-setting row files: <run>/sweep/<setting>/{holdout,outcome}-rows.jsonl, joined by id
+    live_teacher = ev.grade(lambda r: scored(live, r), holdout, rows_out=rows_dir / "live" / "holdout-rows.jsonl")
+    live_outcome = (ev.grade_outcome(lambda r: scored(live, r), o_holdout, rows_out=rows_dir / "live" / "outcome-rows.jsonl")
+                    if o_holdout else None)
     variants = [("cand", candidate, None)]
     for a in alphas:
         if a != 1.0:
@@ -177,9 +179,11 @@ def run_sweep(*, candidate: str, live: str, tilts: list[float], alphas: list[flo
         scorers[adapter] = make_scorer(adapter)
         for t in tilts:
             pred = (lambda ad, tt: lambda r: tilt_answers(scored(ad, r), tt, core.FEATURES))(adapter, t)
-            rows.append({"setting": f"{name}-t{t:g}", "adapter": adapter, "tilt": t, "blend": how,
-                         "teacher": ev.grade(pred, holdout),
-                         "outcome": ev.grade_outcome(pred, o_holdout) if o_holdout else None})
+            setting = f"{name}-t{t:g}"
+            rows.append({"setting": setting, "adapter": adapter, "tilt": t, "blend": how,
+                         "teacher": ev.grade(pred, holdout, rows_out=rows_dir / setting / "holdout-rows.jsonl"),
+                         "outcome": (ev.grade_outcome(pred, o_holdout, rows_out=rows_dir / setting / "outcome-rows.jsonl")
+                                     if o_holdout else None)})
     chosen = select_on_teacher(rows, live_teacher, ev.TEACHER_UNDER_MAX_RISE, ev.OUTWARD_RECALL_FLOOR)
     for r in rows:   # confirmation only: the rule is evaluate.promotion_report, unchanged; nothing is promoted
         r["report"] = ev.promotion_report(r["teacher"], live_teacher, live_outcome, r["outcome"], bool(o_holdout), holdout_rows=len(holdout))

@@ -157,8 +157,56 @@ class SweepNeverPromotes(unittest.TestCase):
         self.assertEqual((pointer.read_text(), pointer.stat().st_mtime_ns), before)
         self.assertEqual([r["setting"] for r in sweep["settings"]], ["cand-t0", "cand-t0.1"])
         self.assertTrue((run / "sweep.json").exists() and (run / "sweep.md").exists())
-        self.assertEqual(sorted(p.name for p in run.iterdir()), ["sweep.json", "sweep.md"])
+        self.assertEqual(sorted(p.name for p in run.iterdir()), ["sweep", "sweep.json", "sweep.md"])
+        for setting in ("live", "cand-t0", "cand-t0.1"):    # per-row files for the morning join, nothing else under sweep/
+            for f in ("holdout-rows.jsonl", "outcome-rows.jsonl"):
+                self.assertTrue((run / "sweep" / setting / f).exists(), (setting, f))
+        rows = [json.loads(x) for x in (run / "sweep/cand-t0/holdout-rows.jsonl").read_text().splitlines()]
+        self.assertEqual([r["id"] for r in rows], ["r0", "r1", "r2"])
+        self.assertNotIn("request", rows[0])
         self.assertNotIn("promote\": true", (run / "sweep.json").read_text().replace(" ", ""))
+
+
+class RowFiles(unittest.TestCase):
+    def test_grade_writes_one_row_per_request_without_text(self):
+        tmp = Path(tempfile.mkdtemp(prefix="s1-rows-"))
+        tv = ev.teacher_view([scored(flat_probs())["answers"]])
+        holdout = [({"id": "a", "request": "x" * 400, "unit_kind": "interactive", "source": "loop"}, tv)]
+        probs = flat_probs()
+        probs["steps"] = [0.0, 0.45, 0.55] + [0.0] * (N_OPTIONS["steps"] - 3)
+        p = scored(probs)
+        g = ev.grade(lambda r: ev.failed_up(p, 0.6), holdout, rows_out=tmp / "h.jsonl")
+        row = json.loads((tmp / "h.jsonl").read_text())
+        self.assertEqual((row["id"], row["source"], row["chars"], row["approx_tokens"]), ("a", "loop", 400, 100))
+        self.assertEqual(row["pred_answers_raw"]["steps"], 2)               # before failed_up: the model's top answer
+        self.assertEqual(row["teacher_major"], tv["major"])
+        self.assertEqual(row["verdict"], "hit" if g["band_accuracy"] == 1 else ("under" if g["under_routed"] else "over"))
+        self.assertNotIn("request", row)
+        ev.grade_outcome(lambda r: p, [(holdout[0][0], "R4")], rows_out=tmp / "o.jsonl")
+        o = json.loads((tmp / "o.jsonl").read_text())
+        self.assertEqual(o["true_band"], "R4")
+        self.assertNotIn("teacher_major", o)
+
+
+class RowsReport(unittest.TestCase):
+    def test_join_finds_candidate_only_under_routes(self):
+        import rows_report
+        tmp = Path(tempfile.mkdtemp(prefix="s1-join-"))
+
+        def row(i, verdict, steps, tokens=10, src="loop", band="R2"):
+            return {"id": i, "verdict": verdict, "pred_answers": {"steps": steps, "novelty": 0}, "approx_tokens": tokens,
+                    "source": src, "true_band": band}
+        cand = [row("a", "under", 1), row("b", "under", 1), row("c", "hit", 2), row("d", "under", 0, 300, "teacher", "R3"), row("x", "hit", 1)]
+        live = [row("a", "hit", 2), row("b", "under", 1), row("c", "hit", 2), row("d", "over", 0, 300), row("y", "hit", 1)]
+        (tmp / "c.jsonl").write_text("".join(json.dumps(r) + "\n" for r in cand))
+        (tmp / "l.jsonl").write_text("".join(json.dumps(r) + "\n" for r in live))
+        rep = rows_report.regressions(rows_report.load(tmp / "c.jsonl"), rows_report.load(tmp / "l.jsonl"))
+        self.assertEqual(rep["ids"], ["a", "d"])
+        self.assertEqual((rep["joined"], rep["only_candidate"], rep["only_live"]), (4, 1, 1))
+        self.assertEqual(rep["by_source"], {"loop": 1, "teacher": 1})
+        self.assertEqual(rep["by_true_band"], {"R2": 1, "R3": 1})
+        self.assertEqual(rep["by_differing_question"], {"steps": 1})
+        self.assertEqual(rep["by_length"], {"<50": 1, "200-799": 1})
 
 
 def sweep_fn() -> str:
