@@ -383,9 +383,10 @@ def _read_json(path):
         return json.load(stream)
 
 
-def live_intents(gate, now, alive=pid_alive):
-    """Unexpired intents whose trainer pid is alive. Expired or dead ones are
-    removed so a crashed trainer cannot hold the model off forever."""
+def live_intents(gate, now, alive=pid_alive, prune=True):
+    """Unexpired intents whose trainer pid is alive. With prune (the daemon), expired or
+    dead ones are removed so a crashed trainer cannot hold the model off forever; without
+    it (local_gate, advisory only) nothing is ever deleted or modified."""
     gate = Path(gate)
     if not gate.is_dir():
         return []
@@ -406,10 +407,13 @@ def live_intents(gate, now, alive=pid_alive):
             if age < INTENT_TTL_SECONDS:
                 live.append(dict(pid=None, nonce=None, expires_at=None))
             else:
-                print("studio_capacity: discarding malformed intent " + path.name, file=sys.stderr)
-                path.unlink()
+                if prune:
+                    print("studio_capacity: discarding malformed intent " + path.name, file=sys.stderr)
+                    path.unlink()
             continue
         if expires <= now or not alive(pid):
+            if not prune:
+                continue
             print("studio_capacity: discarding %s intent pid %d" % (
                 "expired" if expires <= now else "dead", pid), file=sys.stderr)
             with contextlib.suppress(FileNotFoundError):
@@ -463,72 +467,47 @@ class GateRefused(RuntimeError):
     """Residency could not be confirmed absent: training must not start."""
 
 
-# Active-request markers (Dekker-style handshake with local_gate). The gate FIRST writes
-# active-<pid>-<uuid>.json, THEN checks for live intents; the trainer FIRST writes its intent,
-# THEN waits for live markers to disappear. Whichever writes second sees the other's file, so a
-# request can never pass the gate's last intent check and then load a model under training.
-#
-# A marker is stale (ignored and removed) when its gate pid is dead (a killed gate never reaches
-# its finally) or it is older than ACTIVE_REQUEST_MAX_AGE_SECONDS: 3x the gate's 300 s upstream
-# read timeout, a bound on a pid that was reused. Dropping a marker of a still-running request is
-# not unsafe: the trainer's unload-all confirmation after the wait refuses while a model stays.
-ACTIVE_REQUEST_MAX_AGE_SECONDS = 900
-# How long the trainer waits for in-flight gate requests to end: a typical local generation
-# finishes well within 2 min; longer means the node is busy and training should retry later.
-ACTIVE_REQUEST_WAIT_SECONDS = 120
+# Node lock: <gate>/node.lock, shared by local_gate and training_gate. Every forwarded gate request
+# holds flock(LOCK_SH) from before it reaches Ollama until its response is fully relayed; the
+# trainer holds flock(LOCK_EX) for the whole training block. The kernel enforces exclusion and drops
+# a lock when its holder dies, so there is no expiry, pid check or staleness logic to get wrong.
+NODE_LOCK_NAME = "node.lock"
+# In-flight local requests get this long to drain; a typical local generation ends well within
+# 2 min. If they do not, training is refused and retries later rather than running over a live request.
+TRAINER_LOCK_WAIT_SECONDS = 120
+# Poll interval for the exclusive lock: flock has no timed wait, and 1 s is negligible next to training.
+TRAINER_LOCK_POLL_SECONDS = 1
 
 
-def begin_active_request(gate, pid=None, clock=time.time):
-    """Write this request's marker before checking intents; returns its path (pass to end_active_request)."""
+def node_lock_path(gate):
+    """The one lock file gate and trainer agree on."""
+    return Path(gate) / NODE_LOCK_NAME
+
+
+def open_node_lock(gate):
+    """Open (creating, mode 0600) the node lock file; returns an fd. OSError propagates: callers fail closed."""
     gate = Path(gate)
-    gate.mkdir(parents=True, exist_ok=True)
-    pid = os.getpid() if pid is None else pid
-    path = gate / ("active-%d-%s.json" % (pid, uuid.uuid4().hex))
-    write_status(path, dict(version=1, pid=pid, created_at=clock()))
-    return path
+    gate.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return os.open(node_lock_path(gate), os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
 
 
-def end_active_request(path):
-    with contextlib.suppress(FileNotFoundError):
-        Path(path).unlink()
-
-
-def live_active_requests(gate, now, alive=pid_alive):
-    """Markers of gate requests that may still load a model. Malformed markers fail closed (count as
-    live) until older than ACTIVE_REQUEST_MAX_AGE_SECONDS by mtime; stale ones are removed."""
-    gate = Path(gate)
-    if not gate.is_dir():
-        return []
-    live = []
-    for path in sorted(gate.glob("active-*.json")):
-        try:
-            marker = _read_json(path)
-            if marker.get("version") != 1:
-                raise ValueError("unsupported marker version")
-            pid = marker["pid"]
-            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-                raise ValueError("invalid pid")
-            created = _finite(marker["created_at"])
-        except FileNotFoundError:
-            continue  # the request ended between glob and read
-        except (ValueError, KeyError, TypeError, AttributeError):
+def acquire_trainer_lock(gate, clock=time.time, sleep=time.sleep, wait_seconds=TRAINER_LOCK_WAIT_SECONDS):
+    """Take LOCK_EX on the node lock, polling until wait_seconds; returns the held fd. GateRefused on timeout."""
+    fd = open_node_lock(gate)
+    try:
+        deadline = clock() + wait_seconds
+        while True:
             try:
-                age = now - path.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if age < ACTIVE_REQUEST_MAX_AGE_SECONDS:
-                live.append(dict(pid=None, created_at=None, path=path))
-            else:
-                print("studio_capacity: discarding malformed marker " + path.name, file=sys.stderr)
-                end_active_request(path)
-            continue
-        if now - created >= ACTIVE_REQUEST_MAX_AGE_SECONDS or not alive(pid):
-            print("studio_capacity: discarding %s active-request marker pid %d" % (
-                "dead" if not alive(pid) else "expired", pid), file=sys.stderr)
-            end_active_request(path)
-            continue
-        live.append(dict(pid=pid, created_at=created, path=path))
-    return live
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if clock() >= deadline:
+                    raise GateRefused("studio_gate: local gate request(s) still in flight after %ss; refusing to start"
+                                      % wait_seconds)
+                sleep(TRAINER_LOCK_POLL_SECONDS)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def write_ack(gate, intent, model, now):
@@ -554,12 +533,13 @@ def _daemon_alive(status_path, now):
 @contextlib.contextmanager
 def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=time.time,
                   sleep=time.sleep, log=None, pid=None, wait_seconds=ACK_WAIT_SECONDS,
-                  refresh_seconds=INTENT_REFRESH_SECONDS, alive=pid_alive,
-                  request_wait_seconds=ACTIVE_REQUEST_WAIT_SECONDS):
+                  refresh_seconds=INTENT_REFRESH_SECONDS,
+                  lock_wait_seconds=TRAINER_LOCK_WAIT_SECONDS):
     """Hold an S1 training intent for the duration of the block.
 
-    Writes an intent, waits (bounded) for in-flight local gate requests to end
-    (GateRefused on timeout), then waits (bounded) for the daemon's ack. After an
+    First takes the node lock exclusively (bounded wait for in-flight local gate
+    requests, GateRefused on timeout) and holds it until the block ends; then writes
+    an intent and waits (bounded) for the daemon's ack. After an
     ack or its timeout alike it queries /api/ps itself, unloads EVERY resident
     model and confirms none remain, raising GateRefused if that cannot be confirmed.
     Only a refused connection (Ollama not running) proceeds without a query
@@ -573,6 +553,16 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
     intent_path = gate / ("intent-%d-%s.json" % (pid, nonce))
     ack_path = gate / ("ack-" + nonce + ".json")
 
+    lock_fd = acquire_trainer_lock(gate, clock=clock, sleep=sleep, wait_seconds=lock_wait_seconds)
+    try:
+        yield from _hold_intent(gate, status_path, model, api, clock, sleep, log, pid, wait_seconds,
+                                refresh_seconds, intent_path, ack_path, nonce)
+    finally:
+        os.close(lock_fd)  # releases LOCK_EX; the kernel would also release it if this process died
+
+
+def _hold_intent(gate, status_path, model, api, clock, sleep, log, pid, wait_seconds, refresh_seconds,
+                 intent_path, ack_path, nonce):
     def write_intent():
         now = clock()
         write_status(intent_path, dict(version=1, pid=pid, nonce=nonce, created_at=now,
@@ -587,21 +577,11 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
             except OSError as exc:
                 log("intent refresh failed: " + type(exc).__name__)
 
-    write_intent()
-    refresher = threading.Thread(target=refresh, daemon=True)
-    refresher.start()
+    refresher = None
     try:
-        # Intent is written: no new gate request is admitted from here on. Wait out in-flight ones,
-        # which may still load a model (see ACTIVE_REQUEST_WAIT_SECONDS).
-        request_deadline = clock() + request_wait_seconds
-        while True:
-            active = live_active_requests(gate, clock(), alive=alive)
-            if not active:
-                break
-            if clock() >= request_deadline:
-                raise GateRefused("studio_gate: %d local gate request(s) still in flight after %ss; refusing to start"
-                                  % (len(active), request_wait_seconds))
-            sleep(ACK_POLL_SECONDS)
+        write_intent()
+        refresher = threading.Thread(target=refresh, daemon=True)
+        refresher.start()
         deadline = clock() + wait_seconds
         while not ack_path.exists():
             if clock() >= deadline:
@@ -618,7 +598,8 @@ def training_gate(gate=None, status_path=None, model=MODEL, api=ollama, clock=ti
         yield intent_path
     finally:
         stop.set()
-        refresher.join(timeout=5)
+        if refresher is not None:
+            refresher.join(timeout=5)
         for path in (intent_path, ack_path):
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()

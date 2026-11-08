@@ -198,14 +198,17 @@ tailnet is the token gate `cortados_router/local_gate.py`, run on the node:
 local-enabled flag). Despite the name it runs on any node that runs the gate, the Studio included: a Studio on AC with
 the flag on passes it; turning the flag off takes that node's lane down.
 
-**S1 training hold (Studio).** S1 training holds the node through the lease/ack handshake of
-`cortados_router/studio_capacity.py` (`training_gate` writes intents in `$CORTADOS_HOME/studio-gate`). While any live
-intent exists there, the gate refuses every forwarded request with a 503 ("S1 training in progress"), so a pin never
-loads a model beside the trainer; it serves again once the intent is removed or expires. A missing directory means no
-trainer has run (free); a directory the gate cannot read is a 503 (fail closed). The reason names no path or pid.
-Override the directory with `--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. On the trainer side, when the
-capacity daemon does not ack in time, `training_gate` itself unloads EVERY model `/api/ps` lists (`keep_alive=0` each)
-and refuses to start training if any remains.
+**S1 training hold (Studio).** The guarantee is a kernel file lock on `$CORTADOS_HOME/studio-gate/node.lock`
+(created 0600; `studio_capacity.node_lock_path`). Every forwarded gate request takes `flock(LOCK_SH|LOCK_NB)` before it
+reaches Ollama and holds it until the response (streamed or not) is fully relayed or fails; `training_gate` takes
+`flock(LOCK_EX)` before writing its intent, polling 1 s for at most 120 s while in-flight requests drain (then
+`GateRefused`, retry later), and holds it for the whole training block. A gate request that finds the exclusive lock
+gets a 503 ("S1 training in progress"; no path, pid or nonce); a lock file it cannot open or create is a 503 with a
+logged warning (fail closed). The kernel drops a dead holder's lock, so there is no expiry or pid logic. The gate's
+intent check is a read-only advisory fast path and never deletes an intent. Override the directory with
+`--studio-gate-dir` / `CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR`. Inside the lock, after the daemon's ack or its timeout,
+`training_gate` unloads EVERY model `/api/ps` lists (`keep_alive=0` each) and refuses to start if any remains or the
+reply is malformed.
 
 **Context length must match the node.** A model's `context_length` here is only the provider's input-fit gate; Ollama
 uses the node's own `OLLAMA_CONTEXT_LENGTH` (or Ollama.app's setting). Set the node to the same value, or requests the

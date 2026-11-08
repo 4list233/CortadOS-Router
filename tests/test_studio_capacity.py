@@ -1,5 +1,7 @@
+import fcntl
 import json
 import os
+import stat
 import time
 from pathlib import Path
 import tempfile
@@ -380,7 +382,7 @@ class HandshakeTests(unittest.TestCase):
         self.intent()
         (self.gate / ("ack-%s.json" % N1)).write_text("{}")
         self.assertEqual(c.live_intents(self.gate, self.now, alive=lambda p: p not in self.dead), [])
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_invalid_intent_schema_takes_malformed_path(self):
         good = dict(version=1, pid=4242, nonce=N1, created_at=self.now, expires_at=self.now + 300)
@@ -430,6 +432,10 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(len(c.live_intents(self.gate, time.time())), 1)
         self.assertEqual(c.live_intents(self.gate, time.time() + c.INTENT_TTL_SECONDS + 1), [])
 
+    def leftovers(self):
+        """Handshake files left in the gate dir; node.lock is permanent by design."""
+        return sorted(p.name for p in self.gate.iterdir() if p.name != c.NODE_LOCK_NAME) if self.gate.exists() else []
+
     def gate_ctx(self, **kw):
         clock = [0.0]
         def sleep(seconds):
@@ -453,7 +459,7 @@ class HandshakeTests(unittest.TestCase):
         self.assertTrue(any("daemon acked" in line for line in self.logs))
         self.assertIn("confirmed no model resident", self.logs[-1])
         self.assertLess(clock[0], c.ACK_WAIT_SECONDS)
-        self.assertFalse(list(self.gate.iterdir()))  # intent + ack removed
+        self.assertEqual(self.leftovers(), [])  # intent + ack removed
 
     def test_daemon_dead_model_resident_trainer_unloads(self):
         # A daemon killed right after a renewal leaves the model resident for a
@@ -465,7 +471,7 @@ class HandshakeTests(unittest.TestCase):
         self.assertGreaterEqual(clock[0], c.ACK_WAIT_SECONDS)
         self.assertTrue(any("not running" in line for line in self.logs))
         self.assertIn("confirmed", self.logs[-1])
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_daemon_dead_unload_unconfirmed_refuses(self):
         def stuck(path, payload=None):
@@ -474,7 +480,7 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(c.GateRefused):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_ollama_not_running_proceeds_with_log(self):
         def refused(path, payload=None):
@@ -491,7 +497,7 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(c.GateRefused):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_live_daemon_without_ack_trainer_unloads_itself(self):
         c.write_status(self.status, dict(version=1, sampled_at=0, expires_at=10**9, reason="hold"))
@@ -509,7 +515,7 @@ class HandshakeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with ctx:
                 self.fail("training must not start")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_fallback_unloads_every_loaded_model(self):
         resident = {c.MODEL, "huihui-other:latest", "third:q4"}
@@ -540,7 +546,7 @@ class HandshakeTests(unittest.TestCase):
             with ctx:
                 self.fail("training must not start")
         self.assertIn("stuck:latest", str(cm.exception))
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def ack_on_sleep(self):
         """Fake daemon: acks every live intent at the first poll, unloading only its own model."""
@@ -576,7 +582,7 @@ class HandshakeTests(unittest.TestCase):
             with ctx:
                 self.fail("training must not start")
         self.assertIn("stuck:latest", str(cm.exception))
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_malformed_ps_reply_refuses(self):
         for reply in ({"models": {}}, {"models": ""}, {}, {"models": [{"size": 1}]}, {"models": [{"name": ""}]},
@@ -586,59 +592,75 @@ class HandshakeTests(unittest.TestCase):
                 with self.assertRaises(c.GateRefused):
                     with ctx:
                         self.fail("training must not start")
-                self.assertFalse(list(self.gate.iterdir()))
+                self.assertEqual(self.leftovers(), [])
 
-    # Active-request markers (local_gate <-> training_gate), deterministic: injected clock, sleep and pid check.
+    # Node lock (local_gate <-> training_gate), deterministic: injected clock and sleep.
+
+    def holder(self, kind=fcntl.LOCK_SH):
+        fd = c.open_node_lock(self.gate)
+        fcntl.flock(fd, kind | fcntl.LOCK_NB)
+        return fd
+
+    def exclusive_free(self):
+        fd = c.open_node_lock(self.gate)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_node_lock_path_shared_and_private(self):
+        self.assertEqual(c.node_lock_path(self.gate), self.gate / "node.lock")
+        os.close(c.open_node_lock(self.gate))
+        self.assertEqual(stat.S_IMODE((self.gate / "node.lock").stat().st_mode), 0o600)
 
     def test_trainer_waits_for_in_flight_request_then_proceeds(self):
         self.loaded = False
-        marker = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
+        fd = self.holder()
         def on_sleep():  # gate_ctx runs this at the first poll only: the request ends while the trainer waits
-            self.assertTrue(marker.exists())
-            c.end_active_request(marker)
+            os.close(fd)
         ctx, clock = self.gate_ctx(on_sleep=on_sleep, wait_seconds=0)
         with ctx as intent_path:
-            self.assertFalse(marker.exists())
             self.assertTrue(intent_path.exists())
-        self.assertEqual(clock[0], c.ACK_POLL_SECONDS)  # waited exactly one poll
+            self.assertFalse(self.exclusive_free())  # LOCK_EX held for the whole block
+            with self.assertRaises(BlockingIOError):
+                self.holder()                         # a gate request cannot take LOCK_SH
+        self.assertEqual(clock[0], c.TRAINER_LOCK_POLL_SECONDS)  # waited exactly one poll
         self.assertIn("confirmed no model resident", self.logs[-1])
-
-    def test_dead_gate_marker_ignored_and_removed(self):
-        self.loaded = False
-        marker = c.begin_active_request(self.gate, pid=999999, clock=lambda: 0.0)
-        ctx, clock = self.gate_ctx(wait_seconds=0, alive=lambda pid: pid != 999999)
-        with ctx:
-            self.assertFalse(marker.exists())
-        self.assertEqual(clock[0], 0.0)  # no wait at all
-
-    def test_old_and_malformed_markers_bounded(self):
-        old = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
-        self.assertEqual(c.live_active_requests(self.gate, c.ACTIVE_REQUEST_MAX_AGE_SECONDS - 1)[0]["path"], old)
-        self.assertEqual(c.live_active_requests(self.gate, c.ACTIVE_REQUEST_MAX_AGE_SECONDS), [])
-        self.assertFalse(old.exists())
-        bad = self.gate / "active-1-x.json"
-        bad.write_text("{bad")
-        self.assertEqual(len(c.live_active_requests(self.gate, time.time())), 1)  # fails closed
-        self.assertEqual(c.live_active_requests(self.gate, time.time() + c.ACTIVE_REQUEST_MAX_AGE_SECONDS + 1), [])
-        self.assertFalse(bad.exists())
+        self.assertTrue(self.exclusive_free())
 
     def test_trainer_times_out_on_in_flight_request(self):
-        marker = c.begin_active_request(self.gate, pid=os.getpid(), clock=lambda: 0.0)
-        ctx, clock = self.gate_ctx(request_wait_seconds=5)
+        fd = self.holder()
+        self.addCleanup(os.close, fd)
+        ctx, clock = self.gate_ctx(lock_wait_seconds=5)
         with self.assertRaises(c.GateRefused) as cm:
             with ctx:
                 self.fail("training must not start")
         self.assertIn("in flight", str(cm.exception))
         self.assertGreaterEqual(clock[0], 5)
-        self.assertEqual([p.name for p in self.gate.iterdir()], [marker.name])  # intent cleaned, marker untouched
-        self.assertFalse([p for p in self.calls if p[0] == "/api/generate"])  # never reached the unload step
+        self.assertEqual(self.leftovers(), [])        # no intent written
+        self.assertEqual(self.calls, [])               # no residency query, no unload attempted
+
+    def test_lock_released_when_block_raises_or_gate_refuses(self):
+        ctx, _ = self.gate_ctx()
+        with self.assertRaises(ValueError):
+            with ctx:
+                raise ValueError("trainer crashed")
+        self.assertTrue(self.exclusive_free())
+        ctx, _ = self.gate_ctx(api=lambda path, payload=None: {"bad": 1}, wait_seconds=0)
+        with self.assertRaises(c.GateRefused):
+            with ctx:
+                self.fail("training must not start")
+        self.assertTrue(self.exclusive_free())
 
     def test_crash_in_block_removes_intent(self):
         ctx, _ = self.gate_ctx()
         with self.assertRaises(ValueError):
             with ctx:
                 raise ValueError("trainer crashed")
-        self.assertFalse(list(self.gate.iterdir()))
+        self.assertEqual(self.leftovers(), [])
 
     def test_intent_refreshed_while_held(self):
         ctx, _ = self.gate_ctx(refresh_seconds=0.01)

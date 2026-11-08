@@ -13,11 +13,13 @@ Run:   python3 -m cortados_router.local_gate --listen <tailscale-ip>
 Check: python3 -m cortados_router.local_gate --listen <tailscale-ip> --print-config
 Env equivalents: CORTADOS_LOCAL_GATE_LISTEN, CORTADOS_LOCAL_GATE_PORT, CORTADOS_LOCAL_GATE_UPSTREAM,
 CORTADOS_LOCAL_GATE_TOKEN_FILE, CORTADOS_LOCAL_GATE_STUDIO_GATE_DIR. Stdlib only.
-While S1 training holds the node (a live intent in the studio-gate dir), every forwarded request is a 503.
+While S1 training holds the node (LOCK_EX on <studio-gate dir>/node.lock), every forwarded request is a 503: each
+request holds LOCK_SH on that file from before it reaches Ollama until its response is fully relayed.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hmac
 import ipaddress
 import http.client
@@ -35,8 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cortados_router.local_resources import pro_local_allowed
-from cortados_router.studio_capacity import (begin_active_request, end_active_request,
-                                             gate_dir as default_studio_gate_dir, live_intents)
+from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
+                                             open_node_lock)
 
 logger = logging.getLogger("cortados.local_gate")
 
@@ -82,7 +84,8 @@ class GateConfigError(ValueError):
 
 
 def training_hold(gate_dir: str | os.PathLike | None, now: float | None = None) -> str | None:
-    """Why the node must not serve now because S1 training holds it, or None when it is free.
+    """Advisory fast path: why the node must not serve now because an S1 trainer announced an intent, or None.
+    Read-only (never deletes or modifies an intent); the guarantee is the node lock in _handle_one.
 
     A pinned request loads a model; during training that would compete with the trainer for unified memory, so any
     live intent in the studio-gate handshake directory (studio_capacity.training_gate writes them) refuses the request.
@@ -96,7 +99,7 @@ def training_hold(gate_dir: str | os.PathLike | None, now: float | None = None) 
         if not gate.exists():
             return None
         os.listdir(gate)                          # Path.glob swallows a permission error; listdir raises it
-        live = live_intents(gate, time.time() if now is None else now)
+        live = live_intents(gate, time.time() if now is None else now, prune=False)  # read-only, advisory
     except OSError as exc:
         logger.warning("studio-gate dir unreadable (%s): refusing local requests", type(exc).__name__)
         return "S1 training state unreadable; local model refused"
@@ -358,24 +361,30 @@ class GateHandler(BaseHTTPRequestHandler):
             body = self._read_body(n, self.server.body_deadline)
             if body is None:                     # too slow or gone: close, freeing the slot
                 return
-        # Admission, Dekker-style with studio_capacity.training_gate: FIRST mark this request active, THEN check
-        # intents (body upload can outlast the power cache, a switch change or a trainer's intent). A trainer that
-        # wrote its intent after this check sees the marker and waits until the finally removes it.
-        marker = None
+        # Admission: hold LOCK_SH on the node lock from here until the response is fully relayed. A trainer holds
+        # LOCK_EX for its whole run (studio_capacity.training_gate), so the kernel guarantees no request reaches
+        # Ollama while training runs, and the trainer cannot start while this request is in flight.
+        lock_fd = None
         if self.server.studio_gate_dir is not None:
             try:
-                marker = begin_active_request(self.server.studio_gate_dir)
+                lock_fd = open_node_lock(self.server.studio_gate_dir)
             except OSError as exc:
-                logger.warning("studio-gate marker unwritable (%s): refusing local request", type(exc).__name__)
-                return self._error(503, "overloaded_error", "S1 training state unwritable; local model refused")
+                logger.warning("studio-gate node lock unopenable (%s): refusing local request", type(exc).__name__)
+                return self._error(503, "overloaded_error", "S1 training state unavailable; local model refused")
         try:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return self._error(503, "overloaded_error",
+                                       "S1 training in progress on this node; local model refused until it ends")
             allowed, reason = self._node_free()
             if not allowed:
                 return self._error(503, "overloaded_error", reason)
             self._forward(method, path, body)
         finally:
-            if marker is not None:
-                end_active_request(marker)
+            if lock_fd is not None:
+                os.close(lock_fd)            # releases LOCK_SH
 
     def _forward(self, method: str, path: str, body: bytes | None) -> None:
         conn = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port,
