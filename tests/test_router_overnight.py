@@ -783,3 +783,98 @@ class NightWindowBudget(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TrainOnlyInWindow(unittest.TestCase):
+    """Forest 2026-11-08: continuous mode trains (gated steps) only inside the night window; labeling runs all day."""
+
+    def _guard(self, now):
+        return night.Guard(latency=lambda: 2.0, memory=lambda: 100.0, budget_s=1, min_free_gb=8, interval_s=0,
+                           max_pause_s=1800, signaller=lambda pid, s: None, log=lambda m: None,
+                           alerter=lambda n, d: None, wall=now, night_window=night.parse_night_window('01:00-07:00'),
+                           night_budget_s=6.0)
+
+    def test_policy_outside_inside_switch_invalid_off(self):
+        day, nite = datetime(2026, 11, 8, 14, 0), datetime(2026, 11, 8, 3, 0)
+        ok, why, dl = night.train_policy(day, window_raw='01:00-07:00', switch_raw='1')
+        self.assertFalse(ok)
+        self.assertIn('training skipped: outside night window 01:00-07:00; next window starts 2026-11-09 01:00', why)
+        self.assertIsNone(dl)
+        ok, why, dl = night.train_policy(nite, window_raw='01:00-07:00', switch_raw='1')
+        self.assertTrue(ok)
+        self.assertEqual(dl, datetime(2026, 11, 8, 7, 0))
+        self.assertEqual(night.train_policy(day, window_raw='01:00-07:00', switch_raw='0')[::2], (True, None))
+        ok, why, _ = night.train_policy(nite, window_raw='25:00-07:00', switch_raw='1')
+        self.assertFalse(ok)   # invalid window fails closed even at 03:00
+        self.assertIn('invalid', why)
+        self.assertFalse(night.train_policy(nite, window_raw='off', switch_raw='1')[0])
+        # midnight-crossing window: deadline is tomorrow's end
+        ok, _, dl = night.train_policy(datetime(2026, 11, 8, 23, 30), window_raw='23:00-05:00', switch_raw='1')
+        self.assertEqual((ok, dl), (True, datetime(2026, 11, 9, 5, 0)))
+
+    def _env_cmd(self, tmp):
+        out = Path(tmp) / 'env'
+        return out, [sys.executable, '-c', "import os,sys; open(sys.argv[1],'w').write("
+                     "os.environ['CORTADOS_S1_TRAIN_ALLOWED']+'|'+os.environ['CORTADOS_S1_TRAIN_SKIP_REASON'])", str(out)]
+
+    def test_outside_window_child_told_to_skip_and_loop_sleeps_idle(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
+                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
+            out, cmd = self._env_cmd(tmp)
+            sleeps = []
+            g = self._guard(lambda: datetime(2026, 11, 8, 14, 0))
+            night.run_continuous(cmd, g, result_file=Path(tmp) / 'r', idle_s=900, sleep=sleeps.append, cycles=1, poll_s=0)
+            allowed, reason = out.read_text().split('|', 1)
+            self.assertEqual(allowed, '0')
+            self.assertIn('outside night window', reason)
+            self.assertEqual(sleeps[-1], 900)   # rc 0, no 'worked': idle interval, not a hot loop, not a failure backoff
+            self.assertEqual(night._load_failures(Path(tmp) / 'r'), 0)
+
+    def test_inside_window_and_switch_off_allow_training(self):
+        for env, now in (({'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1'}, datetime(2026, 11, 8, 3, 0)),
+                         ({'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '0'}, datetime(2026, 11, 8, 14, 0))):
+            with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {**env, 'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
+                out, cmd = self._env_cmd(tmp)
+                rc, _ = night.run_cycle(cmd, self._guard(lambda: now), result_file=Path(tmp) / 'r', poll_s=0,
+                                        sleep=lambda s: None)
+                self.assertEqual((rc, out.read_text()), (0, '1|'))
+
+    def test_invalid_window_means_no_training(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
+                                                                          'CORTADOS_S1_NIGHT_WINDOW': 'nonsense'}):
+            out, cmd = self._env_cmd(tmp)
+            night.run_cycle(cmd, self._guard(lambda: datetime(2026, 11, 8, 3, 0)), result_file=Path(tmp) / 'r', poll_s=0,
+                            sleep=lambda s: None)
+            self.assertTrue(out.read_text().startswith('0|training skipped: CORTADOS_S1_NIGHT_WINDOW invalid'))
+
+    def test_window_end_terminates_group_and_next_cycle_starts_at_once(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
+                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
+            # a "trainer" grandchild in the same group that ignores nothing: TERM must reach it through the group
+            marker = Path(tmp) / 'grandchild.pid'
+            cmd = ['/bin/bash', '-c', f'{sys.executable} -c "import os,time; open(\'{marker}\',\'w\').write(str(os.getpid())); '
+                   f'time.sleep(60)" & wait']
+            clock = iter([datetime(2026, 11, 8, 6, 59)] + [datetime(2026, 11, 8, 6, 59, 30)] * 3
+                         + [datetime(2026, 11, 8, 7, 0)] * 1000)
+            ticks = []
+            def sleep(s):
+                ticks.append(s)
+                _time.sleep(0.05)
+            g = self._guard(lambda: next(clock))
+            t0 = _time.monotonic()
+            rc, res = night.run_cycle(cmd, g, result_file=Path(tmp) / 'r', poll_s=0, sleep=sleep, grace_end=5)
+            self.assertEqual(res, 'window_end')
+            self.assertLess(_time.monotonic() - t0, 30)
+            pid = int(marker.read_text())
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(50):
+                    os.kill(pid, 0)
+                    _time.sleep(0.1)
+            # the loop treats it as neither a failure nor a reason to wait
+            sleeps = []
+            clock2 = iter([datetime(2026, 11, 8, 6, 59)] + [datetime(2026, 11, 8, 7, 0)] * 1000)
+            g2 = self._guard(lambda: next(clock2))
+            night.run_continuous([sys.executable, '-c', 'import time; time.sleep(30)'], g2, result_file=Path(tmp) / 'r2',
+                                 idle_s=900, sleep=lambda s: (sleeps.append(s), _time.sleep(0.01)), cycles=1, poll_s=0)
+            self.assertNotIn(900, sleeps)
+            self.assertEqual(night._load_failures(Path(tmp) / 'r2'), 0)

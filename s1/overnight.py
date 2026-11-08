@@ -195,7 +195,7 @@ def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: st
     if in_night_window(window, now):
         return True, f"inside night window {s:%H:%M}-{e:%H:%M}: training allowed", _window_end(window, now)
     return False, (f"training skipped: outside night window {s:%H:%M}-{e:%H:%M}; "
-                   f"next window starts {_next_start(window, now):%Y-%m-%d %H:%M %Z}"), None
+                   f"next window starts {_next_start(window, now).strftime('%Y-%m-%d %H:%M %Z').strip()}"), None
 
 
 # Grace between the window-end SIGTERM and SIGKILL. Longer than studio_capacity's TRAINING_STOP_GRACE_SECONDS (30 s), so the gate

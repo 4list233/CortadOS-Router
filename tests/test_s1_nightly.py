@@ -394,6 +394,19 @@ PY
         self.assertIn("skipped: no new labels", log)
         self.assertEqual((rc, res), (0, None), log)
 
+    def test_outside_night_window_labels_but_skips_every_gated_step(self):
+        # Forest 2026-11-08: overnight.py sets CORTADOS_S1_TRAIN_ALLOWED=0 outside the window; labeling still counts as work.
+        reason = "training skipped: outside night window 01:00-07:00; next window starts 2026-11-09 01:00 EST"
+        rc, log, run, res = self._cycle(STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=0, CORTADOS_S1_TRAIN_SKIP_REASON=reason)
+        self.assertEqual((rc, res), (0, "worked"), log)
+        self.assertIn(reason, log)
+        self.assertNotIn("training tonight", log)
+        self.assertNotIn("studio gate", log)
+        self.assertFalse((self.s1 / run / "adapter").exists(), log)
+        rc, log, run, res = self._cycle(STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=1)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("training tonight", log)
+
     def test_cycle_result_absent_on_label_failure(self):
         rc, log, _, res = self._cycle(STUB_LABEL_RC=1)
         self.assertNotEqual(rc, 0, log)
