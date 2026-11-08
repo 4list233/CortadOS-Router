@@ -71,9 +71,12 @@ def cmd_build(args) -> int:
     md_path = os.path.join(args.out, "handoff.md")
     man_path = os.path.join(args.out, "handoff.manifest.json")
     extra_paths = {os.path.join(args.out, name): text for name, text in sorted(extra.items())}
-    # A stale overflow file from an earlier build would point a reader at the wrong text: refuse/replace it too.
-    stale = [os.path.join(args.out, n) for n in handoff.OVERFLOW_FILES.values()
-             if os.path.join(args.out, n) not in extra_paths and os.path.lexists(os.path.join(args.out, n))]
+    # Overflow files are content-addressed (handoff.overflow_file_name), so this build's files never share a name
+    # with a previous generation's unless the bytes are identical: writing them cannot change what the published
+    # handoff.md points at. Earlier generations (and orphans left by a failed rebuild) are "stale": they are refused
+    # without --force like everything else, and removed only after the new handoff.md and manifest are published.
+    stale = [os.path.join(args.out, n) for n in sorted(os.listdir(args.out))
+             if handoff.OVERFLOW_FILE_RE.match(n) and os.path.join(args.out, n) not in extra_paths]
     for p in [md_path, man_path] + list(extra_paths) + stale:  # check all first so a refusal leaves neither file half-updated
         if os.path.islink(p) or (os.path.exists(p) and not args.force):
             print("refusing to overwrite %s (%s)" % (p, "symlink" if os.path.islink(p) else "use --force"),
@@ -84,8 +87,9 @@ def cmd_build(args) -> int:
             _write_private(p, text, args.force)
         _write_private(md_path, md, args.force)
         _write_private(man_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", args.force)
-        # Stale overflow files go only after the new handoff.md and manifest are published: a failed rebuild must
-        # leave the old handoff's full text in place.
+        # Only now do both published files reference the new generation. If either write fails, keep ALL overflow
+        # generations: a manifest failure can leave the new handoff.md alongside the old manifest, and both sets of
+        # pointers must still resolve. A later successful build removes any unreferenced files.
         for p in stale:
             os.unlink(p)
     except WriteRefused as exc:
@@ -129,9 +133,10 @@ def classify(pol: dict, pct: Optional[float], used: Optional[float], window: Opt
              now: Optional[float] = None) -> Tuple[str, str]:
     """Level for one status sample. Thresholds are min(pct of W, cap) (and force <= price cliff - margin for an
     API-billed model in policy.price_cliff_tokens); with no window size the absolute caps and cliffs still apply to a
-    known token count. `history` = used tokens at earlier turn ends, oldest first; `restarts` = restart events
-    ({"ts", "forced"}). Levels: ok, warn (checkpoint at the next turn boundary), checkpoint, force, escalate (circuit
-    breaker: stop, tell the owner, no automatic restart)."""
+    known token count. `history` = used tokens at earlier turn ends, oldest first (a current sample equal to the last
+    entry is a refresh of that same turn, not a new turn); `restarts` = restart events ({"ts", "forced"}). Levels: ok,
+    warn (checkpoint at the next turn boundary), checkpoint, force, escalate (circuit breaker: stop, tell the owner, no
+    automatic restart)."""
     level, reason = _level(pol, pct, used, window, history, model, idle_s, ttl_class, fresh)
     if level in ("checkpoint", "force"):
         n = forced_restarts_in_window(pol, restarts, time.time() if now is None else now)
@@ -168,7 +173,12 @@ def _level(pol, pct, used, window, history, model, idle_s, ttl_class, fresh) -> 
             return name, "%d tokens >= %s %d%s" % (used, name, th[name], note) if used >= th[name] else \
                 "used %.1f%% >= %s %s%%" % (pct, name, pol[name]["pct"])
     v = pol["velocity"]
-    samples = [x for x in history if x is not None] + [used]
+    prior = [x for x in history if x is not None]
+    # The history holds turn ends (the status line appends a sample only when the count changed) while the status line
+    # itself refreshes several times per turn. A sample equal to the last recorded turn end is therefore the same turn
+    # seen again, not a zero-growth turn: appending it would dilute the mean and clear a "last turn added" verdict
+    # (10000 -> 35000 -> 35000 read ok -> checkpoint -> ok).
+    samples = prior if prior and prior[-1] == used else prior + [used]
     growths = [b - a for a, b in zip(samples, samples[1:])][-v["lookback_turns"]:]
     if growths:
         if window and growths[-1] >= window * v["single_turn_pct_of_window"] / 100.0:

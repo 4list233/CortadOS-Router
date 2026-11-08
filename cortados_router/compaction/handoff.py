@@ -11,9 +11,9 @@ The manifest records exactly which message (`m`) / tool event (`e`) indexes went
 phase 2 can turn later reuse into labels. Same Session + same policy -> byte-identical output.
 
 Over the total budget, sections are trimmed lowest priority first: excerpts, files, decisions, recency pin. Goal and
-Standing rules are never dropped: over their cap, the full text goes to a sibling file (handoff.goal-full.md /
-handoff.rules-full.md, returned by build_handoff_files) and the section shows head + tail and a "full text: <file>"
-pointer. HandoffBudgetError only when a cap cannot hold even that (pathological policy).
+Standing rules are never dropped: over their cap, the full text goes to a sibling file (handoff.goal-full.<hash>.md /
+handoff.rules-full.<hash>.md, content-addressed, returned by build_handoff_files) and the section shows head + tail
+and a "full text: <file>" pointer. HandoffBudgetError only when a cap cannot hold even that (pathological policy).
 """
 from __future__ import annotations
 
@@ -138,7 +138,10 @@ def _rules(session: Session) -> List[dict]:
         for line in m.text.splitlines():
             s = line.strip()
             if s and RULE_RE.search(s):
-                key = " ".join(s.lower().split())
+                # Exact line only (case and internal whitespace kept): "Never modify `Token`." and "Never modify
+                # `token`." are different constraints, as are literals that differ only in spacing. Conflating them
+                # silently dropped one of two rules.
+                key = s
                 latest.pop(key, None)  # newest wins: re-insert at the newest position
                 latest[key] = {"kind": "m", "index": m.index, "line": "- %s [m%d]" % (s, m.index)}
     return list(latest.values())
@@ -285,7 +288,18 @@ def _victim(key: str, items: List[dict]) -> dict:
     return items[0]
 
 
-OVERFLOW_FILES = {"goal": "handoff.goal-full.md", "rules": "handoff.rules-full.md"}
+OVERFLOW_FILES = {"goal": "handoff.goal-full", "rules": "handoff.rules-full"}  # name prefixes; see overflow_file_name
+# Every generation of an overflow file, including the unsuffixed names written before they were content-addressed, so
+# a rebuild can find and remove the ones the new handoff no longer points at.
+OVERFLOW_FILE_RE = re.compile(r"^handoff\.(?:goal|rules)-full(?:\.[0-9a-f]{16})?\.md$")
+
+
+def overflow_file_name(key: str, text: str) -> str:
+    """Content-addressed sibling file name: <prefix>.<sha256(text)[:16]>.md. A rebuild whose section text differs
+    writes a NEW file and never overwrites the one the published handoff.md points at (a failed rebuild used to leave
+    the old handoff pointing at the new rules); identical text maps to the same, byte-identical file. 16 hex chars
+    (64 bits), the same length as handoff_id: a handful of files per directory cannot collide in practice."""
+    return "%s.%s.md" % (OVERFLOW_FILES[key], hashlib.sha256(text.encode()).hexdigest()[:16])
 
 
 def build_handoff(session: Session, policy: dict, out_dir: str = "") -> Tuple[str, dict]:
@@ -377,9 +391,10 @@ def build_handoff_files(session: Session, policy: dict, out_dir: str = "") -> Tu
     for key in ("goal", "rules"):
         if sec_tokens(key) > b[key]:
             full_body = "\n".join(it["line"] for it in sections[key])
-            name = OVERFLOW_FILES[key]
+            text = "# %s (full text)\n\n%s\n" % (titles[key], full_body)
+            name = overflow_file_name(key, text)
             where = os.path.join(os.path.abspath(out_dir), name) if out_dir else name
-            extra_files[name] = "# %s (full text)\n\n%s\n" % (titles[key], full_body)
+            extra_files[name] = text
             override[key] = _overflow_render(titles[key], full_body, where, b[key])
             overflow[key] = {"file": name, "path": where, "full_tokens": est_tokens(full_body)}
     for key in ("recency_pin", "decisions", "in_flight", "files", "excerpts"):

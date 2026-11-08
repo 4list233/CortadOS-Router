@@ -16,7 +16,8 @@ uncontrolled auto-compaction of either client. Three phases share the record sha
   min(55%, 150k), checkpoint min(70%, 200k), force min(85%, 300k) — a 200k window binds on the percentages, a 1M
   window on the caps — and force <= price cliff - 10k for API-billed models listed in `price_cliff_tokens`
   (subscription sessions have none). Velocity: checkpoint if current + 2 x mean growth of the last 3 turns >= force,
-  or one turn adds >= 10% of W. At >= warn, checkpoint at the turn boundary, and before resuming after an idle gap
+  or one turn adds >= 10% of W. Unchanged status refreshes reuse the last sample, rather than inventing zero-growth
+  turns. At >= warn, checkpoint at the turn boundary, and before resuming after an idle gap
   longer than the cache TTL. Self-handoff deadline 4 min after the current tool ends, forced at 6 min. No time-based
   timer. Circuit breaker: 2 forced restarts in 30 min, or a fresh session opening above 50% of the checkpoint
   threshold -> stop and escalate. The `pruning` and `provider_tool_result_cap_tokens` values are for phase 1, which
@@ -24,13 +25,16 @@ uncontrolled auto-compaction of either client. Three phases share the record sha
 - **Handoff** (`compaction/handoff.py`): `build_handoff(session, policy) -> (markdown, manifest)`. Sections in order,
   each under its own cap (16k total; tokens estimated as ceil(chars / chars_per_token): 2.5 for Claude Code, 4 for
   Codex, 2.5 when unknown): Goal (latest user prompt verbatim, 400), Recency pin (the 3 earlier recent user turns
-  verbatim + the last 2 tool calls raw, 4000), Standing rules (whole user-message lines containing a rule word, deduped by line,
-  newest wins, 1500), Decisions (1500), In-flight (interrupted calls flagged VERIFY; branches, PRs, hashes, task ids,
-  worktrees from the last 8 messages, 2000), Files touched (<= 40 paths with edit counts and tools, 800), Ranked
+  verbatim + the last 2 tool calls raw, 4000), Standing rules (whole user-message lines containing a rule word, deduped by
+  exact line with case and internal whitespace preserved, newest wins, 1500), Decisions (1500), In-flight (interrupted
+  calls flagged VERIFY; branches, PRs, hashes, task ids, worktrees from the last 8 messages, 2000), Files touched (<= 40
+  paths with edit counts and tools, 800), Ranked
   excerpts (+3 per shared goal word, +2 per load-bearing signal, recency bonus; greedy fill, then chronological; tool
   results head + tail with their char count, 6000). Over the total: trim excerpts, files, decisions, then recency
   pin. Goal and rules are never dropped: over their cap the full text goes to a 0600 sibling file
-  (`handoff.goal-full.md` / `handoff.rules-full.md`) and the section shows head + tail plus "full text: <absolute path> (N
+  (`handoff.goal-full.<hash>.md` / `handoff.rules-full.<hash>.md`, named by the sha256 of its content so a rebuild never
+  overwrites the file the published handoff points at; earlier generations are removed only after the new handoff and
+  manifest are written) and the section shows head + tail plus "full text: <absolute path> (N
   tokens) — read it before acting" (recorded as `overflow` in the manifest); only a cap too small for even that fails. The manifest lists every message / event index
   per section with scores. Same input -> same bytes.
 - **CLI** (`compaction/checkpoint.py`): `build` writes `handoff.md` + `handoff.manifest.json` (0600, no overwrite

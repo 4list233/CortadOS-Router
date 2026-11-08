@@ -432,14 +432,16 @@ class ReviewRegressionTests(unittest.TestCase):
         md, man, extra = handoff.build_handoff_files(s, self.pol)
         sec = man["sections"]["goal"]
         self.assertLessEqual(sec["tokens"], sec["budget"])
-        self.assertEqual(sec["overflow"]["file"], "handoff.goal-full.md")
+        name = sec["overflow"]["file"]
+        self.assertRegex(name, r"^handoff\.goal-full\.[0-9a-f]{16}\.md$")
+        self.assertEqual(name, handoff.overflow_file_name("goal", extra[name]))  # content-addressed
         self.assertGreater(sec["overflow"]["full_tokens"], sec["budget"])
         goal = md[md.index("## Goal"):md.index("## Recency pin")]
         self.assertIn("START", goal)
         self.assertIn("END", goal)
-        self.assertIn("full text: handoff.goal-full.md (%d tokens)" % sec["overflow"]["full_tokens"], goal)
+        self.assertIn("full text: %s (%d tokens)" % (name, sec["overflow"]["full_tokens"]), goal)
         self.assertIn("read it before acting", goal)
-        self.assertIn(prompt.strip(), extra["handoff.goal-full.md"])
+        self.assertIn(prompt.strip(), extra[name])
         self.assertEqual([it["index"] for it in sec["items"]], [0])
 
     def test_rules_overflow_goes_to_sibling_file_via_cli(self):
@@ -448,12 +450,13 @@ class ReviewRegressionTests(unittest.TestCase):
         d = tempfile.mkdtemp()
         rc, _, err = self.run_cli("build", "--transcript", _write(lines), "--out", d)
         self.assertEqual(rc, 0, err)
-        full = os.path.join(d, "handoff.rules-full.md")
+        man = json.loads(_read(os.path.join(d, "handoff.manifest.json")))
+        name = man["sections"]["rules"]["overflow"]["file"]
+        self.assertRegex(name, r"^handoff\.rules-full\.[0-9a-f]{16}\.md$")
+        full = os.path.join(d, name)
         self.assertEqual(stat.S_IMODE(os.stat(full).st_mode), 0o600)
         self.assertIn("Never do thing number 299 ever.", _read(full))
         self.assertIn("Never do thing number 150 ever.", _read(full))
-        man = json.loads(_read(os.path.join(d, "handoff.manifest.json")))
-        self.assertEqual(man["sections"]["rules"]["overflow"]["file"], "handoff.rules-full.md")
         self.assertLessEqual(man["sections"]["rules"]["tokens"], man["sections"]["rules"]["budget"])
         self.assertIn("full text: %s " % full, _read(os.path.join(d, "handoff.md")))
         # a rebuild without --force refuses (overflow file exists too); with --force a short build drops the stale file
@@ -559,7 +562,9 @@ class Round2RegressionTests(unittest.TestCase):
         md, man = handoff.build_handoff(Session("s", "claude-code", msgs, ()), self.pol)
         rules = md[md.index("## Standing rules"):md.index("## Decisions")]
         self.assertIn("never run cleanup from .   or /important/production. [m1]", rules)
-        self.assertEqual(rules.lower().count("cleanup"), 1)  # deduped by line, newest wins
+        # Round-3 exact-line dedup preserves both: case/internal whitespace can change a constraint.
+        self.assertIn("Never run cleanup from . or /important/production. [m0]", rules)
+        self.assertEqual(rules.lower().count("cleanup"), 2)
         self.assertNotIn("unrelated", rules)
 
     def test_2_structured_envelope_output_serialized(self):
@@ -583,7 +588,8 @@ class Round2RegressionTests(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.assertEqual(self.run_cli("build", "--transcript", _write(self._overflowing_rules_lines()),
                                       "--out", d)[0], 0)
-        full = os.path.join(d, "handoff.rules-full.md")
+        # Round-3 overflow files are content-addressed; follow the published pointer, not a fixed filename.
+        full = json.loads(_read(os.path.join(d, "handoff.manifest.json")))["sections"]["rules"]["overflow"]["path"]
         real = checkpoint._write_private
 
         def failing(path, text, force):
@@ -664,6 +670,111 @@ class Round2RegressionTests(unittest.TestCase):
         need = handoff.section_min_tokens("files", min(pol["chars_per_token"].values()))
         r["section_budgets"]["value"]["files"] = need
         policy.validate(r)
+
+
+class Round3RegressionTests(unittest.TestCase):
+    """One test per finding of the df56ff0 review."""
+
+    def setUp(self):
+        self.pol = load_policy()
+
+    def run_cli(self, *argv):
+        return CliTests.run_cli(self, *argv)
+
+    @staticmethod
+    def _overflowing_rules_lines(template):
+        return [cc_line("user", " ".join(template % i for i in range(300))), cc_line("user", "go")]
+
+    def test_1_failed_overflow_to_overflow_rebuild_keeps_old_generation(self):
+        old_lines = self._overflowing_rules_lines("Never do thing number %d ever.")
+        new_lines = self._overflowing_rules_lines("Always do chore number %d first.")
+        for fail_at in ("handoff.md", "handoff.manifest.json"):
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as d:
+                self.assertEqual(self.run_cli("build", "--transcript", _write(old_lines), "--out", d)[0], 0)
+                md_path = os.path.join(d, "handoff.md")
+                man_path = os.path.join(d, "handoff.manifest.json")
+                before, before_man = _read(md_path), _read(man_path)
+                old_full = json.loads(before_man)["sections"]["rules"]["overflow"]["path"]
+                old_text = _read(old_full)
+                self.assertIn("full text: %s " % old_full, before)
+                self.assertIn("Never do thing number 150 ever.", old_text)
+                real = checkpoint._write_private
+                written = []
+
+                def failing(path, text, force):
+                    if os.path.basename(path) == fail_at:
+                        raise OSError("injected failure")
+                    result = real(path, text, force)
+                    written.append(path)
+                    return result
+                checkpoint._write_private = failing
+                try:
+                    with self.assertRaisesRegex(OSError, "injected failure"):
+                        self.run_cli("build", "--transcript", _write(new_lines), "--out", d, "--force")
+                finally:
+                    checkpoint._write_private = real
+                # The old manifest's pointer must still resolve to exactly its original bytes.
+                self.assertEqual(_read(man_path), before_man)
+                self.assertEqual(_read(old_full), old_text)
+                new_full = next(p for p in written if "-full" in os.path.basename(p))
+                self.assertNotEqual(new_full, old_full)
+                self.assertIn("Always do chore number 150 first.", _read(new_full))
+                if fail_at == "handoff.md":
+                    self.assertEqual(_read(md_path), before)
+                else:
+                    # The markdown was published before the manifest failed: its NEW pointer must resolve too.
+                    self.assertIn("full text: %s " % new_full, _read(md_path))
+                # Cleanup must wait for BOTH publications, including during a retry.
+                def publishing(path, text, force):
+                    self.assertTrue(os.path.exists(old_full), path)
+                    return real(path, text, force)
+                checkpoint._write_private = publishing
+                try:
+                    rc = self.run_cli("build", "--transcript", _write(new_lines), "--out", d, "--force")[0]
+                finally:
+                    checkpoint._write_private = real
+                self.assertEqual(rc, 0)
+                man = json.loads(_read(man_path))
+                self.assertEqual(man["sections"]["rules"]["overflow"]["path"], new_full)
+                self.assertFalse(os.path.exists(old_full))
+                self.assertIn("full text: %s " % new_full, _read(md_path))
+                self.assertEqual(stat.S_IMODE(os.stat(new_full).st_mode), 0o600)
+                self.assertEqual([f for f in os.listdir(d) if "-full" in f], [os.path.basename(new_full)])
+
+    def test_2_rule_dedup_is_exact_line_only(self):
+        msgs = (Message("s", 0, "user", "Never modify `Token`.\nAlways print `a  b` verbatim.\nOnly use \"Foo\" here."),
+                Message("s", 1, "user", "Never modify `token`.\nAlways print `a b` verbatim.\nOnly use \"Foo\" here."),
+                Message("s", 2, "user", "go"))
+        md, man = handoff.build_handoff(Session("s", "claude-code", msgs, ()), self.pol)
+        rules = md[md.index("## Standing rules"):md.index("## Decisions")]
+        # distinct identifiers (case) and distinct literals (internal whitespace) are distinct constraints: all kept
+        self.assertIn("- Never modify `Token`. [m0]", rules)
+        self.assertIn("- Never modify `token`. [m1]", rules)
+        self.assertIn("- Always print `a  b` verbatim. [m0]", rules)
+        self.assertIn("- Always print `a b` verbatim. [m1]", rules)
+        # an identical line is still deduplicated, newest wins
+        self.assertEqual(rules.count('Only use "Foo" here.'), 1)
+        self.assertIn('- Only use "Foo" here. [m1]', rules)
+        self.assertEqual([it["index"] for it in man["sections"]["rules"]["items"]], [0, 0, 1, 1, 1])
+
+    def test_3_unchanged_refresh_does_not_clear_velocity_checkpoint(self):
+        # the current sample equals the last recorded turn end: the same turn, not a zero-growth one
+        level, reason = checkpoint.classify(self.pol, None, 35000, 200000, history=[10000, 35000])
+        self.assertEqual((level, reason.startswith("velocity: last turn added 25000")), ("checkpoint", True), reason)
+        level, _ = checkpoint.classify(self.pol, None, 36000, 200000, history=[10000, 35000])
+        self.assertEqual(level, "ok")  # a real next turn that added little: the velocity verdict is over
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, CORTADOS_HOME=home, REPO=REPO)
+        script = os.path.join(REPO, "integrations", "checkpoint", "statusline.sh")
+
+        def run(tokens):
+            payload = json.dumps({"session_id": "v", "context_window": {"total_input_tokens": tokens,
+                                                                        "context_window_size": 200000}})
+            return subprocess.run(["sh", script], input=payload, env=env, capture_output=True, text=True,
+                                  check=True).stdout.split()[0]
+        self.assertEqual([run(n) for n in (10000, 35000, 35000)], ["ok", "checkpoint", "checkpoint"])
+        hist = _read(os.path.join(home, "checkpoint", "v.history")).split()
+        self.assertEqual(hist, ["10000", "35000"])  # the unchanged refresh did not become a turn
 
 
 if __name__ == "__main__":

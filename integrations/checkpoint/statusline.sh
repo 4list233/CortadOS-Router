@@ -23,7 +23,8 @@ else
   fresh="--fresh"
 fi
 cd "$REPO"
-# check reads the history BEFORE this sample is appended (history = earlier turn ends)
+# check reads the history BEFORE this sample is appended (history = earlier turn ends). An unchanged refresh is
+# already the history's last line; check treats a sample equal to it as the same turn, so it does not advance velocity.
 python3 -B -m cortados_router.compaction.checkpoint check --status-file "$tmp" --history-file "$hist" $fresh \
   ${idle:+--idle-seconds "$idle"} --restart-log "$dir/restarts.jsonl" --breaker-file "$dir/breaker.json" \
   ${CORTADOS_CACHE_TTL_CLASS:+--cache-ttl-class "$CORTADOS_CACHE_TTL_CLASS"} \
