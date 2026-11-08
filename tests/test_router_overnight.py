@@ -1189,3 +1189,119 @@ class WindowEndDrainAndDst(unittest.TestCase):
         self.assertFalse(night.stop_group_drained(child, grace=0.5))
         self.assertLess(_time.monotonic() - t0, 5)
         self.assertIsNotNone(child.poll())
+
+
+class DrainResendsTerm(unittest.TestCase):
+    """A TERM latched by bash between nightly.sh steps lets the next gated() step start after the supervisor's TERM: that new
+    gate must still get a TERM (the periodic re-send) and stop its own-session trainer before the grace ends."""
+    # the gate-like fixtures' temp dir, group cleanup and lock assertion, shared with WindowEndDrainAndDst
+    READY_TIMEOUT_S = WindowEndDrainAndDst.READY_TIMEOUT_S
+    _fixture_dir = WindowEndDrainAndDst._fixture_dir
+    _kill_fixture_groups = staticmethod(WindowEndDrainAndDst._kill_fixture_groups)
+    _assert_gate_released = WindowEndDrainAndDst._assert_gate_released
+
+    def _late_gate_cycle(self, tmp):
+        """Bash leader that ignores the first TERM, then starts a gate-like process (installs its TERM handler first, like
+        studio_capacity's StopRequest, takes LOCK_EX, runs the trainer in its own session with the fd). Returns paths."""
+        lock, released, child_pid = tmp / 'lock', tmp / 'released', tmp / 'child.pid'
+        leader_ready, gate_termed = tmp / 'leader_ready', tmp / 'gate_termed'
+        (tmp / 'trainer.py').write_text(
+            "import os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+            f"open({str(child_pid)!r}, 'w').write(str(os.getpid()))\n"
+            "while True:\n    time.sleep(0.05)\n")
+        (tmp / 'gate.py').write_text(
+            "import fcntl, os, signal, subprocess, sys, time\n"
+            "stop = []\n"
+            "signal.signal(signal.SIGTERM, lambda *a: stop.append(1))\n"
+            f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            f"p = subprocess.Popen([sys.executable, {str(tmp / 'trainer.py')!r}], pass_fds=(fd,), start_new_session=True)\n"
+            "while not stop:\n    time.sleep(0.02)\n"
+            f"open({str(gate_termed)!r}, 'w').write('x')\n"
+            "os.killpg(p.pid, signal.SIGTERM)\n"
+            "try:\n    p.wait(timeout=3)\n"
+            "except subprocess.TimeoutExpired:\n    os.killpg(p.pid, signal.SIGKILL); p.wait()\n"
+            f"open({str(released)!r}, 'w').write('x')\n")
+        script = (f"n=0; trap 'n=$((n+1)); [ $n -ge 2 ] && exit 130' TERM\n"
+                  f"echo $$ > {tmp / 'cycle.pgid'}; touch {leader_ready}\n"
+                  "while [ $n -lt 1 ]; do sleep 0.05; done\n"   # the first TERM is latched; the next step starts anyway
+                  f"{sys.executable} {tmp / 'gate.py'}\n"
+                  "while :; do sleep 0.05; done\n")
+        return ['/bin/bash', '-c', script], lock, leader_ready, gate_termed, released, child_pid
+
+    def _start(self, tmp, cmd, leader_ready):
+        child = subprocess.Popen(cmd, start_new_session=True)
+        self.addCleanup(lambda: child.poll() is None and (child.kill(), child.wait()))
+        end = _time.monotonic() + self.READY_TIMEOUT_S
+        while not leader_ready.exists():
+            self.assertLess(_time.monotonic(), end, 'fixture leader never got ready')
+            _time.sleep(0.02)
+        return child
+
+    def test_gate_started_after_the_first_term_gets_the_resent_term(self):
+        tmp = self._fixture_dir()
+        cmd, lock, leader_ready, gate_termed, released, child_pid = self._late_gate_cycle(tmp)
+        child = self._start(tmp, cmd, leader_ready)
+        t0 = _time.monotonic()
+        self.assertTrue(night.stop_group_drained(child, grace=20, resend_s=2), 'cycle group did not drain within the grace')
+        self.assertLess(_time.monotonic() - t0, 20)
+        self.assertTrue(gate_termed.exists(), 'the late gate never received a TERM')
+        self._assert_gate_released(lock, released, child_pid)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(child.pid, 0)
+
+    def test_without_resend_the_late_gate_is_killed_and_orphans_its_trainer(self):
+        # Control: the fixture really reproduces the bug (one TERM only -> the late gate is SIGKILLed unreleased).
+        tmp = self._fixture_dir()
+        cmd, lock, leader_ready, gate_termed, released, child_pid = self._late_gate_cycle(tmp)
+        child = self._start(tmp, cmd, leader_ready)
+        end = _time.monotonic() + self.READY_TIMEOUT_S
+        orig_sleep = _time.sleep
+        def sleep(s):   # hold the grace open until the late trainer is up, so the KILL hits a running gate
+            if not child_pid.exists():
+                self.assertLess(_time.monotonic(), end, 'late trainer never started')
+            orig_sleep(s)
+        clock = [0.0]
+        def fake_clock():
+            if child_pid.exists():
+                clock[0] += 10
+            return clock[0]
+        self.assertFalse(night.stop_group_drained(child, grace=5, resend_s=1e9, clock=fake_clock, sleep=sleep))
+        self.assertFalse(gate_termed.exists())
+        self.assertFalse(released.exists())
+
+    def test_resend_interval_is_respected(self):
+        t = [0.0]
+        sent = []
+        def killpg(pgid, sig):
+            sent.append((t[0], sig))
+        def sleep(s):
+            t[0] += s
+        child = Mock(pid=4242)
+        child.poll.return_value = None
+        with patch.object(night.os, 'killpg', killpg):
+            self.assertFalse(night.stop_group_drained(child, grace=12, poll_s=1, resend_s=5,
+                                                      clock=lambda: t[0], sleep=sleep))
+        terms = [ts for ts, sig in sent if sig == signal.SIGTERM]
+        self.assertEqual(terms, [0.0, 5.0, 10.0])
+        self.assertEqual(sent[0], (0.0, signal.SIGCONT))
+        self.assertEqual(sent[-1], (12.0, signal.SIGKILL))
+        child.wait.assert_called_once_with()
+
+    def test_resend_stops_once_the_group_has_drained(self):
+        t = [0.0]
+        sent = []
+        def killpg(pgid, sig):
+            sent.append((t[0], sig))
+            if sig == 0 and t[0] >= 7:
+                raise ProcessLookupError
+        def sleep(s):
+            t[0] += s
+        child = Mock(pid=4242)
+        child.poll.return_value = None
+        with patch.object(night.os, 'killpg', killpg):
+            self.assertTrue(night.stop_group_drained(child, grace=60, poll_s=1, resend_s=5,
+                                                     clock=lambda: t[0], sleep=sleep))
+        self.assertEqual([ts for ts, sig in sent if sig == signal.SIGTERM], [0.0, 5.0])
+        self.assertNotIn(signal.SIGKILL, [sig for _, sig in sent])

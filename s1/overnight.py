@@ -605,6 +605,14 @@ def stop_tree(child, *, grace: float = TRAIN_STOP_GRACE_S) -> None:
 DRAIN_POLL_S = 0.1
 
 
+# While draining, the cycle group gets SIGTERM again every DRAIN_RESEND_TERM_S until it drains or the grace ends. A single TERM
+# that lands while nightly.sh is between steps is latched by bash, which then starts the next gated() step: that new
+# studio_capacity gate joins the group after the TERM, never sees one, runs on, and is SIGKILLed at the grace, orphaning its
+# own-session trainer with the training lock fd. Re-sending reaches such a late joiner with ~55 s of the 60 s grace left (the
+# gate needs up to 30 s to stop its trainer). The gate treats repeated TERMs as one stop request, so re-sending is harmless.
+DRAIN_RESEND_TERM_S = 5.0
+
+
 # Seen on Darwin: killpg answers EPERM for a group whose leader is exiting but not yet waitable; that window is milliseconds.
 EPERM_SETTLE_S = 1.0
 
@@ -653,23 +661,31 @@ def send_group_drained(child, sig: int) -> bool:
 
 
 def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clock=_time.monotonic,
-                       sleep=_time.sleep) -> bool:
+                       sleep=_time.sleep, resend_s: float = DRAIN_RESEND_TERM_S) -> bool:
     """Window-end stop: SIGCONT + SIGTERM the cycle's group, then wait for the WHOLE group to drain (not just the shell leader)
     for up to `grace`, and only then SIGKILL survivors. stop_tree's KILL right after the leader exits killed studio_capacity's gate
     wrapper while it was still stopping its separately grouped trainer: the trainer was orphaned and kept the inherited LOCK_EX.
     Every send (CONT, TERM, the 0 probe, the final CONT/KILL) goes through send_group_drained, so a group that is already
-    zombie-only at any point ends the stop normally instead of raising.
+    zombie-only at any point ends the stop normally instead of raising. While waiting, TERM is re-sent every `resend_s`
+    (see DRAIN_RESEND_TERM_S) so a process that joined the group after the first TERM is stopped too.
     Returns True when the group drained within the grace, False when survivors were killed."""
     pgid = child.pid
     if send_group_drained(child, signal.SIGCONT) or send_group_drained(child, signal.SIGTERM):
         return True
-    end = clock() + grace
+    start = clock()
+    end = start + grace
+    next_term = start + resend_s
     while True:
         child.poll()   # reap the leader: an unreaped zombie leader would keep the group "alive" to kill(pgid, 0)
         if send_group_drained(child, 0):
             return True
-        if clock() >= end:
+        now = clock()
+        if now >= end:
             break
+        if now >= next_term:
+            if send_group_drained(child, signal.SIGTERM):
+                return True
+            next_term = now + resend_s
         sleep(poll_s)
     print(f"overnight: cycle group {pgid} still running {grace:g}s after TERM; sending KILL", flush=True)
     if send_group_drained(child, signal.SIGKILL):
