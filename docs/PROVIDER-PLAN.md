@@ -567,3 +567,26 @@ the usage ledger against the Claude lane it ran on (`claude`, or the named accou
 ## Usage endpoint (GET /v1/cortados/usage)
 
 `GET /v1/cortados/usage` (token required, 401 otherwise): one cheap JSON view for a usage dashboard, built by `cortados_router/provider/usage.py` — `lanes` (cached scarcity.json only: % left, windows/resets, sample age, `stale` by the routing freshness rule), `routed` (router.db counts per lane/model today and 7 d, top S1 bands; plus `provider_since_start` from the in-memory run records), `refusals` (24 h by reason, in-memory), `child_tasks` (7 d by last event from child-tasks.jsonl), `s1` (1.5 s `/health` probe), `hardware` (`$CORTADOS_HOME/hardware/*.json` passed through with age), `notes`, `errors` (every failed or absent source), `generated_at`. Opens no vendor CLI.
+
+## Compaction content store (phase 1, shadow only)
+
+The provider can keep conversation CONTENT on its host (the Air) so compaction labels can be harvested; the owner
+approved this with a retention limit. Nothing it does changes what any backend receives (pinned by
+`tests/test_compaction_store.py`, which compares the bytes delivered to the fake backend with the store on and off).
+
+- Switch: `CORTADOS_COMPACTION_STORE=1` (off by default: no files are created).
+- Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600, opened with O_NOFOLLOW;
+  symlinks are refused). Code: `cortados_router/compaction/store.py`.
+- What: per provider turn, a `turn` header (source `claude-code` / `codex`, `x-cortados-run-id`, `x-cortados-session`,
+  client), the tool results answering earlier calls (text capped at 64k chars per result, original length and error
+  flag kept: labels need the content, one huge output must not fill the disk), the new user text, the assistant text
+  and the tool calls it issued. Read back with `store.read_session(path) -> events.Session`.
+- Retention: `CORTADOS_COMPACTION_RETENTION_DAYS` (default 14: nightly harvest plus a week of review; tools can print
+  secrets, so keep it short), then `CORTADOS_COMPACTION_MAX_MB` (default 2048) deletes the oldest sessions first.
+  Pruned at provider start and at most hourly after, in a background thread.
+- Failures: a write failure is logged with its reason and counted in `store.STORE.write_failures`; it never fails the
+  user's request (the reply is already in hand).
+- Shadow pruning: when a conversation closes (drop, failure, idle reap) `compaction/prune.py` decides keep/drop for
+  every past tool call in a background thread and appends the decisions, with the chars/tokens they would have saved,
+  to `$CORTADOS_HOME/compaction/decisions.jsonl` (0600). Thresholds: `tables/compaction-prune.json` (provisional).
+- The Office view (`office.py`) stays metadata-only; it never reads this store.
