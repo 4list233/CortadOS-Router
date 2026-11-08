@@ -603,6 +603,6 @@ approved this with a retention limit. Nothing it does changes what any backend r
   least `min_freed_tokens` (`would_prune`), so labels can be joined later. W is `assumed_window_tokens` (200k) because
   the provider does not learn the backend window. Shared thresholds (keep the last 4 results, start, min freed, result
   cap, chars per token) are read from `tables/compaction.json` through `compaction/policy.py`, the one source shared
-  with phase 0; `tables/compaction-prune.json` holds only this phase's rule data (tool lists, read-only Bash prefixes,
+  with phase 0; `tables/compaction-prune.json` holds only this phase's rule data (tool lists, read-only Bash command shapes,
   MCP side-effect words, small-result N, dropped-result head H, assumed window), provisional.
 - The Office view (`office.py`) stays metadata-only; it never reads this store.

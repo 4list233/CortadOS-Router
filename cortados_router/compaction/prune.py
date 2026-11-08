@@ -4,7 +4,7 @@ SHADOW ONLY: decisions are appended to $CORTADOS_HOME/compaction/decisions.jsonl
 saved; nothing here edits what any backend sees. Shared thresholds (keep the last N results, the pruning start
 min(cap, pct x W), the minimum tokens freed, chars per token by source) come from tables/compaction.json through
 compaction/policy.py (one source of truth with phase 0); tables/compaction-prune.json holds only this phase's rule data
-(tool lists, read-only Bash prefixes, MCP side-effect words, small-result N, dropped-result head H, assumed window).
+(tool lists, read-only Bash command shapes, MCP side-effect words, small-result N, dropped-result head H, assumed window).
 
 Rules, first match wins:
   pinned          events of the first message, and the last `pruning.keep_last_results` tool events: keep both
