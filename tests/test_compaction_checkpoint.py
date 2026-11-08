@@ -5,11 +5,15 @@ import io
 import json
 import os
 import stat
+import subprocess
 import tempfile
+import time
 import unittest
 
 from cortados_router.compaction import checkpoint, handoff, policy, transcript
 from cortados_router.compaction.events import Message, Session, ToolEvent
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _write(lines):
@@ -364,6 +368,142 @@ class CliTests(unittest.TestCase):
         self.assertIn("error", err)
         rc, out, _ = self.check(used_percentage=72)
         self.assertTrue(out.startswith("checkpoint") and "window unknown" in out, out)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """One test per finding of the b811196 review."""
+
+    def setUp(self):
+        self.pol = load_policy()
+
+    def run_cli(self, *argv):
+        return CliTests.run_cli(self, *argv)
+
+    def test_1_codex_structured_result_kept(self):
+        lines = [CODEX_LINES[0], CODEX_LINES[3],
+                 {"type": "response_item", "payload": {"type": "function_call", "name": "spawn", "call_id": "k",
+                                                       "arguments": "{}"}},
+                 {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "k",
+                                                       "output": json.dumps({"task_id": "task_1234abcd",
+                                                                             "state": "running"})}}]
+        s = transcript.read_codex(_write(lines))
+        self.assertIn("task_1234abcd", s.events[0].result_text)
+        self.assertEqual(json.loads(s.events[0].result_text)["state"], "running")
+        self.assertFalse(s.events[0].interrupted)
+
+    def test_2_rule_with_path_not_cut(self):
+        msgs = (Message("s", 0, "user", "Never modify ~/.cortados/router.db. Always run python3 -B -m a.b.c first."),
+                Message("s", 1, "user", "go"))
+        md, _ = handoff.build_handoff(Session("s", "claude-code", msgs, ()), self.pol)
+        rules = md[md.index("## Standing rules"):md.index("## Decisions")]
+        self.assertIn("Never modify ~/.cortados/router.db.", rules)
+        self.assertIn("Always run python3 -B -m a.b.c first.", rules)
+
+    def test_3_force_write_never_wider_than_0600_and_no_symlink(self):
+        d = tempfile.mkdtemp()
+        md = os.path.join(d, "handoff.md")
+        with open(md, "w") as fh:
+            fh.write("old")
+        os.chmod(md, 0o644)
+        rc, _, _ = self.run_cli("build", "--transcript", _write(CLAUDE_LINES), "--out", d, "--force")
+        self.assertEqual(rc, 0)
+        self.assertEqual(stat.S_IMODE(os.stat(md).st_mode), 0o600)
+        self.assertEqual([f for f in os.listdir(d) if f.endswith(".tmp")], [])
+        d2 = tempfile.mkdtemp()
+        target = os.path.join(d2, "elsewhere.txt")
+        with open(target, "w") as fh:
+            fh.write("keep")
+        os.symlink(target, os.path.join(d2, "handoff.md"))
+        rc, _, err = self.run_cli("build", "--transcript", _write(CLAUDE_LINES), "--out", d2, "--force")
+        self.assertEqual(rc, 3)
+        self.assertIn("symlink", err)
+        self.assertEqual(_read(target), "keep")
+
+    def test_4_goal_and_rules_caps_include_heading(self):
+        long_goal = Session("s", "claude-code", (Message("s", 0, "user", "x" * 1100),), ())
+        with self.assertRaisesRegex(handoff.HandoffBudgetError, "goal section"):
+            handoff.build_handoff(long_goal, self.pol)  # ~440 tokens + heading > 400
+        rules = " ".join("Never do thing number %d ever." % i for i in range(300))
+        with self.assertRaisesRegex(handoff.HandoffBudgetError, "rules section"):
+            handoff.build_handoff(Session("s", "claude-code", (Message("s", 0, "user", rules),
+                                                               Message("s", 1, "user", "go")), ()), self.pol)
+        md, man = handoff.build_handoff(synthetic_session(n_filler=60), self.pol)
+        for key, sec in man["sections"].items():
+            self.assertLessEqual(sec["tokens"], sec["budget"], key)
+            self.assertFalse(sec["over_budget"], key)
+
+    def test_5_caps_apply_without_window(self):
+        level, _ = checkpoint.classify(self.pol, 31, 310000, None)
+        self.assertEqual(level, "force")
+        level, _ = checkpoint.classify(self.pol, None, 210000, None)
+        self.assertEqual(level, "checkpoint")
+        level, _ = checkpoint.classify(self.pol, None, 95000, None, model="api/claude-haiku-5-5")
+        self.assertEqual(level, "force")
+
+    def test_6_circuit_breaker_from_restart_log(self):
+        log = os.path.join(tempfile.mkdtemp(), "restarts.jsonl")
+        now = 10000.0
+        for ts in (now - 600, now - 300):
+            self.assertEqual(self.run_cli("record-restart", "--restart-log", log, "--forced",
+                                          "--now", str(ts))[0], 0)
+        st = CliTests.status(self, total_input_tokens=150000, context_window_size=200000)
+        rc, out, _ = self.run_cli("check", "--status-file", st, "--restart-log", log, "--now", str(now))
+        self.assertTrue(out.startswith("escalate"), out)
+        rc, out, _ = self.run_cli("check", "--status-file", st, "--restart-log", log, "--now", str(now + 3600))
+        self.assertTrue(out.startswith("checkpoint"), out)  # outside the 30-min window
+        ok = CliTests.status(self, total_input_tokens=1000, context_window_size=200000)
+        rc, out, _ = self.run_cli("check", "--status-file", ok, "--restart-log", log, "--now", str(now))
+        self.assertTrue(out.startswith("ok"), out)  # breaker only blocks a restart recommendation
+
+    def test_7_statusline_passes_idle_seconds(self):
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, CORTADOS_HOME=home, REPO=REPO, CORTADOS_CACHE_TTL_CLASS="claude-subscription")
+        script = os.path.join(REPO, "integrations", "checkpoint", "statusline.sh")
+
+        def run(tokens):
+            payload = json.dumps({"session_id": "idle", "context_window": {"total_input_tokens": tokens,
+                                                                           "context_window_size": 200000}})
+            return subprocess.run(["sh", script], input=payload, env=env, capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertTrue(run(20000).startswith("ok"))  # first (fresh) sample creates the history
+        hist = os.path.join(home, "checkpoint", "idle.history")
+        with open(hist, "w") as fh:
+            fh.write("111000\n")  # a previous turn end at >= warn (110k on a 200k window)
+        self.assertTrue(run(111500).startswith("warn"))  # just active: no idle checkpoint
+        old = time.time() - 4000  # longer than the 1 h subscription cache TTL
+        os.utime(hist, (old, old))
+        out = run(112000)
+        self.assertTrue(out.startswith("checkpoint idle"), out)
+
+    def test_8_handoff_id_covers_tool_results_and_policy(self):
+        a = synthetic_session()
+        evs = list(a.events)
+        evs[0] = ToolEvent("s", 0, evs[0].message_index, "Edit", {"file_path": "src/exporter.py"}, "different",
+                           9, False, False)
+        b = Session(a.session, a.source, a.messages, tuple(evs))
+        ida = handoff.build_handoff(a, self.pol)[1]["handoff_id"]
+        idb = handoff.build_handoff(b, self.pol)[1]["handoff_id"]
+        self.assertNotEqual(ida, idb)
+        pol2 = copy.deepcopy(self.pol)
+        pol2["recency_bonus"] = 5
+        self.assertNotEqual(ida, handoff.build_handoff(a, pol2)[1]["handoff_id"])
+        md, man = handoff.build_handoff(a, self.pol)
+        self.assertIn("handoff-id: %s" % man["handoff_id"], md)
+        self.assertNotIn(handoff.ID_PLACEHOLDER, md)
+
+    def test_9_counts_must_be_positive_ints(self):
+        raw = json.loads(_read(policy.DEFAULT_PATH))
+        for setting, key, bad in (("velocity", "lookback_turns", 0.5), ("velocity", "lookback_turns", 0),
+                                  ("velocity", "projection_turns", 1.5), ("circuit_breaker", "max_forced_restarts", 0),
+                                  ("circuit_breaker", "window_s", 1.5), ("pruning", "keep_last_results", 2.5),
+                                  ("recency_pin", "tool_calls", 1.5), ("velocity", "single_turn_pct_of_window", 100)):
+            r = copy.deepcopy(raw)
+            r[setting]["value"][key] = bad
+            with self.assertRaises(policy.PolicyError, msg="%s.%s=%r" % (setting, key, bad)):
+                policy.validate(r)
+        r = copy.deepcopy(raw)
+        r["velocity"]["value"]["lookback_turns"] = 1
+        self.assertEqual(policy.validate(r)["velocity"]["lookback_turns"], 1)
 
 
 if __name__ == "__main__":

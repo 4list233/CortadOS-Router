@@ -23,7 +23,9 @@ minutes the deterministic handoff from `checkpoint build` is used instead.
    - **Files touched** (800): up to 40 paths, one line each.
    - **Excerpts** (6000): the few passages the next session cannot work without (errors, exact commands, numbers).
    Keep the baseline's `handoff-id:` line as the first line after the title.
-3. Restart: start a fresh session whose first prompt is the handoff file's contents.
+3. Record the restart, then restart: `python3 -B -m cortados_router.compaction.checkpoint record-restart
+   --restart-log $CORTADOS_HOME/checkpoint/restarts.jsonl --handoff-id <id> [--forced]` (`--forced` when the status
+   said `force`), then start a fresh session whose first prompt is the handoff file's contents.
 4. Canary: the new session's first reply must quote the `handoff-id:` line. If it does not, re-send the handoff.
 5. Circuit breaker: if this would be the 2nd forced restart in 30 minutes, or the fresh session opens above 50% of
    the checkpoint threshold, do not restart: stop and tell the owner.

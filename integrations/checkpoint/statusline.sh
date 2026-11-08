@@ -14,10 +14,18 @@ sid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("sessi
 cur="$dir/$sid.status.json"
 hist="$dir/$sid.history"
 fresh=""
-[ -f "$hist" ] || fresh="--fresh"
+idle=""
+if [ -f "$hist" ]; then
+  # Idle time = seconds since the token count last changed (the history file's mtime): the status line has no
+  # turn-end event, and the count changes on every completed turn.
+  idle=$(python3 -c 'import os,sys,time; print(int(time.time() - os.path.getmtime(sys.argv[1])))' "$hist")
+else
+  fresh="--fresh"
+fi
 cd "$REPO"
 # check reads the history BEFORE this sample is appended (history = earlier turn ends)
 python3 -B -m cortados_router.compaction.checkpoint check --status-file "$tmp" --history-file "$hist" $fresh \
+  ${idle:+--idle-seconds "$idle"} --restart-log "$dir/restarts.jsonl" \
   ${CORTADOS_CACHE_TTL_CLASS:+--cache-ttl-class "$CORTADOS_CACHE_TTL_CLASS"} \
   ${CORTADOS_ROUTED_MODEL:+--model "$CORTADOS_ROUTED_MODEL"} || echo "checkpoint: status unreadable"
 python3 -c 'import json,sys
