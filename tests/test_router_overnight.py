@@ -54,8 +54,10 @@ class Overnight(unittest.TestCase):
             self.assertEqual(pidfile.read_text(),'another-owner')
 
     def test_stubborn_child_gets_group_kill(self):
-        proc=Mock(pid=123);proc.wait.side_effect=[subprocess.TimeoutExpired('x',1),subprocess.TimeoutExpired('x',1),-9]
-        with patch.object(night.subprocess,'Popen',return_value=proc) as start,patch.object(night,'signal_group') as kill:
+        # the group never drains (killpg(pgid, 0) keeps succeeding), so the grace runs out and the group is KILLed
+        proc=Mock(pid=123);proc.wait.side_effect=[subprocess.TimeoutExpired('x',1),-9]
+        with patch.object(night.subprocess,'Popen',return_value=proc) as start,patch.object(night,'signal_group') as kill, \
+                patch.object(night.os,'killpg',lambda pgid,sig: None):
             self.assertEqual(night.run_bounded(['owned'],1,grace=.1),124)
         self.assertTrue(start.call_args.kwargs['start_new_session'])
         self.assertIn(((123,signal.SIGTERM),),[(c.args,) for c in kill.call_args_list])
@@ -913,36 +915,95 @@ class WindowEndDrainAndDst(unittest.TestCase):
     def test_local_now_is_a_named_zone(self):
         self.assertIs(night._local_now().tzinfo, night.NIGHT_ZONE)
 
-    def test_window_end_waits_for_the_gate_wrapper_to_stop_its_own_group(self):
+    def _gate_cycle(self, tmp):
+        """A cycle shaped like nightly.sh's gated(): bash leader -> gate (LOCK_EX) -> trainer in its own session holding the
+        inherited lock fd, which takes ~1 s to stop after TERM. Returns (cmd, lock, ready, released, child_pid)."""
+        lock, ready, released, child_pid = tmp / 'lock', tmp / 'ready', tmp / 'released', tmp / 'child.pid'
+        # the "trainer": its own group, holds the inherited LOCK_EX fd, takes ~1 s to stop after TERM
+        (tmp / 'trainer.py').write_text(
+            "import os, signal, sys, time\n"
+            "def term(*a):\n    time.sleep(1.0)\n    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, term)\n"
+            f"open({str(child_pid)!r}, 'w').write(str(os.getpid()))\n"
+            "while True:\n    time.sleep(0.05)\n")
+        # the "gate": takes LOCK_EX, starts the trainer in its own session with the fd, on TERM stops that group (3 s grace)
+        (tmp / 'gate.py').write_text(
+            "import fcntl, os, signal, subprocess, sys, time\n"
+            f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            f"p = subprocess.Popen([sys.executable, {str(tmp / 'trainer.py')!r}], pass_fds=(fd,), start_new_session=True)\n"
+            f"while not os.path.exists({str(child_pid)!r}):\n    time.sleep(0.02)\n"
+            "def term(*a):\n"
+            "    os.killpg(p.pid, signal.SIGTERM)\n"
+            "    try:\n        p.wait(timeout=3)\n"
+            "    except subprocess.TimeoutExpired:\n        os.killpg(p.pid, signal.SIGKILL); p.wait()\n"
+            f"    open({str(released)!r}, 'w').write('x')\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, term)\n"
+            f"open({str(ready)!r}, 'w').write('x')\n"
+            "while True:\n    time.sleep(0.05)\n")
+        cmd = ['/bin/bash', '-c', f'{sys.executable} {tmp / "gate.py"}; echo done']
+        return cmd, lock, ready, released, child_pid
+
+    def _assert_gate_released(self, lock, released, child_pid):
         import fcntl
+        self.assertTrue(released.exists(), 'the gate wrapper was killed before it stopped its trainer')
+        fd = os.open(str(lock), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if an orphaned trainer still holds the lock
+        finally:
+            os.close(fd)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(child_pid.read_text()), 0)
+
+    def _sigterm_when(self, ready):
+        """Deliver a real SIGTERM to this process once `ready` exists, with overnight.main's handler (-> KeyboardInterrupt)."""
+        import threading
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        old = signal.signal(signal.SIGTERM, interrupted)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        def fire():
+            for _ in range(200):
+                if ready.exists():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+                _time.sleep(0.02)
+        threading.Thread(target=fire, daemon=True).start()
+
+    def test_sigterm_to_the_continuous_supervisor_drains_the_cycle_group(self):
+        # launchd stop/restart on deploy: SIGTERM -> KeyboardInterrupt inside run_cycle's poll loop.
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
                                                                           'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
             tmp = Path(tmp)
-            lock, ready, released, child_pid = tmp / 'lock', tmp / 'ready', tmp / 'released', tmp / 'child.pid'
-            # the "trainer": its own group, holds the inherited LOCK_EX fd, takes ~1 s to stop after TERM
-            (tmp / 'trainer.py').write_text(
-                "import os, signal, sys, time\n"
-                "def term(*a):\n    time.sleep(1.0)\n    sys.exit(0)\n"
-                "signal.signal(signal.SIGTERM, term)\n"
-                f"open({str(child_pid)!r}, 'w').write(str(os.getpid()))\n"
-                "while True:\n    time.sleep(0.05)\n")
-            # the "gate": takes LOCK_EX, starts the trainer in its own session with the fd, on TERM stops that group (3 s grace)
-            (tmp / 'gate.py').write_text(
-                "import fcntl, os, signal, subprocess, sys, time\n"
-                f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT)\n"
-                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
-                f"p = subprocess.Popen([sys.executable, {str(tmp / 'trainer.py')!r}], pass_fds=(fd,), start_new_session=True)\n"
-                f"while not os.path.exists({str(child_pid)!r}):\n    time.sleep(0.02)\n"
-                "def term(*a):\n"
-                "    os.killpg(p.pid, signal.SIGTERM)\n"
-                "    try:\n        p.wait(timeout=3)\n"
-                "    except subprocess.TimeoutExpired:\n        os.killpg(p.pid, signal.SIGKILL); p.wait()\n"
-                f"    open({str(released)!r}, 'w').write('x')\n"
-                "    sys.exit(0)\n"
-                "signal.signal(signal.SIGTERM, term)\n"
-                f"open({str(ready)!r}, 'w').write('x')\n"
-                "while True:\n    time.sleep(0.05)\n")
-            cmd = ['/bin/bash', '-c', f'{sys.executable} {tmp / "gate.py"}; echo done']
+            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
+            g = TrainOnlyInWindow._guard(self, lambda: datetime(2026, 11, 8, 3, 0))
+            self._sigterm_when(ready)
+            with self.assertRaises(KeyboardInterrupt):
+                night.run_cycle(cmd, g, result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.05), grace=5)
+            self._assert_gate_released(lock, released, child_pid)
+
+    def test_sigterm_to_the_window_mode_supervisor_drains_the_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
+            self._sigterm_when(ready)
+            with self.assertRaises(KeyboardInterrupt):
+                night.run_bounded(cmd, 60, grace=5)
+            self._assert_gate_released(lock, released, child_pid)
+
+    def test_window_mode_deadline_drains_the_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
+            self.assertEqual(night.run_bounded(cmd, 1.0, grace=5), 124)
+            self._assert_gate_released(lock, released, child_pid)
+
+    def test_window_end_waits_for_the_gate_wrapper_to_stop_its_own_group(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
+                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
+            tmp = Path(tmp)
+            cmd, lock, ready, released, child_pid = self._gate_cycle(tmp)
             # in the window until the gate is ready, then past the deadline
             wall = lambda: datetime(2026, 11, 8, 7, 0) if ready.exists() else datetime(2026, 11, 8, 6, 59)
             g = TrainOnlyInWindow._guard(self, wall)
@@ -957,14 +1018,7 @@ class WindowEndDrainAndDst(unittest.TestCase):
             rc, res = night.run_cycle(cmd, g, result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.05), grace_end=5)
             self.assertEqual(res, 'window_end')
             self.assertLess(_time.monotonic() - t0, 20)
-            self.assertTrue(released.exists(), 'the gate wrapper was killed before it stopped its trainer')
-            fd = os.open(str(lock), os.O_RDWR)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if an orphaned trainer still holds the lock
-            finally:
-                os.close(fd)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(child_pid.read_text()), 0)
+            self._assert_gate_released(lock, released, child_pid)
 
     def test_drain_kills_survivors_after_the_grace(self):
         child = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '

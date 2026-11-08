@@ -71,22 +71,13 @@ def run_bounded(command: list[str], seconds: float, *, grace: float = 20, pidfil
             return child.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
             print("nightly: 07:00 Toronto deadline; stopping this run and preserving checkpoints", flush=True)
-            signal_group(child.pid, signal.SIGTERM)
-            try:
-                child.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                signal_group(child.pid, signal.SIGKILL)
-                child.wait()
-            # The shell can exit before its grandchildren; never leave the trainer behind.
-            signal_group(child.pid, signal.SIGKILL)
+            # Drain the whole group (the shell can exit before its grandchildren, e.g. the studio gate stopping its trainer).
+            stop_group_drained(child, grace=grace)
             return 124
     except BaseException:
-        signal_group(child.pid, signal.SIGTERM)
-        try:
-            child.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            signal_group(child.pid, signal.SIGKILL)
-            child.wait()
+        # launchd unload/restart (SIGTERM -> KeyboardInterrupt): same drain, or the gate is killed mid-stop and its trainer
+        # is orphaned holding the studio lock.
+        stop_group_drained(child, grace=grace)
         raise
     finally:
         if pidfile is not None and child.poll() is not None:
@@ -601,15 +592,10 @@ class Guard:
 
 
 def stop_tree(child, *, grace: float = 20) -> None:
-    """SIGCONT first (a stopped process cannot handle TERM), then TERM so nightly.sh/the trainer save checkpoints, then KILL."""
-    signal_group(child.pid, signal.SIGCONT)
-    signal_group(child.pid, signal.SIGTERM)
-    try:
-        child.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        signal_group(child.pid, signal.SIGKILL)
-        child.wait()
-    signal_group(child.pid, signal.SIGKILL)   # grandchildren can outlive the shell
+    """SIGCONT first (a stopped process cannot handle TERM), then TERM so nightly.sh/the trainer save checkpoints, then KILL
+    whatever of the group is left after `grace`. One implementation: stop_group_drained (waits for the whole group, not just
+    the shell leader)."""
+    stop_group_drained(child, grace=grace)
 
 
 # Poll interval while waiting for a TERMed group to drain: short against the 60 s grace, cheap (one kill(2) per poll).
@@ -631,6 +617,12 @@ def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clo
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
+            child.wait()
+            return True
+        except PermissionError:
+            # Darwin answers EPERM (not ESRCH) when every remaining member is a zombie (seen with the just-exited leader not yet
+            # reaped): nothing in the group can run any more, so it has drained. Same uid, so EPERM never hides a live member.
+            child.wait()
             return True
         if clock() >= end:
             break
@@ -711,7 +703,8 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
             sleep(poll_s)
         watch_stop()
     except BaseException:
-        stop_tree(child, grace=grace)
+        # launchd stop/restart of com.cortados.s1-continuous (every deploy) arrives here as SIGTERM -> KeyboardInterrupt.
+        stop_group_drained(child, grace=grace)
         raise
     finally:
         # Never leave a group stopped: the shell can exit while a paused grandchild (the trainer) is still SIGSTOPped.
