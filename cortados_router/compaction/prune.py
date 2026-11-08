@@ -1,10 +1,13 @@
 """Deterministic shadow pruning rules (phase 1): a KeepDecision for every past tool event of a session.
 
 SHADOW ONLY: decisions are appended to $CORTADOS_HOME/compaction/decisions.jsonl with the chars/tokens they WOULD have
-saved; nothing here edits what any backend sees. Thresholds live in tables/compaction-prune.json, each with its why.
+saved; nothing here edits what any backend sees. Shared thresholds (keep the last N results, the pruning start
+min(cap, pct x W), the minimum tokens freed, chars per token by source) come from tables/compaction.json through
+compaction/policy.py (one source of truth with phase 0); tables/compaction-prune.json holds only this phase's rule data
+(tool lists, read-only Bash prefixes, MCP side-effect words, small-result N, dropped-result head H, assumed window).
 
 Rules, first match wins:
-  pinned          events of the first message and of the last K messages: keep call and result
+  pinned          events of the first message, and the last `pruning.keep_last_results` tool events: keep both
   error           an error result is kept (the model must remember what failed)
   side_effect     Edit/Write/..., non-read-only Bash, MCP tools that send/post/create: keep call (and result unless
                   a later rule says the result is a re-runnable read, which a side effect never is)
@@ -18,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -35,10 +39,16 @@ _CHAIN = re.compile(r"[;&|<>`]|\$\(")      # chains, pipes, redirections, substi
 
 
 @lru_cache(maxsize=4)
-def load_table(path: str = str(TABLE_PATH)) -> dict[str, Any]:
+def load_rules(path: str = str(TABLE_PATH)) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     return {k: v["value"] for k, v in raw.items() if isinstance(v, dict) and "value" in v}
+
+
+def load_table() -> dict[str, Any]:
+    """Phase-1 rule data plus the shared values from tables/compaction.json (policy.py), merged read-only."""
+    pol = store.load_policy()
+    return {**load_rules(), "pruning": dict(pol["pruning"]), "chars_per_token": dict(pol["chars_per_token"])}
 
 
 def _bash_command(ev: ToolEvent) -> Optional[str]:
@@ -93,7 +103,8 @@ def decide(session: Session, *, upto_message: Optional[int] = None,
     t = table or load_table()
     n_msgs = len(session.messages) if upto_message is None else upto_message + 1
     events = [e for e in session.events if e.message_index < n_msgs]
-    pin_from = max(0, n_msgs - int(t["pin_last_messages"]))
+    keep_last = int(t["pruning"]["keep_last_results"])
+    recent = {e.index for e in events[-keep_last:]} if keep_last > 0 else set()
     head = int(t["dropped_head_chars"])
     later: dict[str, int] = {}
     for e in events:
@@ -105,8 +116,8 @@ def decide(session: Session, *, upto_message: Optional[int] = None,
             saved = 0 if keep_result else max(0, e.result_chars - head)
             return (KeepDecision(session=session.session, event_index=e.index, keep_call=keep_call,
                                  keep_result=keep_result, decided_by="rule:" + rule, reason=reason), saved)
-        if e.message_index == 0 or e.message_index >= pin_from:
-            out.append(mk(True, True, "pinned", f"in the first message or the last {t['pin_last_messages']} messages"))
+        if e.message_index == 0 or e.index in recent:
+            out.append(mk(True, True, "pinned", f"in the first message or one of the last {keep_last} tool results"))
         elif e.is_error:
             out.append(mk(True, True, "error", "error results are kept"))
         elif is_side_effect(e, t):
@@ -126,16 +137,39 @@ def decisions_path() -> Path:
     return store.root() / "decisions.jsonl"
 
 
+def session_chars(sess: Session) -> int:
+    """Characters the session's context carries (message text, tool inputs, tool results as recorded lengths)."""
+    return (sum(len(m.text) for m in sess.messages) + sum(e.result_chars for e in sess.events)
+            + sum(len(json.dumps(e.input, default=str)) for e in sess.events))
+
+
+def gate(sess: Session, pairs: list, t: dict[str, Any]) -> dict[str, Any]:
+    """Would phase 1 have pruned here? The session's estimated tokens against the start threshold
+    min(start_cap_tokens, start_pct x W), and the tokens the drops free against min_freed_tokens."""
+    cpt = float(t["chars_per_token"].get(sess.source, t["chars_per_token"]["unknown"]))
+    pr = t["pruning"]
+    window = float(t["assumed_window_tokens"])
+    start = min(float(pr["start_cap_tokens"]), float(pr["start_pct"]) * window / 100.0)
+    tokens = math.ceil(session_chars(sess) / cpt)
+    freed = math.ceil(sum(saved for _, saved in pairs) / cpt)
+    crossed = tokens >= start
+    return {"chars_per_token": cpt, "session_tokens_est": tokens, "start_threshold_tokens": start,
+            "assumed_window_tokens": window, "would_start": crossed, "freed_tokens_est": freed,
+            "min_freed_tokens": pr["min_freed_tokens"], "would_prune": crossed and freed >= pr["min_freed_tokens"]}
+
+
 def shadow_decide(session_path, *, now: Optional[float] = None) -> list[KeepDecision]:
     """Decide for every past tool event of the stored session and append the decisions (0600) with the chars and
-    estimated tokens they WOULD have saved. Returns the decisions."""
+    estimated tokens they WOULD have saved, each carrying the session-level gate (would the pruning start threshold
+    have been crossed here, would the min-freed rule have allowed the prune) so labels can be joined later."""
     sess = store.read_session(session_path)
     t = load_table()
     pairs = decide(sess, table=t)
+    g = gate(sess, pairs, t)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))
-    cpt = float(t["chars_per_token"])
-    lines = "".join(json.dumps({**dataclasses.asdict(d), "ts": ts, "saved_chars": saved,
-                                "saved_tokens_est": int(saved / cpt), "mode": "shadow"}) + "\n"
+    cpt = g["chars_per_token"]
+    lines = "".join(json.dumps({**dataclasses.asdict(d), "ts": ts, "source": sess.source, "saved_chars": saved,
+                                "saved_tokens_est": math.ceil(saved / cpt), "mode": "shadow", "gate": g}) + "\n"
                     for d, saved in pairs)
     if lines:
         store.ensure_dir(store.root())

@@ -21,13 +21,14 @@ def session(events, n_msgs=20):
 
 
 BIG = 5000
+# Four later small reads, so the event under test is outside pruning.keep_last_results (4, tables/compaction.json).
+FILLER = [(18, "Read", {"file_path": f"f{i}"}, 10, False) for i in range(T["pruning"]["keep_last_results"])]
 
 
 class RuleTests(unittest.TestCase):
     CASES = [
         # (message_index, name, input, chars, error) -> (rule, keep_call, keep_result)
         ((0, "Read", {"file_path": "a"}, BIG, False), ("pinned", True, True)),
-        ((19, "Read", {"file_path": "z"}, BIG, False), ("pinned", True, True)),
         ((3, "Read", {"file_path": "b"}, BIG, True), ("error", True, True)),
         ((3, "Edit", {"file_path": "b"}, BIG, False), ("side_effect", True, True)),
         ((3, "Bash", {"command": "rm -rf build"}, BIG, False), ("side_effect", True, True)),
@@ -42,26 +43,52 @@ class RuleTests(unittest.TestCase):
     def test_table(self):
         for ev, (rule, kc, kr) in self.CASES:
             with self.subTest(ev=ev):
-                (d, saved), = prune.decide(session([ev]), table=T)
+                (d, saved), *_ = prune.decide(session([ev] + FILLER), table=T)
                 self.assertEqual((d.decided_by, d.keep_call, d.keep_result), ("rule:" + rule, kc, kr))
                 self.assertEqual(saved, 0 if kr else BIG - T["dropped_head_chars"])
 
     def test_superseded_read_dropped_even_if_small(self):
         out = prune.decide(session([(3, "Read", {"file_path": "a"}, 100, False),
-                                    (5, "Read", {"file_path": "a"}, 100, False)]), table=T)
-        self.assertEqual([d.decided_by for d, _ in out], ["rule:superseded", "rule:small"])
+                                    (5, "Read", {"file_path": "a"}, 100, False)] + FILLER), table=T)
+        self.assertEqual([d.decided_by for d, _ in out[:2]], ["rule:superseded", "rule:small"])
 
-    def test_pin_window_follows_table(self):
-        t = dict(T, pin_last_messages=2)
-        (d, _), = prune.decide(session([(17, "Read", {"file_path": "a"}, BIG, False)]), table=t)
+    def test_keep_last_results_follows_policy(self):
+        ev = [(17, "Read", {"file_path": "a"}, BIG, False)]
+        (d, _), = prune.decide(session(ev), table=T)
+        self.assertEqual(d.decided_by, "rule:pinned")             # one of the last 4 results
+        t = dict(T, pruning=dict(T["pruning"], keep_last_results=0))
+        (d, _), = prune.decide(session(ev), table=t)
         self.assertEqual(d.decided_by, "rule:rerunnable_read")
+
+    def test_shared_thresholds_not_duplicated(self):
+        raw = json.loads(prune.TABLE_PATH.read_text())
+        for k in ("pin_last_messages", "chars_per_token", "keep_last_results", "provider_tool_result_cap_tokens",
+                  "pruning", "start_cap_tokens", "min_freed_tokens"):
+            self.assertNotIn(k, raw)
+        self.assertEqual(T["pruning"], store.load_policy()["pruning"])
+
+    def test_gate(self):
+        t = dict(T, assumed_window_tokens=200000)
+        # 40% x 200k = 80k < 100k cap: start at 80k tokens; claude-code 2.5 chars/token.
+        big = [(3, "Grep", {"pattern": str(i)}, 30000, False) for i in range(8)] + FILLER
+        sess = session(big)
+        sess = Session(session="s", source="claude-code", messages=sess.messages, events=sess.events)
+        g = prune.gate(sess, prune.decide(sess, table=t), t)
+        self.assertEqual(g["start_threshold_tokens"], 80000)
+        self.assertTrue(g["would_start"])                         # 240k chars / 2.5 = 96k tokens
+        self.assertGreaterEqual(g["freed_tokens_est"], 20000)
+        self.assertTrue(g["would_prune"])
+        small = session([(3, "Grep", {"pattern": "x"}, 3000, False)] + FILLER)
+        g = prune.gate(small, prune.decide(small, table=t), t)
+        self.assertFalse(g["would_start"])
+        self.assertFalse(g["would_prune"])
 
     def test_every_table_value_has_a_why(self):
         raw = json.loads(prune.TABLE_PATH.read_text())
         for k, v in raw.items():
             if isinstance(v, dict):
                 self.assertTrue(v.get("why"), k)
-        self.assertEqual((T["pin_last_messages"], T["small_result_chars"], T["dropped_head_chars"]), (8, 600, 300))
+        self.assertEqual((T["small_result_chars"], T["dropped_head_chars"]), (600, 300))
 
 
 class ShadowDecideTests(unittest.TestCase):
@@ -86,6 +113,9 @@ class ShadowDecideTests(unittest.TestCase):
         row = json.loads(p.read_text().splitlines()[0])
         self.assertEqual((row["mode"], row["event_index"], row["decided_by"]), ("shadow", 0, "rule:pinned"))
         self.assertIn("saved_tokens_est", row)
+        self.assertEqual(row["source"], "claude-code")
+        self.assertEqual(row["gate"]["chars_per_token"], 2.5)
+        self.assertEqual((row["gate"]["would_start"], row["gate"]["would_prune"]), (False, False))
 
     def test_async_is_noop_when_off_or_missing(self):
         self.assertIsNone(prune.shadow_decide_async("nope"))

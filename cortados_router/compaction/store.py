@@ -30,14 +30,17 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from cortados_router.compaction import policy
 from cortados_router.compaction.events import Message, Session, ToolEvent
 from cortados_router.compat import getenv
 
 logger = logging.getLogger(__name__)
 
-# Why 64k chars: labels need the real content of a result to judge whether a later turn reused it, but one huge
-# output (a full log, a minified bundle) must not fill the disk. The original length is kept beside it.
-RESULT_CAP_CHARS = 64_000
+# The per-result cap is not a number of its own: it is tables/compaction.json's provider_tool_result_cap_tokens
+# (8000) x chars_per_token for the conversation's source (2.5 Claude Code -> 20000 chars, 4 Codex -> 32000 chars),
+# read through compaction/policy.py. Why: labels need the real content of a result to judge whether a later turn
+# reused it, but one huge output must not fill the disk. The same cap applies to a tool call's INPUT (a giant Write
+# content must not bypass it). The original length and a truncated flag are kept beside each.
 # Why 14 days: long enough for the nightly label harvest plus a week of human review; content can hold secrets that
 # tools printed, so it is kept no longer than that.
 DEFAULT_RETENTION_DAYS = 14.0
@@ -48,6 +51,25 @@ PRUNE_INTERVAL_S = 3600.0
 FORMAT_VERSION = 1
 
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+_policy_cache: dict[str, Any] = {}
+
+
+def load_policy() -> dict[str, Any]:
+    """tables/compaction.json through policy.load, once per process (the one source of the shared thresholds)."""
+    if "p" not in _policy_cache:
+        _policy_cache["p"] = policy.load()
+    return _policy_cache["p"]
+
+
+def chars_per_token(source: str) -> float:
+    cpt = load_policy()["chars_per_token"]
+    return float(cpt.get(source, cpt["unknown"]))
+
+
+def cap_chars(source: str) -> int:
+    return int(load_policy()["provider_tool_result_cap_tokens"] * chars_per_token(source))
 
 
 def enabled(environ=None) -> bool:
@@ -143,12 +165,27 @@ def _text_of_blocks(blocks: Any) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _result_record(tool_use_id: str, result: dict[str, Any]) -> dict[str, Any]:
+def _result_record(tool_use_id: str, result: dict[str, Any], cap: int) -> dict[str, Any]:
     content = result.get("content") if isinstance(result, dict) else result
     text = _text_of_blocks(content)
-    return {"kind": "tool_result", "tool_use_id": str(tool_use_id), "text": text[:RESULT_CAP_CHARS],
-            "chars": len(text), "truncated": len(text) > RESULT_CAP_CHARS,
+    return {"kind": "tool_result", "tool_use_id": str(tool_use_id), "text": text[:cap],
+            "chars": len(text), "truncated": len(text) > cap,
             "is_error": bool(result.get("isError")) if isinstance(result, dict) else False}
+
+
+def cap_input(inp: Any, cap: int) -> tuple[dict[str, Any], int, bool]:
+    """(stored input, original JSON length, truncated). Over the cap, every value is cut to an equal share of it
+    (non-strings as their JSON text), so the dict keeps its keys and a giant Write content cannot bypass the cap."""
+    inp = inp if isinstance(inp, dict) else {}
+    raw = json.dumps(inp, ensure_ascii=False, default=str)
+    if len(raw) <= cap:
+        return inp, len(raw), False
+    share = max(1, cap // max(1, len(inp)))
+    out = {}
+    for k, v in inp.items():
+        text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
+        out[k] = text[:share] if len(text) > share else v
+    return out, len(raw), True
 
 
 def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any] | None,
@@ -157,10 +194,11 @@ def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any]
     """The records of one provider turn, in order: turn header, the results answering earlier calls, the new user
     text, the assistant text, the calls it issued."""
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))
+    cap = cap_chars(source)
     out: list[dict[str, Any]] = [{"v": FORMAT_VERSION, "kind": "turn", "ts": ts, "source": source,
                                   "meta": {k: v for k, v in (meta or {}).items() if v}}]
     for tid, res in (tool_results or {}).items():
-        out.append(_result_record(tid, res))
+        out.append(_result_record(tid, res, cap))
     utext = _text_of_blocks(user_content)
     if utext:
         out.append({"kind": "message", "role": "user", "text": utext})
@@ -169,8 +207,9 @@ def turn_records(*, source: str, user_content: Any, tool_results: dict[str, Any]
                 "text": "\n".join(str(b.get("text", "")) for b in blocks if b.get("type") == "text")})
     for b in blocks:
         if b.get("type") == "tool_use":
+            inp, n, cut = cap_input(b.get("input"), cap)
             out.append({"kind": "tool_call", "tool_use_id": str(b.get("id", "")), "name": str(b.get("name", "")),
-                        "input": b.get("input") if isinstance(b.get("input"), dict) else {}})
+                        "input": inp, "input_chars": n, "input_truncated": cut})
     return out
 
 
@@ -281,13 +320,16 @@ def _unlink(path: Path, removed: list[str]) -> None:
 
 
 def read_session(path: str | os.PathLike) -> Session:
-    """Read one session file into events.Session (source "provider"). Calls without a result are interrupted."""
+    """Read one session file into events.Session. Its source is the conversation's wire as the first turn header
+    recorded it ("claude-code" / "codex"; "provider" when there is none), so token estimates use the right ratio.
+    Calls without a result are interrupted."""
     p = Path(path)
     sid = p.stem
     messages: list[dict[str, Any]] = []
     calls: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     turn_ts: Optional[str] = None
+    source: Optional[str] = None
     with open(p, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -301,6 +343,7 @@ def read_session(path: str | os.PathLike) -> Session:
             kind = r.get("kind")
             if kind == "turn":
                 turn_ts = r.get("ts")
+                source = source or r.get("source")
             elif kind == "message":
                 messages.append({"role": r.get("role", ""), "text": r.get("text", ""), "ts": turn_ts, "events": []})
             elif kind == "tool_call":
@@ -322,7 +365,7 @@ def read_session(path: str | os.PathLike) -> Session:
                              result_chars=int((c["result"] or {}).get("chars", 0)),
                              is_error=bool((c["result"] or {}).get("is_error", False)),
                              interrupted=c["result"] is None, ts=c["ts"]) for c in calls)
-    return Session(session=sid, source="provider", messages=msgs, events=events)
+    return Session(session=sid, source=source or "provider", messages=msgs, events=events)
 
 
 STORE = Store()

@@ -69,11 +69,27 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(recs[0]["meta"], {"run_id": "run-1", "session": "s-1"})
         self.assertEqual([r["kind"] for r in recs[:4]], ["turn", "message", "message", "tool_call"])
 
-    def test_result_truncated_with_original_length(self):
-        rec = store._result_record("t", {"content": [{"type": "text", "text": "y" * (store.RESULT_CAP_CHARS + 5)}]})
-        self.assertEqual(len(rec["text"]), store.RESULT_CAP_CHARS)
-        self.assertEqual(rec["chars"], store.RESULT_CAP_CHARS + 5)
-        self.assertTrue(rec["truncated"])
+    def test_cap_comes_from_policy_per_source(self):
+        pol = store.load_policy()
+        for src in ("claude-code", "codex", "other"):
+            cpt = pol["chars_per_token"].get(src, pol["chars_per_token"]["unknown"])
+            self.assertEqual(store.cap_chars(src), int(pol["provider_tool_result_cap_tokens"] * cpt))
+        self.assertEqual((store.cap_chars("claude-code"), store.cap_chars("codex")), (20000, 32000))
+
+    def test_result_and_input_truncated_with_original_length(self):
+        cap = store.cap_chars("claude-code")
+        recs = store.turn_records(source="claude-code", user_content=[], tool_results={
+            "t0": {"content": [{"type": "text", "text": "y" * (cap + 5)}]}}, assistant_blocks=[
+            {"type": "tool_use", "id": "t1", "name": "Write", "input": {"file_path": "a", "content": "z" * (cap * 3)}},
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "a"}}])
+        res = recs[1]
+        self.assertEqual((len(res["text"]), res["chars"], res["truncated"]), (cap, cap + 5, True))
+        w, r = [x for x in recs if x["kind"] == "tool_call"]
+        self.assertTrue(w["input_truncated"])
+        self.assertGreater(w["input_chars"], cap * 3)
+        self.assertLessEqual(len(json.dumps(w["input"])), cap + 100)
+        self.assertEqual(set(w["input"]), {"file_path", "content"})
+        self.assertEqual((r["input"], r["input_truncated"]), ({"file_path": "a"}, False))
 
     def test_symlink_refused_and_failure_counted_not_raised(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):

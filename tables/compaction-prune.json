@@ -1,12 +1,89 @@
 {
   "version": 1,
-  "status": "provisional: a research task will refine these from harvested labels",
-  "pin_last_messages": {"value": 8, "why": "the last K messages are the working set the model is acting on; dropping anything inside them risks re-asking for what it just read"},
-  "small_result_chars": {"value": 600, "why": "a result under N chars costs about as much as the note that would replace it, so dropping it saves nothing"},
-  "dropped_head_chars": {"value": 300, "why": "a dropped result keeps a head of H chars so the model still sees what kind of output it was and can decide to re-run the read"},
-  "chars_per_token": {"value": 4, "why": "rough English/code average used only to estimate tokens saved in shadow reports"},
-  "rerunnable_tools": {"value": ["Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "NotebookRead"], "why": "reads that can be re-run for the same content, so their results are cheap to drop"},
-  "side_effect_tools": {"value": ["Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch", "TodoWrite"], "why": "calls that changed state: the fact they happened must stay or the model may redo or contradict them"},
-  "readonly_bash_prefixes": {"value": ["cat", "ls", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "which", "git log", "git status", "git diff", "git show", "git branch", "sed -n", "stat", "file", "tree"], "why": "bash commands treated as re-runnable reads; anything else (or any command with redirection, pipes to a writer, or ;/&& chains) is a side effect"},
-  "mcp_side_effect_words": {"value": ["send", "post", "create", "delete", "update", "write", "publish", "reply", "forward", "trash", "deploy", "pay", "set", "add", "remove", "upload", "apply", "merge", "cancel", "start"], "why": "an MCP tool whose name holds one of these acts outside the session; its call must stay"}
+  "status": "provisional rule data for phase 1; shared numeric thresholds (keep-last results, pruning start, min freed, result cap, chars per token) are read from tables/compaction.json via compaction/policy.py, never copied here",
+  "small_result_chars": {
+    "value": 600,
+    "why": "a result under N chars costs about as much as the note that would replace it, so dropping it saves nothing"
+  },
+  "dropped_head_chars": {
+    "value": 300,
+    "why": "a dropped result keeps a head of H chars so the model still sees what kind of output it was and can decide to re-run the read"
+  },
+  "rerunnable_tools": {
+    "value": [
+      "Read",
+      "Grep",
+      "Glob",
+      "LS",
+      "WebFetch",
+      "WebSearch",
+      "NotebookRead"
+    ],
+    "why": "reads that can be re-run for the same content, so their results are cheap to drop"
+  },
+  "side_effect_tools": {
+    "value": [
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+      "apply_patch",
+      "TodoWrite"
+    ],
+    "why": "calls that changed state: the fact they happened must stay or the model may redo or contradict them"
+  },
+  "readonly_bash_prefixes": {
+    "value": [
+      "cat",
+      "ls",
+      "head",
+      "tail",
+      "wc",
+      "grep",
+      "rg",
+      "find",
+      "pwd",
+      "echo",
+      "which",
+      "git log",
+      "git status",
+      "git diff",
+      "git show",
+      "git branch",
+      "sed -n",
+      "stat",
+      "file",
+      "tree"
+    ],
+    "why": "bash commands treated as re-runnable reads; anything else (or any command with redirection, pipes to a writer, or ;/&& chains) is a side effect"
+  },
+  "mcp_side_effect_words": {
+    "value": [
+      "send",
+      "post",
+      "create",
+      "delete",
+      "update",
+      "write",
+      "publish",
+      "reply",
+      "forward",
+      "trash",
+      "deploy",
+      "pay",
+      "set",
+      "add",
+      "remove",
+      "upload",
+      "apply",
+      "merge",
+      "cancel",
+      "start"
+    ],
+    "why": "an MCP tool whose name holds one of these acts outside the session; its call must stay"
+  },
+  "assumed_window_tokens": {
+    "value": 200000,
+    "why": "the provider does not learn the backend's context window per turn; 200k is the common Claude window and the smaller of the routed windows, so the pruning start threshold min(cap, pct x W) is estimated conservatively (earlier, not later)"
+  }
 }
