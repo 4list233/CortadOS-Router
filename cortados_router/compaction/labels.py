@@ -17,7 +17,9 @@ Only LATER information decides a label; the S1 dataset (s1/compaction_dataset.py
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 from typing import Any, Iterable, Optional
 
 from .events import Session, ToolEvent
@@ -38,6 +40,78 @@ SIDE_EFFECT_COMMAND = re.compile(
     r"(^|[;&|]\s*)(git\s+(commit|push|merge|rebase|checkout|reset|add|rm|mv|tag|stash)|rm|mv|cp|mkdir|touch|chmod|"
     r"pip\s+install|npm\s+(install|i)|brew\s+install|sed\s+-i|tee|curl\s+.*-X\s*(POST|PUT|DELETE|PATCH))\b"
     r"|[^>]>{1,2}\s*[\w./~-]", re.I)
+
+# Tokenized check (preferred; the regex above is the fallback for commands shlex cannot parse). Git takes global
+# options before its subcommand (`git -C /repo commit`), which a "git <sub>" regex misses.
+GIT_MUTATING = {"commit", "push", "merge", "rebase", "checkout", "switch", "reset", "add", "rm", "mv", "tag", "stash",
+                "cherry-pick", "revert", "pull", "clean", "restore", "apply", "am", "init", "clone", "fetch"}
+GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
+                     "--super-prefix", "--list-cmds"}
+MUTATING_PROGRAMS = {"rm", "mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "tee", "rmdir", "truncate", "dd"}
+INSTALLERS = {"pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"}, "npm": {"install", "i", "ci", "uninstall"},
+              "brew": {"install", "uninstall", "upgrade"}, "uv": {"add", "remove", "pip"}}
+SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
+
+
+def _git_subcommand(args: list[str]):
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in GIT_OPTS_WITH_ARG:
+            i += 2
+        elif a.startswith("-"):
+            i += 1                  # --no-pager, --bare, -p, --git-dir=/x, --work-tree=/y, ...
+        else:
+            return a
+    return None
+
+
+def _segment_mutates(seg: list[str]) -> bool:
+    while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+        seg = seg[1:]               # leading VAR=value assignments
+    while seg and seg[0] in ("sudo", "env", "command", "exec", "time", "nohup"):
+        seg = seg[1:]
+    if not seg:
+        return False
+    prog, args = os.path.basename(seg[0]), seg[1:]
+    if prog == "git":
+        return _git_subcommand(args) in GIT_MUTATING
+    if prog in MUTATING_PROGRAMS:
+        return True
+    if prog in INSTALLERS:
+        return bool(args) and args[0] in INSTALLERS[prog]
+    if prog in ("sed", "perl") and any(a == "-i" or a.startswith("-i") for a in args):
+        return True
+    if prog == "curl":
+        up = [a.upper() for a in args]
+        return any(m in up for m in ("POST", "PUT", "DELETE", "PATCH")) or any(
+            a.upper().startswith("-X") and a[2:].upper() in ("POST", "PUT", "DELETE", "PATCH") for a in args)
+    return False
+
+
+def command_has_side_effect(cmd: str) -> bool:
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return bool(SIDE_EFFECT_COMMAND.search(cmd))   # unbalanced quotes etc.: fall back to the regex
+    seg: list[str] = []
+    for i, t in enumerate(tokens):
+        if t in WRITE_REDIRECTS:
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if nxt != "/dev/null" and not nxt.startswith("&"):
+                return True
+            continue
+        if t in SEPARATORS:
+            if _segment_mutates(seg):
+                return True
+            seg = []
+            continue
+        seg.append(t)
+    return _segment_mutates(seg)
+
 
 # Distinctive identifiers: git-like hashes, uuids, slash paths, long id-like tokens mixing letters and digits.
 IDENT_PATTERNS = (
@@ -79,7 +153,7 @@ def has_side_effect(e: ToolEvent) -> bool:
     if e.name.lower() in SIDE_EFFECT_TOOLS:
         return True
     c = _first(e.input if isinstance(e.input, dict) else {}, COMMAND_KEYS)
-    return bool(c and SIDE_EFFECT_COMMAND.search(c))
+    return bool(c and command_has_side_effect(c))
 
 
 def _strings(v: Any) -> Iterable[str]:

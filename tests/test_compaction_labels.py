@@ -1,7 +1,7 @@
 import unittest
 
 from cortados_router.compaction.events import Message, Session, ToolEvent
-from cortados_router.compaction.labels import label_session, target
+from cortados_router.compaction.labels import command_has_side_effect, label_session, target
 
 LONG_LINE = "def resolve(request, answers, degraded=False, engine='s1'):  # the band decision"
 
@@ -115,6 +115,22 @@ class LabelTests(unittest.TestCase):
                        ev(1, 2, "Tool", {"args": [{"ref": "9fe1b29c0ffee\\x"}]}, "ok")],
                       [("user", "u"), ("assistant", "a"), ("assistant", "b")] + FILLER)
         self.assertEqual(r[0]["evidence"][0]["rule"], "identifier")
+
+    def test_git_global_options_before_mutating_subcommand(self):
+        for c in ("git -C /repo commit -m fix", "git -C /repo push origin main",
+                  "git -c user.name=x --no-pager --git-dir=/r/.git --work-tree /r commit -am y",
+                  "cd /r && git -C x add .", "echo hi > out.txt", "FOO=1 sudo rm -rf build", "sed -i '' s/a/b/ f"):
+            self.assertTrue(command_has_side_effect(c), c)
+        r = self.rows([ev(0, 1, "Bash", {"command": "git -C /repo commit -m fix"}, "[main 1a2b3c4] fix")],
+                      [("user", "u"), ("assistant", "a"), ("assistant", "b")] + FILLER)
+        self.assertTrue(r[0]["needed_call"])
+        self.assertEqual(r[0]["evidence"][0]["rule"], "side_effect")
+
+    def test_read_only_commands_are_not_side_effects(self):
+        for c in ("git -C /repo status", "git -C /repo log --oneline -5", "git --no-pager diff",
+                  "git -c core.pager=cat show HEAD", "ls > /dev/null 2>&1", "grep commit file", "cat a | grep rm",
+                  "pip list", "curl -s https://x"):
+            self.assertFalse(command_has_side_effect(c), c)
 
     def test_target_kinds(self):
         self.assertEqual(target(ev(0, 0, "Grep", {"pattern": " a  b "})), ("query", "grep:a b"))
