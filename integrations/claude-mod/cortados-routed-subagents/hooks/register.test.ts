@@ -1,6 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
+import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'
 
 test('background sweep starts once per session and repeats on the mod clock', async () => {
@@ -1593,4 +1594,57 @@ test('a failing heartbeat is reported once and never breaks the tool call', asyn
   expect(h.logs.length).toBe(1)
   expect(h.logs[0]).toContain('office heartbeat failed')
   expect(h.logs[0]).not.toContain('tok')
+})
+
+test('modelDirective: only an own-line [cortados: model=…] pins; prose mentions do not; two directives refuse', async () => {
+  const d = modelDirective('Review the diff.\n[cortados: model=GPT 6.1]\nReport findings.')
+  expect(d).toEqual({ model: 'sub/gpt-6.1', prompt: 'Review the diff.\nReport findings.', problem: null })
+  expect(modelDirective('[cortados:model = ollama 27b q3km ]\nSummarise.').model).toBe('sub/ollama-27b-q3km')
+  expect(modelDirective('Do it.\n[cortados: model=cortados]').model).toBe('cortados')
+  expect(modelDirective('Do it.\n[cortados: model=sub/claude-opus-5-5]').model).toBe('sub/claude-opus-5-5')
+  for (const prose of ['compare GPT 6.1 with Sonnet', 'Use [cortados: model=GPT 6.1] when you delegate', 'cortados model: GPT 6.1']) {
+    expect(modelDirective(prose)).toEqual({ model: null, prompt: prose, problem: null })
+  }
+  const two = modelDirective('[cortados: model=GPT 6.1]\nwork\n[cortados: model=opus]')
+  expect(two.model).toBe(null)
+  expect(two.problem).toContain('2 [cortados: model=…] directives')
+  expect(MODEL_DIRECTIVE_RE.flags).toBe('m')
+  expect(directiveModelId('  GPT   6.1 ')).toBe('sub/gpt-6.1')
+  expect(directiveModelId('api/claude-opus-5-5')).toBe('api/claude-opus-5-5')
+})
+
+test('a prompt directive sets the routed child --model and is stripped from the prompt it sees', async () => {
+  let agentHandler: any = null
+  const on = (_event: string, filterOrHandler: any, maybeHandler?: any) => {
+    if (maybeHandler && filterOrHandler && filterOrHandler.tool === 'Agent') agentHandler = maybeHandler
+    return { catch() {} }
+  }
+  register(on as any, { providerToken: 'tok', providerUrl: 'http://provider.test:8432', orchestratorMode: false } as any)
+  let recordedArgv: string[] = []
+  const $ = {
+    process: { run: async (argv: string[], opts: any) => { recordedArgv = argv; return hostLikeProcess({}).run(argv, opts) } },
+    fs: { read: async () => 'unused' },
+    ui: { status() {}, toast() {} },
+  }
+  const next = async () => 'native'
+  const out = await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong\n[cortados: model=GPT 6.1]', description: 'd' }, next)
+  expect(out.result.status).toBe('completed')
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('sub/gpt-6.1')
+  expect(recordedArgv[recordedArgv.indexOf('-p') + 1]).toBe('say pong\n\n' + STOP_ON_DEAD_TOOL)
+  // Without a directive the configured model is sent, as before.
+  await agentHandler($, { subagent_type: 'general-purpose', prompt: 'say pong', description: 'd' }, next)
+  expect(recordedArgv[recordedArgv.indexOf('--model') + 1]).toBe('cortados')
+  // Two directives: refused before anything launches.
+  recordedArgv = []
+  const refused = await agentHandler($, { subagent_type: 'general-purpose', prompt: '[cortados: model=opus]\nx\n[cortados: model=GPT 6.1]', description: 'd' }, next)
+  expect(refused.deny).toContain('directives')
+  expect(recordedArgv).toEqual([])
+})
+
+test('a prompt that is only a directive is refused: there is no task to run', async () => {
+  const d = modelDirective('  [cortados: model=GPT 6.1]  \n')
+  expect(d.model).toBe(null)
+  expect(d.problem).toContain('no task to run')
+  // Paragraphs around the directive line stay as written.
+  expect(modelDirective('a\n\nb\n[cortados: model=opus]\nc\n\nd').prompt).toBe('a\n\nb\nc\n\nd')
 })

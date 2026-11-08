@@ -37,7 +37,7 @@ Then set the provider URL (and, if you keep the token inline rather than in a fi
 | `providerUrl` | *(unset)* | Explicit override. Otherwise uses `CORTADOS_PROVIDER_URL`, then `CORTADOS_PROVIDER_URL_FILE` or `~/.config/cortados/provider-url`. HTTP and HTTPS supported; invalid configuration refuses routing. |
 | `providerTokenFile` | `~/.config/cortados/provider-token` | File holding `CORTADOS_PROVIDER_TOKEN`, read fresh at spawn time so the token is never stored in settings. `~` expands to `$HOME`. |
 | `providerToken` | *(unset)* | Optional inline token override. Prefer the file. |
-| `model` | `cortados` | Model id sent to the provider. `cortados` lets S1 route; a concrete id pins one lane. |
+| `model` | `cortados` | Model id sent to the provider. `cortados` lets S1 route; a concrete id pins one lane. A single subagent's prompt can override it with a directive line (see **Pinning one subagent's model**). |
 | `permissionMode` | `bypassPermissions` | Headless permission mode for each routed subagent (see **Blast radius**). |
 | `allowedTools` | `Read,Write,Edit,MultiEdit,Glob,Grep,Bash,WebSearch,WebFetch,TodoWrite,NotebookEdit` | The built-in tools a routed subagent has **on this machine**. Passed as both `--tools` (availability — the real boundary, so a tool left out is genuinely absent even under `bypassPermissions`) and `--allowedTools` (permission). Covers built-in tools only; MCP tools are controlled separately. |
 | `claudeBin` | `claude` | The `claude` executable used to run each routed subagent. |
@@ -229,6 +229,25 @@ refusal names the elapsed time, the timeout in seconds, the session id and trans
 parent can see how far it got instead of losing all the work. The whole refusal is scrubbed of the provider token. The
 child's prompt also ends with: "If a tool returns nothing useful twice in a row, stop and report what you have and
 what failed."
+
+## Pinning one subagent's model
+
+A subagent prompt can ask for a named model instead of the configured `model`. The one form that counts is a line of
+its own:
+
+```
+[cortados: model=GPT 6.1]
+```
+
+`<name>` is a pool model id (`gpt-6.1-sol`), a `sub/` alias (`opus`, `fable`), `cortados` (S1 routes), or a friendly
+name the provider resolves — `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km` (every word must belong to exactly one pool
+model; the provider refuses an ambiguous or unknown name with the candidates, so nothing is guessed). The mod strips
+the line from the prompt the child sees and launches it with `--model sub/<name>` (spaces become dashes, case folds:
+`sub/gpt-6.1`). Only this bracketed own-line form fires: "compare GPT 6.1 with Sonnet", or the tag quoted mid-sentence,
+is prose and pins nothing. A prompt with two directives is refused (the author named two models). Calls the mod passes
+through natively (fork, worktree/remote isolation, named agents) keep their prompt as written and ignore the directive.
+A review directive still goes through the independent-review exclusion: pinning a review onto an excluded model is
+refused by the provider, and the mod retries once without the exclusion header, as for any pinned model.
 
 ## Tests
 

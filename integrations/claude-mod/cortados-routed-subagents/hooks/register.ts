@@ -184,6 +184,41 @@ export function mainLoopAllows(tool: string, agentId: string | null | undefined,
 /** Appended to every routed child's prompt: a child stuck on a broken tool should report, not burn its budget. */
 export const STOP_ON_DEAD_TOOL = 'If a tool returns nothing useful twice in a row, stop and report what you have and what failed.'
 
+/** The ONE explicit way a subagent prompt names its model: `[cortados: model=<name>]` on a line of its own. Only
+ * this form counts, so prose that merely mentions a model ("compare GPT 6.1 with Sonnet") or quotes the directive
+ * mid-sentence never pins anything. `<name>` is a pool model id, a `sub/` alias, or a friendly name the provider's
+ * resolver (routing.resolve_pin) reads: `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km`; `cortados` asks S1 to route. The
+ * name is 1-80 characters of letters, digits, space . _ : / - : a model name is short, and anything longer or wider
+ * is not one. Kept as a single literal so tests/test_mod_directive.py can run the same pattern. */
+export const MODEL_DIRECTIVE_RE = /^[ \t]*\[cortados:[ \t]*model[ \t]*=[ \t]*([A-Za-z0-9][A-Za-z0-9 ._:\/-]{0,79})[ \t]*\][ \t]*$/m
+
+/** The provider model id a directive name becomes: spaces collapse to dashes and case folds (`GPT 6.1` -> `gpt-6.1`),
+ * so the id is one argv token and the provider reads it as the friendly name; `cortados` stays S1-routed and an
+ * explicit `sub/`/`api/` pin is kept as written. */
+export function directiveModelId(name: string): string {
+  const slug = name.trim().replace(/\s+/g, '-').toLowerCase()
+  if (slug === 'cortados' || slug.startsWith('sub/') || slug.startsWith('api/')) return slug
+  return 'sub/' + slug
+}
+
+/** Split a subagent prompt into its model directive (MODEL_DIRECTIVE_RE) and the prompt the child sees, with the
+ * directive line removed. `model` is null when the prompt has no directive. Two or more directives are a `problem`
+ * (the call is refused) rather than one being picked: the author named two models, and guessing could spend the
+ * wrong quota. */
+export function modelDirective(prompt: string): { model: string | null; prompt: string; problem: string | null } {
+  const all = prompt.match(new RegExp(MODEL_DIRECTIVE_RE.source, 'gm')) ?? []
+  if (all.length > 1) {
+    return { model: null, prompt, problem: `the prompt carries ${all.length} [cortados: model=…] directives; keep exactly one` }
+  }
+  const m = MODEL_DIRECTIVE_RE.exec(prompt)
+  if (!m) return { model: null, prompt, problem: null }
+  let end = m.index + m[0].length
+  if (prompt[end] === '\n') end += 1                 // the whole line goes, so the prompt's own paragraphs stay as written
+  const rest = (prompt.slice(0, m.index) + prompt.slice(end)).trim()
+  if (!rest) return { model: null, prompt, problem: 'the prompt is only a [cortados: model=…] directive; there is no task to run' }
+  return { model: directiveModelId(m[1]), prompt: rest, problem: null }
+}
+
 /** The --max-turns value from config: a positive integer, or null (flag off) for 0/negative/invalid. */
 export function resolveMaxTurns(v: unknown): number | null {
   const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN
@@ -1321,15 +1356,24 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Agent' }, async ($: any, e: any, next: any) => {
     const subagentType = String(e.subagent_type ?? '')
     const background = Boolean(e.run_in_background)
-    const prompt = String(e.prompt ?? '')
+    const rawPrompt = String(e.prompt ?? '')
     const description = String(e.description ?? 'routed subagent')
 
     // Pass through BEFORE launching anything — these cannot or should not be routed. After the launch below the
-    // hook never returns next(e), because the child will already have acted and native would re-run it.
-    if (subagentType === 'fork' || !prompt.trim()) return next(e)
+    // hook never returns next(e), because the child will already have acted and native would re-run it. A passed-
+    // through call keeps its prompt as written: a model directive in it is the native runner's to ignore.
+    if (subagentType === 'fork' || !rawPrompt.trim()) return next(e)
     if (background && !cfg.routeBackground) return next(e)
     if (e.isolation) return next(e) // worktree/remote: let the native runner own isolation
     if (e.name) return next(e) // a named agent stays addressable by SendMessage only if the parent spawns it
+
+    // The prompt's own model directive (`[cortados: model=<name>]` on a line of its own, see MODEL_DIRECTIVE_RE)
+    // pins this one child; otherwise the mod's configured model. The directive line is stripped from what the child
+    // sees. An unknown or ambiguous name is the provider's to refuse (it answers with the candidates).
+    const directive = modelDirective(rawPrompt)
+    if (directive.problem) return { deny: `routed-subagents: ${directive.problem}` }
+    const prompt = directive.prompt
+    const childModel = directive.model ?? String(cfg.model)
 
     // Per-call copy: concurrent agents must use the same resolved URL for launch and run-record lookup.
     let resolvedUrl: string
@@ -1377,7 +1421,7 @@ export const register: Register = (on, options) => {
     const tools = String(cfg.allowedTools)
     const args = [
       '-p', prompt + '\n\n' + STOP_ON_DEAD_TOOL,
-      '--model', String(cfg.model),
+      '--model', childModel,
       '--permission-mode', String(cfg.permissionMode),
       '--tools', tools,
       '--allowedTools', tools,

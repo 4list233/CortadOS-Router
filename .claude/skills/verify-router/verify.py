@@ -117,6 +117,36 @@ else:
         record("provider routes a scored conversation to a served lane (never openai-codex itself)",
                "PASS" if served else "FAIL", json.dumps(r))
 
+# Friendly pins (2026-11-08): `sub/<friendly name>` must resolve to the one pool model it means and never guess among
+# several. A pin skips S1, so this runs the same whether S1 is up or down. `GPT 6.1` has exactly one served model
+# (gpt-6.1-sol, codex-cli); `GPT 6` fits three (astra, luna, sol) and must come back as a client error naming them.
+PIN_SCENARIO = """
+import json, sys
+from cortados_router import core
+from cortados_router.provider import routing
+def pin(name):
+    body = {"model": name, "tools": [{"name": "Read"}], "messages": [{"role": "user", "content": "plan the work"}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-pin-" + name, claude_bin=sys.executable,
+                       codex_bin=sys.executable)
+    return {k: r.get(k) for k in ("provider", "model", "pinned", "client_error", "error")}
+print(json.dumps({"one": pin("sub/GPT 6.1"), "many": pin("sub/GPT 6")}))
+"""
+home = tempfile.mkdtemp(prefix="verify-router-pin-")
+PROBE_DIRS.append(Path(home) / "usage-probe")
+p = subprocess.run([sys.executable, "-B", "-c", PIN_SCENARIO], cwd=REPO, capture_output=True, text=True, timeout=180,
+                   env={**os.environ, "CORTADOS_HOME": home, "CORTADOS_SCARCITY_REFRESH": "off"})
+try:
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+except (ValueError, IndexError):
+    record("friendly pin resolves to one model, ambiguity is refused", "FAIL", (p.stderr or p.stdout).strip()[-300:])
+else:
+    one, many = r["one"], r["many"]
+    ok_one = (one.get("provider"), one.get("model"), one.get("pinned")) == ("codex-cli", "gpt-6.1-sol", True)
+    ok_many = many.get("client_error") and all(c in (many.get("error") or "") for c in ("gpt-6-astra", "gpt-6-luna", "gpt-6-sol")) \
+        and not many.get("model")
+    record("friendly pin resolves to one model, ambiguity is refused", "PASS" if ok_one and ok_many else "FAIL",
+           f"sub/GPT 6.1 -> {one.get('provider')}/{one.get('model')} | sub/GPT 6 -> {(many.get('error') or '')[:120]}")
+
 record("live ~/.cortados untouched", "PASS" if live_state_stamp() == before else "FAIL",
        str(LIVE_HOME))
 record("no vendor CLI probe opened", "PASS" if all(not p.exists() or not any(p.iterdir()) for p in PROBE_DIRS) else "FAIL",

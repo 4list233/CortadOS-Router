@@ -1,8 +1,8 @@
 {
  "_doc": "MUTABLE routing table for Cortados. Edit freely: the router reloads this file when its mtime changes, no restart. Models, lanes and order WILL change; the six features and the band conditions come from the 2.0 scale (scale-2.0-reference.json). Validation on load: unknown lane/provider, a Fable/ceiling entry outside R4, or a non-Grok model on the cursor lane = file rejected, last good table kept.",
- "version": 17,
- "updated": "2026-09-21",
- "updated_by": "claude (Forest 2026-09-21: measure every pool, list every model we can reach)",
+ "version": 18,
+ "updated": "2026-11-08",
+ "updated_by": "claude (Forest 2026-11-08: local inventory renamed to the current Ollama names; candidates unchanged)",
  "features": [
   "steps",
   "ambiguity",
@@ -523,15 +523,13 @@
   },
   "local": {
    "plan": "free (M1 Max, 32 GB)",
-   "source": "ollama list",
+   "source": "ollama list (Forest 2026-11-08: current Ollama names; the pinnable set is the local-resources config, docs/LOCAL-RESOURCES.md)",
    "models": [
-    "qwen3-8b-nothink-64k:latest",
-    "qwen3.5:27b",
-    "qwen3:4b",
-    "nomic-embed-text:latest",
-    "hf.co/unsloth/Qwen3-8B-128K-GGUF:Q4_K_M",
-    "qwen3:8b",
-    "qwen3:14b"
+    "qwen3.8-27b-heretic-q3km",
+    "qwen3.8-27b-heretic-iq3xxs",
+    "qwen3-8b-128k-q4km",
+    "qwen3-14b-q4km",
+    "nomic-embed-text-v1.5"
    ],
    "training": "MLX 0.32.2 + mlx-lm 0.31.3 in .venv-mlx (installed 2026-09-21)"
   }

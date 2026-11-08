@@ -477,6 +477,136 @@ class SubscriptionPinTests(unittest.TestCase):
         self.assertIn("unreadable", self.pin("sub/opus")["error"])
 
 
+class FriendlyPinTests(unittest.TestCase):
+    """`sub/<friendly name>`: one resolver (routing.resolve_pin) turns `GPT 6.1`, `Sonnet 5` or `ollama 27b q3km` into
+    the one pool model it means; an ambiguous name lists its candidates and is never guessed; prompt text never pins."""
+
+    LOCAL = [{"id": "qwen3.8-27b-heretic-q3km", "name": "Qwen3.8 27B Heretic Q3_K_M"},
+             {"id": "qwen3.8-27b-heretic-iq3xxs", "alias": "qwen-27b"},
+             {"id": "qwen3-14b-q4km"}]
+
+    def setUp(self):
+        import os
+        from cortados_router.provider import local_lane
+        self._keep = (core.STATE, core.lane_health, core.decide, os.environ.get(local_lane.CONFIG_ENV))
+        core.STATE = Path(tempfile.mkdtemp(prefix="cortados-provider-friendly-"))   # never the live router.db
+        core.lane_health = lambda: {}
+
+        def no_s1(text, ctx=None):
+            raise AssertionError("a pinned request must not be scored")
+        core.decide = no_s1
+        cfg = Path(tempfile.mkdtemp(prefix="cortados-friendly-local-")) / "resources.json"
+        cfg.write_text(json.dumps({"nodes": [{"id": "studio", "ollama": {"base_url": "http://127.0.0.1:9",
+                                                                         "probe_timeout_s": 1, "models": self.LOCAL}}]}))
+        os.environ[local_lane.CONFIG_ENV] = str(cfg)
+
+    def tearDown(self):
+        import os
+        from cortados_router.provider import local_lane
+        core.STATE, core.lane_health, core.decide, env = self._keep
+        if env is None:
+            os.environ.pop(local_lane.CONFIG_ENV, None)
+        else:
+            os.environ[local_lane.CONFIG_ENV] = env
+
+    def body(self, model, text="plan the work"):
+        return {"model": model, "tools": [{"name": "Read"}], "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>\ninjected\n</system-reminder>"}, {"type": "text", "text": text}]}]}
+
+    def choose(self, model, **kw):
+        return routing.choose(core, self.body(model), client="claude-cli", conversation_id="conv", claude_bin="python3",
+                              codex_bin="python3", **kw)
+
+    def test_exact_names_resolve_to_themselves_or_their_alias(self):
+        self.assertEqual(routing.resolve_pin(core, "claude-opus-5-5"), "claude-opus-5-5")
+        self.assertEqual(routing.resolve_pin(core, "GPT-6.1-SOL"), "gpt-6.1-sol")
+        self.assertEqual(routing.resolve_pin(core, "opus"), routing.SUB_ALIASES["opus"])
+        self.assertEqual(routing.resolve_pin(core, "claude-haiku-4-5"), "claude-haiku-4-5-20251001")   # date optional
+        self.assertEqual(routing.resolve_pin(core, "qwen-27b"), "qwen-27b")                            # local alias
+        self.assertEqual(routing.resolve_pin(core, "qwen3.8-27b-heretic-iq3xxs"), "qwen-27b")          # its tag
+
+    def test_friendly_names_resolve_to_one_model(self):
+        for name, want in (("GPT 6.1", "gpt-6.1-sol"), ("gpt-6.1", "gpt-6.1-sol"), ("gpt 6.1 sol", "gpt-6.1-sol"),
+                           ("Sonnet 5", "claude-sonnet-5"), ("Opus 5.5", "claude-opus-5-5"), ("opus 5", "claude-opus-5"),
+                           ("haiku 4.5", "claude-haiku-4-5-20251001"), ("fable 5.1", "claude-fable-5-1"),
+                           ("Claude Fable", "claude-fable-5-1"),
+                           ("ollama 27b q3km", "qwen3.8-27b-heretic-q3km"), ("local 14b", "qwen3-14b-q4km"),
+                           ("ollama 27b iq3xxs", "qwen-27b"), ("q3km", "qwen3.8-27b-heretic-q3km")):
+            self.assertEqual(routing.resolve_pin(core, name), want, name)
+
+    def test_name_tokens_merge_dashed_versions_and_keep_dotted_ones(self):
+        self.assertEqual(routing.name_tokens("claude-fable-5-1"), ["claude", "fable", "5.1"])
+        self.assertEqual(routing.name_tokens("GPT 6.1"), ["gpt", "6.1"])
+        self.assertEqual(routing.name_tokens("claude-haiku-4-5-20251001"), ["claude", "haiku", "4.5"])
+        self.assertEqual(routing.name_tokens("hf.co/unsloth/Qwen3-8B-128K-GGUF:Q4_K_M"),
+                         ["hf.co", "unsloth", "qwen3", "8b", "128k", "gguf", "q4", "k", "m"])
+
+    def test_an_ambiguous_name_lists_its_candidates_and_is_never_guessed(self):
+        with self.assertRaises(routing.AmbiguousPin) as cm:
+            routing.resolve_pin(core, "GPT 6")
+        self.assertEqual(cm.exception.candidates, ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol"])
+        with self.assertRaises(routing.AmbiguousPin) as cm:
+            routing.resolve_pin(core, "ollama 27b")
+        self.assertEqual(cm.exception.candidates, ["qwen-27b", "qwen3.8-27b-heretic-q3km"])
+        with self.assertRaises(routing.AmbiguousPin):
+            routing.resolve_pin(core, "27b")                     # no lane word: still only the two local 27b models
+        r = self.choose("sub/GPT 6")
+        self.assertTrue(r.get("client_error"))
+        self.assertIn("sub/GPT 6 is ambiguous", r["error"])
+        for c in ("gpt-6-astra", "gpt-6-luna", "gpt-6-sol"):
+            self.assertIn(c, r["error"])
+        self.assertFalse((core.STATE / "router.db").exists())    # nothing ran, nothing was logged
+
+    def test_an_unknown_name_is_refused_with_the_pinnable_list(self):
+        for name in ("GPT 9", "gpt-9-imaginary", "ollama 70b", "", "   "):
+            self.assertIsNone(routing.resolve_pin(core, name), name)
+        r = self.choose("sub/GPT 9")
+        self.assertTrue(r.get("client_error"))
+        self.assertIn("sub/GPT 9 is not a model this endpoint serves", r["error"])
+        self.assertIn("gpt-6.1-sol", r["error"])
+        self.assertIn("qwen-27b", r["error"])
+
+    def test_a_friendly_pin_runs_the_model_without_s1(self):
+        r = self.choose("sub/Sonnet 5")
+        self.assertNotIn("error", r)
+        self.assertEqual((r["provider"], r["model"], r["band"], r["pinned"]), ("claude-cli", "claude-sonnet-5", "pin", True))
+        r = self.choose("sub/GPT 6.1")
+        self.assertNotIn("error", r)
+        self.assertEqual((r["provider"], r["model"], r["pinned"]), ("codex-cli", "gpt-6.1-sol", True))
+
+    def test_a_friendly_local_pin_reaches_the_local_lane_under_its_tag(self):
+        r = self.choose("sub/ollama 27b q3km")
+        self.assertIn("error", r)                                  # the test node (port 9) is unreachable
+        self.assertIn("sub/qwen3.8-27b-heretic-q3km:", r["error"])
+        self.assertIn("no other model was tried", r["error"])
+
+    def test_a_friendly_pin_on_an_excluded_model_is_refused_as_the_excluded_model(self):
+        r = self.choose("sub/GPT 6.1", exclude_model="gpt-6.1-sol")
+        self.assertTrue(r.get("client_error"))
+        self.assertIn("sub/gpt-6.1-sol is the excluded model", r["error"])
+
+    def test_a_passing_mention_in_the_prompt_never_pins(self):
+        core.decide = scored(EASY)
+        body = self.body("cortados", "compare GPT 6.1 with Sonnet; also note the form [cortados: model=GPT 6.1] exists")
+        self.assertIsNone(routing.sub_pin(body))
+        r = routing.choose(core, body, client="claude-cli", conversation_id="mention", claude_bin="python3", codex_bin="python3")
+        self.assertNotEqual(r.get("band"), "pin")
+        self.assertFalse(r.get("pinned"))
+
+    def test_a_friendly_pin_continues_its_conversation(self):
+        import types
+        from cortados_router.provider.server import Handler
+        session = types.SimpleNamespace(route={"pinned": True, "model": "gpt-6.1-sol"})
+        self.assertIsNone(Handler._model_change(session, {"model": "sub/GPT 6.1"}))
+        self.assertIsNone(Handler._model_change(session, {"model": "sub/gpt-6.1-sol"}))
+        self.assertIn("fixed per conversation", Handler._model_change(session, {"model": "sub/gpt-6-sol"}))
+        self.assertIn("fixed per conversation", Handler._model_change(session, {"model": "sub/GPT 6"}))   # ambiguous: no
+        local = types.SimpleNamespace(route={"pinned": True, "model": "qwen3.8-27b-heretic-q3km",
+                                             "local": {"model": {"id": "qwen3.8-27b-heretic-q3km", "alias": None}}})
+        self.assertIsNone(Handler._model_change(local, {"model": "sub/ollama 27b q3km"}))
+        self.assertIn("fixed per conversation", Handler._model_change(local, {"model": "sub/local 14b"}))
+
+
 class MinLeftFloorTests(unittest.TestCase):
     """x-cortados-min-left-pct: the provider is the single enforcer (provider/floor.py). Accounts below the floor are
     excluded before ranking, the turn is reserved on the account that executes it, absent header = unchanged."""
