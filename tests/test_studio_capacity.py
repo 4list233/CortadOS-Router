@@ -7,7 +7,9 @@ import stat
 import time
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 import urllib.error
 from unittest.mock import patch
 
@@ -801,6 +803,75 @@ class NodeLockSafetyTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.lstat(self.gate / "node.lock").st_mode), 0o600)
 
 
+class StopRequestReentrancyTests(unittest.TestCase):
+    """The signal handler must never take a lock: a signal landing inside sleep() or inside a first handler call
+    used to deadlock on threading.Event's internal lock."""
+
+    def run_guarded(self, fn, seconds=5):
+        # Bounded: a regression would hang the thread, never the suite.
+        result = {}
+
+        def target():
+            try:
+                fn()
+            except BaseException as exc:  # recorded and asserted on below, never swallowed
+                result["exc"] = exc
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(seconds)
+        self.assertFalse(t.is_alive(), "StopRequest hung (lock taken in the handler?)")
+        return result.get("exc")
+
+    def test_no_lock_primitives(self):
+        stop = c.StopRequest()
+        lock_types = (type(threading.Lock()), type(threading.RLock()), threading.Event, threading.Condition)
+        for name, value in vars(stop).items():
+            self.assertNotIsInstance(value, lock_types, name)
+
+    def test_handler_mid_sleep_and_nested_handler_complete(self):
+        stop = c.StopRequest()
+        calls = []
+
+        def nested_trace(frame, event, arg):
+            # Re-enter the handler from inside the first handler's body (after it recorded its signum, before it
+            # sets the flag), as a second signal would.
+            code = c.StopRequest.handle.__code__
+            if event == "line" and frame.f_code is code and frame.f_lineno == code.co_firstlineno + 3 \
+                    and "nested" not in calls:
+                calls.append("nested")
+                stop.handle(signal.SIGINT, None)
+            return nested_trace
+
+        def fake_sleep(seconds):
+            self.assertLessEqual(seconds, c.STOP_POLL_SECONDS)
+            calls.append("slice")
+            sys.settrace(lambda f, e, a: nested_trace if f.f_code is c.StopRequest.handle.__code__ else None)
+            try:
+                stop.handle(signal.SIGTERM, None)  # the signal arrives mid-slice
+            finally:
+                sys.settrace(None)
+
+        def body():
+            with mock.patch.object(c.time, "sleep", fake_sleep):
+                stop.sleep(30)
+        exc = self.run_guarded(body)
+        self.assertIsInstance(exc, SystemExit)
+        self.assertEqual(exc.code, 128 + signal.SIGTERM)  # first signal fixes the code
+        self.assertIn("nested", calls)
+        self.assertEqual(calls.count("slice"), 1)          # stopped right after the slice that saw the signal
+        self.assertTrue(stop.is_set())
+
+    def test_sleep_without_signal_returns_after_bounded_slices(self):
+        stop = c.StopRequest()
+        slices = []
+        with mock.patch.object(c.time, "sleep", lambda s: slices.append(s)), \
+                mock.patch.object(c.time, "monotonic", side_effect=[0.0] + [0.1 * i for i in range(1, 50)]):
+            stop.sleep(0.35)
+        self.assertTrue(slices)
+        self.assertTrue(all(0 < s <= c.STOP_POLL_SECONDS for s in slices))
+        self.assertFalse(stop.is_set())
+
+
 # Subprocess harness: runs the real gate_main with training_gate bound to a temp gate dir and a fake, empty Ollama
 # (never the real one: the real check would unload models on this machine).
 HARNESS = r'''
@@ -918,6 +989,29 @@ class GateMainProcessTests(unittest.TestCase):
         os.kill(proc.pid, signal.SIGINT)
         self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)   # first signal fixes the code
         self.wait_for(lambda: not self.alive(child), 5)          # SIGKILLed after grace
+        self.assertTrue(self.shared_free())
+
+    def test_sigterm_during_cleanup_after_leader_exit_0_reports_143(self):
+        grand = self.root / "grand"
+        grand_script = ("import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+        # Leader: start a SIGTERM-ignoring descendant, wait until it has ignored SIGTERM, then exit 0.
+        leader = ("import os, subprocess, sys, time; "
+                  "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+                  "[time.sleep(0.02) for _ in range(500) if not (os.path.exists(sys.argv[2]) and "
+                  "open(sys.argv[2]).read().strip())]; "
+                  "open(sys.argv[3], 'w').write(str(os.getpid())); sys.exit(0)")
+        proc = self.start(sys.executable, "-c", leader, grand_script, str(grand), str(self.marker),
+                          extra_env={"TEST_GATE_GRACE": "3"})
+        leader_pid = self.pid_from(self.marker)
+        grand_pid = self.pid_from(grand)
+        self.wait_for(lambda: not self.alive(leader_pid), 5)  # leader exited 0; wrapper now in the 3 s grace
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll())
+        self.assertTrue(self.alive(grand_pid))
+        os.kill(proc.pid, signal.SIGTERM)
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)
+        self.wait_for(lambda: not self.alive(grand_pid), 5)
         self.assertTrue(self.shared_free())
 
     def test_normal_completion_releases(self):

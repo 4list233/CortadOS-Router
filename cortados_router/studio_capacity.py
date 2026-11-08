@@ -802,11 +802,16 @@ def gate_main(argv):
 
 class StopRequest:
     """SIGTERM/SIGINT -> a flag, never an exception. Repeated signals just set it again; the first signal fixes
-    the exit code (128 + signum: 143 for SIGTERM, 130 for SIGINT)."""
+    the exit code (128 + signum: 143 for SIGTERM, 130 for SIGINT).
+
+    The handler only assigns plain attributes: no lock, no threading.Event, no logging, no I/O. Reason: a Python
+    signal handler runs between bytecodes of the main thread, so one that takes a non-reentrant lock (Event.set)
+    deadlocks when the signal lands while that same thread holds it (inside Event.wait, or inside a first handler's
+    set()). Waiters poll the flag instead (sleep below, run_holding_lock's loop)."""
 
     def __init__(self):
-        self.event = threading.Event()
         self.signum = None
+        self.requested = False
 
     def install(self):
         signal.signal(signal.SIGTERM, self.handle)
@@ -815,10 +820,10 @@ class StopRequest:
     def handle(self, signum, frame):
         if self.signum is None:
             self.signum = signum
-        self.event.set()
+        self.requested = True
 
     def is_set(self):
-        return self.event.is_set()
+        return self.requested
 
     def exit_code(self):
         return 128 + self.signum
@@ -826,8 +831,15 @@ class StopRequest:
     def sleep(self, seconds):
         """Sleep for the gate's polls; a stop request ends the gate phase (no child exists yet, so raising is safe:
         training_gate's own cleanup runs on the way out)."""
-        if self.event.wait(seconds):
-            raise SystemExit(self.exit_code())
+        deadline = time.monotonic() + seconds
+        while not self.requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            # Slices of at most STOP_POLL_SECONDS: the flag is a plain attribute nobody can wake us on, so this bounds
+            # how long a recorded stop waits before the gate phase ends.
+            time.sleep(min(remaining, STOP_POLL_SECONDS))
+        raise SystemExit(self.exit_code())
 
 
 # A trainer asked to stop gets this long to checkpoint and exit before SIGKILL: S1 SFT writes a checkpoint of a few
@@ -910,11 +922,15 @@ def run_holding_lock(argv, lock_fd, grace_seconds=None, stop=None, after_spawn=N
             except subprocess.TimeoutExpired:
                 continue
             break
-        return stop.exit_code() if stop.is_set() else child.returncode
     finally:
         if child is not None:
             # pgid == child.pid: start_new_session makes the child lead a new session and group.
             _stop_group(child, child.pid, grace_seconds)
+    # Decided only after the teardown: a stop that arrives during _stop_group (leader already exited 0, a descendant
+    # still in its grace) must still report 128 + signum, not the leader's 0.
+    if stop.is_set():
+        return stop.exit_code()
+    return child.returncode
 
 
 def serve(runner, status_path, sleep=time.sleep, polls=None):
