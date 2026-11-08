@@ -32,31 +32,6 @@
     ],
     "why": "calls that changed state: the fact they happened must stay or the model may redo or contradict them"
   },
-  "readonly_bash_prefixes": {
-    "value": [
-      "cat",
-      "ls",
-      "head",
-      "tail",
-      "wc",
-      "grep",
-      "rg",
-      "find",
-      "pwd",
-      "echo",
-      "which",
-      "git log",
-      "git status",
-      "git diff",
-      "git show",
-      "git branch",
-      "sed -n",
-      "stat",
-      "file",
-      "tree"
-    ],
-    "why": "bash commands treated as re-runnable reads; anything else (or any command with redirection, pipes to a writer, or ;/&& chains) is a side effect"
-  },
   "mcp_side_effect_words": {
     "value": [
       "send",
@@ -85,5 +60,237 @@
   "assumed_window_tokens": {
     "value": 200000,
     "why": "the provider does not learn the backend's context window per turn; 200k is the common Claude window and the smaller of the routed windows, so the pruning start threshold min(cap, pct x W) is estimated conservatively (earlier, not later)"
+  },
+  "readonly_bash": {
+    "value": {
+      "cat": {
+        "flags": [
+          "-n",
+          "-b",
+          "-A",
+          "-v"
+        ],
+        "positionals": true
+      },
+      "ls": {
+        "flags": [
+          "-l",
+          "-a",
+          "-A",
+          "-h",
+          "-R",
+          "-t",
+          "-r",
+          "-1",
+          "-d",
+          "-S",
+          "-F"
+        ],
+        "positionals": true
+      },
+      "head": {
+        "flags": [
+          "-n",
+          "-c"
+        ],
+        "numeric": true,
+        "positionals": true
+      },
+      "tail": {
+        "flags": [
+          "-n",
+          "-c"
+        ],
+        "numeric": true,
+        "positionals": true
+      },
+      "wc": {
+        "flags": [
+          "-l",
+          "-c",
+          "-w",
+          "-m"
+        ],
+        "positionals": true
+      },
+      "grep": {
+        "flags": [
+          "-n",
+          "-i",
+          "-r",
+          "-R",
+          "-l",
+          "-L",
+          "-c",
+          "-w",
+          "-x",
+          "-E",
+          "-F",
+          "-v",
+          "-e",
+          "-A",
+          "-B",
+          "-C",
+          "-h",
+          "-H",
+          "-o",
+          "-s",
+          "-q",
+          "--include",
+          "--exclude",
+          "--exclude-dir",
+          "--color"
+        ],
+        "positionals": true
+      },
+      "rg": {
+        "flags": [
+          "-n",
+          "-i",
+          "-l",
+          "-c",
+          "-w",
+          "-F",
+          "-S",
+          "-e",
+          "-g",
+          "-t",
+          "-A",
+          "-B",
+          "-C",
+          "-u",
+          "--hidden",
+          "--files",
+          "--glob",
+          "--type",
+          "--no-heading",
+          "--color"
+        ],
+        "positionals": true
+      },
+      "find": {
+        "flags": [
+          "-name",
+          "-iname",
+          "-type",
+          "-maxdepth",
+          "-mindepth",
+          "-path",
+          "-ipath",
+          "-print",
+          "-newer",
+          "-size",
+          "-mtime",
+          "-not",
+          "-o",
+          "-and",
+          "-or"
+        ],
+        "positionals": true
+      },
+      "pwd": {
+        "flags": [],
+        "positionals": false
+      },
+      "which": {
+        "flags": [
+          "-a"
+        ],
+        "positionals": true
+      },
+      "echo": {
+        "flags": [
+          "-n",
+          "-e"
+        ],
+        "positionals": true
+      },
+      "stat": {
+        "flags": [],
+        "positionals": true
+      },
+      "file": {
+        "flags": [],
+        "positionals": true
+      },
+      "tree": {
+        "flags": [
+          "-L",
+          "-a",
+          "-d",
+          "-f",
+          "-I"
+        ],
+        "positionals": true
+      },
+      "git status": {
+        "flags": [
+          "-s",
+          "-b",
+          "--short",
+          "--branch",
+          "--porcelain"
+        ],
+        "positionals": false
+      },
+      "git log": {
+        "flags": [
+          "--oneline",
+          "--stat",
+          "-p",
+          "--name-only",
+          "--name-status",
+          "--graph",
+          "--decorate",
+          "--all",
+          "-n",
+          "--format",
+          "--pretty",
+          "--since",
+          "--until",
+          "--author",
+          "--follow"
+        ],
+        "numeric": true,
+        "positionals": true
+      },
+      "git diff": {
+        "flags": [
+          "--stat",
+          "--name-only",
+          "--name-status",
+          "--cached",
+          "--staged",
+          "-w",
+          "--color"
+        ],
+        "positionals": true
+      },
+      "git show": {
+        "flags": [
+          "--stat",
+          "--name-only",
+          "--name-status",
+          "--oneline",
+          "--format",
+          "--pretty"
+        ],
+        "positionals": true
+      },
+      "git branch": {
+        "flags": [
+          "-a",
+          "-r",
+          "-v",
+          "-vv",
+          "--list",
+          "--show-current",
+          "--all",
+          "--remotes"
+        ],
+        "positionals": false
+      }
+    },
+    "why": "read-only commands as an ALLOWLIST of command + argument shapes, checked on the shlex-tokenized command: every flag must be listed (short-flag clusters like -rn are split; --opt=value is checked by --opt), positionals are allowed only where the command takes paths/patterns/refs (git branch/status take none, so `git branch x` creates and is a side effect). Anything else, any unknown flag (find -delete/-exec, git branch -D, sed -i, git diff --output), a parse failure, or any ; & | < > ` $( is a side effect: keeping a call by mistake costs tokens, dropping a side effect by mistake loses state."
   }
 }

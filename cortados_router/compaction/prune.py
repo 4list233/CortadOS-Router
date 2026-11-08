@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import re
+import shlex
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -60,9 +61,42 @@ def _bash_command(ev: ToolEvent) -> Optional[str]:
 
 
 def readonly_bash(cmd: str, table: dict[str, Any]) -> bool:
+    """True only when the command matches an allowlisted shape (tables/compaction-prune.json readonly_bash): the
+    shlex tokens start with a listed command ("git log" takes two tokens), every flag is listed, and positionals
+    appear only where the shape allows them. Everything else is not read-only."""
     if not cmd or _CHAIN.search(cmd):
         return False
-    return any(cmd == p or cmd.startswith(p + " ") for p in table["readonly_bash_prefixes"])
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not toks:
+        return False
+    shapes = table["readonly_bash"]
+    if len(toks) >= 2 and f"{toks[0]} {toks[1]}" in shapes:
+        shape, args = shapes[f"{toks[0]} {toks[1]}"], toks[2:]
+    elif toks[0] in shapes and toks[0] != "git":
+        shape, args = shapes[toks[0]], toks[1:]
+    else:
+        return False
+    flags = set(shape["flags"])
+    for a in args:
+        if a == "--":
+            continue
+        if a.startswith("--"):
+            if a.split("=", 1)[0] not in flags:
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            if a in flags:
+                continue
+            if shape.get("numeric") and a[1:].isdigit():
+                continue
+            # a short-flag cluster (-rn) is allowed when every letter is a listed single-letter flag
+            if not all(f"-{c}" in flags for c in a[1:]):
+                return False
+        elif not shape.get("positionals"):
+            return False
+    return True
 
 
 def is_side_effect(ev: ToolEvent, table: dict[str, Any]) -> bool:
