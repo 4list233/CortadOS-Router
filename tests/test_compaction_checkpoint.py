@@ -146,12 +146,18 @@ class HandoffTests(unittest.TestCase):
     def test_sections_and_manifest(self):
         s = synthetic_session()
         md, man = handoff.build_handoff(s, self.pol)
-        order = [md.index(h) for h in ("## Goal", "## Standing rules", "## Decisions", "## In-flight",
+        order = [md.index(h) for h in ("## Goal", "## Recency pin", "## Standing rules", "## Decisions", "## In-flight",
                                        "## Files touched", "## Ranked excerpts")]
         self.assertEqual(order, sorted(order))
         self.assertIn("handoff-id: %s" % man["handoff_id"], md)
         goal = [it["index"] for it in man["sections"]["goal"]["items"]]
-        self.assertEqual(goal, [0, 2, 4])
+        self.assertEqual(goal, [4])
+        pin = man["sections"]["recency_pin"]["items"]
+        self.assertEqual([(it["kind"], it["index"]) for it in pin],
+                         [("message", 0), ("message", 2), ("event", 1), ("event", 2)])
+        self.assertIn("(no result: interrupted)", md)
+        excerpt_keys = {(it["kind"], it["index"]) for it in man["sections"]["excerpts"]["items"]}
+        self.assertFalse(excerpt_keys & {("message", 0), ("message", 2), ("message", 4), ("event", 1)})
         # newest wins: "Never delete data." appears in m0 and m2; kept once, attributed to m2
         rules = md[md.index("## Standing rules"):md.index("## Decisions")]
         self.assertEqual(rules.count("Never delete data."), 1)
@@ -160,7 +166,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("VERIFY", md)
         for tok in ("branch feat/exporter", "pr 42", "commit 1a2b3c4d"):
             self.assertIn(tok, md)
-        self.assertIn("`src/exporter.py` x2", md)
+        self.assertIn("`src/exporter.py` x2 (Edit)", md)
         files = man["sections"]["files"]["items"]
         self.assertEqual(files[0]["indexes"], [0, 1])
         for it in man["sections"]["excerpts"]["items"]:
@@ -199,9 +205,32 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaises(handoff.HandoffBudgetError):
             handoff.build_handoff(synthetic_session(rule_text="You must always " + "check " * 400), pol)
 
-    def test_est_tokens(self):
-        self.assertEqual(handoff.est_tokens("abcde"), 2)
-        self.assertEqual(handoff.est_tokens(""), 0)
+    def test_est_tokens_per_format(self):
+        self.assertEqual(handoff.est_tokens("abcde", 2.5), 2)
+        self.assertEqual(handoff.est_tokens("abcdefghi", 4), 3)
+        self.assertEqual(handoff.est_tokens("", 4), 0)
+        s = synthetic_session()
+        _, man = handoff.build_handoff(s, self.pol)  # source "test" -> unknown -> conservative 2.5
+        self.assertEqual(man["chars_per_token"], 2.5)
+        cx = Session(s.session, "codex", s.messages, s.events)
+        _, man = handoff.build_handoff(cx, self.pol)
+        self.assertEqual(man["chars_per_token"], 4)
+
+    def test_files_cap_and_head_tail(self):
+        pol = copy.deepcopy(self.pol)
+        pol["files_max"] = 1
+        pol["recency_pin"] = {"user_turns": 3, "tool_calls": 0}
+        msgs = (Message("s", 0, "user", "go"), Message("s", 1, "assistant", "x", (0, 1, 2, 3, 4)))
+        long = "H" * 300 + "M" * 1000 + "T" * 300
+        evs = tuple(ToolEvent("s", i, 1, "Write", {"file_path": "f%d.py" % i}, long, len(long), False, False)
+                    for i in range(5))
+        md, man = handoff.build_handoff(Session("s", "codex", msgs, evs), pol)
+        self.assertEqual(len(man["sections"]["files"]["items"]), 1)
+        self.assertEqual(man["sections"]["files"]["dropped"], 4)
+        ex = md[md.index("## Ranked excerpts"):]
+        self.assertIn("(1600 chars)", ex)
+        self.assertIn("of 1600 chars cut", ex)
+        self.assertIn("T" * 160, ex)
 
 
 class PolicyTests(unittest.TestCase):
@@ -210,9 +239,19 @@ class PolicyTests(unittest.TestCase):
 
     def test_loads(self):
         p = policy.load()
-        self.assertEqual(p["status"], "provisional")
-        self.assertEqual(p["checkpoint_pct"], 70)
-        self.assertEqual(sum(p["section_budgets"].values()), p["handoff_total_tokens"])
+        self.assertEqual(p["status"], "researched-2026-11-08")
+        self.assertEqual(p["checkpoint"], {"pct": 70, "cap_tokens": 200000})
+        self.assertEqual(p["handoff_total_tokens"], 16000)
+        self.assertIn("compaction-prune.json", self.raw()["pruning"]["why"])
+
+    def test_thresholds(self):
+        p = policy.load()
+        self.assertEqual(policy.thresholds(p, 200000), {"warn": 110000, "checkpoint": 140000, "force": 170000})
+        self.assertEqual(policy.thresholds(p, 1000000), {"warn": 150000, "checkpoint": 200000, "force": 300000})
+        self.assertEqual(policy.thresholds(p, 500000, "api/gpt-6.1-sol")["force"], 262000)
+        haiku = policy.thresholds(p, 200000, "api/claude-haiku-5-5")
+        self.assertEqual(haiku["force"], 90000)
+        self.assertLessEqual(haiku["checkpoint"], haiku["force"])
 
     def test_every_value_has_why(self):
         for k, v in self.raw().items():
@@ -225,16 +264,16 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.PolicyError, "unknown"):
             policy.validate(r)
         r = self.raw()
-        del r["force_pct"]
+        del r["force"]
         with self.assertRaisesRegex(policy.PolicyError, "missing"):
             policy.validate(r)
         r = self.raw()
-        r["warn_pct"]["why"] = ""
+        r["warn"]["why"] = ""
         with self.assertRaisesRegex(policy.PolicyError, "reason"):
             policy.validate(r)
         r = self.raw()
-        r["warn_pct"]["value"] = 90
-        with self.assertRaisesRegex(policy.PolicyError, "warn_pct <"):
+        r["warn"]["value"]["pct"] = 90
+        with self.assertRaisesRegex(policy.PolicyError, "warn.pct <"):
             policy.validate(r)
         r = self.raw()
         r["section_budgets"]["value"]["extra"] = 1
@@ -272,25 +311,59 @@ class CliTests(unittest.TestCase):
     def status(self, **cw):
         return _write([{"session_id": "x", "context_window": cw}])
 
-    def test_check_levels(self):
-        cases = [({"used_percentage": 10, "context_window_size": 200000}, "ok"),
-                 ({"used_percentage": 65, "context_window_size": 200000}, "warn"),
-                 ({"used_percentage": 72, "context_window_size": 200000}, "checkpoint"),
-                 ({"used_percentage": 90, "context_window_size": 200000}, "force"),
-                 ({"context_window_size": 1000000, "current_usage": {"input_tokens": 10, "cache_read_input_tokens":
-                                                                     310000}}, "checkpoint")]
-        for cw, want in cases:
-            rc, out, _ = self.run_cli("check", "--status-file", self.status(**cw))
-            self.assertEqual((rc, out.split()[0]), (0, want), cw)
+    def check(self, *extra, **cw):
+        return self.run_cli("check", "--status-file", self.status(**cw), *extra)
 
-    def test_check_velocity_and_missing(self):
-        prev = self.status(total_input_tokens=60000, context_window_size=200000)
-        cur = self.status(total_input_tokens=100000, context_window_size=200000)
-        rc, out, _ = self.run_cli("check", "--status-file", cur, "--previous-status-file", prev)
-        self.assertTrue(out.startswith("checkpoint velocity"), out)
-        rc, out, err = self.run_cli("check", "--status-file", self.status(context_window_size=200000))
+    def test_check_levels_200k_binds_on_pct(self):
+        for used, want in ((50000, "ok"), (115000, "warn"), (145000, "checkpoint"), (175000, "force")):
+            rc, out, _ = self.check(total_input_tokens=used, context_window_size=200000)
+            self.assertEqual((rc, out.split()[0]), (0, want), used)
+
+    def test_check_levels_1m_binds_on_caps(self):
+        for used, want in ((140000, "ok"), (160000, "warn"), (210000, "checkpoint"), (310000, "force")):
+            rc, out, _ = self.check(context_window_size=1000000,
+                                    current_usage={"input_tokens": 10, "cache_read_input_tokens": used - 10})
+            self.assertEqual(out.split()[0], want, used)
+        rc, out, _ = self.check(used_percentage=30, context_window_size=1000000)  # 300k from the percentage
+        self.assertEqual(out.split()[0], "force")
+
+    def test_check_price_cliff(self):
+        rc, out, _ = self.check("--model", "api/gpt-6.1-sol", total_input_tokens=265000, context_window_size=500000)
+        self.assertEqual(out.split()[0], "force")
+        rc, out, _ = self.check("--model", "sub/opus", total_input_tokens=265000, context_window_size=500000)
+        self.assertEqual(out.split()[0], "checkpoint")
+
+    def test_check_velocity(self):
+        hist = _write(["60000", "80000", "100000"])
+        rc, out, _ = self.check("--history-file", hist, total_input_tokens=120000, context_window_size=1000000)
+        self.assertTrue(out.startswith("ok"), out)  # 120k + 2 x 20k = 160k < 300k
+        hist = _write(["20000", "60000", "100000"])
+        rc, out, _ = self.check("--history-file", hist, total_input_tokens=135000, context_window_size=200000)
+        self.assertTrue(out.startswith("checkpoint velocity"), out)  # 135k + 2 x ~38k >= 170k
+        hist = _write(["10000"])
+        rc, out, _ = self.check("--history-file", hist, total_input_tokens=35000, context_window_size=200000)
+        self.assertTrue(out.startswith("checkpoint velocity: last turn"), out)  # +25k >= 10% of 200k
+
+    def test_check_idle_ttl_and_fresh(self):
+        rc, out, _ = self.check("--idle-seconds", "4000", "--cache-ttl-class", "claude-subscription",
+                                total_input_tokens=115000, context_window_size=200000)
+        self.assertTrue(out.startswith("checkpoint idle"), out)
+        rc, out, _ = self.check("--idle-seconds", "100", "--cache-ttl-class", "claude-subscription",
+                                total_input_tokens=115000, context_window_size=200000)
+        self.assertTrue(out.startswith("warn"), out)
+        rc, _, err = self.check("--cache-ttl-class", "nope", total_input_tokens=115000, context_window_size=200000)
+        self.assertEqual(rc, 2)
+        rc, out, _ = self.check("--fresh", total_input_tokens=75000, context_window_size=200000)
+        self.assertTrue(out.startswith("escalate"), out)  # > 50% of 140k
+        rc, out, _ = self.check("--fresh", total_input_tokens=20000, context_window_size=200000)
+        self.assertTrue(out.startswith("ok"), out)
+
+    def test_check_missing_and_pct_only(self):
+        rc, out, err = self.check(context_window_size=200000)
         self.assertEqual(rc, 2)
         self.assertIn("error", err)
+        rc, out, _ = self.check(used_percentage=72)
+        self.assertTrue(out.startswith("checkpoint") and "window unknown" in out, out)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,16 @@
 """Deterministic handoff document from a parsed Session (phase 0; stdlib only, no model calls).
 
 `build_handoff(session, policy) -> (markdown, manifest)`. Sections, in order, each under its own token budget from
-`tables/compaction.json`:
-  Goal (last N user prompts verbatim), Standing rules, Decisions, In-flight, Files touched, Ranked excerpts.
-Tokens are an ESTIMATE: ceil(chars / 4). It is used only for budgeting; it is not a tokenizer count.
+`tables/compaction.json` (values and sources: docs/COMPACTION-THRESHOLDS.md):
+  Goal (latest user prompt verbatim), Recency pin (earlier recent user turns verbatim + the last tool calls raw),
+  Standing rules, Decisions, In-flight, Files touched, Ranked excerpts.
+Tokens are an ESTIMATE: ceil(chars / chars_per_token), per transcript format from the policy (2.5 for Claude Code,
+4 for Codex, the conservative 2.5 when unknown). It is used only for budgeting; it is not a tokenizer count.
 
 The manifest records exactly which message (`m`) / tool event (`e`) indexes went into which section, with scores, so
 phase 2 can turn later reuse into labels. Same Session + same policy -> byte-identical output.
 
-Over the total budget, sections are trimmed lowest priority first: excerpts, then files, then decisions. Goal and
+Over the total budget, sections are trimmed lowest priority first: excerpts, files, decisions, recency pin. Goal and
 Standing rules are never trimmed: if they alone exceed the total budget, HandoffBudgetError is raised (a handoff
 without its goal or rules would restart the session wrong, which is worse than not restarting).
 """
@@ -22,15 +24,18 @@ from typing import Any, Dict, List, Tuple
 
 from .events import Session
 
-ESTIMATE_NOTE = "tokens = ceil(chars / 4), an estimate, not a tokenizer count"
+ESTIMATE_NOTE = "tokens = ceil(chars / chars_per_token) per transcript format, an estimate, not a tokenizer count"
+
+# Set per build from policy["chars_per_token"] and the session's source; 2.5 (the conservative Claude ratio) default.
+_CPT = [2.5]
 
 
 class HandoffBudgetError(ValueError):
     pass
 
 
-def est_tokens(text: str) -> int:
-    return math.ceil(len(text) / 4)
+def est_tokens(text: str, chars_per_token: float = 0) -> int:
+    return math.ceil(len(text) / (chars_per_token or _CPT[0]))
 
 
 RULE_RE = re.compile(r"\b(never|always|must|don't|do not|only|every)\b", re.I)
@@ -85,6 +90,36 @@ def _goal(session: Session, policy: dict) -> List[dict]:
             for m in users[-policy["goal_prompts"]:]]
 
 
+def _head_tail(text: str, head: int, tail: int) -> str:
+    if len(text) <= head + tail:
+        return text
+    return "%s [...%d of %d chars cut...] %s" % (text[:head], len(text) - head - tail, len(text),
+                                                  text[-tail:] if tail else "")
+
+
+def _recency_pin(session: Session, policy: dict, goal_items: List[dict], budget: int) -> Tuple[List[dict], int]:
+    """Earlier recent user turns verbatim (those not already in Goal) and the last tool calls raw (input + result,
+    the result cut head + tail only to fit the section)."""
+    rp = policy["recency_pin"]
+    goal_ids = {it["index"] for it in goal_items}
+    users = [m for m in session.messages if m.role == "user" and m.text.strip() and m.index not in goal_ids]
+    items = [{"kind": "m", "index": m.index, "order": (m.index, 0, 0),
+              "line": "> [m%d user] %s" % (m.index, m.text.strip().replace("\n", "\n> "))}
+             for m in (users[-rp["user_turns"]:] if rp["user_turns"] else [])]
+    evs = list(session.events[-rp["tool_calls"]:]) if rp["tool_calls"] else []
+    cpt = _CPT[0]
+    room = int(budget * cpt / max(1, len(evs) or 1) / 2)  # half the section per call at most, in chars
+    for e in evs:
+        res = "(no result: interrupted)" if e.interrupted else _head_tail(e.result_text, room // 2, room // 4)
+        items.append({"kind": "e", "index": e.index, "order": (e.message_index, 1, e.index),
+                      "line": "- [e%d %s%s] input %s\n  result (%d chars): %s"
+                              % (e.index, e.name, " ERROR" if e.is_error else "", _cut(_json(e.input), room // 4),
+                                 e.result_chars, res)})
+    # newest first under the budget, then chronological
+    taken, dropped = _fill(sorted(items, key=lambda it: it["order"], reverse=True), budget)
+    return sorted(taken, key=lambda it: it["order"]), dropped
+
+
 def _rules(session: Session) -> List[dict]:
     latest: Dict[str, dict] = {}
     for m in session.messages:
@@ -115,7 +150,7 @@ def _in_flight(session: Session, policy: dict, budget: int) -> Tuple[List[dict],
             items.append({"kind": "e", "index": e.index,
                           "line": "- VERIFY: tool call `%s` [e%d] has no result (interrupted): %s"
                                   % (e.name, e.index, _cut(_json(e.input), 200))})
-    k = policy["recency_pin_messages"]
+    k = policy["recency_window_messages"]
     recent = session.messages[-k:] if k else ()
     seen = set()
     for m in recent:
@@ -150,9 +185,10 @@ def _strings(obj: Any):
             yield from _strings(v)
 
 
-def _files(session: Session, budget: int) -> Tuple[List[dict], int]:
+def _files(session: Session, budget: int, max_files: int) -> Tuple[List[dict], int]:
     counts: Counter = Counter()
     where: Dict[str, List[int]] = {}
+    tools: Dict[str, set] = {}
     for e in session.events:
         paths = []
         if e.name in EDIT_TOOLS and isinstance(e.input.get(EDIT_TOOLS[e.name]), str):
@@ -162,17 +198,20 @@ def _files(session: Session, budget: int) -> Tuple[List[dict], int]:
         for p in paths:
             counts[p] += 1
             where.setdefault(p, []).append(e.index)
+            tools.setdefault(p, set()).add(e.name)
     ordered = sorted(counts, key=lambda p: (-counts[p], p))
     items = [{"kind": "e", "indexes": where[p], "path": p, "count": counts[p],
-              "line": "- `%s` x%d" % (p, counts[p])} for p in ordered]
-    return _fill(items, budget)
+              "line": "- `%s` x%d (%s)" % (p, counts[p], ", ".join(sorted(tools[p])))} for p in ordered]
+    over = max(0, len(items) - max_files)
+    taken, dropped = _fill(items[:max_files], budget)
+    return taken, dropped + over
 
 
-def _excerpts(session: Session, policy: dict, goal_items: List[dict], budget: int) -> Tuple[List[dict], int]:
-    goal_ids = {it["index"] for it in goal_items}
+def _excerpts(session: Session, policy: dict, goal_ids: set, skip: set, budget: int) -> Tuple[List[dict], int]:
+    """skip: ("m", i) / ("e", i) already shown verbatim in Goal or the recency pin."""
     goal_words = set(WORD_RE.findall(" ".join(session.messages[i].text for i in sorted(goal_ids)).lower())) - STOPWORDS
     n = len(session.messages)
-    k = policy["recency_pin_messages"]
+    k = policy["recency_window_messages"]
     cands = []
 
     def score(text: str, msg_index: int) -> float:
@@ -186,18 +225,19 @@ def _excerpts(session: Session, policy: dict, goal_items: List[dict], budget: in
         return s
 
     for m in session.messages:
-        if m.index in goal_ids or not m.text.strip():
+        if ("m", m.index) in skip or not m.text.strip():
             continue
         line = "- [m%d %s] %s" % (m.index, m.role,
                                    _cut(m.text.strip(), policy["excerpt_message_truncation_chars"]).replace("\n", " "))
         cands.append({"kind": "m", "index": m.index, "order": (m.index, 0, 0), "score": score(m.text, m.index),
                       "line": line})
     for e in session.events:
-        if not e.result_text:
+        if not e.result_text or ("e", e.index) in skip:
             continue
-        body = _cut(e.result_text.strip(), policy["tool_result_truncation_chars"]).replace("\n", " ")
-        line = "- [e%d %s%s] %s -> %s" % (e.index, e.name, " ERROR" if e.is_error else "",
-                                         _cut(_json(e.input), 160), body)
+        ht = policy["excerpt_tool_result_chars"]
+        body = _head_tail(e.result_text.strip(), ht["head"], ht["tail"]).replace("\n", " ")
+        line = "- [e%d %s%s] %s -> (%d chars) %s" % (e.index, e.name, " ERROR" if e.is_error else "",
+                                                    _cut(_json(e.input), 160), e.result_chars, body)
         cands.append({"kind": "e", "index": e.index, "order": (e.message_index, 1, e.index),
                       "score": score(e.result_text + " " + _json(e.input), e.message_index), "line": line})
     ranked = sorted(cands, key=lambda c: (-c["score"], tuple(-x for x in c["order"])))
@@ -205,10 +245,11 @@ def _excerpts(session: Session, policy: dict, goal_items: List[dict], budget: in
     return sorted(taken, key=lambda c: c["order"]), dropped
 
 
-SECTION_TITLES = (("goal", "Goal"), ("rules", "Standing rules"), ("decisions", "Decisions"),
+SECTION_TITLES = (("goal", "Goal"), ("recency_pin", "Recency pin (latest turns, verbatim)"),
+                  ("rules", "Standing rules"), ("decisions", "Decisions"),
                   ("in_flight", "In-flight (verify before acting)"), ("files", "Files touched"),
                   ("excerpts", "Ranked excerpts"))
-TRIM_ORDER = ("excerpts", "files", "decisions")
+TRIM_ORDER = ("excerpts", "files", "decisions", "recency_pin")
 
 
 def handoff_id(session: Session) -> str:
@@ -225,19 +266,25 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
     total_budget = policy["handoff_total_tokens"]
     sections: Dict[str, List[dict]] = {}
     dropped: Dict[str, int] = {}
+    cpt = policy["chars_per_token"]
+    _CPT[0] = cpt.get(session.source, cpt["unknown"])
     sections["goal"] = _goal(session, policy)
     dropped["goal"] = 0
+    sections["recency_pin"], dropped["recency_pin"] = _recency_pin(session, policy, sections["goal"],
+                                                                   b["recency_pin"])
     sections["rules"] = _rules(session)
     dropped["rules"] = 0
     sections["decisions"], dropped["decisions"] = _decisions(session, b["decisions"])
     sections["in_flight"], dropped["in_flight"] = _in_flight(session, policy, b["in_flight"])
-    sections["files"], dropped["files"] = _files(session, b["files"])
-    sections["excerpts"], dropped["excerpts"] = _excerpts(session, policy, sections["goal"], b["excerpts"])
+    sections["files"], dropped["files"] = _files(session, b["files"], policy["files_max"])
+    sections["excerpts"], dropped["excerpts"] = _excerpts(
+        session, policy, {it["index"] for it in sections["goal"]},
+        {(it["kind"], it["index"]) for k in ("goal", "recency_pin") for it in sections[k]}, b["excerpts"])
 
     hid = handoff_id(session)
     header = ("# CortadOS handoff\n\nhandoff-id: %s\n\nsession %s (%s), %d messages, %d tool calls. Token counts are "
-              "estimates (ceil(chars/4)). Resume from this document; re-read files before editing them.\n"
-              % (hid, session.session, session.source, len(session.messages), len(session.events)))
+              "estimates (ceil(chars/%s)). Resume from this document; re-read files before editing them.\n"
+              % (hid, session.session, session.source, len(session.messages), len(session.events), _CPT[0]))
 
     def render_all() -> Tuple[str, Dict[str, int]]:
         parts, toks = [header], {}
@@ -269,7 +316,7 @@ def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
     manifest = {
         "handoff_id": hid, "session": session.session, "source": session.source,
         "policy_status": policy.get("status"), "policy_version": policy.get("version"),
-        "token_estimate": ESTIMATE_NOTE, "total_tokens": est_tokens(md), "total_budget": total_budget,
+        "token_estimate": ESTIMATE_NOTE, "chars_per_token": _CPT[0], "total_tokens": est_tokens(md), "total_budget": total_budget,
         "sections": {},
     }
     for key, _title in SECTION_TITLES:
