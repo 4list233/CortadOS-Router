@@ -878,3 +878,100 @@ class TrainOnlyInWindow(unittest.TestCase):
                                  idle_s=900, sleep=lambda s: (sleeps.append(s), _time.sleep(0.01)), cycles=1, poll_s=0)
             self.assertNotIn(900, sleeps)
             self.assertEqual(night._load_failures(Path(tmp) / 'r2'), 0)
+
+
+class WindowEndDrainAndDst(unittest.TestCase):
+    """Review fixes: window end waits for the whole cycle group (P1); deadlines follow DST in a named zone (P2-a)."""
+
+    def test_deadline_is_0700_wall_time_across_dst(self):
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/Toronto')
+        w = night.parse_night_window('01:00-07:00')
+        for name, start in (('spring forward', datetime(2027, 3, 14, 1, 30, tzinfo=tz)),     # 01:30 EST, 07:00 is EDT
+                            ('fall back', datetime(2026, 11, 1, 1, 30, tzinfo=tz))):         # 01:30 EDT, 07:00 is EST
+            with self.subTest(name):
+                # a fixed-offset clock (the old _local_now) must give the same deadline
+                for now in (start, start.astimezone(start.tzinfo.utcoffset(start) and timezone(start.utcoffset()))):
+                    ok, _, dl = night.train_policy(now, window_raw='01:00-07:00', switch_raw='1', zone=tz)
+                    self.assertTrue(ok)
+                    local = dl.astimezone(tz)
+                    self.assertEqual((local.date(), local.hour, local.minute), (start.date(), 7, 0))
+                    self.assertEqual(dl.timestamp(), datetime(start.year, start.month, start.day, 7, tzinfo=tz).timestamp())
+                    self.assertLess(now, dl)
+                end = datetime(start.year, start.month, start.day, 7, tzinfo=tz)
+                self.assertTrue(night.in_night_window(w, end - night.timedelta(minutes=1), zone=tz))
+                self.assertFalse(night.in_night_window(w, end, zone=tz))
+                # the same instant read through UTC is still inside / outside
+                self.assertTrue(night.in_night_window(w, (end - night.timedelta(minutes=1)).astimezone(timezone.utc), zone=tz))
+                self.assertFalse(night.in_night_window(w, end.astimezone(timezone.utc), zone=tz))
+        # spring forward: 01:30 EST -> 07:00 EDT is 4.5 real hours; fall back: 01:30 EDT -> 07:00 EST is 6.5
+        spring = night.train_policy(datetime(2027, 3, 14, 1, 30, tzinfo=tz), window_raw='01:00-07:00', switch_raw='1', zone=tz)[2]
+        self.assertEqual(spring.timestamp() - datetime(2027, 3, 14, 1, 30, tzinfo=tz).timestamp(), 4.5 * 3600)
+        fall = night.train_policy(datetime(2026, 11, 1, 1, 30, tzinfo=tz), window_raw='01:00-07:00', switch_raw='1', zone=tz)[2]
+        self.assertEqual(fall.timestamp() - datetime(2026, 11, 1, 1, 30, tzinfo=tz).timestamp(), 6.5 * 3600)
+
+    def test_local_now_is_a_named_zone(self):
+        self.assertIs(night._local_now().tzinfo, night.NIGHT_ZONE)
+
+    def test_window_end_waits_for_the_gate_wrapper_to_stop_its_own_group(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'CORTADOS_S1_TRAIN_ONLY_IN_WINDOW': '1',
+                                                                          'CORTADOS_S1_NIGHT_WINDOW': '01:00-07:00'}):
+            tmp = Path(tmp)
+            lock, ready, released, child_pid = tmp / 'lock', tmp / 'ready', tmp / 'released', tmp / 'child.pid'
+            # the "trainer": its own group, holds the inherited LOCK_EX fd, takes ~1 s to stop after TERM
+            (tmp / 'trainer.py').write_text(
+                "import os, signal, sys, time\n"
+                "def term(*a):\n    time.sleep(1.0)\n    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, term)\n"
+                f"open({str(child_pid)!r}, 'w').write(str(os.getpid()))\n"
+                "while True:\n    time.sleep(0.05)\n")
+            # the "gate": takes LOCK_EX, starts the trainer in its own session with the fd, on TERM stops that group (3 s grace)
+            (tmp / 'gate.py').write_text(
+                "import fcntl, os, signal, subprocess, sys, time\n"
+                f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                f"p = subprocess.Popen([sys.executable, {str(tmp / 'trainer.py')!r}], pass_fds=(fd,), start_new_session=True)\n"
+                f"while not os.path.exists({str(child_pid)!r}):\n    time.sleep(0.02)\n"
+                "def term(*a):\n"
+                "    os.killpg(p.pid, signal.SIGTERM)\n"
+                "    try:\n        p.wait(timeout=3)\n"
+                "    except subprocess.TimeoutExpired:\n        os.killpg(p.pid, signal.SIGKILL); p.wait()\n"
+                f"    open({str(released)!r}, 'w').write('x')\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, term)\n"
+                f"open({str(ready)!r}, 'w').write('x')\n"
+                "while True:\n    time.sleep(0.05)\n")
+            cmd = ['/bin/bash', '-c', f'{sys.executable} {tmp / "gate.py"}; echo done']
+            # in the window until the gate is ready, then past the deadline
+            wall = lambda: datetime(2026, 11, 8, 7, 0) if ready.exists() else datetime(2026, 11, 8, 6, 59)
+            g = TrainOnlyInWindow._guard(self, wall)
+            first = [True]
+            def clock_wall():
+                if first[0]:
+                    first[0] = False
+                    return datetime(2026, 11, 8, 6, 59)
+                return wall()
+            g.wall = clock_wall
+            t0 = _time.monotonic()
+            rc, res = night.run_cycle(cmd, g, result_file=tmp / 'r', poll_s=0, sleep=lambda s: _time.sleep(0.05), grace_end=5)
+            self.assertEqual(res, 'window_end')
+            self.assertLess(_time.monotonic() - t0, 20)
+            self.assertTrue(released.exists(), 'the gate wrapper was killed before it stopped its trainer')
+            fd = os.open(str(lock), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if an orphaned trainer still holds the lock
+            finally:
+                os.close(fd)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(child_pid.read_text()), 0)
+
+    def test_drain_kills_survivors_after_the_grace(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                                  'time.sleep(60)'], start_new_session=True)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        _time.sleep(0.3)
+        t0 = _time.monotonic()
+        self.assertFalse(night.stop_group_drained(child, grace=0.5))
+        self.assertLess(_time.monotonic() - t0, 5)
+        self.assertIsNotNone(child.poll())

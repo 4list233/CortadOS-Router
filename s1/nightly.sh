@@ -200,11 +200,15 @@ trained_unevaluated_runs() {   # runs whose training completed but that have no 
     [ -f "$d/segment-target" ] && [ -f "$d/adapter/adapters.safetensors" ] && [ ! -f "$d/report.json" ] && echo "$d"
   done
 }
-newest_unfinished_run() {   # most recent run that began a training segment but never wrote a report
+newest_unfinished_run() {   # most recent run stopped mid-training: a segment began, checkpoints exist, no final adapter, no report
+  # A run with the final adapters.safetensors is trained-but-unevaluated (the pending/recovery path's, see trained_unevaluated_runs),
+  # not resumable. It is skipped HERE, inside the search, so an older interrupted run behind it is still found; rejecting it after
+  # the search (as before) returned nothing, the older run was not carried, and the retention pass deleted its checkpoints.
   local d
   for d in $(ls -td runs/20*/ 2>/dev/null); do
     d=${d%/}
-    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
+    [ -f "$d/segment-target" ] && [ ! -f "$d/report.json" ] && [ ! -f "$d/adapter/adapters.safetensors" ] \
+      && compgen -G "$d/adapter/*_adapters.safetensors" >/dev/null && { echo "$d"; return; }
   done
 }
 prune_unresumable_runs() {   # only tonight's run is ever resumed, so other unfinished runs' checkpoints (~0.65 GB each) are dead weight
@@ -236,7 +240,7 @@ fi
 CARRIED=""
 if [ "${CORTADOS_S1_CONTINUOUS:-0}" = 1 ] && [ -z "${CORTADOS_S1_RUN:-}" ] && [ ! -d "$RUN/adapter" ] && [ ! -f "$RUN/report.json" ]; then
   carry=$(newest_unfinished_run)
-  if [ -n "$carry" ] && [ "$carry" != "$RUN" ] && [ ! -f "$carry/adapter/adapters.safetensors" ]; then CARRIED="$RUN"; RUN="$carry"; fi
+  if [ -n "$carry" ] && [ "$carry" != "$RUN" ]; then CARRIED="$RUN"; RUN="$carry"; fi
 fi
 mkdir -p "$RUN" data
 exec >> "$RUN/nightly.log" 2>&1

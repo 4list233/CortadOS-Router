@@ -446,6 +446,37 @@ PY
         self.assertFalse((old / "adapter").exists())
         self.assertIn("--resume-adapter-file runs/2026-01-01/", (Path(self.env["HOME"]) / "lora.log").read_text())
 
+    def _completed_unevaluated(self, name):
+        """A run whose LoRA finished (final adapters.safetensors) but was never evaluated: the recovery path's, not resumable."""
+        run = self._stopped_mid_lora(name)
+        (run / "adapter/adapters.safetensors").write_text("final")
+        return run
+
+    def test_completed_unevaluated_run_does_not_hide_an_older_interrupted_run(self):
+        # Review P2-b: newest_unfinished_run used to return the newer completed run, the carry rejected it, the older interrupted
+        # run was not carried, and retention deleted its checkpoints. Both must survive and the older one is resumed.
+        old = self._stopped_mid_lora("2025-12-30", age_s=2 * 86400)
+        done = self._completed_unevaluated("2025-12-31")
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5)
+        log = (old / "nightly.log").read_text() if (old / "nightly.log").exists() else out.stdout + out.stderr
+        self.assertIn("cross-night resume", log)
+        self.assertIn("continuing the unfinished run runs/2025-12-30", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2025-12-30", log)
+        self.assertNotIn("retention: removed checkpoints of unfinished runs/2025-12-31", log)
+        self.assertTrue((old / "adapter/0000100_adapters.safetensors").exists(), log)
+        self.assertTrue((done / "adapter/adapters.safetensors").exists(), log)
+
+    def test_daytime_label_only_cycle_keeps_the_interrupted_runs_checkpoints(self):
+        old = self._stopped_mid_lora("2025-12-30", age_s=2 * 86400)
+        done = self._completed_unevaluated("2025-12-31")
+        reason = "training skipped: outside night window 01:00-07:00"
+        out = self._bare(CORTADOS_S1_CONTINUOUS=1, STUB_NEW_LABELS=5, CORTADOS_S1_TRAIN_ALLOWED=0,
+                         CORTADOS_S1_TRAIN_SKIP_REASON=reason)
+        log = (old / "nightly.log").read_text() if (old / "nightly.log").exists() else out.stdout + out.stderr
+        self.assertNotIn("retention: removed", log)
+        self.assertTrue((old / "adapter/0000100_adapters.safetensors").exists(), log)
+        self.assertTrue((done / "adapter/adapters.safetensors").exists(), log)
+
     def test_window_mode_does_not_carry_runs_across_nights(self):
         run = self._stopped_mid_lora("2026-01-01")
         self._bare(STUB_NEW_LABELS=5)

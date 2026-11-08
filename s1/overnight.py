@@ -123,12 +123,30 @@ def parse_night_window(text: str) -> tuple[time, time] | None:
     return start, end
 
 
-def in_night_window(window: tuple[time, time] | None, now: datetime) -> bool:
-    """True when the local wall time of `now` is in [start, end); handles windows crossing midnight."""
+# The zone the night window is read in. A named zone (not datetime.now().astimezone(), which is a FIXED offset) so window starts,
+# ends and deadlines follow DST: with a fixed offset a 01:30 EST start on 2027-03-14 got an 08:00 EDT deadline, and a fall-back
+# night stopped an hour early. The Studio is in Toronto. Tests inject another zone through the `zone` keyword arguments.
+NIGHT_ZONE = TORONTO
+
+
+def _wall(now: datetime, zone) -> datetime:
+    """`now` as local wall time in `zone`: aware datetimes are converted; naive ones are already local wall time."""
+    return now.astimezone(zone) if now.tzinfo is not None else now
+
+
+def _at(day, t: time, zone, aware: bool) -> datetime:
+    """Local wall time `t` on `day` in `zone`, aware (absolute instant) when the caller works in aware datetimes."""
+    dt = datetime.combine(day, t)
+    return dt.replace(tzinfo=zone) if aware else dt
+
+
+def in_night_window(window: tuple[time, time] | None, now: datetime, *, zone=None) -> bool:
+    """True when the local wall time of `now` (in `zone`, default NIGHT_ZONE) is in [start, end); handles windows crossing
+    midnight."""
     if window is None:
         return False
     start, end = window
-    t = now.time().replace(tzinfo=None)
+    t = _wall(now, zone or NIGHT_ZONE).time().replace(tzinfo=None)
     return start <= t < end if start < end else (t >= start or t < end)
 
 
@@ -162,19 +180,25 @@ def _env_night_window() -> tuple[time, time] | None:
         return parse_night_window(DEFAULT_NIGHT_WINDOW)
 
 
-def _next_start(window: tuple[time, time], now: datetime) -> datetime:
-    """The next local wall time at which `window` starts (today or tomorrow)."""
-    start = now.replace(hour=window[0].hour, minute=window[0].minute, second=0, microsecond=0)
-    return start if start > now else start + timedelta(days=1)
+def _next_start(window: tuple[time, time], now: datetime, *, zone=None) -> datetime:
+    """The next time `window` starts (today or tomorrow, local wall time in `zone`). Aware `now` -> aware result in `zone`."""
+    zone = zone or NIGHT_ZONE
+    local = _wall(now, zone)
+    day = local.date() if local.time().replace(tzinfo=None) < window[0] else local.date() + timedelta(days=1)
+    return _at(day, window[0], zone, now.tzinfo is not None)
 
 
-def _window_end(window: tuple[time, time], now: datetime) -> datetime:
-    """The end of the window `now` is inside (assumes in_night_window(window, now))."""
-    end = now.replace(hour=window[1].hour, minute=window[1].minute, second=0, microsecond=0)
-    return end if end > now else end + timedelta(days=1)
+def _window_end(window: tuple[time, time], now: datetime, *, zone=None) -> datetime:
+    """The end of the window `now` is inside (assumes in_night_window(window, now)): the end's local wall time in `zone` on the
+    right date (tomorrow when the window crosses midnight and `now` is before it), built on that date so it carries that date's
+    UTC offset. Aware `now` -> aware result, so the caller compares absolute instants."""
+    zone = zone or NIGHT_ZONE
+    local = _wall(now, zone)
+    day = local.date() if local.time().replace(tzinfo=None) < window[1] else local.date() + timedelta(days=1)
+    return _at(day, window[1], zone, now.tzinfo is not None)
 
 
-def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: str | None = None
+def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: str | None = None, zone=None
                  ) -> tuple[bool, str, datetime | None]:
     """(training allowed, reason, deadline) for a cycle starting at local wall time `now`. Reuses parse_night_window /
     in_night_window (one window implementation). Unlike the latency budget, an invalid window FAILS CLOSED here: training
@@ -195,10 +219,10 @@ def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: st
         return False, ("training skipped: CORTADOS_S1_NIGHT_WINDOW is off and CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=1; "
                        "set CORTADOS_S1_TRAIN_ONLY_IN_WINDOW=0 to train any time"), None
     s, e = window
-    if in_night_window(window, now):
-        return True, f"inside night window {s:%H:%M}-{e:%H:%M}: training allowed", _window_end(window, now)
+    if in_night_window(window, now, zone=zone):
+        return True, f"inside night window {s:%H:%M}-{e:%H:%M}: training allowed", _window_end(window, now, zone=zone)
     return False, (f"training skipped: outside night window {s:%H:%M}-{e:%H:%M}; "
-                   f"next window starts {_next_start(window, now).strftime('%Y-%m-%d %H:%M %Z').strip()}"), None
+                   f"next window starts {_next_start(window, now, zone=zone).strftime('%Y-%m-%d %H:%M %Z').strip()}"), None
 
 
 # Grace between the window-end SIGTERM and SIGKILL. Longer than studio_capacity's TRAINING_STOP_GRACE_SECONDS (30 s), so the gate
@@ -207,7 +231,7 @@ TRAIN_STOP_GRACE_S = 60.0
 
 
 def _local_now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(NIGHT_ZONE)   # aware, named zone: deadlines compare as absolute instants across DST
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None, above: float | None = None) -> float:
@@ -588,6 +612,35 @@ def stop_tree(child, *, grace: float = 20) -> None:
     signal_group(child.pid, signal.SIGKILL)   # grandchildren can outlive the shell
 
 
+# Poll interval while waiting for a TERMed group to drain: short against the 60 s grace, cheap (one kill(2) per poll).
+DRAIN_POLL_S = 0.1
+
+
+def stop_group_drained(child, *, grace: float, poll_s: float = DRAIN_POLL_S, clock=_time.monotonic,
+                       sleep=_time.sleep) -> bool:
+    """Window-end stop: SIGCONT + SIGTERM the cycle's group, then wait for the WHOLE group to drain (not just the shell leader)
+    for up to `grace`, and only then SIGKILL survivors. stop_tree's KILL right after the leader exits killed studio_capacity's gate
+    wrapper while it was still stopping its separately grouped trainer: the trainer was orphaned and kept the inherited LOCK_EX.
+    Returns True when the group drained within the grace, False when survivors were killed."""
+    pgid = child.pid
+    signal_group(pgid, signal.SIGCONT)
+    signal_group(pgid, signal.SIGTERM)
+    end = clock() + grace
+    while True:
+        child.poll()   # reap the leader: an unreaped zombie leader would keep the group "alive" to kill(pgid, 0)
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        if clock() >= end:
+            break
+        sleep(poll_s)
+    print(f"overnight: cycle group {pgid} still running {grace:g}s after TERM; sending KILL", flush=True)
+    signal_group(pgid, signal.SIGKILL)
+    child.wait()
+    return False
+
+
 RESULT_MARKERS = ("worked", "quota")
 
 
@@ -652,7 +705,7 @@ def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: fl
                 print(f"overnight: night window ended at {deadline:%H:%M}; stopping this cycle's training "
                       f"(TERM, {grace_end:g}s grace, then KILL); checkpoints are kept", flush=True)
                 window_ended = True
-                stop_tree(child, grace=grace_end)
+                stop_group_drained(child, grace=grace_end)
                 break
             guard.tick(child.pid)
             sleep(poll_s)
