@@ -1391,8 +1391,12 @@ class OutcomeEvalTests(OutcomeCase):
         # raw counts catch the regression → BLOCKED (Codex review 2026-10-25).
         obar = {"n": 2001, "band_hits": 2001, "under": 0, "band_accuracy": 1.0, "under_routed": 0.0}
         co = {"n": 2001, "band_hits": 2000, "under": 1, "band_accuracy": 1.0, "under_routed": 0.0}
-        self.assertEqual(evaluate.promote_decision(c, bar, obar, co, True)[0], False)
-        self.assertEqual(evaluate.promote_decision(c, bar, obar, dict(obar), True), (True, True))   # identical → promotes
+        # These grades carry no `over`, so they exercise the old rule's raw-count comparison: hold the outcome-led rule's
+        # threshold above n (at n >= MIN_OUTCOME_HOLDOUT a grade without `over` is blocked as invalid, see below).
+        with mock.patch.object(evaluate, "MIN_OUTCOME_HOLDOUT", 5000):
+            self.assertEqual(evaluate.promote_decision(c, bar, obar, co, True)[0], False)
+            self.assertEqual(evaluate.promote_decision(c, bar, obar, dict(obar), True), (True, True))   # identical → promotes
+        self.assertEqual(evaluate.promote_decision(c, bar, obar, dict(obar), True), (False, False))      # no `over` at n>=50 → blocked
 
     def test_promote_decision_unaffected_without_outcomes_and_never_promotes_without_a_bar(self):
         import evaluate
@@ -1456,10 +1460,34 @@ class PromotionRuleOutcomesLead(unittest.TestCase):
         self.assertEqual(self.decide(same, small_c, obar=small_l)["rule"], "fallback")
         self.assertTrue(self.decide(same, small_c, obar=small_l)["promote"])
 
-    def test_bar_without_over_counts_falls_back(self):
+    def test_bar_without_over_counts_is_blocked_not_fallback(self):
+        # Teacher metrics identical to live would pass the old rule; a 75-row holdout whose live grade lacks `over` must block.
         legacy = {k: v for k, v in self.LIVE_O.items() if k != "over"}
-        r = self.decide(self.cand(), self.CAND_O, obar=legacy)
-        self.assertEqual((r["promote"], r["rule"]), (False, "fallback"))
+        r = self.decide(dict(self.LIVE_T), self.CAND_O, obar=legacy)
+        self.assertEqual((r["promote"], r["rule"]), (False, "blocked"), r)
+        self.assertIn("over missing", r["reason"])
+
+    def test_over_none_is_blocked_without_exception(self):
+        r = self.decide(dict(self.LIVE_T), self.CAND_O, obar=dict(self.LIVE_O, over=None))
+        self.assertEqual((r["promote"], r["rule"]), (False, "blocked"), r)
+        self.assertIn("over=None", r["reason"])
+        r = self.decide(dict(self.LIVE_T), dict(self.CAND_O, over=None))          # candidate side too
+        self.assertEqual((r["promote"], r["rule"]), (False, "blocked"), r)
+
+    def test_outward_floor_applies_without_outcomes(self):
+        import evaluate
+        low = dict(self.LIVE_T, outward_recall=0.84)
+        r = evaluate.promotion_report(dict(low), low, None, None, False, holdout_rows=610)   # candidate == live, both < .85
+        self.assertEqual((r["promote"], r["rule"], self.failed(r)), (False, "fallback", ["outward recall floor"]), r)
+
+    def test_outward_floor_applies_on_small_outcome_holdout(self):
+        import evaluate
+        low = dict(self.LIVE_T, outward_recall=0.84)
+        small = {"n": evaluate.MIN_OUTCOME_HOLDOUT - 1, "band_hits": 20, "under": 4, "over": 10}
+        r = evaluate.promotion_report(dict(low), low, small, dict(small), True, holdout_rows=610)
+        self.assertEqual((r["promote"], r["rule"], self.failed(r)), (False, "fallback", ["outward recall floor"]), r)
+        ok = dict(self.LIVE_T)                                                          # same case at .90 promotes
+        self.assertTrue(evaluate.promotion_report(dict(ok), ok, small, dict(small), True, holdout_rows=610)["promote"])
 
     def test_every_check_is_reported_with_values(self):
         r = self.decide(self.cand(), self.CAND_O)

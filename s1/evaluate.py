@@ -259,16 +259,22 @@ def _new_rule(c: dict, bar: dict, obar: dict, co: dict) -> tuple[bool, list[dict
 def promotion_report(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
                      holdout_rows: int | None = None) -> dict:
     """The full promotion decision for the owner to read: {"promote", "outcome_regression_checked", "rule", "reason", "checks"}.
-    rule is "new" (outcome-led), "fallback" (the old rule, unchanged) or "blocked" (no bar / teacher holdout too small)."""
+    rule is "new" (outcome-led), "fallback" (the old rule, unchanged) or "blocked" (no bar / teacher holdout too small /
+    outcome holdout present but its metrics missing or invalid). The outward-recall floor is checked on every non-blocked path."""
     if not bar:
         return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
                 "reason": "no live bar to compare against (nothing beats nothing)", "checks": []}
     if holdout_rows is not None and holdout_rows < MIN_TEACHER_HOLDOUT:
         return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
                 "reason": f"teacher holdout {holdout_rows} rows < MIN_TEACHER_HOLDOUT {MIN_TEACHER_HOLDOUT}", "checks": []}
-    raw = ("n", "band_hits", "under", "over")
-    usable = bool(has_outcome_holdout and obar and co and all(k in obar and k in co for k in raw)
-                  and co["n"] >= MIN_OUTCOME_HOLDOUT and obar["n"] >= MIN_OUTCOME_HOLDOUT)
+    if has_outcome_holdout:
+        # Invalid outcome metrics block; they never fall back silently (Codex review 2026-11-08): a missing or None metric is a
+        # broken grade, not a small sample, and the teacher-only rule must not quietly decide in its place.
+        bad = _invalid_outcome_metrics(obar, co)
+        if bad:
+            return {"promote": False, "outcome_regression_checked": False, "rule": "blocked",
+                    "reason": f"outcome holdout present but outcome metrics invalid ({bad}): no promotion", "checks": []}
+    usable = bool(has_outcome_holdout and co["n"] >= MIN_OUTCOME_HOLDOUT and obar["n"] >= MIN_OUTCOME_HOLDOUT)
     if usable:
         promote, checks = _new_rule(c, bar, obar, co)
         rule, reason = "new", f"outcome holdout n={co['n']} >= MIN_OUTCOME_HOLDOUT {MIN_OUTCOME_HOLDOUT}: real-task outcomes decide"
@@ -276,13 +282,37 @@ def promotion_report(c: dict, bar: dict | None, obar: dict | None, co: dict | No
         promote, checks = _old_rule(c, bar, obar, co, has_outcome_holdout)
         if not has_outcome_holdout:
             why = "no outcome holdout"
-        elif not (obar and co and all(k in obar and k in co for k in raw)):
-            why = "outcome grade or outcome bar missing, or without raw counts"
         else:
-            why = f"outcome holdout n={co.get('n')} (live n={obar.get('n')}) < MIN_OUTCOME_HOLDOUT {MIN_OUTCOME_HOLDOUT}"
+            why = f"outcome holdout n={co['n']} (live n={obar['n']}) < MIN_OUTCOME_HOLDOUT {MIN_OUTCOME_HOLDOUT}"
         rule, reason = "fallback", why + ": old rule applied unchanged"
-    return {"promote": promote, "outcome_regression_checked": bool(has_outcome_holdout and obar and co and co.get("n")),
+    # The outward-recall floor holds on EVERY path (Codex review 2026-11-08): the old rule only compared against live, so a
+    # live adapter already below the floor let an equally weak candidate through.
+    if not any(ch["check"] == "outward recall" and "OUTWARD_RECALL_FLOOR" in ch["rule"] for ch in checks):
+        checks.append({"check": "outward recall floor", "candidate": c["outward_recall"], "live": bar["outward_recall"],
+                       "rule": f"candidate >= OUTWARD_RECALL_FLOOR {OUTWARD_RECALL_FLOOR}",
+                       "ok": c["outward_recall"] >= OUTWARD_RECALL_FLOOR - _EPS})
+    promote = promote and all(ch["ok"] for ch in checks)
+    return {"promote": promote, "outcome_regression_checked": bool(has_outcome_holdout),
             "rule": rule, "reason": reason, "checks": checks}
+
+
+def _invalid_outcome_metrics(obar: dict | None, co: dict | None) -> str:
+    """'' when both outcome grades carry what their rule needs, else which metric is missing or invalid. n decides the rule;
+    the outcome-led rule (n >= MIN_OUTCOME_HOLDOUT on both) also needs `over`, the old rule only n, band_hits and under."""
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    for name, g in (("outcome bar", obar), ("candidate outcome grade", co)):
+        if not g:
+            return f"{name} missing"
+        # n must be a positive count: zero rows grades nothing, and every ratio divides by it.
+        if not (num(g.get("n")) and g["n"] > 0):
+            return f"{name} n={g.get('n')!r}"
+    need = ("band_hits", "under", "over") if min(obar["n"], co["n"]) >= MIN_OUTCOME_HOLDOUT else ("band_hits", "under")
+    for name, g in (("outcome bar", obar), ("candidate outcome grade", co)):
+        for k in need:
+            if not num(g.get(k)):
+                return f"{name} {k}={g.get(k)!r}" if k in g else f"{name} {k} missing"
+    return ""
 
 
 def promote_decision(c: dict, bar: dict | None, obar: dict | None, co: dict | None, has_outcome_holdout: bool,
