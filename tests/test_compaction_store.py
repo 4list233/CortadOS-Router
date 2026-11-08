@@ -167,7 +167,7 @@ class ProviderHookTests(unittest.TestCase):
     def post(self, path, body, ua):
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST", headers={
             "content-type": "application/json", "authorization": "Bearer t", "user-agent": ua,
-            "x-cortados-run-id": "run-abc", "x-cortados-session": "sess-1"})
+            "x-cortados-run-id": "run-abc12345", "x-cortados-session": "sess-1"})
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read())
 
@@ -183,7 +183,7 @@ class ProviderHookTests(unittest.TestCase):
     def strip_ids(o):
         if isinstance(o, dict):
             return {k: ProviderHookTests.strip_ids(v) for k, v in o.items() if k not in ("id", "created_at")}
-        if isinstance(o, list):
+        if isinstance(o, (list, tuple)):
             return [ProviderHookTests.strip_ids(v) for v in o]
         return o
 
@@ -202,7 +202,7 @@ class ProviderHookTests(unittest.TestCase):
         heads = [r for r in recs if r["kind"] == "turn"]
         self.assertEqual(sorted(h["source"] for h in heads), ["claude-code", "codex"])
         for h in heads:
-            self.assertEqual((h["meta"]["run_id"], h["meta"]["session"]), ("run-abc", "sess-1"))
+            self.assertEqual((h["meta"]["run_id"], h["meta"]["session"]), ("run-abc12345", "sess-1"))
         texts = [r["text"] for r in recs if r["kind"] == "message" and r["role"] == "user"]
         self.assertTrue(any("hello store" in t for t in texts) and any("hello codex" in t for t in texts))
         self.assertEqual(store.STORE.write_failures, 0)
