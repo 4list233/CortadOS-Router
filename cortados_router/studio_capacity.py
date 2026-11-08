@@ -489,47 +489,73 @@ class NodeLockUnsafe(PermissionError):
     """The gate dir or lock file is not the private, real, owned object the lock relies on."""
 
 
-def ensure_gate_dir(gate):
-    """Create (0700) or validate the studio-gate dir; returns an O_DIRECTORY fd. NodeLockUnsafe/OSError: fail closed.
-
-    Reason: the lock only excludes if gate and trainer flock the SAME inode. A symlinked dir, or a dir another user or
-    group can write, lets the lock file be swapped so one side locks a different file. mkdir's mode is masked by the
-    umask (0002 would leave 0775), so a dir we create is chmod'ed to 0700 explicitly."""
-    gate = Path(gate)
-    gate.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.mkdir(gate, 0o700)
-    except FileExistsError:
-        pass  # pre-existing: validated below like any other
-    else:
-        os.chmod(gate, 0o700)
-    st = os.lstat(gate)
+def _check_private_dir(st, what):
     if not stat.S_ISDIR(st.st_mode):
-        raise NodeLockUnsafe("studio-gate dir is not a real directory (symlink or other)")
+        raise NodeLockUnsafe("%s is not a real directory (symlink or other)" % what)
     if st.st_uid != os.geteuid():
-        raise NodeLockUnsafe("studio-gate dir is not owned by this user")
+        raise NodeLockUnsafe("%s is not owned by this user" % what)
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise NodeLockUnsafe("studio-gate dir is group/world-writable")
-    dir_fd = os.open(gate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        raise NodeLockUnsafe("%s is group/world-writable" % what)
+
+
+def _open_dir_checked(name, what, dir_fd=None):
+    """lstat + private-dir check + O_NOFOLLOW open + dev/ino match: the fd is the directory that was checked."""
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    _check_private_dir(st, what)
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     try:
-        st2 = os.fstat(dir_fd)
+        st2 = os.fstat(fd)
         if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
-            raise NodeLockUnsafe("studio-gate dir changed while being opened")
+            raise NodeLockUnsafe("%s changed while being opened" % what)
     except BaseException:
-        os.close(dir_fd)
+        os.close(fd)
         raise
-    return dir_fd
+    return fd
 
 
-def open_node_lock(gate):
-    """Open (creating, mode 0600) the node lock file in a validated gate dir; returns an fd.
+def ensure_gate_dir(gate, create=True):
+    """Validate the gate's parent and (creating it 0700 when create) the studio-gate dir; returns an O_DIRECTORY fd.
 
-    NodeLockUnsafe / OSError propagate: callers fail closed (gate: 503 + warning; trainer: GateRefused).
-    O_NOFOLLOW relative to the dir fd means a symlinked lock file is refused, and fstat proves the fd is a
-    regular file we own, so gate and trainer lock the same inode."""
-    dir_fd = ensure_gate_dir(gate)
+    NodeLockUnsafe/OSError: fail closed. Reason: the lock only excludes if gate and trainer flock the SAME inode. A
+    symlinked dir, or a dir another user or group can write, lets the lock file be swapped so one side locks a
+    different file. The parent ($CORTADOS_HOME) is checked the same way: if others could write it they could rename
+    studio-gate away and the next opener would lock a fresh inode. The gate dir is created and opened RELATIVE to the
+    checked parent fd, so a parent swapped after the check is never followed. mkdir's mode is masked by the umask
+    (0002 would leave 0775), so a dir we create is chmod'ed to 0700 explicitly."""
+    gate = Path(gate)
+    if create and not gate.parent.exists():
+        os.makedirs(gate.parent, 0o700)
+        os.chmod(gate.parent, 0o700)  # leaf only: makedirs' mode is umask-masked; upper levels are validated nowhere
+    parent_fd = _open_dir_checked(str(gate.parent), "studio-gate parent dir")
     try:
-        fd = os.open(NODE_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+        if create:
+            try:
+                os.mkdir(gate.name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass  # pre-existing: validated below like any other
+            else:
+                made = os.open(gate.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+                try:
+                    os.fchmod(made, 0o700)
+                finally:
+                    os.close(made)
+        return _open_dir_checked(gate.name, "studio-gate dir", dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def open_node_lock(gate, create=True):
+    """Open (creating, mode 0600, when create) the node lock file in a validated gate dir; returns an fd.
+
+    create=False (local_gate, per request): a missing gate dir or lock file is an error, never recreated. Reason: a
+    request that recreated a renamed-away studio-gate would take LOCK_SH on a fresh inode while a trainer still holds
+    LOCK_EX on the old one. NodeLockUnsafe / OSError propagate: callers fail closed (gate: 503 + warning; trainer:
+    GateRefused). O_NOFOLLOW relative to the dir fd means a symlinked lock file is refused, and fstat proves the fd is
+    a regular file we own, so gate and trainer lock the same inode."""
+    dir_fd = ensure_gate_dir(gate, create=create)
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_CREAT if create else 0)
+    try:
+        fd = os.open(NODE_LOCK_NAME, flags, 0o600, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)
     try:
@@ -542,6 +568,19 @@ def open_node_lock(gate):
         os.close(fd)
         raise
     return fd
+
+
+def verify_node_lock(gate, fd):
+    """After flock: NodeLockUnsafe unless <parent>/studio-gate/node.lock still resolves (checked, no-follow) to fd's
+    inode. Reason: a rename between open and flock would leave this fd locking an inode the other side never sees."""
+    dir_fd = ensure_gate_dir(gate, create=False)
+    try:
+        st = os.stat(NODE_LOCK_NAME, dir_fd=dir_fd, follow_symlinks=False)
+    finally:
+        os.close(dir_fd)
+    held = os.fstat(fd)
+    if (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
+        raise NodeLockUnsafe("node lock path no longer resolves to the locked file")
 
 
 def acquire_trainer_lock(gate, clock=time.time, sleep=time.sleep, wait_seconds=TRAINER_LOCK_WAIT_SECONDS):
@@ -557,12 +596,18 @@ def acquire_trainer_lock(gate, clock=time.time, sleep=time.sleep, wait_seconds=T
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
             except BlockingIOError:
                 if clock() >= deadline:
                     raise GateRefused("studio_gate: local gate request(s) still in flight after %ss; refusing to start"
                                       % wait_seconds)
                 sleep(TRAINER_LOCK_POLL_SECONDS)
+                continue
+            try:
+                verify_node_lock(gate, fd)
+            except OSError as exc:
+                raise GateRefused("studio_gate: node lock moved while locking (%s: %s); refusing to start"
+                                  % (type(exc).__name__, exc)) from exc
+            return fd
     except BaseException:
         os.close(fd)
         raise
@@ -738,19 +783,51 @@ def gate_main(argv):
         print("studio gate configuration error: %s; refusing" % exc, file=sys.stderr)
         return GATE_REFUSED_EXIT
     held = []
-    # SIGTERM/SIGINT become SystemExit so the finally below stops the child's whole group before the lock goes.
-    signal.signal(signal.SIGTERM, _terminate)
-    signal.signal(signal.SIGINT, _terminate)
+    # SIGTERM/SIGINT only record a stop request (StopRequest): a handler that raised could land between Popen and
+    # the cleanup try, or inside the grace/SIGKILL teardown, and skip stopping the group. Installed before the gate
+    # so no signal is ever lost; the gate's waits check the request through stop.sleep.
+    stop = StopRequest()
+    stop.install()
     try:
-        gate = training_gate(wait_seconds=wait, lock_sink=held.append)
+        gate = training_gate(wait_seconds=wait, lock_sink=held.append, sleep=stop.sleep)
         gate.__enter__()
     except GateRefused as exc:
         print(str(exc), file=sys.stderr)
         return GATE_REFUSED_EXIT
     try:
-        return run_holding_lock(argv, held[0])
+        return run_holding_lock(argv, held[0], stop=stop)
     finally:
         gate.__exit__(None, None, None)
+
+
+class StopRequest:
+    """SIGTERM/SIGINT -> a flag, never an exception. Repeated signals just set it again; the first signal fixes
+    the exit code (128 + signum: 143 for SIGTERM, 130 for SIGINT)."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.signum = None
+
+    def install(self):
+        signal.signal(signal.SIGTERM, self.handle)
+        signal.signal(signal.SIGINT, self.handle)
+
+    def handle(self, signum, frame):
+        if self.signum is None:
+            self.signum = signum
+        self.event.set()
+
+    def is_set(self):
+        return self.event.is_set()
+
+    def exit_code(self):
+        return 128 + self.signum
+
+    def sleep(self, seconds):
+        """Sleep for the gate's polls; a stop request ends the gate phase (no child exists yet, so raising is safe:
+        training_gate's own cleanup runs on the way out)."""
+        if self.event.wait(seconds):
+            raise SystemExit(self.exit_code())
 
 
 # A trainer asked to stop gets this long to checkpoint and exit before SIGKILL: S1 SFT writes a checkpoint of a few
@@ -802,20 +879,42 @@ def _stop_group(child, pgid, grace_seconds):
     return False
 
 
-def run_holding_lock(argv, lock_fd, grace_seconds=TRAINING_STOP_GRACE_SECONDS):
-    """Run argv in its own process group with the node-lock fd passed down; return its exit status.
+# Poll interval of the wait loop: how quickly a recorded stop request is acted on while the child runs.
+STOP_POLL_SECONDS = 0.1
+
+
+def run_holding_lock(argv, lock_fd, grace_seconds=None, stop=None, after_spawn=None):
+    """Run argv in its own process group with the node-lock fd passed down; return its exit status
+    (128 + signum when a stop was requested).
 
     Reason: flock belongs to the open file description, not the process. pass_fds gives the child (and everything it
     forks) the same description, so LOCK_EX stays held until the LAST holder closes it: a SIGKILLed wrapper can no
     longer release the lock while training runs on. start_new_session puts the command and its descendants in one
-    group, so every exit path here (normal end, exception, SIGTERM/SIGINT -> SystemExit) stops the whole group
-    before the caller closes its own fd."""
-    child = subprocess.Popen(argv, pass_fds=(lock_fd,), start_new_session=True)
-    pgid = child.pid  # start_new_session: the child leads a new session and group with its own pid
+    group. Signals only set `stop` (StopRequest), so nothing can interrupt between Popen and the try, or inside
+    _stop_group: every exit path stops the whole group before the caller closes its own fd. after_spawn is a test
+    hook run right after the child exists."""
+    if grace_seconds is None:
+        grace_seconds = TRAINING_STOP_GRACE_SECONDS  # read at call time so tests can shorten it
+    if stop is None:
+        stop = StopRequest()  # never set: plain run (callers that want signal handling pass an installed one)
+    if stop.is_set():
+        return stop.exit_code()  # stop arrived before the child: do not start it
+    child = None
     try:
-        return child.wait()
+        child = subprocess.Popen(argv, pass_fds=(lock_fd,), start_new_session=True)
+        if after_spawn is not None:
+            after_spawn(child)
+        while not stop.is_set():
+            try:
+                child.wait(timeout=STOP_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                continue
+            break
+        return stop.exit_code() if stop.is_set() else child.returncode
     finally:
-        _stop_group(child, pgid, grace_seconds)
+        if child is not None:
+            # pgid == child.pid: start_new_session makes the child lead a new session and group.
+            _stop_group(child, child.pid, grace_seconds)
 
 
 def serve(runner, status_path, sleep=time.sleep, polls=None):

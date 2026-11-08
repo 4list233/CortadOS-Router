@@ -38,7 +38,7 @@ from pathlib import Path
 
 from cortados_router.local_resources import pro_local_allowed
 from cortados_router.studio_capacity import (gate_dir as default_studio_gate_dir, live_intents,
-                                             open_node_lock)
+                                             open_node_lock, verify_node_lock)
 
 logger = logging.getLogger("cortados.local_gate")
 
@@ -367,7 +367,9 @@ class GateHandler(BaseHTTPRequestHandler):
         lock_fd = None
         if self.server.studio_gate_dir is not None:
             try:
-                lock_fd = open_node_lock(self.server.studio_gate_dir)
+                # create=False: a request never recreates a missing/renamed-away gate dir (studio_capacity.open_node_lock);
+                # the gate creates it once at startup (main) and the trainer creates it on its first run.
+                lock_fd = open_node_lock(self.server.studio_gate_dir, create=False)
             except OSError as exc:
                 logger.warning("studio-gate node lock unopenable (%s): refusing local request", type(exc).__name__)
                 return self._error(503, "overloaded_error", "S1 training state unavailable; local model refused")
@@ -378,6 +380,12 @@ class GateHandler(BaseHTTPRequestHandler):
                 except BlockingIOError:
                     return self._error(503, "overloaded_error",
                                        "S1 training in progress on this node; local model refused until it ends")
+                try:
+                    verify_node_lock(self.server.studio_gate_dir, lock_fd)
+                except OSError as exc:
+                    logger.warning("studio-gate node lock moved while locking (%s): refusing local request",
+                                   type(exc).__name__)
+                    return self._error(503, "overloaded_error", "S1 training state unavailable; local model refused")
             allowed, reason = self._node_free()
             if not allowed:
                 return self._error(503, "overloaded_error", reason)
@@ -469,6 +477,14 @@ def main(argv=None) -> int:
     except (GateConfigError, OSError) as exc:
         print(f"local_gate: cannot start: {exc}", file=sys.stderr)
         return 2
+    if a.studio_gate_dir:
+        # Create/validate the gate dir and lock once here: requests open them with create=False.
+        try:
+            os.close(open_node_lock(a.studio_gate_dir))
+        except OSError as exc:
+            srv.server_close()
+            print(f"local_gate: studio-gate node lock unusable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
     logger.info("local gate on %s:%s -> %s (%d forwarded routes)", listen, a.port, a.upstream, len(ROUTES))
     try:
         srv.serve_forever()

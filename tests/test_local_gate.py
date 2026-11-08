@@ -3,6 +3,7 @@ import fcntl
 import http.client
 import json
 import os
+import shutil
 import socket
 import tempfile
 import threading
@@ -330,6 +331,7 @@ class TrainingHoldTests(GateHarness):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name) / "studio-gate"
+        os.close(studio_capacity.open_node_lock(self.dir))   # what local_gate.main does at startup
         self.gate.studio_gate_dir = self.dir
 
     def write_intent(self, expires_in):
@@ -361,7 +363,7 @@ class TrainingHoldTests(GateHarness):
 
     @unittest.skipIf(os.geteuid() == 0, "root reads any directory")
     def test_unreadable_dir_fails_closed(self):
-        self.dir.mkdir()
+        self.dir.mkdir(exist_ok=True)
         os.chmod(self.dir, 0)
         self.addCleanup(os.chmod, self.dir, 0o700)
         code, raw = self.call("/api/tags", headers={"authorization": f"Bearer {TOKEN}"})
@@ -370,6 +372,7 @@ class TrainingHoldTests(GateHarness):
         self.assertEqual(FakeOllama.seen, [])
 
     def test_unopenable_lock_dir_is_503(self):
+        shutil.rmtree(self.dir)
         self.dir.write_text("not a directory")     # mkdir/open of <dir>/node.lock fails
         with self.assertLogs("cortados.local_gate", "WARNING"):
             code, raw = self.call("/v1/messages", GateTests.MSG, headers={"x-api-key": TOKEN})

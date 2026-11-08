@@ -749,6 +749,47 @@ class NodeLockSafetyTests(unittest.TestCase):
         with self.assertRaises(c.GateRefused):
             c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
 
+    def test_group_writable_parent_refused(self):
+        parent = self.root / "home"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o770)
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(parent / "studio-gate")
+        with self.assertRaises(c.GateRefused):
+            c.acquire_trainer_lock(parent / "studio-gate", sleep=lambda s: None, wait_seconds=0)
+        self.assertFalse((parent / "studio-gate").exists())
+
+    def test_symlinked_parent_refused(self):
+        real = self.root / "real-home"
+        real.mkdir(mode=0o700)
+        os.symlink(real, self.root / "home")
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.open_node_lock(self.root / "home" / "studio-gate")
+        self.assertFalse((real / "studio-gate").exists())
+
+    def test_renamed_gate_dir_cannot_be_recreated_by_request(self):
+        trainer = c.acquire_trainer_lock(self.gate, sleep=lambda s: None, wait_seconds=0)
+        self.addCleanup(os.close, trainer)
+        os.rename(self.gate, self.root / "moved-away")
+        with self.assertRaises(FileNotFoundError):        # request side: never recreates, so never a fresh inode
+            c.open_node_lock(self.gate, create=False)
+        self.assertFalse(self.gate.exists())
+
+    def test_rename_between_open_and_lock_is_refused(self):
+        fd = c.open_node_lock(self.gate)
+        self.addCleanup(os.close, fd)
+        os.rename(self.gate, self.root / "moved-away")
+        os.close(c.open_node_lock(self.gate))             # a fresh dir and inode now sit at the path
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)    # locks the moved-away inode
+        with self.assertRaises(c.NodeLockUnsafe):
+            c.verify_node_lock(self.gate, fd)
+
+    def test_verify_passes_on_unchanged_path(self):
+        fd = c.open_node_lock(self.gate)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        c.verify_node_lock(self.gate, fd)
+
     def test_trainer_created_dir_is_0700_under_umask_0002(self):
         old = os.umask(0o002)
         try:
@@ -768,6 +809,15 @@ sys.path.insert(0, sys.argv[1])
 from cortados_router import studio_capacity as c
 c.training_gate = functools.partial(c.training_gate, gate=sys.argv[2], api=lambda path, payload=None: {"models": []},
                                     log=lambda m: None)
+import os, signal
+if os.environ.get("TEST_GATE_GRACE"):
+    c.TRAINING_STOP_GRACE_SECONDS = float(os.environ["TEST_GATE_GRACE"])
+if os.environ.get("TEST_GATE_TERM_AFTER_SPAWN"):
+    _orig = c.run_holding_lock
+    def _hook(child):
+        open(os.environ["TEST_GATE_TERM_AFTER_SPAWN"], "w").write(str(child.pid))
+        os.kill(os.getpid(), signal.SIGTERM)          # the race: SIGTERM right after the child exists
+    c.run_holding_lock = lambda *a, **k: _orig(*a, after_spawn=_hook, **k)
 sys.exit(c.gate_main(["--"] + sys.argv[3:]))
 '''
 
@@ -786,8 +836,8 @@ class GateMainProcessTests(unittest.TestCase):
         self.gate = self.root / "studio-gate"
         self.marker = self.root / "started"
 
-    def start(self, *cmd):
-        env = dict(os.environ, CORTADOS_HOME=str(self.root), **{c.ACK_WAIT_ENV: "0"})
+    def start(self, *cmd, extra_env=None):
+        env = dict(os.environ, CORTADOS_HOME=str(self.root), **{c.ACK_WAIT_ENV: "0"}, **(extra_env or {}))
         proc = self.subprocess.Popen([sys.executable, "-c", HARNESS, self.ROOT, str(self.gate)] + list(cmd), env=env)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         return proc
@@ -844,6 +894,30 @@ class GateMainProcessTests(unittest.TestCase):
         self.assertEqual(proc.wait(10), 128 + signal.SIGTERM)
         self.assertFalse(self.alive(sh_pid))
         self.wait_for(lambda: not self.alive(grand_pid), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_sigterm_right_after_spawn_stops_group(self):
+        spawned = self.root / "spawned"
+        script = "import time; time.sleep(30)"
+        proc = self.start(sys.executable, "-c", script, extra_env={"TEST_GATE_TERM_AFTER_SPAWN": str(spawned)})
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)
+        child = int(spawned.read_text())
+        self.wait_for(lambda: not self.alive(child), 5)
+        self.assertTrue(self.shared_free())
+
+    def test_second_sigterm_during_grace_still_completes_teardown(self):
+        script = ("import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                  "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+        proc = self.start(sys.executable, "-c", script, str(self.marker), extra_env={"TEST_GATE_GRACE": "1.5"})
+        child = self.pid_from(self.marker)
+        self.assertFalse(self.shared_free())
+        os.kill(proc.pid, signal.SIGTERM)
+        time.sleep(0.5)                               # inside the 1.5 s grace: the child ignores SIGTERM
+        self.assertTrue(self.alive(child))
+        os.kill(proc.pid, signal.SIGTERM)
+        os.kill(proc.pid, signal.SIGINT)
+        self.assertEqual(proc.wait(15), 128 + signal.SIGTERM)   # first signal fixes the code
+        self.wait_for(lambda: not self.alive(child), 5)          # SIGKILLed after grace
         self.assertTrue(self.shared_free())
 
     def test_normal_completion_releases(self):
