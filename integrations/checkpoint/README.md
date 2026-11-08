@@ -21,7 +21,9 @@ Values: `tables/compaction.json`, sources in `docs/COMPACTION-THRESHOLDS.md`.
 3. The session writes its handoff within 4 minutes after the current tool call ends; at 6 minutes the deterministic
    one from `checkpoint build` is used.
 4. A fresh session starts with the handoff as its first prompt.
-5. Circuit breaker (`record-restart` appends to `$CORTADOS_HOME/checkpoint/restarts.jsonl`; `check` reads it):
+5. Circuit breaker (`record-restart` appends to `$CORTADOS_HOME/checkpoint/restarts.jsonl`; `check` reads it; an
+   `escalate` is kept in `$CORTADOS_HOME/checkpoint/breaker.json` and repeated on every refresh until
+   `checkpoint ack --breaker-file ...`):
    2 forced restarts in 30 minutes, or a fresh session that opens above 50% of the checkpoint
    threshold -> stop and escalate; no automatic restart. No time-based timer.
 

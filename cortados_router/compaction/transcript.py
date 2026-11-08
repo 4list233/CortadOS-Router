@@ -96,18 +96,27 @@ def _lines(path: str, b: _Builder):
             yield obj
 
 
+_TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
+# Media blocks carry bytes, not text; they are shown as a placeholder naming the type.
+_MEDIA_BLOCK_TYPES = frozenset({"image", "input_image", "document"})
+
+
+def _is_text_block(blk: Any) -> bool:
+    return isinstance(blk, dict) and blk.get("type") in _TEXT_BLOCK_TYPES and isinstance(blk.get("text"), str)
+
+
 def _result_text(content: Any) -> str:
+    """Result text. Only positively identified text blocks ({"type": text|input_text|output_text, "text": str}) are
+    unwrapped and media blocks become "[<type>]"; any other structured payload is kept as its JSON text, so a
+    structured result (e.g. [{"agent_id": ..., "state": ...}]) is never reduced to a placeholder."""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts = []
-        for blk in content:
-            if isinstance(blk, dict) and blk.get("type") == "text":
-                parts.append(str(blk.get("text", "")))
-            elif isinstance(blk, dict):
-                parts.append("[%s]" % blk.get("type", "block"))
-        return "\n".join(parts)
-    return "" if content is None else json.dumps(content, sort_keys=True)
+    if content is None:
+        return ""
+    if isinstance(content, list) and content and all(
+            _is_text_block(b) or (isinstance(b, dict) and b.get("type") in _MEDIA_BLOCK_TYPES) for b in content):
+        return "\n".join(b["text"] if _is_text_block(b) else "[%s]" % b["type"] for b in content)
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
 
 
 def parse_claude_code(path: str) -> Tuple[Session, Stats]:

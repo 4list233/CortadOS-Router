@@ -65,7 +65,7 @@ def _write_private(path: str, text: str, force: bool) -> None:
 def cmd_build(args) -> int:
     pol = policy_mod.load(args.policy)
     session, stats = transcript.parse(args.transcript, args.format)
-    md, manifest, extra = handoff.build_handoff_files(session, pol)
+    md, manifest, extra = handoff.build_handoff_files(session, pol, os.path.abspath(args.out))
     manifest["parse_stats"] = stats
     os.makedirs(args.out, mode=0o700, exist_ok=True)
     md_path = os.path.join(args.out, "handoff.md")
@@ -82,15 +82,17 @@ def cmd_build(args) -> int:
     try:
         for p, text in extra_paths.items():  # sibling files first: handoff.md must never point at a missing file
             _write_private(p, text, args.force)
-        for p in stale:
-            os.unlink(p)
         _write_private(md_path, md, args.force)
         _write_private(man_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", args.force)
+        # Stale overflow files go only after the new handoff.md and manifest are published: a failed rebuild must
+        # leave the old handoff's full text in place.
+        for p in stale:
+            os.unlink(p)
     except WriteRefused as exc:
         print(str(exc), file=sys.stderr)
         return 3
     print("handoff-id: %s  %s  (~%d tokens, %d skipped lines)"
-          % (manifest["handoff_id"], md_path, manifest["total_tokens"], sum(stats["skipped"].values())))
+          % (manifest["handoff_id"], os.path.abspath(md_path), manifest["total_tokens"], sum(stats["skipped"].values())))
     return 0
 
 
@@ -229,6 +231,18 @@ def _read_history(path: Optional[str]) -> List[float]:
 
 def cmd_check(args) -> int:
     pol = policy_mod.load(args.policy)
+    # A tripped breaker stays tripped until acknowledged (`checkpoint ack`): otherwise the next refresh of a session
+    # that opened too full (no longer "fresh") would read "ok" and the escalation would be lost.
+    if args.breaker_file and os.path.lexists(args.breaker_file):
+        try:
+            with open(args.breaker_file, encoding="utf-8") as fh:
+                held = json.load(fh)
+            why = held.get("reason", "?")
+        except (OSError, ValueError) as exc:  # unreadable marker: still tripped, and say why
+            why = "marker unreadable: %s" % exc
+        print("escalate breaker tripped (%s); run `checkpoint ack --breaker-file %s` after the owner decides"
+              % (why, args.breaker_file))
+        return 0
     try:
         with open(args.status_file, encoding="utf-8") as fh:
             pct, used, window = read_status(json.load(fh))
@@ -238,7 +252,25 @@ def cmd_check(args) -> int:
     except StatusError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
+    if level == "escalate" and args.breaker_file:
+        d = os.path.dirname(os.path.abspath(args.breaker_file))
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            _write_private(args.breaker_file, json.dumps({"ts": time.time() if args.now is None else args.now,
+                                                          "reason": reason}, sort_keys=True) + "\n", force=False)
+        except WriteRefused:
+            pass  # another refresh tripped it first; the existing marker holds the decision
     print("%s %s" % (level, reason))
+    return 0
+
+
+def cmd_ack(args) -> int:
+    """The owner acknowledged an escalation: clear the breaker marker. Missing marker is reported, not an error."""
+    if os.path.lexists(args.breaker_file):
+        os.unlink(args.breaker_file)
+        print("breaker cleared: %s" % args.breaker_file)
+    else:
+        print("no breaker set: %s" % args.breaker_file)
     return 0
 
 
@@ -260,6 +292,9 @@ def main(argv=None) -> int:
     c.add_argument("--fresh", action="store_true", help="this is the first sample of a restarted session")
     c.add_argument("--restart-log", help="restart events (record-restart), for the circuit breaker")
     c.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    c.add_argument("--breaker-file", help="escalations persist here until `checkpoint ack`")
+    k = sub.add_parser("ack")
+    k.add_argument("--breaker-file", required=True)
     r = sub.add_parser("record-restart")
     r.add_argument("--restart-log", required=True)
     r.add_argument("--forced", action="store_true")
@@ -267,7 +302,7 @@ def main(argv=None) -> int:
     r.add_argument("--now", type=float, help=argparse.SUPPRESS)
     c.add_argument("--policy")
     args = ap.parse_args(argv)
-    return {"build": cmd_build, "check": cmd_check, "record-restart": cmd_record_restart}[args.cmd](args)
+    return {"build": cmd_build, "check": cmd_check, "record-restart": cmd_record_restart, "ack": cmd_ack}[args.cmd](args)
 
 
 if __name__ == "__main__":

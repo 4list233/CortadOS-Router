@@ -25,7 +25,7 @@ fi
 cd "$REPO"
 # check reads the history BEFORE this sample is appended (history = earlier turn ends)
 python3 -B -m cortados_router.compaction.checkpoint check --status-file "$tmp" --history-file "$hist" $fresh \
-  ${idle:+--idle-seconds "$idle"} --restart-log "$dir/restarts.jsonl" \
+  ${idle:+--idle-seconds "$idle"} --restart-log "$dir/restarts.jsonl" --breaker-file "$dir/breaker.json" \
   ${CORTADOS_CACHE_TTL_CLASS:+--cache-ttl-class "$CORTADOS_CACHE_TTL_CLASS"} \
   ${CORTADOS_ROUTED_MODEL:+--model "$CORTADOS_ROUTED_MODEL"} || echo "checkpoint: status unreadable"
 python3 -c 'import json,sys

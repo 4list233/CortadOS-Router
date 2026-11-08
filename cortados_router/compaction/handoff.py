@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from collections import Counter
 from typing import Any, Dict, List, Tuple
@@ -132,8 +133,11 @@ def _rules(session: Session) -> List[dict]:
     for m in session.messages:
         if m.role != "user":
             continue
-        for s in _sentences(m.text):
-            if RULE_RE.search(s):
+        # Whole lines, not sentences: no sentence splitter is safe for paths, "." as a directory, or dotted commands
+        # ("Never run cleanup from . or /important/production."), and a cut rule is a wrong rule.
+        for line in m.text.splitlines():
+            s = line.strip()
+            if s and RULE_RE.search(s):
                 key = " ".join(s.lower().split())
                 latest.pop(key, None)  # newest wins: re-insert at the newest position
                 latest[key] = {"kind": "m", "index": m.index, "line": "- %s [m%d]" % (s, m.index)}
@@ -284,10 +288,10 @@ def _victim(key: str, items: List[dict]) -> dict:
 OVERFLOW_FILES = {"goal": "handoff.goal-full.md", "rules": "handoff.rules-full.md"}
 
 
-def build_handoff(session: Session, policy: dict) -> Tuple[str, dict]:
+def build_handoff(session: Session, policy: dict, out_dir: str = "") -> Tuple[str, dict]:
     """(markdown, manifest). When Goal or Standing rules overflow their cap, the full text goes to a sibling file
     (see build_handoff_files, which also returns those files' contents for the caller to write)."""
-    md, manifest, _files_out = build_handoff_files(session, policy)
+    md, manifest, _files_out = build_handoff_files(session, policy, out_dir)
     return md, manifest
 
 
@@ -309,7 +313,14 @@ def _overflow_render(title: str, full_body: str, file_name: str, budget: int) ->
     return text
 
 
-def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict[str, str]]:
+def section_min_tokens(key: str, chars_per_token: float) -> int:
+    """Smallest cap that can hold the section's rendered heading with an empty body."""
+    return est_tokens(_render(dict(SECTION_TITLES)[key], []), chars_per_token)
+
+
+def build_handoff_files(session: Session, policy: dict, out_dir: str = "") -> Tuple[str, dict, Dict[str, str]]:
+    """out_dir: where the caller will write the files. Overflow pointers name the absolute path there (a restarted
+    session's cwd is arbitrary, so a bare file name would not resolve); "" leaves bare file names."""
     b = policy["section_budgets"]
     total_budget = policy["handoff_total_tokens"]
     sections: Dict[str, List[dict]] = {}
@@ -338,7 +349,14 @@ def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict
     extra_files: Dict[str, str] = {}   # sibling file name -> full section text
     overflow: Dict[str, dict] = {}
 
+    disabled = {k for k in titles if b[k] == 0}  # cap 0: the section is omitted entirely (policy validation)
+    for k in disabled:
+        dropped[k] += len(sections[k])
+        sections[k] = []
+
     def sec_text(key: str) -> str:
+        if key in disabled:
+            return ""
         return override.get(key) or _render(titles[key], [it["line"] for it in sections[key]])
 
     def sec_tokens(key: str) -> int:
@@ -349,7 +367,8 @@ def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict
         for key, _title in SECTION_TITLES:
             text = sec_text(key)
             toks[key] = est_tokens(text)
-            parts.append(text)
+            if text:
+                parts.append(text)
         return "\n".join(parts), toks
 
     # Caps count the complete rendered section, heading included. Goal and rules are never dropped: over their cap
@@ -359,9 +378,10 @@ def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict
         if sec_tokens(key) > b[key]:
             full_body = "\n".join(it["line"] for it in sections[key])
             name = OVERFLOW_FILES[key]
+            where = os.path.join(os.path.abspath(out_dir), name) if out_dir else name
             extra_files[name] = "# %s (full text)\n\n%s\n" % (titles[key], full_body)
-            override[key] = _overflow_render(titles[key], full_body, name, b[key])
-            overflow[key] = {"file": name, "full_tokens": est_tokens(full_body)}
+            override[key] = _overflow_render(titles[key], full_body, where, b[key])
+            overflow[key] = {"file": name, "path": where, "full_tokens": est_tokens(full_body)}
     for key in ("recency_pin", "decisions", "in_flight", "files", "excerpts"):
         while sec_tokens(key) > b[key] and sections[key]:
             items = sections[key]
@@ -407,6 +427,7 @@ def build_handoff_files(session: Session, policy: dict) -> Tuple[str, dict, Dict
                 ent["score"] = it["score"]
             entries.append(ent)
         manifest["sections"][key] = {"tokens": toks[key], "budget": b[key], "over_budget": toks[key] > b[key],
+                                     "disabled": key in disabled,
                                      "dropped": dropped[key], "items": entries,
                                      "overflow": overflow.get(key)}
     return md, manifest, extra_files

@@ -24,18 +24,19 @@ uncontrolled auto-compaction of either client. Three phases share the record sha
 - **Handoff** (`compaction/handoff.py`): `build_handoff(session, policy) -> (markdown, manifest)`. Sections in order,
   each under its own cap (16k total; tokens estimated as ceil(chars / chars_per_token): 2.5 for Claude Code, 4 for
   Codex, 2.5 when unknown): Goal (latest user prompt verbatim, 400), Recency pin (the 3 earlier recent user turns
-  verbatim + the last 2 tool calls raw, 4000), Standing rules (rule-word sentences from user messages, deduped,
+  verbatim + the last 2 tool calls raw, 4000), Standing rules (whole user-message lines containing a rule word, deduped by line,
   newest wins, 1500), Decisions (1500), In-flight (interrupted calls flagged VERIFY; branches, PRs, hashes, task ids,
   worktrees from the last 8 messages, 2000), Files touched (<= 40 paths with edit counts and tools, 800), Ranked
   excerpts (+3 per shared goal word, +2 per load-bearing signal, recency bonus; greedy fill, then chronological; tool
   results head + tail with their char count, 6000). Over the total: trim excerpts, files, decisions, then recency
   pin. Goal and rules are never dropped: over their cap the full text goes to a 0600 sibling file
-  (`handoff.goal-full.md` / `handoff.rules-full.md`) and the section shows head + tail plus "full text: <file> (N
+  (`handoff.goal-full.md` / `handoff.rules-full.md`) and the section shows head + tail plus "full text: <absolute path> (N
   tokens) — read it before acting" (recorded as `overflow` in the manifest); only a cap too small for even that fails. The manifest lists every message / event index
   per section with scores. Same input -> same bytes.
 - **CLI** (`compaction/checkpoint.py`): `build` writes `handoff.md` + `handoff.manifest.json` (0600, no overwrite
   without `--force`); `check` reads a Claude Code status-line JSON (plus optional turn history, model id, idle time
-  and cache-TTL class, fresh-session flag) and prints ok / warn / checkpoint / force / escalate.
+  and cache-TTL class, fresh-session flag) and prints ok / warn / checkpoint / force / escalate; an escalation persists in a breaker file until `checkpoint ack`.
+  A section cap is 0 (section omitted) or at least its heading; Goal and rules cannot be disabled.
 - **Integration** (`integrations/checkpoint/`, templates only): status line + PreCompact hook, a `/checkpoint` skill,
   a Codex AGENTS.md rule, and the canary: the restarted session's first reply quotes the `handoff-id:` line.
 

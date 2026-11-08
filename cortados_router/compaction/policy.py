@@ -108,6 +108,19 @@ def validate(raw: Dict[str, Any]) -> Dict[str, Any]:
     # could never fit and is a typo.
     if max(out["section_budgets"].values()) > out["handoff_total_tokens"]:
         raise PolicyError("a section budget exceeds handoff_total_tokens")
+    # A cap is 0 (section disabled, omitted entirely) or at least its rendered heading at the most token-dense
+    # estimate; anything in between can never fit and would build over budget. Goal and rules cannot be disabled:
+    # they are never dropped.
+    from .handoff import section_min_tokens  # local import: handoff does not import policy, no cycle
+    dense = min(out["chars_per_token"].values())
+    for key, cap in out["section_budgets"].items():
+        need = section_min_tokens(key, dense)
+        if key in ("goal", "rules") and cap < need:
+            raise PolicyError("section_budgets.%s=%d is below its heading minimum %d (goal and rules cannot be "
+                              "disabled)" % (key, cap, need))
+        if 0 < cap < need:
+            raise PolicyError("section_budgets.%s=%d: use 0 to disable it or at least its heading minimum %d"
+                              % (key, cap, need))
     return out
 
 

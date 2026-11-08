@@ -455,7 +455,7 @@ class ReviewRegressionTests(unittest.TestCase):
         man = json.loads(_read(os.path.join(d, "handoff.manifest.json")))
         self.assertEqual(man["sections"]["rules"]["overflow"]["file"], "handoff.rules-full.md")
         self.assertLessEqual(man["sections"]["rules"]["tokens"], man["sections"]["rules"]["budget"])
-        self.assertIn("full text: handoff.rules-full.md", _read(os.path.join(d, "handoff.md")))
+        self.assertIn("full text: %s " % full, _read(os.path.join(d, "handoff.md")))
         # a rebuild without --force refuses (overflow file exists too); with --force a short build drops the stale file
         rc, _, _ = self.run_cli("build", "--transcript", _write(lines), "--out", d)
         self.assertEqual(rc, 3)
@@ -542,6 +542,128 @@ class ReviewRegressionTests(unittest.TestCase):
         r = copy.deepcopy(raw)
         r["velocity"]["value"]["lookback_turns"] = 1
         self.assertEqual(policy.validate(r)["velocity"]["lookback_turns"], 1)
+
+
+class Round2RegressionTests(unittest.TestCase):
+    """One test per finding of the eae738d review."""
+
+    def setUp(self):
+        self.pol = load_policy()
+
+    def run_cli(self, *argv):
+        return CliTests.run_cli(self, *argv)
+
+    def test_1_rule_lines_kept_whole(self):
+        msgs = (Message("s", 0, "user", "Never run cleanup from . or /important/production.\nunrelated line"),
+                Message("s", 1, "user", "go\nnever run cleanup from .   or /important/production."))
+        md, man = handoff.build_handoff(Session("s", "claude-code", msgs, ()), self.pol)
+        rules = md[md.index("## Standing rules"):md.index("## Decisions")]
+        self.assertIn("never run cleanup from .   or /important/production. [m1]", rules)
+        self.assertEqual(rules.lower().count("cleanup"), 1)  # deduped by line, newest wins
+        self.assertNotIn("unrelated", rules)
+
+    def test_2_structured_envelope_output_serialized(self):
+        out = json.dumps({"output": [{"agent_id": "task_1234", "state": "running"}]})
+        lines = [CODEX_LINES[0], CODEX_LINES[3],
+                 {"type": "response_item", "payload": {"type": "function_call", "name": "spawn", "call_id": "k",
+                                                       "arguments": "{}"}},
+                 {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "k",
+                                                       "output": out}}]
+        s = transcript.read_codex(_write(lines))
+        self.assertEqual(json.loads(s.events[0].result_text), [{"agent_id": "task_1234", "state": "running"}])
+        self.assertEqual(transcript._result_text([{"type": "output_text", "text": "hi"}]), "hi")
+        self.assertEqual(transcript._result_text([{"type": "text", "text": "a"}, {"type": "image"}]), "a\n[image]")
+        self.assertIn("weird", transcript._result_text([{"type": "text", "text": "a"}, {"type": "weird"}]))
+
+    def _overflowing_rules_lines(self):
+        rules = " ".join("Never do thing number %d ever." % i for i in range(300))
+        return [cc_line("user", rules), cc_line("user", "go")]
+
+    def test_3_failed_force_rebuild_keeps_old_overflow(self):
+        d = tempfile.mkdtemp()
+        self.assertEqual(self.run_cli("build", "--transcript", _write(self._overflowing_rules_lines()),
+                                      "--out", d)[0], 0)
+        full = os.path.join(d, "handoff.rules-full.md")
+        real = checkpoint._write_private
+
+        def failing(path, text, force):
+            if path.endswith("handoff.manifest.json"):
+                raise OSError("injected failure")
+            return real(path, text, force)
+        checkpoint._write_private = failing
+        try:
+            with self.assertRaises(OSError):
+                self.run_cli("build", "--transcript", _write(CLAUDE_LINES), "--out", d, "--force")
+        finally:
+            checkpoint._write_private = real
+        self.assertTrue(os.path.exists(full))
+        self.assertEqual(self.run_cli("build", "--transcript", _write(CLAUDE_LINES), "--out", d, "--force")[0], 0)
+        self.assertFalse(os.path.exists(full))
+
+    def test_4_overflow_pointer_resolves_from_other_cwd(self):
+        base = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            rc, out, _ = self.run_cli("build", "--transcript", _write(self._overflowing_rules_lines()),
+                                      "--out", "rel-out")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, 0)
+        md_path = out.split()[2]
+        self.assertTrue(os.path.isabs(md_path))
+        md = _read(md_path)
+        os.chdir(tempfile.mkdtemp())  # the restarted session's cwd is somewhere else
+        try:
+            pointer = [ln for ln in md.splitlines() if ln.startswith("full text: ")][0]
+            path = pointer[len("full text: "):].split(" (")[0]
+            self.assertTrue(os.path.isabs(path))
+            self.assertIn("Never do thing number 150 ever.", _read(path))
+        finally:
+            os.chdir(cwd)
+        man = json.loads(_read(os.path.join(base, "rel-out", "handoff.manifest.json")))
+        self.assertEqual(man["sections"]["rules"]["overflow"]["path"], path)
+
+    def test_5_escalate_persists_until_ack(self):
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, CORTADOS_HOME=home, REPO=REPO)
+        script = os.path.join(REPO, "integrations", "checkpoint", "statusline.sh")
+
+        def run(tokens):
+            payload = json.dumps({"session_id": "b", "context_window": {"total_input_tokens": tokens,
+                                                                        "context_window_size": 200000}})
+            return subprocess.run(["sh", script], input=payload, env=env, capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertTrue(run(80000).startswith("escalate fresh session"))  # > 50% of 140k on open
+        for n in (80100, 80200):
+            self.assertTrue(run(n).startswith("escalate breaker tripped"), n)
+        breaker = os.path.join(home, "checkpoint", "breaker.json")
+        self.assertEqual(stat.S_IMODE(os.stat(breaker).st_mode), 0o600)
+        self.assertEqual(self.run_cli("ack", "--breaker-file", breaker)[0], 0)
+        self.assertFalse(os.path.exists(breaker))
+        self.assertTrue(run(80300).startswith("ok"))
+
+    def test_6_section_caps_zero_or_heading_minimum(self):
+        raw = json.loads(_read(policy.DEFAULT_PATH))
+        r = copy.deepcopy(raw)
+        r["section_budgets"]["value"]["files"] = 1
+        with self.assertRaisesRegex(policy.PolicyError, "files=1"):
+            policy.validate(r)
+        r = copy.deepcopy(raw)
+        r["section_budgets"]["value"]["goal"] = 0
+        with self.assertRaisesRegex(policy.PolicyError, "goal"):
+            policy.validate(r)
+        r = copy.deepcopy(raw)
+        r["section_budgets"]["value"]["files"] = 0
+        pol = policy.validate(r)
+        md, man = handoff.build_handoff(synthetic_session(), pol)
+        self.assertNotIn("## Files touched", md)
+        self.assertTrue(man["sections"]["files"]["disabled"])
+        self.assertEqual(man["sections"]["files"]["items"], [])
+        self.assertEqual(man["sections"]["files"]["tokens"], 0)
+        need = handoff.section_min_tokens("files", min(pol["chars_per_token"].values()))
+        r["section_budgets"]["value"]["files"] = need
+        policy.validate(r)
 
 
 if __name__ == "__main__":
