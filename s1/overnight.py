@@ -60,7 +60,13 @@ def signal_group(pid: int, sig: int) -> None:
         pass
 
 
-def run_bounded(command: list[str], seconds: float, *, grace: float = 20, pidfile: Path | None = None) -> int:
+# Grace between any supervisor SIGTERM (window end, deadline, launchd stop/restart) and SIGKILL. Longer than studio_capacity's
+# TRAINING_STOP_GRACE_SECONDS (30 s), so the gate can TERM/KILL its own training group and nightly.sh's EXIT trap can run
+# before this supervisor escalates to KILL (a shorter grace orphans the trainer with the node lock held).
+TRAIN_STOP_GRACE_S = 60.0
+
+
+def run_bounded(command: list[str], seconds: float, *, grace: float = TRAIN_STOP_GRACE_S, pidfile: Path | None = None) -> int:
     if seconds <= 0:
         print("nightly: outside 01:30–07:00 Toronto; nothing started", flush=True)
         return 0
@@ -216,9 +222,6 @@ def train_policy(now: datetime, *, window_raw: str | None = None, switch_raw: st
                    f"next window starts {_next_start(window, now, zone=zone).strftime('%Y-%m-%d %H:%M %Z').strip()}"), None
 
 
-# Grace between the window-end SIGTERM and SIGKILL. Longer than studio_capacity's TRAINING_STOP_GRACE_SECONDS (30 s), so the gate
-# can TERM/KILL its own training group and nightly.sh's EXIT trap can run before this supervisor escalates to KILL.
-TRAIN_STOP_GRACE_S = 60.0
 
 
 def _local_now() -> datetime:
@@ -591,7 +594,7 @@ class Guard:
                          + (f", free memory {mem:.1f} GB" if mem is not None else ""))
 
 
-def stop_tree(child, *, grace: float = 20) -> None:
+def stop_tree(child, *, grace: float = TRAIN_STOP_GRACE_S) -> None:
     """SIGCONT first (a stopped process cannot handle TERM), then TERM so nightly.sh/the trainer save checkpoints, then KILL
     whatever of the group is left after `grace`. One implementation: stop_group_drained (waits for the whole group, not just
     the shell leader)."""
@@ -652,7 +655,7 @@ def _read_result(result_file: Path) -> str:
     return "idle"
 
 
-def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = 20,
+def run_cycle(command: list[str], guard: Guard, *, result_file: Path, poll_s: float = 1.0, grace: float = TRAIN_STOP_GRACE_S,
               sleep=_time.sleep, pidfile: Path | None = None, stopflag: Path | None = None,
               grace_end: float = TRAIN_STOP_GRACE_S) -> tuple[int, str]:
     """Run one nightly.sh cycle under the guard. Returns (rc, result) with result 'worked', 'quota' or 'idle'.
