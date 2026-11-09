@@ -133,6 +133,33 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(os.listdir(elsewhere), [])
                 self.assertEqual(s.write_failures, 2)               # the turn and its retention pass, both refused
 
+    def test_hard_linked_file_refused_for_append_read_and_decisions(self):
+        """A session name hard-linked to a file outside the store used to be appended to and chmod'ed 0644 -> 0600:
+        O_NOFOLLOW and S_ISREG do not see a hard link (it IS the regular file). Every open of an existing store file
+        refuses st_nlink != 1 before reading, chmodding or writing, and the external file is left byte-for-byte and
+        mode-for-mode as it was. The link entry itself is only ever unlinked, which cannot touch the other name."""
+        ext = Path(self.home, "external.txt")
+        ext.write_text("precious\n")
+        os.chmod(ext, 0o644)
+        with Env(CORTADOS_COMPACTION_STORE="1"):
+            os.makedirs(store.sessions_dir(), mode=0o700)
+            os.link(ext, store.session_path("conv"))
+            self.assertEqual(os.stat(ext).st_nlink, 2)
+            self.assertTrue(self.rec("conv"))                    # queued; the writer refuses it
+            self.assertEqual(self.s.write_failures, 1)
+            self.assertIn("OSError", self.s.last_failure)
+            self.assertIn("link", self.s.last_failure)
+            with self.assertRaises(OSError):
+                store.read_session(store.session_path("conv"))
+            os.makedirs(store.decisions_dir(), mode=0o700)
+            shard = store.decisions_dir() / time.strftime("decisions-%Y-%m-%d.0.jsonl", time.gmtime())
+            os.link(ext, shard)
+            with self.assertRaises(OSError):
+                store.append_decisions('{"x": 1}\n')
+        self.assertEqual(ext.read_text(), "precious\n")
+        self.assertEqual(stat.S_IMODE(os.stat(ext).st_mode), 0o644)
+        self.assertEqual(os.stat(ext).st_nlink, 3)
+
     def test_fifo_at_session_path_does_not_block(self):
         with Env(CORTADOS_COMPACTION_STORE="1"):
             os.makedirs(store.sessions_dir(), mode=0o700)

@@ -577,8 +577,9 @@ approved this with a retention limit. Nothing it does changes what any backend r
 - Switch: `CORTADOS_COMPACTION_STORE=1` (off by default: no files are created).
 - Where: `$CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl` (dirs 0700, files 0600). Every file operation
   is anchored to directory fds opened one component at a time from `$CORTADOS_HOME` down with O_NOFOLLOW, and files
-  are opened relative to them with O_NOFOLLOW | O_NONBLOCK and an fstat regular-file check: a symlinked home,
-  `compaction/` or `sessions/`, a symlinked session file or a FIFO is refused, for writes, reads and retention alike. Code: `cortados_router/compaction/store.py`.
+  are opened relative to them with O_NOFOLLOW | O_NONBLOCK and an fstat check (regular file with exactly one hard
+  link): a symlinked home, `compaction/` or `sessions/`, a symlinked session file, a FIFO or a session name
+  hard-linked to a file outside the store is refused, for writes, reads and retention alike. Code: `cortados_router/compaction/store.py`.
 - What: per provider turn, a `turn` header (source `claude-code` / `codex`, `x-cortados-run-id`, `x-cortados-session`,
   client), the tool results answering earlier calls, the new user text, the assistant text and the tool calls it
   issued. Each result text and each tool input is capped at `provider_tool_result_cap_tokens` x `chars_per_token` for

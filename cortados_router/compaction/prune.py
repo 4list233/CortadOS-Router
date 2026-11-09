@@ -51,14 +51,23 @@ def _has_shell_expansion(cmd: str) -> bool:
     `$` and backticks anywhere except inside single quotes (parameter, command and arithmetic expansion, $'..' and
     $".." quoting; double quotes still expand them, and an escaped one in double quotes is rejected too rather than
     modelled), and the characters of _UNQUOTED_EXPANSION outside any quotes unless backslash-escaped. Process
-    substitution <( >( is rejected by _CHAIN. Tilde expansion is allowed: it yields a path, never a flag."""
+    substitution <( >( is rejected by _CHAIN. An unquoted tilde is rejected where the shell expands it: at the start
+    of a word (`~`, `~user`, `~/x`, `~+`, `~-`) and right after an unquoted `=` or `:` (bash expands assignment-shaped
+    arguments such as `x=~` by default; zsh expands `""~`, so empty quotes do not end that position). Why: tilde
+    expansion yields the CLIENT's $HOME, which the prune cannot see; with HOME=-delete, `find . ~` deleted a marker
+    under bash and zsh while the shape check saw a positional. A quoted or escaped tilde, or one inside a word
+    (`HEAD~1`, `a\ ~`), is literal and allowed. Keeping `cat ~/notes.txt` costs tokens; pruning a destructive call
+    as a re-runnable read loses state, so the cheaper error is chosen."""
     quote = None                                  # None, "'" or '"'
+    word_start = True                             # nothing but whitespace, = / : or empty quotes since the last word
     i, n = 0, len(cmd)
     while i < n:
         c = cmd[i]
         if quote == "'":
             if c == "'":
                 quote = None
+            else:
+                word_start = False
         elif quote == '"':
             if c in "$`":
                 return True
@@ -66,15 +75,23 @@ def _has_shell_expansion(cmd: str) -> bool:
                 if cmd[i + 1:i + 2] in ("$", "`"):
                     return True                   # escaped expansion: rejected, not modelled (see the docstring)
                 i += 1                            # \" and \\ do not end or change the double-quoted string
+                word_start = False
             elif c == '"':
                 quote = None
+            else:
+                word_start = False
         else:
             if c in "$`" or c in _UNQUOTED_EXPANSION:
                 return True
+            if c == "~" and word_start:
+                return True
             if c == "\\":
                 i += 1                            # the next character is literal
+                word_start = False
             elif c in "'\"":
-                quote = c
+                quote = c                         # an empty quoted string keeps the tilde-prefix position (zsh)
+            else:
+                word_start = c in " \t=:"
         i += 1
     return False
 

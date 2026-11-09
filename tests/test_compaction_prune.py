@@ -83,11 +83,38 @@ class RuleTests(unittest.TestCase):
                 self.assertFalse(prune.is_rerunnable(ev, T), c)
         # quoted or escaped, the same characters are literal to the shell and the shape is certain
         literal = ["find . -name '*.py'", "find . -name \"*.py\"", "grep -rn 'foo$' .", "grep -n 'a{2}' f",
-                   "ls a\\*", "grep -e 'a$' f", "cat ~/notes.txt", "git diff --stat HEAD~1",
+                   "ls a\\*", "grep -e 'a$' f", "cat '~/notes.txt'", "git diff --stat HEAD~1",
                    "grep -n \"a[0-9]\" f", "grep -n 'it''s' f"]
         for c in literal:
             with self.subTest(c=c):
                 self.assertTrue(prune.readonly_bash(c, T), c)
+
+    def test_unquoted_tilde_is_never_read_only(self):
+        """With HOME=-delete, `find . ~` deleted a marker under bash and zsh while readonly_bash() said True, and a
+        repeat of the event was pruned as rule:superseded. The expansion's value is the CLIENT's $HOME, which the
+        prune cannot see, so no unquoted tilde the shell may expand (a word start, after empty quotes, or after = or :
+        where bash expands assignment-shaped arguments) is read-only. Mid-word tildes (HEAD~1) and quoted or escaped
+        ones are literal and stay read-only."""
+        expanding = ["find . ~", "cat ~", "ls ~user", "cat ~/notes.txt", "head -n 5 ~+/x", "grep foo ~-", "ls a ~",
+                     "cat '' ~", "cat x=~", "cat x=~/y", "cat x=a:~", "~/bin/cat a", "cat -- ~", "cat\t~",
+                     "cat ''~", "cat \"\"~/x"]                  # zsh expands a tilde after empty quotes
+        for c in expanding:
+            with self.subTest(c=c):
+                self.assertFalse(prune.readonly_bash(c, T), c)
+                ev = ToolEvent(session="s", index=0, message_index=3, name="Bash", input={"command": c},
+                               result_text="", result_chars=0, is_error=False, interrupted=False)
+                self.assertTrue(prune.is_side_effect(ev, T), c)
+                self.assertFalse(prune.is_rerunnable(ev, T), c)
+        literal = ["git diff --stat HEAD~1", "git log HEAD~3..HEAD", "cat a~", "cat '~/x'", "cat \"~/x\"", "cat \\~",
+                   "cat 'a'~", "cat a\\ ~", "cat \"x=~\"", "grep -n '~' f"]
+        for c in literal:
+            with self.subTest(c=c):
+                self.assertTrue(prune.readonly_bash(c, T), c)
+        # the reproduced case end to end: the repeated call keeps its result (side effect), never rule:superseded
+        out = prune.decide(session([(3, "Bash", {"command": "find . ~"}, BIG, False),
+                                    (5, "Bash", {"command": "find . ~"}, BIG, False)] + FILLER), table=T)
+        self.assertEqual([(d.decided_by, d.keep_result) for d, _ in out[:2]],
+                         [("rule:side_effect", True), ("rule:side_effect", True)])
 
     def test_superseded_read_dropped_even_if_small(self):
         out = prune.decide(session([(3, "Read", {"file_path": "a"}, 100, False),

@@ -6,7 +6,8 @@ here changes what is sent to a backend: the provider calls `record_turn` after a
 from the request it already parsed.
 
 Layout: $CORTADOS_HOME/compaction/sessions/<safe-id>-<sha12>.jsonl, directories 0700, files 0600, every open with
-O_NOFOLLOW (a planted symlink is refused, not followed). One JSON object per line:
+O_NOFOLLOW (a planted symlink is refused, not followed) and refused unless fstat shows a regular file with exactly one
+hard link (a planted hard link to an outside file is refused, not written through). One JSON object per line:
   {"kind": "turn", "ts", "source", "meta": {run_id, session, ...}}      one per provider turn, first
   {"kind": "tool_result", "tool_use_id", "text", "chars", "truncated", "is_error"}
   {"kind": "message", "role": "user" | "assistant", "text"}
@@ -143,7 +144,8 @@ def session_path(conversation_id: str) -> Path:
 # a symlinked home or a symlinked ANCESTOR of the home can never redirect a write, a read or a deletion outside the
 # store (the only symlinks crossed are the OS aliases in _TRUSTED_ALIASES). Files are opened relative to those fds with
 # O_NOFOLLOW | O_NONBLOCK (a FIFO planted at a session path cannot block the open) and refused unless fstat says
-# they are regular files.
+# they are regular files with exactly one hard link (a hard link IS a regular file, so S_ISREG alone let a session
+# name linked to an outside file be appended to and chmod'ed).
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -235,11 +237,17 @@ def open_store_dir(*parts: str, create: bool) -> int:
 
 
 def _open_file(name: str, dir_fd: int, flags: int, mode: int = 0o600) -> int:
+    """Open a store file relative to an anchored dir fd and refuse anything that is not a regular file with ONE
+    name. Why the link count: O_NOFOLLOW and S_ISREG do not see a hard link (it IS the regular file), so a session
+    name hard-linked to a file outside the store was appended to and chmod'ed 0644 -> 0600 through it. The check
+    runs before the chmod, the write or the read; a file this store created has exactly one name."""
     fd = os.open(name, flags | _FILE_FLAGS, mode, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError(f"{name} is not a regular file; refusing it")
+        if st.st_nlink != 1:
+            raise OSError(f"{name} has {st.st_nlink} hard links; a store file has one name, refusing it")
         if (flags & os.O_CREAT) and stat.S_IMODE(st.st_mode) != 0o600:
             os.fchmod(fd, 0o600)
         if flags & (os.O_WRONLY | os.O_RDWR) == 0:
