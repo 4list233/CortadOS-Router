@@ -2107,18 +2107,31 @@ class Handler(BaseHTTPRequestHandler):
             return None
         r = getattr(session, "route", None) or {}
         local = r.get("local")
+        # As typed first; a friendly spelling (`sub/gpt-6.1`) is resolved only when that misses (_resolved_pin).
         if local:                       # a local pin answers to its alias or its tag, case-insensitively
             names = {local["model"]["id"].casefold(), local_lane.pin_id(local["model"]).casefold()}
-            if r.get("pinned") and pinned.strip().casefold() in names:
+            if r.get("pinned") and (pinned.strip().casefold() in names
+                                    or Handler._resolved_pin(pinned).casefold() in names):
                 return None
             shown = local_lane.pin_id(local["model"])
         else:
-            if r.get("pinned") and r.get("model") == pinned:
+            if r.get("pinned") and (r.get("model") == pinned or r.get("model") == Handler._resolved_pin(pinned)):
                 return None
             shown = r.get("model")
         now = f"pinned to sub/{shown}" if r.get("pinned") else f"routed by S1 to {r.get('model') or 'its model'}"
         return (f"cortados: the model is fixed per conversation: this one is {now}, and this request asks for "
                 f"sub/{pinned}; start a new conversation to change models")
+
+    @staticmethod
+    def _resolved_pin(pinned: str) -> str:
+        """The pin name a continuation's `sub/<name>` means, through the same resolver the opener went through
+        (routing.resolve_pin), so a friendly pin (`sub/gpt-6.1`) continues on the model it opened on. Only reached when
+        the name did not match as typed. An ambiguous or unknown name resolves to itself (and so is refused)."""
+        from cortados_router import core
+        try:
+            return routing.resolve_pin(core, pinned) or pinned
+        except routing.AmbiguousPin:
+            return pinned
 
     def _reveal(self, session) -> str | None:   # api/-pinned requests reveal in _serve_api_lane (api_reveal_suffix)
         try:

@@ -70,14 +70,16 @@ class RouteTaskTests(unittest.TestCase):
             seen.append(json.loads(req.data)["model"])
             return FakeResp({"model": "claude-opus-backend", "content": [{"type": "text", "text": "ok"}]})
         for given, want in ((None, "cortados"), ("cortados", "cortados"), ("opus", "sub/" + routing.SUB_ALIASES["opus"]),
-                            ("gpt-6.1-sol", "sub/gpt-6.1-sol"), ("sub/claude-x-1", "sub/claude-x-1")):
+                            ("gpt-6.1-sol", "sub/gpt-6.1-sol"), ("sub/claude-x-1", "sub/claude-x-1"),
+                            # friendly names travel as one dashed token; the provider's resolver reads them
+                            ("GPT 6.1", "sub/gpt-6.1"), ("ollama 27b  q3km", "sub/ollama-27b-q3km")):
             r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, model=given)
             self.assertNotIn("isError", r, given)
             self.assertEqual(seen[-1], want, given)
             self.assertEqual(r["_meta"]["cortados/requested_model"], want)
             self.assertEqual(r["_meta"]["cortados/routed_model"], "claude-opus-backend")
         n = len(seen)
-        for bad in ("../etc", "has space", "x" * 90, 5):
+        for bad in ("../etc", "has space!", "x" * 90, 5, "   "):
             r = m.route_task("http://h:8432", "secret-test-0001", "t", urlopen=_open, model=bad)
             self.assertTrue(r.get("isError"), bad)
         self.assertEqual(len(seen), n, "an invalid model is refused before any request")
