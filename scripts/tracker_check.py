@@ -113,23 +113,24 @@ def parse_live_status_date(body: str) -> dt.date | None:
         raise CheckError(f"Live status date {m.group(1)!r} is not a calendar date: {exc}") from exc
 
 
-# These characters can continue a Git branch name in prose. Keep punctuation such as commas and periods
-# available as delimiters, while preventing a short branch from matching the prefix of names like ``foo+bar``.
-_BRANCH_TOKEN_CONTINUATION = r"\w/.\-+@=$"
-_BRANCH_TOKEN_AFTER = r"\w/\-+@=$"
+# Split only on characters forbidden anywhere in a Git ref (git check-ref-format).
+# All remaining characters, including Unicode and punctuation, may continue a name.
+_BRANCH_TOKEN_SEPARATOR = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]+")
 
 
 def mentions(text: str, branch: str) -> bool:
-    """True when `branch` appears in `text` as a whole token.
-
-    Substring matching would let ``foo`` claim ``foo-bar`` or ``foo+bar``. A dot after the name ends a sentence
-    unless another branch-name character follows it (``foo.bar`` is a longer name, ``foo.`` is a mention of ``foo``).
-    """
-    return re.search(
-        r"(?<![" + _BRANCH_TOKEN_CONTINUATION + r"])" + re.escape(branch)
-        + r"(?![" + _BRANCH_TOKEN_AFTER + r"]|\.[" + _BRANCH_TOKEN_CONTINUATION + r"])",
-        text or "",
-    ) is not None
+    """Match complete ref-name tokens, or an explicitly backtick-delimited name."""
+    # Do not strip sentence punctuation from bare names: even trailing commas can
+    # belong to a valid branch. Treat foo. and foo, as ambiguous and report drift
+    # rather than a false clean. Backticks make prose mentions such as `foo`,
+    # explicit; strip only punctuation outside a complete code token, never inside.
+    for token in _BRANCH_TOKEN_SEPARATOR.split(text or ""):
+        if token == branch:
+            return True
+        quoted = re.fullmatch(r"`([^`]+)`[.,;!)]*", token)
+        if quoted and quoted.group(1) == branch:
+            return True
+    return False
 
 
 def parse_issue_list(raw: str) -> list[Issue]:

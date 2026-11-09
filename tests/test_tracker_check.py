@@ -74,14 +74,31 @@ class ParsingTests(unittest.TestCase):
 
     def test_mentions_is_whole_token(self):
         self.assertTrue(tc.mentions("see `foo-bar` here", "foo-bar"))
-        self.assertTrue(tc.mentions("branch foo-bar, then", "foo-bar"))
+        self.assertFalse(tc.mentions("branch foo-bar, then", "foo-bar"))
         self.assertFalse(tc.mentions("see foo-bar-baz", "foo-bar"))
         self.assertFalse(tc.mentions("see foo", "foo-bar"))
         self.assertFalse(tc.mentions("fix/teacher-identity-two", "fix/teacher-identity"))
-        self.assertTrue(tc.mentions("tag fix/teacher-identity.", "fix/teacher-identity"))
+        self.assertFalse(tc.mentions("tag fix/teacher-identity.", "fix/teacher-identity"))
         for suffix in ("+bar", "@bar", "=bar", "$bar"):
             self.assertFalse(tc.mentions("see foo" + suffix, "foo"))
             self.assertTrue(tc.mentions("see foo" + suffix, "foo" + suffix))
+
+    def test_mentions_valid_ref_extensions(self):
+        for char in map(chr, range(33, 127)):
+            if char in "~^:?*[\\":
+                continue
+            with self.subTest(char=char):
+                longer = "foo" + char + "bar"
+                self.assertFalse(tc.mentions(longer, "foo"))
+                self.assertFalse(tc.mentions("bar" + char + "foo", "foo"))
+                self.assertTrue(tc.mentions(longer, longer))
+
+    def test_mentions_sentence_punctuation_is_conservative(self):
+        for text in ("foo.", "foo,", "foo, then", "foo!"):
+            with self.subTest(text=text):
+                self.assertFalse(tc.mentions(text, "foo"))
+        self.assertTrue(tc.mentions("Use `foo`, then continue.", "foo"))
+        self.assertFalse(tc.mentions("Use `foo,bar`.", "foo"))
 
     def test_parse_branches_classifies_merged_unmerged_and_empty(self):
         b = tc.parse_branches(REFS, MERGED, "main")
@@ -123,6 +140,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("#10", text)
         self.assertIn("forgotten-branch", text)
         self.assertIn("result: drift found", text)
+
+    def test_longer_branch_mention_cannot_hide_orphan(self):
+        r = tc.build_report(
+            [tc.Issue(1, "foo,bar", "")], tc.Branches(unmerged={"foo"}),
+            ISSUES[3]["body"], dt.date(2026, 11, 8),
+        )
+        self.assertEqual(r.orphan_branches, ["foo"])
+        self.assertFalse(r.clean)
 
     def test_stale_tracker_warns_past_two_days(self):
         fresh = tc.build_report([], tc.Branches(), ISSUES[3]["body"], dt.date(2026, 11, 10))
