@@ -232,8 +232,7 @@ what failed."
 
 ## Pinning one subagent's model
 
-A subagent prompt can ask for a named model instead of the configured `model`. The one form that counts is a line of
-its own:
+A subagent prompt can ask for a named model instead of the configured `model`. The one form that counts is the very first line of the prompt:
 
 ```
 [cortados: model=GPT 6.1]
@@ -243,11 +242,11 @@ its own:
 name the provider resolves — `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km` (every word must belong to exactly one pool
 model; the provider refuses an ambiguous or unknown name with the candidates, so nothing is guessed). The mod strips
 the line from the prompt the child sees and launches it with `--model sub/<name>` (spaces become dashes, case folds:
-`sub/gpt-6.1`). Only this bracketed own-line form fires: "compare GPT 6.1 with Sonnet", or the tag quoted mid-sentence,
-is prose and pins nothing. A prompt with two directives is refused (the author named two models). Calls the mod passes
+`sub/gpt-6.1`). Only this bracketed first-line form fires: "compare GPT 6.1 with Sonnet", or the tag quoted mid-sentence,
+is prose and pins nothing. Later lines, including pasted or fenced content, are left alone. `api/` directives are refused to prevent unexpected API bills. Only the first line is metadata; later directive-shaped lines remain task data. Calls the mod passes
 through natively (fork, worktree/remote isolation, named agents) keep their prompt as written and ignore the directive.
 A review directive still goes through the independent-review exclusion: pinning a review onto an excluded model is
-refused by the provider, and the mod retries once without the exclusion header, as for any pinned model.
+refused without retrying or dropping the exclusion header. The retry for an owner-configured global pin is unchanged.
 
 ## Tests
 

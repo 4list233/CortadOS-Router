@@ -184,7 +184,7 @@ export function mainLoopAllows(tool: string, agentId: string | null | undefined,
 /** Appended to every routed child's prompt: a child stuck on a broken tool should report, not burn its budget. */
 export const STOP_ON_DEAD_TOOL = 'If a tool returns nothing useful twice in a row, stop and report what you have and what failed.'
 
-/** The ONE explicit way a subagent prompt names its model: `[cortados: model=<name>]` on a line of its own. Only
+/** The ONE explicit way a subagent prompt names its model: `[cortados: model=<name>]` on the very first line of the prompt. Only
  * this form counts, so prose that merely mentions a model ("compare GPT 6.1 with Sonnet") or quotes the directive
  * mid-sentence never pins anything. `<name>` is a pool model id, a `sub/` alias, or a friendly name the provider's
  * resolver (routing.resolve_pin) reads: `GPT 6.1`, `Sonnet 5`, `ollama 27b q3km`; `cortados` asks S1 to route. The
@@ -194,29 +194,27 @@ export const MODEL_DIRECTIVE_RE = /^[ \t]*\[cortados:[ \t]*model[ \t]*=[ \t]*([A
 
 /** The provider model id a directive name becomes: spaces collapse to dashes and case folds (`GPT 6.1` -> `gpt-6.1`),
  * so the id is one argv token and the provider reads it as the friendly name; `cortados` stays S1-routed and an
- * explicit `sub/`/`api/` pin is kept as written. */
-export function directiveModelId(name: string): string {
+ * explicit `sub/` pin is kept as written; `api/` is refused. */
+export function directiveModelId(name: string): string | null {
   const slug = name.trim().replace(/\s+/g, '-').toLowerCase()
-  if (slug === 'cortados' || slug.startsWith('sub/') || slug.startsWith('api/')) return slug
+  // Directives must never spend API credit: the owner forbids unexpected bills.
+  if (slug.startsWith('api/')) return null
+  if (slug === 'cortados' || slug.startsWith('sub/')) return slug
   return 'sub/' + slug
 }
 
-/** Split a subagent prompt into its model directive (MODEL_DIRECTIVE_RE) and the prompt the child sees, with the
- * directive line removed. `model` is null when the prompt has no directive. Two or more directives are a `problem`
- * (the call is refused) rather than one being picked: the author named two models, and guessing could spend the
- * wrong quota. */
+/** Remove only first-line model metadata. All later lines remain task data, including pasted directives. */
 export function modelDirective(prompt: string): { model: string | null; prompt: string; problem: string | null } {
-  const all = prompt.match(new RegExp(MODEL_DIRECTIVE_RE.source, 'gm')) ?? []
-  if (all.length > 1) {
-    return { model: null, prompt, problem: `the prompt carries ${all.length} [cortados: model=…] directives; keep exactly one` }
-  }
-  const m = MODEL_DIRECTIVE_RE.exec(prompt)
+  // Only the first line is control metadata, never later pasted or fenced content.
+  const m = MODEL_DIRECTIVE_RE.exec(prompt.split('\n', 1)[0])
   if (!m) return { model: null, prompt, problem: null }
   let end = m.index + m[0].length
   if (prompt[end] === '\n') end += 1                 // the whole line goes, so the prompt's own paragraphs stay as written
   const rest = (prompt.slice(0, m.index) + prompt.slice(end)).trim()
   if (!rest) return { model: null, prompt, problem: 'the prompt is only a [cortados: model=…] directive; there is no task to run' }
-  return { model: directiveModelId(m[1]), prompt: rest, problem: null }
+  const model = directiveModelId(m[1])
+  if (!model) return { model: null, prompt, problem: 'api/ model directives are forbidden to prevent unexpected API bills' }
+  return { model, prompt: rest, problem: null }
 }
 
 /** The --max-turns value from config: a positive integer, or null (flag off) for 0/negative/invalid. */
@@ -1601,12 +1599,13 @@ export const register: Register = (on, options) => {
           let res = await waitDetached(firstDir, backgroundTimeoutMs)
           let p = parseResult(res.stdout)
           let note = ''
+          // Directive pins preserve review independence and never retry without exclusions.
           // As in the foreground: an exclude header the router refused is retried ONCE without it, in what is left
           // of the one overall budget.
           if (excluded.length && !res.timedOut && !res.overflow && !res.supervisorFailed && !cleanCompletion(res.exitCode, res.isStdoutTruncated, p)) {
             const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
             const remainingMs = Math.floor(backgroundTimeoutMs - (Date.now() - startedAt))
-            if (reason && remainingMs >= MIN_RETRY_MS) {
+            if (reason && directive.model === null && remainingMs >= MIN_RETRY_MS) {
               $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
               note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
               const dir = await launchDetached('x-cortados-reveal: 1', remainingMs)
@@ -1683,6 +1682,7 @@ export const register: Register = (on, options) => {
       let res = await runChild(customHeaders, subagentTimeoutMs)
       let p = parseResult(res.stdout)
       let note = ''
+      // Only owner-configured global pins may relax exclusions; directive pins fail closed.
       // Fallback: the provider refuses (HTTP 400) an exclude header naming no model it serves — e.g. after a model
       // rename — or one that leaves nothing usable. Without this every review would fail. Retry ONCE without the
       // exclusion, and tell the user and the parent model that independence was NOT enforced. The refusal comes on
@@ -1692,7 +1692,7 @@ export const register: Register = (on, options) => {
         // Only an error result or stderr is read: a successful-looking result text is the child's own words.
         const reason = excludeRefusalReason(`${p.isError ? p.text ?? '' : ''}\n${res.stderr}`)
         const remainingMs = Math.floor(subagentTimeoutMs - (Date.now() - startedAt))
-        if (reason && remainingMs >= MIN_RETRY_MS) {
+        if (reason && directive.model === null && remainingMs >= MIN_RETRY_MS) {
           $.ui.toast(`routed-subagents: the router refused to keep this review off ${excludedNames} (${reason}); ran it without the exclusion`)
           note = `[review NOT kept off ${excludedNames}: ${reason}]\n`
           res = await runChild('x-cortados-reveal: 1', Math.min(MAX_SUBAGENT_TIMEOUT_MS, remainingMs))
