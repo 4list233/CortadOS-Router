@@ -43,7 +43,14 @@ class HostError(Exception):
 
 
 class HostUnreachable(HostError):
-    """The host did not answer: ssh could not connect, timed out, or the remote command produced no reply."""
+    """The host did not answer: ssh could not connect, timed out, or the remote command produced no reply.
+    `ambiguous` is True when the request may have reached the host and run there (a timeout once the session was up,
+    or a remote command that ran but left no reply): a `start` may then have launched a child nobody heard about.
+    False for failures before anything was sent (ssh could not be run, or exited 255 on connect/authentication)."""
+
+    def __init__(self, msg: str, ambiguous: bool = False):
+        super().__init__(msg)
+        self.ambiguous = ambiguous
 
 
 def short_hostname() -> str:
@@ -199,7 +206,10 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
     try:
         rc, out, err = transport(ssh_argv(host), req, timeout_s)
     except subprocess.TimeoutExpired:
-        raise HostUnreachable(f"execution host {host.describe()} did not answer {op} within {timeout_s:g} s") from None
+        # Ambiguous: ssh gives up connecting after SSH_CONNECT_TIMEOUT_S (exit 255, below), well inside timeout_s, so a
+        # timeout here means the session was up and the request was sent; the host may have acted on it.
+        raise HostUnreachable(f"execution host {host.describe()} did not answer {op} within {timeout_s:g} s",
+                              ambiguous=True) from None
     except OSError as exc:
         raise HostUnreachable(f"cannot run ssh for execution host {host.describe()}: {type(exc).__name__}: {exc}") from None
     if rc == 255:                                       # ssh's own exit status for a connection/authentication failure
@@ -211,8 +221,9 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
     except ValueError:
         reply = None
     if not isinstance(reply, dict):
+        # Ambiguous: the remote command ran (ssh did not exit 255) and may have acted before failing to reply.
         raise HostUnreachable(f"execution host {host.describe()} returned no reply to {op} (exit {rc}): "
-                              f"{_tail(err) or _tail(out) or 'no output'}")
+                              f"{_tail(err) or _tail(out) or 'no output'}", ambiguous=True)
     if reply.get("v") != PROTOCOL:
         raise HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
                         f"{reply.get('v')!r}, this one speaks {PROTOCOL}: update the checkout there ({host.router})")

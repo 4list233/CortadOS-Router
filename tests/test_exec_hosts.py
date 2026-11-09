@@ -124,18 +124,22 @@ class CallTests(unittest.TestCase):
             self.assertIn("unreachable", str(cm.exception))
             self.assertIn("'air' (ssh air)", str(cm.exception))
             self.assertIn("No route to host", str(cm.exception))
+            self.assertFalse(cm.exception.ambiguous)            # nothing was sent: a definite failure
             self.reply = subprocess.TimeoutExpired("ssh", 30)
             with self.assertRaises(eh.HostUnreachable) as cm:
                 eh.call(self.host, "start", {}, transport=self.transport)
             self.assertIn("did not answer", str(cm.exception))
+            self.assertTrue(cm.exception.ambiguous)             # sent, then no answer: the host may have acted
             self.reply = (1, b"Traceback...\n", b"python3: No such file")
             with self.assertRaises(eh.HostUnreachable) as cm:
                 eh.call(self.host, "start", {}, transport=self.transport)
             self.assertIn("no reply", str(cm.exception))
             self.assertIn("No such file", str(cm.exception))
+            self.assertTrue(cm.exception.ambiguous)             # the remote command ran
             self.reply = OSError("ssh missing")
-            with self.assertRaises(eh.HostUnreachable):
+            with self.assertRaises(eh.HostUnreachable) as cm:
                 eh.call(self.host, "start", {}, transport=self.transport)
+            self.assertFalse(cm.exception.ambiguous)
 
     def test_remote_error_protocol_mismatch_and_banner(self):
         with mock.patch.object(eh, "short_hostname", return_value="pro"):

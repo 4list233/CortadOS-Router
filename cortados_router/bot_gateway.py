@@ -511,7 +511,7 @@ class Gateway:
         # bot gets verbatim. An omitted permission_mode resolves there to the child default (auto where supported).
         args = {k: a[k] for k in START_PASSTHROUGH if k in a}
         args["task"] = prompt
-        tid = None
+        tid, ambiguous = None, False
         try:
             res = self.child("start_task", args, {**self.cfg, "client": CLIENT})
             if not res.get("isError"):
@@ -519,15 +519,27 @@ class Gateway:
                     tid = json.loads(res["content"][0]["text"]).get("task_id")
                 except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                     tid = None
+            else:
+                meta = res.get("_meta")
+                ambiguous = isinstance(meta, dict) and meta.get(subagent_mcp.AMBIGUOUS_META) is True
         finally:
             with self.lock:
-                self.running.discard(slot)
-                self.reserved.pop(slot, None)
+                if not ambiguous:
+                    # Success (the task id takes the slot over) or a definite failure (refused or invalid before
+                    # anything ran on the host): the reservation is released.
+                    self.running.discard(slot)
+                    self.reserved.pop(slot, None)
+                # else: an ambiguous failure (e.g. the host timed out after the start was sent) may have launched a
+                # child we hold no id for. The reservation stays, persisted, and expires in _refresh_running after
+                # reservation_ttl from its creation (the child's max runtime + kill grace + 60 s). Reason: a child
+                # that did start is killed by its runner by then, so the slot is provably free; releasing it now
+                # would let retries start more children than max_concurrent.
                 if tid:
                     self.tasks[tid] = CLIENT
                     self.running.add(tid)
                 self._save_counters()
-        self.record("start_task", "ok" if tid else "error", tid, owner_approval=approval)
+        extra = {"launch": "ambiguous"} if ambiguous else {}
+        self.record("start_task", "ok" if tid else "error", tid, owner_approval=approval, **extra)
         return res
 
     def child_prompt(self, a: dict):

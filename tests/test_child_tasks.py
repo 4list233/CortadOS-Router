@@ -618,7 +618,7 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(ct.classify({"exit_code": 0, "output": result, "activity": act}), "succeeded")
         write([{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "c1",
                                                                "name": "mcp__claude-in-chrome__find", "input": {}}]}},
-               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1", "is_error": True,
                                                           "content": [{"type": "text", "text": "Error: " + phrase}]}]}},
                {"type": "assistant", "message": {"content": [{"type": "text", "text": "The browser is connected and "
                                                                                        "I finished the task."}]}},
@@ -627,6 +627,29 @@ class ChildTaskTests(unittest.TestCase):
         self.assertEqual(act["browser_disconnected"], {"mcp__claude-in-chrome__find": 1})
         self.assertEqual(ct.classify({"exit_code": 0, "output": result, "activity": act}), "failed")
         self.assertIn("1 browser tool call(s) (find)", ct.browser_disconnected_reason(act["browser_disconnected"]))
+
+    def test_page_content_quoting_the_disconnect_phrase_is_not_a_disconnection(self):
+        """A successful read_page whose page text quotes the phrase (a help article, a forum post) is website content:
+        only an error result naming it, or a result that is exactly the extension's message, counts."""
+        path = os.path.join(self.tmp, "stdout.log")
+        page = ("Troubleshooting Claude in Chrome\n\nIf you see \"" + ct.BROWSER_DISCONNECTED + "\", open the "
+                "extension and sign in again. " + "More help text. " * 40)
+        result = {"type": "result", "subtype": "success", "is_error": False, "result": "summarised the page"}
+        with open(path, "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in [
+                {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "r1",
+                                                                "name": "mcp__claude-in-chrome__read_page", "input": {}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "r1",
+                                                           "content": [{"type": "text", "text": page}]}]}},
+                {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "r2",
+                                                                "name": "mcp__claude-in-chrome__get_page_text",
+                                                                "input": {}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "r2",
+                                                           "content": "Quote: " + ct.BROWSER_DISCONNECTED}]}},
+                result]))
+        act = ct.summarize_stream(path, self.work)
+        self.assertNotIn("browser_disconnected", act)
+        self.assertEqual(ct.classify({"exit_code": 0, "output": result, "activity": act}), "succeeded")
 
     def test_a_queued_chrome_task_can_be_cancelled(self):
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"

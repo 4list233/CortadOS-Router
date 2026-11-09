@@ -4,6 +4,7 @@ and no provider is ever started."""
 import io
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -280,6 +281,60 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(r["error"]["message"], "internal error (RuntimeError)")
         self.assertNotIn("child died", json.dumps(r))
         self.assertEqual(self.gw.running, set())
+
+    def _remote_air(self, transport):
+        """The real start path (call_child_tool -> child_tasks.start -> exec_hosts.call) to a remote host 'air' whose
+        ssh is replaced by `transport` (never ssh)."""
+        tmp = os.path.realpath(tempfile.mkdtemp())
+        hosts = os.path.join(tmp, "exec-hosts.json")
+        with open(hosts, "w") as f:
+            json.dump({"default": "air", "hosts": {"air": {"ssh": "air-fake", "router": "/r", "root": "/w",
+                                                         "hostnames": ["not-this-machine"]}}}, f)
+        env = mock.patch.dict(os.environ, {"HOME": tmp, "CORTADOS_TASKS_DIR": os.path.join(tmp, "tasks"),
+                                           "CORTADOS_EXEC_HOSTS_FILE": hosts, "CORTADOS_EXEC_HOST": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CORTADOS_CHILD_TASK", None)
+        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport)
+        t.start()
+        self.addCleanup(t.stop)
+        self.gw.child = subagent_mcp.call_child_tool
+        self.gw.limits["max_concurrent"] = 1
+
+    def test_ambiguous_start_failure_keeps_the_reservation(self):
+        # The host accepted the start, then the reply timed out: a child may be running there. Retries must not pass
+        # the cap; the reservation is kept (persisted) and expires only after reservation_ttl.
+        sent = []
+
+        def accepts_then_times_out(argv, stdin, timeout):
+            sent.append(json.loads(stdin)["op"])
+            raise subprocess.TimeoutExpired("ssh", timeout)
+        self._remote_air(accepts_then_times_out)
+        r = self.start()
+        self.assertIn("did not answer start", r["result"]["content"][0]["text"])
+        self.assertTrue(r["result"]["isError"])
+        for _ in range(2):
+            self.assertIn("concurrency cap", self.start()["error"]["message"])
+        self.assertEqual(sent, ["start"])                       # one start reached the transport, not three
+        self.assertEqual(len(self.gw.reserved), 1)
+        self.assertTrue(all(s.startswith(bg._PENDING) for s in self.gw.running))
+        with open(os.path.join(self.home, bg.COUNTERS_FILE)) as f:
+            self.assertEqual(list(json.load(f)["reserved"]), list(self.gw.reserved))
+        self.assertEqual([u.get("launch") for u in self.usage() if u["outcome"] == "error"], ["ambiguous"])
+        self.gw.reservation_ttl = 0                             # past the child's max runtime the slot is free
+        self.gw._refresh_running()
+        self.assertEqual((self.gw.reserved, self.gw.running), ({}, set()))
+
+    def test_definite_start_failure_releases_the_reservation(self):
+        replies = iter([(255, b"", b"ssh: connect to host air port 22: Connection refused"),
+                        (0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False,
+                                        "error": "cwd '/nope' does not exist on execution host air"}).encode(), b"")])
+        self._remote_air(lambda argv, stdin, timeout: next(replies))
+        for want in ("unreachable", "does not exist"):
+            r = self.start()
+            self.assertIn(want, r["result"]["content"][0]["text"])
+            self.assertNotIn("_meta", r["result"])
+            self.assertEqual((self.gw.reserved, self.gw.running), ({}, set()))
 
     def test_load_skips_bad_lines(self):
         self.start()
