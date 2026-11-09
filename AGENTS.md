@@ -25,7 +25,10 @@ is the long form.
   `office.py` is the Office view (`GET /v1/cortados/office`, metadata-only floors per routing session, fed by the
   `x-cortados-session/-project/-device/-task-title` headers, child-tasks.jsonl and `POST /v1/cortados/office/heartbeat`);
   `clients.py` holds the scoped per-client tokens (`clients.json`, hashes + named scopes; only `office:read` today; the
-  owner token is checked first and unchanged).
+  owner token is checked first and unchanged). `usage.py` builds `GET /v1/cortados/usage` and `tasks.py` builds
+  `GET /v1/cortados/tasks` (the latest 200 `routes` rows as metadata: model, band, S1 reason by category, elapsed, % routed
+  per session; never the request text; tokens are not recorded per route), both behind the owner token and both read by
+  `dashboard.html` (`GET /dashboard`).
 - `tables/` — routing table, budgets, generated model scores and tiers (`*.generated.json` are built
   nightly by `tables/benchmarks/build_tiers.py`; do not hand-edit them).
 - `s1/` — S1 scorer: dataset, labelling, SFT, evaluation, serving, nightly job.

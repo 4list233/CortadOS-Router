@@ -61,7 +61,7 @@ class OfficeHarness(EndpointHarness):
 
 
 class ScopeTests(OfficeHarness):
-    GETS = ["/health", "/", "/dashboard", "/v1/models", "/resources", "/v1/cortados/usage",
+    GETS = ["/health", "/", "/dashboard", "/v1/models", "/resources", "/v1/cortados/usage", "/v1/cortados/tasks",
             "/v1/cortados/runs/abcdefgh12", "/v1/cortados/office/heartbeat", "/v1/cortados/office/x", "/nope",
             "/v1/cortados/office?x=1/../usage"]
     POSTS = ["/v1/messages", "/v1/responses", "/v1/messages/count_tokens", "/bridge/call",

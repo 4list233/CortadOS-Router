@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -62,6 +63,12 @@ class DashboardTest(unittest.TestCase):
         self.assertNotIn(TOKEN, body)
         self.assertIsNone(re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", body))   # no IP addresses
         self.assertIn("/v1/cortados/usage", body)
+        self.assertIn("/v1/cortados/tasks", body)
+
+    def test_tasks_still_needs_auth(self):
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/v1/cortados/tasks", timeout=10)
+        self.assertEqual(cm.exception.code, 401)
 
     def test_page_source_is_safe(self):
         html = server._DASHBOARD_PATH.read_text()
@@ -131,11 +138,16 @@ class DashboardTest(unittest.TestCase):
 #   fetchthrow    a good render, then a poll whose fetch rejects
 #   storagethrow  sessionStorage throws on every call; the login form is submitted, then the poll answers the view
 #   storagelater  sessionStorage works at startup (token "tok"), then throws; the next poll still carries the token
+#   tasks500      the usage poll is good; the tasks poll on the same token answers 500
+# The tasks fetch (/v1/cortados/tasks, made after each good usage render) answers TASKS_VIEW from the environment (an
+# empty view when unset) and is not counted in POLLS, which counts usage polls only.
 # It prints every text node under main (marked [ERR] when its class carries err), then STATUS / BODY / STORAGE / LOGIN.
 _NODE_HARNESS = r"""
 const fs = require("fs");
 const [page, mode] = process.argv.slice(1);
 const view = JSON.parse(fs.readFileSync(0, "utf8"));
+const tasksView = process.env.TASKS_VIEW ? JSON.parse(process.env.TASKS_VIEW) : {tasks: [], sessions: [], errors: []};
+let tasksAuth = "", tasksPolls = 0;
 const html = fs.readFileSync(page, "utf8");
 const js = html.slice(html.indexOf("<script>") + 8, html.indexOf("</script>"));
 function mk(tag) { const n = { tag, kids: [], className: "", style: {}, hidden: false, textContent: "", value: "", on: {},
@@ -152,7 +164,11 @@ global.sessionStorage = { getItem: () => broken ? boom() : "tok", setItem: (k, v
 global.setInterval = () => 1; global.clearInterval = () => {};
 let auth = "", polls = 0;
 const ok = { status: 200, ok: true, json: async () => view };
-global.fetch = async (url, opts) => { auth = opts.headers.Authorization; polls++;
+global.fetch = async (url, opts) => {
+  if (url === "/v1/cortados/tasks") { tasksAuth = opts.headers.Authorization; tasksPolls++;
+    if (mode === "tasks500") return { status: 500, ok: false };
+    return { status: 200, ok: true, json: async () => tasksView }; }
+  auth = opts.headers.Authorization; polls++;
   if (polls > 1 && mode === "fetch500") return { status: 500, ok: false };
   if (polls > 1 && mode === "fetchthrow") throw new Error("network down");
   return ok; };
@@ -173,6 +189,7 @@ const tick = () => new Promise(r => setImmediate(r));
   console.log("BODY: " + document.body.className);
   console.log("STORAGE: " + (ids.storage.hidden ? "" : ids.storage.textContent));
   console.log("LOGIN: " + (ids.login.hidden ? "hidden" : "shown") + " AUTH: " + auth + " POLLS: " + polls);
+  console.log("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
 })().catch(e => { console.error(e); process.exit(1); });
 """
 
@@ -199,11 +216,54 @@ class DashboardRenderTest(unittest.TestCase):
         args.update(kw)
         return usage.collect(**args)
 
-    def run_page(self, view, mode="render"):
+    def run_page(self, view, mode="render", tasks_view=None):
+        env = dict(os.environ)
+        if tasks_view is not None:
+            env["TASKS_VIEW"] = json.dumps(tasks_view)
         r = subprocess.run(["node", "-e", _NODE_HARNESS, str(server._DASHBOARD_PATH), mode], input=json.dumps(view),
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
+
+    def tasks_fixture(self):
+        """A tasks view collected from a router.db built on core.DDL (tests/test_tasks.py's builders)."""
+        from tests import test_tasks as tt
+        d = tt.home(); self.addCleanup(shutil.rmtree, d, True)
+        tt.insert(d, turn_id="routed-1", session_id="session-aaaaaaaa-1111", ts=tt.NOW)
+        tt.insert(d, turn_id="routed-2", session_id="session-aaaaaaaa-1111", ts=tt.NOW - 1)
+        tt.pin(d, turn_id="pinned-1", session_id="session-aaaaaaaa-1111", ts=tt.NOW - 2)
+        tt.pin(d, turn_id="pinned-2", session_id="session-bbbbbbbb-2222", ts=tt.NOW - 3)
+        from cortados_router.provider import tasks
+        return tasks.collect(d)
+
+    def test_page_renders_tasks_after_the_usage_view(self):
+        tv = self.tasks_fixture()
+        out = self.run_page(self.view(), "refresh", tv)
+        self.assertNotIn("SECRET", json.dumps(tv))
+        self.assertIn("Tasks (recent routing decisions)", out)
+        self.assertIn("latest 4 of at most 200 logged decisions · routed 50% (2 routed, 2 pinned, 0 unselected)", out)
+        self.assertIn(tv["percentage_definition"], out)                          # the definition is stated on the page
+        self.assertIn("67%", out); self.assertIn("0%", out)                      # session a: 2 of 3 routed; session b: pinned only
+        self.assertIn("sessio…a-1111", out)                                      # ids are shortened, never dropped
+        self.assertIn("tokens: not recorded", out)
+        self.assertIn("claude-cli · sonnet", out); self.assertIn("anthropic/claude-sonnet", out); self.assertIn("1.2 s", out)
+        self.assertIn("S1 decision; band R1; steps=1", out); self.assertIn("client pin; S1 not asked; band pin", out)
+        self.assertNotIn("loading tasks", out)
+        self.assertNotIn("[object Object]", out)
+        self.assertIn("LOGIN: hidden AUTH: Bearer tok POLLS: 2", out)            # startup poll + the harness's refresh
+        self.assertIn("TASKS: AUTH: Bearer tok POLLS: 2", out)                   # same token, one tasks poll per usage poll
+
+    def test_tasks_errors_are_shown_in_their_section_only(self):
+        d = self.tmp()
+        from cortados_router.provider import tasks
+        out = self.run_page(self.view(), "refresh", tasks.collect(d))               # no router.db at all
+        self.assertIn("[ERR] router.db: absent", out)
+        self.assertIn("latest 0 of at most 200 logged decisions · routed –", out)
+        self.assertIn("Resources (% left)", out); self.assertNotIn("BODY: stale", out)   # the usage view is unaffected
+        out = self.run_page(self.view(), "tasks500")
+        self.assertIn("[ERR] tasks unavailable: error 500", out)
+        self.assertIn("Resources (% left)", out); self.assertNotIn("BODY: stale", out)
+        self.assertRegex(out, r"STATUS:  updated")                               # the header stays green: usage was good
 
     def test_page_reads_every_section(self):
         html = server._DASHBOARD_PATH.read_text()
