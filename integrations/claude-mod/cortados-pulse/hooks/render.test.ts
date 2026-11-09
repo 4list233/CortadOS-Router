@@ -35,6 +35,21 @@ test('the pane draws the lanes from /resources and never the token', { options: 
 })
 
 
+test('null subscription lanes do not break the pane render', { options: { providerUrl: 'http://air.example:8432', providerToken: TOKEN } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  on('ui.open', async () => ({ value: { isPlaced: true } }))
+  on('http.fetch', async () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify({
+    usage: {}, subscriptions: { codex: null }, readings: {}, devices: { status: 'pending', nodes: [] },
+  }) } }))
+  await $.command.run({ command: 'cortados-pulse', args: '' } as any)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: 'cortados-pulse', surface: 'terminal', component: 'Pane', requestId: 'cortados-pulse',
+    props: { title: 'CortadOS pulse', isFocused: false, bodyColumns: 80, placement: 'dock' } as any })
+  const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\\n')
+  expect(all).toMatch(/none cached/)
+  await ui.unmount()
+})
+
 test('response-derived errors and lane reasons are redacted in the mounted pane', { options: { providerUrl: 'http://air.example:8432', providerToken: TOKEN } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
   on('ui.open', async () => ({ value: { isPlaced: true } }))

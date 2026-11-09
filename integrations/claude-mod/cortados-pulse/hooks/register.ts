@@ -141,7 +141,7 @@ export async function poll($: Pick<EngineInterface, 'env' | 'fs' | 'http' | 'sta
 // ---- formatting (pure; tested) ----------------------------------------------------------------------------------
 
 export const gib = (b?: number | null): string => typeof b === 'number' ? (b / 2 ** 30).toFixed(1) + ' GiB' : '—'
-export const pct = (v?: number | null): string => typeof v === 'number' ? Math.round(v) + '%' : '—'
+export const pct = (v?: number | null): string => typeof v === 'number' && Number.isFinite(v) ? Math.round(v) + '%' : '—'
 
 export function age(seconds: number): string {
   if (!(seconds >= 0)) return '?'
@@ -153,8 +153,8 @@ export function age(seconds: number): string {
 /** The window's % left as the S1 quota door computes it (s1/outcome/provider.py _left): headroom_pct, else 100 -
  * used_pct, else unknown. */
 export function leftPct(w: { headroom_pct?: number | null; used_pct?: number | null }): number | null {
-  if (typeof w.headroom_pct === 'number') return w.headroom_pct
-  if (typeof w.used_pct === 'number') return 100 - w.used_pct
+  if (typeof w.headroom_pct === 'number' && Number.isFinite(w.headroom_pct)) return w.headroom_pct
+  if (typeof w.used_pct === 'number' && Number.isFinite(w.used_pct)) return 100 - w.used_pct
   return null
 }
 
@@ -167,8 +167,9 @@ export function laneLabel(lane: string, health: Pick<PulseReading, 'config_dir'>
 
 /** One lane as lines: the headline (quota state, scarcity, expiring credit), then each cached window's % left with
  * its separately metered pool. `nowS` is the pane's clock in seconds, for the reading's age. */
-export function laneLines(lane: string, health: PulseLaneHealth, reading: PulseReading | undefined, nowS: number): string[] {
+export function laneLines(lane: string, health: PulseLaneHealth | null | undefined, reading: PulseReading | undefined, nowS: number): string[] {
   const out: string[] = []
+  health ??= {}
   // The projection exposes local admission and its reason, not deployment counts. Never infer quota from admission.
   if (lane === 'local') return [`local: ${health.ok === false ? 'unavailable' : health.ok === true ? 'eligible' : 'unknown'}` +
     (health.why ? ` · ${health.why}` : '')]
@@ -265,7 +266,7 @@ export const register: Register = (on, options) => {
     const nowS = typeof s.generated_at === 'number' ? s.generated_at + (nowMs - h.at) / 1000 : nowMs / 1000
     const subs = s.subscriptions ?? {}
     const readings = s.readings ?? {}
-    const lanes = laneOrder(Object.keys(subs).filter(k => k !== 'error' && typeof subs[k] === 'object'))
+    const lanes = laneOrder(Object.keys(subs).filter(k => k !== 'error' && subs[k] !== null && typeof subs[k] === 'object'))
     const subsError = typeof subs.error === 'string' ? subs.error : null
     const readingsError = typeof readings.error === 'string' ? readings.error : null
     const rows = [
