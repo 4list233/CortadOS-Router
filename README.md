@@ -469,7 +469,8 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
 - Workspaces (`cortados_router/workspaces.py`; layout `~/CortadOS/README.md` on the Air): `repo` (a clone URL, or the
   name of a clone already under `<root>/repos/`) [+ `branch`] gives the task a git worktree at `<root>/active/<task_id>`:
   the host clones to `repos/<name>` if needed, fetches, and checks out `branch` (from `origin/<branch>` when it exists,
-  else a new branch from the default; refused while another task has it checked out) or, with no branch, a new
+  else a new branch from the default; refused while another task has it checked out, or while a `held/` worktree
+  holds it with unpushed work, the error naming that path) or, with no branch, a new
   `task/<task_id>` from the default branch, so parallel tasks never share a checkout. No repo and no cwd: a plain
   folder there. `cwd`: an existing directory ON THE HOST (not managed; a path that exists only on the requesting machine
   is refused saying so). The runner prepares the workspace before spawning (a clone can take minutes; start_task
@@ -477,7 +478,11 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). A plain folder containing a `.git` entry at any depth is conservatively moved
-  to `held/` too (symlinks are never followed). `task_status` shows `workspace` (kind, state, path, reason).
+  to `held/` too (symlinks are never followed). An archived worktree has its HEAD detached at the same commit so its
+  branch is free for the next task (a failed detach is recorded as `detach_error` and loses nothing); a held one keeps
+  its branch. An archive entry from before this that still holds the branch is detached when a new task asks for it,
+  only if its tree is clean and its HEAD is the fetched `origin/<branch>` tip; otherwise the start is refused.
+  `task_status` shows `workspace` (kind, state, path, reason).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
   entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an

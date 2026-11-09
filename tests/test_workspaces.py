@@ -287,6 +287,122 @@ class SettleTests(_Base):
             ws.update_index(self.root, {"state": "x"})
 
 
+class BranchReleaseTests(_Base):
+    """Issue #92: an archived worktree frees its branch; a held one keeps it; a legacy attached archive is freed only
+    when that provably loses nothing."""
+
+    def head(self, path):
+        return git("rev-parse", "HEAD", cwd=path).strip()
+
+    def attached(self, path):
+        return subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                              env=GIT_ENV).returncode == 0
+
+    def archive_feature(self, tid=TID):
+        rec = self.prepare(tid, repo=self.origin, branch="feature")
+        commit = self.head(rec["path"])
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "archived")
+        return settled, commit
+
+    def test_archive_detaches_at_same_commit_and_branch_is_reusable(self):
+        settled, commit = self.archive_feature()
+        self.assertTrue(settled.get("detached"))
+        self.assertNotIn("detach_error", settled)
+        self.assertFalse(self.attached(settled["path"]))
+        self.assertEqual(self.head(settled["path"]), commit)
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "f.txt")))
+        rec2 = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=rec2["path"]).strip(), "feature")
+        self.assertEqual(self.head(rec2["path"]), commit)
+        self.assertNotIn("freed_from_archive", rec2)
+
+    def test_held_worktree_keeps_branch_and_refusal_names_it(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with open(os.path.join(rec["path"], "wip.txt"), "w") as f:
+            f.write("unpushed\n")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertTrue(self.attached(settled["path"]))
+        self.assertNotIn("detached", settled)
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        msg = str(cm.exception)
+        self.assertIn("held worktree with unpushed work", msg)
+        self.assertIn(settled["path"], msg)
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "wip.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "active", TID2)))
+
+    def test_failed_detach_is_recorded_and_loses_nothing(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        commit = self.head(rec["path"])
+        gitdir = git("rev-parse", "--absolute-git-dir", cwd=rec["path"]).strip()
+        lock = os.path.join(gitdir, "HEAD.lock")              # makes git refuse to rewrite HEAD
+        open(lock, "w").close()
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "archived")
+        self.assertEqual(settled["path"], os.path.join(self.root, "archive", TID))
+        self.assertIn("could not detach HEAD", settled["detach_error"])
+        self.assertNotIn("detached", settled)
+        self.assertTrue(self.attached(settled["path"]))
+        self.assertEqual(self.head(settled["path"]), commit)
+        ws.update_index(self.root, settled)
+        self.assertIn("detach_error", ws.read_index(self.root)[TID])
+        # still locked: the start-time release fails too, and the refusal says why
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("was not detached", str(cm.exception))
+        os.unlink(lock)
+        rec2 = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(rec2["freed_from_archive"], settled["path"])
+
+    def legacy(self):
+        """An archive entry from before #92: settled, then re-attached to its branch."""
+        settled, commit = self.archive_feature()
+        git("checkout", "-q", "feature", cwd=settled["path"])
+        self.assertTrue(self.attached(settled["path"]))
+        return settled["path"], commit
+
+    def test_legacy_clean_archive_at_remote_tip_is_detached_on_start(self):
+        path, commit = self.legacy()
+        rec2 = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(rec2["freed_from_archive"], path)
+        self.assertFalse(self.attached(path))
+        self.assertEqual(self.head(path), commit)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=rec2["path"]).strip(), "feature")
+
+    def test_legacy_dirty_archive_is_refused_and_untouched(self):
+        path, _ = self.legacy()
+        with open(os.path.join(path, "late.txt"), "w") as f:
+            f.write("late\n")
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("checked out by another worktree", str(cm.exception))
+        self.assertIn("untracked", str(cm.exception))
+        self.assertTrue(self.attached(path))
+        self.assertTrue(os.path.exists(os.path.join(path, "late.txt")))
+
+    def test_legacy_archive_ahead_of_remote_is_refused_and_untouched(self):
+        path, commit = self.legacy()
+        with open(os.path.join(path, "local.txt"), "w") as f:
+            f.write("local\n")
+        git("add", ".", cwd=path)
+        git("commit", "-q", "-m", "local only", cwd=path)
+        ahead = self.head(path)
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("is not the tip of origin/feature", str(cm.exception))
+        self.assertTrue(self.attached(path))
+        self.assertEqual(self.head(path), ahead)
+
+    def test_active_worktree_keeps_original_refusal(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare(TID2, repo="demo", branch="feature")
+        self.assertIn("wait for that task", str(cm.exception))
+        self.assertTrue(self.attached(rec["path"]))
+
+
 class CleanupTests(_Base):
     def archived(self, tid, age_s, kind="folder"):
         """An archive/<tid> entry with an index record settled age_s ago."""

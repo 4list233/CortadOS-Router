@@ -2,8 +2,10 @@
 
   <root>/repos/<name>      one clone per repository; every task worktree branches from it
   <root>/active/<task_id>  the task's working folder while it runs: a git worktree, or a plain folder (no repo)
-  <root>/archive/<task_id> finished and pushed (or no repository): deleted by cleanup_archive() after ARCHIVE_AGE_S
-  <root>/held/<task_id>    finished with unpushed work: never deleted automatically, listed for the owner
+  <root>/archive/<task_id> finished and pushed (or no repository): HEAD detached at its commit so the branch is free
+                           for the next task; deleted by cleanup_archive() after ARCHIVE_AGE_S
+  <root>/held/<task_id>    finished with unpushed work: keeps its branch checked out (a new task on that branch is
+                           refused); never deleted automatically, listed for the owner
   <root>/index.jsonl       one line per task (rewritten in place under index.lock, never appended twice for a task)
 
 Only archive/ is ever deleted from, only entries named like a task id, only regular directories directly inside it
@@ -165,12 +167,23 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
     if not _ref_exists(repo_dir, "refs/remotes/origin/HEAD"):
         _git(["remote", "set-head", "origin", "--auto"], cwd=repo_dir, timeout=FETCH_TIMEOUT_S)
     taken = _worktree_branches(repo_dir)
+    if branch is not None and branch in taken:
+        holder = taken[branch]
+        where = _settled_under(holder, root)
+        if where == "held":
+            raise WorkspaceError(f"branch {branch!r} is checked out by a held worktree with unpushed work ({holder}); "
+                                 "publish or recover that work there first, or name another branch")
+        if where != "archive":
+            raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({holder}); wait for that "
+                                 "task or name another branch")
+        why = _free_archived_branch(holder, branch)
+        if why:
+            raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({holder}); it is under "
+                                 f"archive/ but was not detached: {why}")
+        rec["freed_from_archive"] = holder
     if branch is None:
         branch = TASK_BRANCH_PREFIX + tid
         _git(["worktree", "add", "-b", branch, "--", path, "origin/HEAD"], cwd=repo_dir)
-    elif branch in taken:
-        raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({taken[branch]}); wait for that "
-                             "task or name another branch")
     elif _ref_exists(repo_dir, "refs/heads/" + branch):
         if _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
             counts = _git(["rev-list", "--left-right", "--count",
@@ -193,6 +206,59 @@ def _prepare_repo_locked(rec, tid, path, repo_dir, name, url, branch, root):
     rec.update(repo=name, url=url or _git(["remote", "get-url", "origin"], cwd=repo_dir).strip(),
                repo_dir=repo_dir, branch=branch)
     return rec
+
+
+def _settled_under(path: str, root: str):
+    """'archive' or 'held' when path is a direct entry of <root>/archive or <root>/held, else None."""
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    for sub in ("archive", "held"):
+        if parent == os.path.realpath(os.path.join(root, sub)):
+            return sub
+    return None
+
+
+def _detach_head(path: str):
+    """Detach the worktree's HEAD at the commit it is on, so its branch is free for another worktree. Touches no file
+    and no ref but HEAD. Returns None on success (or when already detached), else the reason it did not happen."""
+    try:
+        head = _git(["rev-parse", "--verify", "HEAD"], cwd=path).strip()
+        _git(["checkout", "--quiet", "--detach"], cwd=path)
+        after = _git(["rev-parse", "--verify", "HEAD"], cwd=path).strip()
+        attached = subprocess.run([GIT, "symbolic-ref", "--quiet", "HEAD"], cwd=path, capture_output=True,
+                                  text=True, timeout=GIT_TIMEOUT_S,
+                                  env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    except (WorkspaceError, OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not detach HEAD: {exc}"
+    if after != head:
+        return f"HEAD moved from {head} to {after} while detaching"
+    if attached:
+        return "HEAD is still on a branch after detaching"
+    return None
+
+
+def _free_archived_branch(path: str, branch: str):
+    """A worktree archived before settle() detached HEAD may still hold `branch`. Detach it only when that cannot lose
+    anything: its tree is clean (no untracked, ignored or hidden-modified file) and its HEAD is exactly the fetched
+    origin/<branch>. Returns None once detached, else why it was left alone."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return "the archived worktree is missing or not a directory"
+    try:
+        if _git(["symbolic-ref", "--quiet", "HEAD"], cwd=path).strip() != "refs/heads/" + branch:
+            return f"its HEAD is not on {branch!r}"
+        head = _git(["rev-parse", "--verify", "HEAD"], cwd=path).strip()
+        if not _ref_exists(path, "refs/remotes/origin/" + branch):
+            return f"origin/{branch} does not exist, so its commits are not proven published"
+        tip = _git(["rev-parse", "--verify", "refs/remotes/origin/" + branch], cwd=path).strip()
+        if head != tip:
+            return f"its HEAD {head[:12]} is not the tip of origin/{branch} ({tip[:12]})"
+        flagged = _git(["ls-files", "-v"], cwd=path)
+        if any(line and (line[0].islower() or line[0] == "S") for line in flagged.splitlines()):
+            return "it has files hidden by assume-unchanged or skip-worktree"
+        if _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path).strip():
+            return "it has uncommitted, untracked or ignored files"
+    except WorkspaceError as exc:
+        return f"could not assess it: {exc}"
+    return _detach_head(path)
 
 
 def pushed(path: str):
@@ -259,6 +325,15 @@ def settle(rec: dict, root: str) -> dict:
         rec["error"] = f"could not move {path} to {dest}: {exc}"
         return rec
     rec.update(state="archived" if ok else "held", path=dest, settled_at=time.time(), reason=reason)
+    if ok and rec.get("kind") == "repo":
+        # Pushed work: free the branch for the next task (the commit stays checked out, detached). Held work keeps
+        # its branch, so a new task cannot start on it while it is unpushed. A failed detach loses nothing: the
+        # worktree stays archived and attached, and the reason is recorded here and in index.jsonl.
+        why = _detach_head(dest)
+        if why:
+            rec["detach_error"] = why
+        else:
+            rec["detached"] = True
     return rec
 
 
