@@ -18,7 +18,7 @@ import fcntl
 import json
 import os
 import re
-import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -159,12 +159,23 @@ def prepare(spec: dict, root: str) -> dict:
     elif branch in taken:
         raise WorkspaceError(f"branch {branch!r} is checked out by another worktree ({taken[branch]}); wait for that "
                              "task or name another branch")
-    elif _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
-        # The branch as it is on origin: a stale local branch of the same name (left by an archived, i.e. fully
-        # pushed, task) is reset to it; -B never drops anything that is not already on the remote.
-        _git(["worktree", "add", "-B", branch, "--", path, "origin/" + branch], cwd=repo_dir)
     elif _ref_exists(repo_dir, "refs/heads/" + branch):
-        _git(["worktree", "add", "--", path, branch], cwd=repo_dir)       # local-only branch: keep its commits
+        if _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
+            counts = _git(["rev-list", "--left-right", "--count",
+                           branch + "...origin/" + branch], cwd=repo_dir).split()
+            if len(counts) != 2:
+                raise WorkspaceError(f"could not compare local branch {branch!r} with origin/{branch}")
+            local_only, remote_only = map(int, counts)
+            if local_only and remote_only:
+                raise WorkspaceError(f"local branch {branch!r} has diverged from origin/{branch}; refusing to reset "
+                                     "or discard either history")
+            if not local_only and remote_only:
+                _git(["branch", "-f", branch, "origin/" + branch], cwd=repo_dir)
+        # A local branch is owner work even when a remote branch has the same name. Check it out unchanged; never use
+        # `-B`, because resetting to the remote can discard commits that have not been published.
+        _git(["worktree", "add", "--", path, branch], cwd=repo_dir)
+    elif _ref_exists(repo_dir, "refs/remotes/origin/" + branch):
+        _git(["worktree", "add", "-b", branch, "--", path, "origin/" + branch], cwd=repo_dir)
     else:
         _git(["worktree", "add", "-b", branch, "--", path, "origin/HEAD"], cwd=repo_dir)   # a new branch
     rec.update(repo=name, url=url or _git(["remote", "get-url", "origin"], cwd=repo_dir).strip(),
@@ -173,13 +184,31 @@ def prepare(spec: dict, root: str) -> dict:
 
 
 def pushed(path: str):
-    """(True, "pushed") when the worktree holds no uncommitted or untracked change and every commit reachable from
-    HEAD is on some remote ref; otherwise (False, why). A git failure is (False, why): work we cannot assess is held."""
+    """(True, "pushed") only after fresh remote refs prove every byte and commit is published.
+
+    Any git or fetch failure is uncertainty, so the caller holds the workspace rather than risking owner data.
+    """
     try:
-        dirty = _git(["status", "--porcelain", "--untracked-files=all"], cwd=path)
+        remotes = _git(["remote"], cwd=path).split()
+        if not remotes:
+            return False, "could not assess the worktree: it has no remote"
+        for remote in remotes:
+            # An explicit all-heads refspec also prunes stale refs excluded by a locally narrowed fetch refspec.
+            _git(["fetch", "--prune", remote,
+                  f"+refs/heads/*:refs/remotes/{remote}/*"], cwd=path, timeout=FETCH_TIMEOUT_S)
+        submodules = _git(["ls-files", "--stage"], cwd=path)
+        if any(line.startswith("160000 ") for line in submodules.splitlines()):
+            return False, "submodule content cannot be proven published; holding the workspace"
+        # Ignored content is owner data too. No cache (including __pycache__ or node_modules) is exempt: generated and
+        # unpublished content cannot be distinguished safely here, and holding is the required conservative default.
+        flagged = _git(["ls-files", "-v"], cwd=path)
+        hidden = [line for line in flagged.splitlines() if line and (line[0].islower() or line[0] == "S")]
+        if hidden:
+            return False, f"{len(hidden)} tracked file(s) hidden by assume-unchanged or skip-worktree"
+        dirty = _git(["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd=path)
         if dirty.strip():
             n = len(dirty.splitlines())
-            return False, f"{n} uncommitted or untracked file(s)"
+            return False, f"{n} uncommitted or untracked file(s), including ignored content"
         ahead = _git(["rev-list", "HEAD", "--not", "--remotes"], cwd=path)
         if ahead.strip():
             return False, f"{len(ahead.split())} commit(s) not on any remote"
@@ -270,67 +299,153 @@ def update_index(root: str, rec: dict) -> None:
 
 # --- cleanup: archive/ only -------------------------------------------------------------------------------------
 
-def cleanup_archive(root: str, now=None, max_deletions=None) -> dict:
-    """Delete archive/<task_id> entries whose index record says `archived` more than ARCHIVE_AGE_S ago. Everything
-    else is refused and listed: a name that is not a task id, a symlink (never followed, never removed), a non-
-    directory, an entry outside the real archive directory, an entry without an archive record (we do not delete what
-    we did not archive), or one still within the week. held/, repos/, services/ are never visited. `max_deletions`
-    bounds one call (start_task runs this opportunistically and must answer quickly; the daily job passes None)."""
-    now = time.time() if now is None else now
-    archive = os.path.join(root, "archive")
-    out = {"deleted": [], "kept": 0, "refused": [], "errors": []}
-    if os.path.islink(archive) or not os.path.isdir(archive):
-        out["errors"].append(f"{archive} is not a real directory; nothing deleted")
-        return out
-    real_archive = os.path.realpath(archive)
-    index = read_index(root)
-    for name in sorted(os.listdir(archive)):
-        p = os.path.join(archive, name)
-        if not TASK_ID_RE.fullmatch(name):
-            out["refused"].append(f"{name}: not a task id")
-            continue
-        if os.path.islink(p):
-            out["refused"].append(f"{name}: symlink")
-            continue
-        if not os.path.isdir(p):
-            out["refused"].append(f"{name}: not a directory")
-            continue
-        if os.path.dirname(os.path.realpath(p)) != real_archive:
-            out["refused"].append(f"{name}: resolves outside archive/")
-            continue
-        rec = index.get(name)
-        if not isinstance(rec, dict) or rec.get("state") != "archived" or not isinstance(rec.get("settled_at"), (int, float)):
-            out["refused"].append(f"{name}: no archive record in index.jsonl")
-            continue
-        if now - rec["settled_at"] < ARCHIVE_AGE_S:
-            out["kept"] += 1
-            continue
-        if max_deletions is not None and len(out["deleted"]) >= max_deletions:
-            out["kept"] += 1
-            continue
-        try:
-            _delete_entry(p, rec)
-        except (OSError, WorkspaceError) as exc:
-            out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
-            continue
-        update_index(root, {**rec, "state": "deleted", "deleted_at": now})
-        out["deleted"].append(name)
-    return out
+def _open_dir(path: str, *, dir_fd=None) -> int:
+    """Open a real directory without following its final component."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags, dir_fd=dir_fd)
 
 
-def _delete_entry(p: str, rec: dict) -> None:
+def _same_entry(fd: int, path: str) -> bool:
+    """Whether path still names the directory held by fd (all ancestors included)."""
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    opened = os.fstat(fd)
+    return (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _remove_tree_fd(directory_fd: int) -> None:
+    """Remove a directory's contents relative to an already verified descriptor, never through a symlink."""
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_dir(name, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise WorkspaceError(f"directory entry {name!r} changed while opening it")
+                _remove_tree_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _prune_worktrees(rec: dict) -> None:
     repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
         try:
-            _git(["worktree", "remove", "--force", "--", p], cwd=repo_dir)   # the folder and the clone's record of it
+            _git(["worktree", "prune", "--expire", "now"], cwd=repo_dir)
         except WorkspaceError:
-            pass                                    # fall through: remove the folder, then prune the clone's records
-    if os.path.lexists(p):
-        if os.path.islink(p):
-            raise WorkspaceError("became a symlink; refusing")
-        shutil.rmtree(p)
+            pass  # The data operation is complete; stale administrative metadata is safe and can be pruned later.
+
+
+def _hold_changed_archive(root: str, archive_fd: int, name: str, rec: dict, reason: str, now: float) -> dict:
+    """Move a newly changed archived worktree to held/ using anchored source and destination descriptors."""
+    held_path = os.path.join(root, "held", name)
+    held_fd = _open_dir(os.path.join(root, "held"))
+    try:
+        try:
+            os.stat(name, dir_fd=held_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkspaceError(f"held/{name} already exists; archived workspace was not deleted")
+        os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=held_fd)
+    finally:
+        os.close(held_fd)
+    updated = {**rec, "state": "held", "path": held_path, "settled_at": now, "reason": reason}
+    update_index(root, updated)
+    repo_dir = rec.get("repo_dir")
     if rec.get("kind") == "repo" and isinstance(repo_dir, str) and os.path.isdir(repo_dir):
         try:
-            _git(["worktree", "prune"], cwd=repo_dir)
+            _git(["worktree", "repair", held_path], cwd=repo_dir)
         except WorkspaceError:
-            pass                                    # the folder is gone; a stale record in the clone is harmless
+            pass  # The workspace is safely held; repair is administrative and must not put data back at risk.
+    return updated
+
+
+def cleanup_archive(root: str, now=None, max_deletions=None) -> dict:
+    """Serialize reassessment through deletion so a concurrent cleanup cannot move an entry being deleted."""
+    lock = os.open(os.path.join(root, "cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _cleanup_archive_locked(root, now=now, max_deletions=max_deletions)
+    finally:
+        os.close(lock)
+
+
+def _cleanup_archive_locked(root: str, now=None, max_deletions=None) -> dict:
+    """Delete old recorded archive entries through no-follow directory descriptors.
+
+    Repository worktrees are reassessed immediately before deletion. Any change, stale remote, or assessment failure
+    moves the workspace to held/. held/, repos/, services/, and a replacement archive ancestor are never traversed.
+    """
+    now = time.time() if now is None else now
+    archive = os.path.join(root, "archive")
+    out = {"deleted": [], "kept": 0, "refused": [], "errors": []}
+    try:
+        archive_fd = _open_dir(archive)
+    except OSError as exc:
+        out["errors"].append(f"{archive} is not a real directory; nothing deleted ({exc})")
+        return out
+    try:
+        index = read_index(root)
+        for name in sorted(os.listdir(archive_fd)):
+            if not TASK_ID_RE.fullmatch(name):
+                out["refused"].append(f"{name}: not a task id")
+                continue
+            try:
+                info = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+            except OSError as exc:
+                out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                out["refused"].append(f"{name}: symlink")
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                out["refused"].append(f"{name}: not a directory")
+                continue
+            rec = index.get(name)
+            if not isinstance(rec, dict) or rec.get("state") != "archived" \
+                    or not isinstance(rec.get("settled_at"), (int, float)):
+                out["refused"].append(f"{name}: no archive record in index.jsonl")
+                continue
+            if now - rec["settled_at"] < ARCHIVE_AGE_S:
+                out["kept"] += 1
+                continue
+            if max_deletions is not None and len(out["deleted"]) >= max_deletions:
+                out["kept"] += 1
+                continue
+            entry_fd = None
+            try:
+                entry_fd = _open_dir(name, dir_fd=archive_fd)
+                path = os.path.join(archive, name)
+                if not _same_entry(entry_fd, path):
+                    raise WorkspaceError("archive path changed after it was opened; refusing deletion")
+                if rec.get("kind") == "repo":
+                    ok, reason = pushed(path)
+                    if not _same_entry(entry_fd, path):
+                        raise WorkspaceError("archive path changed during reassessment; refusing deletion")
+                    if not ok:
+                        _hold_changed_archive(root, archive_fd, name, rec, reason, now)
+                        out["kept"] += 1
+                        continue
+                _remove_tree_fd(entry_fd)
+                os.close(entry_fd)
+                entry_fd = None
+                os.rmdir(name, dir_fd=archive_fd)
+                _prune_worktrees(rec)
+            except (OSError, WorkspaceError) as exc:
+                out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            finally:
+                if entry_fd is not None:
+                    os.close(entry_fd)
+            update_index(root, {**rec, "state": "deleted", "deleted_at": now})
+            out["deleted"].append(name)
+    finally:
+        os.close(archive_fd)
+    return out

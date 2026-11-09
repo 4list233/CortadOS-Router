@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,7 @@ def git(*args, cwd=None):
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.root = os.path.join(self.tmp, "CortadOS")
         os.mkdir(self.root)
         self.origin = os.path.join(self.tmp, "origin", "demo.git")
@@ -123,6 +125,32 @@ class PrepareTests(_Base):
         self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=rec2["path"]).strip(), "brand-new")
         self.assertFalse(os.path.exists(os.path.join(rec2["path"], "f.txt")))
 
+    def test_existing_local_branch_is_preserved_and_divergence_is_refused(self):
+        first = self.prepare(repo=self.origin, branch="feature")
+        with open(os.path.join(first["path"], "local.txt"), "w") as f:
+            f.write("unpublished\n")
+        git("add", ".", cwd=first["path"])
+        git("commit", "-q", "-m", "local only", cwd=first["path"])
+        local_head = git("rev-parse", "HEAD", cwd=first["path"]).strip()
+        git("worktree", "remove", "--force", first["path"], cwd=first["repo_dir"])
+
+        preserved = self.prepare(TID2, repo="demo", branch="feature")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=preserved["path"]).strip(), local_head)
+        self.assertTrue(os.path.exists(os.path.join(preserved["path"], "local.txt")))
+        git("worktree", "remove", "--force", preserved["path"], cwd=preserved["repo_dir"])
+
+        seed = os.path.join(self.tmp, "remote-change")
+        git("clone", "-q", self.origin, seed)
+        git("checkout", "-q", "feature", cwd=seed)
+        with open(os.path.join(seed, "remote.txt"), "w") as f:
+            f.write("remote\n")
+        git("add", ".", cwd=seed)
+        git("commit", "-q", "-m", "remote only", cwd=seed)
+        git("push", "-q", "origin", "feature", cwd=seed)
+        with self.assertRaises(ws.WorkspaceError) as cm:
+            self.prepare("t20261108120200-0000000c", repo="demo", branch="feature")
+        self.assertIn("diverged", str(cm.exception))
+
     def test_name_without_clone_and_url_mismatch_are_refused(self):
         with self.assertRaises(ws.WorkspaceError) as cm:
             self.prepare(repo="demo")
@@ -176,6 +204,35 @@ class SettleTests(_Base):
         shutil.rmtree(settled["path"])
         gone = ws.settle({**rec}, self.root)
         self.assertEqual(gone["state"], "missing")
+
+    def test_ignored_files_are_unpublished_work(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        with open(os.path.join(rec["path"], ".gitignore"), "w") as f:
+            f.write("private.dat\n")
+        git("add", ".gitignore", cwd=rec["path"])
+        git("commit", "-q", "-m", "ignore private data", cwd=rec["path"])
+        git("push", "-q", "origin", "feature", cwd=rec["path"])
+        with open(os.path.join(rec["path"], "private.dat"), "w") as f:
+            f.write("must survive\n")
+        settled = ws.settle(rec, self.root)
+        self.assertEqual(settled["state"], "held")
+        self.assertTrue(os.path.exists(os.path.join(settled["path"], "private.dat")))
+
+    def test_skip_worktree_cannot_hide_unpublished_bytes(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("update-index", "--skip-worktree", "f.txt", cwd=rec["path"])
+        with open(os.path.join(rec["path"], "f.txt"), "w") as f:
+            f.write("private replacement\n")
+        ok, why = ws.pushed(rec["path"])
+        self.assertFalse(ok)
+        self.assertIn("skip-worktree", why)
+
+    def test_deleted_remote_branch_is_not_proof_of_publication(self):
+        rec = self.prepare(repo=self.origin, branch="feature")
+        git("update-ref", "-d", "refs/heads/feature", cwd=self.origin)
+        ok, why = ws.pushed(rec["path"])
+        self.assertFalse(ok)
+        self.assertIn("not on any remote", why)
 
     def test_index_has_one_line_per_task(self):
         rec = self.prepare()
@@ -262,6 +319,57 @@ class CleanupTests(_Base):
         report = ws.cleanup_archive(self.root)
         self.assertEqual(report["deleted"], [])
         self.assertTrue(report["errors"])
+
+    def test_changed_archived_worktree_is_moved_to_held_before_cleanup(self):
+        path = self.archived(TID, ws.ARCHIVE_AGE_S + 60, kind="repo")
+        with open(os.path.join(path, "late.txt"), "w") as f:
+            f.write("created after archival\n")
+        report = ws.cleanup_archive(self.root)
+        held = os.path.join(self.root, "held", TID)
+        self.assertEqual(report["deleted"], [])
+        self.assertTrue(os.path.exists(os.path.join(held, "late.txt")))
+        self.assertEqual(ws.read_index(self.root)[TID]["state"], "held")
+
+    def test_archive_ancestor_swap_cannot_delete_held_workspace(self):
+        archived = self.archived(TID, ws.ARCHIVE_AGE_S + 60)
+        held = os.path.join(self.root, "held", TID)
+        shutil.copytree(archived, held)
+        replacement = os.path.join(self.tmp, "original-archive")
+        archive = os.path.join(self.root, "archive")
+        real_islink = os.path.islink
+        real_stat = os.stat
+        entry_checks = 0
+        swapped = False
+
+        def swap_archive():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                os.rename(archive, replacement)
+                os.symlink(os.path.join(self.root, "held"), archive)
+
+        def islink_then_swap(target):
+            nonlocal entry_checks
+            result = real_islink(target)
+            if target == archived:
+                entry_checks += 1
+                if entry_checks == 2:  # old implementation: after validation, immediately before rmtree
+                    swap_archive()
+            return result
+
+        def stat_then_swap(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if target == archived and kwargs.get("follow_symlinks") is False:
+                swap_archive()  # descriptor implementation: after opening the entry, at its identity check
+            return result
+
+        with mock.patch.object(ws.os.path, "islink", side_effect=islink_then_swap), \
+                mock.patch.object(ws.os, "stat", side_effect=stat_then_swap):
+            report = ws.cleanup_archive(self.root)
+        self.assertTrue(swapped)
+        self.assertEqual(report["deleted"], [TID])
+        self.assertTrue(os.path.isdir(held))
+        self.assertFalse(os.path.islink(held))
 
     def test_record_without_settled_time_or_wrong_state_is_kept(self):
         path = self.archived(TID, ws.ARCHIVE_AGE_S + 60)
