@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily cleanup of finished, PUSHED task workspaces on an execution host (owner decision 2026-11-08, #86):
+  deletes <root>/archive/<task_id> entries archived more than 7 days ago, and nothing else (never held/, repos/,
+  services/, symlinks or unrecorded folders: cortados_router/workspaces.py cleanup_archive).
+  Install on the Air (edit the paths if the checkout or user differ):
+    cp integrations/launchd/com.cortados.archive-cleanup.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cortados.archive-cleanup.plist
+  Run once by hand: /usr/bin/python3 -B ~/cortados-router/cortados_router/child_tasks.py - -cleanup-archive
+  (the root comes from the entry naming this machine in ~/.config/cortados/exec-hosts.json; or pass - -root <dir>).
+  start_task also runs the same cleanup opportunistically (at most 3 deletions per call), so a missed day is caught up.
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cortados.archive-cleanup</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string><string>-B</string>
+    <string>/Users/4list/cortados-router/cortados_router/child_tasks.py</string>
+    <string>--cleanup-archive</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/4list/cortados-router</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/4list</string>
+  </dict>
+  <key>StartCalendarInterval</key><dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/4list/.cortados/archive-cleanup.out</string>
+  <key>StandardErrorPath</key><string>/Users/4list/.cortados/archive-cleanup.out</string>
+</dict></plist>

@@ -1,8 +1,10 @@
 """Child tasks (start_task & co. on the cortados-route MCP server) against a FAKE claude binary: no real claude runs,
 no provider is contacted, and all state lives in a throwaway tasks dir."""
+import glob
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -11,6 +13,7 @@ import signal
 import time
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 from cortados_router import child_tasks as ct
@@ -256,8 +259,16 @@ class ChildTaskTests(unittest.TestCase):
         tok = os.path.join(self.tmp, "token")
         with open(tok, "w") as f:
             f.write("tok-test-000000001")
+        # Execution hosts: "here" is this machine (no ssh), with a workspace root in the temp dir. Tests that need a
+        # remote host add an entry and replace exec_hosts.TRANSPORT (never ssh).
+        self.ws_root = os.path.join(self.tmp, "CortadOS")
+        os.mkdir(self.ws_root)
+        self.hosts_file = os.path.join(self.tmp, "exec-hosts.json")
+        self.write_hosts({"default": "here", "hosts": {"here": {"root": self.ws_root}}})
         self.env = mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": os.path.join(self.tmp, "tasks"),
                                                 "CORTADOS_CHILD_CLAUDE_BIN": bin_, "FAKE_CLAUDE_MODE": "ok",
+                                                "CORTADOS_EXEC_HOSTS_FILE": self.hosts_file,
+                                                "CORTADOS_EXEC_HOST": "",
                                                 "CLAUDECODE": "1",
                                                 "CORTADOS_CONNECTORS_MCP_CONFIG": os.path.join(self.tmp, "no-conn.json"),
                                                 "HOME": self.tmp,
@@ -305,6 +316,10 @@ class ChildTaskTests(unittest.TestCase):
                     pass
                 proc.wait()
         ct._REAP.clear()
+
+    def write_hosts(self, cfg):
+        with open(self.hosts_file, "w") as f:
+            json.dump(cfg, f)
 
     def call(self, name, **args):
         r = m.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}},
@@ -508,23 +523,463 @@ class ChildTaskTests(unittest.TestCase):
         self.assertNotIn(old, names)
         self.assertIn(live, names)
 
-    def test_chrome_opt_in_and_parallel(self):
+    def test_chrome_opt_in_and_queue(self):
+        """Two chrome tasks: both accepted (no cap on their number), but Chrome serves one client at a time, so the
+        second waits for the host's Chrome lock (phase 'queued') until the first ends, then runs (owner, #89)."""
         os.environ["FAKE_CLAUDE_MODE"] = "sleep"
         tid = self.start(chrome=True)
-        tid2 = self.start(chrome=True)                        # two chrome tasks run together: no concurrency limit
+        self.assertTrue(_wait_file(os.path.join(self.work, "fake-argv.json")))   # the first holds Chrome
+        tid2 = self.start(chrome=True)
+        self.assertTrue(_wait_file(os.path.join(ct.task_path(tid2), ct.QUEUED_MARKER)))
         for t in (tid, tid2):
             meta = _load(os.path.join(ct.task_path(t), "meta.json"))
             self.assertTrue(meta["chrome"])
             self.assertIn("--chrome", meta["argv"])
             _, st = self.call("task_status", task_id=t)
             self.assertEqual(st["state"], "running")
-        other = self.start()
+        _, st2 = self.call("task_status", task_id=tid2)
+        self.assertIn("queued", st2["phase"])
+        _, st1 = self.call("task_status", task_id=tid)
+        self.assertNotIn("phase", st1)
+        other = self.start()                                  # a routed child does not queue behind Chrome
         self.assertNotIn("--chrome", _load(os.path.join(ct.task_path(other), "meta.json"))["argv"])
         r, _ = self.call("start_task", task="x", cwd=self.work, chrome="yes")
         self.assertIn("chrome must be true or false", r["content"][0]["text"])
-        for t in (tid, tid2, other):
+        # the first ends: the second leaves the queue and spawns its child
+        os.unlink(os.path.join(self.work, "fake-argv.json"))
+        self.call("cancel_task", task_id=tid)
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "cancelled")
+        self.assertTrue(_wait_file(os.path.join(self.work, "fake-argv.json")), "the queued chrome task did not start")
+        self.assertFalse(os.path.exists(os.path.join(ct.task_path(tid2), ct.QUEUED_MARKER)))
+        for t in (tid2, other):
             self.call("cancel_task", task_id=t)
             self.call("wait_task", task_id=t, timeout_s=30)
+
+    def test_a_queued_chrome_task_can_be_cancelled(self):
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        tid = self.start(chrome=True)
+        self.assertTrue(_wait_file(os.path.join(self.work, "fake-argv.json")))
+        tid2 = self.start(chrome=True)
+        self.assertTrue(_wait_file(os.path.join(ct.task_path(tid2), ct.QUEUED_MARKER)))
+        self.call("cancel_task", task_id=tid2)
+        _, w = self.call("wait_task", task_id=tid2, timeout_s=30)
+        self.assertEqual(w["state"], "cancelled")
+        self.assertIn("before the child was started", w["error"])
+        self.call("cancel_task", task_id=tid)
+        self.call("wait_task", task_id=tid, timeout_s=30)
+
+    # --- execution host, workspaces, launchd (2026-11-08) ---------------------------------------------------------
+
+    def test_tools_list_schema_names_repo_branch_host_and_makes_cwd_optional(self):
+        r = m.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.cfg)
+        st = [t for t in r["result"]["tools"] if t["name"] == "start_task"][0]
+        self.assertEqual(st["inputSchema"]["required"], ["task"])
+        for k in ("repo", "branch", "cwd", "host"):
+            self.assertIn(k, st["inputSchema"]["properties"])
+        self.assertIn("exists only on the requesting machine is refused", st["inputSchema"]["properties"]["cwd"]["description"])
+        self.assertIn("EXECUTION HOST", st["description"])
+
+    def test_no_hosts_config_refuses_clearly_and_runs_nothing(self):
+        os.unlink(self.hosts_file)
+        r, _ = self.call("start_task", task="x", cwd=self.work)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("no execution hosts are configured", r["content"][0]["text"])
+        self.assertIn(self.hosts_file, r["content"][0]["text"])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+
+    def test_no_cwd_gets_a_plain_folder_that_is_archived_when_done(self):
+        r, out = self.call("start_task", task="hello")
+        self.assertFalse(r.get("isError"), r)
+        self.assertEqual(out["host"], "here")
+        self.assertEqual(out["workspace"]["kind"], "folder")
+        active = os.path.join(self.ws_root, "active", out["task_id"])
+        self.assertEqual(out["workspace"]["path"], active)
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["result"], "done: hello")
+        archived = os.path.join(self.ws_root, "archive", out["task_id"])
+        self.assertEqual(w["workspace"]["state"], "archived")
+        self.assertEqual(w["workspace"]["path"], archived)
+        self.assertEqual(w["cwd"], active)                         # where the child ran
+        self.assertTrue(os.path.exists(os.path.join(archived, "fake-argv.json")))   # the child's cwd was the folder
+        self.assertFalse(os.path.exists(active))
+        with open(os.path.join(self.ws_root, "index.jsonl")) as f:
+            lines = [json.loads(x) for x in f]
+        self.assertEqual([(x["task_id"], x["state"]) for x in lines], [(out["task_id"], "archived")])
+        self.assertEqual(_events()[-1]["cwd"], active)
+        _, rows = self.call("list_tasks")
+        self.assertEqual(rows["tasks"][0]["workspace"]["kind"], "folder")
+
+    def _origin(self):
+        origin = os.path.join(self.tmp, "origin", "demo.git")
+        os.makedirs(os.path.dirname(origin))
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@x"}
+        run = lambda *a, **k: subprocess.run(["git", *a], check=True, capture_output=True, env=env, **k)
+        run("-c", "init.defaultBranch=main", "init", "-q", "--bare", origin)
+        seed = os.path.join(self.tmp, "seed")
+        run("clone", "-q", origin, seed)
+        with open(os.path.join(seed, "README.md"), "w") as f:
+            f.write("demo\n")
+        run("add", ".", cwd=seed)
+        run("commit", "-q", "-m", "init", cwd=seed)
+        run("push", "-q", "origin", "HEAD:main", cwd=seed)
+        return origin
+
+    def test_repo_task_gets_a_worktree_and_is_held_when_its_work_is_unpushed(self):
+        origin = self._origin()
+        r, out = self.call("start_task", task="hello", repo=origin, title="repo task")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.assertEqual(out["workspace"], {"kind": "repo", "path": os.path.join(self.ws_root, "active", tid),
+                                            "repo": "demo", "branch": "task/" + tid})
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        # the fake child wrote fake-argv.json into the worktree: untracked work, so the folder is HELD, not archived
+        self.assertEqual(w["workspace"]["state"], "held")
+        held = os.path.join(self.ws_root, "held", tid)
+        self.assertEqual(w["workspace"]["path"], held)
+        self.assertIn("untracked", w["workspace"]["reason"])
+        self.assertTrue(os.path.exists(os.path.join(held, "fake-argv.json")))
+        self.assertTrue(os.path.exists(os.path.join(held, "README.md")))
+        listed = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=os.path.join(self.ws_root, "repos", "demo"),
+                                capture_output=True, text=True).stdout
+        self.assertIn(held, listed)
+        self.assertEqual(_load(os.path.join(ct.task_path(tid), "meta.json"))["office"]["project"], "demo")
+        rec = ct.workspaces.read_index(self.ws_root)[tid]
+        self.assertEqual((rec["state"], rec["branch"]), ("held", "task/" + tid))
+        self.assertEqual(ct.workspaces.cleanup_archive(self.ws_root, now=time.time() + 10 ** 7)["deleted"], [])   # held: never
+
+    def test_bad_repo_or_branch_and_cwd_plus_repo_are_refused_before_anything_runs(self):
+        for kw, needle in (({"repo": "-rf"}, "not a clone URL"), ({"branch": "main"}, "branch needs repo"),
+                           ({"repo": "x", "branch": "a..b"}, "not a valid git branch"),
+                           ({"cwd": self.work, "repo": "x"}, "not both")):
+            r, _ = self.call("start_task", task="x", **kw)
+            self.assertTrue(r.get("isError"), kw)
+            self.assertIn(needle, r["content"][0]["text"], kw)
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "tasks")) and os.listdir(os.path.join(self.tmp, "tasks")))
+
+    def test_a_cwd_missing_on_the_host_is_refused_naming_the_host(self):
+        r, _ = self.call("start_task", task="x", cwd=os.path.join(self.tmp, "nowhere"))
+        self.assertIn("does not exist on execution host 'here' (this machine)", r["content"][0]["text"])
+        self.assertIn("name a `repo`", r["content"][0]["text"])
+
+    # -- a second machine, reached through a fake transport that runs this module's --remote mode in a subprocess --
+
+    def _air(self, transport=None):
+        """Configure host 'air' as another machine. Its side (HOME, tasks dir, state, hosts file, token, provider URL)
+        lives under tmp/air; the transport runs `child_tasks.py --remote` there instead of ssh."""
+        self.air_home = os.path.join(self.tmp, "air")
+        os.makedirs(os.path.join(self.air_home, ".config", "cortados"), mode=0o700)
+        os.chmod(self.air_home, 0o700)
+        with open(os.path.join(self.air_home, ".config", "cortados", "provider-token"), "w") as f:
+            f.write("tok-air-0000000001")
+        self.air_root = os.path.join(self.air_home, "CortadOS")
+        os.mkdir(self.air_root)
+        air_hosts = os.path.join(self.air_home, "exec-hosts.json")
+        entry = {"ssh": "air-fake", "router": str(ct.REPO_ROOT), "python": sys.executable, "root": self.air_root,
+                 "claude": os.environ["CORTADOS_CHILD_CLAUDE_BIN"], "provider_url": "http://127.0.0.1:9",
+                 "path": os.environ["PATH"]}
+        with open(air_hosts, "w") as f:      # the Air's own file: its entry names this machine, so it is local THERE
+            json.dump({"default": "air", "hosts": {"air": {**entry, "hostnames": [ct.exec_hosts.short_hostname()]}}}, f)
+        # this machine's file: the Air is another machine
+        self.write_hosts({"default": "air", "hosts": {"air": {**entry, "hostnames": ["not-this-machine"]},
+                                                      "here": {"root": self.ws_root}}})
+        self.transport_calls = []
+
+        def run_remote(argv, stdin, timeout):
+            self.transport_calls.append(argv)
+            self.assertEqual(argv[0], "ssh")
+            self.assertEqual(argv[argv.index("--") + 1], "air-fake")
+            env = {**os.environ, "HOME": self.air_home, "CORTADOS_TASKS_DIR": os.path.join(self.air_home, "tasks"),
+                   "CORTADOS_HOME": os.path.join(self.air_home, "state"), "CORTADOS_EXEC_HOSTS_FILE": air_hosts,
+                   "CORTADOS_PROVIDER_TOKEN": "", "CORTADOS_PROVIDER_TOKEN_FILE": "", "CORTADOS_PROVIDER_URL": ""}
+            p = subprocess.run([sys.executable, "-B", str(Path(ct.__file__)), "--remote"], input=stdin,
+                               capture_output=True, env=env, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport or run_remote)
+        t.start()
+        self.addCleanup(t.stop)
+
+    def test_remote_start_status_wait_list_cancel_through_the_fake_transport(self):
+        self._air()
+        r, out = self.call("start_task", task="hello", title="remote one")
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.assertEqual(out["host"], "air")
+        self.assertEqual(out["workspace"]["path"], os.path.join(self.air_root, "active", tid))
+        # a stub here, the task there
+        self.assertEqual(_load(os.path.join(ct.task_path(tid), ct.REMOTE_STUB))["host"], "air")
+        self.assertFalse(os.path.exists(os.path.join(ct.task_path(tid), "meta.json")))
+        self.assertTrue(os.path.isdir(os.path.join(self.air_home, "tasks", tid)))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "tasks", tid, "stdout.log")))
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["host"], "air")
+        self.assertIn(st["state"], ("running", "succeeded"))
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual(w["result"], "done: hello")
+        self.assertEqual(w["host"], "air")
+        self.assertEqual(w["workspace"]["state"], "archived")
+        self.assertTrue(os.path.isdir(os.path.join(self.air_root, "archive", tid)))
+        self.assertTrue(w["dir"].startswith(self.air_home))      # paths in the reply are the host's
+        with open(os.path.join(self.air_home, "state", "child-tasks.jsonl")) as f:
+            self.assertEqual([json.loads(x)["event"] for x in f], ["started", "finished"])
+        self.assertFalse(os.path.exists(os.path.join(os.environ["CORTADOS_HOME"], "child-tasks.jsonl")))
+        # list: one round trip for the host, rows carry its state
+        _, rows = self.call("list_tasks")
+        row = [x for x in rows["tasks"] if x["task_id"] == tid][0]
+        self.assertEqual((row["host"], row["state"], row["task_preview"]), ("air", "succeeded", "hello"))
+        # cancel a sleeping one there
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        _, out2 = self.call("start_task", task="zzz", cwd=self.air_root)   # an existing dir ON THE HOST is fine
+        self.assertFalse(out2.get("workspace"))
+        self.assertTrue(_wait_file(os.path.join(self.air_root, "fake-argv.json")))
+        _, c = self.call("cancel_task", task_id=out2["task_id"])
+        self.assertEqual((c["cancelled"], c["host"]), (True, "air"))
+        _, w2 = self.call("wait_task", task_id=out2["task_id"], timeout_s=30)
+        self.assertEqual(w2["state"], "cancelled")
+        self.assertGreaterEqual(len(self.transport_calls), 6)
+
+    def test_a_cwd_that_exists_only_here_is_refused_with_both_facts(self):
+        # The fake remote shares this filesystem, so the host's refusal (_check_cwd_here, exercised in
+        # test_a_cwd_missing_on_the_host_is_refused_naming_the_host) is replayed as the Air would send it.
+        remote_error = f"cwd {self.work!r} does not exist on execution host 'air' (ssh air-fake); name a `repo`"
+        self._air(transport=lambda a, s, t: (1, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False,
+                                                            "error": remote_error}).encode(), b""))
+        r, _ = self.call("start_task", task="x", cwd=self.work)
+        self.assertTrue(r.get("isError"))
+        text = r["content"][0]["text"]
+        self.assertIn(f"cwd {self.work!r} does not exist on execution host 'air' (ssh air-fake)", text)
+        self.assertIn("it exists on this machine", text)
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+
+    def test_an_unreachable_host_is_a_clear_error_and_nothing_runs_here(self):
+        self._air(transport=lambda argv, stdin, timeout: (255, b"", b"ssh: connect to host air port 22: No route to host"))
+        for kw in ({}, {"host": "air"}):
+            r, _ = self.call("start_task", task="x", **kw)
+            self.assertTrue(r.get("isError"))
+            text = r["content"][0]["text"]
+            self.assertIn("execution host 'air' (ssh air-fake) is unreachable", text)
+            self.assertIn("No route to host", text)
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.ws_root, "active")) and os.listdir(os.path.join(self.ws_root, "active")))
+        # an explicit local host still works
+        r, out = self.call("start_task", task="x", host="here", cwd=self.work)
+        self.assertFalse(r.get("isError"), r)
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+
+    def test_a_remote_task_whose_host_is_down_reports_it_in_status_and_list(self):
+        self._air()
+        r, out = self.call("start_task", task="hello")
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: (255, b"", b"down")):
+            r, _ = self.call("task_status", task_id=out["task_id"])
+            self.assertIn("unreachable", r["content"][0]["text"])
+            _, rows = self.call("list_tasks")
+            row = [x for x in rows["tasks"] if x["task_id"] == out["task_id"]][0]
+            self.assertEqual(row["state"], "unknown")
+            self.assertIn("unreachable", row["error"])
+
+    def test_remote_mode_refuses_a_request_for_a_host_that_is_not_this_machine(self):
+        import io
+        self.write_hosts({"default": "air", "hosts": {"air": {"ssh": "air", "router": "/r", "hostnames": ["not-me"], "root": "/w"}}})
+        out = io.StringIO()
+        rc = ct.serve_remote(io.StringIO(json.dumps({"v": ct.exec_hosts.PROTOCOL, "op": "list", "host": "air", "args": {}})), out)
+        self.assertEqual(rc, 1)
+        reply = json.loads(out.getvalue())
+        self.assertFalse(reply["ok"])
+        self.assertIn("is not execution host 'air'", reply["error"])
+        out = io.StringIO()
+        ct.serve_remote(io.StringIO(json.dumps({"v": 0, "op": "list", "host": "air"})), out)
+        self.assertIn("protocol", json.loads(out.getvalue())["error"])
+        out = io.StringIO()
+        ct.serve_remote(io.StringIO("not json"), out)
+        self.assertIn("not JSON", json.loads(out.getvalue())["error"])
+
+    def test_chrome_on_a_remote_host_without_gui_is_refused_before_the_round_trip(self):
+        self._air(transport=lambda a, s, t: self.fail("no round trip expected"))
+        r, _ = self.call("start_task", task="x", chrome=True)
+        self.assertIn("need `gui: true`", r["content"][0]["text"])
+        self.assertIn("login Keychain", r["content"][0]["text"])
+
+    # -- chrome on a gui host: a per-task LaunchAgent in the desktop session, through a fake launchctl --
+
+    FAKE_LAUNCHCTL = textwrap.dedent('''\
+        #!{py}
+        import json, os, plistlib, signal, subprocess, sys
+        log = os.environ["FAKE_LAUNCHCTL_LOG"]
+        with open(log, "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\\n")
+        reg = log + ".jobs.json"
+        jobs = json.load(open(reg)) if os.path.exists(reg) else {{}}
+        mode = os.environ.get("FAKE_LAUNCHCTL_MODE", "run")
+        cmd = sys.argv[1]
+        if cmd == "bootstrap":
+            if mode == "fail":
+                sys.stderr.write("Bootstrap failed: 5: Input/output error\\n"); sys.exit(5)
+            with open(sys.argv[3], "rb") as f:
+                p = plistlib.load(f)
+            if p["Label"] in jobs:
+                sys.stderr.write("Bootstrap failed: 37: Operation already in progress\\n"); sys.exit(37)
+            if mode == "noop":
+                jobs[p["Label"]] = None                       # loaded but never started
+            else:
+                out = open(p["StandardOutPath"], "ab"); err = open(p["StandardErrorPath"], "ab")
+                proc = subprocess.Popen(p["ProgramArguments"], cwd=p["WorkingDirectory"], env=p["EnvironmentVariables"],
+                                        stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                jobs[p["Label"]] = proc.pid
+        elif cmd in ("bootout", "kill"):
+            label = sys.argv[-1].rsplit("/", 1)[1]
+            if label not in jobs:
+                sys.stderr.write("Boot-out failed: 113: Could not find specified service\\n"); sys.exit(113)
+            pid = jobs[label]
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if cmd == "bootout":
+                del jobs[label]
+        with open(reg, "w") as f:
+            json.dump(jobs, f)
+    ''')
+
+    def _gui_host(self, mode="run"):
+        self.write_hosts({"default": "here", "hosts": {"here": {"root": self.ws_root, "gui": True}}})
+        fake = os.path.join(self.tmp, "fake-launchctl")
+        with open(fake, "w") as f:
+            f.write(self.FAKE_LAUNCHCTL.format(py=sys.executable))
+        os.chmod(fake, 0o755)
+        self.launchctl_log = os.path.join(self.tmp, "launchctl.log")
+        os.environ["FAKE_LAUNCHCTL_LOG"] = self.launchctl_log
+        os.environ["FAKE_LAUNCHCTL_MODE"] = mode
+        p = mock.patch.object(ct, "LAUNCHCTL", fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _launchctl_calls(self):
+        with open(self.launchctl_log) as f:
+            return [json.loads(x) for x in f]
+
+    def test_chrome_on_a_gui_host_runs_as_a_launchagent_in_the_gui_domain(self):
+        self._gui_host()
+        r, out = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertFalse(r.get("isError"), r)
+        tid = out["task_id"]
+        self.assertEqual((out["launch"], out["lane"]), ("launchd", ct.LOGIN_LANE))
+        self.assertIn("one at a time", out["chrome_queue"])
+        d = ct.task_path(tid)
+        label = ct.LAUNCHD_LABEL_PREFIX + tid
+        domain = f"gui/{os.getuid()}"
+        self.assertEqual(self._launchctl_calls()[0], ["bootstrap", domain, os.path.join(d, "launchd.plist")])
+        import plistlib
+        with open(os.path.join(d, "launchd.plist"), "rb") as f:
+            plist = plistlib.load(f)
+        self.assertEqual(oct(os.stat(os.path.join(d, "launchd.plist")).st_mode & 0o777), "0o600")
+        self.assertEqual(plist["Label"], label)
+        self.assertEqual(plist["ProgramArguments"][-2:], ["--run", d])
+        self.assertTrue(plist["RunAtLoad"])
+        self.assertFalse(plist["KeepAlive"])
+        env = plist["EnvironmentVariables"]
+        self.assertEqual(env["CORTADOS_CHILD_TASK"], "1")
+        self.assertEqual(env["HOME"], os.environ["HOME"])
+        for k in ct.LOGIN_FORBIDDEN_ENV + ("ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_SUBAGENT_MODEL"):
+            self.assertNotIn(k, env)
+        self.assertFalse(os.path.exists(os.path.join(d, "runner.lock")) and False)   # the runner creates its own lock
+        _, w = self.call("wait_task", task_id=tid, timeout_s=30)
+        self.assertEqual(w["state"], "succeeded", w)
+        self.assertEqual((w["launch"], w["lane"]), ("launchd", ct.LOGIN_LANE))
+        seen = _load(os.path.join(self.work, "fake-argv.json"))
+        self.assertIn("--chrome", seen["argv"])
+        self.assertEqual(seen["nested"], "1")
+        self.assertIsNone(seen["env"]["ANTHROPIC_AUTH_TOKEN"])
+        meta = _load(os.path.join(d, "meta.json"))
+        self.assertIsInstance(meta["runner_pid"], int)          # recorded by the runner itself
+        self.assertEqual(meta["launch"], "launchd")
+        # final: the one-shot job is booted out (once)
+        self.assertTrue(_load(os.path.join(d, ct.LAUNCHD_FILE))["booted_out"])
+        self.call("task_status", task_id=tid)
+        calls = self._launchctl_calls()
+        self.assertEqual([c for c in calls if c[0] == "bootout"], [["bootout", f"{domain}/{label}"]])
+
+    def test_a_running_launchd_chrome_task_is_cancelled_through_its_runner(self):
+        self._gui_host()
+        os.environ["FAKE_CLAUDE_MODE"] = "sleep"
+        r, out = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertTrue(_wait_file(os.path.join(self.work, "fake-argv.json")))
+        pid = _load(os.path.join(self.work, "fake-argv.json"))["pid"]
+        _, c = self.call("cancel_task", task_id=out["task_id"])
+        self.assertTrue(c["cancelled"])
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(w["state"], "cancelled")
+        self.assertFalse(_pid_alive(pid))
+        self.assertTrue(_load(os.path.join(ct.task_path(out["task_id"]), ct.LAUNCHD_FILE))["booted_out"])
+
+    def test_cancel_before_the_launchd_runner_starts_boots_the_job_out(self):
+        self._gui_host(mode="noop")                     # launchd accepts the job but never starts it
+        r, out = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertFalse(r.get("isError"), r)
+        d = ct.task_path(out["task_id"])
+        _, st = self.call("task_status", task_id=out["task_id"])
+        self.assertEqual(st["state"], "running")        # within META_GRACE_S the runner may still appear
+        _, c = self.call("cancel_task", task_id=out["task_id"])
+        self.assertTrue(c["cancelled"])
+        self.assertIn("runner not started yet", c["note"])
+        self.assertTrue(os.path.exists(os.path.join(d, "cancelled")))
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{ct.LAUNCHD_LABEL_PREFIX}{out['task_id']}"], self._launchctl_calls())
+        with mock.patch.object(ct, "META_GRACE_S", 0):
+            _, st = self.call("task_status", task_id=out["task_id"])
+        self.assertEqual(st["state"], "cancelled")
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+
+    def test_a_launchd_runner_that_never_starts_is_failed_with_a_pointer(self):
+        self._gui_host(mode="noop")
+        r, out = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        with mock.patch.object(ct, "META_GRACE_S", 0):
+            _, st = self.call("task_status", task_id=out["task_id"])
+        self.assertEqual(st["state"], "failed")
+        self.assertIn("launchd", st["error"])
+        self.assertIn("launchctl print", st["error"])
+
+    def test_launchctl_failure_is_reported_and_leaves_no_task(self):
+        self._gui_host(mode="fail")
+        r, _ = self.call("start_task", task="browse", cwd=self.work, chrome=True)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("desktop session", r["content"][0]["text"])
+        self.assertIn("exited 5", r["content"][0]["text"])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")), [])
+        # a routed (non-chrome) task on the same gui host spawns as before, without launchd
+        r, out = self.call("start_task", task="x", cwd=self.work)
+        self.assertEqual(out["launch"], "spawn")
+        self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(len(self._launchctl_calls()), 1)
+
+    def test_chrome_launchd_task_in_a_workspace_checks_project_settings_in_the_runner(self):
+        self._gui_host()
+        origin = self._origin()
+        # a project settings file that disables Chrome, committed in the repository: only visible once cloned
+        seed = os.path.join(self.tmp, "seed2")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        subprocess.run(["git", "clone", "-q", origin, seed], check=True, env=env)
+        os.makedirs(os.path.join(seed, ".claude"))
+        with open(os.path.join(seed, ".claude", "settings.json"), "w") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": "http://x"}}, f)
+        subprocess.run(["git", "add", "."], cwd=seed, check=True, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "s"], cwd=seed, check=True, env=env)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:main"], cwd=seed, check=True, env=env)
+        r, out = self.call("start_task", task="browse", repo=origin, chrome=True)
+        self.assertFalse(r.get("isError"), r)
+        _, w = self.call("wait_task", task_id=out["task_id"], timeout_s=30)
+        self.assertEqual(w["state"], "failed", w)
+        self.assertIn("chrome task refused", w["error"])
+        self.assertIn("ANTHROPIC_BASE_URL", w["error"])
+        self.assertEqual(w["workspace"]["state"], "archived")   # a clean worktree: nothing to hold
+        self.assertFalse(glob.glob(os.path.join(self.ws_root, "*", "*", "fake-argv.json")), "no child was spawned")
 
     def test_router_run_id_header_and_run_record(self):
         tid = self.start(task="secret-ish prompt text")

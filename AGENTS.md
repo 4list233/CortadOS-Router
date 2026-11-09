@@ -15,7 +15,10 @@ is the long form.
   `scarcity.py` quota reading via vendor CLIs (`scarcity_codex.py` parses Codex's `/status`), `unitcost.py`,
   `transport.py`, `local_resources.py`, `local_gate.py` (token-checked reverse proxy run on a local Ollama node: the
   provider's local lane reaches Ollama only through it), `subagent_mcp.py` (stdio MCP server: a `route_task` tool that delegates a
-  self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone).
+  self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
+  `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`),
+  `exec_hosts.py` (which machine a child runs on: `~/.config/cortados/exec-hosts.json`, ssh transport), `workspaces.py`
+  (per-task repo worktrees / folders under `<root>/active`, archive-or-held settling, index.jsonl, archive-only cleanup).
 - `cortados_router/provider/` — the `cortados` model endpoint (design and status: `docs/PROVIDER-PLAN.md`).
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
@@ -84,8 +87,15 @@ is unconfigured or the provider is unreachable it returns a clear error; fall ba
 
 ## Delegating whole tasks from the Claude app
 The same server serves `start_task` / `task_status` / `wait_task` / `list_tasks` / `cancel_task`
-(`cortados_router/child_tasks.py`): each task runs as a separate headless Claude Code session on this machine through
-the provider (every child spends subscription quota). Child traffic carries `x-cortados-run-id: <task_id>`;
-lifecycle events go to `$CORTADOS_HOME/child-tasks.jsonl` (tests must use a throwaway `CORTADOS_HOME`). Registration snippets (desktop app and `claude mcp add -s user`)
-are in README.md under the same heading. Tests use a fake claude binary (`tests/test_child_tasks.py`); never launch a
-real child in tests.
+(`cortados_router/child_tasks.py`): each task runs as a separate headless Claude Code session on the configured
+EXECUTION HOST (`cortados_router/exec_hosts.py`; `~/.config/cortados/exec-hosts.json`, default the Air; a remote host
+is reached by `ssh` running this module's `--remote` mode there; never a silent fallback to the requesting machine)
+through the provider (every child spends subscription quota). Workspaces (`cortados_router/workspaces.py`): `repo`
+[+ `branch`] gives a git worktree under `<root>/active/<task_id>`, settled to `archive/` (pushed) or `held/`
+(unpushed) when the task ends; only `archive/` is ever cleaned up (7 days). `chrome: true` on a `gui` host launches
+through `launchctl bootstrap gui/<uid>` and chrome children queue on one lock per host. Child traffic carries
+`x-cortados-run-id: <task_id>`; lifecycle events go to `$CORTADOS_HOME/child-tasks.jsonl` (tests must use a throwaway
+`CORTADOS_HOME`). Registration snippets (desktop app and `claude mcp add -s user`) are in README.md under the same
+heading. Tests use a fake claude binary, a fake transport in place of ssh and a fake launchctl
+(`tests/test_child_tasks.py`, `tests/test_exec_hosts.py`, `tests/test_workspaces.py`); never launch a real child,
+open ssh or call the real launchctl in tests.

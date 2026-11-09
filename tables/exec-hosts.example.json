@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to ~/.config/cortados/exec-hosts.json on EVERY machine that runs the cortados-route MCP server or receives tasks (the Air needs it too: it recognises itself by `hostnames`). `default` is the host new start_task calls run on (owner decision 2026-11-08: the always-on Air). An entry reached over ssh needs `router` (its cortados-router checkout) and should set `claude`, `path` (ssh sessions get a bare PATH) and `provider_url` (its own provider; the token is read from ~/.config/cortados/provider-token THERE). `gui: true` means chrome (login-mode) children are launched as per-task LaunchAgents in the desktop session (ssh sessions cannot read the login Keychain). An entry without `ssh` is this machine; add `hostnames` so the same file works when the server runs on that host. Add the Studio as another entry when it is ready.",
+  "default": "air",
+  "hosts": {
+    "air": {
+      "ssh": "air",
+      "hostnames": ["Forests-MacBook-Air"],
+      "root": "/Users/4list/CortadOS",
+      "router": "/Users/4list/cortados-router",
+      "python": "/usr/bin/python3",
+      "claude": "/Users/4list/.local/bin/claude",
+      "path": "/Users/4list/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "gui": true,
+      "provider_url": "http://127.0.0.1:8432"
+    }
+  }
+}

@@ -426,12 +426,50 @@ existing in-flight inference is not cancelled. Other fit, busy and exclusion che
 ## Delegating whole tasks from the Claude app
 
 The same `cortados-route` server also hands off WHOLE tasks: each one runs as a separate headless Claude Code session
-on the machine that runs the server (`claude -p` launched through `cortados_router.session`, so the provider env, the
-`sub/<model>` pin and S1-routed native subagents are exactly those of a `cortados` session), with every tool and MCP
-server the user's Claude Code has. Only the result comes back; the calling orchestrator verifies it.
+on the configured EXECUTION HOST (below; by default the always-on Air, whichever machine runs the server), `claude -p`
+launched through `cortados_router.session`, so the provider env, the `sub/<model>` pin and S1-routed native subagents
+are exactly those of a `cortados` session, with every tool and MCP server Claude Code has there. Only the result comes
+back; the calling orchestrator verifies it.
 
-Tools: `start_task(task, cwd, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
+Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_mode?, allowed_tools?, chrome?, connectors?)` returns a `task_id` at once;
 `task_status(task_id)`, `wait_task(task_id, timeout_s≤50)` (50 s default and cap: the Claude desktop app times MCP requests out at 60 s, and the reply, post-wait status work included, lands inside it; `CORTADOS_WAIT_MAX_S` (0-3600 s; a bad value is an error) raises it for clients with a longer timeout; a result with state `running` means call again), `list_tasks(limit?)`, `cancel_task(task_id)`.
+
+- Execution host (owner decision 2026-11-08, #89/#86; `cortados_router/exec_hosts.py`): `~/.config/cortados/exec-hosts.json`
+  (`CORTADOS_EXEC_HOSTS_FILE`; copy `tables/exec-hosts.example.json`, which holds the Air entry) names the hosts and the
+  `default` new tasks run on; `host` picks another; `CORTADOS_EXEC_HOST` overrides the default. Without the file
+  start_task refuses: a task never quietly runs on the requesting machine. An entry whose `hostnames` include this
+  machine (or has no `ssh`) is local and the child is spawned as before; otherwise start_task runs
+  `ssh <entry.ssh> <python> <router>/cortados_router/child_tasks.py --remote` (BatchMode, StrictHostKeyChecking=yes,
+  10 s connect, 30 s per call) with a JSON request on stdin, and keeps a stub (`<task_id>/remote.json`) so
+  `task_status`, `wait_task` (the host waits; one ssh session held open), `list_tasks` (one round trip per host) and
+  `cancel_task` (stops the process there) know where to ask. An unreachable host is a clear error naming it. The Air
+  needs: this checkout at `router` at the same commit (the protocol version is checked), the hosts file with its own
+  entry, `~/.config/cortados/provider-url` or `provider_url` in its entry, `~/.config/cortados/provider-token` (routed
+  children authenticate to the provider with it; they need no Keychain), `claude` (its ssh PATH is bare: set `path`).
+- Workspaces (`cortados_router/workspaces.py`; layout `~/CortadOS/README.md` on the Air): `repo` (a clone URL, or the
+  name of a clone already under `<root>/repos/`) [+ `branch`] gives the task a git worktree at `<root>/active/<task_id>`:
+  the host clones to `repos/<name>` if needed, fetches, and checks out `branch` (from `origin/<branch>` when it exists,
+  else a new branch from the default; refused while another task has it checked out) or, with no branch, a new
+  `task/<task_id>` from the default branch, so parallel tasks never share a checkout. No repo and no cwd: a plain
+  folder there. `cwd`: an existing directory ON THE HOST (not managed; a path that exists only on the requesting machine
+  is refused saying so). The runner prepares the workspace before spawning (a clone can take minutes; start_task
+  answers at once; a failed clone fails the task with the reason) and, when the child ends, moves the folder to
+  `archive/` (every commit on a remote and nothing uncommitted or untracked, or no repository) or `held/` (anything
+  else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
+  task, rewritten under `index.lock`). `task_status` shows `workspace` (kind, state, path, reason).
+- Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
+  entries whose index record says archived more than 7 days ago, and nothing else: not a name that is not a task id,
+  not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
+  archive record, never anything in `held/`, `repos/`, `services/`. `integrations/launchd/com.cortados.archive-cleanup.plist`
+  runs it daily on the Air; start_task also runs it (at most 3 deletions per call) so a missed day is caught up.
+- `chrome: true` on a `gui` host runs the child as a per-task LaunchAgent in the desktop session
+  (`launchctl bootstrap gui/<uid> <task dir>/launchd.plist`, label `com.cortados.task.<task_id>`, booted out when the
+  task is final): an ssh session cannot read the login Keychain that holds Claude's login, and Claude in Chrome needs
+  the session Chrome runs in. The plist carries only the login-mode allowlisted env (`LOGIN_ENV_ALLOW`); the login
+  rules (fail-closed settings check, which the runner repeats on the project files once the workspace exists; unrouted,
+  main-subscription lane) are unchanged. Chrome serves one client at a time, so chrome children on a host take
+  `<tasks dir>/chrome.lock` one at a time: the others wait (`task_status` phase `queued`, cancellable while waiting,
+  given up after 6 h). Chrome on an ssh host without `gui: true` is refused before any round trip.
 
 - `orchestrator`: `cortados` (default, S1 routes every turn) or a pinnable model (`fable`, `opus`, `gpt-6.1-sol`,
   ...), which pins the child's MAIN model; the child's subagents are still routed by S1.

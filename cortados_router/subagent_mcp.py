@@ -66,14 +66,30 @@ NESTED_ENV = "CORTADOS_CHILD_TASK"
 _MODES = ["auto", "acceptEdits", "manual", "plan", "dontAsk"]   # mirrors child_tasks.PERMISSION_MODES (checked by a test)
 CHILD_TOOLS = [
     {"name": "start_task",
-     "description": ("Start a WHOLE task as a separate headless Claude Code session on this machine, routed through "
-                     "CortadOS (S1 picks the model per turn unless an orchestrator model is pinned). The child has every "
-                     "tool and MCP server the user's Claude Code has, works in `cwd`, and runs unattended; only its "
-                     "final result comes back. Returns a task_id at once: poll with task_status or block with wait_task. "
-                     "Put everything the child needs in `task`: it does not see this conversation."),
+     "description": ("Start a WHOLE task as a separate headless Claude Code session on the configured EXECUTION HOST "
+                     "(default: the always-on Air; `host` picks another configured one), routed through CortadOS (S1 "
+                     "picks the model per turn unless an orchestrator model is pinned). The child has every tool and MCP "
+                     "server Claude Code has THERE, and runs unattended; only its final result comes back. Where it "
+                     "works: give `repo` (+ optional `branch`) and the host clones/fetches the repository and creates a "
+                     "git worktree under its CortadOS/active/<task_id>; give nothing and it gets a plain folder there; "
+                     "give `cwd` only for a directory that ALREADY EXISTS ON THE EXECUTION HOST (a path that exists only "
+                     "on this machine is refused). When the task ends its folder moves to archive/ (pushed, or no repo; "
+                     "deleted after 7 days) or held/ (unpushed work; kept). Returns a task_id at once: poll with "
+                     "task_status or block with wait_task. Put everything the child needs in `task`: it does not see "
+                     "this conversation."),
      "inputSchema": {"type": "object", "properties": {
          "task": {"type": "string", "description": "The complete, self-contained task prompt."},
-         "cwd": {"type": "string", "description": "Absolute path of an existing directory the child works in."},
+         "repo": {"type": "string", "description": "Optional: a clone URL (https://github.com/owner/name.git, "
+                  "git@github.com:owner/name.git) or the name of a repository already cloned on the host. The host "
+                  "clones it to repos/<name> if needed, fetches, and gives the task a worktree in active/<task_id>."},
+         "branch": {"type": "string", "description": "Optional, with repo: the branch to check out (created from the "
+                    "default branch if it does not exist; refused if another task has it checked out). Omitted: a new "
+                    "branch task/<task_id> from the default branch."},
+         "cwd": {"type": "string", "description": "Optional: absolute path of a directory that already exists ON THE "
+                 "EXECUTION HOST. Not for repositories (use repo); a path that exists only on the requesting machine "
+                 "is refused with a message saying so."},
+         "host": {"type": "string", "description": "Optional: the name of a configured execution host "
+                  "(~/.config/cortados/exec-hosts.json). Default: the file's default, the Air."},
          "title": {"type": "string", "description": "Optional short label for the task (1-80 printable ASCII "
                    "characters), shown in the CortadOS Office view. A label only: never secrets or file contents."},
          "orchestrator": {"type": "string", "description": "'cortados' (default: S1 routes every turn) or a pinnable "
@@ -96,7 +112,7 @@ CHILD_TOOLS = [
                         "(the provider then refuses with 413)."},
          "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional extra tool patterns "
                            "pre-approved for the child, e.g. ['Bash(npm test:*)', 'Bash(git diff:*)']."}},
-         "required": ["task", "cwd"]}},
+         "required": ["task"]}},
     {"name": "task_status",
      "description": "State of a child task (running/succeeded/failed/cancelled), elapsed time, models used, and the final "
                     "result text when done (bounded; the full log path is included).",
@@ -106,7 +122,7 @@ CHILD_TOOLS = [
      "description": "Most recent child tasks, newest first, with state and a short preview.",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "1-200, default 20"}}}},
     {"name": "cancel_task",
-     "description": "Terminate a running child task (its own process group only).",
+     "description": "Terminate a running child task (its own process group only, on whichever execution host runs it).",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
 ]
 _CHILD_NAMES = {t["name"] for t in CHILD_TOOLS}
@@ -179,7 +195,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
                            a.get("permission_mode") or None, a.get("allowed_tools"),
                            cfg.get("url", ""), cfg.get("token_file"), a.get("chrome", False), red,
                            a.get("connectors"), client=cfg.get("client"), title=a.get("title"),
-                           session_tag=cfg.get("session_tag"))
+                           session_tag=cfg.get("session_tag"), repo=a.get("repo"), branch=a.get("branch"),
+                           host=a.get("host"))
         elif name == "task_status":
             out = ct.status(a.get("task_id"), red, cfg.get("url", ""), token)
         elif name == "wait_task":
