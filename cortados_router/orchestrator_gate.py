@@ -8,6 +8,7 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -79,8 +80,8 @@ def display(url):
 
 
 def provider_unreachable(url, timeout=PROBE_TIMEOUT):
-    """None when a TCP connection to the provider succeeds, else a one-line reason. A malformed URL is an outage too:
-    cortados-route cannot delegate through it either."""
+    """None when reachable or the wall-clock deadline expires, else a one-line outage reason.
+    A malformed URL is an outage too: cortados-route cannot delegate through it either."""
     try:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname
@@ -89,11 +90,27 @@ def provider_unreachable(url, timeout=PROBE_TIMEOUT):
         return "provider URL is malformed"
     if parts.scheme not in ("http", "https") or not host:
         return "provider URL is malformed"
-    try:
-        socket.create_connection((host, port), timeout=timeout).close()
-    except OSError as exc:
-        return f"cannot connect to {host}:{port} ({type(exc).__name__})"
-    return None
+    # create_connection's timeout excludes DNS and applies separately to each address.
+    # Bound the whole probe instead. A daemon is essential: a stuck resolver must not
+    # hold this standalone hook process open during interpreter shutdown.
+    deadline = time.monotonic() + timeout
+    done = threading.Event()
+    result = [None]
+
+    def connect():
+        try:
+            socket.create_connection((host, port), timeout=timeout).close()
+        except OSError as exc:
+            result[0] = f"cannot connect to {host}:{port} ({type(exc).__name__})"
+        finally:
+            done.set()
+
+    threading.Thread(target=connect, daemon=True).start()
+    if not done.wait(max(0.0, deadline - time.monotonic())) or time.monotonic() >= deadline:
+        # Unknown is treated like reachable, NOT an outage: outage releases the
+        # direct-work budget, so a stalled resolver must not authorize bypassing it.
+        return None
+    return result[0]
 
 
 def state_path(directory, session_id):

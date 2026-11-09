@@ -242,6 +242,39 @@ class GateTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_slow_resolver_deadline_keeps_budget_and_does_not_hold_hook_open(self):
+        # No real host: the resolver stays blocked beyond hook exit. This also catches
+        # non-daemon workers that hold Python shutdown open.
+        script = """
+import io
+import json
+import socket
+import sys
+import time
+from cortados_router import orchestrator_gate as gate
+
+def slow_resolver(*args, **kwargs):
+    time.sleep(10)
+    raise socket.gaierror("fake resolver stalled")
+
+socket.getaddrinfo = slow_resolver
+event = {"session_id": "deadline", "prompt_id": "p", "tool_name": "Bash"}
+env = {"CORTADOS_DELEGATE_BUDGET": "0", "CORTADOS_PROVIDER_URL": "http://fake.invalid"}
+start = time.monotonic()
+rc = gate.main(io.StringIO(json.dumps(event)), env=env, directory=sys.argv[1],
+               probe=lambda url: gate.provider_unreachable(url, timeout=0.1))
+assert time.monotonic() - start < 1.0, "probe exceeded wall-clock deadline"
+sys.exit(rc)
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script, str(self.directory)],
+            cwd=str(Path(gate.__file__).resolve().parent.parent),
+            text=True, capture_output=True, timeout=2,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_real_probe_against_local_sockets(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
