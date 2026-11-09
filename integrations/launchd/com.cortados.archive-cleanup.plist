@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Daily cleanup of finished, PUSHED task workspaces on an execution host (owner decision 2026-11-08, #86):
-  deletes <root>/archive/<task_id> entries archived more than 7 days ago, and nothing else (never held/, repos/,
+  deletes <root>/archive/<task_id> entries archived more than 3 days ago, and nothing else (never held/, repos/,
   services/, symlinks or unrecorded folders: cortados_router/workspaces.py cleanup_archive).
   Install on the Air (edit the paths if the checkout or user differ):
     cp integrations/launchd/com.cortados.archive-cleanup.plist ~/Library/LaunchAgents/

@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 import time
 
-ARCHIVE_AGE_S = 7 * 24 * 3600       # owner decision 2026-11-08: archived (pushed) work is kept a week, then deleted
+ARCHIVE_AGE_S = 3 * 24 * 3600       # owner decision 2026-11-08: archived (pushed) work is kept three days, then deleted
 TASK_ID_RE = re.compile(r"t\d{14}-[0-9a-f]{8}")     # child_tasks.TASK_ID_RE; repeated here so this module stands alone
 # A clone directory name under repos/: from the URL's last path segment. Dots, dashes and underscores as git hosts
 # allow; no leading dot or dash (hidden dirs, option-looking names); 64 is plenty for any repository name.

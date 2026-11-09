@@ -458,7 +458,7 @@ Tools: `start_task(task, repo?, branch?, cwd?, host?, orchestrator?, permission_
   else, or a worktree git cannot assess) with `git worktree move`, and records it in `<root>/index.jsonl` (one line per
   task, rewritten under `index.lock`). `task_status` shows `workspace` (kind, state, path, reason).
 - Archive cleanup: `python3 cortados_router/child_tasks.py --cleanup-archive [--root <dir>]` deletes `archive/<task_id>`
-  entries whose index record says archived more than 7 days ago, and nothing else: not a name that is not a task id,
+  entries whose index record says archived more than 3 days ago, and nothing else: not a name that is not a task id,
   not a symlink (never followed), not a non-directory, not an entry resolving outside `archive/`, not one without an
   archive record, never anything in `held/`, `repos/`, `services/`. `integrations/launchd/com.cortados.archive-cleanup.plist`
   runs it daily on the Air; start_task also runs it (at most 3 deletions per call) so a missed day is caught up.
