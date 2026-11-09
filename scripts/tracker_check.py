@@ -53,8 +53,9 @@ class Issue:
 
 @dataclass
 class Branches:
-    """Local branches by state relative to main. `empty` are branches at main's tip (a worktree with no commits yet):
-    neither merged work nor unmerged work, so they appear in no finding."""
+    """Local branches by state relative to main. `empty` are branches at main's tip:
+    refs cannot distinguish a fresh worktree from fast-forwarded work. Named open issues
+    therefore report these conservatively as merged; unnamed ones produce no finding."""
 
     merged: set[str] = field(default_factory=set)
     unmerged: set[str] = field(default_factory=set)
@@ -176,12 +177,16 @@ def parse_branches(refs: str, merged_list: str, main: str) -> Branches:
 
 def build_report(issues: list[Issue], branches: Branches, tracker_body: str, today: dt.date) -> Report:
     merged_but_open = sorted(
-        (i.number, i.title, i.branch) for i in issues if i.branch and i.branch in branches.merged
+        (i.number, i.title, i.branch) for i in issues
+        if i.branch and i.branch in (branches.merged | branches.empty)
     )
     corpus = [f"{i.title}\n{i.body}" for i in issues]
     orphans = sorted(b for b in branches.unmerged if not any(mentions(text, b) for text in corpus))
     live = parse_live_status_date(tracker_body)
     age = (today - live).days if live else None
+    # A future date cannot establish freshness (bad tracker data or a bad clock).
+    if age is not None and age < 0:
+        raise CheckError(f"Live status date {live.isoformat()} is in the future relative to {today.isoformat()}")
     return Report(merged_but_open, orphans, live, age)
 
 
@@ -192,6 +197,8 @@ def run(cmd: list[str]) -> str:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except FileNotFoundError as exc:
         raise CheckError(f"{cmd[0]} is not installed or not on PATH: {exc}") from exc
+    except OSError as exc:
+        raise CheckError(f"{cmd[0]} could not be executed: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise CheckError(f"{' '.join(cmd)} timed out after 60 s") from exc
     if proc.returncode != 0:

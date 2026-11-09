@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -166,11 +167,17 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(r.clean)
         self.assertIn("NOT FOUND", "\n".join(r.lines()))
 
-    def test_empty_branch_at_main_tip_appears_in_no_finding(self):
+    def test_named_branch_at_main_tip_is_not_clean(self):
         issues = tc.parse_issue_list('[{"number": 1, "title": "t", "body": "Branch: `fresh-worktree`"}]')
         r = tc.build_report(issues, self.branches, ISSUES[3]["body"], dt.date(2026, 11, 8))
-        self.assertEqual(r.merged_but_open, [])
+        self.assertEqual(r.merged_but_open, [(1, "t", "fresh-worktree")])
+        self.assertFalse(r.clean)
         self.assertNotIn("fresh-worktree", r.orphan_branches)
+
+    def test_unnamed_branch_at_main_tip_appears_in_no_finding(self):
+        branches = tc.parse_branches(f"main {MAIN_SHA}\nfresh-worktree {MAIN_SHA}\n", MERGED, "main")
+        r = tc.build_report([], branches, ISSUES[3]["body"], dt.date(2026, 11, 8))
+        self.assertTrue(r.clean)
 
 
 class MainTests(unittest.TestCase):
@@ -220,6 +227,22 @@ class MainTests(unittest.TestCase):
         rc, out, err = self.run_main(["--today", "2026-11-08"], fake_gh_factory(issues=issues), fake_git)
         self.assertEqual(rc, 2)
         self.assertIn("page cap", err)
+
+    def test_future_live_status_exits_two(self):
+        rc, out, err = self.run_main(["--today", "2026-11-07"], fake_gh_factory(), fake_git)
+        self.assertEqual(rc, 2)
+        self.assertIn("tracker check FAILED", err)
+        self.assertIn("future", err)
+        self.assertNotIn("result:", out)
+
+    def test_os_errors_exit_two(self):
+        for error in (PermissionError("permission denied"), OSError("cannot execute")):
+            with self.subTest(error=error), mock.patch.object(tc.subprocess, "run", side_effect=error):
+                rc, out, err = self.run_main(["--today", "2026-11-08"], tc.run, fake_git)
+                self.assertEqual(rc, 2)
+                self.assertIn("tracker check FAILED", err)
+                self.assertIn(str(error), err)
+                self.assertNotIn("result:", out)
 
     def test_bad_today_exits_two(self):
         rc, _, err = self.run_main(["--today", "yesterday"], fake_gh_factory(), fake_git)
