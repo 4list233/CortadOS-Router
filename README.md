@@ -362,6 +362,12 @@ What runs where:
   Set `CORTADOS_DELEGATE_ALLOW_MCP` to a comma-separated list of **exact** `mcp__...` tool names to exempt owner-approved
   MCP tools (default none; no wildcards). The launcher writes `CORTADOS_DELEGATE_BUDGET` into settings env.
   `--no-gate` disables enforcement independently of `--no-delegate-directive`.
+  **Router outage:** once the budget is spent, the gate opens a TCP connection to the provider cortados-route
+  delegates through (`CORTADOS_PROVIDER_URL`, else the launcher's `ANTHROPIC_BASE_URL`; 2 s timeout). If it cannot
+  connect, the call is allowed and not counted, with a one-line stderr notice to the owner, so the session can do the
+  work directly as the owner's rule says; Agent/Task stay refused. With no provider URL in the hook env there is
+  nothing to check and the budget holds. If the provider is up but cortados-route is missing, the only override is the
+  owner's: relaunch with `--no-gate` or a larger `--delegate-budget` (a switch the model cannot flip).
   The **Agent and Task tools are always denied in the main loop**, budget or not, with a reason naming `start_task`
   and the fallback when cortados-route is not connected (tell the owner in one line, do the work directly): the
   owner's rule (`~/.config/ai-coding/CORTADOS-ORCHESTRATOR.md`) makes cortados-route the only delegation path, and a

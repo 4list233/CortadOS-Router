@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import sys
 import tempfile
 import time
+import urllib.parse
 
 PLANNING_TOOLS = frozenset((
     "TodoWrite", "Read", "Grep", "Glob", "ToolSearch", "Skill",
@@ -33,12 +35,65 @@ AGENT_DENY_REASON = (
 )
 
 
-def budget_deny_reason(budget):
+def budget_deny_reason(budget, provider=None):
+    where = f" at {provider}" if provider else ""
     return (
         f"orchestrator: you have used your {budget} direct work calls for this prompt; delegate this with "
         "mcp__cortados-route__start_task (a CortadOS child session with every tool, MCP included) or "
-        "mcp__cortados-route__route_task (a text answer). If cortados-route is not connected, tell the owner in one line."
+        "mcp__cortados-route__route_task (a text answer). If cortados-route is not connected, tell the owner in one "
+        f"line, then: while the provider{where} is unreachable this gate releases the budget by itself and your "
+        "direct calls go through (Agent and Task stay refused); if the provider is up but cortados-route is still "
+        "missing, ask the owner to relaunch with --no-gate or a larger --delegate-budget."
     )
+
+
+# Outage recovery (owner rule: when cortados-route is not connected, say so in one line and do the work directly).
+# Without it, a router outage left the session with neither delegation nor direct work. The release is decided by a
+# real check, not a switch the model can flip: only when the budget is spent, the gate opens a TCP connection to the
+# provider that cortados-route delegates through; if that fails, the call is allowed and the owner sees a stderr line
+# (exit 1, as for fail-open). The only override is the owner's own launcher flags (--no-gate, --delegate-budget),
+# which the model cannot change from inside the session. Agent/Task stay refused either way (see SUBAGENT_TOOLS).
+PROBE_TIMEOUT = 2.0  # seconds; bounded so a black-holed host costs at most this per call past the budget
+
+
+def provider_url(env):
+    """The provider cortados-route delegates through: CORTADOS_PROVIDER_URL, else the launcher's ANTHROPIC_BASE_URL
+    (session.launcher_env sets it to the provider). None when neither is set: no target, so no release."""
+    for key in ("CORTADOS_PROVIDER_URL", "ANTHROPIC_BASE_URL"):
+        url = (env.get(key) or "").strip()
+        if url:
+            return url
+    return None
+
+
+def display(url):
+    """scheme://host:port only: a URL's userinfo, path or query never reaches a model-visible reason or the log."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = f":{parts.port}" if parts.port else ""
+        if parts.hostname:
+            return f"{parts.scheme}://{parts.hostname}{port}"
+    except ValueError:
+        pass
+    return "(malformed URL)"
+
+
+def provider_unreachable(url, timeout=PROBE_TIMEOUT):
+    """None when a TCP connection to the provider succeeds, else a one-line reason. A malformed URL is an outage too:
+    cortados-route cannot delegate through it either."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return "provider URL is malformed"
+    if parts.scheme not in ("http", "https") or not host:
+        return "provider URL is malformed"
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+    except OSError as exc:
+        return f"cannot connect to {host}:{port} ({type(exc).__name__})"
+    return None
 
 
 def state_path(directory, session_id):
@@ -80,7 +135,11 @@ def deny(reason):
     }}
 
 
-def decide(event, env, directory=None):
+class OutageRelease(Exception):
+    """The budget is spent but the provider is down: allow the call, and tell the owner (main prints the reason)."""
+
+
+def decide(event, env, directory=None, probe=provider_unreachable):
     # A subagent (the hook input carries agent_id) is never gated: it does its work directly, with every tool. A
     # CortadOS child task is launched with --no-gate (child_tasks._prepare), so this hook is not even installed there.
     if "agent_id" in event:
@@ -123,30 +182,43 @@ def decide(event, env, directory=None):
         ):
             raise ValueError("invalid gate counter state")
         count = counts.get(prompt_id, 0)
-        if count >= budget:
-            return deny(budget_deny_reason(budget))
-        counts[prompt_id] = count + 1
-        fd, name = tempfile.mkstemp(prefix=".counter-", dir=str(directory))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as dst:
-                json.dump(counts, dst)
-                dst.flush()
-                os.fsync(dst.fileno())
-            os.replace(name, path)
-        finally:
-            if os.path.exists(name):
-                os.unlink(name)
-    return None
+        exhausted = count >= budget
+        if not exhausted:
+            counts[prompt_id] = count + 1
+            fd, name = tempfile.mkstemp(prefix=".counter-", dir=str(directory))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as dst:
+                    json.dump(counts, dst)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.replace(name, path)
+            finally:
+                if os.path.exists(name):
+                    os.unlink(name)
+    if not exhausted:
+        return None
+    # Probed after the lock is released, so a slow probe never stalls parallel hooks. An outage call is not counted:
+    # the budget is suspended while the provider is down, not spent.
+    url = provider_url(env)
+    outage = probe(url) if url else None
+    if outage:
+        raise OutageRelease(f"orchestrator gate: provider {display(url)} unreachable: {outage}; direct work allowed past the "
+                            "budget until it is back (Agent stays refused)")
+    return deny(budget_deny_reason(budget, display(url) if url else None))
 
 
-def main(stdin=None, stdout=None, stderr=None, env=None, directory=None):
+def main(stdin=None, stdout=None, stderr=None, env=None, directory=None, probe=provider_unreachable):
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     try:
-        result = decide(json.load(stdin), os.environ if env is None else env, directory)
+        result = decide(json.load(stdin), os.environ if env is None else env, directory, probe)
         if result is not None:
             print(json.dumps(result), file=stdout)
+    except OutageRelease as exc:
+        # Same visibility as fail-open: exit 1 shows the owner this line while Claude Code still allows the tool.
+        print(str(exc).replace("\n", " ").replace("\r", " "), file=stderr)
+        return 1
     except Exception as exc:
         # A broken gate must NEVER brick a session: all internal errors fail OPEN,
         # visibly, rather than turning corrupt state or an I/O failure into denial.

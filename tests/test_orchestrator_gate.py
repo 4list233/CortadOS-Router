@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import sys
@@ -22,10 +23,12 @@ class GateTests(unittest.TestCase):
         self.event = {"session_id": "session", "prompt_id": "prompt", "tool_name": "Bash",
                       "tool_input": {"command": "true"}, "hook_event_name": "PreToolUse"}
 
-    def call(self, event=None, env=None):
+    def call(self, event=None, env=None, probe=None):
         out, err = io.StringIO(), io.StringIO()
+        # Default probe: any real probe in these tests is a test failure (no network, no provider is ever opened).
         rc = gate.main(io.StringIO(json.dumps(self.event if event is None else event)),
-                       out, err, {} if env is None else env, self.directory)
+                       out, err, {} if env is None else env, self.directory,
+                       probe or (lambda url: self.fail(f"unexpected provider probe of {url}")))
         # Fail-open exits 1 so Claude Code shows the stderr line yet still allows the tool; normal decisions exit 0.
         self.assertEqual(rc, 1 if err.getvalue() else 0)
         return out.getvalue(), err.getvalue()
@@ -179,6 +182,8 @@ class GateTests(unittest.TestCase):
 
     def test_absolute_script_unknown_cwd_and_parallel_budget(self):
         env = dict(os.environ, HOME=str(self.home), CORTADOS_DELEGATE_BUDGET="3")
+        for key in ("CORTADOS_PROVIDER_URL", "ANTHROPIC_BASE_URL"):     # no provider target: no real probe
+            env.pop(key, None)
         script = str(Path(gate.__file__).resolve())
 
         def invoke(_):
@@ -189,6 +194,66 @@ class GateTests(unittest.TestCase):
         self.assertTrue(all(r.returncode == 0 and not r.stderr for r in results))
         self.assertEqual(sum(not r.stdout for r in results), 3)
         self.assertEqual(sum(bool(r.stdout) for r in results), 9)
+
+    def test_router_outage_releases_budget_but_agent_stays_refused(self):
+        """Regression (review P2): with the budget spent and cortados-route unavailable, the session could neither
+        delegate nor work directly. While the provider is unreachable the gate now allows direct work past the budget,
+        visibly (stderr, exit 1), without counting it; Agent/Task stay refused; recovery restores the denial."""
+        env = {"CORTADOS_DELEGATE_BUDGET": "3", "ANTHROPIC_BASE_URL": "http://user:secret@provider.example:8432/x"}
+        probed = []
+        down = lambda url: probed.append(url) or "cannot connect to provider.example:8432 (ConnectionRefusedError)"
+        for _ in range(3):
+            self.assertEqual(self.call(env=env, probe=down), ("", ""))
+        self.assertEqual(probed, [], "no probe while the budget lasts")
+        for _ in range(2):
+            out, err = self.call(env=env, probe=down)
+            self.assertEqual(out, "")
+            self.assertIn("provider http://provider.example:8432 unreachable", err)
+            self.assertIn("Agent stays refused", err)
+            self.assertNotIn("secret", err)
+            self.assertNotIn("fail open", err)
+        self.assertEqual(len(probed), 2)
+        self.assertEqual(json.loads(gate.state_path(self.directory, "session").read_text()), {"prompt": 3},
+                         "outage calls do not spend the budget")
+        for tool in ("Agent", "Task"):
+            out, err = self.call(dict(self.event, tool_name=tool, tool_input={"prompt": "x"}), env, down)
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"],
+                             gate.AGENT_DENY_REASON)
+            self.assertEqual(err, "")
+        self.assertEqual(len(probed), 2, "an Agent refusal never probes")
+        # Provider back: the budget denial returns, and its reason explains the recovery path.
+        out, err = self.call(env=env, probe=lambda url: None)
+        self.assertEqual(err, "")
+        reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(reason, gate.budget_deny_reason(3, "http://provider.example:8432"))
+        self.assertIn("unreachable this gate releases the budget", reason)
+        self.assertIn("Agent and Task stay refused", reason)
+        self.assertIn("--no-gate", reason)
+        self.assertNotIn("secret", reason)
+
+    def test_cortados_provider_url_preferred_and_no_target_no_release(self):
+        seen = []
+        env = {"CORTADOS_DELEGATE_BUDGET": "0", "CORTADOS_PROVIDER_URL": "https://route.example",
+               "ANTHROPIC_BASE_URL": "http://other.example:1"}
+        self.assertIn("unreachable", self.call(env=env, probe=lambda url: seen.append(url) or "down")[1])
+        self.assertEqual(seen, ["https://route.example"])
+        # No provider configured at all: nothing to check, so the budget holds (no silent release).
+        out, err = self.call(env={"CORTADOS_DELEGATE_BUDGET": "0"})
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_real_probe_against_local_sockets(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            self.assertIsNone(gate.provider_unreachable(f"http://127.0.0.1:{port}"))
+        finally:
+            listener.close()
+        self.assertIn("cannot connect to 127.0.0.1", gate.provider_unreachable(f"http://127.0.0.1:{port}", 1.0))
+        for url in ("not a url", "ftp://host", "http://", "http://h:99999"):
+            self.assertEqual(gate.provider_unreachable(url), "provider URL is malformed", url)
 
 
 if __name__ == "__main__":
